@@ -87,14 +87,61 @@ fn warn_subscription_route_drop(cause: &str) {
     tracing::warn!(cause, "dropping remote subscription batch");
 }
 
-/// Clears the in-flight checkpoint flag on drop, so a panicking persist task
-/// can't leave it stuck and permanently disable checkpointing.
-struct CheckpointInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+/// Releases an in-flight epoch's admission slot and staged-bytes
+/// budget on drop, so a panicking tail can't leave them leaked and
+/// permanently stall checkpoint admission.
+struct EpochInFlightGuard {
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
+    staged_bytes: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+}
 
-impl Drop for CheckpointInFlightGuard {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+impl EpochInFlightGuard {
+    /// Claim one admission slot and `bytes` of the staged budget.
+    fn claim(
+        in_flight: &Arc<std::sync::atomic::AtomicU64>,
+        staged_bytes: &Arc<std::sync::atomic::AtomicU64>,
+        bytes: u64,
+    ) -> Self {
+        in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        staged_bytes.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            in_flight: Arc::clone(in_flight),
+            staged_bytes: Arc::clone(staged_bytes),
+            bytes,
+        }
     }
+}
+
+impl Drop for EpochInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.staged_bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Captured-state bytes a pending [`CheckpointRequest`]
+/// (plus per-vnode slices) holds in memory while its epoch is between
+/// capture and upload — the unit the `max_staged_bytes` admission cap
+/// counts.
+#[allow(clippy::disallowed_types)]
+fn staged_request_bytes(
+    request: &crate::checkpoint_coordinator::CheckpointRequest,
+    vnode_states: &std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+) -> u64 {
+    let ops: usize = request
+        .operator_states
+        .values()
+        .map(bytes::Bytes::len)
+        .sum();
+    let vnodes: usize = vnode_states
+        .values()
+        .flat_map(|m| m.values())
+        .map(bytes::Bytes::len)
+        .sum();
+    (ops + vnodes) as u64
 }
 
 /// Follower durable-tail bookkeeping shared between the pipeline task
@@ -251,9 +298,20 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
         crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
     >,
-    /// Set while a background checkpoint persists; the coordinator reads it to
-    /// bound concurrent checkpoints to one.
-    pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Count of epochs between admission and restorable (tails still
+    /// running). The streaming coordinator compares it against
+    /// `max_in_flight_epochs` to admit the next barrier.
+    pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
+    /// Captured-state bytes held by in-flight epochs; admission pauses
+    /// at `max_staged_bytes`.
+    pub(crate) staged_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared id allocator (cloned from the coordinator) so barrier
+    /// admission claims ids without the coordinator mutex, which an
+    /// earlier epoch's durable tail may hold.
+    pub(crate) epoch_allocator: Option<Arc<crate::checkpoint_coordinator::EpochAllocator>>,
+    /// Copied from `CheckpointConfig` for the pre-mutex quorum stage.
+    #[cfg(feature = "cluster")]
+    pub(crate) quorum_timeout: Duration,
 }
 
 impl ConnectorPipelineCallback {
@@ -380,8 +438,13 @@ impl ConnectorPipelineCallback {
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         self.sync_sinks_and_drain_events().await;
 
+        // Ids allocated at alignment must be threaded through to the
+        // checkpoint, otherwise the inner allocation would burn a second
+        // pair and checkpoint a different epoch than was announced.
         #[cfg(feature = "cluster")]
-        let _ = self.align_shuffle_for_leader().await?;
+        let leader_ids = self.align_shuffle_for_leader().await?;
+        #[cfg(not(feature = "cluster"))]
+        let leader_ids: Option<(u64, u64)> = None;
 
         let operator_states = self
             .capture_and_serialize_operator_state()
@@ -403,7 +466,19 @@ impl ConnectorPipelineCallback {
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
         coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
-        let result = coord.checkpoint_with_offsets(request).await?;
+        let result = match leader_ids {
+            Some((epoch, checkpoint_id)) => {
+                coord
+                    .checkpoint_preallocated(
+                        request,
+                        epoch,
+                        checkpoint_id,
+                        crate::checkpoint_coordinator::QuorumStage::RunInline,
+                    )
+                    .await?
+            }
+            None => coord.checkpoint_with_offsets(request).await?,
+        };
         if result.success {
             self.last_checkpoint = std::time::Instant::now();
         }
@@ -413,9 +488,8 @@ impl ConnectorPipelineCallback {
     /// Skip a follower `Prepare` for `ann_epoch` only if it is already
     /// committed (`last_committed`), already awaiting local source
     /// barriers (`pending`), or its durable tail is already running
-    /// (`tail_in_flight`). A failed checkpoint does not advance
-    /// `last_committed`, and the leader retries the same epoch (it advances
-    /// only on success), so the retry must be reprocessed, not deduped.
+    /// (`tail_in_flight`). Comparisons are monotonic — leaders abandon
+    /// failed epochs, so gaps in the announced sequence are normal.
     #[cfg(feature = "cluster")]
     fn follower_should_skip(
         last_committed: Option<u64>,
@@ -432,9 +506,10 @@ impl ConnectorPipelineCallback {
     /// save, vnode-partial uploads, the leader-decision wait, and the
     /// 2PC commit/rollback — to a background task so the pipeline can
     /// resume on `Aligned` instead of stalling until `Commit`
-    /// (ADR-003 two-level completion). `follower_checkpoint` acks the
-    /// capture as its first action, which is what releases the leader's
-    /// quorum wait. On commit, completion flows through
+    /// (ADR-003 two-level completion). The capture ack is sent before
+    /// queuing on the coordinator mutex — an earlier epoch's tail may
+    /// hold it for the duration of its uploads, and the leader's quorum
+    /// must not wait on those. On commit, completion flows through
     /// `checkpoint_complete_tx` so the streaming coordinator fans
     /// `EpochCommitted` out to sources and publishes the wire barrier —
     /// the same path the leader's background persist uses.
@@ -455,15 +530,31 @@ impl ConnectorPipelineCallback {
         let coordinator = Arc::clone(&self.coordinator);
         let tail = Arc::clone(&self.follower_tail);
         let complete_tx = self.checkpoint_complete_tx.clone();
+        let cc = self.cluster_controller.clone();
         tokio::spawn(async move {
+            let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
+            if let Some(ref cc) = cc {
+                cc.ack_barrier(&laminar_core::cluster::control::BarrierAck {
+                    epoch,
+                    ok: true,
+                    error: None,
+                    local_watermark_ms: wm_opt,
+                })
+                .await
+                .ok();
+            }
             let committed = {
                 let mut guard = coordinator.lock().await;
                 match guard.as_mut() {
                     Some(coord) => {
                         coord.set_pending_vnode_states(vnode_states);
-                        coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+                        coord.set_local_watermark_ms(wm_opt);
                         match coord
-                            .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))
+                            .follower_checkpoint_acked(
+                                request,
+                                ann,
+                                std::time::Duration::from_secs(30),
+                            )
                             .await
                         {
                             Ok(true) => {
@@ -685,46 +776,60 @@ impl ConnectorPipelineCallback {
         BarrierOutcome::Async
     }
 
-    /// Leader-side cross-node shuffle barrier alignment, run *before* capture so
-    /// the snapshot includes peers' pre-checkpoint rows. Prepare-triggered: the
-    /// leader announces `Prepare` early here (so followers begin aligning), then
-    /// aligns. No-op when not the leader or there is no cross-node shuffle. On
-    /// alignment failure it signals `Abort` so prepared followers don't block.
-    ///
-    /// Returns the epoch announced (read under the same coordinator lock,
-    /// before the background tail can hold it) so the caller can gate its
-    /// resume on the matching `Aligned` announcement; `None` when this
-    /// node isn't the cluster leader.
+    /// Leader-side barrier admission: allocate this barrier's ids
+    /// (lock-free — an earlier epoch's durable tail may hold the
+    /// coordinator mutex), announce `Prepare` so followers begin
+    /// aligning, then drain + align the cross-node shuffle so the
+    /// snapshot includes peers' pre-barrier rows. Returns the allocated
+    /// `(epoch, checkpoint_id)`; `None` when this node isn't the
+    /// cluster leader or no coordinator is wired. On alignment failure
+    /// the allocated epoch is abandoned (Abort + rollback + next epoch
+    /// begun).
     #[cfg(feature = "cluster")]
-    async fn align_shuffle_for_leader(&mut self) -> Result<Option<u64>, DbError> {
-        let (checkpoint_id, epoch, live) = {
-            let mut guard = self.coordinator.lock().await;
-            match guard.as_mut() {
-                Some(coord) => (
-                    coord.announce_prepare().await,
-                    coord.epoch(),
-                    coord.live_node_ids(),
-                ),
-                None => (None, 0, Vec::new()),
-            }
-        };
-        let Some(checkpoint_id) = checkpoint_id else {
+    async fn align_shuffle_for_leader(&mut self) -> Result<Option<(u64, u64)>, DbError> {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+
+        let (Some(cc), Some(allocator)) = (
+            self.cluster_controller.clone(),
+            self.epoch_allocator.clone(),
+        ) else {
             return Ok(None);
         };
+        if !cc.is_leader() {
+            return Ok(None);
+        }
+        let (epoch, checkpoint_id) = allocator.allocate();
+        if let Err(e) = cc
+            .announce_barrier(&BarrierAnnouncement {
+                epoch,
+                checkpoint_id,
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+                seq: 0,
+            })
+            .await
+        {
+            tracing::warn!(epoch, checkpoint_id, error = %e, "prepare announcement failed");
+        }
+
+        let live: Vec<u64> = cc.live_instances().iter().map(|n| n.0).collect();
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
         if let Err(e) = self
             .graph
-            .align_shuffle_barriers(checkpoint_id, wm, &live, self.cluster_controller.as_deref())
+            .align_shuffle_barriers(checkpoint_id, wm, &live, Some(&*cc))
             .await
         {
-            if let Some(coord) = self.coordinator.lock().await.as_ref() {
-                coord.announce_abort(checkpoint_id).await;
+            if let Some(coord) = self.coordinator.lock().await.as_mut() {
+                coord
+                    .abandon_epoch(checkpoint_id, epoch, format!("shuffle alignment: {e}"))
+                    .await;
             }
             return Err(e);
         }
-        Ok(Some(epoch))
+        Ok(Some((epoch, checkpoint_id)))
     }
 
     /// Assemble a [`CheckpointRequest`](crate::checkpoint_coordinator::CheckpointRequest)
@@ -1417,14 +1522,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Persist in the background; in-flight flag bounds to one checkpoint at a time.
-            self.checkpoint_in_flight
-                .store(true, std::sync::atomic::Ordering::Release);
+            // Persist in the background; the in-flight slot + staged
+            // bytes are released by the guard when the tail finishes.
+            let in_flight = EpochInFlightGuard::claim(
+                &self.checkpoint_in_flight,
+                &self.staged_bytes,
+                staged_request_bytes(&request, &vnode_states),
+            );
             let coordinator_clone = Arc::clone(&self.coordinator);
             let tx = self.checkpoint_complete_tx.clone();
-            let in_flight = CheckpointInFlightGuard(Arc::clone(&self.checkpoint_in_flight));
             tokio::spawn(async move {
-                let _in_flight = in_flight; // cleared on drop, even on panic
+                let _in_flight = in_flight; // released on drop, even on panic
                 let mut guard = coordinator_clone.lock().await;
                 if let Some(ref mut coord) = *guard {
                     coord.set_pending_vnode_states(vnode_states);
@@ -1453,13 +1561,30 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        checkpoint_id: u64,
     ) -> crate::pipeline::BarrierOutcome {
         use crate::pipeline::{BarrierOutcome, SkipReason};
 
+        #[cfg(not(feature = "cluster"))]
+        let _ = checkpoint_id;
         #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.clone() {
             if !cc.is_leader() {
                 if let Some(ann) = self.pending_follower_checkpoint.take() {
+                    // Leaders abandon failed epochs, so a slow barrier
+                    // round can complete after its announcement was
+                    // superseded — the captured offsets must never be
+                    // attributed to the newer epoch's announcement.
+                    if ann.checkpoint_id != checkpoint_id {
+                        tracing::warn!(
+                            round_checkpoint_id = checkpoint_id,
+                            pending_checkpoint_id = ann.checkpoint_id,
+                            "stale follower barrier round — its epoch was abandoned; \
+                             re-queueing the newer announcement"
+                        );
+                        self.pending_follower_checkpoint = Some(ann);
+                        return BarrierOutcome::Failed;
+                    }
                     return self
                         .run_follower_checkpoint_deferred(ann, source_checkpoints)
                         .await;
@@ -1488,15 +1613,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         // Drain + align the cross-node shuffle before capture so peers'
         // pre-barrier rows enter the snapshot (announces Prepare early).
-        // The returned epoch keys this barrier's Aligned resume gate.
+        // The returned ids key this barrier's tail and resume gate.
         #[cfg(feature = "cluster")]
-        let leader_epoch = match self.align_shuffle_for_leader().await {
-            Ok(epoch) => epoch,
+        let leader_ids = match self.align_shuffle_for_leader().await {
+            Ok(ids) => ids,
             Err(e) => {
                 tracing::warn!(error = %e, "shuffle barrier alignment failed");
                 return BarrierOutcome::Failed;
             }
         };
+        #[cfg(not(feature = "cluster"))]
+        let leader_ids: Option<(u64, u64)> = None;
 
         // Capture stream executor aggregate state — now consistent because
         // all pre-barrier data has been executed. Serialize on blocking thread.
@@ -1516,23 +1643,89 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let vnode_states = self.capture_vnode_states();
         let request = self.build_checkpoint_request(operator_states, &source_checkpoints);
 
-        // Persist in the background; in-flight flag bounds to one checkpoint at a time.
-        self.checkpoint_in_flight
-            .store(true, std::sync::atomic::Ordering::Release);
+        // Durable tail in the background, two stages: the capture
+        // quorum + `Aligned` run *before* the coordinator mutex (an
+        // earlier epoch's tail may hold it for its uploads — Aligned
+        // must never queue behind those), then the durable remainder
+        // under the FIFO mutex, which keeps epochs restorable in order.
+        let in_flight = EpochInFlightGuard::claim(
+            &self.checkpoint_in_flight,
+            &self.staged_bytes,
+            staged_request_bytes(&request, &vnode_states),
+        );
         let coordinator_clone = Arc::clone(&self.coordinator);
         let tx = self.checkpoint_complete_tx.clone();
-        let in_flight = CheckpointInFlightGuard(Arc::clone(&self.checkpoint_in_flight));
         let fan_out = source_checkpoints.clone();
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(feature = "cluster")]
+        let cc_for_tail = self.cluster_controller.clone();
+        #[cfg(feature = "cluster")]
+        let quorum_timeout = self.quorum_timeout;
         tokio::spawn(async move {
-            let _in_flight = in_flight; // cleared on drop, even on panic
+            use crate::checkpoint_coordinator::{CheckpointCoordinator, QuorumStage};
+
+            let _in_flight = in_flight; // released on drop, even on panic
+            let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
+
+            #[allow(unused_mut)]
+            let mut quorum = QuorumStage::RunInline;
+            #[cfg(feature = "cluster")]
+            if let (Some(cc), Some((epoch, checkpoint_id))) = (cc_for_tail.as_ref(), leader_ids) {
+                use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+                match CheckpointCoordinator::run_prepare_quorum(
+                    cc,
+                    quorum_timeout,
+                    epoch,
+                    checkpoint_id,
+                    wm_opt,
+                )
+                .await
+                {
+                    Ok(min_watermark_ms) => {
+                        if let Err(e) = cc
+                            .announce_barrier(&BarrierAnnouncement {
+                                epoch,
+                                checkpoint_id,
+                                phase: Phase::Aligned,
+                                flags: 0,
+                                min_watermark_ms,
+                                seq: 0,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                epoch, error = %e,
+                                "[LDB-6031] aligned announcement failed; peers resume on Commit"
+                            );
+                        }
+                        quorum = QuorumStage::Done(min_watermark_ms);
+                    }
+                    Err(msg) => {
+                        tracing::error!(checkpoint_id, epoch, error = %msg, "[LDB-6032] quorum miss");
+                        let mut guard = coordinator_clone.lock().await;
+                        if let Some(ref mut coord) = *guard {
+                            coord.abandon_epoch(checkpoint_id, epoch, msg).await;
+                        }
+                        return;
+                    }
+                }
+            }
+
             let mut guard = coordinator_clone.lock().await;
             if let Some(ref mut coord) = *guard {
                 coord.set_pending_vnode_states(vnode_states);
-                coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
-                match coord.checkpoint_with_offsets(request).await {
+                coord.set_local_watermark_ms(wm_opt);
+                let result = match leader_ids {
+                    Some((epoch, checkpoint_id)) => {
+                        coord
+                            .checkpoint_preallocated(request, epoch, checkpoint_id, quorum)
+                            .await
+                    }
+                    None => coord.checkpoint_with_offsets(request).await,
+                };
+                match result {
                     Ok(result) if result.success => {
                         let _ = tx.send((result.epoch, fan_out)).await;
                     }
@@ -1552,7 +1745,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // still folding pre-barrier rows into its epoch-N snapshot.
         // Abort (quorum miss) also releases; the gate is bounded.
         #[cfg(feature = "cluster")]
-        if let (Some(epoch), Some(cc)) = (leader_epoch, self.cluster_controller.clone()) {
+        if let (Some((epoch, _)), Some(cc)) = (leader_ids, self.cluster_controller.clone()) {
             let has_shuffle = self.graph.cluster_shuffle_config().is_some();
             Self::wait_for_aligned_resume(has_shuffle, &cc, epoch).await;
         }
@@ -1783,9 +1976,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn next_checkpoint_id(&self) -> Option<u64> {
-        let guard = self.coordinator.try_lock().ok()?;
-        let coord = guard.as_ref()?;
-        Some(coord.next_checkpoint_id())
+        // Lock-free: an in-flight epoch's tail may hold the coordinator
+        // mutex for the duration of its uploads.
+        self.epoch_allocator.as_ref().map(|a| a.peek().1)
     }
 
     fn set_barrier_injectors(

@@ -1601,8 +1601,37 @@ impl LaminarDB {
             u64,
             rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>,
         )>(16);
-        // Shared in-flight flag: callback sets it per persist, coordinator gates on it.
-        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Shared admission state: the callback claims a slot (and staged
+        // bytes) per in-flight epoch; the streaming coordinator gates new
+        // barriers on the caps (ADR-003 Phase 2). Exactly-once pipelines
+        // are capped at depth 1 — a single-open-transaction sink cannot
+        // overlap epochs.
+        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let staged_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (epoch_allocator, ckpt_quorum_timeout, max_in_flight_epochs, max_staged_bytes) = {
+            let guard = coordinator.lock().await;
+            match guard.as_ref() {
+                Some(coord) => {
+                    let cfg = coord.config();
+                    let depth = if pipeline_config.delivery_guarantee
+                        == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+                    {
+                        1
+                    } else {
+                        cfg.max_in_flight_epochs.max(1)
+                    };
+                    (
+                        Some(coord.epoch_allocator()),
+                        cfg.quorum_timeout,
+                        depth,
+                        cfg.max_staged_bytes,
+                    )
+                }
+                None => (None, std::time::Duration::from_secs(3), 1, u64::MAX),
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let _ = ckpt_quorum_timeout;
 
         let static_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_sources
             .iter()
@@ -1660,6 +1689,10 @@ impl LaminarDB {
             static_stream_names,
             checkpoint_complete_tx,
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
+            staged_bytes: Arc::clone(&staged_bytes),
+            epoch_allocator,
+            #[cfg(feature = "cluster")]
+            quorum_timeout: ckpt_quorum_timeout,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1680,7 +1713,12 @@ impl LaminarDB {
             )
             .await?
             .with_checkpoint_complete_rx(checkpoint_complete_rx)
-            .with_checkpoint_in_flight(checkpoint_in_flight);
+            .with_checkpoint_admission(
+                checkpoint_in_flight,
+                max_in_flight_epochs,
+                staged_bytes,
+                max_staged_bytes,
+            );
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();

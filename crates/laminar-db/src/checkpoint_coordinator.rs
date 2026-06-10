@@ -69,6 +69,15 @@ pub struct CheckpointConfig {
     /// leader's durability gate polls for partial presence instead of
     /// checking once. Expiry aborts the epoch.
     pub restorable_gate_timeout: Duration,
+    /// Maximum epochs admitted between `Aligned` and restorable — the
+    /// upload backlog (ADR-003 Phase 2). Exactly-once pipelines are
+    /// capped at 1: a single-open-transaction sink (e.g. a Kafka
+    /// transactional producer) cannot overlap epochs.
+    pub max_in_flight_epochs: u64,
+    /// Cap on captured-state bytes held in memory by in-flight epochs
+    /// awaiting upload. At the cap, barrier admission pauses — cadence
+    /// degrades to upload speed instead of exhausting memory.
+    pub max_staged_bytes: u64,
 }
 
 impl Default for CheckpointConfig {
@@ -86,6 +95,8 @@ impl Default for CheckpointConfig {
             max_checkpoint_bytes: None,
             quorum_timeout: Duration::from_secs(3),
             restorable_gate_timeout: Duration::from_secs(30),
+            max_in_flight_epochs: 4,
+            max_staged_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -109,6 +120,66 @@ pub struct CheckpointRequest {
     pub pipeline_hash: Option<u64>,
     /// Source offset overrides for recovery.
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
+}
+
+/// Lock-free epoch/checkpoint-id allocator (ADR-003 Phase 2).
+///
+/// Ids are handed out at barrier admission — possibly while an earlier
+/// epoch's durable tail still holds the coordinator mutex — so they
+/// live outside the coordinator's exclusive state. Failed epochs are
+/// abandoned, never re-allocated.
+#[derive(Debug)]
+pub(crate) struct EpochAllocator {
+    epoch: std::sync::atomic::AtomicU64,
+    next_checkpoint_id: std::sync::atomic::AtomicU64,
+}
+
+impl EpochAllocator {
+    fn new(epoch: u64, next_checkpoint_id: u64) -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicU64::new(epoch),
+            next_checkpoint_id: std::sync::atomic::AtomicU64::new(next_checkpoint_id),
+        }
+    }
+
+    /// Claim the next `(epoch, checkpoint_id)` pair.
+    pub(crate) fn allocate(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.epoch.fetch_add(1, Ordering::AcqRel),
+            self.next_checkpoint_id.fetch_add(1, Ordering::AcqRel),
+        )
+    }
+
+    /// The pair the next [`allocate`](Self::allocate) would return.
+    pub(crate) fn peek(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.epoch.load(Ordering::Acquire),
+            self.next_checkpoint_id.load(Ordering::Acquire),
+        )
+    }
+
+    /// Rebase after recovery, or on a follower mirroring the leader's ids.
+    fn reset(&self, epoch: u64, next_checkpoint_id: u64) {
+        use std::sync::atomic::Ordering;
+        self.epoch.store(epoch, Ordering::Release);
+        self.next_checkpoint_id
+            .store(next_checkpoint_id, Ordering::Release);
+    }
+}
+
+/// Whether `checkpoint_inner` still needs to run the cluster capture
+/// quorum, or a pipelined tail already ran it before taking the
+/// coordinator mutex.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum QuorumStage {
+    /// Run the quorum + `Aligned` announce inline (forced/timer paths).
+    RunInline,
+    /// Already reached before the coordinator lock; carries the merged
+    /// cluster-min watermark for the `Commit` announcement.
+    #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+    Done(Option<i64>),
 }
 
 /// Phase of the checkpoint lifecycle.
@@ -185,8 +256,9 @@ pub struct CheckpointCoordinator {
     config: CheckpointConfig,
     store: Arc<dyn CheckpointStore>,
     sinks: Vec<RegisteredSink>,
-    next_checkpoint_id: u64,
-    epoch: u64,
+    /// Shared with the pipeline callback, which allocates ids at
+    /// barrier admission without taking the coordinator mutex.
+    allocator: Arc<EpochAllocator>,
     phase: CheckpointPhase,
     checkpoints_completed: u64,
     checkpoints_failed: u64,
@@ -274,8 +346,7 @@ impl CheckpointCoordinator {
             config,
             store,
             sinks: Vec::new(),
-            next_checkpoint_id: next_id,
-            epoch,
+            allocator: Arc::new(EpochAllocator::new(epoch, next_id)),
             phase: CheckpointPhase::Idle,
             checkpoints_completed: 0,
             checkpoints_failed: 0,
@@ -397,7 +468,13 @@ impl CheckpointCoordinator {
     ///
     /// Returns the first error from any sink that fails to begin the epoch.
     pub async fn begin_initial_epoch(&self) -> Result<(), DbError> {
-        self.begin_epoch_for_sinks(self.epoch).await
+        self.begin_epoch_for_sinks(self.allocator.peek().0).await
+    }
+
+    /// Shared id allocator, cloned by the pipeline callback so barrier
+    /// admission can claim ids without the coordinator mutex.
+    pub(crate) fn epoch_allocator(&self) -> Arc<EpochAllocator> {
+        Arc::clone(&self.allocator)
     }
 
     /// Begins an epoch on all exactly-once sinks. If any sink fails,
@@ -461,7 +538,8 @@ impl CheckpointCoordinator {
         &mut self,
         request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
-        self.checkpoint_inner(request).await
+        self.checkpoint_inner(request, None, QuorumStage::RunInline)
+            .await
     }
 
     /// Pre-commits all exactly-once sinks (phase 1) with a timeout.
@@ -776,7 +854,7 @@ impl CheckpointCoordinator {
     /// and an unbounded `begin_epoch` await would hang the coordinator
     /// on it.
     async fn begin_next_epoch_bounded(&self) {
-        let next_epoch = self.epoch;
+        let next_epoch = self.allocator.peek().0;
         match tokio::time::timeout(
             self.config.rollback_timeout,
             self.begin_epoch_for_sinks(next_epoch),
@@ -950,75 +1028,81 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Leader-only: announce `Prepare` *early* — before operator capture — so
-    /// peers can start cross-node shuffle barrier alignment. Returns the
-    /// checkpoint id every node aligns on (the same one `checkpoint_inner` will
-    /// use, since `next_checkpoint_id` is stable until commit), or `None` if not
-    /// the leader. `await_prepare_quorum` later re-announces the identical
-    /// `Prepare` idempotently, and followers dedup by epoch.
-    #[cfg(feature = "cluster")]
-    pub async fn announce_prepare(&self) -> Option<u64> {
-        use laminar_core::cluster::control::Phase;
-        let cc = self.cluster_controller.as_ref()?;
-        if !cc.is_leader() {
-            return None;
-        }
-        let checkpoint_id = self.next_checkpoint_id;
-        self.announce_if_leader(self.epoch, checkpoint_id, Phase::Prepare, None)
-            .await;
-        Some(checkpoint_id)
-    }
-
-    /// Leader-only: announce `Abort` for an early-announced checkpoint whose
-    /// shuffle alignment failed, so followers already prepared on the `Prepare`
-    /// don't block until their decision timeout.
-    #[cfg(feature = "cluster")]
-    pub async fn announce_abort(&self, checkpoint_id: u64) {
-        use laminar_core::cluster::control::Phase;
-        self.announce_if_leader(self.epoch, checkpoint_id, Phase::Abort, None)
-            .await;
-    }
-
-    /// Live cluster node ids (the controller's view), for the caller to derive
-    /// the shuffle barrier-alignment peer set. Empty without a controller.
-    #[cfg(feature = "cluster")]
-    #[must_use]
-    pub fn live_node_ids(&self) -> Vec<u64> {
-        self.cluster_controller
-            .as_ref()
-            .map(|cc| cc.live_instances().iter().map(|n| n.0).collect())
-            .unwrap_or_default()
-    }
-
     /// Announce PREPARE and block for follower acks. Returns `None` on
-    /// quorum or no-op (not leader); `Some(msg)` with the failure.
-    /// When quorum is reached, the `Ok` path writes the cluster-wide
-    /// minimum watermark (leader's local + min of follower acks) into
-    /// `self.cluster_min_watermark` so the subsequent `Commit`
-    /// announcement can fan it out.
+    /// quorum or no-op (not leader); `Some(msg)` with the failure
+    /// (after announcing `Abort`). When quorum is reached, writes the
+    /// cluster-wide minimum watermark into `self.cluster_min_watermark`
+    /// so the subsequent `Commit` announcement can fan it out.
     #[cfg(feature = "cluster")]
     async fn await_prepare_quorum(&mut self, epoch: u64, checkpoint_id: u64) -> Option<String> {
-        use laminar_core::cluster::control::{Phase, QuorumOutcome};
-        let cc = self.cluster_controller.as_ref()?;
+        use laminar_core::cluster::control::Phase;
+        let cc = Arc::clone(self.cluster_controller.as_ref()?);
         if !cc.is_leader() {
             return None;
         }
-        self.announce_if_leader(epoch, checkpoint_id, Phase::Prepare, None)
-            .await;
+        match Self::run_prepare_quorum(
+            &cc,
+            self.config.quorum_timeout,
+            epoch,
+            checkpoint_id,
+            self.local_watermark_ms,
+        )
+        .await
+        {
+            Ok(merged) => {
+                self.cluster_min_watermark = merged;
+                None
+            }
+            Err(msg) => {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
+                    .await;
+                Some(msg)
+            }
+        }
+    }
+
+    /// The capture-quorum stage, callable without the coordinator mutex
+    /// so pipelined barrier tails can reach `Aligned` while an earlier
+    /// epoch's durable tail still holds it. Announces `Prepare`, waits
+    /// for every live follower's capture ack (failing fast on unhealthy
+    /// membership), and returns the merged cluster-min watermark. The
+    /// caller announces `Aligned` on success / `Abort` on failure and
+    /// publishes the watermark via the announcement.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn run_prepare_quorum(
+        cc: &laminar_core::cluster::control::ClusterController,
+        quorum_timeout: Duration,
+        epoch: u64,
+        checkpoint_id: u64,
+        local_watermark_ms: Option<i64>,
+    ) -> Result<Option<i64>, String> {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, QuorumOutcome};
+
+        if let Err(e) = cc
+            .announce_barrier(&BarrierAnnouncement {
+                epoch,
+                checkpoint_id,
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+                seq: 0,
+            })
+            .await
+        {
+            warn!(epoch, checkpoint_id, error = %e, "[LDB-6031] prepare announcement failed");
+        }
 
         let mut followers = cc.live_instances();
         followers.retain(|id| *id != cc.instance_id());
         if followers.is_empty() {
             // Leader-only cluster — cluster-wide min is just the
             // leader's local watermark (if any).
-            self.cluster_min_watermark = self.local_watermark_ms;
-            if let Some(wm) = self.local_watermark_ms {
+            if let Some(wm) = local_watermark_ms {
                 cc.publish_cluster_min_watermark(wm);
             }
-            return None;
+            return Ok(local_watermark_ms);
         }
 
-        let quorum_timeout = self.config.quorum_timeout;
         let mut members_rx = cc.members_watch();
 
         let quorum_fut = cc.wait_for_quorum(epoch, &followers, quorum_timeout);
@@ -1064,40 +1148,29 @@ impl CheckpointCoordinator {
                 ..
             }) => {
                 // Fold follower min with the leader's own watermark.
-                let merged = match (self.local_watermark_ms, min_follower_watermark_ms) {
+                let merged = match (local_watermark_ms, min_follower_watermark_ms) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (Some(a), None) => Some(a),
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
-                self.cluster_min_watermark = merged;
                 if let Some(wm) = merged {
                     cc.publish_cluster_min_watermark(wm);
                 }
-                None
+                Ok(merged)
             }
-            Ok(QuorumOutcome::TimedOut { missing, .. }) => {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
-                    .await;
-                Some(format!(
-                    "quorum timeout: {} follower(s) did not ack",
-                    missing.len()
-                ))
-            }
+            Ok(QuorumOutcome::TimedOut { missing, .. }) => Err(format!(
+                "quorum timeout: {} follower(s) did not ack",
+                missing.len()
+            )),
             Ok(QuorumOutcome::Failed { failures }) => {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
-                    .await;
                 let first = failures.first().map_or("unknown", |(_, msg)| msg.as_str());
-                Some(format!(
+                Err(format!(
                     "follower snapshot failed on {} peer(s): {first}",
                     failures.len()
                 ))
             }
-            Err(err_msg) => {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
-                    .await;
-                Some(format!("fail-fast: {err_msg}"))
-            }
+            Err(err_msg) => Err(format!("fail-fast: {err_msg}")),
         }
     }
 
@@ -1244,16 +1317,16 @@ impl CheckpointCoordinator {
         self.phase
     }
 
-    /// Returns the current epoch.
+    /// Returns the next epoch to be allocated.
     #[must_use]
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.allocator.peek().0
     }
 
-    /// Returns the next checkpoint ID.
+    /// Returns the next checkpoint ID to be allocated.
     #[must_use]
     pub fn next_checkpoint_id(&self) -> u64 {
-        self.next_checkpoint_id
+        self.allocator.peek().1
     }
 
     /// Returns the checkpoint config.
@@ -1276,7 +1349,7 @@ impl CheckpointCoordinator {
             duration_p99_ms: p99 / 1_000,
             total_bytes_written: self.total_bytes_written,
             current_phase: self.phase,
-            current_epoch: self.epoch,
+            current_epoch: self.allocator.peek().0,
         }
     }
 
@@ -1301,7 +1374,38 @@ impl CheckpointCoordinator {
         &mut self,
         request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
-        self.checkpoint_inner(request).await
+        self.checkpoint_inner(request, None, QuorumStage::RunInline)
+            .await
+    }
+
+    /// Pipelined-barrier entry point: ids were allocated at admission
+    /// and the capture quorum already ran before the coordinator mutex
+    /// was taken (see `QuorumStage::Done`).
+    ///
+    /// # Errors
+    /// Returns `DbError::Checkpoint` if any phase fails.
+    pub(crate) async fn checkpoint_preallocated(
+        &mut self,
+        request: CheckpointRequest,
+        epoch: u64,
+        checkpoint_id: u64,
+        quorum: QuorumStage,
+    ) -> Result<CheckpointResult, DbError> {
+        self.checkpoint_inner(request, Some((epoch, checkpoint_id)), quorum)
+            .await
+    }
+
+    /// Abandon a pre-allocated epoch whose pre-mutex stage (alignment
+    /// or capture quorum) failed: announce `Abort`, roll back, and
+    /// begin the next epoch's sink transactions.
+    pub(crate) async fn abandon_epoch(
+        &mut self,
+        checkpoint_id: u64,
+        epoch: u64,
+        error: String,
+    ) -> CheckpointResult {
+        self.fail_epoch(checkpoint_id, epoch, Instant::now(), error)
+            .await
     }
 
     /// Follower half of a cluster checkpoint: ack the capture, run the
@@ -1326,6 +1430,45 @@ impl CheckpointCoordinator {
         ann: laminar_core::cluster::control::BarrierAnnouncement,
         decision_timeout: Duration,
     ) -> Result<bool, DbError> {
+        use laminar_core::cluster::control::BarrierAck;
+
+        let Some(cc) = self.cluster_controller.clone() else {
+            return Err(DbError::Checkpoint(
+                "[LDB-6033] follower_checkpoint called without cluster controller".into(),
+            ));
+        };
+
+        // Capture ack — state is already consistently captured by the
+        // caller; the leader needs nothing more to release pipelines.
+        cc.ack_barrier(&BarrierAck {
+            epoch: ann.epoch,
+            ok: true,
+            error: None,
+            // Leader folds this into the cluster-wide min announced on
+            // Aligned/Commit. `None` is non-blocking.
+            local_watermark_ms: self.local_watermark_ms,
+        })
+        .await
+        .ok(); // best effort; leader's quorum wait tolerates missed acks
+
+        self.follower_checkpoint_acked(request, ann, decision_timeout)
+            .await
+    }
+
+    /// [`follower_checkpoint`](Self::follower_checkpoint) minus the
+    /// capture ack, for pipelined tails that ack *before* queuing on
+    /// the coordinator mutex (an earlier epoch's durable tail may hold
+    /// it for the duration of its uploads).
+    ///
+    /// # Errors
+    /// Propagates sink pre-commit, manifest save, or marker-write failures.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn follower_checkpoint_acked(
+        &mut self,
+        request: CheckpointRequest,
+        ann: laminar_core::cluster::control::BarrierAnnouncement,
+        decision_timeout: Duration,
+    ) -> Result<bool, DbError> {
         use laminar_core::cluster::control::{BarrierAck, Phase};
 
         let Some(cc) = self.cluster_controller.clone() else {
@@ -1337,21 +1480,7 @@ impl CheckpointCoordinator {
         let epoch = ann.epoch;
         let checkpoint_id = ann.checkpoint_id;
         // Align with the leader so a later leader-mode call resumes correctly.
-        self.epoch = epoch;
-        self.next_checkpoint_id = checkpoint_id.saturating_add(1);
-
-        // Capture ack — state is already consistently captured by the
-        // caller; the leader needs nothing more to release pipelines.
-        cc.ack_barrier(&BarrierAck {
-            epoch,
-            ok: true,
-            error: None,
-            // Leader folds this into the cluster-wide min announced on
-            // Aligned/Commit. `None` is non-blocking.
-            local_watermark_ms: self.local_watermark_ms,
-        })
-        .await
-        .ok(); // best effort; leader's quorum wait tolerates missed acks
+        self.allocator.reset(epoch, checkpoint_id.saturating_add(1));
 
         // Durable prepare (runs after the ack, off the critical path
         // when the caller drives this from a background task).
@@ -1475,7 +1604,8 @@ impl CheckpointCoordinator {
             );
         }
         self.checkpoints_completed += 1;
-        self.epoch = epoch.saturating_add(1);
+        let (_, next_id) = self.allocator.peek();
+        self.allocator.reset(epoch.saturating_add(1), next_id);
         self.phase = CheckpointPhase::Idle;
         true
     }
@@ -1548,6 +1678,8 @@ impl CheckpointCoordinator {
     async fn checkpoint_inner(
         &mut self,
         request: CheckpointRequest,
+        ids: Option<(u64, u64)>,
+        quorum: QuorumStage,
     ) -> Result<CheckpointResult, DbError> {
         let CheckpointRequest {
             operator_states,
@@ -1559,16 +1691,15 @@ impl CheckpointCoordinator {
             source_offset_overrides,
         } = request;
         let start = Instant::now();
-        let checkpoint_id = self.next_checkpoint_id;
-        let epoch = self.epoch;
-        // Allocate ids up front (Flink-style): a failed attempt is
+        // Ids are allocated up front (Flink-style): a failed attempt is
         // abandoned — never retried under the same ids — so a future
         // epoch's identity never depends on this one's outcome. That
         // independence is what allows epochs to overlap (ADR-003
         // Phase 2); it also removes the same-epoch-retry ambiguity the
-        // announcement `seq` otherwise has to disambiguate.
-        self.next_checkpoint_id += 1;
-        self.epoch += 1;
+        // announcement `seq` otherwise has to disambiguate. Pipelined
+        // barrier paths allocate at admission and pass the ids in;
+        // forced/timer paths allocate here.
+        let (epoch, checkpoint_id) = ids.unwrap_or_else(|| self.allocator.allocate());
 
         info!(checkpoint_id, epoch, "starting checkpoint");
 
@@ -1584,23 +1715,33 @@ impl CheckpointCoordinator {
         // prepare runs after their ack; its completion is verified by
         // the restorable gate below (each node writes its vnode
         // partials *last*, so full presence implies every prepare
-        // finished).
+        // finished). Pipelined barrier tails run this stage *before*
+        // taking the coordinator mutex (so Aligned is never queued
+        // behind an earlier epoch's uploads) and pass `Done` here.
         #[cfg(feature = "cluster")]
-        {
-            if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
-                error!(checkpoint_id, epoch, error = %quorum_failure, "[LDB-6032] quorum miss");
-                return Ok(self
-                    .fail_epoch(checkpoint_id, epoch, start, quorum_failure)
-                    .await);
+        match quorum {
+            QuorumStage::RunInline => {
+                if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await
+                {
+                    error!(checkpoint_id, epoch, error = %quorum_failure, "[LDB-6032] quorum miss");
+                    return Ok(self
+                        .fail_epoch(checkpoint_id, epoch, start, quorum_failure)
+                        .await);
+                }
+                self.announce_if_leader(
+                    epoch,
+                    checkpoint_id,
+                    laminar_core::cluster::control::Phase::Aligned,
+                    self.cluster_min_watermark,
+                )
+                .await;
             }
-            self.announce_if_leader(
-                epoch,
-                checkpoint_id,
-                laminar_core::cluster::control::Phase::Aligned,
-                self.cluster_min_watermark,
-            )
-            .await;
+            QuorumStage::Done(min_watermark_ms) => {
+                self.cluster_min_watermark = min_watermark_ms;
+            }
         }
+        #[cfg(not(feature = "cluster"))]
+        let _ = quorum;
 
         self.phase = CheckpointPhase::PreCommitting;
         if let Err(e) = self.pre_commit_sinks(epoch).await {
@@ -1855,7 +1996,7 @@ impl CheckpointCoordinator {
             }
         }
 
-        let next_epoch = self.epoch;
+        let next_epoch = self.allocator.peek().0;
         let begin_epoch_error = match self.begin_epoch_for_sinks(next_epoch).await {
             Ok(()) => None,
             Err(e) => {
@@ -1913,13 +2054,10 @@ impl CheckpointCoordinator {
 
         if let Some(ref recovered) = result {
             // Advance epoch past the recovered one
-            self.epoch = recovered.epoch() + 1;
-            self.next_checkpoint_id = recovered.manifest.checkpoint_id + 1;
-            info!(
-                epoch = self.epoch,
-                checkpoint_id = self.next_checkpoint_id,
-                "coordinator epoch set after recovery"
-            );
+            self.allocator
+                .reset(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
+            let (epoch, checkpoint_id) = self.allocator.peek();
+            info!(epoch, checkpoint_id, "coordinator epoch set after recovery");
         }
 
         Ok(result)
@@ -1938,8 +2076,7 @@ impl CheckpointCoordinator {
 impl std::fmt::Debug for CheckpointCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckpointCoordinator")
-            .field("epoch", &self.epoch)
-            .field("next_checkpoint_id", &self.next_checkpoint_id)
+            .field("allocator", &self.allocator)
             .field("phase", &self.phase)
             .field("sinks", &self.sinks.len())
             .field("completed", &self.checkpoints_completed)
@@ -3220,6 +3357,17 @@ mod tests {
         );
         let err = result.error.expect("failure produces an error message");
         assert!(err.contains("vnode partial write failed"), "got: {err}");
+    }
+
+    #[test]
+    fn epoch_allocator_allocates_monotonic_pairs() {
+        let a = EpochAllocator::new(5, 9);
+        assert_eq!(a.peek(), (5, 9));
+        assert_eq!(a.allocate(), (5, 9));
+        assert_eq!(a.allocate(), (6, 10));
+        assert_eq!(a.peek(), (7, 11));
+        a.reset(20, 30);
+        assert_eq!(a.allocate(), (20, 30));
     }
 
     /// Ids are allocated at the start of an attempt: a failed epoch is
