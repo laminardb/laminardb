@@ -53,8 +53,10 @@ laminardb:
     
   cluster:
     discovery:
-      strategy: dns    # Headless service DNS discovery (recommended for K8s)
+      strategy: gossip
       gossipPort: 7946
+      # seeds are generated from replicaCount (per-pod headless DNS names);
+      # set `seeds` explicitly only for non-standard topologies
     coordination:
       strategy: raft
       raftPort: 7947
@@ -159,10 +161,13 @@ prometheusRule:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `replicaCount` | Number of pods to run | `1` |
+| `podManagementPolicy` | StatefulSet pod launch ordering: `Parallel` or `OrderedReady` (immutable after creation) | `Parallel` |
 | `laminardb.mode` | Server mode: `embedded` or `cluster` | `embedded` |
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
 | `laminardb.workers` | Number of worker threads (0 = auto) | `0` |
+| `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
+| `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.state.backend` | Storage type: `in_process`, `local`, or `object_store` | `local` |
 | `laminardb.state.path` | Path for persistent state (required if backend=local) | `/var/lib/laminardb/state` |
 | `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |
@@ -170,7 +175,7 @@ prometheusRule:
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
 | `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
-| `laminardb.cluster.discovery.strategy` | Discovery method (`dns`, `gossip`, `static`) | `dns` |
+| `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
 | `laminardb.cluster.coordination.strategy` | Clustering controller coordination (`raft`) | `raft` |
 | `persistence.state.enabled` | Keep local state in Persistent Volume | `true` |
 | `persistence.state.storageClass` | K8s storage class for state PVC | `""` (default) |

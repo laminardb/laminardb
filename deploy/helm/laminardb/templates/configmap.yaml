@@ -20,6 +20,13 @@ data:
     bind = "{{ .Values.laminardb.httpBind }}"
     workers = {{ .Values.laminardb.workers }}
     log_level = "{{ .Values.laminardb.logLevel }}"
+    {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
+    # Resolved from the pod env at config load; the token never enters the ConfigMap.
+    console_token = "${LAMINAR_CONSOLE_TOKEN}"
+    {{- end }}
+    {{- with .Values.laminardb.consoleCorsAllowedOrigins }}
+    console_cors_allowed_origins = [{{ range $i, $o := . }}{{ if $i }}, {{ end }}"{{ $o }}"{{ end }}]
+    {{- end }}
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"
@@ -45,10 +52,18 @@ data:
 
     [discovery]
     {{- $discovery := $cluster.discovery | default dict }}
-    strategy = "{{ $discovery.strategy }}"
-    gossip_port = {{ $discovery.gossipPort }}
+    {{- $gossipPort := $discovery.gossipPort | default 7946 }}
+    {{- $podDomain := printf "%s.%s.svc.%s" (include "laminardb.headlessServiceName" .) .Release.Namespace (.Values.clusterDomain | default "cluster.local") }}
+    strategy = "{{ $discovery.strategy | default "gossip" }}"
+    gossip_port = {{ $gossipPort }}
+    # Peers must reach this node by its per-pod headless-service DNS name; the
+    # bare pod hostname the server would otherwise advertise is not resolvable.
+    advertise_host = "{{ $discovery.advertiseHost | default (printf "${HOSTNAME}.%s" $podDomain) }}"
     {{- if $discovery.seeds }}
     seeds = [{{ range $i, $s := $discovery.seeds }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    {{- else }}
+    # Generated from replicaCount: every node lists the full cluster (self included).
+    seeds = [{{ range $i := until (int .Values.replicaCount) }}{{ if $i }}, {{ end }}"{{ include "laminardb.fullname" $ }}-{{ $i }}.{{ $podDomain }}:{{ $gossipPort }}"{{ end }}]
     {{- end }}
 
     [coordination]

@@ -1,6 +1,13 @@
 # -- Number of replicas (use 1 for embedded, >1 for cluster mode)
 replicaCount: 1
 
+# -- StatefulSet pod launch ordering: "Parallel" or "OrderedReady".
+# -- Immutable on a live StatefulSet (delete with --cascade=orphan to change).
+podManagementPolicy: Parallel
+
+# -- Kubernetes cluster DNS domain, used to build per-pod discovery addresses.
+clusterDomain: cluster.local
+
 image:
   # -- Docker image repository
   repository: laminardb/laminardb-server
@@ -60,6 +67,16 @@ laminardb:
     # -- Snapshot strategy: "full", "incremental", or "fork_cow"
     snapshotStrategy: full
 
+  # -- Bearer token for the control-plane (console) HTTP API, read from an
+  # -- existing Secret. Empty existingSecret = unauthenticated API (dev only).
+  consoleToken:
+    existingSecret: ""
+    secretKey: "token"
+
+  # -- CORS allow-list of console origins, e.g. ["https://console.example.com"].
+  # -- Empty falls back to the permissive legacy policy (dev only).
+  consoleCorsAllowedOrigins: []
+
   # -- Hot-reload config on file change. Off in K8s: config changes already roll pods
   # (checksum/config annotation) and the watcher spams reloads on ConfigMap mounts.
   configWatch: false
@@ -73,14 +90,16 @@ laminardb:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
     discovery:
-      # -- Discovery strategy: "dns", "gossip", or "static"
-      strategy: dns
-      # -- DNS name for discovery (auto-set to headless service if empty)
-      dnsName: ""
+      # -- Discovery strategy: "gossip" (recommended) or "static"
+      strategy: gossip
       # -- Gossip port
       gossipPort: 7946
-      # -- Seed nodes for static discovery
+      # -- Seed nodes. Empty = generated from replicaCount as
+      # -- <fullname>-N.<headless>.<namespace>.svc.cluster.local:<gossipPort>
       seeds: []
+      # -- Host peers use to reach this node. Empty = the pod's headless-service
+      # -- DNS name (override only for non-standard network setups)
+      advertiseHost: ""
     coordination:
       # -- Coordination strategy (only "raft" supported)
       strategy: raft

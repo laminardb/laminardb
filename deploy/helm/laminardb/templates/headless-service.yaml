@@ -9,6 +9,10 @@ metadata:
 spec:
   type: ClusterIP
   clusterIP: None
+  # Pods must resolve each other DURING cluster formation, before any pod is
+  # Ready (the server blocks on membership before serving probes) — without
+  # this, multi-replica discovery deadlocks.
+  publishNotReadyAddresses: true
   ports:
     - port: {{ .Values.service.httpPort }}
       targetPort: http
