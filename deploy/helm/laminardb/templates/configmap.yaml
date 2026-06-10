@@ -36,7 +36,7 @@ data:
     {{- end }}
 
     [checkpoint]
-    url = "{{ .Values.laminardb.checkpoint.url }}"
+    url = "{{ .Values.laminardb.checkpoint.url | default "file:///var/lib/laminardb/checkpoints" }}"
     interval = "{{ .Values.laminardb.checkpoint.interval }}"
     mode = "{{ .Values.laminardb.checkpoint.mode }}"
     snapshot_strategy = "{{ .Values.laminardb.checkpoint.snapshotStrategy }}"

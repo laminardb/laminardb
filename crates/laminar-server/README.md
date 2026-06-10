@@ -71,7 +71,10 @@ backend = "local"           # "in_process", "local", or "object_store"
 path = "./data/state"       # required when backend = "local"
 
 [checkpoint]
-url = "file:///tmp/laminardb/checkpoints"  # file://, s3://, gs://
+# Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the
+# AWS/GCS/Azure backends are in the default build). Credentials come from the
+# standard provider env vars, or set them under [checkpoint.storage].
+url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
 
 [[source]]
