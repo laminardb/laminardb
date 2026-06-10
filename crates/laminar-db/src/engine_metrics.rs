@@ -81,6 +81,9 @@ pub struct EngineMetrics {
     /// a checkpoint (shuffle alignment + state capture + the Aligned
     /// resume gate), excluding the background durable tail (ADR-003).
     pub checkpoint_pipeline_stall_duration: Histogram,
+    /// Vnode partials written as references to an unchanged base
+    /// instead of re-uploading state (ADR-003 Phase 3).
+    pub checkpoint_unchanged_vnodes: IntCounter,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// Sink commit round-trip (2PC phase 2).
@@ -282,6 +285,11 @@ impl EngineMetrics {
                     "Pipeline stall per checkpoint barrier (align + capture + resume gate)",
                 )
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_unchanged_vnodes: reg!(IntCounter::new(
+                "checkpoint_unchanged_vnodes_total",
+                "Vnode partials written as unchanged-base references"
             )
             .unwrap()),
             // pre_commit_timeout=30s. 0.005 * 2^13 = 40.96s.

@@ -297,6 +297,13 @@ pub struct CheckpointCoordinator {
     #[allow(clippy::disallowed_types)] // matches the graph snapshot shape
     pending_vnode_states:
         std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    /// Per-vnode `(epoch, slices)` of the last *full* partial uploaded —
+    /// the bases for unchanged-vnode reference partials (ADR-003
+    /// Phase 3). Bytes are refcounted, so this holds one serialized
+    /// snapshot's worth of memory, not a deep copy per epoch.
+    #[allow(clippy::disallowed_types)]
+    last_vnode_uploads:
+        std::collections::HashMap<u32, (u64, std::collections::HashMap<String, bytes::Bytes>)>,
     /// `Some` in cluster mode, `None` in single-instance / embedded.
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -363,6 +370,7 @@ impl CheckpointCoordinator {
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
             pending_vnode_states: std::collections::HashMap::new(),
+            last_vnode_uploads: std::collections::HashMap::new(),
             #[cfg(feature = "cluster")]
             cluster_controller: None,
             cached_sorted_sink_names: None,
@@ -688,14 +696,25 @@ impl CheckpointCoordinator {
     /// The payload is a [`VnodePartial`](crate::vnode_partial::VnodePartial)
     /// carrying the operator-state slices staged via
     /// [`set_pending_vnode_states`](Self::set_pending_vnode_states) for that
-    /// vnode — real, rehydratable state rather than the old `ckpt:{id}`
-    /// marker. A vnode with no staged state writes an empty `VnodePartial`,
+    /// vnode. A vnode with no staged state writes an empty `VnodePartial`,
     /// which still seals the durability gate (presence is all the gate checks).
+    ///
+    /// A vnode whose slices are byte-identical to its last full upload
+    /// writes a tiny *reference* partial instead of re-uploading the
+    /// state (ADR-003 Phase 3) — upload cost becomes proportional to
+    /// changed vnodes. References are forced back to full before their
+    /// base ages out of the `max_retained` prune window, and bases are
+    /// recorded only after every write lands so a partially-failed
+    /// epoch re-uploads full next time.
     ///
     /// Fires every vnode write concurrently via `try_join_all`: the serial
     /// version was O(`vnode_count` × per-write latency) — trivial CPU but each
     /// a scheduling hop (and tens-to-hundreds of ms on a remote object store).
-    async fn write_vnode_partials(&self, epoch: u64, checkpoint_id: u64) -> Result<(), DbError> {
+    async fn write_vnode_partials(
+        &mut self,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<(), DbError> {
         let Some(ref backend) = self.state_backend else {
             return Ok(());
         };
@@ -706,27 +725,50 @@ impl CheckpointCoordinator {
         // means the host hasn't wired a version (single-instance path) and
         // the fence is a no-op.
         let caller_version = self.assignment_version;
-        let writes = self
-            .vnode_set
-            .iter()
-            .map(|&v| {
-                let backend = Arc::clone(backend);
-                let operators = self
-                    .pending_vnode_states
+        let max_ref_age = (self.config.max_retained as u64).max(1);
+
+        // Phase 1 (sync): classify each vnode as reference or full and
+        // encode its payload.
+        let mut full_uploads: Vec<(u32, std::collections::HashMap<String, bytes::Bytes>)> =
+            Vec::new();
+        let mut emptied: Vec<u32> = Vec::new();
+        let mut reference_count: u64 = 0;
+        let mut encoded: Vec<(u32, bytes::Bytes)> = Vec::with_capacity(self.vnode_set.len());
+        for &v in &self.vnode_set {
+            let ops = self.pending_vnode_states.get(&v);
+            let base = ops.filter(|ops| !ops.is_empty()).and_then(|ops| {
+                self.last_vnode_uploads
                     .get(&v)
-                    .map(|ops| ops.iter().map(|(n, b)| (n.clone(), b.to_vec())).collect())
-                    .unwrap_or_default();
-                let partial = crate::vnode_partial::VnodePartial {
+                    .filter(|(base, last)| epoch.saturating_sub(*base) < max_ref_age && last == ops)
+                    .map(|(base, _)| *base)
+            });
+            let partial = if let Some(base_epoch) = base {
+                reference_count += 1;
+                crate::vnode_partial::VnodePartial {
                     checkpoint_id,
-                    operators,
-                };
-                partial
-                    .encode()
-                    .map(|bytes| (v, backend, bytes::Bytes::from(bytes)))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|(v, backend, payload)| async move {
+                    operators: Vec::new(),
+                    base_epoch: Some(base_epoch),
+                }
+            } else {
+                match ops {
+                    Some(ops) if !ops.is_empty() => full_uploads.push((v, ops.clone())),
+                    _ => emptied.push(v),
+                }
+                crate::vnode_partial::VnodePartial {
+                    checkpoint_id,
+                    operators: ops
+                        .map(|ops| ops.iter().map(|(n, b)| (n.clone(), b.to_vec())).collect())
+                        .unwrap_or_default(),
+                    base_epoch: None,
+                }
+            };
+            encoded.push((v, bytes::Bytes::from(partial.encode()?)));
+        }
+
+        // Phase 2 (async): upload concurrently.
+        let writes = encoded.into_iter().map(|(v, payload)| {
+            let backend = Arc::clone(backend);
+            async move {
                 backend
                     .write_partial(v, epoch, caller_version, payload)
                     .await
@@ -735,8 +777,23 @@ impl CheckpointCoordinator {
                             "[LDB-6024] vnode partial write failed (vnode={v}, epoch={epoch}): {e}"
                         ))
                     })
-            });
-        futures::future::try_join_all(writes).await.map(|_| ())
+            }
+        });
+        futures::future::try_join_all(writes).await?;
+
+        // Phase 3 (sync): record the new bases / clear emptied vnodes.
+        for (v, ops) in full_uploads {
+            self.last_vnode_uploads.insert(v, (epoch, ops));
+        }
+        for v in emptied {
+            self.last_vnode_uploads.remove(&v);
+        }
+        if reference_count > 0 {
+            if let Some(ref m) = self.prom {
+                m.checkpoint_unchanged_vnodes.inc_by(reference_count);
+            }
+        }
+        Ok(())
     }
 
     /// Poll the state backend's durability gate until every vnode in
@@ -3357,6 +3414,99 @@ mod tests {
         );
         let err = result.error.expect("failure produces an error message");
         assert!(err.contains("vnode partial write failed"), "got: {err}");
+    }
+
+    /// ADR-003 Phase 3: a vnode whose slices didn't change uploads a
+    /// reference to its last full partial instead of the state bytes,
+    /// and is forced back to full before the base ages out of the
+    /// prune retention window.
+    #[tokio::test]
+    async fn unchanged_vnode_state_becomes_reference_partial() {
+        use laminar_core::state::InProcessBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = CheckpointConfig {
+            max_retained: 2, // reference age cap = 2 epochs
+            ..CheckpointConfig::default()
+        };
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+        let backend = Arc::new(InProcessBackend::new(2));
+        coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+        coord.set_vnode_set(vec![0]);
+
+        let slices = || {
+            let mut ops = std::collections::HashMap::new();
+            ops.insert("agg".to_string(), bytes::Bytes::from_static(b"state-v1"));
+            std::collections::HashMap::from([(0u32, ops)])
+        };
+
+        // Epoch 1: full upload.
+        coord.set_pending_vnode_states(slices());
+        let r1 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r1.success);
+        let p1 = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, r1.epoch).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p1.base_epoch, None, "first upload must be full");
+        assert!(!p1.operators.is_empty());
+
+        // Epoch 2: identical slices → reference to epoch 1.
+        coord.set_pending_vnode_states(slices());
+        let r2 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r2.success);
+        let p2 = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, r2.epoch).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            p2.base_epoch,
+            Some(r1.epoch),
+            "unchanged slice must reference its base"
+        );
+        assert!(p2.operators.is_empty());
+
+        // Epoch 3: still identical, but the base would hit the age cap —
+        // forced back to a full upload (new base).
+        coord.set_pending_vnode_states(slices());
+        let r3 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r3.success);
+        let p3 = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, r3.epoch).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            p3.base_epoch, None,
+            "reference age cap must force a full re-upload",
+        );
+
+        // Changed slices always upload full.
+        let mut changed = std::collections::HashMap::new();
+        let mut ops = std::collections::HashMap::new();
+        ops.insert("agg".to_string(), bytes::Bytes::from_static(b"state-v2"));
+        changed.insert(0u32, ops);
+        coord.set_pending_vnode_states(changed);
+        let r4 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r4.success);
+        let p4 = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, r4.epoch).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p4.base_epoch, None);
+        assert!(!p4.operators.is_empty());
     }
 
     #[test]
