@@ -10,7 +10,7 @@ What the engine does, end to end, from one [`pipeline.toml`](pipeline.toml):
   skew to tune): Binance `btcusdt@trade` and the Bluesky Jetstream.
 - **`ai_sentiment(text) → DOUBLE`** scored inline on a stream by **FinBERT**, a
   finance-tuned BERT running locally (ONNX) on Ring 1 (never blocking the hot
-  path), batched and deduped through the foyer cache, every call in `laminar.ai_calls`.
+  path), batched and deduped through the result cache, every call in `laminar.ai_calls`.
 - **1-minute tumbling windows** on each side (price OHLC-ish; mean sentiment + post count).
 - **An MV-to-MV join** on `bucket_start`, emitting as both minutes close.
 - **A rolling `CORR(price, mean_sentiment)` over 30 buckets**, computed in-engine

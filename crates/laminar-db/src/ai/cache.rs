@@ -7,14 +7,13 @@
 //! permanently for correctness; remote results are cached as a cost-saver. The
 //! cache itself does not distinguish the two — that policy lives in the caller.
 //!
-//! The cache is an in-memory [`foyer::Cache`] with S3-FIFO eviction, the same
-//! crate the lookup and schema-registry caches use. A lookup is a memory op:
-//! cheap enough to gate the inference worker from the operator without doing the
-//! model call inline.
+//! The cache is an in-memory [`quick_cache::sync::Cache`] with S3-FIFO-style
+//! eviction, the same crate the lookup and schema-registry caches use. A lookup
+//! is a memory op: cheap enough to gate the inference worker from the operator
+//! without doing the model call inline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use foyer::{Cache, CacheBuilder};
+use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, Weighter};
 
 use crate::ai::provider::InferenceParams;
 use crate::ai::registry::Task;
@@ -83,53 +82,57 @@ pub struct AiResultCacheConfig {
     /// bounds memory directly — an entry count would not, since an embedding
     /// vector is orders of magnitude larger than a one-word label.
     pub capacity_bytes: usize,
-    /// Number of shards for concurrent access (power of 2).
-    pub shards: usize,
 }
 
 impl Default for AiResultCacheConfig {
     fn default() -> Self {
         Self {
             capacity_bytes: 64 * 1024 * 1024,
-            shards: 16,
         }
     }
 }
 
 /// Weight of one cache entry: its payload bytes plus fixed key/bookkeeping
 /// overhead, so tiny entries still count against the budget.
-fn entry_weight(_key: &AiCacheKey, value: &CachedOutput) -> usize {
-    let payload = match value {
-        CachedOutput::Text(s) => s.len(),
-        CachedOutput::Vector(v) => v.len() * std::mem::size_of::<f32>(),
-        CachedOutput::Score(_) => std::mem::size_of::<f64>(),
-    };
-    payload + std::mem::size_of::<AiCacheKey>() + 32
+#[derive(Debug, Clone)]
+struct OutputWeighter;
+
+impl Weighter<AiCacheKey, CachedOutput> for OutputWeighter {
+    fn weight(&self, _key: &AiCacheKey, value: &CachedOutput) -> u64 {
+        let payload = match value {
+            CachedOutput::Text(s) => s.len(),
+            CachedOutput::Vector(v) => v.len() * std::mem::size_of::<f32>(),
+            CachedOutput::Score(_) => std::mem::size_of::<f64>(),
+        };
+        (payload + std::mem::size_of::<AiCacheKey>() + 32) as u64
+    }
 }
 
-/// foyer-backed in-memory cache of per-row inference results.
+/// `quick_cache`-backed in-memory cache of per-row inference results.
 ///
-/// `foyer::Cache` is internally sharded and lock-free on the read path, so
-/// [`AiResultCache`] is `Send + Sync`.
+/// `quick_cache::sync::Cache` is internally sharded with per-shard locks held
+/// only for the duration of a map operation, so [`AiResultCache`] is
+/// `Send + Sync`.
 pub struct AiResultCache {
-    cache: Cache<AiCacheKey, CachedOutput>,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    cache: Cache<AiCacheKey, CachedOutput, OutputWeighter>,
 }
 
 impl AiResultCache {
     /// Create a cache with the given configuration.
     #[must_use]
     pub fn new(config: AiResultCacheConfig) -> Self {
-        let cache = CacheBuilder::new(config.capacity_bytes)
-            .with_shards(config.shards)
-            .with_weighter(entry_weight)
-            .build();
-        Self {
-            cache,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
+        // Estimated entry count only sizes internal tables; within an order
+        // of magnitude is fine. Assume ~256 B/entry (labels are small,
+        // embeddings large; the byte weighter enforces the real bound).
+        let estimated_items = (config.capacity_bytes / 256).max(64);
+        let cache = Cache::with(
+            estimated_items,
+            config.capacity_bytes as u64,
+            OutputWeighter,
+            DefaultHashBuilder::default(),
+            DefaultLifecycle::default(),
+        );
+        Self { cache }
     }
 
     /// Create a cache with default configuration.
@@ -138,16 +141,10 @@ impl AiResultCache {
         Self::new(AiResultCacheConfig::default())
     }
 
-    /// Look up a cached result, recording a hit or miss.
+    /// Look up a cached result.
     #[must_use]
     pub fn get(&self, key: &AiCacheKey) -> Option<CachedOutput> {
-        if let Some(entry) = self.cache.get(key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.value().clone())
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+        self.cache.get(key)
     }
 
     /// Insert or update a cached result.
@@ -155,22 +152,10 @@ impl AiResultCache {
         self.cache.insert(key, value);
     }
 
-    /// Total cache hits since creation.
-    #[must_use]
-    pub fn hit_count(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-
-    /// Total cache misses since creation.
-    #[must_use]
-    pub fn miss_count(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-
     /// Number of entries currently cached.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cache.entries()
+        self.cache.len()
     }
 
     /// Whether the cache is empty.
@@ -184,8 +169,6 @@ impl std::fmt::Debug for AiResultCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AiResultCache")
             .field("len", &self.len())
-            .field("hits", &self.hit_count())
-            .field("misses", &self.miss_count())
             .finish()
     }
 }
@@ -235,6 +218,5 @@ mod tests {
             cache.get(&remote),
             Some(CachedOutput::Text("negative".into()))
         );
-        assert_eq!(cache.hit_count(), 2);
     }
 }
