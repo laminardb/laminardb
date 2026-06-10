@@ -727,6 +727,77 @@ impl CheckpointCoordinator {
         }
     }
 
+    /// Common abandon path for a failed checkpoint attempt: announce
+    /// `Abort` so prepared followers release immediately, roll the
+    /// epoch's sink transactions back, and begin the next epoch's
+    /// transactions so writes arriving after the failure are not
+    /// orphaned in a rolled-back transaction. Ids were allocated at the
+    /// start of [`checkpoint_inner`](Self::checkpoint_inner), so the
+    /// failed epoch is abandoned, never retried.
+    async fn fail_epoch(
+        &mut self,
+        checkpoint_id: u64,
+        epoch: u64,
+        started: Instant,
+        error: String,
+    ) -> CheckpointResult {
+        #[cfg(feature = "cluster")]
+        self.announce_if_leader(
+            epoch,
+            checkpoint_id,
+            laminar_core::cluster::control::Phase::Abort,
+            None,
+        )
+        .await;
+        self.checkpoints_failed += 1;
+        self.phase = CheckpointPhase::Idle;
+        let duration = started.elapsed();
+        self.emit_checkpoint_metrics(false, epoch, duration);
+        if let Err(e) = self.rollback_sinks(epoch).await {
+            error!(
+                checkpoint_id, epoch, error = %e,
+                "[LDB-6004] sink rollback failed after checkpoint failure",
+            );
+        }
+        self.begin_next_epoch_bounded().await;
+        self.pending_vnode_states.clear();
+        CheckpointResult {
+            success: false,
+            checkpoint_id,
+            epoch,
+            duration,
+            error: Some(error),
+        }
+    }
+
+    /// Begin the (already-allocated) next epoch's sink transactions
+    /// after a failed or partially-committed checkpoint, bounded by
+    /// `rollback_timeout` — the sink that just failed may be wedged,
+    /// and an unbounded `begin_epoch` await would hang the coordinator
+    /// on it.
+    async fn begin_next_epoch_bounded(&self) {
+        let next_epoch = self.epoch;
+        match tokio::time::timeout(
+            self.config.rollback_timeout,
+            self.begin_epoch_for_sinks(next_epoch),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(
+                next_epoch, error = %e,
+                "[LDB-6015] failed to begin next epoch after abandoning a \
+                 failed one — writes will be non-transactional",
+            ),
+            Err(_) => error!(
+                next_epoch,
+                timeout_secs = self.config.rollback_timeout.as_secs(),
+                "[LDB-6015] begin next epoch timed out after a failed \
+                 checkpoint — writes will be non-transactional",
+            ),
+        }
+    }
+
     /// On startup, reconcile any Pending sinks in the last manifest
     /// against the durable commit marker. Marker present → drive
     /// local commit (idempotent); marker absent → rollback. Runs on
@@ -1139,13 +1210,14 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Collects the last committed epoch from each sink.
-    fn collect_sink_epochs(&self) -> HashMap<String, u64> {
+    /// Per-sink epoch map for the manifest: every exactly-once sink is
+    /// committing `epoch` (passed in — `self.epoch` already points at
+    /// the next epoch once a checkpoint is underway).
+    fn collect_sink_epochs(&self, epoch: u64) -> HashMap<String, u64> {
         let mut epochs = HashMap::with_capacity(self.sinks.len());
         for sink in &self.sinks {
-            // The epoch being committed is the current one
             if sink.exactly_once {
-                epochs.insert(sink.name.clone(), self.epoch);
+                epochs.insert(sink.name.clone(), epoch);
             }
         }
         epochs
@@ -1435,7 +1507,7 @@ impl CheckpointCoordinator {
         let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
         manifest.source_offsets = source_offset_overrides;
         manifest.table_offsets = extra_table_offsets;
-        manifest.sink_epochs = self.collect_sink_epochs();
+        manifest.sink_epochs = self.collect_sink_epochs(epoch);
         manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
         manifest.watermark = watermark;
         manifest.source_watermarks = source_watermarks;
@@ -1489,6 +1561,14 @@ impl CheckpointCoordinator {
         let start = Instant::now();
         let checkpoint_id = self.next_checkpoint_id;
         let epoch = self.epoch;
+        // Allocate ids up front (Flink-style): a failed attempt is
+        // abandoned — never retried under the same ids — so a future
+        // epoch's identity never depends on this one's outcome. That
+        // independence is what allows epochs to overlap (ADR-003
+        // Phase 2); it also removes the same-epoch-retry ambiguity the
+        // announcement `seq` otherwise has to disambiguate.
+        self.next_checkpoint_id += 1;
+        self.epoch += 1;
 
         info!(checkpoint_id, epoch, "starting checkpoint");
 
@@ -1508,29 +1588,10 @@ impl CheckpointCoordinator {
         #[cfg(feature = "cluster")]
         {
             if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
-                self.phase = CheckpointPhase::Idle;
-                self.checkpoints_failed += 1;
-                let duration = start.elapsed();
-                self.emit_checkpoint_metrics(false, epoch, duration);
-                // Idempotent: this epoch's sinks have not pre-committed yet,
-                // but rollback also closes any transaction opened by
-                // `begin_epoch_for_sinks` after the previous checkpoint.
-                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                    error!(
-                        checkpoint_id,
-                        epoch,
-                        error = %rollback_err,
-                        "[LDB-6032] sink rollback failed after quorum miss",
-                    );
-                }
-                self.pending_vnode_states.clear();
-                return Ok(CheckpointResult {
-                    success: false,
-                    checkpoint_id,
-                    epoch,
-                    duration,
-                    error: Some(quorum_failure),
-                });
+                error!(checkpoint_id, epoch, error = %quorum_failure, "[LDB-6032] quorum miss");
+                return Ok(self
+                    .fail_epoch(checkpoint_id, epoch, start, quorum_failure)
+                    .await);
             }
             self.announce_if_leader(
                 epoch,
@@ -1543,36 +1604,21 @@ impl CheckpointCoordinator {
 
         self.phase = CheckpointPhase::PreCommitting;
         if let Err(e) = self.pre_commit_sinks(epoch).await {
-            self.phase = CheckpointPhase::Idle;
-            self.checkpoints_failed += 1;
-            // Roll back unconditionally — `rollback_epoch` is idempotent.
-            // Without this, a poisoned epoch leaves Kafka transactions
-            // open until the broker-side transaction.timeout.ms fires.
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
+            error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
+            return Ok(self
+                .fail_epoch(
                     checkpoint_id,
                     epoch,
-                    error = %rollback_err,
-                    "[LDB-6004] sink rollback failed after pre-commit failure"
-                );
-            }
-            let duration = start.elapsed();
-            self.emit_checkpoint_metrics(false, epoch, duration);
-            error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
-            self.pending_vnode_states.clear();
-            return Ok(CheckpointResult {
-                success: false,
-                checkpoint_id,
-                epoch,
-                duration,
-                error: Some(format!("pre-commit failed: {e}")),
-            });
+                    start,
+                    format!("pre-commit failed: {e}"),
+                )
+                .await);
         }
 
         let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
         manifest.source_offsets = source_offsets;
         manifest.table_offsets = table_offsets;
-        manifest.sink_epochs = self.collect_sink_epochs();
+        manifest.sink_epochs = self.collect_sink_epochs(epoch);
         // Mark all exactly-once sinks as Pending before commit phase.
         manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
         manifest.watermark = watermark;
@@ -1607,23 +1653,15 @@ impl CheckpointCoordinator {
 
         if let Some(cap) = self.config.max_checkpoint_bytes {
             if sidecar_bytes > cap {
-                self.phase = CheckpointPhase::Idle;
-                self.checkpoints_failed += 1;
-                let duration = start.elapsed();
-                self.emit_checkpoint_metrics(false, epoch, duration);
                 let msg = format!(
                     "[LDB-6014] checkpoint size {sidecar_bytes} bytes exceeds \
                      cap {cap} bytes — checkpoint rejected"
                 );
                 error!(checkpoint_id, epoch, sidecar_bytes, cap, "{msg}");
-                self.pending_vnode_states.clear();
-                return Ok(CheckpointResult {
-                    success: false,
-                    checkpoint_id,
-                    epoch,
-                    duration,
-                    error: Some(msg),
-                });
+                // `fail_epoch` also rolls the pre-committed sinks back —
+                // previously this path returned without a rollback,
+                // leaving the epoch's transactions open.
+                return Ok(self.fail_epoch(checkpoint_id, epoch, start, msg).await);
             }
             let warn_threshold = cap * 4 / 5; // 80%
             if sidecar_bytes > warn_threshold {
@@ -1642,55 +1680,30 @@ impl CheckpointCoordinator {
         // free mutable reference for the post-commit sink-status update.
         let mut manifest = Arc::new(manifest);
         if let Err(e) = self.save_manifest(Arc::clone(&manifest), state_data).await {
-            self.phase = CheckpointPhase::Idle;
-            self.checkpoints_failed += 1;
-            let duration = start.elapsed();
-            self.emit_checkpoint_metrics(false, epoch, duration);
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
+            error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
+            return Ok(self
+                .fail_epoch(
                     checkpoint_id,
                     epoch,
-                    error = %rollback_err,
-                    "[LDB-6004] sink rollback failed after manifest persist failure — \
-                     sinks may be in an inconsistent state"
-                );
-            }
-            error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
-            self.pending_vnode_states.clear();
-            return Ok(CheckpointResult {
-                success: false,
-                checkpoint_id,
-                epoch,
-                duration,
-                error: Some(format!("manifest persist failed: {e}")),
-            });
+                    start,
+                    format!("manifest persist failed: {e}"),
+                )
+                .await);
         }
 
         // Publish each owned vnode's partial (operator-state slice + commit
         // marker in one blob) so the durability gate below has something to
         // check and a future owner can rehydrate the vnode's state.
         if let Err(e) = self.write_vnode_partials(epoch, checkpoint_id).await {
-            self.phase = CheckpointPhase::Idle;
-            self.checkpoints_failed += 1;
-            let duration = start.elapsed();
-            self.emit_checkpoint_metrics(false, epoch, duration);
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
+            error!(checkpoint_id, epoch, error = %e, "[LDB-6025] vnode partial write failed");
+            return Ok(self
+                .fail_epoch(
                     checkpoint_id,
                     epoch,
-                    error = %rollback_err,
-                    "[LDB-6025] sink rollback failed after marker write failure",
-                );
-            }
-            error!(checkpoint_id, epoch, error = %e, "vnode partial write failed");
-            self.pending_vnode_states.clear();
-            return Ok(CheckpointResult {
-                success: false,
-                checkpoint_id,
-                epoch,
-                duration,
-                error: Some(format!("vnode partial write failed: {e}")),
-            });
+                    start,
+                    format!("vnode partial write failed: {e}"),
+                )
+                .await);
         }
 
         // Durability gate (level 2, "restorable"): confirm every
@@ -1709,34 +1722,7 @@ impl CheckpointCoordinator {
                 error = %gate_err,
                 "[LDB-6020] state durability gate failed — rolling back sinks",
             );
-            #[cfg(feature = "cluster")]
-            self.announce_if_leader(
-                epoch,
-                checkpoint_id,
-                laminar_core::cluster::control::Phase::Abort,
-                None,
-            )
-            .await;
-            self.checkpoints_failed += 1;
-            self.phase = CheckpointPhase::Idle;
-            let duration = start.elapsed();
-            self.emit_checkpoint_metrics(false, epoch, duration);
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
-                    checkpoint_id,
-                    epoch,
-                    error = %rollback_err,
-                    "[LDB-6021] sink rollback failed after durability gate miss",
-                );
-            }
-            self.pending_vnode_states.clear();
-            return Ok(CheckpointResult {
-                success: false,
-                checkpoint_id,
-                epoch,
-                duration,
-                error: Some(gate_err),
-            });
+            return Ok(self.fail_epoch(checkpoint_id, epoch, start, gate_err).await);
         }
 
         // Record the commit marker before issuing sink commits — this
@@ -1758,37 +1744,13 @@ impl CheckpointCoordinator {
         if is_decision_leader {
             if let Some(ds) = self.decision_store.as_ref() {
                 if let Err(e) = ds.record_committed(epoch).await {
-                    let reason = e.to_string();
                     error!(
-                        checkpoint_id, epoch, error = %reason,
+                        checkpoint_id, epoch, error = %e,
                         "[LDB-6038] cannot record commit marker — aborting epoch",
                     );
-                    #[cfg(feature = "cluster")]
-                    self.announce_if_leader(
-                        epoch,
-                        checkpoint_id,
-                        laminar_core::cluster::control::Phase::Abort,
-                        None,
-                    )
-                    .await;
-                    self.checkpoints_failed += 1;
-                    self.phase = CheckpointPhase::Idle;
-                    let duration = start.elapsed();
-                    self.emit_checkpoint_metrics(false, epoch, duration);
-                    if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                        error!(
-                            checkpoint_id, epoch, error = %rollback_err,
-                            "[LDB-6039] sink rollback failed after commit marker failure",
-                        );
-                    }
-                    self.pending_vnode_states.clear();
-                    return Ok(CheckpointResult {
-                        success: false,
-                        checkpoint_id,
-                        epoch,
-                        duration,
-                        error: Some(format!("commit marker: {reason}")),
-                    });
+                    return Ok(self
+                        .fail_epoch(checkpoint_id, epoch, start, format!("commit marker: {e}"))
+                        .await);
                 }
             }
         }
@@ -1827,14 +1789,22 @@ impl CheckpointCoordinator {
         }
 
         if has_failures {
+            // The commit decision is already durable (marker + Commit
+            // announcement), so the epoch is NOT rolled back: the failed
+            // sinks' statuses are recorded in the manifest and re-driven
+            // by `reconcile_prepared_on_init` on restart. Begin the next
+            // epoch so subsequent writes stay transactional.
             self.checkpoints_failed += 1;
             error!(
                 checkpoint_id,
-                epoch, "sink commit partially failed — epoch NOT advanced, will retry"
+                epoch,
+                "sink commit partially failed after the commit decision — \
+                 statuses recorded for recovery-time re-drive"
             );
             self.phase = CheckpointPhase::Idle;
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
+            self.begin_next_epoch_bounded().await;
             self.pending_vnode_states.clear();
             return Ok(CheckpointResult {
                 success: false,
@@ -1846,8 +1816,6 @@ impl CheckpointCoordinator {
         }
 
         self.phase = CheckpointPhase::Idle;
-        self.next_checkpoint_id += 1;
-        self.epoch += 1;
         self.checkpoints_completed += 1;
         self.total_bytes_written += checkpoint_bytes;
         let duration = start.elapsed();
@@ -3252,6 +3220,43 @@ mod tests {
         );
         let err = result.error.expect("failure produces an error message");
         assert!(err.contains("vnode partial write failed"), "got: {err}");
+    }
+
+    /// Ids are allocated at the start of an attempt: a failed epoch is
+    /// abandoned (Flink-style), never retried under the same ids.
+    #[tokio::test]
+    async fn failed_epoch_is_abandoned_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CheckpointConfig {
+            max_checkpoint_bytes: Some(16),
+            ..CheckpointConfig::default()
+        };
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+
+        // Oversized state → size-cap rejection.
+        let mut ops = HashMap::new();
+        ops.insert("big".to_string(), bytes::Bytes::from(vec![0u8; 2_000_000]));
+        let failed = coord
+            .checkpoint(CheckpointRequest {
+                operator_states: ops,
+                ..CheckpointRequest::default()
+            })
+            .await
+            .unwrap();
+        assert!(!failed.success);
+
+        let ok = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(ok.success);
+        assert_eq!(
+            ok.epoch,
+            failed.epoch + 1,
+            "the failed epoch must be abandoned, not reused",
+        );
+        assert_eq!(ok.checkpoint_id, failed.checkpoint_id + 1);
     }
 
     #[tokio::test]
