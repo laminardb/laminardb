@@ -6,11 +6,13 @@
 /// Canonical JSONB binary format type tag constants.
 pub mod jsonb_tags;
 
+use std::sync::Arc;
+
 use arrow::buffer::Buffer;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::{StreamDecoder, StreamReader};
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{ArrowError, Schema};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 
 /// Serializes a single [`RecordBatch`] to Arrow IPC stream bytes.
 ///
@@ -44,6 +46,7 @@ pub fn deserialize_batch_stream(bytes: &[u8]) -> Result<RecordBatch, arrow_schem
 /// per-call blobs in order yields one IPC stream for [`BatchStreamDecoder`].
 pub struct BatchStreamEncoder {
     writer: StreamWriter<Vec<u8>>,
+    schema: SchemaRef,
 }
 
 impl BatchStreamEncoder {
@@ -54,7 +57,14 @@ impl BatchStreamEncoder {
     pub fn new(schema: &Schema) -> Result<Self, ArrowError> {
         Ok(Self {
             writer: StreamWriter::try_new(Vec::new(), schema)?,
+            schema: Arc::new(schema.clone()),
         })
+    }
+
+    /// Schema this encoder was created with; every encoded batch must match it.
+    #[must_use]
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     /// Encode one batch, returning the bytes written since the last call (the

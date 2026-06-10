@@ -16,6 +16,9 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload}
 
 use super::backend::{StateBackend, StateBackendError};
 
+/// Every Nth prune does a full listing instead of the incremental window.
+const PRUNE_FULL_SCAN_EVERY: u64 = 32;
+
 /// Object-store-backed [`StateBackend`].
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
@@ -25,6 +28,14 @@ pub struct ObjectStoreBackend {
     /// every commit attempt.
     committer_bytes: Bytes,
     vnode_capacity: u32,
+    /// Highest prune horizon already covered cleanly: later prunes list only
+    /// `epoch={N}/` prefixes in `[latest_pruned_epoch, before)` instead of the
+    /// whole store. `0` = no baseline yet; the first prune does one full
+    /// listing, then bounds every subsequent one.
+    latest_pruned_epoch: AtomicU64,
+    /// Prune-call counter driving the periodic full-scan re-baseline, which
+    /// bounds how long a straggler write below the cursor can leak.
+    prune_passes: AtomicU64,
     /// Authoritative vnode-assignment version known to this backend.
     /// Split-brain fence: [`write_partial`](Self::write_partial) rejects
     /// any caller whose `assignment_version` is strictly less than this
@@ -60,6 +71,8 @@ impl ObjectStoreBackend {
             instance_id,
             committer_bytes,
             vnode_capacity,
+            latest_pruned_epoch: AtomicU64::new(0),
+            prune_passes: AtomicU64::new(0),
             authoritative_version: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -212,34 +225,68 @@ impl StateBackend for ObjectStoreBackend {
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
-        use tokio_stream::StreamExt;
+        use futures::stream::{self, StreamExt};
 
-        // NOTE: We list the entire store (None prefix) because epochs are stored as
-        // `epoch={epoch}/...` where the first segment is dynamic. The `object_store` API
-        // enforces segment-based prefix matching, so a prefix like `"epoch="` would match
-        // nothing (it requires an exact match on the segment, e.g., `"epoch=1"`).
-        let mut entries = self.store.list(None);
+        let pass = self.prune_passes.fetch_add(1, Ordering::AcqRel);
+        let start = if pass.is_multiple_of(PRUNE_FULL_SCAN_EVERY) {
+            0
+        } else {
+            self.latest_pruned_epoch.load(Ordering::Acquire)
+        };
+
         let mut victims: Vec<OsPath> = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
-            // Only `epoch=N/...` entries with N < before are candidates.
-            let Some(epoch) = Self::epoch_of_first_segment(entry.location.as_ref()) else {
-                continue;
-            };
-            if epoch < before {
-                victims.push(entry.location);
+        if start == 0 {
+            // No baseline yet: one full listing. `epoch={epoch}/...` has a
+            // dynamic first segment and the `object_store` API matches whole
+            // segments, so a bare `epoch=` prefix would match nothing.
+            let mut entries = self.store.list(None);
+            while let Some(entry) = entries.next().await {
+                let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
+                let Some(epoch) = Self::epoch_of_first_segment(entry.location.as_ref()) else {
+                    continue;
+                };
+                if epoch < before {
+                    victims.push(entry.location);
+                }
+            }
+        } else {
+            // Only epochs in `[start, before)` can still hold objects, and
+            // `epoch={N}/` is an exact segment, so per-epoch listings cost
+            // O(epochs-since-last-prune × vnodes) instead of O(store).
+            for epoch in start..before {
+                let prefix = OsPath::from(format!("epoch={epoch}/"));
+                let mut entries = self.store.list(Some(&prefix));
+                while let Some(entry) = entries.next().await {
+                    let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
+                    victims.push(entry.location);
+                }
             }
         }
 
-        // Cold path: sequential deletes keep the implementation free of
-        // a `futures::stream` dep. For cluster deployments with many
-        // stale epochs, the prune horizon still advances one checkpoint
-        // at a time so each call deletes O(vnodes) objects.
-        for victim in victims {
-            match self.store.delete(&victim).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => tracing::warn!(error = %e, "state backend prune: delete failed"),
+        // `delete_stream` coalesces into bulk-delete API calls where the store
+        // supports them (S3 `DeleteObjects`); a missing object is a no-op.
+        let mut delete_failed = false;
+        if !victims.is_empty() {
+            let locations =
+                stream::iter(victims.into_iter().map(Ok::<OsPath, object_store::Error>)).boxed();
+            let mut deletes = self.store.delete_stream(locations);
+            while let Some(res) = deletes.next().await {
+                match res {
+                    Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => {
+                        delete_failed = true;
+                        tracing::warn!(error = %e, "state backend prune: delete failed");
+                    }
+                }
             }
+        }
+
+        // Advance the cursor only on a clean pass: a failed delete must stay
+        // above it so the next prune re-lists that epoch and retries, instead
+        // of orphaning the object until a process restart. `fetch_max` keeps
+        // the cursor monotonic under concurrent prunes.
+        if !delete_failed {
+            self.latest_pruned_epoch.fetch_max(before, Ordering::AcqRel);
         }
         Ok(())
     }
@@ -557,5 +604,89 @@ mod tests {
                 "epoch {epoch} should be retained",
             );
         }
+    }
+
+    /// The horizon cursor must advance so the second prune takes the
+    /// bounded `[latest_pruned_epoch, before)` window (hot path) rather
+    /// than re-listing the whole store, while still deleting exactly the
+    /// epochs below the new horizon.
+    #[tokio::test]
+    async fn prune_before_is_incremental_and_advances_horizon() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        // Seed epochs 1..=6, two vnodes each so deletes touch >1 object.
+        for epoch in 1..=6u64 {
+            for v in 0..2u32 {
+                backend
+                    .write_partial(v, epoch, 0, Bytes::from_static(b"x"))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // First prune: cold path (cursor still at the `0` sentinel) — one
+        // full scan, drops epochs 1..=2, then advances the cursor to 3.
+        backend.prune_before(3).await.unwrap();
+        assert_eq!(backend.latest_pruned_epoch.load(Ordering::Relaxed), 3);
+
+        // Second prune: hot path now (cursor == 3), only walks epochs
+        // [3, 5) yet must still leave the store as if a full scan ran.
+        backend.prune_before(5).await.unwrap();
+        assert_eq!(backend.latest_pruned_epoch.load(Ordering::Relaxed), 5);
+
+        for epoch in 1..=4u64 {
+            for v in 0..2u32 {
+                assert!(
+                    backend.read_partial(v, epoch).await.unwrap().is_none(),
+                    "epoch {epoch} vnode {v} should be pruned",
+                );
+            }
+        }
+        for epoch in 5..=6u64 {
+            for v in 0..2u32 {
+                assert!(
+                    backend.read_partial(v, epoch).await.unwrap().is_some(),
+                    "epoch {epoch} vnode {v} should be retained",
+                );
+            }
+        }
+
+        // Idempotent re-prune at the same horizon is a no-op.
+        backend.prune_before(5).await.unwrap();
+        assert_eq!(backend.latest_pruned_epoch.load(Ordering::Relaxed), 5);
+        assert!(backend.read_partial(0, 5).await.unwrap().is_some());
+    }
+
+    /// A straggler write below the cursor is invisible to incremental prunes;
+    /// the periodic full-scan re-baseline must reclaim it.
+    #[tokio::test]
+    async fn periodic_full_scan_reclaims_late_write_below_cursor() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        backend
+            .write_partial(0, 1, 0, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        backend.prune_before(3).await.unwrap();
+        assert!(backend.read_partial(0, 1).await.unwrap().is_none());
+
+        // Straggler lands in an epoch the cursor has already passed.
+        backend
+            .write_partial(0, 1, 0, Bytes::from_static(b"late"))
+            .await
+            .unwrap();
+        backend.prune_before(3).await.unwrap();
+        assert!(
+            backend.read_partial(0, 1).await.unwrap().is_some(),
+            "incremental prune cannot see below the cursor",
+        );
+
+        // Drive past the re-baseline pass; the full scan reclaims it.
+        for _ in 0..PRUNE_FULL_SCAN_EVERY {
+            backend.prune_before(3).await.unwrap();
+        }
+        assert!(backend.read_partial(0, 1).await.unwrap().is_none());
     }
 }

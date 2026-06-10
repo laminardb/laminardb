@@ -119,3 +119,8 @@ harness = false
 [[bench]]
 name = "lookup_join_bench"
 harness = false
+
+[[bench]]
+name = "shuffle_bench"
+harness = false
+required-features = ["cluster"]
