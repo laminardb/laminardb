@@ -5,6 +5,9 @@ replicaCount: 1
 # -- Immutable on a live StatefulSet (delete with --cascade=orphan to change).
 podManagementPolicy: Parallel
 
+# -- Kubernetes cluster DNS domain, used to build per-pod discovery addresses.
+clusterDomain: cluster.local
+
 image:
   # -- Docker image repository
   repository: laminardb/laminardb-server

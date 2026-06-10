@@ -53,7 +53,7 @@ data:
     [discovery]
     {{- $discovery := $cluster.discovery | default dict }}
     {{- $gossipPort := $discovery.gossipPort | default 7946 }}
-    {{- $podDomain := printf "%s.%s.svc.cluster.local" (include "laminardb.headlessServiceName" .) .Release.Namespace }}
+    {{- $podDomain := printf "%s.%s.svc.%s" (include "laminardb.headlessServiceName" .) .Release.Namespace (.Values.clusterDomain | default "cluster.local") }}
     strategy = "{{ $discovery.strategy | default "gossip" }}"
     gossip_port = {{ $gossipPort }}
     # Peers must reach this node by its per-pod headless-service DNS name; the

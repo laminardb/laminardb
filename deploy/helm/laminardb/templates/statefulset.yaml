@@ -10,7 +10,7 @@ spec:
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   serviceName: {{ include "laminardb.headlessServiceName" . }}
-  podManagementPolicy: {{ .Values.podManagementPolicy | default "OrderedReady" }}
+  podManagementPolicy: {{ .Values.podManagementPolicy | default "Parallel" }}
   selector:
     matchLabels:
       {{- include "laminardb.selectorLabels" . | nindent 6 }}
