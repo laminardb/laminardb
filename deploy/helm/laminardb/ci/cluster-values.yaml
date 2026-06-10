@@ -5,7 +5,7 @@ laminardb:
   logLevel: info
   cluster:
     discovery:
-      strategy: dns
+      strategy: gossip
       gossipPort: 7946
     coordination:
       strategy: raft

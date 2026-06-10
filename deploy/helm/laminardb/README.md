@@ -53,8 +53,10 @@ laminardb:
     
   cluster:
     discovery:
-      strategy: dns    # Headless service DNS discovery (recommended for K8s)
+      strategy: gossip
       gossipPort: 7946
+      # seeds are generated from replicaCount (per-pod headless DNS names);
+      # set `seeds` explicitly only for non-standard topologies
     coordination:
       strategy: raft
       raftPort: 7947
