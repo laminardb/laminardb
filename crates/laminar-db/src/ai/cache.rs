@@ -7,14 +7,15 @@
 //! permanently for correctness; remote results are cached as a cost-saver. The
 //! cache itself does not distinguish the two — that policy lives in the caller.
 //!
-//! The cache is an in-memory [`foyer::Cache`] with S3-FIFO eviction, the same
-//! crate the lookup and schema-registry caches use. A lookup is a memory op:
-//! cheap enough to gate the inference worker from the operator without doing the
-//! model call inline.
+//! The cache is an in-memory [`quick_cache::sync::Cache`] with S3-FIFO-style
+//! eviction, the same crate the lookup and schema-registry caches use. A lookup
+//! is a memory op: cheap enough to gate the inference worker from the operator
+//! without doing the model call inline.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use foyer::{Cache, CacheBuilder};
+use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 
 use crate::ai::provider::InferenceParams;
 use crate::ai::registry::Task;
@@ -98,33 +99,56 @@ impl Default for AiResultCacheConfig {
 
 /// Weight of one cache entry: its payload bytes plus fixed key/bookkeeping
 /// overhead, so tiny entries still count against the budget.
-fn entry_weight(_key: &AiCacheKey, value: &CachedOutput) -> usize {
-    let payload = match value {
-        CachedOutput::Text(s) => s.len(),
-        CachedOutput::Vector(v) => v.len() * std::mem::size_of::<f32>(),
-        CachedOutput::Score(_) => std::mem::size_of::<f64>(),
-    };
-    payload + std::mem::size_of::<AiCacheKey>() + 32
+#[derive(Debug, Clone)]
+struct OutputWeighter;
+
+impl Weighter<AiCacheKey, CachedOutput> for OutputWeighter {
+    fn weight(&self, _key: &AiCacheKey, value: &CachedOutput) -> u64 {
+        let payload = match value {
+            CachedOutput::Text(s) => s.len(),
+            CachedOutput::Vector(v) => v.len() * std::mem::size_of::<f32>(),
+            CachedOutput::Score(_) => std::mem::size_of::<f64>(),
+        };
+        (payload + std::mem::size_of::<AiCacheKey>() + 32) as u64
+    }
 }
 
-/// foyer-backed in-memory cache of per-row inference results.
+/// `quick_cache`-backed in-memory cache of per-row inference results.
 ///
-/// `foyer::Cache` is internally sharded and lock-free on the read path, so
-/// [`AiResultCache`] is `Send + Sync`.
+/// `quick_cache::sync::Cache` is internally sharded with per-shard locks held
+/// only for the duration of a map operation, so [`AiResultCache`] is
+/// `Send + Sync`.
 pub struct AiResultCache {
-    cache: Cache<AiCacheKey, CachedOutput>,
+    cache: Cache<AiCacheKey, CachedOutput, OutputWeighter>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
 impl AiResultCache {
     /// Create a cache with the given configuration.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the options builder only errors when a capacity
+    /// field is left unset, and both are always set here.
     #[must_use]
     pub fn new(config: AiResultCacheConfig) -> Self {
-        let cache = CacheBuilder::new(config.capacity_bytes)
-            .with_shards(config.shards)
-            .with_weighter(entry_weight)
-            .build();
+        // Estimated entry count only sizes internal tables; within an order
+        // of magnitude is fine. Assume ~256 B/entry (labels are small,
+        // embeddings large; the byte weighter enforces the real bound).
+        let estimated_items = (config.capacity_bytes / 256).max(64);
+        let options = OptionsBuilder::new()
+            .shards(config.shards)
+            .estimated_items_capacity(estimated_items)
+            .weight_capacity(config.capacity_bytes as u64)
+            .build()
+            .expect("both capacities are set");
+        let cache = Cache::with_options(
+            options,
+            OutputWeighter,
+            DefaultHashBuilder::default(),
+            DefaultLifecycle::default(),
+        );
         Self {
             cache,
             hits: AtomicU64::new(0),
@@ -141,9 +165,9 @@ impl AiResultCache {
     /// Look up a cached result, recording a hit or miss.
     #[must_use]
     pub fn get(&self, key: &AiCacheKey) -> Option<CachedOutput> {
-        if let Some(entry) = self.cache.get(key) {
+        if let Some(value) = self.cache.get(key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.value().clone())
+            Some(value)
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
@@ -170,7 +194,7 @@ impl AiResultCache {
     /// Number of entries currently cached.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cache.entries()
+        self.cache.len()
     }
 
     /// Whether the cache is empty.

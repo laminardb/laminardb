@@ -1727,7 +1727,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 }
 
-/// Update a partial foyer cache from a CDC batch by inserting or deleting
+/// Update a partial lookup cache from a CDC batch by inserting or deleting
 /// each row keyed by the primary key column(s).
 ///
 /// CDC delete detection: if the batch has a column named `__op`, `__operation`,
@@ -1788,10 +1788,10 @@ fn update_partial_cache_from_batch(
         });
 
         if is_delete {
-            partial.foyer_cache.invalidate(key.as_ref());
+            partial.lookup_cache.invalidate(key.as_ref());
         } else {
             let row_batch = batch.slice(row, 1);
-            partial.foyer_cache.insert(key.as_ref(), row_batch);
+            partial.lookup_cache.insert(key.as_ref(), row_batch);
         }
     }
 }

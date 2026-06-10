@@ -55,7 +55,7 @@ pub(crate) struct TableRegistration {
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
     pub refresh: Option<RefreshMode>,
-    /// Byte budget for the on-demand lookup `FoyerMemoryCache` (partial mode).
+    /// Byte budget for the on-demand lookup `LookupMemoryCache` (partial mode).
     /// `None` falls back to the cache's default.
     pub cache_max_bytes: Option<usize>,
     /// Time-to-live for on-demand lookup cache entries (partial mode). After

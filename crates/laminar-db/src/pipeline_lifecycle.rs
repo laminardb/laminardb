@@ -1152,7 +1152,7 @@ impl LaminarDB {
         }
 
         // On-demand (Manual) tables: register as Partial in the lookup
-        // registry so lookup joins use the foyer cache + source fallback path,
+        // registry so lookup joins use the lookup cache + source fallback path,
         // then promote to SnapshotPlusCdc so poll_tables() calls poll_changes().
         for (name, _source, mode) in &mut table_sources {
             if !matches!(mode, RefreshMode::Manual) {
@@ -1182,9 +1182,9 @@ impl LaminarDB {
                 })
                 .collect();
 
-            let cache = Arc::new(laminar_core::lookup::foyer_cache::FoyerMemoryCache::new(
+            let cache = Arc::new(laminar_core::lookup::lookup_cache::LookupMemoryCache::new(
                 0,
-                laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig {
+                laminar_core::lookup::lookup_cache::LookupMemoryCacheConfig {
                     capacity_bytes,
                     shards: 16,
                     ttl: reg.cache_ttl,
@@ -1225,7 +1225,7 @@ impl LaminarDB {
             self.lookup_registry.register_partial(
                 name,
                 laminar_sql::datafusion::PartialLookupState {
-                    foyer_cache: cache,
+                    lookup_cache: cache,
                     schema,
                     key_columns: pk_cols,
                     key_sort_fields,

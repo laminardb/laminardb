@@ -23,7 +23,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use laminar_core::lookup::foyer_cache::FoyerMemoryCache;
+use laminar_core::lookup::lookup_cache::LookupMemoryCache;
 use laminar_core::lookup::source::{ColumnId, LookupSourceDyn};
 use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stream};
 use laminar_sql::datafusion::lookup_join::LookupJoinType;
@@ -127,7 +127,7 @@ struct PendingBatch {
 /// Registry-resolved state, materialised on the first `process` (the
 /// `PartialLookupState` is only registered at pipeline start).
 struct Resolved {
-    cache: Arc<FoyerMemoryCache>,
+    cache: Arc<LookupMemoryCache>,
     converter: RowConverter,
     key_indices: Vec<usize>,
     /// `(lookup key column, expected type)` per key, used to fail fast with a
@@ -249,7 +249,7 @@ impl LookupEnrichOperator {
             )));
         };
         let PartialLookupState {
-            foyer_cache,
+            lookup_cache,
             schema,
             key_columns,
             key_sort_fields,
@@ -299,7 +299,7 @@ impl LookupEnrichOperator {
         };
 
         self.resolved = Some(Resolved {
-            cache: Arc::clone(foyer_cache),
+            cache: Arc::clone(lookup_cache),
             converter,
             key_indices: Vec::new(),
             key_checks,
@@ -922,7 +922,7 @@ mod tests {
         registry.register_partial(
             "customers",
             PartialLookupState {
-                foyer_cache: Arc::new(FoyerMemoryCache::with_defaults(0)),
+                lookup_cache: Arc::new(LookupMemoryCache::with_defaults(0)),
                 schema: lookup_schema(),
                 key_columns: vec!["id".into()],
                 key_sort_fields: vec![SortField::new(DataType::Int64)],
@@ -1072,7 +1072,7 @@ mod tests {
         registry.register_partial(
             "customers",
             PartialLookupState {
-                foyer_cache: Arc::new(FoyerMemoryCache::with_defaults(0)),
+                lookup_cache: Arc::new(LookupMemoryCache::with_defaults(0)),
                 schema: lookup_schema(), // id, name
                 key_columns: vec!["id".into()],
                 key_sort_fields: vec![SortField::new(DataType::Int64)],
@@ -1150,7 +1150,7 @@ mod tests {
         lookups.register_partial(
             "customers",
             PartialLookupState {
-                foyer_cache: Arc::new(FoyerMemoryCache::with_defaults(0)),
+                lookup_cache: Arc::new(LookupMemoryCache::with_defaults(0)),
                 schema: lookup_schema(),
                 key_columns: vec!["id".into()],
                 key_sort_fields: vec![SortField::new(DataType::Int64)],

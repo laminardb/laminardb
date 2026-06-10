@@ -1379,7 +1379,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">cache.hybrid</td>
             <td class="field-type">bool</td>
             <td class="field-default">false</td>
-            <td>Enable memory + disk caching via foyer</td>
+            <td>Enable in-memory caching via quick_cache</td>
           </tr>
         </tbody>
       </table>
@@ -2025,7 +2025,7 @@ LEFT JOIN products p
       </div>
 
       <p style="font-size: 0.82rem;">
-        <strong>Cache:</strong> Foyer-backed memory/hybrid cache. Configure via
+        <strong>Cache:</strong> quick_cache-backed in-memory cache. Configure via
         <code>[[lookup]]</code> section: <code>cache.size_bytes</code>,
         <code>cache.ttl</code>, <code>cache.hybrid</code>.
         Supports predicate pushdown to the lookup connector.
