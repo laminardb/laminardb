@@ -378,8 +378,6 @@ impl ConnectorPipelineCallback {
     async fn force_capture_and_checkpoint(
         &mut self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
-        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-
         self.sync_sinks_and_drain_events().await;
 
         #[cfg(feature = "cluster")]
@@ -389,32 +387,7 @@ impl ConnectorPipelineCallback {
             .capture_and_serialize_operator_state()
             .await
             .map_err(DbError::Checkpoint)?;
-
-        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
-        for (name, source, _) in &self.table_sources {
-            extra_tables.insert(
-                name.clone(),
-                source_to_connector_checkpoint(&source.checkpoint()),
-            );
-        }
-
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
-            if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
-            }
-        }
-
-        let request = crate::checkpoint_coordinator::CheckpointRequest {
-            operator_states,
-            watermark: None,
-            table_store_checkpoint_path: None,
-            extra_table_offsets: extra_tables,
-            source_watermarks: per_source_watermarks,
-            pipeline_hash: self.pipeline_hash,
-            source_offset_overrides: HashMap::new(),
-        };
+        let request = self.build_checkpoint_request(operator_states, &FxHashMap::default());
 
         let vnode_states = self.capture_vnode_states();
         let mut guard = self.coordinator.lock().await;
@@ -582,7 +555,6 @@ impl ConnectorPipelineCallback {
         controller: Arc<laminar_core::cluster::control::ClusterController>,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64> {
-        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use laminar_core::cluster::control::Phase;
 
         let ann = match controller.observe_barrier().await {
@@ -637,33 +609,8 @@ impl ConnectorPipelineCallback {
             }
         }
 
-        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
-        for (name, source, _) in &self.table_sources {
-            extra_tables.insert(
-                name.clone(),
-                source_to_connector_checkpoint(&source.checkpoint()),
-            );
-        }
-        let source_overrides: HashMap<String, _> = source_offsets
-            .iter()
-            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
-            .collect();
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
-            if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
-            }
-        }
-        let request = crate::checkpoint_coordinator::CheckpointRequest {
-            operator_states: std::collections::HashMap::new(),
-            watermark: None,
-            table_store_checkpoint_path: None,
-            extra_table_offsets: extra_tables,
-            source_watermarks: per_source_watermarks,
-            pipeline_hash: self.pipeline_hash,
-            source_offset_overrides: source_overrides,
-        };
+        let request =
+            self.build_checkpoint_request(std::collections::HashMap::new(), &source_offsets);
 
         // Durable tail off the pipeline task; resume once every node has
         // captured (Aligned). Completion is reported asynchronously via
@@ -686,7 +633,6 @@ impl ConnectorPipelineCallback {
         ann: laminar_core::cluster::control::BarrierAnnouncement,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> crate::pipeline::BarrierOutcome {
-        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::pipeline::BarrierOutcome;
 
         // Owned clone: `controller` outlives the `&mut self` calls below
@@ -719,35 +665,7 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-
-        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
-        for (name, source, _) in &self.table_sources {
-            extra_tables.insert(
-                name.clone(),
-                source_to_connector_checkpoint(&source.checkpoint()),
-            );
-        }
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
-            if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
-            }
-        }
-        let mut source_overrides = HashMap::with_capacity(source_checkpoints.len());
-        for (name, cp) in &source_checkpoints {
-            source_overrides.insert(name.clone(), source_to_connector_checkpoint(cp));
-        }
-
-        let request = crate::checkpoint_coordinator::CheckpointRequest {
-            operator_states,
-            watermark: None,
-            table_store_checkpoint_path: None,
-            extra_table_offsets: extra_tables,
-            source_watermarks: per_source_watermarks,
-            pipeline_hash: self.pipeline_hash,
-            source_offset_overrides: source_overrides,
-        };
+        let request = self.build_checkpoint_request(operator_states, &source_checkpoints);
 
         // Durable tail (pre-commit + manifest + uploads + decision wait
         // + 2PC) off the pipeline task; resume processing once every
@@ -807,6 +725,48 @@ impl ConnectorPipelineCallback {
             return Err(e);
         }
         Ok(Some(epoch))
+    }
+
+    /// Assemble a [`CheckpointRequest`](crate::checkpoint_coordinator::CheckpointRequest)
+    /// from the given operator states and barrier-captured source
+    /// offsets, folding in table-source offsets and per-source
+    /// watermarks. Shared by every checkpoint entry point (leader
+    /// barrier, follower, timer, forced).
+    fn build_checkpoint_request(
+        &self,
+        operator_states: std::collections::HashMap<String, bytes::Bytes>,
+        source_checkpoints: &FxHashMap<String, SourceCheckpoint>,
+    ) -> crate::checkpoint_coordinator::CheckpointRequest {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+        let source_offset_overrides = source_checkpoints
+            .iter()
+            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
+            .collect();
+
+        crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides,
+        }
     }
 
     async fn capture_and_serialize_operator_state(
@@ -1344,8 +1304,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         force: bool,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64> {
-        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-
         // Drain any pending `db.checkpoint()` requests first. Each
         // request gets a capture of operator state (the same path the
         // periodic barrier-aligned checkpoint uses), committed through
@@ -1421,21 +1379,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        // Capture table source offsets.
-        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
-        for (name, source, _) in &self.table_sources {
-            extra_tables.insert(
-                name.clone(),
-                source_to_connector_checkpoint(&source.checkpoint()),
-            );
-        }
-
-        // Convert source offsets from connector format to manifest format.
-        let source_overrides: HashMap<String, _> = source_offsets
-            .iter()
-            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
-            .collect();
-
         // Capture stream executor aggregate state and serialize on blocking thread.
         // Abort the checkpoint if serialization fails — persisting source
         // offsets without matching operator state would cause data loss on
@@ -1447,25 +1390,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return None;
             }
         };
-
-        // Collect per-source watermarks from the watermark tracker.
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
-            if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
-            }
-        }
-
-        let request = crate::checkpoint_coordinator::CheckpointRequest {
-            operator_states,
-            watermark: None,
-            table_store_checkpoint_path: None,
-            extra_table_offsets: extra_tables,
-            source_watermarks: per_source_watermarks,
-            pipeline_hash: self.pipeline_hash,
-            source_offset_overrides: source_overrides,
-        };
+        let request = self.build_checkpoint_request(operator_states, &source_offsets);
 
         let vnode_states = self.capture_vnode_states();
         let mut committed = None;
@@ -1529,7 +1454,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> crate::pipeline::BarrierOutcome {
-        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::pipeline::{BarrierOutcome, SkipReason};
 
         #[cfg(feature = "cluster")]
@@ -1559,17 +1483,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Everything from here until the Aligned resume gate releases is
-        // pipeline stall — the ADR-003 Phase-1 metric.
+        // pipeline stall — the metric Phase 1 of ADR-003 targets.
         let stall_start = std::time::Instant::now();
-
-        // Capture table source offsets.
-        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
-        for (name, source, _) in &self.table_sources {
-            extra_tables.insert(
-                name.clone(),
-                source_to_connector_checkpoint(&source.checkpoint()),
-            );
-        }
 
         // Drain + align the cross-node shuffle before capture so peers'
         // pre-barrier rows enter the snapshot (announces Prepare early).
@@ -1595,34 +1510,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         };
 
-        // Collect per-source watermarks.
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
-            if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
-            }
-        }
-
-        // Barrier-captured source offsets go into source_offset_overrides
-        // so they land in manifest.source_offsets (not table_offsets).
-        // These positions are consistent with the operator state at the
-        // barrier point and must not be re-queried from the live connectors.
-        let mut source_overrides = HashMap::with_capacity(source_checkpoints.len());
-        for (name, cp) in &source_checkpoints {
-            source_overrides.insert(name.clone(), source_to_connector_checkpoint(cp));
-        }
-
+        // The barrier-captured source offsets are consistent with the
+        // operator state at the barrier point and must not be re-queried
+        // from the live connectors.
         let vnode_states = self.capture_vnode_states();
-        let request = crate::checkpoint_coordinator::CheckpointRequest {
-            operator_states,
-            watermark: None,
-            table_store_checkpoint_path: None,
-            extra_table_offsets: extra_tables,
-            source_watermarks: per_source_watermarks,
-            pipeline_hash: self.pipeline_hash,
-            source_offset_overrides: source_overrides,
-        };
+        let request = self.build_checkpoint_request(operator_states, &source_checkpoints);
 
         // Persist in the background; in-flight flag bounds to one checkpoint at a time.
         self.checkpoint_in_flight
@@ -2173,12 +2065,14 @@ mod tests {
     }
 
     /// Build a follower-side controller whose `current_leader()` is a
-    /// seeded peer, for resume-gate tests.
+    /// seeded peer, for resume-gate tests. The caller holds the
+    /// returned membership sender alive for the test's duration.
     #[cfg(feature = "cluster")]
     fn gate_controller() -> (
         Arc<laminar_core::cluster::control::InMemoryKv>,
         laminar_core::cluster::control::ClusterController,
         laminar_core::cluster::discovery::NodeId,
+        tokio::sync::watch::Sender<Vec<laminar_core::cluster::discovery::NodeInfo>>,
     ) {
         use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
         use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
@@ -2197,12 +2091,11 @@ mod tests {
             last_heartbeat_ms: 0,
         };
         let (tx, rx) = tokio::sync::watch::channel(vec![leader_info]);
-        // Keep the membership sender alive for the controller's lifetime.
-        std::mem::forget(tx);
         (
             kv,
             ClusterController::new(follower_id, kv_trait, None, rx),
             leader_id,
+            tx,
         )
     }
 
@@ -2212,7 +2105,7 @@ mod tests {
     async fn aligned_resume_gate_releases_on_aligned() {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
-        let (kv, controller, leader_id) = gate_controller();
+        let (kv, controller, leader_id, _members_tx) = gate_controller();
         let aligned = serde_json::to_string(&BarrierAnnouncement {
             epoch: 3,
             checkpoint_id: 3,
@@ -2243,7 +2136,7 @@ mod tests {
     async fn aligned_resume_gate_releases_on_newer_epoch() {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
-        let (kv, controller, leader_id) = gate_controller();
+        let (kv, controller, leader_id, _members_tx) = gate_controller();
         let newer = serde_json::to_string(&BarrierAnnouncement {
             epoch: 4,
             checkpoint_id: 4,
@@ -2268,7 +2161,7 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn aligned_resume_gate_skips_without_shuffle() {
-        let (_kv, controller, _leader_id) = gate_controller();
+        let (_kv, controller, _leader_id, _members_tx) = gate_controller();
         tokio::time::timeout(
             Duration::from_millis(100),
             ConnectorPipelineCallback::wait_for_aligned_resume(false, &controller, 3),

@@ -68,14 +68,11 @@ pub struct BarrierAnnouncement {
     pub min_watermark_ms: Option<i64>,
     /// Leader-stamped monotonic announce sequence, assigned by
     /// [`BarrierCoordinator::announce`] (caller-set values are
-    /// overwritten). Observation is latest-wins across two channels
-    /// (gRPC push + gossip KV), and a retry of an aborted epoch reuses
-    /// the same epoch/checkpoint id — within an epoch only this
-    /// sequence distinguishes `Abort(attempt 1)` from the retry's
-    /// `Prepare(attempt 2)`. Resets on leader change/restart; epoch
-    /// ordering dominates across leaders, and the gRPC push physically
-    /// overwriting the watch self-heals same-epoch staleness.
-    /// `0` on legacy payloads via `#[serde(default)]`.
+    /// overwritten). Orders same-epoch announcements under latest-wins
+    /// observation: a retry of an aborted epoch reuses the epoch and
+    /// checkpoint id, so only `seq` distinguishes the stale `Abort`
+    /// from the retry's `Prepare`. Resets on leader change; epoch
+    /// ordering dominates across leaders. `0` = legacy/unset.
     #[serde(default)]
     pub seq: u64,
 }
@@ -935,11 +932,7 @@ impl BarrierCoordinator {
                             flags: 0,
                             seq: round_seq,
                         });
-                        if let Some(lid) = local_id {
-                            if let Ok(val) = lid.0.to_string().parse() {
-                                req.metadata_mut().insert("x-leader-id", val);
-                            }
-                        }
+                        stamp_leader_id(&mut req, local_id);
 
                         match tokio::time::timeout(deadline, client.prepare(req)).await {
                             Ok(Ok(response)) => {

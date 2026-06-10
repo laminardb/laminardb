@@ -678,7 +678,13 @@ impl CheckpointCoordinator {
     async fn await_restorable_gate(&self, epoch: u64) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
-        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        // Each `epoch_complete` call LISTs the epoch prefix on the
+        // object store, so back off after the first second: fast for
+        // the common local/in-process case, cheap on S3 for a slow
+        // follower upload (≤10 + ~60 LISTs over the 30s default).
+        const FAST_POLL: Duration = Duration::from_millis(100);
+        const SLOW_POLL: Duration = Duration::from_millis(500);
+        const FAST_WINDOW: Duration = Duration::from_secs(1);
 
         let Some(ref backend) = self.state_backend else {
             return Ok(());
@@ -687,7 +693,8 @@ impl CheckpointCoordinator {
             return Ok(());
         }
 
-        let deadline = Instant::now() + self.config.restorable_gate_timeout;
+        let start = Instant::now();
+        let deadline = start + self.config.restorable_gate_timeout;
         let mut last_state = String::from("not all vnodes persisted");
         loop {
             match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
@@ -711,7 +718,12 @@ impl CheckpointCoordinator {
                     self.config.restorable_gate_timeout
                 ));
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            let interval = if start.elapsed() < FAST_WINDOW {
+                FAST_POLL
+            } else {
+                SLOW_POLL
+            };
+            tokio::time::sleep(interval).await;
         }
     }
 
@@ -1486,16 +1498,13 @@ impl CheckpointCoordinator {
         let source_offsets = source_offset_overrides;
         let table_offsets = extra_table_offsets;
 
-        // Cluster 2PC, level 1 of two-level completion (ADR-003): collect
-        // capture acks from every live follower, then announce `Aligned` —
-        // the full-membership pipeline-resume gate. Followers ack as soon
-        // as they have aligned the shuffle and captured state locally;
-        // their durable prepare (sink pre-commit + manifest + partial
-        // uploads) runs after the ack, and its completion is verified by
-        // the restorable gate below (each node writes its vnode partials
-        // *last*, so full partial presence implies every prepare finished).
-        // Running this before the leader's own uploads keeps the
-        // cluster-wide stall at alignment + capture.
+        // Cluster 2PC, level 1 of two-level completion: collect capture
+        // acks from every live follower, then announce `Aligned` — the
+        // full-membership pipeline-resume gate. Followers' durable
+        // prepare runs after their ack; its completion is verified by
+        // the restorable gate below (each node writes its vnode
+        // partials *last*, so full presence implies every prepare
+        // finished).
         #[cfg(feature = "cluster")]
         {
             if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
