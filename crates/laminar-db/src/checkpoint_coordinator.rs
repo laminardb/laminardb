@@ -63,6 +63,12 @@ pub struct CheckpointConfig {
     pub max_checkpoint_bytes: Option<usize>,
     /// Quorum wait timeout for checkpoint coordination.
     pub quorum_timeout: Duration,
+    /// Max wait for every participating vnode's partial to land before
+    /// the epoch is declared restorable. Followers ack at *capture* and
+    /// upload asynchronously (ADR-003 two-level completion), so the
+    /// leader's durability gate polls for partial presence instead of
+    /// checking once. Expiry aborts the epoch.
+    pub restorable_gate_timeout: Duration,
 }
 
 impl Default for CheckpointConfig {
@@ -79,6 +85,7 @@ impl Default for CheckpointConfig {
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
             quorum_timeout: Duration::from_secs(3),
+            restorable_gate_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -654,6 +661,60 @@ impl CheckpointCoordinator {
         futures::future::try_join_all(writes).await.map(|_| ())
     }
 
+    /// Poll the state backend's durability gate until every vnode in
+    /// `gate_vnode_set` has its partial for `epoch` persisted (sealing
+    /// the epoch's `_COMMIT` marker), or `restorable_gate_timeout`
+    /// expires. No-op without a backend or with an empty gate set.
+    ///
+    /// Polling (vs the old single check) is what lets followers ack at
+    /// capture and upload asynchronously: each node writes its vnode
+    /// partials *after* sink pre-commit + manifest save, so full
+    /// presence here also proves every node completed its durable
+    /// prepare. A follower whose prepare fails after acking surfaces as
+    /// a gate timeout → abort.
+    ///
+    /// Transient backend errors are retried until the deadline; a
+    /// split-brain commit marker aborts immediately.
+    async fn await_restorable_gate(&self, epoch: u64) -> Result<(), String> {
+        use laminar_core::state::StateBackendError;
+
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        let Some(ref backend) = self.state_backend else {
+            return Ok(());
+        };
+        if self.gate_vnode_set.is_empty() {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + self.config.restorable_gate_timeout;
+        let mut last_state = String::from("not all vnodes persisted");
+        loop {
+            match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
+                Ok(true) => return Ok(()),
+                // Keep the default/previous message; a lingering
+                // transient-error string is more informative than
+                // resetting it.
+                Ok(false) => {}
+                Err(e @ StateBackendError::SplitBrainCommit { .. }) => {
+                    return Err(format!("state durability gate: {e}"));
+                }
+                Err(e) => {
+                    // Transient I/O — keep polling until the deadline.
+                    debug!(epoch, error = %e, "durability gate poll error; retrying");
+                    last_state = e.to_string();
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "state durability gate timed out after {:?}: {last_state}",
+                    self.config.restorable_gate_timeout
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// On startup, reconcile any Pending sinks in the last manifest
     /// against the durable commit marker. Marker present → drive
     /// local commit (idempotent); marker absent → rollback. Runs on
@@ -793,6 +854,7 @@ impl CheckpointCoordinator {
             phase,
             flags: 0,
             min_watermark_ms,
+            seq: 0,
         };
         if let Err(e) = cc.announce_barrier(&ann).await {
             warn!(
@@ -1158,9 +1220,18 @@ impl CheckpointCoordinator {
         self.checkpoint_inner(request).await
     }
 
-    /// Follower half of a cluster checkpoint: pre-commit + save +
-    /// markers + ack, then wait for the leader's commit/abort.
+    /// Follower half of a cluster checkpoint: ack the capture, run the
+    /// durable prepare (pre-commit + manifest + partial uploads), then
+    /// wait for the leader's commit/abort.
     /// `Ok(true)` = committed, `Ok(false)` = aborted/timed out.
+    ///
+    /// The ack is sent *before* the durable prepare (ADR-003 two-level
+    /// completion): it means "aligned + captured" — the caller has
+    /// already aligned the shuffle and captured state into `request`.
+    /// The leader announces `Aligned` on the full ack quorum (releasing
+    /// every pipeline), and verifies prepare completion through the
+    /// restorable gate (this node writes its vnode partials last, so
+    /// partial presence implies the whole prepare finished).
     ///
     /// # Errors
     /// Propagates sink pre-commit, manifest save, or marker-write failures.
@@ -1185,26 +1256,45 @@ impl CheckpointCoordinator {
         self.epoch = epoch;
         self.next_checkpoint_id = checkpoint_id.saturating_add(1);
 
-        // Phase 1: local prepare.
-        let prepare_result = self.follower_prepare(request, epoch, checkpoint_id).await;
-        let prepare_err = prepare_result.as_ref().err().map(ToString::to_string);
+        // Capture ack — state is already consistently captured by the
+        // caller; the leader needs nothing more to release pipelines.
         cc.ack_barrier(&BarrierAck {
             epoch,
-            ok: prepare_err.is_none(),
-            error: prepare_err.clone(),
-            // Leader folds this into the cluster-wide min before
-            // announcing Commit. `None` is non-blocking.
+            ok: true,
+            error: None,
+            // Leader folds this into the cluster-wide min announced on
+            // Aligned/Commit. `None` is non-blocking.
             local_watermark_ms: self.local_watermark_ms,
         })
         .await
         .ok(); // best effort; leader's quorum wait tolerates missed acks
-        if let Err(e) = prepare_result {
+
+        // Durable prepare (runs after the ack, off the critical path
+        // when the caller drives this from a background task).
+        if let Err(e) = self.follower_prepare(request, epoch, checkpoint_id).await {
+            // Best-effort fast failure signal: overwrites the capture
+            // ack in the gossip-KV slot so a still-polling leader fails
+            // the quorum instead of waiting; in gRPC mode the leader
+            // learns through its restorable-gate timeout.
+            cc.ack_barrier(&BarrierAck {
+                epoch,
+                ok: false,
+                error: Some(e.to_string()),
+                local_watermark_ms: self.local_watermark_ms,
+            })
+            .await
+            .ok();
             self.rollback_sinks(epoch).await.ok();
             self.phase = CheckpointPhase::Idle;
             return Err(e);
         }
 
-        // Phase 2: wait for the leader's decision.
+        // Phase 2: wait for the leader's decision. `Aligned` is not a
+        // decision — only Commit/Abort (or epoch advancement) end the
+        // wait. Observation is latest-wins, so a newer epoch's
+        // announcement can supersede this epoch's Commit: the leader
+        // only advances epochs after a successful commit, so verify via
+        // the durable marker and drive the commit.
         let deadline = Instant::now() + decision_timeout;
         loop {
             match cc.observe_barrier().await.ok().flatten() {
@@ -1216,6 +1306,23 @@ impl CheckpointCoordinator {
                     self.checkpoints_failed += 1;
                     self.phase = CheckpointPhase::Idle;
                     return Ok(false);
+                }
+                Some(a) if a.epoch > epoch => {
+                    let committed = match self.decision_store.as_ref() {
+                        Some(ds) => ds.is_committed(epoch).await.unwrap_or(false),
+                        None => false,
+                    };
+                    if committed {
+                        info!(
+                            epoch,
+                            checkpoint_id,
+                            observed_epoch = a.epoch,
+                            "newer epoch observed with commit marker present — driving commit",
+                        );
+                        return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                    }
+                    // No marker yet — keep waiting for the decision or
+                    // the timeout's marker re-check below.
                 }
                 _ => {}
             }
@@ -1379,6 +1486,52 @@ impl CheckpointCoordinator {
         let source_offsets = source_offset_overrides;
         let table_offsets = extra_table_offsets;
 
+        // Cluster 2PC, level 1 of two-level completion (ADR-003): collect
+        // capture acks from every live follower, then announce `Aligned` —
+        // the full-membership pipeline-resume gate. Followers ack as soon
+        // as they have aligned the shuffle and captured state locally;
+        // their durable prepare (sink pre-commit + manifest + partial
+        // uploads) runs after the ack, and its completion is verified by
+        // the restorable gate below (each node writes its vnode partials
+        // *last*, so full partial presence implies every prepare finished).
+        // Running this before the leader's own uploads keeps the
+        // cluster-wide stall at alignment + capture.
+        #[cfg(feature = "cluster")]
+        {
+            if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
+                self.phase = CheckpointPhase::Idle;
+                self.checkpoints_failed += 1;
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                // Idempotent: this epoch's sinks have not pre-committed yet,
+                // but rollback also closes any transaction opened by
+                // `begin_epoch_for_sinks` after the previous checkpoint.
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                    error!(
+                        checkpoint_id,
+                        epoch,
+                        error = %rollback_err,
+                        "[LDB-6032] sink rollback failed after quorum miss",
+                    );
+                }
+                self.pending_vnode_states.clear();
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(quorum_failure),
+                });
+            }
+            self.announce_if_leader(
+                epoch,
+                checkpoint_id,
+                laminar_core::cluster::control::Phase::Aligned,
+                self.cluster_min_watermark,
+            )
+            .await;
+        }
+
         self.phase = CheckpointPhase::PreCommitting;
         if let Err(e) = self.pre_commit_sinks(epoch).await {
             self.phase = CheckpointPhase::Idle;
@@ -1531,119 +1684,50 @@ impl CheckpointCoordinator {
             });
         }
 
-        // Cluster 2PC phase 1: announce PREPARE and wait for followers
-        // to snapshot + ack.
-        #[cfg(feature = "cluster")]
-        {
-            if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
-                self.phase = CheckpointPhase::Idle;
-                self.checkpoints_failed += 1;
-                let duration = start.elapsed();
-                self.emit_checkpoint_metrics(false, epoch, duration);
-                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                    error!(
-                        checkpoint_id,
-                        epoch,
-                        error = %rollback_err,
-                        "[LDB-6032] sink rollback failed after quorum miss",
-                    );
-                }
-                self.pending_vnode_states.clear();
-                return Ok(CheckpointResult {
-                    success: false,
+        // Durability gate (level 2, "restorable"): confirm every
+        // participating vnode has its partial persisted before sinks
+        // commit. `gate_vnode_set` is the FULL registry in cluster mode —
+        // the leader verifies markers from every follower's
+        // shared-storage writes, not just its own. Single-instance
+        // defaults to `vnode_set` (the two match). Followers upload
+        // asynchronously after their capture ack, so this polls until
+        // `restorable_gate_timeout` rather than checking once.
+        if let Err(gate_err) = self.await_restorable_gate(epoch).await {
+            warn!(
+                checkpoint_id,
+                epoch,
+                vnodes = self.gate_vnode_set.len(),
+                error = %gate_err,
+                "[LDB-6020] state durability gate failed — rolling back sinks",
+            );
+            #[cfg(feature = "cluster")]
+            self.announce_if_leader(
+                epoch,
+                checkpoint_id,
+                laminar_core::cluster::control::Phase::Abort,
+                None,
+            )
+            .await;
+            self.checkpoints_failed += 1;
+            self.phase = CheckpointPhase::Idle;
+            let duration = start.elapsed();
+            self.emit_checkpoint_metrics(false, epoch, duration);
+            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                error!(
                     checkpoint_id,
                     epoch,
-                    duration,
-                    error: Some(quorum_failure),
-                });
+                    error = %rollback_err,
+                    "[LDB-6021] sink rollback failed after durability gate miss",
+                );
             }
-        }
-
-        // Durability gate: confirm every participating vnode has its
-        // partial persisted before sinks commit. `gate_vnode_set` is the
-        // FULL registry in cluster mode — the leader verifies markers
-        // from every follower's shared-storage writes, not just its own.
-        // Single-instance defaults to `vnode_set` (the two match).
-        if let Some(ref backend) = self.state_backend {
-            if !self.gate_vnode_set.is_empty() {
-                match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        warn!(
-                            checkpoint_id,
-                            epoch,
-                            vnodes = self.gate_vnode_set.len(),
-                            "[LDB-6020] state durability gate returned false — \
-                             rolling back sinks",
-                        );
-                        #[cfg(feature = "cluster")]
-                        self.announce_if_leader(
-                            epoch,
-                            checkpoint_id,
-                            laminar_core::cluster::control::Phase::Abort,
-                            None,
-                        )
-                        .await;
-                        self.checkpoints_failed += 1;
-                        self.phase = CheckpointPhase::Idle;
-                        let duration = start.elapsed();
-                        self.emit_checkpoint_metrics(false, epoch, duration);
-                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                            error!(
-                                checkpoint_id,
-                                epoch,
-                                error = %rollback_err,
-                                "[LDB-6021] sink rollback failed after durability gate miss",
-                            );
-                        }
-                        self.pending_vnode_states.clear();
-                        return Ok(CheckpointResult {
-                            success: false,
-                            checkpoint_id,
-                            epoch,
-                            duration,
-                            error: Some("state durability gate: not all vnodes persisted".into()),
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            checkpoint_id,
-                            epoch,
-                            error = %e,
-                            "[LDB-6022] state backend error during durability gate — \
-                             treating as gate miss, rolling back sinks",
-                        );
-                        #[cfg(feature = "cluster")]
-                        self.announce_if_leader(
-                            epoch,
-                            checkpoint_id,
-                            laminar_core::cluster::control::Phase::Abort,
-                            None,
-                        )
-                        .await;
-                        self.checkpoints_failed += 1;
-                        self.phase = CheckpointPhase::Idle;
-                        let duration = start.elapsed();
-                        self.emit_checkpoint_metrics(false, epoch, duration);
-                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                            error!(
-                                checkpoint_id,
-                                epoch,
-                                error = %rollback_err,
-                                "[LDB-6023] sink rollback failed after durability gate error",
-                            );
-                        }
-                        self.pending_vnode_states.clear();
-                        return Ok(CheckpointResult {
-                            success: false,
-                            checkpoint_id,
-                            epoch,
-                            duration,
-                            error: Some(format!("state durability gate: {e}")),
-                        });
-                    }
-                }
-            }
+            self.pending_vnode_states.clear();
+            return Ok(CheckpointResult {
+                success: false,
+                checkpoint_id,
+                epoch,
+                duration,
+                error: Some(gate_err),
+            });
         }
 
         // Record the commit marker before issuing sink commits — this
@@ -2058,6 +2142,18 @@ mod tests {
         CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap()
+    }
+
+    /// Coordinator whose restorable gate gives up quickly — for tests
+    /// that exercise a gate *miss* (the default 30s poll would stall
+    /// the suite).
+    async fn make_coordinator_with_fast_gate(dir: &std::path::Path) -> CheckpointCoordinator {
+        let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
+        let config = CheckpointConfig {
+            restorable_gate_timeout: Duration::from_millis(250),
+            ..CheckpointConfig::default()
+        };
+        CheckpointCoordinator::new(config, store).await.unwrap()
     }
 
     #[tokio::test]
@@ -2672,6 +2768,7 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         })
         .unwrap();
         let commit_json = serde_json::to_string(&BarrierAnnouncement {
@@ -2680,6 +2777,7 @@ mod tests {
             phase: Phase::Commit,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         })
         .unwrap();
         // Overwrite the prepare with commit — observe_barrier reads the
@@ -2694,6 +2792,7 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
         let committed = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
@@ -2747,6 +2846,7 @@ mod tests {
             phase: Phase::Abort,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, abort_json);
@@ -2757,12 +2857,157 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
         let committed = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
             .await
             .unwrap();
         assert!(!committed, "follower should roll back on leader's Abort");
+    }
+
+    /// KV that records every announcement written, preserving order —
+    /// the single-slot `InMemoryKv` only keeps the latest.
+    #[cfg(feature = "cluster")]
+    struct RecordingKv {
+        inner: laminar_core::cluster::control::InMemoryKv,
+        announcements: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "cluster")]
+    #[async_trait::async_trait]
+    impl laminar_core::cluster::control::ClusterKv for RecordingKv {
+        async fn write(&self, key: &str, value: String) {
+            if key == laminar_core::cluster::control::ANNOUNCEMENT_KEY {
+                self.announcements.lock().push(value.clone());
+            }
+            self.inner.write(key, value).await;
+        }
+        async fn read_from(
+            &self,
+            who: laminar_core::cluster::discovery::NodeId,
+            key: &str,
+        ) -> Option<String> {
+            self.inner.read_from(who, key).await
+        }
+        async fn scan(&self, key: &str) -> Vec<(laminar_core::cluster::discovery::NodeId, String)> {
+            self.inner.scan(key).await
+        }
+        async fn scan_prefix(
+            &self,
+            prefix: &str,
+        ) -> Vec<(laminar_core::cluster::discovery::NodeId, String, String)> {
+            self.inner.scan_prefix(prefix).await
+        }
+    }
+
+    /// ADR-003 two-level completion: the leader must announce `Aligned`
+    /// (the pipeline resume gate) after the capture quorum and *before*
+    /// the durable tail's `Commit`.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn leader_announces_aligned_between_prepare_and_commit() {
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+
+        let self_id = NodeId(1);
+        let announcements = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let kv: Arc<dyn ClusterKv> = Arc::new(RecordingKv {
+            inner: InMemoryKv::new(self_id),
+            announcements: Arc::clone(&announcements),
+        });
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+        coord.set_cluster_controller(controller);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let phases: Vec<Phase> = announcements
+            .lock()
+            .iter()
+            .map(|json| {
+                serde_json::from_str::<BarrierAnnouncement>(json)
+                    .unwrap()
+                    .phase
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec![Phase::Prepare, Phase::Aligned, Phase::Commit],
+            "two-level completion must announce Aligned between Prepare and Commit",
+        );
+    }
+
+    /// ADR-003: the follower acks at capture (before its durable
+    /// prepare). If the prepare then fails, a best-effort `ok = false`
+    /// ack overwrites the capture ack so a still-polling leader can
+    /// fail the quorum fast instead of waiting for its gate timeout.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_prepare_failure_overwrites_capture_ack() {
+        use laminar_core::cluster::control::{
+            BarrierAck, BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase,
+            ACK_KEY,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+        use laminar_core::state::InProcessBackend;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+
+        let leader_id = NodeId(1);
+        let follower_id = NodeId(7);
+        let kv = Arc::new(InMemoryKv::new(follower_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let leader_info = NodeInfo {
+            id: leader_id,
+            name: "leader".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_tx, rx) = watch::channel(vec![leader_info]);
+        let controller = Arc::new(ClusterController::new(follower_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+        // Backend sized for 2 vnodes but the follower claims vnode 99 —
+        // `write_vnode_partials` (the last prepare step) fails.
+        coord.set_state_backend(Arc::new(InProcessBackend::new(2)));
+        coord.set_vnode_set(vec![99]);
+
+        let ann = BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+            seq: 0,
+        };
+        let result = coord
+            .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(1))
+            .await;
+        assert!(result.is_err(), "prepare failure must surface as an error");
+
+        let ack_raw = kv.read_from(follower_id, ACK_KEY).await.unwrap();
+        let ack: BarrierAck = serde_json::from_str(&ack_raw).unwrap();
+        assert_eq!(ack.epoch, 1);
+        assert!(!ack.ok, "the failure ack must overwrite the capture ack");
+        assert!(
+            ack.error.unwrap().contains("vnode partial write failed"),
+            "failure ack should carry the prepare error",
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -2881,7 +3126,7 @@ mod tests {
         // gate must fail even though the leader wrote its own.
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path()).await;
+        let mut coord = make_coordinator_with_fast_gate(dir.path()).await;
         let backend = Arc::new(InProcessBackend::new(4));
         coord.set_state_backend(backend.clone());
         coord.set_vnode_set(vec![0, 1]); // leader's owned subset
@@ -2899,6 +3144,51 @@ mod tests {
         assert!(
             err.contains("not all vnodes persisted"),
             "expected full-registry gate miss, got: {err}",
+        );
+    }
+
+    /// ADR-003: followers ack at capture and upload partials
+    /// asynchronously, so the leader's restorable gate must *wait* for
+    /// late partials rather than failing on the first check.
+    #[tokio::test]
+    async fn restorable_gate_waits_for_async_follower_uploads() {
+        use bytes::Bytes;
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+        let backend = Arc::new(InProcessBackend::new(4));
+        // Leader's own partials are present; the "follower's" vnodes
+        // {2, 3} land only after a delay, simulating its background
+        // upload completing while the leader polls.
+        backend
+            .write_partial(0, 1, 0, Bytes::from_static(b"leader"))
+            .await
+            .unwrap();
+        backend
+            .write_partial(1, 1, 0, Bytes::from_static(b"leader"))
+            .await
+            .unwrap();
+        let late = Arc::clone(&backend);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for v in [2u32, 3] {
+                late.write_partial(v, 1, 0, Bytes::from_static(b"follower"))
+                    .await
+                    .unwrap();
+            }
+        });
+        coord.set_state_backend(backend);
+        coord.set_vnode_set(vec![0, 1]);
+        coord.set_gate_vnode_set(vec![0, 1, 2, 3]);
+
+        let start = std::time::Instant::now();
+        coord
+            .await_restorable_gate(1)
+            .await
+            .expect("gate must seal once the late partials land");
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "gate returned before the late partials could have landed",
         );
     }
 

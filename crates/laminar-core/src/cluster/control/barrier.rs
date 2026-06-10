@@ -28,9 +28,14 @@ pub const BARRIER_ADDR_KEY: &str = "barrier:addr";
 /// Barrier phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
-    /// Snapshot state and pre-commit sinks.
+    /// Align the shuffle, capture state locally, ack. The durable tail
+    /// (sink pre-commit, manifest, uploads) runs after the ack.
     Prepare,
-    /// Durability gate passed; commit sinks.
+    /// Every node has aligned + captured this epoch (full-membership
+    /// capture quorum). Pipelines may resume the next epoch; the epoch
+    /// is NOT yet restorable (ADR-003 two-level completion).
+    Aligned,
+    /// Durability gate passed; commit sinks. The epoch is restorable.
     Commit,
     /// Prepare failed; roll back.
     Abort,
@@ -61,6 +66,18 @@ pub struct BarrierAnnouncement {
     /// node is still processing earlier events.
     #[serde(default)]
     pub min_watermark_ms: Option<i64>,
+    /// Leader-stamped monotonic announce sequence, assigned by
+    /// [`BarrierCoordinator::announce`] (caller-set values are
+    /// overwritten). Observation is latest-wins across two channels
+    /// (gRPC push + gossip KV), and a retry of an aborted epoch reuses
+    /// the same epoch/checkpoint id — within an epoch only this
+    /// sequence distinguishes `Abort(attempt 1)` from the retry's
+    /// `Prepare(attempt 2)`. Resets on leader change/restart; epoch
+    /// ordering dominates across leaders, and the gRPC push physically
+    /// overwriting the watch self-heals same-epoch staleness.
+    /// `0` on legacy payloads via `#[serde(default)]`.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Follower ack. `ok = false` forces the leader to abort instead of wait.
@@ -214,14 +231,19 @@ type BarrierClientPool = Arc<
 
 #[cfg(feature = "cluster")]
 struct GrpcState {
-    incoming_rx: parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
-    incoming_rx_returned: Arc<tokio::sync::Notify>,
+    /// Latest gRPC-delivered announcement, fed in arrival order by the
+    /// relay task draining the incoming queue. Latest-wins semantics
+    /// (matching the gossip-KV fallback) so concurrent observers — the
+    /// pipeline's resume gate and the background durable tail — never
+    /// steal announcements from each other.
+    latest_rx: watch::Receiver<Option<BarrierAnnouncement>>,
     #[allow(dead_code)]
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
     completed_acks: Arc<parking_lot::Mutex<FxHashMap<u64, BarrierAck>>>,
     clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    relay_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     advertise_addr: String,
 }
 
@@ -326,6 +348,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Prepare,
             flags: req.flags,
             min_watermark_ms: None,
+            seq: req.seq,
         };
 
         if self.incoming_tx.send(ann).await.is_err() {
@@ -352,6 +375,35 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         }
     }
 
+    async fn aligned(
+        &self,
+        request: tonic::Request<barrier_v1::AlignedRequest>,
+    ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.validate_leader(request.metadata()).await?;
+        let req = request.into_inner();
+
+        // Unlike Commit/Abort, Aligned is mid-protocol: the epoch's ack
+        // bookkeeping stays untouched — only the announcement is relayed
+        // so the pipeline's resume gate can release.
+        let ann = BarrierAnnouncement {
+            epoch: req.epoch,
+            checkpoint_id: req.checkpoint_id,
+            phase: Phase::Aligned,
+            flags: req.flags,
+            min_watermark_ms: req.min_watermark_ms,
+            seq: req.seq,
+        };
+        if self.incoming_tx.send(ann).await.is_err() {
+            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
+        }
+        Ok(tonic::Response::new(barrier_v1::Ack {
+            epoch: req.epoch,
+            ok: true,
+            error: None,
+            local_watermark_ms: None,
+        }))
+    }
+
     async fn commit(
         &self,
         request: tonic::Request<barrier_v1::CommitRequest>,
@@ -371,6 +423,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Commit,
             flags: req.flags,
             min_watermark_ms: req.min_watermark_ms,
+            seq: req.seq,
         };
         if self.incoming_tx.send(ann).await.is_err() {
             return Err(tonic::Status::aborted("Follower coordinator shutdown"));
@@ -402,6 +455,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Abort,
             flags: req.flags,
             min_watermark_ms: None,
+            seq: req.seq,
         };
         if self.incoming_tx.send(ann).await.is_err() {
             return Err(tonic::Status::aborted("Follower coordinator shutdown"));
@@ -434,9 +488,91 @@ async fn get_barrier_client(
     Some(client)
 }
 
+/// Stamp the leader's identity into the request metadata so the
+/// follower's `validate_leader` check can reject impostors.
+#[cfg(feature = "cluster")]
+fn stamp_leader_id<T>(req: &mut tonic::Request<T>, local_id: Option<NodeId>) {
+    if let Some(lid) = local_id {
+        if let Ok(val) = lid.0.to_string().parse() {
+            req.metadata_mut().insert("x-leader-id", val);
+        }
+    }
+}
+
+/// Fan a non-Prepare phase announcement to one peer over gRPC. A failed
+/// RPC evicts the pooled client so the next round re-resolves the peer.
+#[cfg(feature = "cluster")]
+async fn send_phase_rpc(
+    peer: NodeId,
+    clients_pool: BarrierClientPool,
+    kv: Arc<dyn ClusterKv>,
+    ann: BarrierAnnouncement,
+    local_id: Option<NodeId>,
+) -> Result<(), String> {
+    let mut client = get_barrier_client(peer, &clients_pool, &kv)
+        .await
+        .ok_or_else(|| format!("failed to get client for peer {}", peer.0))?;
+    let result = match ann.phase {
+        Phase::Aligned => {
+            let mut req = tonic::Request::new(barrier_v1::AlignedRequest {
+                epoch: ann.epoch,
+                checkpoint_id: ann.checkpoint_id,
+                flags: ann.flags,
+                min_watermark_ms: ann.min_watermark_ms,
+                seq: ann.seq,
+            });
+            stamp_leader_id(&mut req, local_id);
+            client
+                .aligned(req)
+                .await
+                .map(|_| ())
+                .map_err(|e| ("aligned", e))
+        }
+        Phase::Commit => {
+            let mut req = tonic::Request::new(barrier_v1::CommitRequest {
+                epoch: ann.epoch,
+                checkpoint_id: ann.checkpoint_id,
+                flags: ann.flags,
+                min_watermark_ms: ann.min_watermark_ms,
+                seq: ann.seq,
+            });
+            stamp_leader_id(&mut req, local_id);
+            client
+                .commit(req)
+                .await
+                .map(|_| ())
+                .map_err(|e| ("commit", e))
+        }
+        Phase::Abort => {
+            let mut req = tonic::Request::new(barrier_v1::AbortRequest {
+                epoch: ann.epoch,
+                checkpoint_id: ann.checkpoint_id,
+                flags: ann.flags,
+                seq: ann.seq,
+            });
+            stamp_leader_id(&mut req, local_id);
+            client
+                .abort(req)
+                .await
+                .map(|_| ())
+                .map_err(|e| ("abort", e))
+        }
+        Phase::Prepare => Ok(()),
+    };
+    result.map_err(|(rpc, e)| {
+        clients_pool.lock().remove(&peer);
+        format!("{rpc} RPC to peer {} failed: {e}", peer.0)
+    })
+}
+
 /// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
+    /// Monotonic per-process announce sequence (see
+    /// [`BarrierAnnouncement::seq`]). Stamped on every announce and on
+    /// each `wait_for_quorum` Prepare round so observers can order
+    /// same-epoch announcements across retries.
+    announce_seq: std::sync::atomic::AtomicU64,
     #[cfg(feature = "cluster")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
     #[cfg(feature = "cluster")]
@@ -459,6 +595,10 @@ impl Drop for BarrierCoordinator {
                 if let Some(handle) = handle_opt {
                     handle.abort();
                 }
+                let relay_opt = state.relay_handle.lock().take();
+                if let Some(handle) = relay_opt {
+                    handle.abort();
+                }
             }
         }
     }
@@ -470,11 +610,20 @@ impl BarrierCoordinator {
     pub fn new(kv: Arc<dyn ClusterKv>) -> Self {
         Self {
             kv,
+            announce_seq: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "cluster")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Next announce sequence value (starts at 1 so `0` stays the
+    /// legacy/unset sentinel).
+    fn next_seq(&self) -> u64 {
+        self.announce_seq
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
     }
 
     /// Configure the leader election state used to validate incoming leader identity.
@@ -568,14 +717,26 @@ impl BarrierCoordinator {
             local_addr.to_string()
         };
 
+        // Relay every gRPC-delivered announcement into a latest-wins
+        // watch in arrival order. Observation is then non-destructive,
+        // so the pipeline's resume gate and the background durable
+        // tail can watch concurrently (matching the gossip-KV
+        // fallback's read-latest semantics).
+        let (latest_tx, latest_rx) = watch::channel::<Option<BarrierAnnouncement>>(None);
+        let relay_task = tokio::spawn(async move {
+            while let Ok(ann) = incoming_rx.recv().await {
+                let _ = latest_tx.send(Some(ann));
+            }
+        });
+
         let grpc_state = Arc::new(GrpcState {
-            incoming_rx: parking_lot::Mutex::new(Some(incoming_rx)),
-            incoming_rx_returned: Arc::new(tokio::sync::Notify::new()),
+            latest_rx,
             incoming_tx,
             pending_acks,
             completed_acks,
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
+            relay_handle: Arc::new(parking_lot::Mutex::new(Some(relay_task))),
             advertise_addr: advertise_addr.clone(),
         });
 
@@ -586,11 +747,18 @@ impl BarrierCoordinator {
         Ok(local_addr)
     }
 
-    /// Leader-side announce.
+    /// Leader-side announce. Stamps [`BarrierAnnouncement::seq`] from
+    /// this coordinator's monotonic counter (any caller-set value is
+    /// overwritten) so observers can order same-epoch announcements
+    /// across abort/retry sequences.
     ///
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
+        let ann = &BarrierAnnouncement {
+            seq: self.next_seq(),
+            ..ann.clone()
+        };
         #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
@@ -599,7 +767,7 @@ impl BarrierCoordinator {
                 if ann.phase == Phase::Prepare {
                     // Prepare gRPC calls are initiated by wait_for_quorum.
                     // Redundant calls here cause duplicate prepare executions and timeouts on followers.
-                } else if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
+                } else {
                     let mut expected = Vec::new();
                     for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
                         if addr == state.advertise_addr {
@@ -613,60 +781,26 @@ impl BarrierCoordinator {
                         let clients_pool = Arc::clone(&state.clients);
                         let kv = Arc::clone(&self.kv);
                         let ann_clone = ann.clone();
-                        futures.push(async move {
-                            let mut client = get_barrier_client(peer, &clients_pool, &kv)
-                                .await
-                                .ok_or_else(|| {
-                                    format!("failed to get client for peer {}", peer.0)
-                                })?;
-                            match ann_clone.phase {
-                                Phase::Commit => {
-                                    let mut req = tonic::Request::new(barrier_v1::CommitRequest {
-                                        epoch: ann_clone.epoch,
-                                        checkpoint_id: ann_clone.checkpoint_id,
-                                        flags: ann_clone.flags,
-                                        min_watermark_ms: ann_clone.min_watermark_ms,
-                                    });
-                                    if let Some(lid) = local_id {
-                                        if let Ok(val) = lid.0.to_string().parse() {
-                                            req.metadata_mut().insert("x-leader-id", val);
-                                        }
-                                    }
-                                    if let Err(e) = client.commit(req).await {
-                                        clients_pool.lock().remove(&peer);
-                                        return Err(format!(
-                                            "commit RPC to peer {} failed: {e}",
-                                            peer.0
-                                        ));
-                                    }
-                                }
-                                Phase::Abort => {
-                                    let mut req = tonic::Request::new(barrier_v1::AbortRequest {
-                                        epoch: ann_clone.epoch,
-                                        checkpoint_id: ann_clone.checkpoint_id,
-                                        flags: ann_clone.flags,
-                                    });
-                                    if let Some(lid) = local_id {
-                                        if let Ok(val) = lid.0.to_string().parse() {
-                                            req.metadata_mut().insert("x-leader-id", val);
-                                        }
-                                    }
-                                    if let Err(e) = client.abort(req).await {
-                                        clients_pool.lock().remove(&peer);
-                                        return Err(format!(
-                                            "abort RPC to peer {} failed: {e}",
-                                            peer.0
-                                        ));
-                                    }
-                                }
-                                Phase::Prepare => {}
-                            }
-                            Ok::<(), String>(())
-                        });
+                        futures.push(send_phase_rpc(peer, clients_pool, kv, ann_clone, local_id));
                     }
                     let results = futures::future::join_all(futures).await;
                     for res in results {
-                        res?;
+                        match res {
+                            Ok(()) => {}
+                            // Aligned is best-effort per peer: a missed
+                            // delivery only delays that peer's pipeline
+                            // resume until Commit (or its gate timeout) —
+                            // never fail the announce, and never skip the
+                            // KV write below.
+                            Err(e) if ann.phase == Phase::Aligned => {
+                                tracing::warn!(
+                                    epoch = ann.epoch,
+                                    error = %e,
+                                    "aligned announcement RPC failed; peer resumes on Commit"
+                                );
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
 
@@ -681,38 +815,47 @@ impl BarrierCoordinator {
         Ok(())
     }
 
-    /// Follower-side observe.
+    /// Follower-side observe — returns the *latest* announcement
+    /// (non-destructive; repeated calls return the same value until a
+    /// newer one arrives, matching the gossip-KV fallback). Callers
+    /// already dedup by epoch/phase. The gRPC-delivered value and the
+    /// gossip-KV value are merged by `(epoch, seq)` — within an epoch
+    /// only the leader's announce sequence distinguishes a retry's
+    /// `Prepare` from the previous attempt's `Abort`; on a full tie the
+    /// gRPC value wins (RPC arrival order is authoritative).
     ///
     /// # Errors
     /// Returns a string on JSON decode failure.
     pub async fn observe(&self, leader: NodeId) -> Result<Option<BarrierAnnouncement>, String> {
         #[cfg(feature = "cluster")]
-        {
+        let grpc_latest: Option<BarrierAnnouncement> = {
             let grpc_opt = self.grpc.lock().clone();
-            if let Some(state) = grpc_opt {
-                let taken = { state.incoming_rx.lock().take() };
-                if let Some(rx) = taken {
-                    let blocking_rx = rx.into_blocking();
-                    let res = blocking_rx.try_recv();
-                    let async_rx = blocking_rx.into_async();
-                    *state.incoming_rx.lock() = Some(async_rx);
-                    state.incoming_rx_returned.notify_one();
+            grpc_opt.and_then(|state| state.latest_rx.borrow().clone())
+        };
+        #[cfg(not(feature = "cluster"))]
+        let grpc_latest: Option<BarrierAnnouncement> = None;
 
-                    match res {
-                        Ok(ann) => return Ok(Some(ann)),
-                        Err(crossfire::TryRecvError::Disconnected) => return Ok(None),
-                        Err(crossfire::TryRecvError::Empty) => {} // fallback to KV check below
-                    }
+        let kv_latest: Option<BarrierAnnouncement> =
+            match self.kv.read_from(leader, ANNOUNCEMENT_KEY).await {
+                Some(json) => serde_json::from_str(&json).map(Some).map_err(|e| {
+                    // A decode failure on the KV path is fatal only when
+                    // there is no gRPC value to fall back on.
+                    e.to_string()
+                })?,
+                None => None,
+            };
+
+        Ok(match (grpc_latest, kv_latest) {
+            (Some(g), Some(k)) => {
+                if (k.epoch, k.seq) > (g.epoch, g.seq) {
+                    Some(k)
+                } else {
+                    Some(g)
                 }
             }
-        }
-
-        match self.kv.read_from(leader, ANNOUNCEMENT_KEY).await {
-            Some(json) => serde_json::from_str(&json)
-                .map(Some)
-                .map_err(|e| e.to_string()),
-            None => Ok(None),
-        }
+            (Some(g), None) => Some(g),
+            (None, k) => k,
+        })
     }
 
     /// Follower-side ack.
@@ -772,6 +915,10 @@ impl BarrierCoordinator {
                     };
 
                 let local_id = self.local_node_id().await;
+                // One sequence value per Prepare round: each round is a
+                // (re-)announcement, so it must supersede any earlier
+                // same-epoch announcement (e.g. a prior attempt's Abort).
+                let round_seq = self.next_seq();
                 let mut futures = Vec::new();
                 for &peer in expected {
                     let clients_pool = Arc::clone(&state.clients);
@@ -786,6 +933,7 @@ impl BarrierCoordinator {
                             epoch,
                             checkpoint_id,
                             flags: 0,
+                            seq: round_seq,
                         });
                         if let Some(lid) = local_id {
                             if let Ok(val) = lid.0.to_string().parse() {
@@ -942,14 +1090,22 @@ mod tests {
         use super::*;
         use std::net::SocketAddr;
 
-        async fn wait_observe(coord: &BarrierCoordinator, leader: NodeId) -> BarrierAnnouncement {
+        /// Observation is latest-wins (non-destructive), so wait for the
+        /// expected phase specifically — earlier phases may linger.
+        async fn wait_observe(
+            coord: &BarrierCoordinator,
+            leader: NodeId,
+            phase: Phase,
+        ) -> BarrierAnnouncement {
             for _ in 0..100 {
                 if let Some(ann) = coord.observe(leader).await.unwrap() {
-                    return ann;
+                    if ann.phase == phase {
+                        return ann;
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            panic!("timed out waiting for announcement from leader {leader:?}");
+            panic!("timed out waiting for {phase:?} announcement from leader {leader:?}");
         }
 
         #[tokio::test]
@@ -970,11 +1126,15 @@ mod tests {
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
             follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
 
+            // Sequencing handshake: observation is latest-wins, so the
+            // leader must not announce Commit until the follower has
+            // observed Aligned (otherwise Commit may overwrite it).
+            let (aligned_seen_tx, aligned_seen_rx) = tokio::sync::oneshot::channel::<()>();
+
             let follower_task = tokio::spawn(async move {
-                let ann = wait_observe(&follower_coord, NodeId(1)).await;
+                let ann = wait_observe(&follower_coord, NodeId(1), Phase::Prepare).await;
                 assert_eq!(ann.epoch, 1);
                 assert_eq!(ann.checkpoint_id, 42);
-                assert_eq!(ann.phase, Phase::Prepare);
 
                 follower_coord
                     .ack(&BarrierAck {
@@ -986,8 +1146,12 @@ mod tests {
                     .await
                     .unwrap();
 
-                let commit_ann = wait_observe(&follower_coord, NodeId(1)).await;
-                assert_eq!(commit_ann.phase, Phase::Commit);
+                let aligned_ann = wait_observe(&follower_coord, NodeId(1), Phase::Aligned).await;
+                assert_eq!(aligned_ann.epoch, 1);
+                assert_eq!(aligned_ann.min_watermark_ms, Some(100));
+                aligned_seen_tx.send(()).unwrap();
+
+                let commit_ann = wait_observe(&follower_coord, NodeId(1), Phase::Commit).await;
                 assert_eq!(commit_ann.min_watermark_ms, Some(100));
             });
 
@@ -998,6 +1162,7 @@ mod tests {
                     phase: Phase::Prepare,
                     flags: 0,
                     min_watermark_ms: None,
+                    seq: 0,
                 })
                 .await
                 .unwrap();
@@ -1013,6 +1178,21 @@ mod tests {
                     assert_eq!(acks, vec![NodeId(2)]);
                     assert_eq!(min_follower_watermark_ms, Some(100));
 
+                    // Two-level completion: resume gate first…
+                    leader_coord
+                        .announce(&BarrierAnnouncement {
+                            epoch: 1,
+                            checkpoint_id: 42,
+                            phase: Phase::Aligned,
+                            flags: 0,
+                            min_watermark_ms: min_follower_watermark_ms,
+                            seq: 0,
+                        })
+                        .await
+                        .unwrap();
+                    aligned_seen_rx.await.unwrap();
+
+                    // …then the restorable decision.
                     leader_coord
                         .announce(&BarrierAnnouncement {
                             epoch: 1,
@@ -1020,6 +1200,7 @@ mod tests {
                             phase: Phase::Commit,
                             flags: 0,
                             min_watermark_ms: min_follower_watermark_ms,
+                            seq: 0,
                         })
                         .await
                         .unwrap();
@@ -1029,6 +1210,92 @@ mod tests {
 
             follower_task.await.unwrap();
         }
+    }
+
+    /// Regression: observation is latest-wins, and a retry of an
+    /// aborted epoch reuses the same epoch/checkpoint id. Without the
+    /// announce `seq`, a stale gRPC-delivered `Abort(N)` would mask
+    /// the retry's gossip-delivered `Prepare(N)` forever (follower
+    /// never starts the retry → leader alignment times out → abort →
+    /// livelock).
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn kv_retry_prepare_supersedes_stale_grpc_abort() {
+        let leader_kv = kv(NodeId(1));
+        let follower_kv = kv(NodeId(2));
+        let leader_coord = BarrierCoordinator::new(leader_kv.clone());
+        let follower_coord = BarrierCoordinator::new(follower_kv.clone());
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let slot = || Arc::new(parking_lot::RwLock::new(None));
+        let leader_addr = leader_coord.start_server(addr, None, slot()).await.unwrap();
+        let bound_addr = follower_coord
+            .start_server(addr, None, slot())
+            .await
+            .unwrap();
+        leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
+        follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+
+        // Attempt 1 aborts — delivered over gRPC, lands in the
+        // follower's latest-wins watch (announce stamps seq = 1).
+        leader_coord
+            .announce(&BarrierAnnouncement {
+                epoch: 5,
+                checkpoint_id: 9,
+                phase: Phase::Abort,
+                flags: 0,
+                min_watermark_ms: None,
+                seq: 0,
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if let Some(ann) = follower_coord.observe(NodeId(1)).await.unwrap() {
+                if ann.phase == Phase::Abort {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Attempt 2's early Prepare reaches this follower via
+        // gossip KV only (the prepare RPC comes later, at quorum
+        // time). Its higher seq must win the merge.
+        let retry = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 5,
+            checkpoint_id: 9,
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+            seq: 2,
+        })
+        .unwrap();
+        follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, retry);
+        let got = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+        assert_eq!(
+            got.phase,
+            Phase::Prepare,
+            "retry Prepare (higher seq) must supersede the stale gRPC Abort",
+        );
+
+        // Conversely, a *stale* lower-seq KV value (gossip lag)
+        // must not mask the fresher gRPC value.
+        let stale = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 5,
+            checkpoint_id: 9,
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+            seq: 0,
+        })
+        .unwrap();
+        follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, stale);
+        let got = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+        assert_eq!(
+            got.phase,
+            Phase::Abort,
+            "lagging gossip must not mask the fresher gRPC announcement",
+        );
     }
 
     #[tokio::test]
@@ -1042,6 +1309,7 @@ mod tests {
                 phase: Phase::Prepare,
                 flags: 0,
                 min_watermark_ms: None,
+                seq: 0,
             })
             .await
             .unwrap();

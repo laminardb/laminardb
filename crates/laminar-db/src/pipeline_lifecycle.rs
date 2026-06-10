@@ -1646,7 +1646,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             cluster_controller: self.cluster_controller.lock().clone(),
             #[cfg(feature = "cluster")]
-            last_follower_epoch: None,
+            follower_tail: Arc::default(),
             #[cfg(feature = "cluster")]
             barrier_injectors: Vec::new(),
             #[cfg(feature = "cluster")]

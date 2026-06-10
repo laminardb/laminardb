@@ -77,6 +77,10 @@ pub struct EngineMetrics {
     pub cycle_duration: Histogram,
     /// Checkpoint cycle duration.
     pub checkpoint_duration: Histogram,
+    /// Pipeline stall per barrier: time the pipeline task is blocked by
+    /// a checkpoint (shuffle alignment + state capture + the Aligned
+    /// resume gate), excluding the background durable tail (ADR-003).
+    pub checkpoint_pipeline_stall_duration: Histogram,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// Sink commit round-trip (2PC phase 2).
@@ -268,6 +272,16 @@ impl EngineMetrics {
             checkpoint_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("checkpoint_duration_seconds", "Checkpoint cycle duration")
                     .buckets(prometheus::exponential_buckets(0.01, 2.0, 15).unwrap()),
+            )
+            .unwrap()),
+            // Stall target is sub-second; the resume gate is bounded at
+            // 30s. 0.001 * 2^15 = 32.77s.
+            checkpoint_pipeline_stall_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_pipeline_stall_duration_seconds",
+                    "Pipeline stall per checkpoint barrier (align + capture + resume gate)",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )
             .unwrap()),
             // pre_commit_timeout=30s. 0.005 * 2^13 = 40.96s.

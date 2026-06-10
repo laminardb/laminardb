@@ -796,6 +796,7 @@ mod two_pc {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
 
         let follower_handle = tokio::spawn(async move {
@@ -878,6 +879,7 @@ mod two_pc {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
         let follower_handle = tokio::spawn(async move {
             follower_coord
@@ -938,6 +940,7 @@ mod two_pc {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
         let committed = follower_coord
             .follower_checkpoint(
@@ -985,6 +988,7 @@ mod two_pc {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
         let committed = follower_coord
             .follower_checkpoint(
@@ -1111,6 +1115,7 @@ mod minio {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         };
 
         let follower_handle = tokio::spawn(async move {

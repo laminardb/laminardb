@@ -292,10 +292,12 @@ impl ClusterController {
 
     /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
-    /// As a side effect, a `Commit` announcement with a populated
-    /// `min_watermark_ms` updates the shared cluster-min-watermark
-    /// atomic so operators on this instance see the cluster-wide
-    /// minimum without a separate polling path.
+    /// As a side effect, an `Aligned` or `Commit` announcement with a
+    /// populated `min_watermark_ms` updates the shared
+    /// cluster-min-watermark atomic so operators on this instance see
+    /// the cluster-wide minimum without a separate polling path
+    /// (`Aligned` carries it so a resuming pipeline sees fresh
+    /// event-time progress before the upload-gated `Commit`).
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::observe`] errors.
@@ -305,7 +307,7 @@ impl ClusterController {
         };
         let observed = self.barrier.observe(leader).await?;
         if let Some(ref ann) = observed {
-            if ann.phase == Phase::Commit {
+            if matches!(ann.phase, Phase::Commit | Phase::Aligned) {
                 if let Some(wm) = ann.min_watermark_ms {
                     // Monotonic publish — never lower the watermark,
                     // even if a stale announcement re-gossips.
@@ -452,6 +454,7 @@ mod tests {
             phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         })
         .await
         .unwrap();
@@ -496,6 +499,7 @@ mod tests {
             phase: crate::cluster::control::Phase::Commit,
             flags: 0,
             min_watermark_ms: Some(12_345),
+            seq: 0,
         })
         .await
         .unwrap();
@@ -510,6 +514,7 @@ mod tests {
             phase: crate::cluster::control::Phase::Commit,
             flags: 0,
             min_watermark_ms: Some(100), // stale re-gossip
+            seq: 0,
         })
         .await
         .unwrap();
@@ -527,6 +532,7 @@ mod tests {
             phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
+            seq: 0,
         })
         .await
         .unwrap();
