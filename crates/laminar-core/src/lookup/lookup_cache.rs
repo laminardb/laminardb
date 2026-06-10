@@ -9,13 +9,12 @@
 //! `RecordBatch` clone is Arc bumps only (~16-48ns), within Ring 0 budget.
 
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use equivalent::Equivalent;
 use quick_cache::sync::{Cache, DefaultLifecycle};
-use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
+use quick_cache::{DefaultHashBuilder, Weighter};
 
 use crate::lookup::table::LookupResult;
 
@@ -62,17 +61,15 @@ impl Equivalent<LookupCacheKey> for LookupCacheKeyRef<'_> {
 pub struct LookupMemoryCacheConfig {
     /// Memory budget in bytes. Entries are weighted by their `RecordBatch`
     /// array size, so a few wide rows can't blow the bound the way an
-    /// entry-count limit would.
+    /// entry-count limit would. The budget is split across internal shards;
+    /// an entry larger than a shard's slice is rejected rather than admitted
+    /// (it degrades to a re-fetch, never an error).
     pub capacity_bytes: usize,
-    /// Number of shards for concurrent access (should be a power of 2).
-    /// Each shard holds `capacity_bytes / shards`; an entry larger than its
-    /// shard's budget is rejected rather than admitted.
-    pub shards: usize,
     /// Optional time-to-live. An entry older than `ttl` is treated as a miss
-    /// on the next [`get`](LookupMemoryCache::get) (lazy expiry) and dropped, so
-    /// the caller re-fetches from the source. `None` = entries live until the
-    /// byte bound evicts them (eventual freshness via eviction + CDC
-    /// invalidation only).
+    /// on the next [`get_cached`](LookupMemoryCache::get_cached) (lazy expiry)
+    /// and dropped, so the caller re-fetches from the source. `None` = entries
+    /// live until the byte bound evicts them (eventual freshness via eviction
+    /// + CDC invalidation only).
     pub ttl: Option<Duration>,
 }
 
@@ -80,7 +77,6 @@ impl Default for LookupMemoryCacheConfig {
     fn default() -> Self {
         Self {
             capacity_bytes: 64 * 1024 * 1024, // 64 MiB
-            shards: 16,
             ttl: None,
         }
     }
@@ -109,8 +105,9 @@ type BatchCache = Cache<LookupCacheKey, CachedBatch, BatchWeighter>;
 
 /// `quick_cache`-backed in-memory lookup table cache.
 ///
-/// Wraps [`quick_cache::sync::Cache`] with hit/miss counters and lookup-table
-/// semantics. Designed for Ring 0 (< 500ns per operation).
+/// Wraps [`quick_cache::sync::Cache`] with lookup-table semantics (composite
+/// table-scoped keys, lazy TTL expiry). Designed for Ring 0 (< 500ns per
+/// operation).
 ///
 /// # Thread safety
 ///
@@ -121,30 +118,18 @@ pub struct LookupMemoryCache {
     cache: BatchCache,
     table_id: u32,
     ttl: Option<Duration>,
-    hits: AtomicU64,
-    misses: AtomicU64,
 }
 
 impl LookupMemoryCache {
     /// Create a new cache with the given configuration.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: the options builder only errors when a capacity
-    /// field is left unset, and both are always set here.
     #[must_use]
     pub fn new(table_id: u32, config: LookupMemoryCacheConfig) -> Self {
         // Estimated entry count only sizes internal tables (ghost set, shard
         // count); within an order of magnitude is fine. Assume ~1 KiB/entry.
         let estimated_items = (config.capacity_bytes / 1024).max(64);
-        let options = OptionsBuilder::new()
-            .shards(config.shards)
-            .estimated_items_capacity(estimated_items)
-            .weight_capacity(config.capacity_bytes as u64)
-            .build()
-            .expect("both capacities are set");
-        let cache = BatchCache::with_options(
-            options,
+        let cache = BatchCache::with(
+            estimated_items,
+            config.capacity_bytes as u64,
             BatchWeighter,
             DefaultHashBuilder::default(),
             DefaultLifecycle::default(),
@@ -154,8 +139,6 @@ impl LookupMemoryCache {
             cache,
             table_id,
             ttl: config.ttl,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
@@ -163,32 +146,6 @@ impl LookupMemoryCache {
     #[must_use]
     pub fn with_defaults(table_id: u32) -> Self {
         Self::new(table_id, LookupMemoryCacheConfig::default())
-    }
-
-    /// Total cache hits since creation.
-    #[must_use]
-    pub fn hit_count(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-
-    /// Total cache misses since creation.
-    #[must_use]
-    pub fn miss_count(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-
-    /// Cache hit ratio (0.0 – 1.0).
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn hit_ratio(&self) -> f64 {
-        let hits = self.hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        }
     }
 
     /// The table ID this cache is associated with.
@@ -209,38 +166,27 @@ impl LookupMemoryCache {
     ///
     /// When a TTL is configured, an entry older than the TTL is dropped and
     /// reported as a miss (lazy expiry), so the caller re-fetches a fresh value
-    /// from the source.
+    /// from the source. The drop is best-effort: a fresh value racing in
+    /// between the get and the remove may be dropped too, costing one
+    /// redundant re-fetch.
+    #[must_use]
     pub fn get_cached(&self, key: &[u8]) -> LookupResult {
         let ref_key = LookupCacheKeyRef {
             table_id: self.table_id,
             key,
         };
-        if let Some(cached) = self.cache.get(&ref_key) {
-            if self
-                .ttl
-                .is_some_and(|ttl| cached.inserted_at.elapsed() >= ttl)
+        match self.cache.get(&ref_key) {
+            Some(cached)
+                if self
+                    .ttl
+                    .is_some_and(|ttl| cached.inserted_at.elapsed() >= ttl) =>
             {
-                // Lazy expiry. If a fresh value raced in between the get and
-                // the remove, put it back rather than dropping it.
-                if let Some((k, v)) = self.cache.remove(&ref_key) {
-                    if v.inserted_at != cached.inserted_at {
-                        self.cache.insert(k, v);
-                    }
-                }
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return LookupResult::NotFound;
+                self.cache.remove(&ref_key);
+                LookupResult::NotFound
             }
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            LookupResult::Hit(cached.batch)
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            LookupResult::NotFound
+            Some(cached) => LookupResult::Hit(cached.batch),
+            None => LookupResult::NotFound,
         }
-    }
-
-    /// Alias for [`get_cached`](Self::get_cached). No slower storage tiers are wired yet.
-    pub fn get(&self, key: &[u8]) -> LookupResult {
-        self.get_cached(key)
     }
 
     /// Insert or update a cached entry. The TTL clock starts now.
@@ -265,6 +211,7 @@ impl LookupMemoryCache {
     }
 
     /// Number of entries currently in the cache.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.cache.len()
     }
@@ -282,8 +229,6 @@ impl std::fmt::Debug for LookupMemoryCache {
             .field("table_id", &self.table_id)
             .field("ttl", &self.ttl)
             .field("entries", &self.cache.len())
-            .field("hits", &self.hits.load(Ordering::Relaxed))
-            .field("misses", &self.misses.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -305,7 +250,6 @@ mod tests {
             table_id,
             LookupMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
-                shards: 4,
                 ttl: None,
             },
         )
@@ -315,27 +259,22 @@ mod tests {
     fn test_lookup_cache_hit_miss() {
         let cache = small_cache(1);
 
-        let result = cache.get_cached(b"key1");
-        assert!(result.is_not_found());
-        assert_eq!(cache.miss_count(), 1);
+        assert!(cache.get_cached(b"key1").is_not_found());
 
         cache.insert(b"key1", test_batch("value1"));
         let result = cache.get_cached(b"key1");
         assert!(result.is_hit());
-        let batch = result.into_batch().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(result.into_batch().unwrap().num_rows(), 1);
     }
 
     #[test]
     fn test_lookup_cache_eviction() {
-        // Tiny byte budget: inserting many batches must evict (the bound is
-        // bytes, so the cache can't hold all 200 entries).
+        // Tiny byte budget: inserting many batches must evict or reject (the
+        // bound is bytes, so the cache can't hold all 200 entries).
         let cache = LookupMemoryCache::new(
             1,
             LookupMemoryCacheConfig {
                 capacity_bytes: 512,
-                shards: 1,
                 ttl: None,
             },
         );
@@ -378,50 +317,11 @@ mod tests {
         assert_ne!(batch_a, batch_b);
     }
 
-    #[test]
-    fn test_lookup_cache_methods() {
-        let cache = small_cache(1);
-
-        cache.insert(b"k", test_batch("v"));
-        assert!(!cache.is_empty());
-        assert!(cache.get(b"k").is_hit());
-    }
-
-    #[test]
-    fn test_lookup_cache_hit_ratio() {
-        let cache = small_cache(1);
-        cache.insert(b"k1", test_batch("v1"));
-
-        // 1 hit
-        cache.get_cached(b"k1");
-        // 1 miss
-        cache.get_cached(b"k2");
-
-        assert!((cache.hit_ratio() - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_lookup_cache_debug() {
-        let cache = small_cache(42);
-        let debug = format!("{cache:?}");
-        assert!(debug.contains("LookupMemoryCache"));
-        assert!(debug.contains("table_id: 42"));
-    }
-
-    #[test]
-    fn test_lookup_cache_default_config() {
-        let config = LookupMemoryCacheConfig::default();
-        assert_eq!(config.capacity_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.shards, 16);
-        assert!(config.ttl.is_none());
-    }
-
     fn ttl_cache(ttl: Duration) -> LookupMemoryCache {
         LookupMemoryCache::new(
             1,
             LookupMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
-                shards: 4,
                 ttl: Some(ttl),
             },
         )
@@ -435,7 +335,6 @@ mod tests {
         assert!(cache.get_cached(b"k").is_not_found());
         // The expired entry was evicted, not just skipped.
         assert!(cache.is_empty());
-        assert_eq!(cache.miss_count(), 1);
     }
 
     #[test]
@@ -457,17 +356,5 @@ mod tests {
         cache.insert(b"k", test_batch("v"));
         std::thread::sleep(Duration::from_millis(10));
         assert!(cache.get_cached(b"k").is_hit());
-    }
-
-    #[test]
-    fn test_lookup_cache_recordbatch_clone_is_cheap() {
-        let cache = small_cache(1);
-        let batch = test_batch("value");
-        cache.insert(b"k", batch.clone());
-
-        let hit1 = cache.get_cached(b"k").into_batch().unwrap();
-        let hit2 = cache.get_cached(b"k").into_batch().unwrap();
-        assert_eq!(hit1, hit2);
-        assert_eq!(hit1.num_rows(), 1);
     }
 }

@@ -31,7 +31,6 @@ fn populated_cache(n: usize) -> LookupMemoryCache {
         LookupMemoryCacheConfig {
             // Generous byte budget so the working set is never evicted mid-bench.
             capacity_bytes: n.saturating_mul(8 * 1024),
-            shards: 16,
             ttl: None,
         },
     );

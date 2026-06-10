@@ -12,10 +12,8 @@
 //! is a memory op: cheap enough to gate the inference worker from the operator
 //! without doing the model call inline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use quick_cache::sync::{Cache, DefaultLifecycle};
-use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
+use quick_cache::{DefaultHashBuilder, Weighter};
 
 use crate::ai::provider::InferenceParams;
 use crate::ai::registry::Task;
@@ -84,15 +82,12 @@ pub struct AiResultCacheConfig {
     /// bounds memory directly — an entry count would not, since an embedding
     /// vector is orders of magnitude larger than a one-word label.
     pub capacity_bytes: usize,
-    /// Number of shards for concurrent access (power of 2).
-    pub shards: usize,
 }
 
 impl Default for AiResultCacheConfig {
     fn default() -> Self {
         Self {
             capacity_bytes: 64 * 1024 * 1024,
-            shards: 16,
         }
     }
 }
@@ -120,40 +115,24 @@ impl Weighter<AiCacheKey, CachedOutput> for OutputWeighter {
 /// `Send + Sync`.
 pub struct AiResultCache {
     cache: Cache<AiCacheKey, CachedOutput, OutputWeighter>,
-    hits: AtomicU64,
-    misses: AtomicU64,
 }
 
 impl AiResultCache {
     /// Create a cache with the given configuration.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: the options builder only errors when a capacity
-    /// field is left unset, and both are always set here.
     #[must_use]
     pub fn new(config: AiResultCacheConfig) -> Self {
         // Estimated entry count only sizes internal tables; within an order
         // of magnitude is fine. Assume ~256 B/entry (labels are small,
         // embeddings large; the byte weighter enforces the real bound).
         let estimated_items = (config.capacity_bytes / 256).max(64);
-        let options = OptionsBuilder::new()
-            .shards(config.shards)
-            .estimated_items_capacity(estimated_items)
-            .weight_capacity(config.capacity_bytes as u64)
-            .build()
-            .expect("both capacities are set");
-        let cache = Cache::with_options(
-            options,
+        let cache = Cache::with(
+            estimated_items,
+            config.capacity_bytes as u64,
             OutputWeighter,
             DefaultHashBuilder::default(),
             DefaultLifecycle::default(),
         );
-        Self {
-            cache,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
+        Self { cache }
     }
 
     /// Create a cache with default configuration.
@@ -162,33 +141,15 @@ impl AiResultCache {
         Self::new(AiResultCacheConfig::default())
     }
 
-    /// Look up a cached result, recording a hit or miss.
+    /// Look up a cached result.
     #[must_use]
     pub fn get(&self, key: &AiCacheKey) -> Option<CachedOutput> {
-        if let Some(value) = self.cache.get(key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(value)
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+        self.cache.get(key)
     }
 
     /// Insert or update a cached result.
     pub fn insert(&self, key: AiCacheKey, value: CachedOutput) {
         self.cache.insert(key, value);
-    }
-
-    /// Total cache hits since creation.
-    #[must_use]
-    pub fn hit_count(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-
-    /// Total cache misses since creation.
-    #[must_use]
-    pub fn miss_count(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
     }
 
     /// Number of entries currently cached.
@@ -208,8 +169,6 @@ impl std::fmt::Debug for AiResultCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AiResultCache")
             .field("len", &self.len())
-            .field("hits", &self.hit_count())
-            .field("misses", &self.miss_count())
             .finish()
     }
 }
@@ -259,6 +218,5 @@ mod tests {
             cache.get(&remote),
             Some(CachedOutput::Text("negative".into()))
         );
-        assert_eq!(cache.hit_count(), 2);
     }
 }

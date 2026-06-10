@@ -52,7 +52,6 @@ fn bench_lookup_join_throughput(c: &mut Criterion) {
         LookupMemoryCacheConfig {
             // Generous byte budget so the dimension set is never evicted mid-bench.
             capacity_bytes: dim_size.saturating_mul(8 * 1024),
-            shards: 16,
             ttl: None,
         },
     );
@@ -98,7 +97,6 @@ fn bench_lookup_join_miss_rate(c: &mut Criterion) {
         LookupMemoryCacheConfig {
             // Generous byte budget so the dimension set is never evicted mid-bench.
             capacity_bytes: dim_size.saturating_mul(8 * 1024),
-            shards: 16,
             ttl: None,
         },
     );

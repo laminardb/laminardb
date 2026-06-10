@@ -387,7 +387,7 @@ impl LookupEnrichOperator {
                 continue;
             }
             let key = rows.row(row);
-            match resolved.cache.get(key.as_ref()).into_batch() {
+            match resolved.cache.get_cached(key.as_ref()).into_batch() {
                 // Zero-row batch = negative-cache tombstone (known miss).
                 Some(b) if b.num_rows() == 0 => {
                     hits += 1;

@@ -2089,7 +2089,6 @@ mod tests {
             1,
             LookupMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
-                shards: 4,
                 ttl: None,
             },
         ))

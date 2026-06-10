@@ -1186,7 +1186,6 @@ impl LaminarDB {
                 0,
                 laminar_core::lookup::lookup_cache::LookupMemoryCacheConfig {
                     capacity_bytes,
-                    shards: 16,
                     ttl: reg.cache_ttl,
                 },
             ));
