@@ -221,11 +221,18 @@ fn three_node_kill9_soak() {
     );
     let url = std::env::var("LAMINAR_SOAK_CHECKPOINT_URL").unwrap_or(default_url);
 
+    // Node logs go under target/ (not the tempdir) so they survive a
+    // failed run for post-mortem; the path is printed up front.
+    let log_dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    eprintln!("soak: node logs in {}", log_dir.display());
+
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
             id,
             config_path: write_config(dir.path(), id, interval_ms, &url),
-            log_path: dir.path().join(format!("node{id}.log")),
+            log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
         })

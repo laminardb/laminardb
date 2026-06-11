@@ -544,7 +544,7 @@ impl ConnectorPipelineCallback {
             )
             .await
             {
-                Ok(min_watermark_ms) => {
+                Ok((min_watermark_ms, participants)) => {
                     if let Err(e) = cc
                         .announce_barrier(&BarrierAnnouncement {
                             epoch,
@@ -560,7 +560,10 @@ impl ConnectorPipelineCallback {
                             "[LDB-6031] aligned announcement failed; peers resume on Commit"
                         );
                     }
-                    quorum = QuorumStage::Done(min_watermark_ms);
+                    quorum = QuorumStage::Done {
+                        min_watermark_ms,
+                        participants,
+                    };
                 }
                 Err(msg) => {
                     tracing::error!(checkpoint_id, epoch, error = %msg, "[LDB-6032] quorum miss");

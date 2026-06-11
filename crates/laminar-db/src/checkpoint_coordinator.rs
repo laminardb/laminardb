@@ -186,14 +186,21 @@ impl EpochAllocator {
 /// Whether `checkpoint_inner` still needs to run the cluster capture
 /// quorum, or a pipelined tail already ran it before taking the
 /// coordinator mutex.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum QuorumStage {
     /// Run the quorum + `Aligned` announce inline (forced/timer paths).
     RunInline,
     /// Already reached before the coordinator lock; carries the merged
-    /// cluster-min watermark for the `Commit` announcement.
+    /// cluster-min watermark for the `Commit` announcement plus the
+    /// capture-time follower set, so the durability gate can fail fast
+    /// if one of them dies instead of burning its full timeout.
     #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
-    Done(Option<i64>),
+    Done {
+        /// Merged cluster-min watermark from the capture acks.
+        min_watermark_ms: Option<i64>,
+        /// Followers that acked the capture quorum.
+        participants: Vec<laminar_core::cluster::discovery::NodeId>,
+    },
 }
 
 /// Phase of the checkpoint lifecycle.
@@ -828,7 +835,11 @@ impl CheckpointCoordinator {
     ///
     /// Transient backend errors are retried until the deadline; a
     /// split-brain commit marker aborts immediately.
-    async fn await_restorable_gate(&self, epoch: u64) -> Result<(), String> {
+    async fn await_restorable_gate(
+        &self,
+        epoch: u64,
+        participants: &[laminar_core::cluster::discovery::NodeId],
+    ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
         // Each `epoch_complete` call LISTs the epoch prefix on the
@@ -871,6 +882,29 @@ impl CheckpointCoordinator {
                     last_state = e.to_string();
                 }
             }
+            // Fail fast when a capture participant dies: its uploads
+            // will never arrive, so waiting out the timeout only
+            // stalls the pipeline — and with pipelining, queued doomed
+            // epochs would each burn the full timeout serially.
+            #[cfg(feature = "cluster")]
+            if let Some(cc) = self.cluster_controller.as_ref() {
+                if let Some(reason) =
+                    Self::unhealthy_participant(&cc.members_watch().borrow(), participants)
+                {
+                    return Err(format!("durability gate fail-fast: {reason}"));
+                }
+                if let Some(p) = participants
+                    .iter()
+                    .find(|p| cc.is_recently_unresponsive(**p))
+                {
+                    return Err(format!(
+                        "durability gate fail-fast: follower {} missed a capture quorum",
+                        p.0
+                    ));
+                }
+            }
+            #[cfg(not(feature = "cluster"))]
+            let _ = participants;
             if Instant::now() >= deadline {
                 return Err(format!(
                     "state durability gate timed out after {:?}: {last_state}",
@@ -1104,17 +1138,24 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Announce PREPARE and block for follower acks. Returns `None` on
-    /// quorum or no-op (not leader); `Some(msg)` with the failure
-    /// (after announcing `Abort`). When quorum is reached, writes the
+    /// Announce PREPARE and block for follower acks. On quorum (or
+    /// no-op — not leader / no controller) returns the capture-time
+    /// follower set for the durability gate fail-fast and writes the
     /// cluster-wide minimum watermark into `self.cluster_min_watermark`
-    /// so the subsequent `Commit` announcement can fan it out.
+    /// so the subsequent `Commit` announcement can fan it out. On
+    /// failure, announces `Abort` and returns the failure message.
     #[cfg(feature = "cluster")]
-    async fn await_prepare_quorum(&mut self, epoch: u64, checkpoint_id: u64) -> Option<String> {
+    async fn await_prepare_quorum(
+        &mut self,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<Vec<laminar_core::cluster::discovery::NodeId>, String> {
         use laminar_core::cluster::control::Phase;
-        let cc = Arc::clone(self.cluster_controller.as_ref()?);
+        let Some(cc) = self.cluster_controller.clone() else {
+            return Ok(Vec::new());
+        };
         if !cc.is_leader() {
-            return None;
+            return Ok(Vec::new());
         }
         match Self::run_prepare_quorum(
             &cc,
@@ -1125,16 +1166,48 @@ impl CheckpointCoordinator {
         )
         .await
         {
-            Ok(merged) => {
+            Ok((merged, participants)) => {
                 self.cluster_min_watermark = merged;
-                None
+                Ok(participants)
             }
             Err(msg) => {
                 self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
                     .await;
-                Some(msg)
+                Err(msg)
             }
         }
+    }
+
+    /// Shared health predicate for the capture quorum and the
+    /// durability gate: a participant that is suspected, draining,
+    /// left, or vanished can no longer contribute to this epoch, so
+    /// waiting out the full timeout only stalls the pipeline.
+    #[cfg(feature = "cluster")]
+    fn unhealthy_participant(
+        members: &[laminar_core::cluster::discovery::NodeInfo],
+        participants: &[laminar_core::cluster::discovery::NodeId],
+    ) -> Option<String> {
+        use laminar_core::cluster::discovery::NodeState;
+        for &id in participants {
+            match members.iter().find(|m| m.id.0 == id.0) {
+                Some(node)
+                    if matches!(
+                        node.state,
+                        NodeState::Suspected | NodeState::Left | NodeState::Draining
+                    ) =>
+                {
+                    return Some(format!(
+                        "Follower {} transitioned to unhealthy state {:?}",
+                        id.0, node.state
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return Some(format!("Follower {} missing from cluster membership", id.0));
+                }
+            }
+        }
+        None
     }
 
     /// The capture-quorum stage, callable without the coordinator mutex
@@ -1151,7 +1224,7 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
         local_watermark_ms: Option<i64>,
-    ) -> Result<Option<i64>, String> {
+    ) -> Result<(Option<i64>, Vec<laminar_core::cluster::discovery::NodeId>), String> {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase, QuorumOutcome};
 
         if let Err(e) = cc
@@ -1175,36 +1248,17 @@ impl CheckpointCoordinator {
             if let Some(wm) = local_watermark_ms {
                 cc.publish_cluster_min_watermark(wm);
             }
-            return Ok(local_watermark_ms);
+            return Ok((local_watermark_ms, Vec::new()));
         }
 
         let mut members_rx = cc.members_watch();
 
         let quorum_fut = cc.wait_for_quorum(epoch, &followers, quorum_timeout);
         let membership_fut = async {
-            use laminar_core::cluster::discovery::NodeState;
             loop {
+                if let Some(reason) = Self::unhealthy_participant(&members_rx.borrow(), &followers)
                 {
-                    let members = members_rx.borrow();
-                    for &follower_id in &followers {
-                        let follower_node = members.iter().find(|m| m.id.0 == follower_id.0);
-                        if let Some(node) = follower_node {
-                            if matches!(
-                                node.state,
-                                NodeState::Suspected | NodeState::Left | NodeState::Draining
-                            ) {
-                                return format!(
-                                    "Follower {} transitioned to unhealthy state {:?}",
-                                    follower_id.0, node.state
-                                );
-                            }
-                        } else {
-                            return format!(
-                                "Follower {} missing from cluster membership",
-                                follower_id.0
-                            );
-                        }
-                    }
+                    return reason;
                 }
                 if members_rx.changed().await.is_err() {
                     // Membership watch closed (host shutting down): this
@@ -1225,8 +1279,10 @@ impl CheckpointCoordinator {
         match outcome {
             Ok(QuorumOutcome::Reached {
                 min_follower_watermark_ms,
-                ..
+                ref acks,
             }) => {
+                // Demonstrably alive — clear any quorum-miss suspicion.
+                cc.note_responsive(acks);
                 // Fold follower min with the leader's own watermark.
                 let merged = match (local_watermark_ms, min_follower_watermark_ms) {
                     (Some(a), Some(b)) => Some(a.min(b)),
@@ -1237,12 +1293,19 @@ impl CheckpointCoordinator {
                 if let Some(wm) = merged {
                     cc.publish_cluster_min_watermark(wm);
                 }
-                Ok(merged)
+                Ok((merged, followers))
             }
-            Ok(QuorumOutcome::TimedOut { missing, .. }) => Err(format!(
-                "quorum timeout: {} follower(s) did not ack",
-                missing.len()
-            )),
+            Ok(QuorumOutcome::TimedOut { missing, .. }) => {
+                // Gossip failure detection can lag a hard kill by tens
+                // of seconds; record the leader''s own faster signal so
+                // the durability gates of already-captured epochs fail
+                // fast instead of each burning their full timeout.
+                cc.note_unresponsive(&missing);
+                Err(format!(
+                    "quorum timeout: {} follower(s) did not ack",
+                    missing.len()
+                ))
+            }
             Ok(QuorumOutcome::Failed { failures }) => {
                 let first = failures.first().map_or("unknown", |(_, msg)| msg.as_str());
                 Err(format!(
@@ -1867,14 +1930,19 @@ impl CheckpointCoordinator {
         // taking the coordinator mutex (so Aligned is never queued
         // behind an earlier epoch's uploads) and pass `Done` here.
         #[cfg(feature = "cluster")]
+        #[allow(unused_assignments)] // both match arms assign; init keeps non-cluster shape
+        let mut quorum_participants: Vec<laminar_core::cluster::discovery::NodeId> = Vec::new();
+        #[cfg(feature = "cluster")]
         match quorum {
             QuorumStage::RunInline => {
-                if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await
-                {
-                    error!(checkpoint_id, epoch, error = %quorum_failure, "[LDB-6032] quorum miss");
-                    return Ok(self
-                        .fail_epoch(checkpoint_id, epoch, start, quorum_failure)
-                        .await);
+                match self.await_prepare_quorum(epoch, checkpoint_id).await {
+                    Ok(p) => quorum_participants = p,
+                    Err(quorum_failure) => {
+                        error!(checkpoint_id, epoch, error = %quorum_failure, "[LDB-6032] quorum miss");
+                        return Ok(self
+                            .fail_epoch(checkpoint_id, epoch, start, quorum_failure)
+                            .await);
+                    }
                 }
                 self.announce_if_leader(
                     epoch,
@@ -1884,8 +1952,12 @@ impl CheckpointCoordinator {
                 )
                 .await;
             }
-            QuorumStage::Done(min_watermark_ms) => {
+            QuorumStage::Done {
+                min_watermark_ms,
+                participants,
+            } => {
                 self.cluster_min_watermark = min_watermark_ms;
+                quorum_participants = participants;
             }
         }
         #[cfg(not(feature = "cluster"))]
@@ -2003,7 +2075,12 @@ impl CheckpointCoordinator {
         // defaults to `vnode_set` (the two match). Followers upload
         // asynchronously after their capture ack, so this polls until
         // `restorable_gate_timeout` rather than checking once.
-        if let Err(gate_err) = self.await_restorable_gate(epoch).await {
+        #[cfg(not(feature = "cluster"))]
+        let quorum_participants: Vec<laminar_core::cluster::discovery::NodeId> = Vec::new();
+        if let Err(gate_err) = self
+            .await_restorable_gate(epoch, &quorum_participants)
+            .await
+        {
             warn!(
                 checkpoint_id,
                 epoch,
@@ -3440,7 +3517,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         coord
-            .await_restorable_gate(1)
+            .await_restorable_gate(1, &[])
             .await
             .expect("gate must seal once the late partials land");
         assert!(

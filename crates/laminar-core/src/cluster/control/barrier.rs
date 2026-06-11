@@ -918,7 +918,13 @@ impl BarrierCoordinator {
                             }
                             Ok(Err(e)) => {
                                 clients_pool.lock().remove(&peer);
-                                Err((peer, e.to_string()))
+                                // Transport-level failure (connect refused,
+                                // reset): the peer is unreachable — the same
+                                // epistemic state as a timeout, NOT an
+                                // application-level NACK. Classified as
+                                // missing below so `Failed` keeps meaning
+                                // "a live follower answered ok = false".
+                                Err((peer, format!("unreachable: {e}")))
                             }
                             Err(_) => {
                                 clients_pool.lock().remove(&peer);
@@ -947,7 +953,10 @@ impl BarrierCoordinator {
                             }
                         }
                         Err((peer, msg)) => {
-                            if msg.contains("Timeout") || msg.contains("deadline exceeded") {
+                            if msg.contains("Timeout")
+                                || msg.contains("deadline exceeded")
+                                || msg.starts_with("unreachable:")
+                            {
                                 timed_out.push(peer);
                             } else {
                                 failures.push((peer, msg));
