@@ -317,3 +317,18 @@ At 100ms the soak now survives kills and rejoins until it hits this
 window (~round 4); at 500ms all rounds pass. Sign-off order: fix (5),
 then 900s+ clean at 100ms, then hours-long + MinIO + exactly-once
 sink diff.
+## SOAK GREEN (2026-06-11, honest commit assertions)
+
+Both target cadences pass the 3-node real-binary kill -9 soak with
+commit-based progress assertions: 500ms — 5 fault rounds (final epoch
+45); 100ms — 6 fault rounds (final epoch 57); every node including the
+leader killed and recovered each cycle, dead-node vnode rotation
+shedding + rehydrating every round. Fixes that got here (`cd4fde0f`):
+membership-watch dedup (heartbeat ticks starved the rebalance
+debounce forever), skip the pre-rotation drain when shedding a dead
+node (it deadlocked rotation against the durability gate), recovery
+budgets cut (drain 60→15s, retry 10→2s, the four 30s last-resort
+bounds → 10s — fail-fasts are the primary path now). Endurance run
+(3600s @ 100ms) launched detached → target/soak-endurance-100ms.log.
+Remaining for full sign-off: that endurance result, MinIO/S3 variant,
+exactly-once sink-output diff.
