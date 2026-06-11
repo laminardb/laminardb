@@ -1478,6 +1478,7 @@ impl CheckpointCoordinator {
     /// Abandon a pre-allocated epoch whose pre-mutex stage (alignment
     /// or capture quorum) failed: announce `Abort`, roll back, and
     /// begin the next epoch's sink transactions.
+    #[cfg(feature = "cluster")]
     pub(crate) async fn abandon_epoch(
         &mut self,
         checkpoint_id: u64,
