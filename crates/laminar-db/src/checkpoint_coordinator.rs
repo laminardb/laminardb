@@ -1607,9 +1607,10 @@ impl CheckpointCoordinator {
                         );
                         return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
                     }
-                    // No marker yet — keep waiting (the predicate keeps
-                    // matching the newer epoch, so pace the re-check).
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // No marker yet — keep waiting. Each pass through
+                    // this (rare) state costs an object-store HEAD, so
+                    // pace the re-check well below the decision timeout.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 None => {
                     // Deadline: one last durable-marker check.

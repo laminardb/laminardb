@@ -122,6 +122,28 @@ impl Drop for EpochInFlightGuard {
     }
 }
 
+/// Everything the leader's spawned durable tail needs
+/// (see [`ConnectorPipelineCallback::run_leader_tail`]).
+struct LeaderTail {
+    in_flight: EpochInFlightGuard,
+    coordinator:
+        Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
+    complete_tx: crossfire::MAsyncTx<
+        crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
+    >,
+    request: crate::checkpoint_coordinator::CheckpointRequest,
+    #[allow(clippy::disallowed_types)]
+    vnode_states: std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    fan_out: FxHashMap<String, SourceCheckpoint>,
+    local_watermark_ms: Option<i64>,
+    /// `Some` when this node admitted the barrier as cluster leader.
+    leader_ids: Option<(u64, u64)>,
+    #[cfg(feature = "cluster")]
+    controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    #[cfg(feature = "cluster")]
+    quorum_timeout: Duration,
+}
+
 /// Captured-state bytes a pending [`CheckpointRequest`]
 /// (plus per-vnode slices) holds in memory while its epoch is between
 /// capture and upload — the unit the `max_staged_bytes` admission cap
@@ -500,6 +522,91 @@ impl ConnectorPipelineCallback {
         last_committed.is_some_and(|e| e >= ann_epoch)
             || pending.is_some_and(|e| e >= ann_epoch)
             || tail_in_flight.is_some_and(|e| e >= ann_epoch)
+    }
+
+    /// The leader's durable tail, spawned per admitted barrier
+    /// (`run_leader_tail`). Stage 1 (cluster): capture quorum +
+    /// `Aligned` announce, run *before* the coordinator mutex so the
+    /// resume gate never queues behind an earlier epoch's uploads.
+    /// Stage 2: the durable remainder under the FIFO mutex, which keeps
+    /// epochs restorable in order. Commit completion flows back through
+    /// `complete_tx` (`EpochCommitted` fan-out + wire barrier).
+    async fn run_leader_tail(tail: LeaderTail) {
+        use crate::checkpoint_coordinator::QuorumStage;
+
+        let _in_flight = tail.in_flight; // released on drop, even on panic
+
+        #[allow(unused_mut)]
+        let mut quorum = QuorumStage::RunInline;
+        #[cfg(feature = "cluster")]
+        if let (Some(cc), Some((epoch, checkpoint_id))) =
+            (tail.controller.as_ref(), tail.leader_ids)
+        {
+            use crate::checkpoint_coordinator::CheckpointCoordinator;
+            use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+            match CheckpointCoordinator::run_prepare_quorum(
+                cc,
+                tail.quorum_timeout,
+                epoch,
+                checkpoint_id,
+                tail.local_watermark_ms,
+            )
+            .await
+            {
+                Ok(min_watermark_ms) => {
+                    if let Err(e) = cc
+                        .announce_barrier(&BarrierAnnouncement {
+                            epoch,
+                            checkpoint_id,
+                            phase: Phase::Aligned,
+                            flags: 0,
+                            min_watermark_ms,
+                            seq: 0,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            epoch, error = %e,
+                            "[LDB-6031] aligned announcement failed; peers resume on Commit"
+                        );
+                    }
+                    quorum = QuorumStage::Done(min_watermark_ms);
+                }
+                Err(msg) => {
+                    tracing::error!(checkpoint_id, epoch, error = %msg, "[LDB-6032] quorum miss");
+                    let mut guard = tail.coordinator.lock().await;
+                    if let Some(ref mut coord) = *guard {
+                        coord.abandon_epoch(checkpoint_id, epoch, msg).await;
+                    }
+                    return;
+                }
+            }
+        }
+
+        let mut guard = tail.coordinator.lock().await;
+        if let Some(ref mut coord) = *guard {
+            coord.set_pending_vnode_states(tail.vnode_states);
+            coord.set_local_watermark_ms(tail.local_watermark_ms);
+            let result = match tail.leader_ids {
+                Some((epoch, checkpoint_id)) => {
+                    coord
+                        .checkpoint_preallocated(tail.request, epoch, checkpoint_id, quorum)
+                        .await
+                }
+                None => coord.checkpoint_with_offsets(tail.request).await,
+            };
+            match result {
+                Ok(result) if result.success => {
+                    let _ = tail.complete_tx.send((result.epoch, tail.fan_out)).await;
+                }
+                Ok(result) => tracing::warn!(
+                    epoch = result.epoch,
+                    error = ?result.error,
+                    "Barrier-aligned checkpoint failed"
+                ),
+                Err(e) => tracing::warn!(error = %e, "Barrier-aligned checkpoint error"),
+            }
+        }
     }
 
     /// Hand the follower's durable tail — sink pre-commit, manifest
@@ -1647,91 +1754,23 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             &self.staged_bytes,
             staged_request_bytes(&request, &vnode_states),
         );
-        let coordinator_clone = Arc::clone(&self.coordinator);
-        let tx = self.checkpoint_complete_tx.clone();
-        let fan_out = source_checkpoints.clone();
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(feature = "cluster")]
-        let cc_for_tail = self.cluster_controller.clone();
-        #[cfg(feature = "cluster")]
-        let quorum_timeout = self.quorum_timeout;
-        tokio::spawn(async move {
-            use crate::checkpoint_coordinator::{CheckpointCoordinator, QuorumStage};
-
-            let _in_flight = in_flight; // released on drop, even on panic
-            let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
-
-            #[allow(unused_mut)]
-            let mut quorum = QuorumStage::RunInline;
+        tokio::spawn(Self::run_leader_tail(LeaderTail {
+            in_flight,
+            coordinator: Arc::clone(&self.coordinator),
+            complete_tx: self.checkpoint_complete_tx.clone(),
+            request,
+            vnode_states,
+            fan_out: source_checkpoints.clone(),
+            local_watermark_ms: if wm == i64::MIN { None } else { Some(wm) },
+            leader_ids,
             #[cfg(feature = "cluster")]
-            if let (Some(cc), Some((epoch, checkpoint_id))) = (cc_for_tail.as_ref(), leader_ids) {
-                use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
-                match CheckpointCoordinator::run_prepare_quorum(
-                    cc,
-                    quorum_timeout,
-                    epoch,
-                    checkpoint_id,
-                    wm_opt,
-                )
-                .await
-                {
-                    Ok(min_watermark_ms) => {
-                        if let Err(e) = cc
-                            .announce_barrier(&BarrierAnnouncement {
-                                epoch,
-                                checkpoint_id,
-                                phase: Phase::Aligned,
-                                flags: 0,
-                                min_watermark_ms,
-                                seq: 0,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                epoch, error = %e,
-                                "[LDB-6031] aligned announcement failed; peers resume on Commit"
-                            );
-                        }
-                        quorum = QuorumStage::Done(min_watermark_ms);
-                    }
-                    Err(msg) => {
-                        tracing::error!(checkpoint_id, epoch, error = %msg, "[LDB-6032] quorum miss");
-                        let mut guard = coordinator_clone.lock().await;
-                        if let Some(ref mut coord) = *guard {
-                            coord.abandon_epoch(checkpoint_id, epoch, msg).await;
-                        }
-                        return;
-                    }
-                }
-            }
-
-            let mut guard = coordinator_clone.lock().await;
-            if let Some(ref mut coord) = *guard {
-                coord.set_pending_vnode_states(vnode_states);
-                coord.set_local_watermark_ms(wm_opt);
-                let result = match leader_ids {
-                    Some((epoch, checkpoint_id)) => {
-                        coord
-                            .checkpoint_preallocated(request, epoch, checkpoint_id, quorum)
-                            .await
-                    }
-                    None => coord.checkpoint_with_offsets(request).await,
-                };
-                match result {
-                    Ok(result) if result.success => {
-                        let _ = tx.send((result.epoch, fan_out)).await;
-                    }
-                    Ok(result) => tracing::warn!(
-                        epoch = result.epoch,
-                        error = ?result.error,
-                        "Barrier-aligned checkpoint failed"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "Barrier-aligned checkpoint error"),
-                }
-            }
-        });
+            controller: self.cluster_controller.clone(),
+            #[cfg(feature = "cluster")]
+            quorum_timeout: self.quorum_timeout,
+        }));
 
         // Leader resume gate (ADR-003): hold the pipeline until the tail
         // above announces `Aligned` (full-membership capture quorum) —

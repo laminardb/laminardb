@@ -174,6 +174,26 @@ impl PendingBarrier {
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Throttled (~once/10s) WARN while barrier admission is paused at the
+/// staged-state cap — this check runs every coordinator tick, so an
+/// unthrottled warn would spam under a sustained upload backlog.
+fn warn_staged_cap_throttled(staged_bytes: u64, cap: u64) {
+    use std::sync::atomic::AtomicI64;
+    static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
+        return;
+    }
+    LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
+    tracing::warn!(
+        staged_bytes,
+        cap,
+        "checkpoint admission paused: staged-state cap reached"
+    );
+}
+
 /// What woke a source task's select loop.
 enum SourceWake {
     Shutdown,
@@ -978,10 +998,9 @@ impl StreamingCoordinator {
         if self.staged_bytes.load(Ordering::Acquire) >= self.max_staged_bytes {
             // Cadence degrades to upload speed rather than buffering
             // unbounded captured state.
-            tracing::warn!(
-                staged_bytes = self.staged_bytes.load(Ordering::Acquire),
-                cap = self.max_staged_bytes,
-                "checkpoint admission paused: staged-state cap reached"
+            warn_staged_cap_throttled(
+                self.staged_bytes.load(Ordering::Acquire),
+                self.max_staged_bytes,
             );
             return;
         }
