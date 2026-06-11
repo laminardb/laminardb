@@ -865,6 +865,9 @@ impl LaminarDB {
     /// Register built-in connectors based on enabled features.
     #[allow(unused_variables)]
     fn register_builtin_connectors(registry: &laminar_connectors::registry::ConnectorRegistry) {
+        // Infra-free synthetic source; always available (used by demos
+        // and the cluster soak harness).
+        laminar_connectors::generator::register_generator_source(registry);
         #[cfg(feature = "kafka")]
         {
             laminar_connectors::kafka::register_kafka_source(registry);
