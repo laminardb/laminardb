@@ -237,14 +237,13 @@ gate on:
    has only unit coverage.
 2. **Depth > 1 end-to-end**: enabled only for at-least-once pipelines
    and admission-capped, but never exercised across real nodes.
-3. **Cap tuning exposure**: `max_in_flight_epochs`/`max_staged_bytes`
-   are default-only (no server TOML) — wire before anyone needs to
-   tune them live.
-4. **Pre-existing recovery sharp edge** (not a regression): followers
-   persist manifests before the decision, so an aborted epoch's
-   manifest can be the highest on disk; reconcile handles Pending
-   sinks, but the restore-from-aborted-manifest path deserves an
-   audit of its own.
+3. ~~Cap tuning exposure~~ — DONE: `max_in_flight_epochs` /
+   `max_staged_bytes` are settable in the server `[checkpoint]` TOML.
+4. ~~Aborted-manifest recovery audit~~ — DONE: recovery already skips
+   Pending-sink manifests (tested); the real hazard found was recovery
+   walking allocator ids *back* below an aborted epoch's seed,
+   re-allocating it over stale artifacts — ids are now strictly
+   monotonic (`recovery_never_walks_ids_back_onto_aborted_epochs`).
 
 Operationally: 100ms is permission, not a promise — quorum RTT +
 capture must fit the interval, and at the caps cadence degrades to
