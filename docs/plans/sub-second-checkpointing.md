@@ -260,3 +260,37 @@ upload speed. Two documented benign races: a stale `Aligned` from an
 attempt aborted post-quorum can release a successor's resume gate
 early, and overlapping quorum rounds (cadence < quorum RTT) burn an
 epoch.
+## 100ms-cadence soak findings (2026-06-11)
+
+The kill -9 soak at 100ms cadence (vs the passing 500ms runs) peeled
+four distinct defects; three are fixed (`e0e95242`), one is open:
+
+1. FIXED — serial doomed-gate burn: in-flight epochs each waited the
+   full 30s durability gate for a dead node''s uploads, serialized on
+   the coordinator mutex (depth 4 → ~2min commit stall). Gate now
+   fail-fasts on unhealthy capture participants.
+2. FIXED — gossip detection lag: membership can show a killed node
+   Active for >30s, muting fix 1. Capture-quorum misses now mark peers
+   unresponsive on the controller (TTL 60s, cleared on ack); gates
+   consult it.
+3. FIXED — quorum misclassification: connection-refused RPC errors
+   counted as `Failed` (live NACK) instead of unreachable, bypassing
+   the unresponsive signal. Transport errors now classify into
+   `TimedOut{missing}`.
+4. OPEN — rejoin lockstep livelock (pre-existing alignment mechanics):
+   a restarted node can start aligning checkpoint N after peers already
+   sent their N barriers (lost while its transport was down), time out
+   the full 30s, and land one epoch behind forever; the leader''s
+   quorums miss its ack every epoch and nothing commits. The newer
+   Prepare(N+1)/Abort(N) announcement releases the alignment wait
+   *between* attempts but NOT mid-wait — `align_shuffle_barriers` (or
+   its pipeline_callback wrapper) needs an announcement-driven release
+   inside the wait loop. Soak evidence: run `soak-225504`, node0
+   aligning ckpt 15 19:39:41→19:40:11 straight through Abort(15) +
+   Prepare(16) at 19:39:44. Repro: `LAMINAR_SOAK_INTERVAL_MS=100`,
+   fails within ~10 fault rounds at "progress after rejoin".
+
+Survival progression at 100ms as fixes landed: 2 → 5 → 8 full fault
+rounds. 500ms cadence: passes (3+ rounds, all nodes). Fix item 4, then
+re-run 900s+ at 100ms until clean, before production sign-off on the
+100ms floor.
