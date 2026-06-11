@@ -678,7 +678,7 @@ impl ConnectorPipelineCallback {
                         decision_store.as_deref(),
                         epoch,
                         checkpoint_id,
-                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(10),
                     )
                     .await;
                     // Stage 3: act on the verdict under the mutex.
@@ -733,7 +733,7 @@ impl ConnectorPipelineCallback {
     ) {
         use laminar_core::cluster::control::Phase;
 
-        const RESUME_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const RESUME_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
         if !has_cluster_shuffle {
             return;

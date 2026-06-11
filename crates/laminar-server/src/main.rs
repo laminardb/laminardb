@@ -57,8 +57,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // `laminardb` is the BIN crate: main.rs/cluster.rs etc.
+                // log under that target, not `laminar_server` (the lib
+                // name) — without it the server''s own startup logs are
+                // silently filtered out.
                 format!(
-                    "laminar_server={l},laminar_db={l},laminar_core={l},\
+                    "laminardb={l},laminar_server={l},laminar_db={l},laminar_core={l},\
                      laminar_sql={l},laminar_connectors={l}",
                     l = args.log_level
                 )

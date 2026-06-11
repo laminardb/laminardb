@@ -128,7 +128,7 @@ impl StaticDiscovery {
     fn broadcast_membership(&self) {
         let peers = self.peers.read();
         let peer_list: Vec<NodeInfo> = peers.values().map(|p| p.info.clone()).collect();
-        let _ = self.membership_tx.send(peer_list);
+        publish_if_changed(&self.membership_tx, peer_list);
     }
 
     /// Send a heartbeat to a single seed address with connect + I/O timeouts.
@@ -288,7 +288,7 @@ impl StaticDiscovery {
                                     peer.info.last_heartbeat_ms = now;
                                     guard.values().map(|p| p.info.clone()).collect::<Vec<_>>()
                                 };
-                                let _ = membership_tx.send(peer_list);
+                                publish_if_changed(&membership_tx, peer_list);
                             }
 
                             if let Ok(resp) = Self::serialize_node_info(&local_info) {
@@ -423,11 +423,40 @@ impl StaticDiscovery {
                         let peers = ctx.peers.read();
                         peers.values().map(|p| p.info.clone()).collect()
                     };
-                    let _ = ctx.membership_tx.send(peer_list);
+                    publish_if_changed(&ctx.membership_tx, peer_list);
                 }
             }
         }
     }
+}
+
+/// Update the membership watch only when the list actually changed.
+/// `watch::Sender::send` notifies receivers on EVERY call, and the
+/// heartbeater publishes each tick — unconditional sends starve any
+/// consumer that debounces on `changed()` waiting for a quiet period
+/// (the rebalance controller never saw 5s of quiet, so vnode rotation
+/// never ran and a dead node''s vnodes were never shed).
+fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_list: Vec<NodeInfo>) {
+    // Stable order: the peer map iterates in arbitrary order, and
+    // equality must not depend on it.
+    peer_list.sort_by_key(|n| n.id.0);
+    tx.send_if_modified(|cur| {
+        // Compare the MEMBERSHIP projection only — `last_heartbeat_ms`
+        // refreshes every tick, so whole-struct equality would still
+        // notify continuously. Consumers of the watch react to who is
+        // in the cluster and in what state, not to heartbeat times.
+        let same = cur.len() == peer_list.len()
+            && cur
+                .iter()
+                .zip(&peer_list)
+                .all(|(a, b)| a.id == b.id && a.state == b.state && a.rpc_address == b.rpc_address);
+        if same {
+            false
+        } else {
+            *cur = peer_list;
+            true
+        }
+    });
 }
 
 /// Shared context for the heartbeater background task.

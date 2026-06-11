@@ -56,7 +56,14 @@ impl fmt::Display for NodeState {
 
 /// Hardware and deployment metadata for a node.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct NodeMetadata {
     /// Number of CPU cores available.
@@ -88,7 +95,14 @@ impl Default for NodeMetadata {
 
 /// Full information about a discovered node.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct NodeInfo {
     /// The node's unique identifier.

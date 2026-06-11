@@ -40,8 +40,12 @@ impl Default for RebalanceConfig {
         Self {
             watcher_poll: Duration::from_secs(2),
             rebalance_debounce: Duration::from_secs(5),
-            checkpoint_timeout: Duration::from_secs(60),
-            retry_delay: Duration::from_secs(10),
+            // A healthy pre-rotation drain commits in well under a
+            // second; a long budget only delays recovery when a node
+            // dies mid-drain (the drain then cannot succeed and the
+            // rotation is what restores commit availability).
+            checkpoint_timeout: Duration::from_secs(15),
+            retry_delay: Duration::from_secs(2),
             placement_isolation_tier: 0,
         }
     }
@@ -185,14 +189,19 @@ pub fn spawn_rebalance_controller(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut members = controller.members_watch();
+        info!("rebalance controller watching membership");
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.notified() => return,
                 res = members.changed() => {
-                    if res.is_err() { return; }
+                    if res.is_err() {
+                        warn!("membership watch sender dropped; rebalance controller exiting");
+                        return;
+                    }
                 }
             }
+            info!("membership change observed; debouncing");
 
             // Debounce: absorb further churn before acting.
             loop {
@@ -215,6 +224,7 @@ pub fn spawn_rebalance_controller(
             // leave the cluster on a stale assignment.
             loop {
                 if !controller.is_leader() {
+                    info!("membership changed; not the leader — skipping rotation check");
                     break;
                 }
                 // Use assignable (Active, non-draining) instances so
@@ -229,7 +239,9 @@ pub fn spawn_rebalance_controller(
                         break;
                     }
                     Ok(None) => {
-                        debug!("live set matches current snapshot; no rotation");
+                        info!(
+                            "membership changed but live set matches current snapshot; no rotation"
+                        );
                         break;
                     }
                     Err(e) => {
@@ -309,20 +321,46 @@ async fn try_rebalance(
     }
 
     // Drain in-flight shuffle rows into durable state at the old
-    // fence version before rotating.
-    let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
-        .await
-        .map_err(|_| {
-            format!(
-                "pre-rotation checkpoint did not complete within {}s",
-                config.checkpoint_timeout.as_secs()
-            )
-        })?
-        .map_err(|e| e.to_string())?;
-    if !ckpt.success {
-        return Err(ckpt
-            .error
-            .unwrap_or_else(|| "checkpoint returned success=false".into()));
+    // fence version before rotating. When the rotation sheds a DEAD
+    // node this drain can never succeed — the durability gate needs
+    // captures from a node that will never provide them — and
+    // requiring it would deadlock rotation against the gate (rotation
+    // is the only thing that restores commit availability). In that
+    // case proceed without the drain: the dead node''s in-flight rows
+    // are unrecoverable regardless, and the survivors rehydrate its
+    // vnodes from the last committed epoch — the same at-least-once
+    // duplication window every ungraceful failover already has.
+    let shedding_dead = {
+        let owners = current.to_vnode_vec(registry.vnode_count());
+        owners.iter().any(|o| !live.contains(o))
+    };
+    if shedding_dead {
+        // Don''t even attempt the drain: its durability gate needs
+        // captures from the dead node, so it can only burn its full
+        // timeout and abort — delaying the rotation that restores
+        // commit availability. The dead node''s in-flight rows are
+        // unrecoverable regardless; survivors rehydrate its vnodes
+        // from the last committed epoch — the same at-least-once
+        // duplication window every ungraceful failover already has.
+        warn!(
+            "rotation sheds a dead node — skipping the pre-rotation drain \
+             checkpoint (it cannot seal without the dead node''s captures)"
+        );
+    } else {
+        let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
+            .await
+            .map_err(|_| {
+                format!(
+                    "pre-rotation checkpoint did not complete within {}s",
+                    config.checkpoint_timeout.as_secs()
+                )
+            })?
+            .map_err(|e| e.to_string())?;
+        if !ckpt.success {
+            return Err(ckpt
+                .error
+                .unwrap_or_else(|| "checkpoint returned success=false".into()));
+        }
     }
 
     let proposal = current.next(new_vnodes);

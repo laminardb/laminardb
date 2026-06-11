@@ -62,6 +62,10 @@ impl Node {
         let child = Command::new(env!("CARGO_BIN_EXE_laminardb"))
             .arg("--config")
             .arg(&self.config_path)
+            .env(
+                "RUST_LOG",
+                "laminardb=info,laminar_server=info,laminar_db=info,laminar_core=info",
+            )
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log))
             .spawn()

@@ -94,7 +94,10 @@ impl Default for CheckpointConfig {
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
             quorum_timeout: Duration::from_secs(3),
-            restorable_gate_timeout: Duration::from_secs(30),
+            // Last-resort bound only: membership/unresponsive/rotation
+            // fail-fasts catch dead participants in seconds. Long values
+            // serialize recovery (pipelined doomed epochs each burn it).
+            restorable_gate_timeout: Duration::from_secs(10),
             max_in_flight_epochs: 4,
             max_staged_bytes: 512 * 1024 * 1024,
         }

@@ -1939,7 +1939,7 @@ impl OperatorGraph {
         use laminar_core::cluster::control::Phase;
         use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
 
-        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
