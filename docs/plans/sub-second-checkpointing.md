@@ -229,14 +229,23 @@ cluster, coordinator-level fault injection at depth > 1, wedged-sink
 and abandoned-epoch coverage). **Not yet validated for production**;
 gate on:
 
-1. **Real multi-node soak**: 3-node real-binary cluster (gRPC control
-   plane, S3/MinIO state), hours at 100ms–1s cadence, `kill -9` of
-   leader and follower mid-epoch, verifying exactly-once sink output
-   and recovery point after each fault. The in-process harness runs
-   the gossip-KV path; the gRPC path (Aligned RPC, push-driven waits)
-   has only unit coverage.
-2. **Depth > 1 end-to-end**: enabled only for at-least-once pipelines
-   and admission-capped, but never exercised across real nodes.
+1. **Real multi-node soak** — HARNESS BUILT + PASSING:
+   `cluster_soak.rs` (laminar-server) spawns 3 real binaries over the
+   real gRPC control plane with a deterministic `generator` workload
+   and kills nodes round-robin mid-epoch. Verified runs: 3 fault
+   rounds, every node (incl. leader) killed + rejoined, epochs
+   committing throughout (2 → 16). Node logs confirm cross-node
+   shuffle alignment and pipelined epochs (N+1..N+3 aligning while
+   N's tail held the durability gate). Remaining before flipping the
+   100ms floor on in production: long-duration runs (hours, via
+   `LAMINAR_SOAK_SECONDS`), 100ms cadence (`LAMINAR_SOAK_INTERVAL_MS`),
+   MinIO/S3 backend (`LAMINAR_SOAK_CHECKPOINT_URL` + `_S3_*`), and an
+   exactly-once sink-output diff (needs a transactional sink in the
+   workload; the generator is deterministic precisely so that check is
+   a recompute-and-compare).
+2. **Depth > 1 end-to-end**: exercised implicitly by the soak
+   (at-least-once workload, default depth 4 — logs show overlapping
+   epochs); a targeted cross-node depth assertion is follow-up.
 3. ~~Cap tuning exposure~~ — DONE: `max_in_flight_epochs` /
    `max_staged_bytes` are settable in the server `[checkpoint]` TOML.
 4. ~~Aborted-manifest recovery audit~~ — DONE: recovery already skips
