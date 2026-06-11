@@ -178,20 +178,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 /// staged-state cap — this check runs every coordinator tick, so an
 /// unthrottled warn would spam under a sustained upload backlog.
 fn warn_staged_cap_throttled(staged_bytes: u64, cap: u64) {
-    use std::sync::atomic::AtomicI64;
-    static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
-        return;
+    static THROTTLE: crate::log_throttle::LogThrottle =
+        crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
+    if THROTTLE.allow() {
+        tracing::warn!(
+            staged_bytes,
+            cap,
+            "checkpoint admission paused: staged-state cap reached"
+        );
     }
-    LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
-    tracing::warn!(
-        staged_bytes,
-        cap,
-        "checkpoint admission paused: staged-state cap reached"
-    );
 }
 
 /// What woke a source task's select loop.

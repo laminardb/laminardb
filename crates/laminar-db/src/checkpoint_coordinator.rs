@@ -166,12 +166,22 @@ impl EpochAllocator {
         )
     }
 
-    /// Rebase after recovery, or on a follower mirroring the leader's ids.
+    /// Rebase after recovery (authoritative — may move backwards).
     fn reset(&self, epoch: u64, next_checkpoint_id: u64) {
         use std::sync::atomic::Ordering;
         self.epoch.store(epoch, Ordering::Release);
         self.next_checkpoint_id
             .store(next_checkpoint_id, Ordering::Release);
+    }
+
+    /// Monotonic advance, for followers mirroring the leader's ids: a
+    /// depth>1 tail finishing out of order must never walk the
+    /// allocator backwards past a successor's ids.
+    fn advance_to(&self, epoch: u64, next_checkpoint_id: u64) {
+        use std::sync::atomic::Ordering;
+        self.epoch.fetch_max(epoch, Ordering::AcqRel);
+        self.next_checkpoint_id
+            .fetch_max(next_checkpoint_id, Ordering::AcqRel);
     }
 }
 
@@ -827,9 +837,15 @@ impl CheckpointCoordinator {
         // object store, so back off after the first second: fast for
         // the common local/in-process case, cheap on S3 for a slow
         // follower upload (≤10 + ~60 LISTs over the 30s default).
-        const FAST_POLL: Duration = Duration::from_millis(100);
-        const SLOW_POLL: Duration = Duration::from_millis(500);
-        const FAST_WINDOW: Duration = Duration::from_secs(1);
+        // Each poll LISTs the epoch prefix on the object store, so back
+        // off exponentially: fast for the common local/in-process case,
+        // ~1 LIST/s steady-state per slow epoch on S3 (gates also
+        // serialize on the coordinator mutex, so at most one loop polls
+        // at a time regardless of pipelining depth). Replacing the poll
+        // with follower upload-completion acks is the protocol-level
+        // follow-up tracked in the plan.
+        const INITIAL_POLL: Duration = Duration::from_millis(100);
+        const MAX_POLL: Duration = Duration::from_secs(1);
 
         let Some(ref backend) = self.state_backend else {
             return Ok(());
@@ -838,8 +854,8 @@ impl CheckpointCoordinator {
             return Ok(());
         }
 
-        let start = Instant::now();
-        let deadline = start + self.config.restorable_gate_timeout;
+        let deadline = Instant::now() + self.config.restorable_gate_timeout;
+        let mut interval = INITIAL_POLL;
         let mut last_state = String::from("not all vnodes persisted");
         loop {
             match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
@@ -863,12 +879,8 @@ impl CheckpointCoordinator {
                     self.config.restorable_gate_timeout
                 ));
             }
-            let interval = if start.elapsed() < FAST_WINDOW {
-                FAST_POLL
-            } else {
-                SLOW_POLL
-            };
             tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(MAX_POLL);
         }
     }
 
@@ -1082,7 +1094,6 @@ impl CheckpointCoordinator {
             phase,
             flags: 0,
             min_watermark_ms,
-            seq: 0,
         };
         if let Err(e) = cc.announce_barrier(&ann).await {
             warn!(
@@ -1152,7 +1163,6 @@ impl CheckpointCoordinator {
                 phase: Phase::Prepare,
                 flags: 0,
                 min_watermark_ms: None,
-                seq: 0,
             })
             .await
         {
@@ -1199,6 +1209,11 @@ impl CheckpointCoordinator {
                     }
                 }
                 if members_rx.changed().await.is_err() {
+                    // Membership watch closed (host shutting down): this
+                    // arm can no longer fail fast, so park it and let the
+                    // sibling `select!` arm — the deadline-bounded quorum
+                    // wait — decide the outcome. Not a leak: the select
+                    // always completes via that arm.
                     futures::future::pending::<()>().await;
                 }
             }
@@ -1523,9 +1538,11 @@ impl CheckpointCoordinator {
     }
 
     /// [`follower_checkpoint`](Self::follower_checkpoint) minus the
-    /// capture ack, for pipelined tails that ack *before* queuing on
-    /// the coordinator mutex (an earlier epoch's durable tail may hold
-    /// it for the duration of its uploads).
+    /// capture ack: prepare, await the decision, then commit/rollback.
+    /// Pipelined tails call the three stages separately so the
+    /// decision wait does not hold the coordinator mutex (the next
+    /// epoch's uploads would queue behind it for up to
+    /// `decision_timeout`).
     ///
     /// # Errors
     /// Propagates sink pre-commit, manifest save, or marker-write failures.
@@ -1536,45 +1553,98 @@ impl CheckpointCoordinator {
         ann: laminar_core::cluster::control::BarrierAnnouncement,
         decision_timeout: Duration,
     ) -> Result<bool, DbError> {
-        use laminar_core::cluster::control::{BarrierAck, Phase};
-
         let Some(cc) = self.cluster_controller.clone() else {
             return Err(DbError::Checkpoint(
                 "[LDB-6033] follower_checkpoint called without cluster controller".into(),
             ));
         };
+        let (epoch, checkpoint_id) = (ann.epoch, ann.checkpoint_id);
+        self.follower_prepare_acked(request, epoch, checkpoint_id)
+            .await?;
+        let committed = Self::await_follower_decision(
+            &cc,
+            self.decision_store.as_deref(),
+            epoch,
+            checkpoint_id,
+            decision_timeout,
+        )
+        .await;
+        Ok(self.follower_finish(epoch, checkpoint_id, committed).await)
+    }
 
-        let epoch = ann.epoch;
-        let checkpoint_id = ann.checkpoint_id;
-        // Align with the leader so a later leader-mode call resumes correctly.
-        self.allocator.reset(epoch, checkpoint_id.saturating_add(1));
+    /// Stage 1 of the follower tail: durable prepare (sink pre-commit +
+    /// manifest + partial uploads), after the capture ack. On failure,
+    /// sends a best-effort `ok = false` ack (overwrites the capture ack
+    /// in the gossip-KV slot so a still-polling leader fails the quorum
+    /// fast; in gRPC mode the leader learns via its restorable-gate
+    /// timeout) and rolls the epoch back.
+    ///
+    /// # Errors
+    /// Propagates sink pre-commit, manifest save, or marker-write failures.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn follower_prepare_acked(
+        &mut self,
+        request: CheckpointRequest,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<(), DbError> {
+        use laminar_core::cluster::control::BarrierAck;
 
-        // Durable prepare (runs after the ack, off the critical path
-        // when the caller drives this from a background task).
+        // Track the leader's ids so a later leader-mode call resumes
+        // correctly. Monotonic: a depth>1 tail finishing late must not
+        // walk the allocator backwards past a successor's ids.
+        self.allocator
+            .advance_to(epoch, checkpoint_id.saturating_add(1));
+
         if let Err(e) = self.follower_prepare(request, epoch, checkpoint_id).await {
-            // Best-effort fast failure signal: overwrites the capture
-            // ack in the gossip-KV slot so a still-polling leader fails
-            // the quorum instead of waiting; in gRPC mode the leader
-            // learns through its restorable-gate timeout.
-            cc.ack_barrier(&BarrierAck {
-                epoch,
-                ok: false,
-                error: Some(e.to_string()),
-                local_watermark_ms: self.local_watermark_ms,
-            })
-            .await
-            .ok();
+            if let Some(cc) = self.cluster_controller.clone() {
+                cc.ack_barrier(&BarrierAck {
+                    epoch,
+                    ok: false,
+                    error: Some(e.to_string()),
+                    local_watermark_ms: self.local_watermark_ms,
+                })
+                .await
+                .ok();
+            }
             self.rollback_sinks(epoch).await.ok();
             self.phase = CheckpointPhase::Idle;
             return Err(e);
         }
+        Ok(())
+    }
 
-        // Phase 2: wait for the leader's decision — push-driven off the
-        // announcement watch. `Aligned` is not a decision; only
-        // Commit/Abort (or epoch advancement) end the wait. Observation
-        // is latest-wins, so a newer epoch's announcement can supersede
-        // this epoch's Commit: the leader only advances epochs after a
-        // successful commit, so verify via the durable marker.
+    /// Stage 2 of the follower tail: wait for the leader's decision —
+    /// push-driven off the announcement watch, and deliberately
+    /// `&self`-free so the wait does not hold the coordinator mutex.
+    /// `Aligned` is not a decision; only Commit/Abort (or epoch
+    /// advancement) end the wait. Observation is latest-wins, so a
+    /// newer epoch's announcement can supersede this epoch's Commit:
+    /// the leader only advances epochs after a successful commit, so
+    /// the durable marker is the tie-breaker. Returns the verdict.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn await_follower_decision(
+        cc: &laminar_core::cluster::control::ClusterController,
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        epoch: u64,
+        checkpoint_id: u64,
+        decision_timeout: Duration,
+    ) -> bool {
+        use laminar_core::cluster::control::Phase;
+
+        let is_marked = || async {
+            match decision_store {
+                Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
+                    warn!(
+                        epoch, checkpoint_id, error = %e,
+                        "[LDB-6045] decision store read failed — defaulting to Abort",
+                    );
+                    false
+                }),
+                None => false,
+            }
+        };
+
         let deadline = Instant::now() + decision_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1588,30 +1658,17 @@ impl CheckpointCoordinator {
                 )
                 .await;
             match decision {
-                Some(a) if a.epoch == epoch && a.phase == Phase::Commit => {
-                    return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
-                }
-                Some(a) if a.epoch == epoch => {
-                    // Abort.
-                    self.rollback_sinks(epoch).await.ok();
-                    self.checkpoints_failed += 1;
-                    self.phase = CheckpointPhase::Idle;
-                    return Ok(false);
-                }
+                Some(a) if a.epoch == epoch => return a.phase == Phase::Commit,
                 Some(a) => {
                     // Newer epoch supersedes the decision announcement.
-                    let committed = match self.decision_store.as_ref() {
-                        Some(ds) => ds.is_committed(epoch).await.unwrap_or(false),
-                        None => false,
-                    };
-                    if committed {
+                    if is_marked().await {
                         info!(
                             epoch,
                             checkpoint_id,
                             observed_epoch = a.epoch,
-                            "newer epoch observed with commit marker present — driving commit",
+                            "newer epoch observed with commit marker present — committing",
                         );
-                        return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                        return true;
                     }
                     // No marker yet — keep waiting. Each pass through
                     // this (rare) state costs an object-store HEAD, so
@@ -1620,35 +1677,50 @@ impl CheckpointCoordinator {
                 }
                 None => {
                     // Deadline: one last durable-marker check.
-                    let committed = match self.decision_store.as_ref() {
-                        Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
-                            warn!(
-                                epoch, checkpoint_id, error = %e,
-                                "[LDB-6045] decision store read failed — defaulting to Abort",
-                            );
-                            false
-                        }),
-                        None => false,
-                    };
-                    if committed {
+                    if is_marked().await {
                         warn!(
                             epoch,
                             checkpoint_id,
-                            "[LDB-6046] follower timeout but marker present — driving commit",
+                            "[LDB-6046] follower timeout but marker present — committing",
                         );
-                        return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                        return true;
                     }
                     warn!(
                         epoch,
                         checkpoint_id, "[LDB-6034] follower decision timeout; rolling back",
                     );
-                    self.rollback_sinks(epoch).await.ok();
-                    self.checkpoints_failed += 1;
-                    self.phase = CheckpointPhase::Idle;
-                    return Ok(false);
+                    return false;
                 }
             }
         }
+    }
+
+    /// Stage 3 of the follower tail: act on the decision. Returns
+    /// `true` on a clean commit.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn follower_finish(
+        &mut self,
+        epoch: u64,
+        checkpoint_id: u64,
+        committed: bool,
+    ) -> bool {
+        if committed {
+            self.drive_follower_commit(epoch, checkpoint_id).await
+        } else {
+            self.rollback_sinks(epoch).await.ok();
+            self.checkpoints_failed += 1;
+            self.phase = CheckpointPhase::Idle;
+            false
+        }
+    }
+
+    /// Durable commit-marker store handle, for the lock-free decision
+    /// wait in pipelined follower tails.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn decision_store_handle(
+        &self,
+    ) -> Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>> {
+        self.decision_store.clone()
     }
 
     /// Commit this follower's sinks for `epoch` and update its
@@ -1685,7 +1757,7 @@ impl CheckpointCoordinator {
         }
         self.checkpoints_completed += 1;
         let (_, next_id) = self.allocator.peek();
-        self.allocator.reset(epoch.saturating_add(1), next_id);
+        self.allocator.advance_to(epoch.saturating_add(1), next_id);
         self.phase = CheckpointPhase::Idle;
         true
     }
@@ -2962,7 +3034,6 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .unwrap();
         let commit_json = serde_json::to_string(&BarrierAnnouncement {
@@ -2971,7 +3042,6 @@ mod tests {
             phase: Phase::Commit,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .unwrap();
         // Overwrite the prepare with commit — observe_barrier reads the
@@ -2986,7 +3056,6 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         };
         let committed = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
@@ -3040,7 +3109,6 @@ mod tests {
             phase: Phase::Abort,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, abort_json);
@@ -3051,7 +3119,6 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         };
         let committed = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
@@ -3187,7 +3254,6 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         };
         let result = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(1))

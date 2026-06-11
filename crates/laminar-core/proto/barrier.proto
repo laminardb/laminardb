@@ -43,8 +43,6 @@ message PrepareRequest {
   // Reserved for unaligned / other barrier flags (mirrors
   // `BarrierAnnouncement.flags`).
   uint64 flags = 3;
-  // Leader-stamped announce sequence (see `BarrierAnnouncement.seq`).
-  uint64 seq = 4;
 }
 
 message AlignedRequest {
@@ -55,8 +53,6 @@ message AlignedRequest {
   // followers see cluster-wide event-time progress at resume rather
   // than waiting for the (upload-gated) Commit.
   optional int64 min_watermark_ms = 4;
-  // Leader-stamped announce sequence (see `BarrierAnnouncement.seq`).
-  uint64 seq = 5;
 }
 
 message CommitRequest {
@@ -67,16 +63,12 @@ message CommitRequest {
   // leader from the Prepare acks. Absent when no node has a watermark
   // yet (treated as +infinity).
   optional int64 min_watermark_ms = 4;
-  // Leader-stamped announce sequence (see `BarrierAnnouncement.seq`).
-  uint64 seq = 5;
 }
 
 message AbortRequest {
   uint64 epoch = 1;
   uint64 checkpoint_id = 2;
   uint64 flags = 3;
-  // Leader-stamped announce sequence (see `BarrierAnnouncement.seq`).
-  uint64 seq = 4;
 }
 
 // Follower reply to any phase. Mirrors `BarrierAck`.

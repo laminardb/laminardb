@@ -505,7 +505,6 @@ mod tests {
             phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .await
         .unwrap();
@@ -550,7 +549,6 @@ mod tests {
             phase: crate::cluster::control::Phase::Commit,
             flags: 0,
             min_watermark_ms: Some(12_345),
-            seq: 0,
         })
         .await
         .unwrap();
@@ -565,7 +563,6 @@ mod tests {
             phase: crate::cluster::control::Phase::Commit,
             flags: 0,
             min_watermark_ms: Some(100), // stale re-gossip
-            seq: 0,
         })
         .await
         .unwrap();
@@ -583,7 +580,6 @@ mod tests {
             phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .await
         .unwrap();

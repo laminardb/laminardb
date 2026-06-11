@@ -103,7 +103,6 @@ async fn barrier_announce_then_follower_observes_and_acks() {
         phase: laminar_core::cluster::control::Phase::Prepare,
         flags: 0,
         min_watermark_ms: None,
-        seq: 0,
     };
 
     // Step 1: leader announces.
@@ -554,7 +553,6 @@ async fn quorum_times_out_when_follower_silent() {
             phase: laminar_core::cluster::control::Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .await
         .unwrap();

@@ -42,15 +42,11 @@ enum SinkFilterDispatch {
 /// 3. The compute thread is dedicated — blocking is acceptable
 // Throttled (~once/10s) WARN so silent watermark drops are diagnosable.
 fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize) {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
+    static THROTTLE: crate::log_throttle::LogThrottle =
+        crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
+    if !THROTTLE.allow() {
         return;
     }
-    LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
     tracing::warn!(
         source,
         time_column = column,
@@ -75,16 +71,11 @@ const SUB_ROUTE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// with `cause` so a full queue isn't confused with a slow peer.
 #[cfg(feature = "cluster")]
 fn warn_subscription_route_drop(cause: &str) {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
-        return;
+    static THROTTLE: crate::log_throttle::LogThrottle =
+        crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
+    if THROTTLE.allow() {
+        tracing::warn!(cause, "dropping remote subscription batch");
     }
-    LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
-    tracing::warn!(cause, "dropping remote subscription batch");
 }
 
 /// Releases an in-flight epoch's admission slot and staged-bytes
@@ -561,7 +552,6 @@ impl ConnectorPipelineCallback {
                             phase: Phase::Aligned,
                             flags: 0,
                             min_watermark_ms,
-                            seq: 0,
                         })
                         .await
                     {
@@ -624,10 +614,10 @@ impl ConnectorPipelineCallback {
     fn spawn_follower_tail(
         &mut self,
         request: crate::checkpoint_coordinator::CheckpointRequest,
-        ann: laminar_core::cluster::control::BarrierAnnouncement,
+        epoch: u64,
+        checkpoint_id: u64,
         fan_out: FxHashMap<String, SourceCheckpoint>,
     ) {
-        let epoch = ann.epoch;
         let vnode_states = self.capture_vnode_states();
         let wm = self
             .pipeline_watermark
@@ -639,6 +629,8 @@ impl ConnectorPipelineCallback {
         let complete_tx = self.checkpoint_complete_tx.clone();
         let cc = self.cluster_controller.clone();
         tokio::spawn(async move {
+            use crate::checkpoint_coordinator::CheckpointCoordinator;
+
             let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
             if let Some(ref cc) = cc {
                 cc.ack_barrier(&laminar_core::cluster::control::BarrierAck {
@@ -650,40 +642,61 @@ impl ConnectorPipelineCallback {
                 .await
                 .ok();
             }
-            let committed = {
+
+            // Stage 1: durable prepare under the FIFO mutex.
+            let decision_store = {
                 let mut guard = coordinator.lock().await;
                 match guard.as_mut() {
                     Some(coord) => {
                         coord.set_pending_vnode_states(vnode_states);
                         coord.set_local_watermark_ms(wm_opt);
                         match coord
-                            .follower_checkpoint_acked(
-                                request,
-                                ann,
-                                std::time::Duration::from_secs(30),
-                            )
+                            .follower_prepare_acked(request, epoch, checkpoint_id)
                             .await
                         {
-                            Ok(true) => {
-                                tracing::info!(epoch, "follower checkpoint committed");
-                                true
-                            }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    epoch,
-                                    "follower checkpoint aborted (leader signalled Abort)"
-                                );
-                                false
-                            }
+                            Ok(()) => Some(coord.decision_store_handle()),
                             Err(e) => {
-                                tracing::warn!(epoch, error = %e, "follower checkpoint errored");
-                                false
+                                tracing::warn!(epoch, error = %e, "follower prepare errored");
+                                None
                             }
                         }
                     }
-                    None => false,
+                    None => None,
                 }
             };
+
+            // Stage 2: await the leader's decision WITHOUT the mutex —
+            // the next epoch's prepare/uploads must not queue behind a
+            // wait that can last the full decision timeout.
+            let committed = match (decision_store, cc.as_ref()) {
+                (Some(decision_store), Some(cc)) => {
+                    let verdict = CheckpointCoordinator::await_follower_decision(
+                        cc,
+                        decision_store.as_deref(),
+                        epoch,
+                        checkpoint_id,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                    // Stage 3: act on the verdict under the mutex.
+                    let mut guard = coordinator.lock().await;
+                    match guard.as_mut() {
+                        Some(coord) => {
+                            let committed =
+                                coord.follower_finish(epoch, checkpoint_id, verdict).await;
+                            if committed {
+                                tracing::info!(epoch, "follower checkpoint committed");
+                            } else {
+                                tracing::warn!(epoch, "follower checkpoint aborted");
+                            }
+                            committed
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+
             // Record only on commit so a failed-then-retried epoch is
             // reprocessed, not deduped.
             tail.finish(epoch, committed);
@@ -810,7 +823,7 @@ impl ConnectorPipelineCallback {
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-        self.spawn_follower_tail(request, ann, source_offsets);
+        self.spawn_follower_tail(request, ann.epoch, ann.checkpoint_id, source_offsets);
         Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
         self.prom
             .checkpoint_pipeline_stall_duration
@@ -868,7 +881,7 @@ impl ConnectorPipelineCallback {
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-        self.spawn_follower_tail(request, ann, source_checkpoints);
+        self.spawn_follower_tail(request, ann.epoch, ann.checkpoint_id, source_checkpoints);
         Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
         self.prom
             .checkpoint_pipeline_stall_duration
@@ -907,7 +920,6 @@ impl ConnectorPipelineCallback {
                 phase: Phase::Prepare,
                 flags: 0,
                 min_watermark_ms: None,
-                seq: 0,
             })
             .await
         {
@@ -2338,7 +2350,6 @@ mod tests {
             phase: Phase::Aligned,
             flags: 0,
             min_watermark_ms: Some(42),
-            seq: 0,
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, aligned);
@@ -2369,7 +2380,6 @@ mod tests {
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, newer);

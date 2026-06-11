@@ -66,15 +66,6 @@ pub struct BarrierAnnouncement {
     /// node is still processing earlier events.
     #[serde(default)]
     pub min_watermark_ms: Option<i64>,
-    /// Leader-stamped monotonic announce sequence, assigned by
-    /// [`BarrierCoordinator::announce`] (caller-set values are
-    /// overwritten). Orders same-epoch announcements under latest-wins
-    /// observation: a retry of an aborted epoch reuses the epoch and
-    /// checkpoint id, so only `seq` distinguishes the stale `Abort`
-    /// from the retry's `Prepare`. Resets on leader change; epoch
-    /// ordering dominates across leaders. `0` = legacy/unset.
-    #[serde(default)]
-    pub seq: u64,
 }
 
 /// Follower ack. `ok = false` forces the leader to abort instead of wait.
@@ -345,7 +336,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Prepare,
             flags: req.flags,
             min_watermark_ms: None,
-            seq: req.seq,
         };
 
         if self.incoming_tx.send(ann).await.is_err() {
@@ -388,7 +378,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Aligned,
             flags: req.flags,
             min_watermark_ms: req.min_watermark_ms,
-            seq: req.seq,
         };
         if self.incoming_tx.send(ann).await.is_err() {
             return Err(tonic::Status::aborted("Follower coordinator shutdown"));
@@ -420,7 +409,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Commit,
             flags: req.flags,
             min_watermark_ms: req.min_watermark_ms,
-            seq: req.seq,
         };
         if self.incoming_tx.send(ann).await.is_err() {
             return Err(tonic::Status::aborted("Follower coordinator shutdown"));
@@ -452,7 +440,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             phase: Phase::Abort,
             flags: req.flags,
             min_watermark_ms: None,
-            seq: req.seq,
         };
         if self.incoming_tx.send(ann).await.is_err() {
             return Err(tonic::Status::aborted("Follower coordinator shutdown"));
@@ -516,7 +503,6 @@ async fn send_phase_rpc(
                 checkpoint_id: ann.checkpoint_id,
                 flags: ann.flags,
                 min_watermark_ms: ann.min_watermark_ms,
-                seq: ann.seq,
             });
             stamp_leader_id(&mut req, local_id);
             client
@@ -531,7 +517,6 @@ async fn send_phase_rpc(
                 checkpoint_id: ann.checkpoint_id,
                 flags: ann.flags,
                 min_watermark_ms: ann.min_watermark_ms,
-                seq: ann.seq,
             });
             stamp_leader_id(&mut req, local_id);
             client
@@ -545,7 +530,6 @@ async fn send_phase_rpc(
                 epoch: ann.epoch,
                 checkpoint_id: ann.checkpoint_id,
                 flags: ann.flags,
-                seq: ann.seq,
             });
             stamp_leader_id(&mut req, local_id);
             client
@@ -565,11 +549,6 @@ async fn send_phase_rpc(
 /// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
-    /// Monotonic per-process announce sequence (see
-    /// [`BarrierAnnouncement::seq`]). Stamped on every announce and on
-    /// each `wait_for_quorum` Prepare round so observers can order
-    /// same-epoch announcements across retries.
-    announce_seq: std::sync::atomic::AtomicU64,
     #[cfg(feature = "cluster")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
     #[cfg(feature = "cluster")]
@@ -607,20 +586,11 @@ impl BarrierCoordinator {
     pub fn new(kv: Arc<dyn ClusterKv>) -> Self {
         Self {
             kv,
-            announce_seq: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "cluster")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
         }
-    }
-
-    /// Next announce sequence value (starts at 1 so `0` stays the
-    /// legacy/unset sentinel).
-    fn next_seq(&self) -> u64 {
-        self.announce_seq
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1
     }
 
     /// Configure the leader election state used to validate incoming leader identity.
@@ -744,18 +714,11 @@ impl BarrierCoordinator {
         Ok(local_addr)
     }
 
-    /// Leader-side announce. Stamps [`BarrierAnnouncement::seq`] from
-    /// this coordinator's monotonic counter (any caller-set value is
-    /// overwritten) so observers can order same-epoch announcements
-    /// across abort/retry sequences.
+    /// Leader-side announce.
     ///
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
-        let ann = &BarrierAnnouncement {
-            seq: self.next_seq(),
-            ..ann.clone()
-        };
         #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
@@ -826,10 +789,10 @@ impl BarrierCoordinator {
     /// (non-destructive; repeated calls return the same value until a
     /// newer one arrives, matching the gossip-KV fallback). Callers
     /// already dedup by epoch/phase. The gRPC-delivered value and the
-    /// gossip-KV value are merged by `(epoch, seq)` — within an epoch
-    /// only the leader's announce sequence distinguishes a retry's
-    /// `Prepare` from the previous attempt's `Abort`; on a full tie the
-    /// gRPC value wins (RPC arrival order is authoritative).
+    /// gossip-KV value are merged by epoch (higher wins — epochs are
+    /// never reused: failed ones are abandoned); within an epoch the
+    /// gRPC value wins, since RPC arrival order is authoritative while
+    /// gossip may lag.
     ///
     /// # Errors
     /// Returns a string on JSON decode failure.
@@ -854,7 +817,7 @@ impl BarrierCoordinator {
 
         Ok(match (grpc_latest, kv_latest) {
             (Some(g), Some(k)) => {
-                if (k.epoch, k.seq) > (g.epoch, g.seq) {
+                if k.epoch > g.epoch {
                     Some(k)
                 } else {
                     Some(g)
@@ -922,10 +885,6 @@ impl BarrierCoordinator {
                     };
 
                 let local_id = self.local_node_id().await;
-                // One sequence value per Prepare round: each round is a
-                // (re-)announcement, so it must supersede any earlier
-                // same-epoch announcement (e.g. a prior attempt's Abort).
-                let round_seq = self.next_seq();
                 let mut futures = Vec::new();
                 for &peer in expected {
                     let clients_pool = Arc::clone(&state.clients);
@@ -940,7 +899,6 @@ impl BarrierCoordinator {
                             epoch,
                             checkpoint_id,
                             flags: 0,
-                            seq: round_seq,
                         });
                         stamp_leader_id(&mut req, local_id);
 
@@ -1165,7 +1123,6 @@ mod tests {
                     phase: Phase::Prepare,
                     flags: 0,
                     min_watermark_ms: None,
-                    seq: 0,
                 })
                 .await
                 .unwrap();
@@ -1189,7 +1146,6 @@ mod tests {
                             phase: Phase::Aligned,
                             flags: 0,
                             min_watermark_ms: min_follower_watermark_ms,
-                            seq: 0,
                         })
                         .await
                         .unwrap();
@@ -1203,7 +1159,6 @@ mod tests {
                             phase: Phase::Commit,
                             flags: 0,
                             min_watermark_ms: min_follower_watermark_ms,
-                            seq: 0,
                         })
                         .await
                         .unwrap();
@@ -1215,15 +1170,15 @@ mod tests {
         }
     }
 
-    /// Regression: observation is latest-wins, and a retry of an
-    /// aborted epoch reuses the same epoch/checkpoint id. Without the
-    /// announce `seq`, a stale gRPC-delivered `Abort(N)` would mask
-    /// the retry's gossip-delivered `Prepare(N)` forever (follower
-    /// never starts the retry → leader alignment times out → abort →
-    /// livelock).
+    /// The gRPC-vs-gossip merge in `observe`: a newer epoch's
+    /// gossip-only announcement (the early `Prepare` is KV-only)
+    /// supersedes an older epoch in the gRPC watch, while lagging
+    /// gossip for the *same* epoch never masks the fresher gRPC value.
+    /// Epochs are never reused — failed ones are abandoned — so epoch
+    /// comparison alone orders the channels.
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn kv_retry_prepare_supersedes_stale_grpc_abort() {
+    async fn observe_merges_grpc_and_gossip_by_epoch() {
         let leader_kv = kv(NodeId(1));
         let follower_kv = kv(NodeId(2));
         let leader_coord = BarrierCoordinator::new(leader_kv.clone());
@@ -1239,8 +1194,8 @@ mod tests {
         leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
         follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
 
-        // Attempt 1 aborts — delivered over gRPC, lands in the
-        // follower's latest-wins watch (announce stamps seq = 1).
+        // Epoch 5 aborts — delivered over gRPC, lands in the
+        // follower's latest-wins watch.
         leader_coord
             .announce(&BarrierAnnouncement {
                 epoch: 5,
@@ -1248,7 +1203,6 @@ mod tests {
                 phase: Phase::Abort,
                 flags: 0,
                 min_watermark_ms: None,
-                seq: 0,
             })
             .await
             .unwrap();
@@ -1261,35 +1215,30 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        // Attempt 2's early Prepare reaches this follower via
-        // gossip KV only (the prepare RPC comes later, at quorum
-        // time). Its higher seq must win the merge.
-        let retry = serde_json::to_string(&BarrierAnnouncement {
-            epoch: 5,
-            checkpoint_id: 9,
+        // The next epoch's early Prepare reaches this follower via
+        // gossip KV only (its prepare RPC comes later, at quorum time)
+        // and must win the merge over the stale watch value.
+        let next = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 6,
+            checkpoint_id: 10,
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 2,
         })
         .unwrap();
-        follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, retry);
+        follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, next);
         let got = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
-        assert_eq!(
-            got.phase,
-            Phase::Prepare,
-            "retry Prepare (higher seq) must supersede the stale gRPC Abort",
-        );
+        assert_eq!(got.epoch, 6);
+        assert_eq!(got.phase, Phase::Prepare);
 
-        // Conversely, a *stale* lower-seq KV value (gossip lag)
-        // must not mask the fresher gRPC value.
+        // Same-epoch lagging gossip must not mask the fresher gRPC
+        // value (RPC arrival order is authoritative within an epoch).
         let stale = serde_json::to_string(&BarrierAnnouncement {
             epoch: 5,
             checkpoint_id: 9,
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
-            seq: 0,
         })
         .unwrap();
         follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, stale);
@@ -1312,7 +1261,6 @@ mod tests {
                 phase: Phase::Prepare,
                 flags: 0,
                 min_watermark_ms: None,
-                seq: 0,
             })
             .await
             .unwrap();

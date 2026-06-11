@@ -62,6 +62,7 @@ mod filter_compile;
 mod handle;
 mod interval_join;
 mod key_column;
+mod log_throttle;
 mod metrics;
 mod metrics_api;
 mod mv_store;

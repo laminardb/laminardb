@@ -52,14 +52,11 @@ Control plane (`laminar-core/src/cluster/control/`):
   for. This makes observation non-destructive, so the pipeline's
   resume gate and the background durable tail can watch concurrently
   without stealing announcements from each other.
-- `BarrierAnnouncement.seq`: a leader-stamped monotonic announce
-  sequence (stamped in `announce()` and per `wait_for_quorum` Prepare
-  round; carried through the proto). The gRPC and KV values merge by
-  `(epoch, seq)` — required because a retry of an aborted epoch reuses
-  the same epoch/checkpoint id, so without `seq` a stale
-  gRPC-delivered `Abort(N)` would mask the retry's gossiped
-  `Prepare(N)` forever (livelock; regression test
-  `kv_retry_prepare_supersedes_stale_grpc_abort`).
+- The gRPC and KV values merge by epoch (higher wins; same-epoch ties
+  prefer gRPC arrival order). A `seq` ordering field briefly existed to
+  disambiguate same-epoch retries, but Phase 2's allocate-at-admission
+  abandonment removed epoch reuse, so it was deleted (merge test:
+  `observe_merges_grpc_and_gossip_by_epoch`).
 - `Aligned` fan-out is best-effort per peer: a missed delivery only
   delays that peer's resume until Commit or its gate timeout.
 
@@ -68,7 +65,7 @@ Coordinator (`laminar-db/src/checkpoint_coordinator.rs`):
 - Leader (`checkpoint_inner`, cluster): `await_prepare_quorum` moved
   **before** the leader's own pre-commit/manifest/partial writes; on
   quorum it announces `Aligned`. The durability gate became
-  `await_restorable_gate`: it **polls** `epoch_complete` (100ms, up to
+  `await_restorable_gate`: it **polls** `epoch_complete` (100ms with exponential backoff to 1s, up to
   `CheckpointConfig::restorable_gate_timeout`, default 30s) because
   followers now upload after acking. Split-brain commit markers still
   abort immediately; transient I/O errors retry until the deadline.
@@ -85,7 +82,7 @@ Pipeline (`laminar-db/src/pipeline_callback.rs`):
 
 - Followers hand the durable tail (prepare + decision wait + 2PC
   commit/rollback) to a spawned task (`spawn_follower_tail`); the
-  pipeline blocks only in `wait_for_aligned_resume` (10ms poll, 30s
+  pipeline blocks only in `wait_for_aligned_resume` (push-driven, 30s
   bound, no-op without a cross-node shuffle). Tail bookkeeping lives
   in the shared `FollowerTailState` (in-flight epoch dedups the
   leader's idempotent Prepare re-announcements; committed epoch
@@ -114,9 +111,9 @@ drain, and drain has its own checkpoint barrier.)
 
 | Failure | Outcome |
 |---|---|
-| Follower capture/alignment fails | No ack → leader quorum timeout (3s) → Abort → retry same epoch |
+| Follower capture/alignment fails | No ack → leader quorum timeout (3s) → Abort; epoch abandoned, next barrier gets fresh ids |
 | Follower prepare fails after ack | `ok=false` ack overwrite (KV fast path) or leader gate timeout → Abort; follower already rolled back its sinks |
-| Leader upload/gate/marker fails after Aligned | Abort announced; pipelines already resumed — epoch N is simply not restorable; retry same epoch |
+| Leader upload/gate/marker fails after Aligned | Abort announced; pipelines already resumed — epoch N is simply not restorable and is abandoned |
 | Aligned RPC lost to one peer | That peer resumes on Commit or its 30s gate timeout; epoch unaffected |
 | Follower tail misses Commit (gossip lag + RPC loss) | Decision timeout → durable marker check → commit (pre-existing fallback); epoch advancement check accelerates it |
 | Leader dies between Aligned and Commit | Followers' decision timeout → marker absent → rollback; new leader reconciles via `reconcile_prepared_on_init` |
