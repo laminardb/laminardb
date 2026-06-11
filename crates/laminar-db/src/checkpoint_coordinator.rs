@@ -143,6 +143,12 @@ impl EpochAllocator {
     }
 
     /// Claim the next `(epoch, checkpoint_id)` pair.
+    ///
+    /// The two counters advance independently (not as one atomic unit):
+    /// every allocation site runs on the pipeline task or under the
+    /// coordinator mutex, so concurrent `allocate` calls cannot occur
+    /// today. A new call site off those paths would need this upgraded
+    /// to a single CAS over a packed pair.
     pub(crate) fn allocate(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
         (
@@ -3524,6 +3530,208 @@ mod tests {
         .unwrap();
         assert_eq!(p4.base_epoch, None);
         assert!(!p4.operators.is_empty());
+    }
+
+    /// `InProcessBackend` wrapper with a per-write delay (forces epoch
+    /// overlap) and injected failures keyed by `(epoch, vnode)`.
+    struct FaultBackend {
+        inner: laminar_core::state::InProcessBackend,
+        fail: parking_lot::Mutex<std::collections::HashSet<(u64, u32)>>,
+        write_delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl StateBackend for FaultBackend {
+        async fn write_partial(
+            &self,
+            vnode: u32,
+            epoch: u64,
+            assignment_version: u64,
+            bytes: bytes::Bytes,
+        ) -> Result<(), laminar_core::state::StateBackendError> {
+            tokio::time::sleep(self.write_delay).await;
+            if self.fail.lock().contains(&(epoch, vnode)) {
+                return Err(laminar_core::state::StateBackendError::Io(
+                    "injected write failure".into(),
+                ));
+            }
+            self.inner
+                .write_partial(vnode, epoch, assignment_version, bytes)
+                .await
+        }
+
+        async fn read_partial(
+            &self,
+            vnode: u32,
+            epoch: u64,
+        ) -> Result<Option<bytes::Bytes>, laminar_core::state::StateBackendError> {
+            self.inner.read_partial(vnode, epoch).await
+        }
+
+        async fn epoch_complete(
+            &self,
+            epoch: u64,
+            vnodes: &[u32],
+        ) -> Result<bool, laminar_core::state::StateBackendError> {
+            self.inner.epoch_complete(epoch, vnodes).await
+        }
+
+        async fn prune_before(
+            &self,
+            before: u64,
+        ) -> Result<(), laminar_core::state::StateBackendError> {
+            self.inner.prune_before(before).await
+        }
+
+        async fn latest_committed_epoch(
+            &self,
+        ) -> Result<Option<u64>, laminar_core::state::StateBackendError> {
+            self.inner.latest_committed_epoch().await
+        }
+
+        fn set_authoritative_version(&self, version: u64) {
+            self.inner.set_authoritative_version(version);
+        }
+
+        fn authoritative_version(&self) -> u64 {
+            self.inner.authoritative_version()
+        }
+    }
+
+    /// Fault injection at pipeline depth > 1 (ADR-003 Phase 2). Four
+    /// epochs are admitted (ids allocated, tails spawned) while the
+    /// first is still uploading; the third epoch's upload partially
+    /// fails — one vnode's write lands, the other's is injected to
+    /// fail. Must hold:
+    /// - tails complete in admission order (FIFO coordinator mutex);
+    /// - the failed epoch is abandoned without disturbing successors;
+    /// - the recovery point is the last successful epoch;
+    /// - the partial that *landed* for the failed epoch never becomes
+    ///   a reference base (a successor with identical state must
+    ///   re-upload full, or reference an older *successful* epoch).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // four-epoch fault sequence reads better unsplit
+    async fn overlapping_epoch_failure_is_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
+        let backend = Arc::new(FaultBackend {
+            inner: laminar_core::state::InProcessBackend::new(2),
+            fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            write_delay: Duration::from_millis(100),
+        });
+        coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+        coord.set_vnode_set(vec![0, 1]);
+
+        let allocator = coord.epoch_allocator();
+        let coordinator = Arc::new(tokio::sync::Mutex::new(Some(coord)));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<CheckpointResult>();
+
+        // Admit an epoch exactly as the pipeline callback does: claim
+        // ids lock-free, spawn the tail; the FIFO mutex serializes the
+        // durable work.
+        let admit = |tag: &'static [u8]| {
+            let (epoch, checkpoint_id) = allocator.allocate();
+            let coordinator = Arc::clone(&coordinator);
+            let done = done_tx.clone();
+            let states = std::collections::HashMap::from([
+                (
+                    0u32,
+                    std::collections::HashMap::from([(
+                        "agg".to_string(),
+                        bytes::Bytes::from_static(tag),
+                    )]),
+                ),
+                (
+                    1u32,
+                    std::collections::HashMap::from([(
+                        "agg".to_string(),
+                        bytes::Bytes::from_static(tag),
+                    )]),
+                ),
+            ]);
+            tokio::spawn(async move {
+                let mut guard = coordinator.lock().await;
+                let coord = guard.as_mut().unwrap();
+                coord.set_pending_vnode_states(states);
+                let result = coord
+                    .checkpoint_preallocated(
+                        CheckpointRequest::default(),
+                        epoch,
+                        checkpoint_id,
+                        QuorumStage::RunInline,
+                    )
+                    .await
+                    .unwrap();
+                done.send(result).unwrap();
+            });
+            epoch
+        };
+
+        // All four admitted while epoch A's tail is still uploading
+        // (each write sleeps 100ms; admissions are microseconds apart,
+        // paced just enough that lock-queue order is admission order).
+        let a = admit(b"v1");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let b = admit(b"v1"); // unchanged → reference to A
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (c_epoch, _) = allocator.peek();
+        backend.fail.lock().insert((c_epoch, 1)); // vnode 0 lands, vnode 1 fails
+        let c = admit(b"v2"); // changed → full attempt, partially fails
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let d = admit(b"v2"); // same state as the failed epoch
+
+        let mut results = Vec::new();
+        for _ in 0..4 {
+            results.push(done_rx.recv().await.unwrap());
+        }
+
+        assert_eq!(
+            results.iter().map(|r| r.epoch).collect::<Vec<_>>(),
+            vec![a, b, c, d],
+            "tails must complete in admission order",
+        );
+        assert_eq!(
+            results.iter().map(|r| r.success).collect::<Vec<_>>(),
+            vec![true, true, false, true],
+            "the failed epoch must not disturb its successors",
+        );
+        assert!(results[2]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("vnode partial write failed")));
+
+        // Recovery point: the failed epoch was never sealed.
+        assert_eq!(
+            backend.latest_committed_epoch().await.unwrap(),
+            Some(d),
+            "the last successful epoch is the recovery point",
+        );
+
+        // B was unchanged from A → reference. D matches the FAILED
+        // epoch's state, and C's vnode-0 write landed before the
+        // injected failure — D must not reference it (bases are
+        // recorded only after every write in an epoch lands).
+        let p_b = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, b).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p_b.base_epoch, Some(a));
+        for vnode in [0u32, 1] {
+            let p_d = crate::vnode_partial::VnodePartial::decode(
+                &backend.read_partial(vnode, d).await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                p_d.base_epoch, None,
+                "vnode {vnode}: a successor of a failed epoch must re-upload full, \
+                 never reference the failed epoch's stray partial",
+            );
+            assert_eq!(p_d.operators[0].1, b"v2");
+        }
+        assert_eq!(c, d - 1, "abandoned epoch's id is burned, not reused");
     }
 
     #[test]

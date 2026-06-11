@@ -181,8 +181,16 @@ v1 scope notes (deliberate):
 - Concurrent quorum rounds (cadence < quorum RTT) can waste an epoch
   (one round's Prepare masks the other under latest-wins observation;
   the loser aborts via quorum timeout) — safe, documented.
-- No fault-injection integration test for depth > 1 yet (existing
-  two-node 2PC suites cover depth 1 end-to-end) — follow-up.
+- Tails enqueue on the FIFO mutex in spawn order, which matches
+  admission order in practice but is not scheduler-guaranteed; an
+  inversion is benign at depth > 1 because only at-least-once
+  pipelines pipeline (full snapshots are independent and recovery
+  takes the highest restorable manifest). Exactly-once stays depth 1.
+- Depth > 1 fault injection is covered at the coordinator level
+  (`overlapping_epoch_failure_is_isolated`: four overlapping tails,
+  one epoch's upload partially fails → abandoned; successors commit;
+  no reference partial ever points at the failed epoch). A two-node
+  end-to-end depth > 1 harness remains follow-up.
 
 ## Phase 3 — Incremental snapshots (v1 IMPLEMENTED)
 
