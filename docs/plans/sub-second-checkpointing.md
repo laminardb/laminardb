@@ -221,3 +221,34 @@ and reader plumbing landed here are forward-compatible with it.
 - The per-cycle `observe_barrier` Prepare pickup remains poll-per-cycle
   (cheap in-memory read; the micro-batch cycle time bounds barrier
   frequency, as the ADR notes).
+
+## Production readiness (assessed 2026-06-10)
+
+Code-complete and internally verified (unit, two-node in-process
+cluster, coordinator-level fault injection at depth > 1, wedged-sink
+and abandoned-epoch coverage). **Not yet validated for production**;
+gate on:
+
+1. **Real multi-node soak**: 3-node real-binary cluster (gRPC control
+   plane, S3/MinIO state), hours at 100ms–1s cadence, `kill -9` of
+   leader and follower mid-epoch, verifying exactly-once sink output
+   and recovery point after each fault. The in-process harness runs
+   the gossip-KV path; the gRPC path (Aligned RPC, push-driven waits)
+   has only unit coverage.
+2. **Depth > 1 end-to-end**: enabled only for at-least-once pipelines
+   and admission-capped, but never exercised across real nodes.
+3. **Cap tuning exposure**: `max_in_flight_epochs`/`max_staged_bytes`
+   are default-only (no server TOML) — wire before anyone needs to
+   tune them live.
+4. **Pre-existing recovery sharp edge** (not a regression): followers
+   persist manifests before the decision, so an aborted epoch's
+   manifest can be the highest on disk; reconcile handles Pending
+   sinks, but the restore-from-aborted-manifest path deserves an
+   audit of its own.
+
+Operationally: 100ms is permission, not a promise — quorum RTT +
+capture must fit the interval, and at the caps cadence degrades to
+upload speed. Two documented benign races: a stale `Aligned` from an
+attempt aborted post-quorum can release a successor's resume gate
+early, and overlapping quorum rounds (cadence < quorum RTT) burn an
+epoch.
