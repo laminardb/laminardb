@@ -225,7 +225,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         // sustainable; admission caps (`max_in_flight_epochs`,
         // `max_staged_bytes`) degrade cadence to upload speed instead
         // of letting a tight interval build an unbounded backlog
-        // (ADR-003 Phase 4). Below 100ms the quorum round-trip itself
+        // . Below 100ms the quorum round-trip itself
         // dominates.
         if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(
@@ -1178,7 +1178,7 @@ sql = "SELECT 2"
     #[test]
     fn test_cluster_mode_rejects_tight_checkpoint_interval() {
         // Below 100ms the capture-quorum round-trip itself dominates
-        // the barrier (ADR-003 Phase 4 floor).
+        // the barrier.
         let toml = r#"
 node_id = "n1"
 

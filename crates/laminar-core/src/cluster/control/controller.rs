@@ -341,8 +341,7 @@ impl ClusterController {
     /// matching `pred`, or `timeout` expires (→ `None`). Push-driven
     /// off the gRPC announcement watch when available; gossip-KV-only
     /// deployments (and KV-only announcements) are covered by a
-    /// fallback poll — 250ms with the watch, 25ms without (ADR-003
-    /// Phase 4 replaced the old fixed 50ms decision poll).
+    /// fallback poll — 250ms with the watch, 25ms without.
     #[cfg(feature = "cluster")]
     pub async fn wait_for_barrier<F>(
         &self,

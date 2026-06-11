@@ -184,7 +184,7 @@ impl<'a> VnodeRehydrator<'a> {
             match self.backend.read_partial(vnode, epoch).await {
                 Ok(Some(bytes)) => {
                     // An unchanged-vnode partial is a reference to the
-                    // epoch of its last full upload (ADR-003 Phase 3) —
+                    // epoch of its last full upload —
                     // follow the single hop to the real state. A blob
                     // that doesn't decode is handed through unchanged
                     // (the apply path skips undecodable partials).
@@ -1292,7 +1292,7 @@ mod rehydration_tests {
         assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"new"[..]));
     }
 
-    /// ADR-003 Phase 3: a reference partial resolves (one hop) to the
+    /// A reference partial resolves (one hop) to the
     /// full partial it points at.
     #[tokio::test]
     async fn rehydrate_resolves_reference_partials() {

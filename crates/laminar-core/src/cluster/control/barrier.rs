@@ -33,7 +33,7 @@ pub enum Phase {
     Prepare,
     /// Every node has aligned + captured this epoch (full-membership
     /// capture quorum). Pipelines may resume the next epoch; the epoch
-    /// is NOT yet restorable (ADR-003 two-level completion).
+    /// is NOT yet restorable.
     Aligned,
     /// Durability gate passed; commit sinks. The epoch is restorable.
     Commit,

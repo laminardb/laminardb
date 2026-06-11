@@ -127,7 +127,7 @@ pub struct StreamingCoordinator {
         Option<crossfire::AsyncRx<crossfire::mpsc::Array<CheckpointCompletion>>>,
     /// Epochs between admission and restorable (durable tails still
     /// running). Shared with the callback; gated against
-    /// `max_in_flight_epochs` (ADR-003 Phase 2).
+    /// `max_in_flight_epochs`.
     checkpoint_in_flight: Arc<AtomicU64>,
     /// Barrier admission cap on `checkpoint_in_flight`. Exactly-once
     /// pipelines are wired with 1.
@@ -473,7 +473,7 @@ impl StreamingCoordinator {
 
     /// Share the callback's admission state so the coordinator admits a
     /// new barrier only while in-flight epochs and staged bytes are
-    /// under their caps (ADR-003 Phase 2).
+    /// under their caps.
     pub(crate) fn with_checkpoint_admission(
         mut self,
         in_flight: Arc<AtomicU64>,

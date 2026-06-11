@@ -158,7 +158,7 @@ fn staged_request_bytes(
 }
 
 /// Follower durable-tail bookkeeping shared between the pipeline task
-/// and the spawned tail task (ADR-003 two-level completion). Epochs
+/// and the spawned tail task. Epochs
 /// start at 1, so `0` encodes "none".
 #[cfg(feature = "cluster")]
 #[derive(Debug, Default)]
@@ -602,8 +602,8 @@ impl ConnectorPipelineCallback {
     /// Hand the follower's durable tail — sink pre-commit, manifest
     /// save, vnode-partial uploads, the leader-decision wait, and the
     /// 2PC commit/rollback — to a background task so the pipeline can
-    /// resume on `Aligned` instead of stalling until `Commit`
-    /// (ADR-003 two-level completion). The capture ack is sent before
+    /// resume on `Aligned` instead of stalling until `Commit`.
+    /// The capture ack is sent before
     /// queuing on the coordinator mutex — an earlier epoch's tail may
     /// hold it for the duration of its uploads, and the leader's quorum
     /// must not wait on those. On commit, completion flows through
@@ -707,7 +707,7 @@ impl ConnectorPipelineCallback {
     }
 
     /// Block the pipeline until the leader announces `Aligned` for
-    /// `epoch` — the re-keyed shuffle-alignment resume gate (ADR-003).
+    /// `epoch` — the re-keyed shuffle-alignment resume gate.
     /// `Aligned` is announced only after the *full-membership* capture
     /// quorum, preserving the invariant the no-post-barrier-buffering
     /// shuffle drain relies on: no peer ships epoch-N+1 rows while
@@ -1721,7 +1721,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Everything from here until the Aligned resume gate releases is
-        // pipeline stall — the metric Phase 1 of ADR-003 targets.
+        // pipeline stall — what checkpoint_pipeline_stall_duration measures.
         let stall_start = std::time::Instant::now();
 
         // Drain + align the cross-node shuffle before capture so peers'
@@ -1784,7 +1784,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             quorum_timeout: self.quorum_timeout,
         }));
 
-        // Leader resume gate (ADR-003): hold the pipeline until the tail
+        // Leader resume gate: hold the pipeline until the tail
         // above announces `Aligned` (full-membership capture quorum) —
         // resuming earlier could ship epoch-N+1 shuffle rows to a peer
         // still folding pre-barrier rows into its epoch-N snapshot.

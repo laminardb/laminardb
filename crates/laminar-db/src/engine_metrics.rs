@@ -79,10 +79,10 @@ pub struct EngineMetrics {
     pub checkpoint_duration: Histogram,
     /// Pipeline stall per barrier: time the pipeline task is blocked by
     /// a checkpoint (shuffle alignment + state capture + the Aligned
-    /// resume gate), excluding the background durable tail (ADR-003).
+    /// resume gate), excluding the background durable tail.
     pub checkpoint_pipeline_stall_duration: Histogram,
     /// Vnode partials written as references to an unchanged base
-    /// instead of re-uploading state (ADR-003 Phase 3).
+    /// instead of re-uploading state.
     pub checkpoint_unchanged_vnodes: IntCounter,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,

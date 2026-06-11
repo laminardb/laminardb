@@ -21,8 +21,8 @@ use crate::error::DbError;
 /// (e.g. an rkyv-encoded `AggStateCheckpoint` holding only this vnode's
 /// groups), so the apply path can hand them straight back to the operator.
 ///
-/// `base_epoch = Some(N)` makes this a *reference* artifact (ADR-003
-/// Phase 3): the vnode's state is byte-identical to the full partial it
+/// `base_epoch = Some(N)` makes this a *reference* artifact: the
+/// vnode's state is byte-identical to the full partial it
 /// uploaded at epoch `N`, so `operators` is empty and the reader follows
 /// the reference (a single hop — references always point at a full
 /// artifact, never at another reference). The writer re-emits a full

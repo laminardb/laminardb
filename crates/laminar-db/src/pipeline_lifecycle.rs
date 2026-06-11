@@ -1603,7 +1603,7 @@ impl LaminarDB {
         )>(16);
         // Shared admission state: the callback claims a slot (and staged
         // bytes) per in-flight epoch; the streaming coordinator gates new
-        // barriers on the caps (ADR-003 Phase 2). Exactly-once pipelines
+        // barriers on the caps. Exactly-once pipelines
         // are capped at depth 1 — a single-open-transaction sink cannot
         // overlap epochs.
         let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));

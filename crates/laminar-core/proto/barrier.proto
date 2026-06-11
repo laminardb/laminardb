@@ -17,8 +17,7 @@ service BarrierSync {
   // The follower returns its local watermark so the leader can fold a
   // cluster-wide minimum for the matching Aligned/Commit. The durable
   // tail (sink pre-commit, manifest, state uploads) runs after the ack
-  // — the ack means "captured", not "durable" (ADR-003 two-level
-  // completion).
+  // — the ack means "captured", not "durable".
   rpc Prepare(PrepareRequest) returns (Ack);
 
   // Intermediate (success). Every node has aligned the shuffle and

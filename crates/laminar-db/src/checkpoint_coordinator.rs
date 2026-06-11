@@ -65,12 +65,12 @@ pub struct CheckpointConfig {
     pub quorum_timeout: Duration,
     /// Max wait for every participating vnode's partial to land before
     /// the epoch is declared restorable. Followers ack at *capture* and
-    /// upload asynchronously (ADR-003 two-level completion), so the
+    /// upload asynchronously after acking, so the
     /// leader's durability gate polls for partial presence instead of
     /// checking once. Expiry aborts the epoch.
     pub restorable_gate_timeout: Duration,
     /// Maximum epochs admitted between `Aligned` and restorable — the
-    /// upload backlog (ADR-003 Phase 2). Exactly-once pipelines are
+    /// upload backlog. Exactly-once pipelines are
     /// capped at 1: a single-open-transaction sink (e.g. a Kafka
     /// transactional producer) cannot overlap epochs.
     pub max_in_flight_epochs: u64,
@@ -122,7 +122,7 @@ pub struct CheckpointRequest {
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
 }
 
-/// Lock-free epoch/checkpoint-id allocator (ADR-003 Phase 2).
+/// Lock-free epoch/checkpoint-id allocator.
 ///
 /// Ids are handed out at barrier admission — possibly while an earlier
 /// epoch's durable tail still holds the coordinator mutex — so they
@@ -314,8 +314,8 @@ pub struct CheckpointCoordinator {
     pending_vnode_states:
         std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
     /// Per-vnode `(epoch, slices)` of the last *full* partial uploaded —
-    /// the bases for unchanged-vnode reference partials (ADR-003
-    /// Phase 3). Bytes are refcounted, so this holds one serialized
+    /// the bases for unchanged-vnode reference partials. Bytes are
+    /// refcounted, so this holds one serialized
     /// snapshot's worth of memory, not a deep copy per epoch.
     #[allow(clippy::disallowed_types)]
     last_vnode_uploads:
@@ -721,7 +721,7 @@ impl CheckpointCoordinator {
     ///
     /// A vnode whose slices are byte-identical to its last full upload
     /// writes a tiny *reference* partial instead of re-uploading the
-    /// state (ADR-003 Phase 3) — upload cost becomes proportional to
+    /// state — upload cost becomes proportional to
     /// changed vnodes. References are forced back to full before their
     /// base ages out of the `max_retained` prune window, and bases are
     /// recorded only after every write lands so a partially-failed
@@ -747,7 +747,7 @@ impl CheckpointCoordinator {
         let caller_version = self.assignment_version;
         let max_ref_age = (self.config.max_retained as u64).max(1);
 
-        // Phase 1 (sync): classify each vnode as reference or full and
+        // Step 1 (sync): classify each vnode as reference or full and
         // encode its payload.
         let mut full_uploads: Vec<(u32, std::collections::HashMap<String, bytes::Bytes>)> =
             Vec::new();
@@ -785,7 +785,7 @@ impl CheckpointCoordinator {
             encoded.push((v, bytes::Bytes::from(partial.encode()?)));
         }
 
-        // Phase 2 (async): upload concurrently.
+        // Step 2 (async): upload concurrently.
         let writes = encoded.into_iter().map(|(v, payload)| {
             let backend = Arc::clone(backend);
             async move {
@@ -801,7 +801,7 @@ impl CheckpointCoordinator {
         });
         futures::future::try_join_all(writes).await?;
 
-        // Phase 3 (sync): record the new bases / clear emptied vnodes.
+        // Step 3 (sync): record the new bases / clear emptied vnodes.
         for (v, ops) in full_uploads {
             self.last_vnode_uploads.insert(v, (epoch, ops));
         }
@@ -1495,8 +1495,7 @@ impl CheckpointCoordinator {
     /// wait for the leader's commit/abort.
     /// `Ok(true)` = committed, `Ok(false)` = aborted/timed out.
     ///
-    /// The ack is sent *before* the durable prepare (ADR-003 two-level
-    /// completion): it means "aligned + captured" — the caller has
+    /// The ack is sent *before* the durable prepare: it means "aligned + captured" — the caller has
     /// already aligned the shuffle and captured state into `request`.
     /// The leader announces `Aligned` on the full ack quorum (releasing
     /// every pipeline), and verifies prepare completion through the
@@ -1845,12 +1844,10 @@ impl CheckpointCoordinator {
         let start = Instant::now();
         // Ids are allocated up front (Flink-style): a failed attempt is
         // abandoned — never retried under the same ids — so a future
-        // epoch's identity never depends on this one's outcome. That
-        // independence is what allows epochs to overlap (ADR-003
-        // Phase 2); it also removes the same-epoch-retry ambiguity the
-        // announcement `seq` otherwise has to disambiguate. Pipelined
-        // barrier paths allocate at admission and pass the ids in;
-        // forced/timer paths allocate here.
+        // epoch's identity never depends on this one's outcome, which
+        // is what allows epochs to overlap. Pipelined barrier paths
+        // allocate at admission and pass the ids in; forced/timer
+        // paths allocate here.
         let (epoch, checkpoint_id) = ids.unwrap_or_else(|| self.allocator.allocate());
 
         info!(checkpoint_id, epoch, "starting checkpoint");
@@ -3162,7 +3159,7 @@ mod tests {
         }
     }
 
-    /// ADR-003 two-level completion: the leader must announce `Aligned`
+    /// Two-level completion: the leader must announce `Aligned`
     /// (the pipeline resume gate) after the capture quorum and *before*
     /// the durable tail's `Commit`.
     #[cfg(feature = "cluster")]
@@ -3209,7 +3206,7 @@ mod tests {
         );
     }
 
-    /// ADR-003: the follower acks at capture (before its durable
+    /// The follower acks at capture (before its durable
     /// prepare). If the prepare then fails, a best-effort `ok = false`
     /// ack overwrites the capture ack so a still-polling leader can
     /// fail the quorum fast instead of waiting for its gate timeout.
@@ -3407,7 +3404,7 @@ mod tests {
         );
     }
 
-    /// ADR-003: followers ack at capture and upload partials
+    /// Followers ack at capture and upload partials
     /// asynchronously, so the leader's restorable gate must *wait* for
     /// late partials rather than failing on the first check.
     #[tokio::test]
@@ -3505,7 +3502,7 @@ mod tests {
         assert!(err.contains("vnode partial write failed"), "got: {err}");
     }
 
-    /// ADR-003 Phase 3: a vnode whose slices didn't change uploads a
+    /// A vnode whose slices didn't change uploads a
     /// reference to its last full partial instead of the state bytes,
     /// and is forced back to full before the base ages out of the
     /// prune retention window.
@@ -3664,7 +3661,7 @@ mod tests {
         }
     }
 
-    /// Fault injection at pipeline depth > 1 (ADR-003 Phase 2). Four
+    /// Fault injection at pipeline depth > 1. Four
     /// epochs are admitted (ids allocated, tails spawned) while the
     /// first is still uploading; the third epoch's upload partially
     /// fails — one vnode's write lands, the other's is injected to
