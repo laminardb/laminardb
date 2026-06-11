@@ -281,6 +281,8 @@ pub(crate) fn apply_checkpoint_config(
         max_retained: Some(checkpoint.max_retained),
         // Not yet exposed in the server TOML; keeps the 30s default.
         alignment_timeout_ms: None,
+        max_in_flight_epochs: checkpoint.max_in_flight_epochs,
+        max_staged_bytes: checkpoint.max_staged_bytes,
     };
     builder = builder.checkpoint(cfg);
 

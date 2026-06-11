@@ -279,10 +279,17 @@ impl LaminarDB {
                 (Box::new(cs), obj)
             };
 
+            let defaults = CkpConfig::default();
             let config = CkpConfig {
                 interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
                 max_retained,
-                ..CkpConfig::default()
+                max_in_flight_epochs: cp_config
+                    .max_in_flight_epochs
+                    .unwrap_or(defaults.max_in_flight_epochs),
+                max_staged_bytes: cp_config
+                    .max_staged_bytes
+                    .unwrap_or(defaults.max_staged_bytes),
+                ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
             if let Some(ref prom) = *self.engine_metrics.lock() {

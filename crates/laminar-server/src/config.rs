@@ -395,6 +395,14 @@ pub struct CheckpointSection {
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
+    /// Max epochs between capture and restorable (the upload backlog).
+    /// Default 4; exactly-once pipelines are capped at 1 regardless.
+    #[serde(default)]
+    pub max_in_flight_epochs: Option<u64>,
+    /// Cap on captured-state bytes held by in-flight epochs awaiting
+    /// upload; admission pauses at the cap. Default 512 MiB.
+    #[serde(default)]
+    pub max_staged_bytes: Option<u64>,
 }
 
 impl Default for CheckpointSection {
@@ -404,6 +412,8 @@ impl Default for CheckpointSection {
             interval: default_checkpoint_interval(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
+            max_in_flight_epochs: None,
+            max_staged_bytes: None,
         }
     }
 }

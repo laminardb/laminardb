@@ -166,17 +166,15 @@ impl EpochAllocator {
         )
     }
 
-    /// Rebase after recovery (authoritative — may move backwards).
-    fn reset(&self, epoch: u64, next_checkpoint_id: u64) {
-        use std::sync::atomic::Ordering;
-        self.epoch.store(epoch, Ordering::Release);
-        self.next_checkpoint_id
-            .store(next_checkpoint_id, Ordering::Release);
-    }
-
-    /// Monotonic advance, for followers mirroring the leader's ids: a
-    /// depth>1 tail finishing out of order must never walk the
-    /// allocator backwards past a successor's ids.
+    /// Monotonic advance — the only way the allocator moves after
+    /// construction; an epoch number can never be re-allocated. That
+    /// matters because an aborted epoch leaves artifacts behind (a
+    /// Pending manifest, uploaded partials): construction seeds from
+    /// the highest *loadable* manifest even if Pending, and recovery
+    /// (which restores from the highest *committed* one, possibly
+    /// older) must not pull ids back down onto those stale artifacts.
+    /// Also keeps a depth>1 follower tail finishing out of order from
+    /// walking past a successor's ids.
     fn advance_to(&self, epoch: u64, next_checkpoint_id: u64) {
         use std::sync::atomic::Ordering;
         self.epoch.fetch_max(epoch, Ordering::AcqRel);
@@ -2202,9 +2200,10 @@ impl CheckpointCoordinator {
         let result = mgr.recover(&[], &self.sinks, &[]).await?;
 
         if let Some(ref recovered) = result {
-            // Advance epoch past the recovered one
+            // Monotonic: the recovered (committed) epoch may be older
+            // than a Pending manifest this node seeded its ids from.
             self.allocator
-                .reset(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
+                .advance_to(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
             let (epoch, checkpoint_id) = self.allocator.peek();
             info!(epoch, checkpoint_id, "coordinator epoch set after recovery");
         }
@@ -3797,6 +3796,46 @@ mod tests {
         assert_eq!(c, d - 1, "abandoned epoch's id is burned, not reused");
     }
 
+    /// A follower persists its manifest before learning the leader
+    /// aborted, so an aborted epoch's Pending manifest can be the
+    /// highest on disk at restart. Construction seeds ids from it
+    /// (high is safe); recovery then restores from the older committed
+    /// epoch and must NOT walk the ids back down — that would
+    /// re-allocate the aborted epoch over its stale artifacts.
+    #[tokio::test]
+    async fn recovery_never_walks_ids_back_onto_aborted_epochs() {
+        use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path(), 5);
+        // Committed epoch 3.
+        let mut committed = CheckpointManifest::new(3, 3);
+        committed
+            .sink_commit_statuses
+            .insert("out".into(), SinkCommitStatus::Committed);
+        store.save(&committed).await.unwrap();
+        // Aborted epoch 5: persisted by a follower before the leader's
+        // Abort, never committed.
+        let mut aborted = CheckpointManifest::new(5, 5);
+        aborted
+            .sink_commit_statuses
+            .insert("out".into(), SinkCommitStatus::Pending);
+        store.save(&aborted).await.unwrap();
+
+        let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store))
+            .await
+            .unwrap();
+        assert_eq!(coord.epoch(), 6, "seeds from the highest loadable manifest");
+
+        let recovered = coord.recover().await.unwrap().expect("recovers");
+        assert_eq!(recovered.epoch(), 3, "restores from the committed epoch");
+        assert_eq!(
+            coord.epoch(),
+            6,
+            "ids must stay above the aborted epoch, never re-allocating it",
+        );
+    }
+
     #[test]
     fn epoch_allocator_allocates_monotonic_pairs() {
         let a = EpochAllocator::new(5, 9);
@@ -3804,8 +3843,11 @@ mod tests {
         assert_eq!(a.allocate(), (5, 9));
         assert_eq!(a.allocate(), (6, 10));
         assert_eq!(a.peek(), (7, 11));
-        a.reset(20, 30);
+        a.advance_to(20, 30);
         assert_eq!(a.allocate(), (20, 30));
+        // Monotonic: never walks backwards.
+        a.advance_to(5, 5);
+        assert_eq!(a.peek(), (21, 31));
     }
 
     /// Ids are allocated at the start of an attempt: a failed epoch is
