@@ -277,7 +277,7 @@ four distinct defects; three are fixed (`e0e95242`), one is open:
    counted as `Failed` (live NACK) instead of unreachable, bypassing
    the unresponsive signal. Transport errors now classify into
    `TimedOut{missing}`.
-4. OPEN — rejoin lockstep livelock (pre-existing alignment mechanics):
+4. FIXED (`dc4376bd`) — rejoin lockstep livelock:
    a restarted node can start aligning checkpoint N after peers already
    sent their N barriers (lost while its transport was down), time out
    the full 30s, and land one epoch behind forever; the leader''s
@@ -294,3 +294,26 @@ Survival progression at 100ms as fixes landed: 2 → 5 → 8 full fault
 rounds. 500ms cadence: passes (3+ rounds, all nodes). Fix item 4, then
 re-run 900s+ at 100ms until clean, before production sign-off on the
 100ms floor.
+### Remaining open defect (5) — orphaned-vnode window
+
+Epochs admitted after membership drops a dead node but before the
+(debounced, barrier-gated) rebalance rotates its vnodes away are
+unsealable: every capture participant is healthy (no fail-fast
+applies), but the dead node''s vnodes were captured by nobody, so the
+durability gate burns its full 30s per epoch until rotation lands
+(`set_vnode_set` → rotation floor then clears the backlog). Soak
+evidence: run `soak-254772`, epoch 14 gate burn while epochs 15-18
+reached quorum two-node. Candidate fixes, in design order:
+(a) pause barrier admission while live membership disagrees with
+vnode-assignment ownership (cheap, bounded stall = rotation latency;
+matches the existing admission-cap machinery), or (b) gate epochs on
+the vnodes owned by their capture participants only — protocol-level
+change to `epoch_complete` semantics; interacts with recovery and
+rehydration expectations of a sealed epoch. Also worth measuring: the
+rebalance controller''s rotation latency after a hard kill — it waits
+on a checkpoint barrier that may itself be stuck behind doomed gates.
+
+At 100ms the soak now survives kills and rejoins until it hits this
+window (~round 4); at 500ms all rounds pass. Sign-off order: fix (5),
+then 900s+ clean at 100ms, then hours-long + MinIO + exactly-once
+sink diff.
