@@ -96,6 +96,14 @@ impl Node {
     fn epoch(&self) -> Option<f64> {
         self.metric("laminardb_checkpoint_epoch")
     }
+
+    /// Committed checkpoints — the REAL progress signal.
+    /// `checkpoint_epoch` advances on aborted epochs too (abandonment
+    /// churns ids), so asserting on it only proves the control loop is
+    /// alive, not that the cluster can actually complete a checkpoint.
+    fn commits(&self) -> Option<f64> {
+        self.metric("laminardb_checkpoints_completed_total")
+    }
 }
 
 impl Drop for Node {
@@ -105,6 +113,18 @@ impl Drop for Node {
 }
 
 fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -> PathBuf {
+    let depth = env_u64("LAMINAR_SOAK_DEPTH", 4);
+    // Vnode partials go through the [state] backend, NOT [checkpoint] -
+    // without a SHARED state store each node writes partials to its own
+    // local default and the leader durability gate (which lists the
+    // full registry) can never seal an epoch. The first soak runs
+    // missed this and masked it by asserting on epoch churn.
+    let state_url = std::env::var("LAMINAR_SOAK_STATE_URL").unwrap_or_else(|_| {
+        let shared = dir.join("state");
+        std::fs::create_dir_all(&shared).unwrap();
+        let fwd = shared.display().to_string().replace(char::from(92), "/");
+        format!("file:///{fwd}")
+    });
     let http = BASE_PORT + id as u16;
     let gossip = BASE_PORT + 100 + id as u16;
     let seeds: Vec<String> = (0..NODES)
@@ -146,10 +166,17 @@ advertise_host = "127.0.0.1"
 [coordination]
 strategy = "raft"
 
+[state]
+backend = "object_store"
+url = "{state_url}"
+instance_id = "n{id}"
+vnode_capacity = 64
+
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
 max_retained = 5
+max_in_flight_epochs = {depth}
 
 [checkpoint.storage]
 {storage}
@@ -191,17 +218,25 @@ fn cluster_epoch(nodes: &[Node]) -> f64 {
     nodes.iter().filter_map(Node::epoch).fold(0.0, f64::max)
 }
 
-/// Assert cluster-wide commit progress within `window`: the highest
-/// epoch visible on any live node must advance past the prior floor.
-/// (Leadership is a NodeId-hash order, not spawn order, so rounds
-/// kill nodes round-robin — over the soak both leader and followers
-/// get hit — and progress of the cluster max is the invariant.)
-fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) -> f64 {
-    let target = cluster_epoch(nodes).max(floor) + 2.0;
+/// Total commits across live nodes (per-node counters; a killed node''s
+/// contribution drops out, so progress is always asserted relative to
+/// a fresh reading, never an absolute floor).
+fn cluster_commits(nodes: &[Node]) -> f64 {
+    nodes.iter().filter_map(Node::commits).sum()
+}
+
+/// Assert the cluster COMMITS two more checkpoints within `window`
+/// (sink 2PC + recovery point both key off commits — epoch numbers
+/// also advance on aborts, so they prove nothing). Returns the new
+/// epoch floor for logging. Leadership is a NodeId-hash order, not
+/// spawn order, so rounds kill nodes round-robin — over the soak both
+/// leader and followers get hit.
+fn assert_progress(nodes: &[Node], _floor: f64, window: Duration, label: &str) -> f64 {
+    let target = cluster_commits(nodes) + 2.0;
     wait_for(
-        &format!("{label}: cluster epoch to reach {target}"),
+        &format!("{label}: cluster commits to reach {target}"),
         window,
-        || cluster_epoch(nodes) >= target,
+        || cluster_commits(nodes) >= target,
     );
     cluster_epoch(nodes)
 }
