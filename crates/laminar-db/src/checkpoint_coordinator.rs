@@ -186,6 +186,14 @@ impl EpochAllocator {
     }
 }
 
+/// Capture-quorum participant id. Aliased so non-cluster builds (where
+/// `laminar_core::cluster` is compiled out and participant sets are
+/// always empty) still type-check the shared plumbing.
+#[cfg(feature = "cluster")]
+pub(crate) type QuorumPeer = laminar_core::cluster::discovery::NodeId;
+#[cfg(not(feature = "cluster"))]
+pub(crate) type QuorumPeer = u64;
+
 /// Whether `checkpoint_inner` still needs to run the cluster capture
 /// quorum, or a pipelined tail already ran it before taking the
 /// coordinator mutex.
@@ -202,7 +210,7 @@ pub(crate) enum QuorumStage {
         /// Merged cluster-min watermark from the capture acks.
         min_watermark_ms: Option<i64>,
         /// Followers that acked the capture quorum.
-        participants: Vec<laminar_core::cluster::discovery::NodeId>,
+        participants: Vec<QuorumPeer>,
     },
 }
 
@@ -850,7 +858,7 @@ impl CheckpointCoordinator {
     async fn await_restorable_gate(
         &self,
         epoch: u64,
-        participants: &[laminar_core::cluster::discovery::NodeId],
+        participants: &[QuorumPeer],
     ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
@@ -1204,7 +1212,7 @@ impl CheckpointCoordinator {
     #[cfg(feature = "cluster")]
     fn unhealthy_participant(
         members: &[laminar_core::cluster::discovery::NodeInfo],
-        participants: &[laminar_core::cluster::discovery::NodeId],
+        participants: &[QuorumPeer],
     ) -> Option<String> {
         use laminar_core::cluster::discovery::NodeState;
         for &id in participants {
@@ -1950,7 +1958,7 @@ impl CheckpointCoordinator {
         // behind an earlier epoch's uploads) and pass `Done` here.
         #[cfg(feature = "cluster")]
         #[allow(unused_assignments)] // both match arms assign; init keeps non-cluster shape
-        let mut quorum_participants: Vec<laminar_core::cluster::discovery::NodeId> = Vec::new();
+        let mut quorum_participants: Vec<QuorumPeer> = Vec::new();
         #[cfg(feature = "cluster")]
         match quorum {
             QuorumStage::RunInline => {
@@ -2095,7 +2103,7 @@ impl CheckpointCoordinator {
         // asynchronously after their capture ack, so this polls until
         // `restorable_gate_timeout` rather than checking once.
         #[cfg(not(feature = "cluster"))]
-        let quorum_participants: Vec<laminar_core::cluster::discovery::NodeId> = Vec::new();
+        let quorum_participants: Vec<QuorumPeer> = Vec::new();
         if let Err(gate_err) = self
             .await_restorable_gate(epoch, &quorum_participants)
             .await

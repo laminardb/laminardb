@@ -304,8 +304,14 @@ mod failures {
         out
     }
 
+    /// A hard crash sheds the dead node''s vnodes to the survivor,
+    /// which rehydrates their checkpointed state and takes over their
+    /// keys (rows in flight at the crash are lost — the at-least-once
+    /// failover window). Before dead-node rotation engaged, the
+    /// survivor kept only its own keys and the cluster could not
+    /// commit at all until the node returned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn crash_mid_stream_loses_in_flight() {
+    async fn crash_sheds_vnodes_to_survivor() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
         let leader_idx = harness.leader_idx();
         let follower_idx = harness.follower_idxs()[0];
@@ -370,7 +376,13 @@ mod failures {
         let post_crash_leader_keys: HashSet<i64> =
             post_crash_leader.iter().map(|(k, _)| *k).collect();
 
-        let expected_keys: HashSet<i64> = key_buckets[0].1.iter().copied().collect();
+        // Rotation handed the crashed node''s vnodes to the survivor,
+        // which rehydrated their phase-A state and processed phase C
+        // for them — so the survivor now serves EVERY key.
+        let expected_keys: HashSet<i64> = key_buckets
+            .iter()
+            .flat_map(|(_, ks)| ks.iter().copied())
+            .collect();
         assert_eq!(post_crash_leader_keys, expected_keys);
 
         harness.shutdown().await;
