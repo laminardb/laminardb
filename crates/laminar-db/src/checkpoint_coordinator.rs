@@ -309,6 +309,13 @@ pub struct CheckpointCoordinator {
     /// Vnodes the leader's durability gate checks. In cluster mode the
     /// full registry; single-instance mirrors `vnode_set`.
     gate_vnode_set: Vec<u32>,
+    /// First epoch admitted at-or-after the latest vnode rotation. An
+    /// in-flight epoch BELOW this captured under the previous
+    /// assignment: vnodes that changed hands mid-epoch were captured by
+    /// nobody, so its durability gate can never seal — fail it fast
+    /// instead of burning the gate timeout (with pipelining, several
+    /// such epochs would burn serially).
+    rotation_epoch_floor: u64,
     /// Per-vnode operator-state slices for the in-flight checkpoint,
     /// `vnode → (operator_name → bytes)`. Set fresh before each checkpoint
     /// by the pipeline callback from `OperatorGraph::snapshot_state_by_vnode`;
@@ -390,6 +397,7 @@ impl CheckpointCoordinator {
             cluster_min_watermark: None,
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
+            rotation_epoch_floor: 0,
             pending_vnode_states: std::collections::HashMap::new(),
             last_vnode_uploads: std::collections::HashMap::new(),
             #[cfg(feature = "cluster")]
@@ -460,6 +468,7 @@ impl CheckpointCoordinator {
         if self.gate_vnode_set.is_empty() {
             self.gate_vnode_set.clone_from(&vnodes);
         }
+        self.rotation_epoch_floor = self.allocator.peek().0;
         // Drop reference bases for vnodes shed in a rebalance — they
         // hold refcounts on serialized state this node no longer owns
         // (and the new owner builds its own bases from a full upload).
@@ -867,6 +876,13 @@ impl CheckpointCoordinator {
         let mut interval = INITIAL_POLL;
         let mut last_state = String::from("not all vnodes persisted");
         loop {
+            if epoch < self.rotation_epoch_floor {
+                return Err(format!(
+                    "vnode assignment rotated after epoch {epoch} captured \
+                     (rotation floor {}); epoch cannot seal",
+                    self.rotation_epoch_floor
+                ));
+            }
             match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
                 Ok(true) => return Ok(()),
                 // Keep the default/previous message; a lingering
