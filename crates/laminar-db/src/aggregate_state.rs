@@ -296,6 +296,25 @@ pub(crate) struct IncrementalAggState {
     last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(crate) idle_ttl_ms: Option<u64>,
     weight_col_idx: Option<usize>,
+    /// Vnode count for dirty tracking, learned at the first per-vnode
+    /// capture. `None` = no captures yet, so nothing can be demoted and
+    /// dirty tracking is off.
+    #[cfg(feature = "state-tier")]
+    tier_vnode_count: Option<u32>,
+    /// Vnodes whose groups changed since the last per-vnode capture —
+    /// their in-memory state no longer matches the captured bytes, so
+    /// demoting them would lose the changes.
+    #[cfg(feature = "state-tier")]
+    dirty_vnodes: rustc_hash::FxHashSet<u32>,
+    /// Set when state was bulk-replaced (restore/merge) since the last
+    /// capture: every vnode is suspect, refuse all demotions until the
+    /// next capture re-baselines.
+    #[cfg(feature = "state-tier")]
+    dirty_all: bool,
+    /// Vnodes demoted to the cold tier: their groups are not in memory and
+    /// per-vnode captures stage a cold marker for them.
+    #[cfg(feature = "state-tier")]
+    cold_vnodes: rustc_hash::FxHashSet<u32>,
 }
 
 impl IncrementalAggState {
@@ -798,6 +817,14 @@ impl IncrementalAggState {
             last_emitted: AHashMap::new(),
             idle_ttl_ms: None,
             weight_col_idx,
+            #[cfg(feature = "state-tier")]
+            tier_vnode_count: None,
+            #[cfg(feature = "state-tier")]
+            dirty_vnodes: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "state-tier")]
+            dirty_all: false,
+            #[cfg(feature = "state-tier")]
+            cold_vnodes: rustc_hash::FxHashSet::default(),
         }))
     }
 
@@ -830,6 +857,18 @@ impl IncrementalAggState {
         let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
 
         for key in &idle_keys {
+            #[cfg(feature = "state-tier")]
+            if let Some(count) = self.tier_vnode_count {
+                let v = if self.num_group_cols == 0 {
+                    0
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        (laminar_core::state::key_hash(key.as_ref()) % u64::from(count)) as u32
+                    }
+                };
+                self.dirty_vnodes.insert(v);
+            }
             if let Some(old) = self.last_emitted.remove(key) {
                 retract_keys.push(key.clone());
                 retract_vals.push(old);
@@ -889,6 +928,12 @@ impl IncrementalAggState {
         let max_groups = self.max_groups;
         let mut groups_len = self.groups.len();
         for (row_ref, indices) in &group_indices {
+            #[cfg(feature = "state-tier")]
+            if let Some(count) = self.tier_vnode_count {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = (laminar_core::state::key_hash(row_ref.as_ref()) % u64::from(count)) as u32;
+                self.dirty_vnodes.insert(v);
+            }
             let entry = match self.groups.entry(row_ref.owned()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -936,6 +981,11 @@ impl IncrementalAggState {
         batch: &RecordBatch,
         watermark_ms: i64,
     ) -> Result<(), DbError> {
+        // Global aggregates capture into vnode 0.
+        #[cfg(feature = "state-tier")]
+        if self.tier_vnode_count.is_some() {
+            self.dirty_vnodes.insert(0);
+        }
         let empty_key = global_aggregate_key();
         if !self.groups.contains_key(&empty_key) {
             let mut accs = Vec::with_capacity(self.agg_specs.len());
@@ -1360,6 +1410,13 @@ impl IncrementalAggState {
         self.last_emitted = new_last_emitted;
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
+        // Restored state lives fully in memory: no vnode is cold anymore,
+        // and none can be demoted until the next capture re-baselines.
+        #[cfg(feature = "state-tier")]
+        {
+            self.cold_vnodes.clear();
+            self.dirty_all = true;
+        }
         Ok(checkpoint.groups.len())
     }
 
@@ -1443,6 +1500,16 @@ impl IncrementalAggState {
             }
         }
 
+        // This capture is the new clean baseline: the staged bytes match
+        // memory exactly as of now, so dirty tracking restarts here (and
+        // the vnode count it is keyed to is pinned).
+        #[cfg(feature = "state-tier")]
+        {
+            self.tier_vnode_count = Some(vnode_count);
+            self.dirty_vnodes.clear();
+            self.dirty_all = false;
+        }
+
         Ok(buckets)
     }
 
@@ -1518,7 +1585,81 @@ impl IncrementalAggState {
 
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
+        // Merged-in state changes an unknown set of vnodes; refuse
+        // demotions until the next capture re-baselines.
+        #[cfg(feature = "state-tier")]
+        {
+            self.dirty_all = true;
+        }
         Ok(checkpoint.groups.len())
+    }
+}
+
+#[cfg(feature = "state-tier")]
+impl IncrementalAggState {
+    /// Vnodes currently demoted to the cold tier.
+    pub(crate) fn cold_vnodes(&self) -> &rustc_hash::FxHashSet<u32> {
+        &self.cold_vnodes
+    }
+
+    /// Drop one vnode's groups after their captured bytes were confirmed
+    /// in the cold tier. Refuses (`false`) unless it is provably safe:
+    ///
+    /// - the agg emits a changelog — a full-emit agg rebuilds its entire
+    ///   result from memory each cycle, so dropping groups would shrink
+    ///   the query output (same restriction as idle-TTL eviction);
+    /// - the vnode is untouched since the last per-vnode capture, and no
+    ///   bulk restore/merge happened since — otherwise memory has moved
+    ///   past the bytes sitting in the tier;
+    /// - the capture baseline used this `vnode_count`.
+    ///
+    /// No retractions are emitted: unlike eviction, demotion is invisible
+    /// downstream — the materialized rows stay, and a future update for a
+    /// cold group goes through promotion first.
+    #[allow(dead_code)] // called once the demotion trigger lands with promotion
+    pub(crate) fn demote_vnode(&mut self, vnode: u32, vnode_count: u32) -> bool {
+        if !self.emit_changelog
+            || self.dirty_all
+            || self.dirty_vnodes.contains(&vnode)
+            || self.tier_vnode_count != Some(vnode_count)
+        {
+            return false;
+        }
+        let global = self.num_group_cols == 0;
+        let keys: Vec<arrow::row::OwnedRow> = self
+            .groups
+            .keys()
+            .filter(|k| {
+                let v = if global {
+                    0
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        (laminar_core::state::key_hash(k.as_ref()) % u64::from(vnode_count)) as u32
+                    }
+                };
+                v == vnode
+            })
+            .cloned()
+            .collect();
+        for k in &keys {
+            self.groups.remove(k);
+            self.last_emitted.remove(k);
+        }
+        self.cold_vnodes.insert(vnode);
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
+        true
+    }
+
+    /// The vnode's state is back in memory (promotion applied) or never
+    /// left (tier write failed after the drop was rolled back): captures
+    /// stage bytes again, and the slice counts as changed until the next
+    /// capture re-baselines it.
+    pub(crate) fn mark_vnode_hot(&mut self, vnode: u32) {
+        if self.cold_vnodes.remove(&vnode) {
+            self.dirty_vnodes.insert(vnode);
+        }
     }
 }
 
@@ -2441,6 +2582,154 @@ mod tests {
             result[0].num_rows() <= 3,
             "should have at most 3 groups, got {}",
             result[0].num_rows()
+        );
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn test_demote_vnode_lifecycle() {
+        const VNODES: u32 = 4;
+        // Changelog mode: demotion is only legal when downstream holds the
+        // materialized rows.
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c", "d"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
+
+        // No capture yet: nothing is provably durable, demotion refuses.
+        assert!(!state.demote_vnode(0, VNODES));
+
+        let buckets = state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        let (&v, slice) = buckets.iter().next().unwrap();
+        let demoted_groups = slice.groups.len();
+        assert!(demoted_groups > 0);
+        let groups_before = state.groups.len();
+
+        // Untouched since capture → demote drops exactly that vnode's groups.
+        assert!(state.demote_vnode(v, VNODES));
+        assert!(state.cold_vnodes().contains(&v));
+        assert_eq!(state.groups.len(), groups_before - demoted_groups);
+
+        // The demoted vnode is absent from the next capture's buckets
+        // (its cold marker is staged by the operator wrapper instead).
+        let buckets2 = state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        assert!(!buckets2.contains_key(&v));
+
+        // A vnode-count mismatch (rebalance changed the layout) refuses.
+        let other = buckets2.keys().next().copied();
+        if let Some(other) = other {
+            assert!(!state.demote_vnode(other, VNODES + 1));
+        }
+
+        // Promotion path: hot again, and dirty until the next capture.
+        state.mark_vnode_hot(v);
+        assert!(!state.cold_vnodes().contains(&v));
+        assert!(!state.demote_vnode(v, VNODES), "hot-but-dirty must refuse");
+        let _ = state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        // Clean again after re-baselining (no groups in memory for v, but
+        // the refusal must now come from emptiness, not dirtiness — demote
+        // of an empty vnode is a no-op that still marks it cold).
+        assert!(state.demote_vnode(v, VNODES));
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn test_demote_refused_when_dirty_or_full_emit() {
+        const VNODES: u32 = 4;
+        // Full-emit agg (emit_changelog = false): demotion always refuses —
+        // it rebuilds its whole result from memory, dropping groups would
+        // shrink the output.
+        let (_, mut full) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        full.process_batch(&batch, i64::MIN).unwrap();
+        let buckets = full.checkpoint_groups_by_vnode(VNODES).unwrap();
+        let (&v, _) = buckets.iter().next().unwrap();
+        assert!(
+            !full.demote_vnode(v, VNODES),
+            "full-emit agg must never demote"
+        );
+
+        // Changelog agg with rows since the capture: the touched vnode is
+        // dirty and refuses; an untouched one (if any) still demotes.
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
+        let buckets = state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        let (&v, _) = buckets.iter().next().unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
+        assert!(
+            !state.demote_vnode(v, VNODES),
+            "vnode touched since capture must refuse demotion"
         );
     }
 

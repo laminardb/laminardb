@@ -740,15 +740,23 @@ impl GraphOperator for SqlQueryOperator {
     fn checkpoint_by_vnode(
         &mut self,
         vnode_count: u32,
-    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
+        use crate::checkpoint_coordinator::StagedSlice;
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Ok(None);
         };
         let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
-        if per_vnode.is_empty() {
+        #[cfg(feature = "state-tier")]
+        let cold: Vec<u32> = agg_state.cold_vnodes().iter().copied().collect();
+        #[cfg(not(feature = "state-tier"))]
+        let cold: Vec<u32> = Vec::new();
+        if per_vnode.is_empty() && cold.is_empty() {
             return Ok(None);
         }
-        let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
+        let mut out = std::collections::HashMap::with_capacity(per_vnode.len() + cold.len());
         for (vnode, cp) in per_vnode {
             let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
                 .map(|v| v.to_vec())
@@ -758,9 +766,23 @@ impl GraphOperator for SqlQueryOperator {
                         self.op_name
                     ))
                 })?;
-            out.insert(vnode, bytes::Bytes::from(data));
+            out.insert(vnode, StagedSlice::Bytes(bytes::Bytes::from(data)));
+        }
+        // Demoted vnodes have no groups in memory; stage a cold marker so
+        // the coordinator references (or tier-fetches) their slice instead
+        // of treating the vnode as emptied.
+        for vnode in cold {
+            out.insert(vnode, StagedSlice::Cold);
         }
         Ok(Some(out))
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn demote_vnode(&mut self, vnode: u32, vnode_count: u32) -> bool {
+        match self.state {
+            QueryState::Agg(ref mut agg_state) => agg_state.demote_vnode(vnode, vnode_count),
+            _ => false,
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -775,6 +797,10 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.merge_groups(&cp)?;
+                // Whether this is a rebalance acquisition or a promotion
+                // from the cold tier, the vnode's state now lives in memory.
+                #[cfg(feature = "state-tier")]
+                agg_state.mark_vnode_hot(vnode);
                 tracing::debug!(
                     query = %self.op_name, vnode, groups = merged,
                     "applied rehydrated vnode aggregate state"

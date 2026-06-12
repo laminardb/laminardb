@@ -78,14 +78,30 @@ pub(crate) trait GraphOperator: Send {
     /// a value the cluster shuffle routes (the aggregation fast-path); `None`
     /// (default) for operators that aren't vnode-partitionable — those recover
     /// from the whole-node manifest blob instead. The per-vnode bytes are the
-    /// same encoding the operator's own restore/apply path consumes.
+    /// same encoding the operator's own restore/apply path consumes. A vnode
+    /// demoted to the cold tier stages [`StagedSlice::Cold`] instead of
+    /// bytes — staging nothing would read as "emptied" and drop the demoted
+    /// state from recovery truth.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     fn checkpoint_by_vnode(
         &mut self,
         _vnode_count: u32,
-    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
         Ok(None)
+    }
+
+    /// Drop one vnode's state from memory after its bytes were confirmed
+    /// written to the cold tier. Returns `false` to refuse — the vnode was
+    /// touched since the last capture (the tier bytes would be stale) or
+    /// the operator can't demote at all. Default: refuse.
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // called once the demotion trigger lands with promotion
+    fn demote_vnode(&mut self, _vnode: u32, _vnode_count: u32) -> bool {
+        false
     }
 
     /// Merge one vnode's rehydrated state slice (produced by
@@ -2152,18 +2168,13 @@ impl OperatorGraph {
     #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
     pub fn snapshot_state_by_vnode(
         &mut self,
-    ) -> Result<
-        std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
-        DbError,
-    > {
+    ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, DbError> {
         let vnode_count = match &self.cluster_shuffle {
             Some(cfg) => cfg.registry.vnode_count(),
             None => return Ok(std::collections::HashMap::new()),
         };
-        let mut out: std::collections::HashMap<
-            u32,
-            std::collections::HashMap<String, bytes::Bytes>,
-        > = std::collections::HashMap::new();
+        let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
+            std::collections::HashMap::new();
         for node in &mut self.nodes {
             if node.removed {
                 continue;
@@ -2177,6 +2188,22 @@ impl OperatorGraph {
             }
         }
         Ok(out)
+    }
+
+    /// Ask the named operator to drop one vnode's state after its slice
+    /// was confirmed in the cold tier. `false` = refused (the vnode was
+    /// touched since the last capture, or the operator can't demote).
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // called once the demotion trigger lands with promotion
+    pub(crate) fn demote_vnode(&mut self, operator: &str, vnode: u32) -> bool {
+        let Some(cfg) = &self.cluster_shuffle else {
+            return false;
+        };
+        let vnode_count = cfg.registry.vnode_count();
+        self.nodes
+            .iter_mut()
+            .find(|n| !n.removed && &*n.name == operator)
+            .is_some_and(|n| n.operator.demote_vnode(vnode, vnode_count))
     }
 
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {

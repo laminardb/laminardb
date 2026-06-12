@@ -193,6 +193,15 @@ visible in `/metrics`; soak with a tiny budget shows stable RSS.
 
 ### Phase 2 — Cold-tier service (no operator wiring yet)
 
+> **Status: implemented 2026-06-12** on `feat/state-memory-budget`
+> (`1159df64`). Deviation from the sketch below: a **single KV-separated
+> keyspace** keyed `operator \0 vnode_be32` instead of a keyspace per
+> operator — avoids keyspace-name sanitization, gives prefix-scoped
+> operator drop, and KV separation is the right layout for slice blobs
+> (1.57× WA in the bench). Marker persists logical counters so a clean
+> reuse restores gauges without scanning blobs. Worker is single-flight
+> by design (bench: read tails degrade under concurrent write pressure).
+
 New module `crates/laminar-db/src/state_tier/` behind a new `state-tier`
 feature (implies `cluster`); fjall is the only new dependency, major version
 pinned.
@@ -215,6 +224,38 @@ Exit: unit tests for lifecycle (clean reuse, unclean wipe, version-mismatch
 wipe), round-trip, concurrent fetch-under-write.
 
 ### Phase 3 — Demotion (agg operator + coordinator)
+
+> **Status: substrate implemented 2026-06-12** on `feat/state-memory-budget`
+> (mechanism only — the budget→demote trigger ships with promotion, since a
+> cold vnode receiving rows needs the promotion path first). Design changes
+> vs. the sketch below, all simplifications found during implementation:
+>
+> - **Demotion is coordinator-driven, not operator-serialized**: the
+>   coordinator's `last_vnode_uploads` already retains each slice's exact
+>   uploaded bytes for the reference-partial comparison, so demotion hands
+>   *those* bytes to the tier (truth-identical by construction) and then
+>   swaps the entry to a `Cold` marker — releasing the RAM pin. No
+>   restorable-epoch atomic is needed: candidates carry their base epoch
+>   and the caller (the pipeline callback, which observes epoch
+>   completions) filters against it.
+> - Staged slices are now `StagedSlice::{Bytes, Cold}` end-to-end (operator
+>   → graph → callback → coordinator). `Cold` counts as unchanged in the
+>   reference comparison; a forced full re-upload fetches the bytes back
+>   from the tier, and **a tier miss fails the epoch** rather than writing
+>   a partial that silently drops the slice from recovery truth.
+> - The operator keeps a per-vnode dirty set (re-baselined at each capture)
+>   and `demote_vnode` refuses dirty vnodes, bulk-restored/merged state,
+>   and — load-bearing — **non-changelog aggs**: a full-emit agg rebuilds
+>   its whole result from memory, so dropping groups would shrink query
+>   output (same restriction as idle-TTL eviction).
+>
+> Open items carried to the next phases: (1) the whole-state manifest blob
+> (`checkpoint()`) does not contain demoted groups — the recovery path for
+> tier-enabled operators must restore from vnode partials, audit before
+> enabling the trigger; (2) per-vnode capture currently requires the
+> cluster shuffle config — single-node tiering needs `snapshot_state_by_vnode`
+> to take a vnode count from the single-owner registry (and accept the
+> capture-cost regression only when the tier is enabled).
 
 1. **Restorable-epoch visibility.** Coordinator publishes the latest
    restorable epoch into a shared atomic readable by the pipeline callback /

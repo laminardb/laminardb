@@ -124,7 +124,7 @@ struct LeaderTail {
     >,
     request: crate::checkpoint_coordinator::CheckpointRequest,
     #[allow(clippy::disallowed_types)]
-    vnode_states: std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
     fan_out: FxHashMap<String, SourceCheckpoint>,
     local_watermark_ms: Option<i64>,
     /// `Some` when this node admitted the barrier as cluster leader.
@@ -142,7 +142,7 @@ struct LeaderTail {
 #[allow(clippy::disallowed_types)]
 fn staged_request_bytes(
     request: &crate::checkpoint_coordinator::CheckpointRequest,
-    vnode_states: &std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    vnode_states: &crate::checkpoint_coordinator::StagedVnodeStates,
 ) -> u64 {
     let ops: usize = request
         .operator_states
@@ -152,7 +152,11 @@ fn staged_request_bytes(
     let vnodes: usize = vnode_states
         .values()
         .flat_map(|m| m.values())
-        .map(bytes::Bytes::len)
+        .map(|s| match s {
+            crate::checkpoint_coordinator::StagedSlice::Bytes(b) => b.len(),
+            // Cold slices stage no bytes — they hold tier capacity, not RAM.
+            crate::checkpoint_coordinator::StagedSlice::Cold => 0,
+        })
         .sum();
     (ops + vnodes) as u64
 }
@@ -1062,9 +1066,7 @@ impl ConnectorPipelineCallback {
     /// empty map — the partial then carries no operator state for that epoch,
     /// exactly as the legacy marker did, so the checkpoint still succeeds.
     #[allow(clippy::unused_self, clippy::disallowed_types)] // matches the coordinator/graph map shape
-    fn capture_vnode_states(
-        &mut self,
-    ) -> std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>> {
+    fn capture_vnode_states(&mut self) -> crate::checkpoint_coordinator::StagedVnodeStates {
         #[cfg(feature = "cluster")]
         {
             match self.graph.snapshot_state_by_vnode() {

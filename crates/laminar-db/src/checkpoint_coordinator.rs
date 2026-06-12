@@ -32,6 +32,49 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
 
+/// One operator's staged slice for one vnode of the next checkpoint.
+#[derive(Debug, Clone)]
+pub(crate) enum StagedSlice {
+    /// Freshly serialized memory-resident state.
+    Bytes(bytes::Bytes),
+    /// Demoted to the cold tier and untouched since the upload recorded in
+    /// `last_vnode_uploads`: no bytes staged. The coordinator emits a
+    /// reference partial, or fetches the slice back from the tier when a
+    /// full re-upload is forced.
+    Cold,
+}
+
+/// Per-vnode staged slices, `vnode → operator → slice`.
+pub(crate) type StagedVnodeStates = HashMap<u32, HashMap<String, StagedSlice>>;
+
+/// What `last_vnode_uploads` records per operator slice of the last full
+/// upload: the exact bytes (the reference-partial comparison base, and the
+/// byte source for coordinator-driven demotion), or a cold marker once the
+/// slice was demoted — the bytes then live only in the tier, releasing the
+/// in-memory pin.
+#[derive(Debug, Clone)]
+pub(crate) enum UploadedSlice {
+    Bytes(bytes::Bytes),
+    Cold,
+}
+
+impl UploadedSlice {
+    /// Whether `staged` proves the slice unchanged since this upload.
+    ///
+    /// `Cold` staged ⇒ unchanged by the demotion contract (a demoted slice
+    /// is byte-identical to its recorded upload, and any row for it
+    /// promotes the slice back to memory before processing). Fresh bytes
+    /// against a cold record are conservatively "changed" — the cold bytes
+    /// aren't here to compare, so the slice re-uploads full once.
+    fn matches(&self, staged: &StagedSlice) -> bool {
+        match (staged, self) {
+            (StagedSlice::Cold, _) => true,
+            (StagedSlice::Bytes(b), UploadedSlice::Bytes(prev)) => b == prev,
+            (StagedSlice::Bytes(_), UploadedSlice::Cold) => false,
+        }
+    }
+}
+
 /// Unified checkpoint configuration.
 ///
 /// Timeouts prevent a stuck sink or hung filesystem from stalling the
@@ -329,15 +372,19 @@ pub struct CheckpointCoordinator {
     /// [`write_vnode_partials`](Self::write_vnode_partials). Empty in
     /// single-instance mode (the partial is then just a durability marker).
     #[allow(clippy::disallowed_types)] // matches the graph snapshot shape
-    pending_vnode_states:
-        std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    pending_vnode_states: StagedVnodeStates,
     /// Per-vnode `(epoch, slices)` of the last *full* partial uploaded —
     /// the bases for unchanged-vnode reference partials. Bytes are
     /// refcounted, so this holds one serialized
-    /// snapshot's worth of memory, not a deep copy per epoch.
+    /// snapshot's worth of memory, not a deep copy per epoch; demoted
+    /// slices hold a cold marker instead (their bytes live in the tier).
     #[allow(clippy::disallowed_types)]
     last_vnode_uploads:
-        std::collections::HashMap<u32, (u64, std::collections::HashMap<String, bytes::Bytes>)>,
+        std::collections::HashMap<u32, (u64, std::collections::HashMap<String, UploadedSlice>)>,
+    /// Cold-tier request channel; lets a forced full re-upload of a
+    /// demoted slice fetch its bytes back from the tier.
+    #[cfg(feature = "state-tier")]
+    state_tier: Option<tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>>,
     /// `Some` in cluster mode, `None` in single-instance / embedded.
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -406,6 +453,8 @@ impl CheckpointCoordinator {
             rotation_epoch_floor: 0,
             pending_vnode_states: std::collections::HashMap::new(),
             last_vnode_uploads: std::collections::HashMap::new(),
+            #[cfg(feature = "state-tier")]
+            state_tier: None,
             #[cfg(feature = "cluster")]
             cluster_controller: None,
             cached_sorted_sink_names: None,
@@ -461,11 +510,19 @@ impl CheckpointCoordinator {
     /// Call once per checkpoint (even with an empty map) so a prior epoch's
     /// slices never leak forward.
     #[allow(clippy::disallowed_types)]
-    pub fn set_pending_vnode_states(
-        &mut self,
-        states: std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
-    ) {
+    pub(crate) fn set_pending_vnode_states(&mut self, states: StagedVnodeStates) {
         self.pending_vnode_states = states;
+    }
+
+    /// Wire the cold-tier request channel (forced full re-uploads of
+    /// demoted slices fetch their bytes through it).
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
+    pub(crate) fn set_state_tier(
+        &mut self,
+        tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
+    ) {
+        self.state_tier = Some(tier);
     }
 
     /// Vnodes this instance owns; drives marker writes. Also the
@@ -486,6 +543,114 @@ impl CheckpointCoordinator {
     /// registry in cluster mode). Defaults to `vnode_set` when unset.
     pub fn set_gate_vnode_set(&mut self, vnodes: Vec<u32>) {
         self.gate_vnode_set = vnodes;
+    }
+
+    /// Fetch a demoted slice's bytes back from the cold tier for a forced
+    /// full re-upload.
+    #[cfg(feature = "state-tier")]
+    async fn fetch_cold_slice(&self, operator: &str, vnode: u32) -> Result<bytes::Bytes, DbError> {
+        let Some(ref tier) = self.state_tier else {
+            return Err(DbError::Checkpoint(format!(
+                "cold slice staged but no state tier is wired \
+                 (operator={operator}, vnode={vnode})"
+            )));
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tier.send(crate::state_tier::TierRequest::Fetch {
+            operator: Arc::from(operator),
+            vnode,
+            reply,
+        })
+        .await
+        .map_err(|_| DbError::Checkpoint("state tier worker is gone".to_string()))?;
+        match rx
+            .await
+            .map_err(|_| DbError::Checkpoint("state tier worker dropped the reply".to_string()))??
+        {
+            Some(bytes) => Ok(bytes),
+            None => Err(DbError::Checkpoint(format!(
+                "demoted slice missing from the state tier \
+                 (operator={operator}, vnode={vnode}) — failing the epoch \
+                 rather than dropping it from recovery truth"
+            ))),
+        }
+    }
+
+    /// `state-tier` off: a `Cold` slice can never be staged, so reaching
+    /// this is a logic error reported as a failed epoch.
+    #[cfg(not(feature = "state-tier"))]
+    #[allow(clippy::unused_async)]
+    async fn fetch_cold_slice(&self, operator: &str, vnode: u32) -> Result<bytes::Bytes, DbError> {
+        Err(DbError::Checkpoint(format!(
+            "cold slice staged without state-tier support \
+             (operator={operator}, vnode={vnode})"
+        )))
+    }
+
+    /// Vnodes eligible for demotion: every recorded slice still
+    /// memory-resident, and the base epoch already durable at or below
+    /// `restorable_epoch` (the demoted bytes must be recoverable without
+    /// the tier). Returns `(vnode, base_epoch, total_bytes)`, largest
+    /// first — demoting big idle slices first frees the most memory.
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
+    pub(crate) fn demotion_candidates(&self, restorable_epoch: u64) -> Vec<(u32, u64, usize)> {
+        let mut out: Vec<(u32, u64, usize)> = self
+            .last_vnode_uploads
+            .iter()
+            .filter(|(_, (base, slices))| {
+                *base <= restorable_epoch
+                    && !slices.is_empty()
+                    && slices
+                        .values()
+                        .all(|s| matches!(s, UploadedSlice::Bytes(_)))
+            })
+            .map(|(v, (base, slices))| {
+                let total = slices
+                    .values()
+                    .map(|s| match s {
+                        UploadedSlice::Bytes(b) => b.len(),
+                        UploadedSlice::Cold => 0,
+                    })
+                    .sum();
+                (*v, *base, total)
+            })
+            .collect();
+        out.sort_by_key(|&(_, _, total)| std::cmp::Reverse(total));
+        out
+    }
+
+    /// The recorded upload bytes for `vnode`, to hand to the tier. These
+    /// are exactly the bytes of the slice's last durable full upload, so a
+    /// demotion writes truth-identical state by construction.
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
+    pub(crate) fn slices_for_demotion(&self, vnode: u32) -> Vec<(String, bytes::Bytes)> {
+        self.last_vnode_uploads
+            .get(&vnode)
+            .map(|(_, slices)| {
+                slices
+                    .iter()
+                    .filter_map(|(n, s)| match s {
+                        UploadedSlice::Bytes(b) => Some((n.clone(), b.clone())),
+                        UploadedSlice::Cold => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Release the in-memory byte pins for a demoted vnode (call only
+    /// after the tier write is confirmed and the operator dropped the
+    /// groups). The reference-partial flow then keys off the cold marker.
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
+    pub(crate) fn mark_vnode_demoted(&mut self, vnode: u32) {
+        if let Some((_, slices)) = self.last_vnode_uploads.get_mut(&vnode) {
+            for s in slices.values_mut() {
+                *s = UploadedSlice::Cold;
+            }
+        }
     }
 
     /// Registers a sink connector for checkpoint coordination.
@@ -766,9 +931,15 @@ impl CheckpointCoordinator {
         let caller_version = self.assignment_version;
         let max_ref_age = (self.config.max_retained as u64).max(1);
 
-        // Step 1 (sync): classify each vnode as reference or full and
-        // encode its payload.
-        let mut full_uploads: Vec<(u32, std::collections::HashMap<String, bytes::Bytes>)> =
+        // Step 1: classify each vnode as reference or full and encode its
+        // payload. A staged `Cold` slice counts as unchanged (the demotion
+        // contract guarantees byte identity with the recorded upload); when
+        // a full upload is forced anyway — another operator's slice changed,
+        // or the reference base is aging out — the cold bytes are fetched
+        // back from the tier. A fetch failure fails the epoch: writing a
+        // partial without the demoted slice would silently drop it from the
+        // recovery truth.
+        let mut full_uploads: Vec<(u32, std::collections::HashMap<String, UploadedSlice>)> =
             Vec::new();
         let mut emptied: Vec<u32> = Vec::new();
         let mut reference_count: u64 = 0;
@@ -778,7 +949,13 @@ impl CheckpointCoordinator {
             let base = ops.filter(|ops| !ops.is_empty()).and_then(|ops| {
                 self.last_vnode_uploads
                     .get(&v)
-                    .filter(|(base, last)| epoch.saturating_sub(*base) < max_ref_age && last == ops)
+                    .filter(|(base, last)| {
+                        epoch.saturating_sub(*base) < max_ref_age
+                            && last.len() == ops.len()
+                            && ops
+                                .iter()
+                                .all(|(n, s)| last.get(n).is_some_and(|prev| prev.matches(s)))
+                    })
                     .map(|(base, _)| *base)
             });
             let partial = if let Some(base_epoch) = base {
@@ -789,15 +966,35 @@ impl CheckpointCoordinator {
                     base_epoch: Some(base_epoch),
                 }
             } else {
-                match ops {
-                    Some(ops) if !ops.is_empty() => full_uploads.push((v, ops.clone())),
-                    _ => emptied.push(v),
+                let mut resolved: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut recorded: std::collections::HashMap<String, UploadedSlice> =
+                    std::collections::HashMap::new();
+                if let Some(ops) = ops {
+                    for (name, slice) in ops {
+                        let bytes = match slice {
+                            StagedSlice::Bytes(b) => b.clone(),
+                            StagedSlice::Cold => self.fetch_cold_slice(name, v).await?,
+                        };
+                        resolved.push((name.clone(), bytes.to_vec()));
+                        // Record cold slices as cold: their bytes go into
+                        // this upload but stay pinned only in the tier.
+                        recorded.insert(
+                            name.clone(),
+                            match slice {
+                                StagedSlice::Bytes(b) => UploadedSlice::Bytes(b.clone()),
+                                StagedSlice::Cold => UploadedSlice::Cold,
+                            },
+                        );
+                    }
+                }
+                if recorded.is_empty() {
+                    emptied.push(v);
+                } else {
+                    full_uploads.push((v, recorded));
                 }
                 crate::vnode_partial::VnodePartial {
                     checkpoint_id,
-                    operators: ops
-                        .map(|ops| ops.iter().map(|(n, b)| (n.clone(), b.to_vec())).collect())
-                        .unwrap_or_default(),
+                    operators: resolved,
                     base_epoch: None,
                 }
             };
@@ -3622,7 +3819,10 @@ mod tests {
 
         let slices = || {
             let mut ops = std::collections::HashMap::new();
-            ops.insert("agg".to_string(), bytes::Bytes::from_static(b"state-v1"));
+            ops.insert(
+                "agg".to_string(),
+                StagedSlice::Bytes(bytes::Bytes::from_static(b"state-v1")),
+            );
             std::collections::HashMap::from([(0u32, ops)])
         };
 
@@ -3678,7 +3878,10 @@ mod tests {
         // Changed slices always upload full.
         let mut changed = std::collections::HashMap::new();
         let mut ops = std::collections::HashMap::new();
-        ops.insert("agg".to_string(), bytes::Bytes::from_static(b"state-v2"));
+        ops.insert(
+            "agg".to_string(),
+            StagedSlice::Bytes(bytes::Bytes::from_static(b"state-v2")),
+        );
         changed.insert(0u32, ops);
         coord.set_pending_vnode_states(changed);
         let r4 = coord
@@ -3692,6 +3895,173 @@ mod tests {
         .unwrap();
         assert_eq!(p4.base_epoch, None);
         assert!(!p4.operators.is_empty());
+    }
+
+    /// A demoted (cold-staged) slice keeps emitting references while its
+    /// base is fresh, and a forced full re-upload (base hitting the age
+    /// cap) fetches the bytes back from the tier instead of dropping the
+    /// slice from recovery truth.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn cold_slice_references_then_tier_fetch_on_forced_full() {
+        use laminar_core::state::InProcessBackend;
+
+        let tier_dir = tempfile::tempdir().unwrap();
+        let tier = Arc::new(
+            crate::state_tier::StateTierStore::open(tier_dir.path().join("tier"), None).unwrap(),
+        );
+        tier.put("agg", 0, b"state-v1").unwrap();
+        let tier_tx = crate::state_tier::spawn_worker(&tokio::runtime::Handle::current(), tier, 16);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = CheckpointConfig {
+            max_retained: 2, // reference age cap = 2 epochs
+            ..CheckpointConfig::default()
+        };
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+        let backend = Arc::new(InProcessBackend::new(2));
+        coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+        coord.set_vnode_set(vec![0]);
+        coord.set_state_tier(tier_tx);
+
+        // Epoch 1: full upload while the slice is still memory-resident.
+        let mut ops = std::collections::HashMap::new();
+        ops.insert(
+            "agg".to_string(),
+            StagedSlice::Bytes(bytes::Bytes::from_static(b"state-v1")),
+        );
+        coord.set_pending_vnode_states(std::collections::HashMap::from([(0u32, ops)]));
+        let r1 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r1.success);
+
+        // Demote: release the in-memory pin; subsequent captures stage Cold.
+        assert_eq!(
+            coord.demotion_candidates(r1.epoch),
+            vec![(0, r1.epoch, b"state-v1".len())]
+        );
+        assert!(
+            coord.demotion_candidates(r1.epoch - 1).is_empty(),
+            "a base newer than the restorable epoch must not be a candidate"
+        );
+        let slices = coord.slices_for_demotion(0);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].1.as_ref(), b"state-v1");
+        coord.mark_vnode_demoted(0);
+        assert!(coord.demotion_candidates(r1.epoch).is_empty());
+
+        // Epoch 2: Cold staged → reference to epoch 1, no bytes needed.
+        let cold = || {
+            let mut ops = std::collections::HashMap::new();
+            ops.insert("agg".to_string(), StagedSlice::Cold);
+            std::collections::HashMap::from([(0u32, ops)])
+        };
+        coord.set_pending_vnode_states(cold());
+        let r2 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r2.success);
+        let p2 = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, r2.epoch).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p2.base_epoch, Some(r1.epoch), "cold slice must reference");
+
+        // Epoch 3: still cold, base ages out → full re-upload from the tier.
+        coord.set_pending_vnode_states(cold());
+        let r3 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            r3.success,
+            "forced full must fetch from the tier: {:?}",
+            r3.error
+        );
+        let p3 = crate::vnode_partial::VnodePartial::decode(
+            &backend.read_partial(0, r3.epoch).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p3.base_epoch, None);
+        assert_eq!(p3.operators.len(), 1);
+        assert_eq!(p3.operators[0].0, "agg");
+        assert_eq!(
+            p3.operators[0].1, b"state-v1",
+            "the re-uploaded slice must be the tier's bytes"
+        );
+    }
+
+    /// A forced full re-upload whose cold slice is missing from the tier
+    /// must fail the epoch — writing the partial without it would silently
+    /// drop the slice from recovery truth.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn cold_slice_missing_from_tier_fails_epoch() {
+        use laminar_core::state::InProcessBackend;
+
+        let tier_dir = tempfile::tempdir().unwrap();
+        let tier = Arc::new(
+            crate::state_tier::StateTierStore::open(tier_dir.path().join("tier"), None).unwrap(),
+        );
+        // Deliberately empty tier.
+        let tier_tx = crate::state_tier::spawn_worker(&tokio::runtime::Handle::current(), tier, 16);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = CheckpointConfig {
+            max_retained: 2,
+            ..CheckpointConfig::default()
+        };
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+        let backend = Arc::new(InProcessBackend::new(2));
+        coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+        coord.set_vnode_set(vec![0]);
+        coord.set_state_tier(tier_tx);
+
+        let mut ops = std::collections::HashMap::new();
+        ops.insert(
+            "agg".to_string(),
+            StagedSlice::Bytes(bytes::Bytes::from_static(b"state-v1")),
+        );
+        coord.set_pending_vnode_states(std::collections::HashMap::from([(0u32, ops)]));
+        let r1 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r1.success);
+        coord.mark_vnode_demoted(0);
+
+        let cold = || {
+            let mut ops = std::collections::HashMap::new();
+            ops.insert("agg".to_string(), StagedSlice::Cold);
+            std::collections::HashMap::from([(0u32, ops)])
+        };
+        // Epoch 2 references; epoch 3 forces full → tier miss → failure.
+        coord.set_pending_vnode_states(cold());
+        assert!(
+            coord
+                .checkpoint(CheckpointRequest::default())
+                .await
+                .unwrap()
+                .success
+        );
+        coord.set_pending_vnode_states(cold());
+        let r3 = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            !r3.success,
+            "a tier miss must fail the epoch, not drop state"
+        );
+        assert!(
+            r3.error.unwrap().contains("missing from the state tier"),
+            "failure must name the missing slice"
+        );
     }
 
     /// `InProcessBackend` wrapper with a per-write delay (forces epoch
@@ -3803,14 +4173,14 @@ mod tests {
                     0u32,
                     std::collections::HashMap::from([(
                         "agg".to_string(),
-                        bytes::Bytes::from_static(tag),
+                        StagedSlice::Bytes(bytes::Bytes::from_static(tag)),
                     )]),
                 ),
                 (
                     1u32,
                     std::collections::HashMap::from([(
                         "agg".to_string(),
-                        bytes::Bytes::from_static(tag),
+                        StagedSlice::Bytes(bytes::Bytes::from_static(tag)),
                     )]),
                 ),
             ]);

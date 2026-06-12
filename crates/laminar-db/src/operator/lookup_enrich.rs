@@ -1246,12 +1246,15 @@ mod tests {
         .await;
 
         // node1 sees every key, keeps its own, ships node2's; pump both until
-        // all keys surface (the worker + loopback are async).
+        // all keys surface (the worker + loopback are async). The budget is
+        // generous (breaks early on delivery): under a fully parallel test
+        // run with CPU-heavy neighbors, 500ms of pumping was not enough on
+        // an 8-core box.
         let customers: Vec<Option<i64>> = all.iter().map(|&k| Some(k)).collect();
         let input = stream_batch(&vec![0; all.len()], &customers);
         let mut a = node1.process(&[vec![input]], &[0]).await.unwrap();
         let mut b = node2.process(&[vec![]], &[0]).await.unwrap();
-        for _ in 0..100 {
+        for _ in 0..600 {
             if a.iter().chain(&b).map(RecordBatch::num_rows).sum::<usize>() >= all.len() {
                 break;
             }
