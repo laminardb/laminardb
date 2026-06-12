@@ -593,7 +593,13 @@ impl StreamingCoordinator {
             // the counter on idle timeouts.
             let mut drain_count = 0;
             let drain_budget_ns = self.config.drain_budget_ns;
-            let backpressured = had_data && callback.is_backpressured();
+            // Over the state memory budget, intake throttles to the one
+            // message the select loop already received: skipping the
+            // coalescing drain leaves the rest queued in the channel
+            // (senders block when it fills) while barriers keep flowing
+            // and operators keep draining state.
+            let state_paused = callback.state_over_budget();
+            let backpressured = had_data && (state_paused || callback.is_backpressured());
             if backpressured {
                 tracing::debug!("operator graph backpressured — skipping drain");
             }
@@ -618,7 +624,13 @@ impl StreamingCoordinator {
             // Demote watermarked sources idle past their timeout so a quiet
             // input doesn't pin the combined watermark (active sources keep
             // driving the cycle below, which then closes pending windows).
-            callback.tick_idle_watermark();
+            // Not while intake is paused by the state budget: a paused
+            // source isn't idle — demoting it would advance the combined
+            // watermark past its queued rows, which would then be dropped
+            // as late on resume.
+            if !state_paused {
+                callback.tick_idle_watermark();
+            }
 
             // Step: Execute SQL cycle. Also runs on idle wakeups when
             // operators have deferred input from a prior budget-exceeded
@@ -1664,5 +1676,184 @@ mod tests {
                 "cycle {i} saw {events} events, expected <=1 under backpressure"
             );
         }
+    }
+
+    #[allow(clippy::disallowed_types)] // test-only: std::sync::Mutex is fine here
+    struct StateBudgetCallback {
+        inner: MockCallback,
+        events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
+        idle_ticks: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl PipelineCallback for StateBudgetCallback {
+        async fn execute_cycle(
+            &mut self,
+            source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+            watermark: i64,
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+            let total: u64 = source_batches
+                .values()
+                .flat_map(|bs| bs.iter())
+                .map(|b| b.num_rows() as u64)
+                .sum();
+            self.events_per_cycle.lock().unwrap().push(total);
+            self.inner.execute_cycle(source_batches, watermark).await
+        }
+
+        fn push_to_streams(&self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+            self.inner.push_to_streams(r);
+        }
+        async fn write_to_sinks(&mut self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+            self.inner.write_to_sinks(r).await;
+        }
+        fn extract_watermark(&mut self, s: &str, b: &RecordBatch) {
+            self.inner.extract_watermark(s, b);
+        }
+        fn filter_late_rows(&self, s: &str, b: &RecordBatch) -> Option<RecordBatch> {
+            self.inner.filter_late_rows(s, b)
+        }
+        fn current_watermark(&self) -> i64 {
+            self.inner.current_watermark()
+        }
+        async fn maybe_checkpoint(
+            &mut self,
+            force: bool,
+            offsets: FxHashMap<String, SourceCheckpoint>,
+        ) -> Option<u64> {
+            self.inner.maybe_checkpoint(force, offsets).await
+        }
+        async fn checkpoint_with_barrier(
+            &mut self,
+            cp: FxHashMap<String, SourceCheckpoint>,
+            checkpoint_id: u64,
+        ) -> BarrierOutcome {
+            self.inner.checkpoint_with_barrier(cp, checkpoint_id).await
+        }
+        fn record_cycle(&self, e: u64, b: u64, ns: u64) {
+            self.inner.record_cycle(e, b, ns);
+        }
+        async fn poll_tables(&mut self) {
+            self.inner.poll_tables().await;
+        }
+        fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
+            self.inner.apply_control(msg);
+        }
+
+        fn state_over_budget(&mut self) -> bool {
+            true // Permanently over budget — drain must skip, idle tick must not run.
+        }
+
+        fn tick_idle_watermark(&mut self) {
+            self.idle_ticks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// With `state_over_budget() == true`, the coordinator throttles intake
+    /// exactly like buffer backpressure (one wakeup message per cycle, no
+    /// drain coalescing, no data loss) and never ticks the idle-watermark
+    /// demotion — a budget-paused source must not be treated as idle.
+    #[tokio::test]
+    async fn test_state_budget_pause_throttles_intake_and_holds_idle_tick() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        let coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: None,
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: Duration::from_secs(30),
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                max_input_buf_batches: 256,
+                max_input_buf_bytes: None,
+                backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
+            },
+            rx,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("src")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
+            control_rx,
+            checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        for i in 0..5 {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![i]))],
+            )
+            .unwrap();
+            tx.send(SourceMsg::Batch {
+                source_idx: 0,
+                batch,
+                checkpoint: SourceCheckpoint::new(u64::try_from(i).unwrap()),
+            })
+            .await
+            .unwrap();
+        }
+
+        #[allow(clippy::disallowed_types)]
+        let events_per_cycle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let idle_ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        // The shutdown drain legitimately ticks (everything queued was
+        // drained and watermark-extracted first), so the budget-pause
+        // assertion is on the count snapshotted just before shutdown.
+        let ticks_before_shutdown = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let idle_ticks_clone = Arc::clone(&idle_ticks);
+        let ticks_before_clone = Arc::clone(&ticks_before_shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ticks_before_clone.store(
+                idle_ticks_clone.load(std::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            shutdown_clone.notify_one();
+        });
+
+        let callback = StateBudgetCallback {
+            inner: MockCallback::new(),
+            events_per_cycle: Arc::clone(&events_per_cycle),
+            idle_ticks: Arc::clone(&idle_ticks),
+        };
+        coordinator.run(callback).await;
+
+        let epc = events_per_cycle.lock().unwrap();
+        let total: u64 = epc.iter().sum();
+        assert_eq!(total, 5, "all events must be processed, got {total}");
+        for (i, &events) in epc.iter().enumerate() {
+            assert!(
+                events <= 1,
+                "cycle {i} saw {events} events, expected <=1 while over budget"
+            );
+        }
+        assert_eq!(
+            ticks_before_shutdown.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "idle-watermark tick must not run while intake is budget-paused"
+        );
     }
 }

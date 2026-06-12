@@ -1688,6 +1688,12 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             quorum_timeout: ckpt_quorum_timeout,
             exactly_once_sinks: has_exactly_once_sink,
+            state_memory_budget_bytes: self.config.state_memory_budget_bytes,
+            // Backdated so the first cycle probes immediately.
+            state_budget_probe_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(3600))
+                .unwrap_or_else(std::time::Instant::now),
+            state_budget_exceeded: false,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

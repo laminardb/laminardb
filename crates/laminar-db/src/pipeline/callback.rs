@@ -139,6 +139,16 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// Returns `true` while total operator state exceeds the configured
+    /// memory budget. The coordinator then stops coalescing extra source
+    /// messages into the cycle (intake throttles to the select loop's one
+    /// message per cycle, so checkpoint barriers keep flowing) and skips
+    /// idle-watermark ticking, so a paused source is not demoted and its
+    /// queued rows are not dropped as late on resume. Default: never.
+    fn state_over_budget(&mut self) -> bool {
+        false
+    }
+
     /// Returns `true` when deferred operators have pending input to drain.
     fn has_deferred_input(&self) -> bool {
         false

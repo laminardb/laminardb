@@ -452,6 +452,16 @@ impl OperatorGraph {
         })
     }
 
+    /// Estimated state bytes per operator, for the node-level memory budget
+    /// and the per-operator gauge. Operators serve this from maintained
+    /// counters or a throttled cache, so calling it once per budget probe is
+    /// cheap.
+    pub(crate) fn state_bytes_per_operator(&self) -> impl Iterator<Item = (&Arc<str>, usize)> {
+        self.nodes
+            .iter()
+            .map(|n| (&n.name, n.operator.estimated_state_bytes()))
+    }
+
     pub fn set_lookup_registry(
         &mut self,
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,

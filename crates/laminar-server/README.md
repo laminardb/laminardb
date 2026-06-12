@@ -58,6 +58,11 @@ mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node 
 bind = "0.0.0.0:8080"       # HTTP API bind address
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
+# Optional node-level cap on total operator state held in memory, in bytes.
+# Crossing it pauses source intake (backpressure, not failure) until state
+# drains below the budget; watch `state_bytes` / `state_over_budget` in
+# /metrics. Unset = unlimited.
+# state_memory_budget_bytes = 8589934592
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.

@@ -17,6 +17,7 @@
 //! DISTINCT / FILTER / HAVING / UDAs on the single-process path, which
 //! `PartialAggregate` deliberately does not attempt.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -233,12 +234,56 @@ fn scalars_to_arrays(scalars: &[ScalarValue]) -> Result<Vec<ArrayRef>, DbError> 
         .collect()
 }
 
+/// Minimum interval between full size re-walks in
+/// [`IncrementalAggState::estimated_size_bytes`]. The walk is O(groups);
+/// between walks the cached figure is served, so a per-cycle memory-budget
+/// probe stays O(1) while staleness stays bounded.
+const SIZE_REWALK_MIN_INTERVAL_MS: u64 = 2_000;
+
+/// Cached result of the O(groups) size walk. Atomic because the read path
+/// (`estimated_size_bytes`) takes `&self` but refreshes the cache lazily,
+/// and the operator's `process` future must stay `Send` (which demands
+/// `Sync` of state held across awaits). Single-threaded in practice;
+/// `Relaxed` ordering suffices.
+struct SizeEstimateCache {
+    bytes: AtomicUsize,
+    /// `state_gen` at the last walk; `u64::MAX` forces the next read to walk.
+    walked_gen: AtomicU64,
+    walked_at_ms: AtomicU64,
+}
+
+impl SizeEstimateCache {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            walked_gen: AtomicU64::new(u64::MAX),
+            walked_at_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Force the next `estimated_size_bytes` call to re-walk, bypassing the
+    /// rewalk-interval throttle. For bulk-replacement paths (restore, merge).
+    fn invalidate(&self) {
+        self.walked_gen.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+fn epoch_ms_coarse() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 pub(crate) struct IncrementalAggState {
     pre_agg_sql: String,
     num_group_cols: usize,
     group_types: Vec<DataType>,
     agg_specs: Vec<AggFuncSpec>,
     groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
+    /// Monotonic count of mutations to `groups`; lets the size cache skip
+    /// re-walking idle state entirely.
+    state_gen: u64,
+    size_cache: SizeEstimateCache,
     row_converter: arrow::row::RowConverter,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
@@ -740,6 +785,8 @@ impl IncrementalAggState {
             group_types,
             agg_specs,
             groups: AHashMap::new(),
+            state_gen: 0,
+            size_cache: SizeEstimateCache::new(),
             row_converter,
             output_schema,
             compiled_projection,
@@ -789,6 +836,7 @@ impl IncrementalAggState {
             }
             self.groups.remove(key);
         }
+        self.state_gen = self.state_gen.wrapping_add(1);
 
         if retract_keys.is_empty() {
             return Ok(Vec::new());
@@ -877,6 +925,7 @@ impl IncrementalAggState {
             )?;
             entry.last_updated_ms = watermark_ms;
         }
+        self.state_gen = self.state_gen.wrapping_add(1);
 
         Ok(())
     }
@@ -910,6 +959,7 @@ impl IncrementalAggState {
         entry.last_updated_ms = watermark_ms;
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
+        self.state_gen = self.state_gen.wrapping_add(1);
         Self::update_group_accumulators(
             &mut entry.accs,
             batch,
@@ -1178,7 +1228,25 @@ impl IncrementalAggState {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
 
+    /// Approximate bytes held by group state, from a lazily-refreshed cache.
+    ///
+    /// The underlying walk is O(groups), so the cache re-walks only when the
+    /// state has mutated since the last walk AND at least
+    /// [`SIZE_REWALK_MIN_INTERVAL_MS`] has elapsed — idle state is never
+    /// re-walked, and a per-cycle caller pays O(1) with bounded staleness.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let gen = self.state_gen;
+        let walked_gen = self.size_cache.walked_gen.load(Ordering::Relaxed);
+        if walked_gen == gen {
+            return self.size_cache.bytes.load(Ordering::Relaxed);
+        }
+        let now = epoch_ms_coarse();
+        if walked_gen != u64::MAX
+            && now.saturating_sub(self.size_cache.walked_at_ms.load(Ordering::Relaxed))
+                < SIZE_REWALK_MIN_INTERVAL_MS
+        {
+            return self.size_cache.bytes.load(Ordering::Relaxed);
+        }
         let mut total = 0;
         for (key, entry) in &self.groups {
             total += key.as_ref().len();
@@ -1186,6 +1254,9 @@ impl IncrementalAggState {
                 total += acc.size();
             }
         }
+        self.size_cache.bytes.store(total, Ordering::Relaxed);
+        self.size_cache.walked_gen.store(gen, Ordering::Relaxed);
+        self.size_cache.walked_at_ms.store(now, Ordering::Relaxed);
         total
     }
 
@@ -1287,6 +1358,8 @@ impl IncrementalAggState {
 
         self.groups = new_groups;
         self.last_emitted = new_last_emitted;
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
         Ok(checkpoint.groups.len())
     }
 
@@ -1443,6 +1516,8 @@ impl IncrementalAggState {
             self.last_emitted.entry(row_key).or_insert(vals);
         }
 
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
         Ok(checkpoint.groups.len())
     }
 }
@@ -2366,6 +2441,80 @@ mod tests {
             result[0].num_rows() <= 3,
             "should have at most 3 groups, got {}",
             result[0].num_rows()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_size_estimate_throttled_cache_and_invalidate() {
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+        assert_eq!(state.estimated_size_bytes(), 0);
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
+
+        // Mutated state still serves the previous walk's figure inside the
+        // rewalk interval.
+        assert_eq!(state.estimated_size_bytes(), 0);
+
+        state.size_cache.invalidate();
+        let two_groups = state.estimated_size_bytes();
+        assert!(two_groups > 0, "walk after invalidate must see the groups");
+
+        // Idle reads are stable (gen unchanged → cached, no walk).
+        assert_eq!(state.estimated_size_bytes(), two_groups);
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["c"])),
+                Arc::new(arrow::array::Float64Array::from(vec![3.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch2, i64::MIN).unwrap();
+        // Cached inside the interval, fresh once forced.
+        assert_eq!(state.estimated_size_bytes(), two_groups);
+        state.size_cache.invalidate();
+        assert!(state.estimated_size_bytes() > two_groups);
+    }
+
+    #[tokio::test]
+    async fn test_size_estimate_refreshes_after_restore() {
+        let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
+        let (_, mut donor) = setup_agg_state(sql).await;
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        donor.process_batch(&batch, i64::MIN).unwrap();
+        let cp = donor.checkpoint_groups().unwrap();
+
+        let (_, mut fresh) = setup_agg_state(sql).await;
+        assert_eq!(fresh.estimated_size_bytes(), 0);
+        fresh.restore_groups(&cp).unwrap();
+        assert!(
+            fresh.estimated_size_bytes() > 0,
+            "restore must invalidate the size cache so the next read re-walks"
         );
     }
 

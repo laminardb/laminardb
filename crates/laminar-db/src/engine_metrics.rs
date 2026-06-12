@@ -30,6 +30,17 @@ pub struct EngineMetrics {
     pub mv_updates: IntCounter,
     /// Approximate MV bytes stored.
     pub mv_bytes_stored: IntGauge,
+    /// Estimated operator state bytes held in memory, summed across all
+    /// operators. Refreshed by the memory-budget probe.
+    pub state_bytes: IntGauge,
+    /// Estimated state bytes per operator. Label: `operator`.
+    pub operator_state_bytes: IntGaugeVec,
+    /// Configured node-level state memory budget; `0` = unlimited.
+    pub state_memory_budget_bytes: IntGauge,
+    /// `1` while operator state exceeds the memory budget (ingest paused), else `0`.
+    pub state_over_budget: IntGauge,
+    /// Cycles whose source intake was paused by the state memory budget.
+    pub state_budget_paused_cycles: IntCounter,
     /// Global pipeline watermark.
     pub pipeline_watermark: IntGauge,
     /// Per-source watermark (epoch-ms). Label: `source`.
@@ -163,6 +174,35 @@ impl EngineMetrics {
             mv_bytes_stored: reg!(
                 IntGauge::new("mv_bytes_stored", "Approximate MV bytes stored").unwrap()
             ),
+            state_bytes: reg!(IntGauge::new(
+                "state_bytes",
+                "Estimated operator state bytes held in memory (all operators)"
+            )
+            .unwrap()),
+            // Labels are catalog-bound (one per registered query/operator).
+            operator_state_bytes: reg!(IntGaugeVec::new(
+                Opts::new(
+                    "operator_state_bytes",
+                    "Estimated state bytes per operator"
+                ),
+                &["operator"],
+            )
+            .unwrap()),
+            state_memory_budget_bytes: reg!(IntGauge::new(
+                "state_memory_budget_bytes",
+                "Configured node-level state memory budget (0 = unlimited)"
+            )
+            .unwrap()),
+            state_over_budget: reg!(IntGauge::new(
+                "state_over_budget",
+                "1 while operator state exceeds the memory budget (ingest paused)"
+            )
+            .unwrap()),
+            state_budget_paused_cycles: reg!(IntCounter::new(
+                "state_budget_paused_cycles_total",
+                "Cycles whose source intake was paused by the state memory budget"
+            )
+            .unwrap()),
             pipeline_watermark: reg!(IntGauge::new(
                 "pipeline_watermark",
                 "Global pipeline watermark"

@@ -324,6 +324,11 @@ pub struct ServerSection {
     /// permissive policy (dev only); set this before exposing the console.
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
+    /// Node-level cap on total operator state held in memory, in bytes.
+    /// Crossing it pauses source intake (backpressure, not failure) until
+    /// state drains below the budget. `None` = unlimited.
+    #[serde(default)]
+    pub state_memory_budget_bytes: Option<usize>,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -354,6 +359,7 @@ impl Default for ServerSection {
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
             console_cors_allowed_origins: None,
+            state_memory_budget_bytes: None,
         }
     }
 }
@@ -1103,6 +1109,23 @@ delivery = "exactly_once"
         assert_eq!(coord.heartbeat_interval, Duration::from_millis(300));
 
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn test_state_memory_budget_parses_and_defaults_off() {
+        let toml = r#"
+[server]
+mode = "embedded"
+state_memory_budget_bytes = 1073741824
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.server.state_memory_budget_bytes,
+            Some(1_073_741_824)
+        );
+
+        let config: ServerConfig = toml::from_str("[server]\nmode = \"embedded\"\n").unwrap();
+        assert_eq!(config.server.state_memory_budget_bytes, None);
     }
 
     #[test]

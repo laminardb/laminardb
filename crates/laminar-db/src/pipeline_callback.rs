@@ -332,7 +332,18 @@ pub(crate) struct ConnectorPipelineCallback {
     /// would commit them with epoch N and duplicate them on replay.
     /// Producer pooling is the follow-up that lifts this.
     pub(crate) exactly_once_sinks: bool,
+    /// Node-level cap on total operator state bytes; `None` = unlimited.
+    /// See [`PipelineCallback::state_over_budget`].
+    pub(crate) state_memory_budget_bytes: Option<usize>,
+    /// When the budget was last probed (the probe is throttled).
+    pub(crate) state_budget_probe_at: std::time::Instant,
+    /// Verdict of the last probe, served between probes.
+    pub(crate) state_budget_exceeded: bool,
 }
+
+/// Minimum interval between state-memory-budget probes. Each probe sums
+/// every operator's state estimate and refreshes the state gauges.
+const STATE_BUDGET_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 impl ConnectorPipelineCallback {
     /// `BackpressureFail` raises `shutdown`; coordinator exits via its drain path.
@@ -1876,6 +1887,53 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             self.prom.cycles_backpressured.inc();
         }
         bp
+    }
+
+    fn state_over_budget(&mut self) -> bool {
+        let Some(budget) = self.state_memory_budget_bytes else {
+            return false;
+        };
+        // Probing walks every operator's estimate (each O(1)-ish, but e.g.
+        // the temporal filter still walks its buffer), so throttle it; the
+        // verdict between probes is the cached one.
+        if self.state_budget_probe_at.elapsed() >= STATE_BUDGET_PROBE_INTERVAL {
+            self.state_budget_probe_at = std::time::Instant::now();
+            #[allow(clippy::cast_possible_wrap)]
+            self.prom.state_memory_budget_bytes.set(budget as i64);
+            let mut total = 0usize;
+            for (name, bytes) in self.graph.state_bytes_per_operator() {
+                #[allow(clippy::cast_possible_wrap)]
+                self.prom
+                    .operator_state_bytes
+                    .with_label_values(&[name.as_ref()])
+                    .set(bytes as i64);
+                total = total.saturating_add(bytes);
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            self.prom.state_bytes.set(total as i64);
+            let exceeded = total >= budget;
+            if exceeded != self.state_budget_exceeded {
+                if exceeded {
+                    tracing::warn!(
+                        state_bytes = total,
+                        budget_bytes = budget,
+                        "operator state over memory budget — pausing source intake"
+                    );
+                } else {
+                    tracing::info!(
+                        state_bytes = total,
+                        budget_bytes = budget,
+                        "operator state back under memory budget — resuming source intake"
+                    );
+                }
+            }
+            self.state_budget_exceeded = exceeded;
+            self.prom.state_over_budget.set(i64::from(exceeded));
+        }
+        if self.state_budget_exceeded {
+            self.prom.state_budget_paused_cycles.inc();
+        }
+        self.state_budget_exceeded
     }
 
     fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {

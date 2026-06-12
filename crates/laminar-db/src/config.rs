@@ -65,6 +65,10 @@ pub struct LaminarConfig {
     pub delivery_guarantee: DeliveryGuarantee,
     /// Per-operator state limit. At 80% warns, at 100% errors. `None` = unlimited.
     pub max_state_bytes_per_operator: Option<usize>,
+    /// Node-level cap on total operator state held in memory. Crossing it
+    /// pauses source intake (backpressure, not failure) until state drains
+    /// below the budget. `None` = unlimited.
+    pub state_memory_budget_bytes: Option<usize>,
 
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
@@ -94,6 +98,7 @@ impl Default for LaminarConfig {
             http_auth_token: None,
             delivery_guarantee: DeliveryGuarantee::default(),
             max_state_bytes_per_operator: None,
+            state_memory_budget_bytes: None,
             pipeline_channel_capacity: None,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,

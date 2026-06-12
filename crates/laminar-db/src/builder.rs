@@ -274,6 +274,14 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Cap total operator state held in memory. Crossing the budget pauses
+    /// source intake (backpressure, not failure) until state drains below it.
+    #[must_use]
+    pub fn state_memory_budget_bytes(mut self, bytes: usize) -> Self {
+        self.config.state_memory_budget_bytes = Some(bytes);
+        self
+    }
+
     /// Set checkpoint configuration.
     #[must_use]
     pub fn checkpoint(mut self, config: StreamCheckpointConfig) -> Self {

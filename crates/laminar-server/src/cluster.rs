@@ -448,6 +448,9 @@ pub async fn start_cluster(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
+    if let Some(budget) = config.server.state_memory_budget_bytes {
+        builder = builder.state_memory_budget_bytes(budget);
+    }
 
     if let Some(path) = config.state.local_storage_dir() {
         builder = builder.storage_dir(path);
