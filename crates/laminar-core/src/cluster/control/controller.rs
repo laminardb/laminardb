@@ -36,7 +36,7 @@ pub struct ClusterController {
     active: Arc<AtomicBool>,
     /// Peers that recently failed a capture quorum (no ack within the
     /// timeout), keyed by node id. Gossip failure detection can lag a
-    /// hard kill by tens of seconds; this is the leader''s faster local
+    /// hard kill by tens of seconds; this is the leader's faster local
     /// signal, consulted by the checkpoint durability gate to fail
     /// doomed epochs instead of burning their full timeout. Entries
     /// clear when the peer acks again, and expire after

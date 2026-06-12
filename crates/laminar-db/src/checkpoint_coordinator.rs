@@ -862,17 +862,11 @@ impl CheckpointCoordinator {
     ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
-        // Each `epoch_complete` call LISTs the epoch prefix on the
-        // object store, so back off after the first second: fast for
-        // the common local/in-process case, cheap on S3 for a slow
-        // follower upload (≤10 + ~60 LISTs over the 30s default).
         // Each poll LISTs the epoch prefix on the object store, so back
         // off exponentially: fast for the common local/in-process case,
         // ~1 LIST/s steady-state per slow epoch on S3 (gates also
         // serialize on the coordinator mutex, so at most one loop polls
-        // at a time regardless of pipelining depth). Replacing the poll
-        // with follower upload-completion acks is the protocol-level
-        // follow-up tracked in the plan.
+        // at a time regardless of pipelining depth).
         const INITIAL_POLL: Duration = Duration::from_millis(100);
         const MAX_POLL: Duration = Duration::from_secs(1);
 
@@ -1324,7 +1318,7 @@ impl CheckpointCoordinator {
             }
             Ok(QuorumOutcome::TimedOut { missing, .. }) => {
                 // Gossip failure detection can lag a hard kill by tens
-                // of seconds; record the leader''s own faster signal so
+                // of seconds; record the leader's own faster signal so
                 // the durability gates of already-captured epochs fail
                 // fast instead of each burning their full timeout.
                 cc.note_unresponsive(&missing);

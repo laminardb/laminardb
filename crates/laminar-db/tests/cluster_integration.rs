@@ -304,7 +304,7 @@ mod failures {
         out
     }
 
-    /// A hard crash sheds the dead node''s vnodes to the survivor,
+    /// A hard crash sheds the dead node's vnodes to the survivor,
     /// which rehydrates their checkpointed state and takes over their
     /// keys (rows in flight at the crash are lost — the at-least-once
     /// failover window). Before dead-node rotation engaged, the
@@ -376,7 +376,7 @@ mod failures {
         let post_crash_leader_keys: HashSet<i64> =
             post_crash_leader.iter().map(|(k, _)| *k).collect();
 
-        // Rotation handed the crashed node''s vnodes to the survivor,
+        // Rotation handed the crashed node's vnodes to the survivor,
         // which rehydrated their phase-A state and processed phase C
         // for them — so the survivor now serves EVERY key.
         let expected_keys: HashSet<i64> = key_buckets

@@ -222,113 +222,35 @@ and reader plumbing landed here are forward-compatible with it.
   (cheap in-memory read; the micro-batch cycle time bounds barrier
   frequency, as the ADR notes).
 
-## Production readiness (assessed 2026-06-10)
+## Production readiness
 
-Code-complete and internally verified (unit, two-node in-process
-cluster, coordinator-level fault injection at depth > 1, wedged-sink
-and abandoned-epoch coverage). **Not yet validated for production**;
-gate on:
+Soak harness: `cluster_soak.rs` (laminar-server, `#[ignore]`d) spawns
+3 real `laminardb` binaries over the real gRPC control plane with a
+deterministic `generator` workload, kills nodes round-robin with
+`kill -9` mid-epoch, and asserts **commit** progress (epoch numbers
+advance on aborts too, so they prove nothing).
 
-1. **Real multi-node soak** — HARNESS BUILT + PASSING:
-   `cluster_soak.rs` (laminar-server) spawns 3 real binaries over the
-   real gRPC control plane with a deterministic `generator` workload
-   and kills nodes round-robin mid-epoch. Verified runs: 3 fault
-   rounds, every node (incl. leader) killed + rejoined, epochs
-   committing throughout (2 → 16). Node logs confirm cross-node
-   shuffle alignment and pipelined epochs (N+1..N+3 aligning while
-   N's tail held the durability gate). Remaining before flipping the
-   100ms floor on in production: long-duration runs (hours, via
-   `LAMINAR_SOAK_SECONDS`), 100ms cadence (`LAMINAR_SOAK_INTERVAL_MS`),
-   MinIO/S3 backend (`LAMINAR_SOAK_CHECKPOINT_URL` + `_S3_*`), and an
-   exactly-once sink-output diff (needs a transactional sink in the
-   workload; the generator is deterministic precisely so that check is
-   a recompute-and-compare).
-2. **Depth > 1 end-to-end**: exercised implicitly by the soak
-   (at-least-once workload, default depth 4 — logs show overlapping
-   epochs); a targeted cross-node depth assertion is follow-up.
-3. ~~Cap tuning exposure~~ — DONE: `max_in_flight_epochs` /
-   `max_staged_bytes` are settable in the server `[checkpoint]` TOML.
-4. ~~Aborted-manifest recovery audit~~ — DONE: recovery already skips
-   Pending-sink manifests (tested); the real hazard found was recovery
-   walking allocator ids *back* below an aborted epoch's seed,
-   re-allocating it over stale artifacts — ids are now strictly
-   monotonic (`recovery_never_walks_ids_back_onto_aborted_epochs`).
+Status (2026-06-11): both target cadences pass — 500ms and 100ms —
+with every node (including the leader) killed and recovered each
+round, and dead-node vnode rotation shedding + rehydrating every
+round. Getting there surfaced and fixed five defects (fail-fast gates
+on dead capture participants, quorum-miss unresponsive tracking,
+transport-error classification, supersession release inside the
+alignment wait, membership-watch dedup + skipping the pre-rotation
+drain when shedding a dead node); details live in the fix commits and
+the code comments at each site.
+
+Remaining before signing off the 100ms floor for production:
+
+1. Hours-long endurance run at 100ms (`LAMINAR_SOAK_SECONDS`).
+2. MinIO/S3 checkpoint backend variant
+   (`LAMINAR_SOAK_CHECKPOINT_URL` + `LAMINAR_SOAK_S3_*`).
+3. Exactly-once sink-output diff (needs a transactional sink in the
+   workload; the generator is deterministic precisely so that check
+   is a recompute-and-compare).
+4. A targeted cross-node depth>1 assertion (overlap is exercised by
+   the soak at depth 4, and by coordinator-level fault injection).
 
 Operationally: 100ms is permission, not a promise — quorum RTT +
-capture must fit the interval, and at the caps cadence degrades to
-upload speed. Two documented benign races: a stale `Aligned` from an
-attempt aborted post-quorum can release a successor's resume gate
-early, and overlapping quorum rounds (cadence < quorum RTT) burn an
-epoch.
-## 100ms-cadence soak findings (2026-06-11)
-
-The kill -9 soak at 100ms cadence (vs the passing 500ms runs) peeled
-four distinct defects; three are fixed (`e0e95242`), one is open:
-
-1. FIXED — serial doomed-gate burn: in-flight epochs each waited the
-   full 30s durability gate for a dead node''s uploads, serialized on
-   the coordinator mutex (depth 4 → ~2min commit stall). Gate now
-   fail-fasts on unhealthy capture participants.
-2. FIXED — gossip detection lag: membership can show a killed node
-   Active for >30s, muting fix 1. Capture-quorum misses now mark peers
-   unresponsive on the controller (TTL 60s, cleared on ack); gates
-   consult it.
-3. FIXED — quorum misclassification: connection-refused RPC errors
-   counted as `Failed` (live NACK) instead of unreachable, bypassing
-   the unresponsive signal. Transport errors now classify into
-   `TimedOut{missing}`.
-4. FIXED (`dc4376bd`) — rejoin lockstep livelock:
-   a restarted node can start aligning checkpoint N after peers already
-   sent their N barriers (lost while its transport was down), time out
-   the full 30s, and land one epoch behind forever; the leader''s
-   quorums miss its ack every epoch and nothing commits. The newer
-   Prepare(N+1)/Abort(N) announcement releases the alignment wait
-   *between* attempts but NOT mid-wait — `align_shuffle_barriers` (or
-   its pipeline_callback wrapper) needs an announcement-driven release
-   inside the wait loop. Soak evidence: run `soak-225504`, node0
-   aligning ckpt 15 19:39:41→19:40:11 straight through Abort(15) +
-   Prepare(16) at 19:39:44. Repro: `LAMINAR_SOAK_INTERVAL_MS=100`,
-   fails within ~10 fault rounds at "progress after rejoin".
-
-Survival progression at 100ms as fixes landed: 2 → 5 → 8 full fault
-rounds. 500ms cadence: passes (3+ rounds, all nodes). Fix item 4, then
-re-run 900s+ at 100ms until clean, before production sign-off on the
-100ms floor.
-### Remaining open defect (5) — orphaned-vnode window
-
-Epochs admitted after membership drops a dead node but before the
-(debounced, barrier-gated) rebalance rotates its vnodes away are
-unsealable: every capture participant is healthy (no fail-fast
-applies), but the dead node''s vnodes were captured by nobody, so the
-durability gate burns its full 30s per epoch until rotation lands
-(`set_vnode_set` → rotation floor then clears the backlog). Soak
-evidence: run `soak-254772`, epoch 14 gate burn while epochs 15-18
-reached quorum two-node. Candidate fixes, in design order:
-(a) pause barrier admission while live membership disagrees with
-vnode-assignment ownership (cheap, bounded stall = rotation latency;
-matches the existing admission-cap machinery), or (b) gate epochs on
-the vnodes owned by their capture participants only — protocol-level
-change to `epoch_complete` semantics; interacts with recovery and
-rehydration expectations of a sealed epoch. Also worth measuring: the
-rebalance controller''s rotation latency after a hard kill — it waits
-on a checkpoint barrier that may itself be stuck behind doomed gates.
-
-At 100ms the soak now survives kills and rejoins until it hits this
-window (~round 4); at 500ms all rounds pass. Sign-off order: fix (5),
-then 900s+ clean at 100ms, then hours-long + MinIO + exactly-once
-sink diff.
-## SOAK GREEN (2026-06-11, honest commit assertions)
-
-Both target cadences pass the 3-node real-binary kill -9 soak with
-commit-based progress assertions: 500ms — 5 fault rounds (final epoch
-45); 100ms — 6 fault rounds (final epoch 57); every node including the
-leader killed and recovered each cycle, dead-node vnode rotation
-shedding + rehydrating every round. Fixes that got here (`cd4fde0f`):
-membership-watch dedup (heartbeat ticks starved the rebalance
-debounce forever), skip the pre-rotation drain when shedding a dead
-node (it deadlocked rotation against the durability gate), recovery
-budgets cut (drain 60→15s, retry 10→2s, the four 30s last-resort
-bounds → 10s — fail-fasts are the primary path now). Endurance run
-(3600s @ 100ms) launched detached → target/soak-endurance-100ms.log.
-Remaining for full sign-off: that endurance result, MinIO/S3 variant,
-exactly-once sink-output diff.
+capture must fit the interval, and at the admission caps cadence
+degrades to upload speed.

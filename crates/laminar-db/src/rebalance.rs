@@ -189,7 +189,6 @@ pub fn spawn_rebalance_controller(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut members = controller.members_watch();
-        info!("rebalance controller watching membership");
         loop {
             tokio::select! {
                 biased;
@@ -201,7 +200,7 @@ pub fn spawn_rebalance_controller(
                     }
                 }
             }
-            info!("membership change observed; debouncing");
+            debug!("membership change observed; debouncing");
 
             // Debounce: absorb further churn before acting.
             loop {
@@ -224,7 +223,7 @@ pub fn spawn_rebalance_controller(
             // leave the cluster on a stale assignment.
             loop {
                 if !controller.is_leader() {
-                    info!("membership changed; not the leader — skipping rotation check");
+                    debug!("membership changed; not the leader — skipping rotation check");
                     break;
                 }
                 // Use assignable (Active, non-draining) instances so
@@ -239,9 +238,7 @@ pub fn spawn_rebalance_controller(
                         break;
                     }
                     Ok(None) => {
-                        info!(
-                            "membership changed but live set matches current snapshot; no rotation"
-                        );
+                        debug!("live set matches current snapshot; no rotation");
                         break;
                     }
                     Err(e) => {
@@ -322,29 +319,22 @@ async fn try_rebalance(
 
     // Drain in-flight shuffle rows into durable state at the old
     // fence version before rotating. When the rotation sheds a DEAD
-    // node this drain can never succeed — the durability gate needs
-    // captures from a node that will never provide them — and
-    // requiring it would deadlock rotation against the gate (rotation
-    // is the only thing that restores commit availability). In that
-    // case proceed without the drain: the dead node''s in-flight rows
-    // are unrecoverable regardless, and the survivors rehydrate its
-    // vnodes from the last committed epoch — the same at-least-once
-    // duplication window every ungraceful failover already has.
+    // node, skip the drain entirely: its durability gate needs captures
+    // from a node that will never provide them, so it can only burn its
+    // full timeout and abort — deadlocking rotation against the gate
+    // when rotation is the only thing that restores commit
+    // availability. The dead node's in-flight rows are unrecoverable
+    // regardless; survivors rehydrate its vnodes from the last
+    // committed epoch — the same at-least-once duplication window every
+    // ungraceful failover already has.
     let shedding_dead = {
         let owners = current.to_vnode_vec(registry.vnode_count());
         owners.iter().any(|o| !live.contains(o))
     };
     if shedding_dead {
-        // Don''t even attempt the drain: its durability gate needs
-        // captures from the dead node, so it can only burn its full
-        // timeout and abort — delaying the rotation that restores
-        // commit availability. The dead node''s in-flight rows are
-        // unrecoverable regardless; survivors rehydrate its vnodes
-        // from the last committed epoch — the same at-least-once
-        // duplication window every ungraceful failover already has.
         warn!(
             "rotation sheds a dead node — skipping the pre-rotation drain \
-             checkpoint (it cannot seal without the dead node''s captures)"
+             checkpoint (it cannot seal without the dead node's captures)"
         );
     } else {
         let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())

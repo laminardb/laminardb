@@ -435,7 +435,7 @@ impl StaticDiscovery {
 /// heartbeater publishes each tick — unconditional sends starve any
 /// consumer that debounces on `changed()` waiting for a quiet period
 /// (the rebalance controller never saw 5s of quiet, so vnode rotation
-/// never ran and a dead node''s vnodes were never shed).
+/// never ran and a dead node's vnodes were never shed).
 fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_list: Vec<NodeInfo>) {
     // Stable order: the peer map iterates in arbitrary order, and
     // equality must not depend on it.

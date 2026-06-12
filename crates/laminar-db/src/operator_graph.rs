@@ -2063,7 +2063,7 @@ impl OperatorGraph {
                                     "checkpoint {checkpoint_id} was aborted by leader"
                                 )));
                             }
-                            // Observation is latest-wins, so this checkpoint''s
+                            // Observation is latest-wins, so this checkpoint's
                             // Abort can be superseded before we ever see it. A
                             // NEWER announcement is just as conclusive: ids are
                             // never reused (failed epochs are abandoned), and

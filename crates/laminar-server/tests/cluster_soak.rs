@@ -222,7 +222,7 @@ fn cluster_epoch(nodes: &[Node]) -> f64 {
     nodes.iter().filter_map(Node::epoch).fold(0.0, f64::max)
 }
 
-/// Total commits across live nodes (per-node counters; a killed node''s
+/// Total commits across live nodes (per-node counters; a killed node's
 /// contribution drops out, so progress is always asserted relative to
 /// a fresh reading, never an absolute floor).
 fn cluster_commits(nodes: &[Node]) -> f64 {

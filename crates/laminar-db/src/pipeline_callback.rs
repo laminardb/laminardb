@@ -2222,87 +2222,29 @@ mod tests {
         );
     }
 
-    /// A committed (or older) epoch re-announced by the leader is deduped.
+    /// `follower_should_skip(committed, pending, tail_in_flight, announced)`:
+    /// skip when ANY of the three trackers already covers the announced
+    /// epoch. Committed advances only on commit, so a failed epoch's
+    /// retry (committed still behind) is reprocessed, not deduped — the
+    /// old code recorded the epoch before commit and wedged.
     #[cfg(feature = "cluster")]
     #[test]
-    fn follower_skips_already_committed_or_older_epoch() {
-        assert!(ConnectorPipelineCallback::follower_should_skip(
-            Some(5),
-            None,
-            None,
-            5
-        ));
-        assert!(ConnectorPipelineCallback::follower_should_skip(
-            Some(5),
-            None,
-            None,
-            3
-        ));
-    }
-
-    /// A deferred epoch awaiting local barriers (tracked via the pending
-    /// arg) is deduped so its injectors aren't re-triggered each cycle.
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn follower_skips_in_flight_deferred_epoch() {
-        assert!(ConnectorPipelineCallback::follower_should_skip(
-            Some(4),
-            Some(5),
-            None,
-            5
-        ));
-    }
-
-    /// An epoch whose durable tail (prepare + decision wait) is running
-    /// in the background is deduped — the pipeline has already resumed,
-    /// so the same Prepare announcement stays visible (latest-wins
-    /// observation) and must not re-trigger capture.
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn follower_skips_epoch_with_tail_in_flight() {
-        assert!(ConnectorPipelineCallback::follower_should_skip(
-            Some(4),
-            None,
-            Some(5),
-            5
-        ));
-    }
-
-    /// Regression: a failed checkpoint doesn't advance the committed epoch, and
-    /// the leader retries the same epoch, so the retry must be reprocessed —
-    /// not deduped. The old code recorded the epoch before commit and wedged.
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn follower_reprocesses_retry_of_failed_epoch() {
-        // Epoch 5 failed: committed is still 4, nothing in flight, leader retries 5.
-        assert!(!ConnectorPipelineCallback::follower_should_skip(
-            Some(4),
-            None,
-            None,
-            5
-        ));
-        // Same on a fresh follower whose first epoch failed.
-        assert!(!ConnectorPipelineCallback::follower_should_skip(
-            None, None, None, 5
-        ));
-    }
-
-    /// A higher epoch is always processed.
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn follower_processes_newer_epoch() {
-        assert!(!ConnectorPipelineCallback::follower_should_skip(
-            Some(5),
-            None,
-            None,
-            6
-        ));
-        assert!(!ConnectorPipelineCallback::follower_should_skip(
-            Some(5),
-            Some(5),
-            Some(5),
-            6
-        ));
+    fn follower_should_skip_dedup_matrix() {
+        let skip = ConnectorPipelineCallback::follower_should_skip;
+        // Already committed (or older re-announcement).
+        assert!(skip(Some(5), None, None, 5));
+        assert!(skip(Some(5), None, None, 3));
+        // Deferred, awaiting local barriers.
+        assert!(skip(Some(4), Some(5), None, 5));
+        // Durable tail running in the background (pipeline resumed; the
+        // Prepare stays visible under latest-wins observation).
+        assert!(skip(Some(4), None, Some(5), 5));
+        // Failed-epoch retry: committed didn't advance — reprocess.
+        assert!(!skip(Some(4), None, None, 5));
+        assert!(!skip(None, None, None, 5));
+        // A higher epoch is always processed.
+        assert!(!skip(Some(5), None, None, 6));
+        assert!(!skip(Some(5), Some(5), Some(5), 6));
     }
 
     /// Build a follower-side controller whose `current_leader()` is a

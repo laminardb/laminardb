@@ -224,9 +224,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         // bounded background backlog), so cadences down to 100ms are
         // sustainable; admission caps (`max_in_flight_epochs`,
         // `max_staged_bytes`) degrade cadence to upload speed instead
-        // of letting a tight interval build an unbounded backlog
-        // . Below 100ms the quorum round-trip itself
-        // dominates.
+        // of letting a tight interval build an unbounded backlog.
+        // Below 100ms the quorum round-trip itself dominates.
         if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(
                 "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 100ms",
