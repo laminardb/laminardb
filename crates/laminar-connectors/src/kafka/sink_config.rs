@@ -398,6 +398,17 @@ impl KafkaSinkConfig {
             config.set("ssl.key.password", key_pass);
         }
 
+        // librdkafka rejects a transactional producer whose
+        // message.timeout.ms exceeds transaction.timeout.ms (a message
+        // outliving its transaction could never commit) — and the
+        // defaults conflict (delivery 120s > transaction 60s), so an
+        // unclamped exactly-once config fails producer creation.
+        let message_timeout = if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            self.delivery_timeout.min(self.transaction_timeout)
+        } else {
+            self.delivery_timeout
+        };
+
         config
             .set("enable.idempotence", "true")
             .set("acks", self.acks.as_rdkafka_str())
@@ -410,7 +421,7 @@ impl KafkaSinkConfig {
             )
             .set(
                 "message.timeout.ms",
-                self.delivery_timeout.as_millis().to_string(),
+                message_timeout.as_millis().to_string(),
             );
 
         if let Some(num_msgs) = self.batch_num_messages {
@@ -809,6 +820,11 @@ mod tests {
         let rdk = cfg.to_rdkafka_config();
         assert_eq!(rdk.get("enable.idempotence"), Some("true"));
         assert!(rdk.get("transactional.id").is_some());
+        // librdkafka rejects message.timeout.ms > transaction.timeout.ms;
+        // the default 120s delivery timeout must clamp to the 60s
+        // transaction timeout or producer creation fails outright.
+        assert_eq!(rdk.get("message.timeout.ms"), Some("60000"));
+        assert_eq!(rdk.get("transaction.timeout.ms"), Some("60000"));
     }
 
     #[test]

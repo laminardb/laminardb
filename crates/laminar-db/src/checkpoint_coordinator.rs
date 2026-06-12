@@ -1424,7 +1424,12 @@ impl CheckpointCoordinator {
             let handle = sink.handle.clone();
             let name = sink.name.clone();
             async move {
-                let result = handle.rollback_epoch(epoch).await;
+                // Live abandon, not a hard rollback: a healthy sink
+                // keeps its pending transactional output for the next
+                // epoch's commit — sources don't rewind on a live
+                // abort, so discarding it would lose the rows.
+                // Restart-time rollback (recovery manager) stays hard.
+                let result = handle.abandon_epoch(epoch).await;
                 (name, result)
             }
         });
@@ -1691,6 +1696,10 @@ impl CheckpointCoordinator {
             }
             self.rollback_sinks(epoch).await.ok();
             self.phase = CheckpointPhase::Idle;
+            // The rollback aborted the sinks' open transaction; open
+            // the next epoch's so post-failure writes stay
+            // transactional (mirrors the leader's `fail_epoch`).
+            self.begin_next_epoch_bounded().await;
             return Err(e);
         }
         Ok(())
@@ -1786,14 +1795,22 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
         committed: bool,
     ) -> bool {
-        if committed {
+        let clean = if committed {
             self.drive_follower_commit(epoch, checkpoint_id).await
         } else {
             self.rollback_sinks(epoch).await.ok();
             self.checkpoints_failed += 1;
             self.phase = CheckpointPhase::Idle;
             false
-        }
+        };
+        // Commit and rollback both close the sinks' open transaction;
+        // open the next epoch's so subsequent writes are transactional.
+        // The leader does this inside `checkpoint_inner`/`fail_epoch`;
+        // without the follower mirror, the first commit left
+        // exactly-once sinks transaction-less and every later write
+        // failed (found by the kill -9 exactly-once soak).
+        self.begin_next_epoch_bounded().await;
+        clean
     }
 
     /// Durable commit-marker store handle, for the lock-free decision
@@ -4065,8 +4082,13 @@ mod tests {
         }
     }
 
+    /// A pre-commit failure abandons the epoch but must NOT hard-roll
+    /// the connector back: sources do not rewind on a live abort, so
+    /// discarding a healthy sink's pending transactional output would
+    /// lose those rows forever (measured as gaps by the exactly-once
+    /// soak). The pending output rides into the next epoch's commit.
     #[tokio::test]
-    async fn test_pre_commit_failure_triggers_rollback() {
+    async fn pre_commit_failure_abandons_without_connector_rollback() {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let dir = tempfile::tempdir().unwrap();
@@ -4111,12 +4133,15 @@ mod tests {
         );
         assert_eq!(
             rollback_count.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "rollback_epoch should have been called once"
+            0,
+            "a healthy sink must keep its pending output on a live \
+             abandon — connector rollback would lose unreplayable rows"
         );
     }
 
-    /// `pre_commit` fails; `rollback_epoch` hangs forever.
+    /// Writes fail (poisoning the epoch); `rollback_epoch` hangs
+    /// forever. The poisoned epoch is what makes the live abandon take
+    /// the forced connector-rollback path that can hang.
     struct StuckRollbackSink {
         schema: arrow::datatypes::SchemaRef,
     }
@@ -4137,7 +4162,9 @@ mod tests {
             laminar_connectors::connector::WriteResult,
             laminar_connectors::error::ConnectorError,
         > {
-            Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+            Err(laminar_connectors::error::ConnectorError::WriteError(
+                "synthetic write failure".into(),
+            ))
         }
 
         async fn pre_commit(
@@ -4202,11 +4229,23 @@ mod tests {
             write_timeout: Duration::from_secs(5),
             event_tx,
         });
-        coord.register_sink("stuck-sink", handle, true);
+        coord.register_sink("stuck-sink", handle.clone(), true);
         coord.begin_initial_epoch().await.unwrap();
 
-        // pre_commit fails → rollback_sinks fires → hangs → 100ms
-        // rollback_timeout fires → coordinator returns.
+        // Poison the epoch with a failing write — only a poisoned sink
+        // takes the forced connector-rollback path that can hang.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        handle.write_batch(batch).await.unwrap();
+        handle.sync().await.unwrap();
+
+        // Poisoned pre_commit fails → rollback_sinks fires → connector
+        // rollback hangs → 100ms rollback_timeout fires → coordinator
+        // returns instead of wedging.
         let result = coord
             .checkpoint(CheckpointRequest::default())
             .await

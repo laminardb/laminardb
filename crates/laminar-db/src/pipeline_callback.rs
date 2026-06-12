@@ -325,6 +325,14 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Copied from `CheckpointConfig` for the pre-mutex quorum stage.
     #[cfg(feature = "cluster")]
     pub(crate) quorum_timeout: Duration,
+    /// True when any registered sink is exactly-once. Durable tails
+    /// then run INLINE (pipeline blocked until the commit decision):
+    /// a single transactional producer must not receive post-barrier
+    /// rows while the epoch's transaction is open — an early resume
+    /// would commit them with epoch N and duplicate them on replay.
+    /// Producer pooling (one transaction per in-flight epoch) is the
+    /// follow-up that lifts this.
+    pub(crate) exactly_once_sinks: bool,
 }
 
 impl ConnectorPipelineCallback {
@@ -602,10 +610,14 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Hand the follower's durable tail — sink pre-commit, manifest
-    /// save, vnode-partial uploads, the leader-decision wait, and the
-    /// 2PC commit/rollback — to a background task so the pipeline can
-    /// resume on `Aligned` instead of stalling until `Commit`.
+    /// Build the follower's durable tail — capture ack, sink
+    /// pre-commit, manifest save, vnode-partial uploads, the
+    /// leader-decision wait, and the 2PC commit/rollback. Spawned to a
+    /// background task so the pipeline can resume on `Aligned`, or
+    /// awaited inline for exactly-once pipelines (a single
+    /// transactional producer must not receive post-barrier rows while
+    /// the epoch's transaction is still open — resuming early would
+    /// commit them with epoch N and duplicate them on replay).
     /// The capture ack is sent before
     /// queuing on the coordinator mutex — an earlier epoch's tail may
     /// hold it for the duration of its uploads, and the leader's quorum
@@ -614,13 +626,13 @@ impl ConnectorPipelineCallback {
     /// `EpochCommitted` out to sources and publishes the wire barrier —
     /// the same path the leader's background persist uses.
     #[cfg(feature = "cluster")]
-    fn spawn_follower_tail(
+    fn follower_tail_future(
         &mut self,
         request: crate::checkpoint_coordinator::CheckpointRequest,
         epoch: u64,
         checkpoint_id: u64,
         fan_out: FxHashMap<String, SourceCheckpoint>,
-    ) {
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let vnode_states = self.capture_vnode_states();
         let wm = self
             .pipeline_watermark
@@ -631,7 +643,7 @@ impl ConnectorPipelineCallback {
         let tail = Arc::clone(&self.follower_tail);
         let complete_tx = self.checkpoint_complete_tx.clone();
         let cc = self.cluster_controller.clone();
-        tokio::spawn(async move {
+        async move {
             use crate::checkpoint_coordinator::CheckpointCoordinator;
 
             let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
@@ -706,7 +718,7 @@ impl ConnectorPipelineCallback {
             if committed {
                 let _ = complete_tx.send((epoch, fan_out)).await;
             }
-        });
+        }
     }
 
     /// Block the pipeline until the leader announces `Aligned` for
@@ -823,11 +835,20 @@ impl ConnectorPipelineCallback {
         // Durable tail off the pipeline task; resume once every node has
         // captured (Aligned). Completion is reported asynchronously via
         // `checkpoint_complete_tx`, so there is no epoch to return here.
+        // Exactly-once: the tail runs INLINE — the single transactional
+        // producer must not receive post-barrier rows while the epoch's
+        // transaction is open (resuming on Aligned would commit them
+        // with this epoch and duplicate them on replay).
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-        self.spawn_follower_tail(request, ann.epoch, ann.checkpoint_id, source_offsets);
-        Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
+        let tail = self.follower_tail_future(request, ann.epoch, ann.checkpoint_id, source_offsets);
+        if self.exactly_once_sinks {
+            tail.await;
+        } else {
+            tokio::spawn(tail);
+            Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
+        }
         self.prom
             .checkpoint_pipeline_stall_duration
             .observe(stall_start.elapsed().as_secs_f64());
@@ -880,12 +901,19 @@ impl ConnectorPipelineCallback {
         // node has captured (Aligned) instead of stalling until Commit.
         // Commit completion flows through `checkpoint_complete_tx`
         // (EpochCommitted fan-out + wire barrier), so the outcome here
-        // is Async, not Committed.
+        // is Async, not Committed. Exactly-once runs the tail inline
+        // (see `run_follower_checkpoint_deferred`).
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-        self.spawn_follower_tail(request, ann.epoch, ann.checkpoint_id, source_checkpoints);
-        Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
+        let tail =
+            self.follower_tail_future(request, ann.epoch, ann.checkpoint_id, source_checkpoints);
+        if self.exactly_once_sinks {
+            tail.await;
+        } else {
+            tokio::spawn(tail);
+            Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
+        }
         self.prom
             .checkpoint_pipeline_stall_duration
             .observe(stall_start.elapsed().as_secs_f64());
@@ -1772,7 +1800,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
-        tokio::spawn(Self::run_leader_tail(LeaderTail {
+        let tail = LeaderTail {
             in_flight,
             coordinator: Arc::clone(&self.coordinator),
             complete_tx: self.checkpoint_complete_tx.clone(),
@@ -1785,17 +1813,27 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             controller: self.cluster_controller.clone(),
             #[cfg(feature = "cluster")]
             quorum_timeout: self.quorum_timeout,
-        }));
+        };
+        if self.exactly_once_sinks {
+            // Inline: the single transactional producer must not see
+            // post-barrier rows while the epoch's transaction is open —
+            // an early resume would commit them with this epoch and
+            // duplicate them on replay. (Producer pooling lifts this.)
+            Self::run_leader_tail(tail).await;
+        } else {
+            tokio::spawn(Self::run_leader_tail(tail));
 
-        // Leader resume gate: hold the pipeline until the tail
-        // above announces `Aligned` (full-membership capture quorum) —
-        // resuming earlier could ship epoch-N+1 shuffle rows to a peer
-        // still folding pre-barrier rows into its epoch-N snapshot.
-        // Abort (quorum miss) also releases; the gate is bounded.
-        #[cfg(feature = "cluster")]
-        if let (Some((epoch, _)), Some(cc)) = (leader_ids, self.cluster_controller.clone()) {
-            let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-            Self::wait_for_aligned_resume(has_shuffle, &cc, epoch).await;
+            // Leader resume gate: hold the pipeline until the tail
+            // above announces `Aligned` (full-membership capture
+            // quorum) — resuming earlier could ship epoch-N+1 shuffle
+            // rows to a peer still folding pre-barrier rows into its
+            // epoch-N snapshot. Abort (quorum miss) also releases; the
+            // gate is bounded.
+            #[cfg(feature = "cluster")]
+            if let (Some((epoch, _)), Some(cc)) = (leader_ids, self.cluster_controller.clone()) {
+                let has_shuffle = self.graph.cluster_shuffle_config().is_some();
+                Self::wait_for_aligned_resume(has_shuffle, &cc, epoch).await;
+            }
         }
         self.prom
             .checkpoint_pipeline_stall_duration

@@ -88,9 +88,15 @@ pub(crate) enum SinkCommand {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// Abort a failed epoch.
+    /// Abort a failed epoch. `force = true` (restart/recovery) always
+    /// rolls the connector back; `force = false` (live coordination
+    /// failure) keeps a healthy sink's pending transactional output —
+    /// sources do not rewind on a live abort, so an aborted
+    /// transaction's rows would be lost forever. The next successful
+    /// epoch's commit covers them.
     RollbackEpoch {
         epoch: u64,
+        force: bool,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// No-op barrier: acks once every prior command has been processed.
@@ -257,14 +263,36 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("commit"))?
     }
 
-    /// Abort a failed epoch.
+    /// Roll the connector back unconditionally (restart/recovery, or
+    /// cleanup of a partially-begun epoch).
     pub async fn rollback_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
-            .send(SinkCommand::RollbackEpoch { epoch, ack: ack_tx })
+            .send(SinkCommand::RollbackEpoch {
+                epoch,
+                force: true,
+                ack: ack_tx,
+            })
             .await
             .map_err(|_| self.closed_err())?;
         ack_rx.await.map_err(|_| self.ack_dropped_err("rollback"))?
+    }
+
+    /// Live coordination failure: abandon the epoch but keep a healthy
+    /// sink's pending transactional output for the next epoch's commit
+    /// (see [`SinkCommand::RollbackEpoch`]). Rolls back for real only
+    /// if the sink itself failed (poisoned epoch).
+    pub async fn abandon_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::oneshot();
+        self.tx
+            .send(SinkCommand::RollbackEpoch {
+                epoch,
+                force: false,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("abandon"))?
     }
 
     /// Signals the sink task to close and waits for it to finish (30s timeout).
@@ -402,8 +430,21 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                         };
                         ack.send(result);
                     }
-                    SinkCommand::RollbackEpoch { epoch, ack } => {
-                        let result = inner.sink.rollback_epoch(epoch).await;
+                    SinkCommand::RollbackEpoch { epoch, force, ack } => {
+                        let result = if force || epoch_poisoned.load(Ordering::Acquire) {
+                            inner.sink.rollback_epoch(epoch).await
+                        } else {
+                            // Healthy sink, live coordination failure:
+                            // keep the pending output (see the command's
+                            // docs — the exactly-once soak measured the
+                            // gaps an unconditional abort produced).
+                            tracing::debug!(
+                                sink = %inner.name, epoch,
+                                "coordination rollback — keeping pending sink \
+                                 output for the next epoch's commit"
+                            );
+                            Ok(())
+                        };
                         if let Err(ref e) = result {
                             tracing::warn!(
                                 sink = %inner.name, epoch, error = %e,

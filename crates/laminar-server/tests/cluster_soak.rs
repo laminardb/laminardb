@@ -27,6 +27,12 @@
 //!   durability gate); also takes `s3://` (default: shared `file://`).
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` /
 //!   `_REGION`  forwarded into both storage maps.
+//! - `LAMINAR_SOAK_KAFKA_BROKERS`  e.g. `127.0.0.1:19092` (the compose
+//!   Redpanda). Adds a per-node exactly-once Kafka sink to the
+//!   workload, and after the fault rounds diffs each topic
+//!   (read_committed) against the generator's deterministic output:
+//!   every seq must appear exactly once, no gaps, no duplicates —
+//!   the exactly-once proof under kill -9.
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -117,6 +123,12 @@ impl Drop for Node {
     }
 }
 
+/// Per-node sink topic. Unique per test process so reruns against a
+/// long-lived broker never diff a previous run's records.
+fn eo_topic(id: usize) -> String {
+    format!("soak-eo-n{id}-{}", std::process::id())
+}
+
 fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -> PathBuf {
     let depth = env_u64("LAMINAR_SOAK_DEPTH", 4);
     // Vnode partials go through the [state] backend, NOT [checkpoint] -
@@ -153,7 +165,7 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         storage.push_str("allow_http = \"true\"\n");
     }
 
-    let toml = format!(
+    let mut toml = format!(
         r#"
 node_id = "n{id}"
 storage_dir = "{data}"
@@ -203,9 +215,113 @@ sql = "SELECT seq, ts_ms, value FROM gen"
         seeds = seeds.join(", "),
         url = checkpoint_url,
     );
+
+    // Optional exactly-once Kafka sink: each node writes its own topic
+    // (its generator is an independent seq stream), so each topic must
+    // be a dense 0..=max with no duplicates under read_committed.
+    if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
+        toml.push_str(&format!(
+            r#"
+[[sink]]
+name = "soak_sink"
+pipeline = "soak_stream"
+connector = "kafka"
+delivery = "exactly_once"
+
+[sink.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{topic}"
+format = "json"
+"delivery.guarantee" = "exactly-once"
+"#,
+            topic = eo_topic(id),
+        ));
+    }
+
     let path = dir.join(format!("node{id}.toml"));
     std::fs::write(&path, toml).unwrap();
     path
+}
+
+/// Diff each node's sink topic against the generator's deterministic
+/// output. The generator emits seq 0,1,2,… and the pipeline is a
+/// pass-through, so under exactly-once the topic (read_committed) must
+/// be DENSE: every seq from 0 to the max committed exactly once.
+/// A gap = lost rows (offsets advanced past uncommitted output); a
+/// duplicate = replayed rows leaked outside a transaction. Records
+/// from transactions still open when the writer was killed are
+/// invisible under read_committed — that's the abort path working.
+fn verify_exactly_once_output(brokers: &str) {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+
+    for id in 0..NODES {
+        let topic = eo_topic(id);
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("group.id", format!("soak-eo-diff-{}", std::process::id()))
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("isolation.level", "read_committed")
+            .create()
+            .expect("diff consumer");
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset(&topic, 0, Offset::Beginning)
+            .unwrap();
+        consumer.assign(&tpl).expect("assign");
+
+        // Read until the topic goes idle (the LSO stops a
+        // read_committed consumer ahead of any still-open transaction).
+        let mut seqs: Vec<i64> = Vec::new();
+        let mut idle = 0u32;
+        while idle < 5 {
+            match consumer.poll(Duration::from_secs(2)) {
+                Some(Ok(msg)) => {
+                    idle = 0;
+                    let v: serde_json::Value =
+                        serde_json::from_slice(msg.payload().unwrap_or_default())
+                            .unwrap_or_else(|e| panic!("{topic}: undecodable sink record: {e}"));
+                    seqs.push(
+                        v["seq"]
+                            .as_i64()
+                            .unwrap_or_else(|| panic!("{topic}: record without seq: {v}")),
+                    );
+                }
+                Some(Err(e)) => panic!("{topic}: consume error: {e}"),
+                None => idle += 1,
+            }
+        }
+
+        assert!(
+            !seqs.is_empty(),
+            "{topic}: no committed records — the sink never committed a transaction",
+        );
+        let count = seqs.len();
+        let max = *seqs.iter().max().unwrap();
+        seqs.sort_unstable();
+        seqs.dedup();
+        let duplicates = count - seqs.len();
+        let mut gaps: Vec<(i64, i64)> = Vec::new(); // (expected, found)
+        let mut expected = 0i64;
+        for &s in &seqs {
+            if s != expected {
+                gaps.push((expected, s));
+                expected = s;
+            }
+            expected += 1;
+        }
+        assert!(
+            duplicates == 0 && gaps.is_empty(),
+            "{topic}: exactly-once VIOLATED — {count} records, max seq {max}, \
+             {duplicates} duplicate(s), gap(s) at {gaps:?}",
+        );
+        assert!(
+            max >= 200,
+            "{topic}: only {count} committed records (max seq {max}) — too little \
+             output survived the fault rounds for the diff to be meaningful",
+        );
+        eprintln!("soak: {topic}: exactly-once OK — {count} records, dense 0..={max}");
+    }
 }
 
 /// Wait until `pred` holds, polling, or panic with `what` at deadline.
@@ -343,4 +459,15 @@ fn three_node_kill9_soak() {
     }
 
     eprintln!("soak: completed {round} fault rounds, final epoch {floor}");
+
+    if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
+        // Let in-flight epochs commit, then stop every writer so the
+        // diff reads a stable topic (transactions open at the kill are
+        // aborted and invisible under read_committed).
+        std::thread::sleep(Duration::from_secs(5));
+        for n in &mut nodes {
+            n.kill9();
+        }
+        verify_exactly_once_output(&brokers);
+    }
 }

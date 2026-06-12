@@ -240,17 +240,37 @@ alignment wait, membership-watch dedup + skipping the pre-rotation
 drain when shedding a dead node); details live in the fix commits and
 the code comments at each site.
 
-Remaining before signing off the 100ms floor for production:
+Gates closed (2026-06-12):
 
-1. Hours-long endurance run at 100ms (`LAMINAR_SOAK_SECONDS`).
-2. MinIO/S3 checkpoint backend variant
-   (`LAMINAR_SOAK_CHECKPOINT_URL` + `LAMINAR_SOAK_S3_*`).
-3. Exactly-once sink-output diff (needs a transactional sink in the
-   workload; the generator is deterministic precisely so that check
-   is a recompute-and-compare).
-4. A targeted cross-node depth>1 assertion (overlap is exercised by
-   the soak at depth 4, and by coordinator-level fault injection).
+1. ~~Endurance~~ — 3600s @ 100ms, kill -9 rounds throughout, passed.
+2. ~~MinIO/S3~~ — full-fat (state + checkpoint + control plane all on
+   MinIO): 15 fault rounds @ 100ms, passed. Required the object-store
+   URL-path `PrefixStore` fix (`9b7cd5c8`) — previously decision
+   markers/control/kv wrote to the bucket ROOT and runs cross-talked.
+3. ~~Exactly-once sink-output diff~~ — per-node exactly-once Kafka
+   sinks + read_committed dense-sequence diff
+   (`LAMINAR_SOAK_KAFKA_BROKERS`): 7 fault rounds, 143k committed
+   records across 3 topics, zero duplicates, zero gaps. Surfaced and
+   fixed four defects: self-rejecting default timeouts
+   (message.timeout > transaction.timeout), follower never beginning
+   the next transaction after commit/rollback, the depth-1 cap keying
+   off pipeline-level config only (DDL-configured sinks bypassed it),
+   and live coordination aborts discarding pending transactional
+   output that sources never replay (the keep-pending abandon
+   semantics fix). Exactly-once pipelines now run durable tails
+   INLINE — no Aligned early-resume — until producer pooling lands.
+
+Still open:
+
+- A targeted cross-node depth>1 assertion (overlap is exercised by
+  the soak at depth 4, and by coordinator-level fault injection).
+- Real-network latency/partition testing (all soaks are localhost;
+  kills only, no asymmetric partitions).
+- Large-state workloads (reference partials + staged-bytes caps
+  never stressed beyond trivial state).
 
 Operationally: 100ms is permission, not a promise — quorum RTT +
 capture must fit the interval, and at the admission caps cadence
-degrades to upload speed.
+degrades to upload speed. Exactly-once pipelines do not get the
+sub-second resume: correctness with a single transactional producer
+requires blocking until the commit decision.
