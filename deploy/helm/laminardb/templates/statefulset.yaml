@@ -10,6 +10,7 @@ spec:
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   serviceName: {{ include "laminardb.headlessServiceName" . }}
+  podManagementPolicy: {{ .Values.podManagementPolicy | default "Parallel" }}
   selector:
     matchLabels:
       {{- include "laminardb.selectorLabels" . | nindent 6 }}
@@ -110,6 +111,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- with (.Values.laminardb.consoleToken | default dict).existingSecret }}
+            - name: LAMINAR_CONSOLE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.laminardb.consoleToken.secretKey | default "token" }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
