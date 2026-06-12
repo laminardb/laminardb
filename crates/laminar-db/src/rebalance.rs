@@ -327,9 +327,22 @@ async fn try_rebalance(
     // regardless; survivors rehydrate its vnodes from the last
     // committed epoch — the same at-least-once duplication window every
     // ungraceful failover already has.
+    //
+    // "Dead" must be judged from MEMBERSHIP, not the assignable set:
+    // a Draining node is excluded from assignment but is alive and can
+    // checkpoint — its graceful handoff depends on this drain sealing
+    // its in-flight rows before the rotation takes its vnodes.
     let shedding_dead = {
+        use laminar_core::cluster::discovery::NodeState;
         let owners = current.to_vnode_vec(registry.vnode_count());
-        owners.iter().any(|o| !live.contains(o))
+        let members = controller.members_watch().borrow().clone();
+        owners.iter().filter(|o| !live.contains(o)).any(|&o| {
+            let dead_in_membership = match members.iter().find(|m| m.id.0 == o.0) {
+                Some(node) => matches!(node.state, NodeState::Suspected | NodeState::Left),
+                None => true,
+            };
+            dead_in_membership || controller.is_recently_unresponsive(o)
+        })
     };
     if shedding_dead {
         warn!(

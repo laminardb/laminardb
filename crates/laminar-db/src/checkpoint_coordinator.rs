@@ -169,15 +169,10 @@ impl EpochAllocator {
         )
     }
 
-    /// Monotonic advance — the only way the allocator moves after
-    /// construction; an epoch number can never be re-allocated. That
-    /// matters because an aborted epoch leaves artifacts behind (a
-    /// Pending manifest, uploaded partials): construction seeds from
-    /// the highest *loadable* manifest even if Pending, and recovery
-    /// (which restores from the highest *committed* one, possibly
-    /// older) must not pull ids back down onto those stale artifacts.
-    /// Also keeps a depth>1 follower tail finishing out of order from
-    /// walking past a successor's ids.
+    /// Monotonic advance — ids never walk backwards. An aborted epoch
+    /// leaves artifacts behind (Pending manifest, uploaded partials);
+    /// recovery restoring an OLDER committed epoch must not pull ids
+    /// back down onto them and re-allocate the aborted epoch.
     fn advance_to(&self, epoch: u64, next_checkpoint_id: u64) {
         use std::sync::atomic::Ordering;
         self.epoch.fetch_max(epoch, Ordering::AcqRel);
@@ -745,12 +740,11 @@ impl CheckpointCoordinator {
     /// which still seals the durability gate (presence is all the gate checks).
     ///
     /// A vnode whose slices are byte-identical to its last full upload
-    /// writes a tiny *reference* partial instead of re-uploading the
-    /// state — upload cost becomes proportional to
-    /// changed vnodes. References are forced back to full before their
-    /// base ages out of the `max_retained` prune window, and bases are
-    /// recorded only after every write lands so a partially-failed
-    /// epoch re-uploads full next time.
+    /// writes a tiny *reference* partial instead — upload cost scales
+    /// with changed vnodes. References are forced back to full before
+    /// their base leaves the `max_retained` prune window; bases record
+    /// only after every write lands, so a partially-failed epoch
+    /// re-uploads full.
     ///
     /// Fires every vnode write concurrently via `try_join_all`: the serial
     /// version was O(`vnode_count` × per-write latency) — trivial CPU but each
@@ -846,14 +840,9 @@ impl CheckpointCoordinator {
     /// the epoch's `_COMMIT` marker), or `restorable_gate_timeout`
     /// expires. No-op without a backend or with an empty gate set.
     ///
-    /// Polling (vs the old single check) is what lets followers ack at
-    /// capture and upload asynchronously: each node writes its vnode
-    /// partials *after* sink pre-commit + manifest save, so full
-    /// presence here also proves every node completed its durable
-    /// prepare. A follower whose prepare fails after acking surfaces as
-    /// a gate timeout → abort.
-    ///
-    /// Transient backend errors are retried until the deadline; a
+    /// Each node writes its partials *after* sink pre-commit + manifest
+    /// save, so full presence proves every node finished its durable
+    /// prepare. Transient backend errors retry until the deadline; a
     /// split-brain commit marker aborts immediately.
     async fn await_restorable_gate(
         &self,
@@ -1583,12 +1572,10 @@ impl CheckpointCoordinator {
     /// wait for the leader's commit/abort.
     /// `Ok(true)` = committed, `Ok(false)` = aborted/timed out.
     ///
-    /// The ack is sent *before* the durable prepare: it means "aligned + captured" — the caller has
-    /// already aligned the shuffle and captured state into `request`.
-    /// The leader announces `Aligned` on the full ack quorum (releasing
-    /// every pipeline), and verifies prepare completion through the
-    /// restorable gate (this node writes its vnode partials last, so
-    /// partial presence implies the whole prepare finished).
+    /// The ack precedes the durable prepare — it means "aligned +
+    /// captured". The leader verifies prepare completion through the
+    /// restorable gate instead (partials are written last, so their
+    /// presence implies the whole prepare finished).
     ///
     /// # Errors
     /// Propagates sink pre-commit, manifest save, or marker-write failures.
@@ -1661,10 +1648,8 @@ impl CheckpointCoordinator {
 
     /// Stage 1 of the follower tail: durable prepare (sink pre-commit +
     /// manifest + partial uploads), after the capture ack. On failure,
-    /// sends a best-effort `ok = false` ack (overwrites the capture ack
-    /// in the gossip-KV slot so a still-polling leader fails the quorum
-    /// fast; in gRPC mode the leader learns via its restorable-gate
-    /// timeout) and rolls the epoch back.
+    /// a best-effort `ok = false` ack overwrites the capture ack and
+    /// the epoch rolls back.
     ///
     /// # Errors
     /// Propagates sink pre-commit, manifest save, or marker-write failures.
@@ -1706,13 +1691,11 @@ impl CheckpointCoordinator {
     }
 
     /// Stage 2 of the follower tail: wait for the leader's decision —
-    /// push-driven off the announcement watch, and deliberately
-    /// `&self`-free so the wait does not hold the coordinator mutex.
-    /// `Aligned` is not a decision; only Commit/Abort (or epoch
-    /// advancement) end the wait. Observation is latest-wins, so a
-    /// newer epoch's announcement can supersede this epoch's Commit:
-    /// the leader only advances epochs after a successful commit, so
-    /// the durable marker is the tie-breaker. Returns the verdict.
+    /// `&self`-free so the wait never holds the coordinator mutex.
+    /// Only Commit/Abort (or epoch advancement) end the wait; a newer
+    /// epoch's announcement can supersede this epoch's Commit under
+    /// latest-wins observation, so the durable marker is the
+    /// tie-breaker. Returns the verdict.
     #[cfg(feature = "cluster")]
     pub(crate) async fn await_follower_decision(
         cc: &laminar_core::cluster::control::ClusterController,
@@ -1955,15 +1938,11 @@ impl CheckpointCoordinator {
         let source_offsets = source_offset_overrides;
         let table_offsets = extra_table_offsets;
 
-        // Cluster 2PC, level 1 of two-level completion: collect capture
-        // acks from every live follower, then announce `Aligned` — the
-        // full-membership pipeline-resume gate. Followers' durable
-        // prepare runs after their ack; its completion is verified by
-        // the restorable gate below (each node writes its vnode
-        // partials *last*, so full presence implies every prepare
-        // finished). Pipelined barrier tails run this stage *before*
-        // taking the coordinator mutex (so Aligned is never queued
-        // behind an earlier epoch's uploads) and pass `Done` here.
+        // Two-level completion, level 1: collect capture acks from
+        // every live follower, then announce `Aligned` (the pipeline
+        // resume gate); the restorable gate below verifies their
+        // durable prepares. Pipelined barrier tails run this stage
+        // pre-mutex and pass `Done` here.
         #[cfg(feature = "cluster")]
         #[allow(unused_assignments)] // both match arms assign; init keeps non-cluster shape
         let mut quorum_participants: Vec<QuorumPeer> = Vec::new();
@@ -4084,12 +4063,15 @@ mod tests {
             laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
                 .with_exactly_once()
                 .with_two_phase_commit()
+                .with_preserves_pending_on_abandon()
         }
     }
 
     /// A pre-commit failure abandons the epoch but must NOT hard-roll
-    /// a healthy connector back (see `SinkCommand::RollbackEpoch`):
-    /// the pending output rides into the next epoch's commit.
+    /// back a connector that preserves pending output (see
+    /// `SinkCommand::RollbackEpoch`): the pending rows ride into the
+    /// next epoch's commit. Connectors without the capability ARE
+    /// rolled back.
     #[tokio::test]
     async fn pre_commit_failure_abandons_without_connector_rollback() {
         use arrow::datatypes::{DataType, Field, Schema};

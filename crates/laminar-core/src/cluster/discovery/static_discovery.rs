@@ -441,15 +441,18 @@ fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_list: Vec<Node
     // equality must not depend on it.
     peer_list.sort_by_key(|n| n.id.0);
     tx.send_if_modified(|cur| {
-        // Compare the MEMBERSHIP projection only — `last_heartbeat_ms`
-        // refreshes every tick, so whole-struct equality would still
-        // notify continuously. Consumers of the watch react to who is
-        // in the cluster and in what state, not to heartbeat times.
+        // Compare everything EXCEPT `last_heartbeat_ms` — it refreshes
+        // every tick, so whole-struct equality would still notify
+        // continuously. All other fields (state, addresses, name,
+        // metadata/locality) are real membership changes watchers must
+        // see.
+        fn same_member(a: &NodeInfo, b: &NodeInfo) -> bool {
+            let mut a = a.clone();
+            a.last_heartbeat_ms = b.last_heartbeat_ms;
+            a == *b
+        }
         let same = cur.len() == peer_list.len()
-            && cur
-                .iter()
-                .zip(&peer_list)
-                .all(|(a, b)| a.id == b.id && a.state == b.state && a.rpc_address == b.rpc_address);
+            && cur.iter().zip(&peer_list).all(|(a, b)| same_member(a, b));
         if same {
             false
         } else {

@@ -389,10 +389,14 @@ impl ClusterController {
         F: FnMut(&BarrierAnnouncement) -> bool,
     {
         let mut watch = self.barrier.announcement_watch();
-        let poll = if watch.is_some() {
-            Duration::from_millis(250)
-        } else {
-            Duration::from_millis(25)
+        // Recomputed per iteration: when the watch sender drops
+        // mid-wait, the fallback must tighten to the no-watch cadence.
+        let poll_for = |watch: &Option<_>| {
+            if watch.is_some() {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(25)
+            }
         };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -404,6 +408,7 @@ impl ClusterController {
             if tokio::time::Instant::now() >= deadline {
                 return None;
             }
+            let poll = poll_for(&watch);
             let pushed = async {
                 match watch.as_mut() {
                     Some(w) => w.changed().await.is_ok(),

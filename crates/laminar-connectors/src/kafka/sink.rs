@@ -878,7 +878,14 @@ impl SinkConnector for KafkaSink {
             .with_partitioned();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once().with_two_phase_commit();
+            // The single open transaction holds all rows since the last
+            // commit, so an abandoned epoch's rows ride into the next
+            // epoch's commit — no rollback needed (or wanted) on a live
+            // coordination failure.
+            caps = caps
+                .with_exactly_once()
+                .with_two_phase_commit()
+                .with_preserves_pending_on_abandon();
         }
 
         if self.schema_registry.is_some() {

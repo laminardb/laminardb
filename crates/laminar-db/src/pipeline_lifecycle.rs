@@ -1617,7 +1617,8 @@ impl LaminarDB {
                         Some(coord.epoch_allocator()),
                         cfg.quorum_timeout,
                         depth,
-                        cfg.max_staged_bytes,
+                        // 0 would pause admission permanently.
+                        cfg.max_staged_bytes.max(1),
                     )
                 }
                 None => (None, std::time::Duration::from_secs(3), 1, u64::MAX),

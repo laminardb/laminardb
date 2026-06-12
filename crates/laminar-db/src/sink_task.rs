@@ -338,6 +338,7 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
     // Skip the first immediate tick.
     flush_timer.tick().await;
 
+    let preserves_pending_on_abandon = inner.sink.capabilities().preserves_pending_on_abandon;
     let mut current_epoch: u64 = 0;
     let epoch_poisoned = AtomicBool::new(false);
 
@@ -431,12 +432,18 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                         ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch, force, ack } => {
-                        let result = if force || epoch_poisoned.load(Ordering::Acquire) {
+                        // Keeping pending output across an abandoned
+                        // epoch is only sound when the CONNECTOR says
+                        // so (`preserves_pending_on_abandon`, e.g. a
+                        // Kafka transactional producer); a staging-style
+                        // sink must roll back or its per-epoch state
+                        // diverges.
+                        let result = if force
+                            || !preserves_pending_on_abandon
+                            || epoch_poisoned.load(Ordering::Acquire)
+                        {
                             inner.sink.rollback_epoch(epoch).await
                         } else {
-                            // Healthy sink, live coordination failure:
-                            // keep the pending output (see the command
-                            // docs above).
                             tracing::debug!(
                                 sink = %inner.name, epoch,
                                 "coordination rollback — keeping pending sink \

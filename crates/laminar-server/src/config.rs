@@ -219,19 +219,23 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
         }
-        // With two-level completion the barrier critical path is
-        // alignment + capture + one ack round-trip (uploads run in a
-        // bounded background backlog), so cadences down to 100ms are
-        // sustainable; admission caps (`max_in_flight_epochs`,
-        // `max_staged_bytes`) degrade cadence to upload speed instead
-        // of letting a tight interval build an unbounded backlog.
-        // Below 100ms the quorum round-trip itself dominates.
+        // Below 100ms the capture-quorum round-trip itself dominates
+        // the barrier; above it, the admission caps degrade cadence to
+        // upload speed instead of building an unbounded backlog.
         if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(
                 "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 100ms",
                 config.checkpoint.interval,
             ));
         }
+    }
+    // 0 would pause barrier admission permanently (staged >= cap is
+    // always true), silently wedging checkpointing.
+    if config.checkpoint.max_staged_bytes == Some(0) {
+        errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
+    }
+    if config.checkpoint.max_in_flight_epochs == Some(0) {
+        errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
     }
 
     validate_ai(config, &mut errors);

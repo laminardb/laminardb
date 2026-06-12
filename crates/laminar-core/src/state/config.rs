@@ -35,6 +35,21 @@ pub enum DiscoveryMode {
     Dynamic,
 }
 
+/// Cloud credential/config overrides for the state object store.
+/// `Debug` redacts values — they can hold secrets
+/// (`aws_secret_access_key`, ...).
+#[derive(Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(transparent)]
+pub struct StorageOptions(pub rustc_hash::FxHashMap<String, String>);
+
+impl std::fmt::Debug for StorageOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "[REDACTED]")))
+            .finish()
+    }
+}
+
 /// Tagged-union config that selects the runtime [`StateBackend`].
 ///
 /// See module docs for the five deployment shapes.
@@ -72,7 +87,7 @@ pub enum StateBackendConfig {
         /// Anything absent falls back to the provider's standard env
         /// vars (`AWS_ACCESS_KEY_ID`, ...).
         #[serde(default)]
-        storage: rustc_hash::FxHashMap<String, String>,
+        storage: StorageOptions,
         /// This node's identity. Written into epoch manifests and used
         /// by the assignment-version fence to reject stale writes.
         instance_id: String,
@@ -143,7 +158,7 @@ impl StateBackendConfig {
     pub fn object_store(url: impl Into<String>, instance_id: impl Into<String>) -> Self {
         Self::ObjectStore {
             url: url.into(),
-            storage: rustc_hash::FxHashMap::default(),
+            storage: StorageOptions::default(),
             instance_id: instance_id.into(),
             vnode_capacity: DEFAULT_VNODE_CAPACITY,
             vnodes: None,
@@ -193,15 +208,7 @@ impl StateBackendConfig {
                 vnode_capacity,
                 ..
             } => {
-                // Collected into the builder's std-HashMap parameter by
-                // inference (cold path, runs once at startup).
-                let store = crate::checkpoint::object_store_builder::build_object_store(
-                    url,
-                    &storage
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )?;
+                let store = cloud_store(url, storage)?;
                 Ok(Arc::new(ObjectStoreBackend::new(
                     store,
                     instance_id,
@@ -240,15 +247,7 @@ impl StateBackendConfig {
                     .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
                 Ok(Some(Arc::new(fs)))
             }
-            Self::ObjectStore { url, storage, .. } => Ok(Some(
-                crate::checkpoint::object_store_builder::build_object_store(
-                    url,
-                    &storage
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )?,
-            )),
+            Self::ObjectStore { url, storage, .. } => Ok(Some(cloud_store(url, storage)?)),
         }
     }
 
@@ -268,6 +267,24 @@ impl StateBackendConfig {
             | Self::ObjectStore { vnode_capacity, .. } => *vnode_capacity,
         }
     }
+}
+
+/// Cloud-store construction shared by [`StateBackendConfig::build`] and
+/// [`StateBackendConfig::build_object_store`]: translates the
+/// `StorageOptions` map into the builder's std-HashMap parameter
+/// (cold path, runs once at startup).
+fn cloud_store(
+    url: &str,
+    storage: &StorageOptions,
+) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
+    Ok(crate::checkpoint::object_store_builder::build_object_store(
+        url,
+        &storage
+            .0
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )?)
 }
 
 #[cfg(test)]
@@ -412,11 +429,20 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
     #[cfg(not(feature = "aws"))]
     #[tokio::test]
     async fn build_object_store_s3_requires_aws_feature() {
+        use crate::checkpoint::object_store_builder::ObjectStoreBuilderError;
+
         let c = StateBackendConfig::object_store("s3://bucket/path", "node-0");
-        match c.build().await {
-            Err(e) => assert!(e.to_string().contains("aws"), "got: {e}"),
+        let err = match c.build().await {
             Ok(_) => panic!("s3 must not build without the aws feature"),
-        }
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                StateBackendBuildError::Store(ObjectStoreBuilderError::MissingFeature { .. })
+            ),
+            "got: {err}",
+        );
     }
 
     /// With the `aws` feature, an `s3://` URL + explicit `storage`
