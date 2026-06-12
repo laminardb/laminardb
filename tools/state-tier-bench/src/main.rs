@@ -46,14 +46,20 @@ struct Args {
     zipf_s: f64,
     /// Target sustained upsert rate (ops/s); 0 = unthrottled.
     write_rate: u64,
+    /// fjall block/blob cache size; 0 = fjall default. Size it like a
+    /// deployment would (filters + indexes resident), or every get pays
+    /// extra I/Os and the p99 measures cache sizing, not the LSM.
+    cache_bytes: u64,
     keep: bool,
+    /// Reuse an existing data dir: skip the bulk load (implies --keep).
+    reuse: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "state-tier-bench --path <dir> [--mode group|slice] [--keys N] \
          [--value-bytes N] [--duration-secs N] [--zipf-s F] \
-         [--write-rate OPS] [--keep]\n\
+         [--write-rate OPS] [--cache-bytes N] [--keep] [--reuse]\n\
          defaults: group mode, 2,000,000 keys x 256 B (group) / \
          256 slices x 4 MiB (slice), 60 s, zipf 0.99, 100,000 ops/s"
     );
@@ -69,7 +75,9 @@ fn parse_args() -> Args {
         duration_secs: 60,
         zipf_s: 0.99,
         write_rate: 100_000,
+        cache_bytes: 0,
         keep: false,
+        reuse: false,
     };
     let mut keys_set = false;
     let mut value_set = false;
@@ -100,7 +108,12 @@ fn parse_args() -> Args {
             }
             "--zipf-s" => args.zipf_s = val(&mut it).parse().unwrap_or_else(|_| usage()),
             "--write-rate" => args.write_rate = val(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--cache-bytes" => args.cache_bytes = val(&mut it).parse().unwrap_or_else(|_| usage()),
             "--keep" => args.keep = true,
+            "--reuse" => {
+                args.reuse = true;
+                args.keep = true;
+            }
             _ => usage(),
         }
     }
@@ -251,14 +264,19 @@ fn main() {
         args.keys, args.value_bytes, args.duration_secs, args.zipf_s, args.write_rate
     );
 
-    if args.path.exists() {
-        std::fs::remove_dir_all(&args.path).expect("clear bench dir");
+    let reuse = args.reuse && args.path.exists();
+    if !reuse {
+        if args.path.exists() {
+            std::fs::remove_dir_all(&args.path).expect("clear bench dir");
+        }
+        std::fs::create_dir_all(&args.path).expect("create bench dir");
     }
-    std::fs::create_dir_all(&args.path).expect("create bench dir");
 
-    let db = fjall::Database::builder(&args.path)
-        .open()
-        .expect("open database");
+    let mut builder = fjall::Database::builder(&args.path);
+    if args.cache_bytes > 0 {
+        builder = builder.cache_size(args.cache_bytes);
+    }
+    let db = builder.open().expect("open database");
     // Slice blobs are exactly what key-value separation is for; without it
     // every compaction rewrites the multi-MB values and the write
     // amplification number is meaningless.
@@ -280,46 +298,53 @@ fn main() {
     let mut rng = SmallRng::seed_from_u64(42);
     let mut key = Vec::with_capacity(64);
     let mut value = vec![0u8; args.value_bytes];
-    let mut logical_bytes: u64 = 0;
+    make_key(args.mode, 0, &mut key);
+    let logical_bytes: u64 = args.keys * (key.len() + args.value_bytes) as u64;
     let mut loaded: u64 = 0;
     let progress_every = (args.keys / 10).max(1);
-    let mut load_one = |i: u64| {
-        make_key(args.mode, i, &mut key);
-        fill_value(&mut rng, &mut value);
-        ks.insert(&key, &value).expect("load insert");
-        logical_bytes += (key.len() + value.len()) as u64;
-        loaded += 1;
-        if loaded.is_multiple_of(progress_every) {
-            println!(
-                "  load: {loaded}/{} ({:.0}s)",
-                args.keys,
-                load_start.elapsed().as_secs_f64()
-            );
-        }
-    };
-    match args.mode {
-        Mode::Group => {
-            for v in 0..VNODES.min(args.keys) {
-                let mut i = v;
-                while i < args.keys {
+    if reuse {
+        println!(
+            "reusing existing data dir ({:.1} MiB logical assumed)",
+            logical_bytes as f64 / (1 << 20) as f64
+        );
+    } else {
+        let mut load_one = |i: u64| {
+            make_key(args.mode, i, &mut key);
+            fill_value(&mut rng, &mut value);
+            ks.insert(&key, &value).expect("load insert");
+            loaded += 1;
+            if loaded.is_multiple_of(progress_every) {
+                println!(
+                    "  load: {loaded}/{} ({:.0}s)",
+                    args.keys,
+                    load_start.elapsed().as_secs_f64()
+                );
+            }
+        };
+        match args.mode {
+            Mode::Group => {
+                for v in 0..VNODES.min(args.keys) {
+                    let mut i = v;
+                    while i < args.keys {
+                        load_one(i);
+                        i += VNODES;
+                    }
+                }
+            }
+            Mode::Slice => {
+                for i in 0..args.keys {
                     load_one(i);
-                    i += VNODES;
                 }
             }
         }
-        Mode::Slice => {
-            for i in 0..args.keys {
-                load_one(i);
-            }
-        }
+        db.persist(fjall::PersistMode::SyncAll).expect("persist");
+        println!(
+            "loaded {} keys ({:.1} MiB logical) in {:.1}s",
+            args.keys,
+            logical_bytes as f64 / (1 << 20) as f64,
+            load_start.elapsed().as_secs_f64()
+        );
     }
-    db.persist(fjall::PersistMode::SyncAll).expect("persist");
-    println!(
-        "loaded {} keys ({:.1} MiB logical) in {:.1}s",
-        args.keys,
-        logical_bytes as f64 / (1 << 20) as f64,
-        load_start.elapsed().as_secs_f64()
-    );
 
     // ---- Phase B: steady state — Zipfian writer + uniform cold reader. ----
     let stop = Arc::new(AtomicBool::new(false));
