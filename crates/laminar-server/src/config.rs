@@ -1119,10 +1119,7 @@ mode = "embedded"
 state_memory_budget_bytes = 1073741824
 "#;
         let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(
-            config.server.state_memory_budget_bytes,
-            Some(1_073_741_824)
-        );
+        assert_eq!(config.server.state_memory_budget_bytes, Some(1_073_741_824));
 
         let config: ServerConfig = toml::from_str("[server]\nmode = \"embedded\"\n").unwrap();
         assert_eq!(config.server.state_memory_budget_bytes, None);

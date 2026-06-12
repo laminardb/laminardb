@@ -84,6 +84,9 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
+/// Disk cold tier for demoted operator state.
+#[cfg(feature = "state-tier")]
+mod state_tier;
 /// External `SUBSCRIBE` substrate: per-name broadcast channel and the
 /// per-portal pump task.
 pub mod subscription;
