@@ -362,7 +362,19 @@ mod failures {
         let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
         drop(crashed_runtime);
         crashed_node.crash().await;
-        sleep(Duration::from_secs(4)).await;
+
+        // Wait for rotation to hand every vnode to the survivor.
+        // Detection is time-based (phi-accrual Suspected flip →
+        // debounce → rotation → rehydration), so a fixed sleep flakes
+        // under parallel test load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "survivor never acquired the crashed node's vnodes",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
 
         let phase_c = input_batch(&follower_keys);
         let src = harness.nodes[0]
@@ -370,11 +382,6 @@ mod failures {
             .source_untyped("src")
             .expect("source_untyped on surviving leader");
         src.push_arrow(phase_c).expect("push phase_c");
-        sleep(Duration::from_millis(500)).await;
-
-        let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
-        let post_crash_leader_keys: HashSet<i64> =
-            post_crash_leader.iter().map(|(k, _)| *k).collect();
 
         // Rotation handed the crashed node's vnodes to the survivor,
         // which rehydrated their phase-A state and processed phase C
@@ -383,7 +390,19 @@ mod failures {
             .iter()
             .flat_map(|(_, ks)| ks.iter().copied())
             .collect();
-        assert_eq!(post_crash_leader_keys, expected_keys);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
+            let keys: HashSet<i64> = post_crash_leader.iter().map(|(k, _)| *k).collect();
+            if keys == expected_keys {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "survivor never served all keys: got {keys:?}, want {expected_keys:?}",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
 
         harness.shutdown().await;
     }
