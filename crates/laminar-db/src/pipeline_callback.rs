@@ -325,13 +325,12 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Copied from `CheckpointConfig` for the pre-mutex quorum stage.
     #[cfg(feature = "cluster")]
     pub(crate) quorum_timeout: Duration,
-    /// True when any registered sink is exactly-once. Durable tails
-    /// then run INLINE (pipeline blocked until the commit decision):
-    /// a single transactional producer must not receive post-barrier
+    /// True when any registered sink is exactly-once: durable tails
+    /// then run INLINE (pipeline blocked until the commit decision).
+    /// A single transactional producer must not receive post-barrier
     /// rows while the epoch's transaction is open — an early resume
     /// would commit them with epoch N and duplicate them on replay.
-    /// Producer pooling (one transaction per in-flight epoch) is the
-    /// follow-up that lifts this.
+    /// Producer pooling is the follow-up that lifts this.
     pub(crate) exactly_once_sinks: bool,
 }
 
@@ -610,19 +609,14 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Build the follower's durable tail — capture ack, sink
-    /// pre-commit, manifest save, vnode-partial uploads, the
-    /// leader-decision wait, and the 2PC commit/rollback. Spawned to a
-    /// background task so the pipeline can resume on `Aligned`, or
-    /// awaited inline for exactly-once pipelines (see
-    /// [`Self::exactly_once_sinks`]).
-    /// The capture ack is sent before
-    /// queuing on the coordinator mutex — an earlier epoch's tail may
-    /// hold it for the duration of its uploads, and the leader's quorum
-    /// must not wait on those. On commit, completion flows through
-    /// `checkpoint_complete_tx` so the streaming coordinator fans
-    /// `EpochCommitted` out to sources and publishes the wire barrier —
-    /// the same path the leader's background persist uses.
+    /// Build the follower's durable tail — capture ack, durable
+    /// prepare, decision wait, 2PC commit/rollback. Spawned so the
+    /// pipeline resumes on `Aligned`, or awaited inline for
+    /// exactly-once (see [`Self::exactly_once_sinks`]). The capture
+    /// ack is sent before queuing on the coordinator mutex so the
+    /// leader's quorum never waits on an earlier epoch's uploads.
+    /// Commit completion flows through `checkpoint_complete_tx` — the
+    /// same path the leader's background persist uses.
     #[cfg(feature = "cluster")]
     fn follower_tail_future(
         &mut self,
@@ -720,21 +714,14 @@ impl ConnectorPipelineCallback {
     }
 
     /// Block the pipeline until the leader announces `Aligned` for
-    /// `epoch` — the re-keyed shuffle-alignment resume gate.
-    /// `Aligned` is announced only after the *full-membership* capture
-    /// quorum, preserving the invariant the no-post-barrier-buffering
-    /// shuffle drain relies on: no peer ships epoch-N+1 rows while
-    /// another node is still folding pre-barrier rows into its epoch-N
-    /// snapshot. `Commit`, `Abort`, or any newer epoch's announcement
-    /// also releases the gate (observation is latest-wins, so a quick
-    /// successor can overwrite `Aligned`).
+    /// `epoch` (full-membership capture quorum): no peer may ship
+    /// epoch-N+1 shuffle rows while another node is still folding
+    /// pre-barrier rows into its epoch-N snapshot. `Commit`, `Abort`,
+    /// or any newer epoch's announcement also releases the gate.
     ///
-    /// No-op without a cross-node shuffle — there are no in-flight
-    /// peer rows to protect. Bounded: on timeout the pipeline resumes
-    /// anyway (the epoch aborts independently via the leader's gate).
-    ///
-    /// Associated fn (no `&self`) so callers' futures stay `Send`
-    /// without requiring `ConnectorPipelineCallback: Sync`.
+    /// No-op without a cross-node shuffle; bounded — on timeout the
+    /// pipeline resumes and the epoch aborts via the leader's gate.
+    /// Associated fn (no `&self`) so callers' futures stay `Send`.
     #[cfg(feature = "cluster")]
     async fn wait_for_aligned_resume(
         has_cluster_shuffle: bool,
@@ -1782,11 +1769,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let vnode_states = self.capture_vnode_states();
         let request = self.build_checkpoint_request(operator_states, &source_checkpoints);
 
-        // Durable tail in the background, two stages: the capture
-        // quorum + `Aligned` run *before* the coordinator mutex (an
-        // earlier epoch's tail may hold it for its uploads — Aligned
-        // must never queue behind those), then the durable remainder
-        // under the FIFO mutex, which keeps epochs restorable in order.
+        // Two-stage tail: capture quorum + `Aligned` run pre-mutex
+        // (never queued behind an earlier epoch's uploads); the durable
+        // remainder serializes on the FIFO mutex.
         let in_flight = EpochInFlightGuard::claim(
             &self.checkpoint_in_flight,
             &self.staged_bytes,
