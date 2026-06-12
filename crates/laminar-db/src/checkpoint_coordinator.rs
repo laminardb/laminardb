@@ -2112,10 +2112,18 @@ impl CheckpointCoordinator {
         // `restorable_gate_timeout` rather than checking once.
         #[cfg(not(feature = "cluster"))]
         let quorum_participants: Vec<QuorumPeer> = Vec::new();
-        if let Err(gate_err) = self
+        let gate_start = Instant::now();
+        let gate_result = self
             .await_restorable_gate(epoch, &quorum_participants)
-            .await
-        {
+            .await;
+        // Observed on failure too — a burned gate timeout is the signal
+        // that decides when the push-driven completion-ack follow-up is
+        // worth building.
+        if let Some(ref m) = self.prom {
+            m.checkpoint_restorable_gate_wait
+                .observe(gate_start.elapsed().as_secs_f64());
+        }
+        if let Err(gate_err) = gate_result {
             warn!(
                 checkpoint_id,
                 epoch,

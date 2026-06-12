@@ -81,6 +81,12 @@ pub struct EngineMetrics {
     /// a checkpoint (shuffle alignment + state capture + the Aligned
     /// resume gate), excluding the background durable tail.
     pub checkpoint_pipeline_stall_duration: Histogram,
+    /// Time the leader's restorable gate spends polling for vnode
+    /// partials (failed gates that burn the timeout are observed too).
+    /// When this dominates restorable latency at production cadence,
+    /// the push-driven upload-completion-ack follow-up is worth
+    /// building.
+    pub checkpoint_restorable_gate_wait: Histogram,
     /// Vnode partials written as references to an unchanged base
     /// instead of re-uploading state.
     pub checkpoint_unchanged_vnodes: IntCounter,
@@ -285,6 +291,15 @@ impl EngineMetrics {
                     "Pipeline stall per checkpoint barrier (align + capture + resume gate)",
                 )
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
+            // Gate timeout default 10s. 0.001 * 2^14 = 16.38s.
+            checkpoint_restorable_gate_wait: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_restorable_gate_wait_seconds",
+                    "Restorable-gate poll wait per epoch (vnode-partial presence)",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 15).unwrap()),
             )
             .unwrap()),
             checkpoint_unchanged_vnodes: reg!(IntCounter::new(
