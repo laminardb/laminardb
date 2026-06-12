@@ -99,9 +99,48 @@ own merits. ADR-005 should get a short amendment recording this v1/v2 split.
 
 > **Status: harness built 2026-06-12** (`tools/state-tier-bench`, standalone
 > crate with its own lockfile — fjall stays out of the main workspace until
-> the gate passes). Both modes smoke-tested on Windows; **gate numbers still
-> owed from target-class Linux NVMe with a beyond-RAM dataset** — see the
-> tool's README for the exact invocations.
+> the gate passes). **Formal gate numbers still owed from target-class Linux
+> NVMe** — see the tool's README for the exact invocations.
+>
+> **Dev-box results 2026-06-12** (Windows 11, 31 GB RAM, Crucial P3 Plus 2 TB
+> — consumer DRAM-less QLC; indicative only). Group mode, 300M keys × 240 B
+> (74 GB logical, 2.4× RAM), uniform cold reads from a dedicated thread,
+> fjall 3.1.5 with a 2 GiB block cache unless noted:
+>
+> | sustained writes | p50 | p90 | p99 | p999 | 1ms gate |
+> |---|---|---|---|---|---|
+> | ~88k/s (ingest-saturated, default cache) | 532µs | 1.4ms | 7.7ms | 33ms | FAIL |
+> | ~88k/s (ingest-saturated) | 386µs | 909µs | 6.9ms | 29ms | FAIL |
+> | 10k/s | 307µs | 443µs | 1.43ms | 7.9ms | FAIL (marginal) |
+> | 100/s | 332µs | 428µs | 554µs | 2.0ms | PASS |
+>
+> Slice mode (the v1 demotion unit): 15,360 slices × 4 MiB (60 GB logical),
+> KV separation on, slice rewrites targeted at 10/s, uniform slice fetches:
+>
+> | metric | result |
+> |---|---|
+> | cold slice fetch (4 MiB) | p90 11ms, p99 18.4ms, p999 80ms (p50 4µs cached) |
+> | fetch throughput | 273/s ≈ 1.1 GB/s sustained |
+> | write amplification | **1.57×** (KV separation) |
+> | space amp / CPU | 1.35× / 28% of one core |
+> | achieved rewrite rate | **4/s of the 10/s target** (~17 MB/s logical single-writer blob ingest; bulk load averaged 34 MB/s) |
+>
+> The 1ms gate line doesn't apply to 4 MiB fetches (transfer alone is
+> ms-scale); the relevant comparison is the ~100ms object-store GET this
+> replaces. The slice-ingest throughput ceiling (~17–34 MB/s here) bounds
+> demotion speed (~100 MB of operator state ≈ 3–6 s) — fine for background
+> demotion, but a sizing input for budget-pressure response time.
+>
+> Findings: the cold-read tail is **write-pressure-coupled, not an intrinsic
+> floor** — sub-ms p99 at light write rates, ~7ms at ingest saturation.
+> Sizing the block cache (filters+indexes resident) improves the body of the
+> distribution ~30% but not the tail. Single-keyspace ingest ceiling on this
+> box ≈ 88k upserts/s; write amplification 5.1× at saturation, 6.8–9.2× at
+> low rates (flush/journal floor); compaction CPU bounded (≤123% of one
+> core); space amplification 1.10×. Read for the design: v1's slice-demotion
+> write rates sit near the passing end; sustained group-granularity churn
+> (v2) is the case that pressures the gate. The deciding run must happen on
+> datacenter-class Linux NVMe — this drive is the pessimistic case.
 
 Build a standalone harness (e.g. `tools/state-tier-bench`, not in the default
 workspace build) that exercises fjall with our workload shape:
