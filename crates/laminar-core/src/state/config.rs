@@ -67,6 +67,12 @@ pub enum StateBackendConfig {
         /// Object store URL: `s3://bucket/prefix`, `gs://bucket/prefix`,
         /// etc.
         url: String,
+        /// Cloud credentials/config overrides (e.g. `endpoint`,
+        /// `aws_access_key_id`), same keys as `[checkpoint.storage]`.
+        /// Anything absent falls back to the provider's standard env
+        /// vars (`AWS_ACCESS_KEY_ID`, ...).
+        #[serde(default)]
+        storage: rustc_hash::FxHashMap<String, String>,
         /// This node's identity. Written into epoch manifests and used
         /// by the assignment-version fence to reject stale writes.
         instance_id: String,
@@ -101,10 +107,10 @@ impl Default for StateBackendConfig {
 /// Failure modes for [`StateBackendConfig::build`].
 #[derive(Debug, thiserror::Error)]
 pub enum StateBackendBuildError {
-    /// The selected backend exists in config but its runtime impl has
-    /// not been wired up yet.
-    #[error("state backend '{0}' is not yet implemented")]
-    NotImplemented(&'static str),
+    /// Object store construction failed (bad URL, missing feature
+    /// flag for the scheme, missing credentials, ...).
+    #[error("state backend object store: {0}")]
+    Store(#[from] crate::checkpoint::object_store_builder::ObjectStoreBuilderError),
 
     /// Backend construction failed at the I/O layer.
     #[error("state backend construction failed: {0}")]
@@ -131,10 +137,13 @@ impl StateBackendConfig {
     }
 
     /// Builder: distributed-embedded over an object store, static mode.
+    /// Credentials resolve from the provider's standard env vars; use
+    /// the `storage` config field for explicit overrides.
     #[must_use]
     pub fn object_store(url: impl Into<String>, instance_id: impl Into<String>) -> Self {
         Self::ObjectStore {
             url: url.into(),
+            storage: rustc_hash::FxHashMap::default(),
             instance_id: instance_id.into(),
             vnode_capacity: DEFAULT_VNODE_CAPACITY,
             vnodes: None,
@@ -152,9 +161,10 @@ impl StateBackendConfig {
     /// still `.await` for forward-compatibility.
     ///
     /// # Errors
-    /// - [`StateBackendBuildError::NotImplemented`] for remote
-    ///   `object_store` schemes not yet wired (`s3://`, `gs://`, `az://`).
-    /// - [`StateBackendBuildError::Io`] on filesystem/network setup.
+    /// - [`StateBackendBuildError::Store`] for a bad URL, a scheme
+    ///   whose feature flag (`aws`/`gcs`/`azure`) is not compiled in,
+    ///   or cloud-client construction failure.
+    /// - [`StateBackendBuildError::Io`] on filesystem setup.
     #[allow(clippy::unused_async)]
     pub async fn build(&self) -> Result<Arc<dyn StateBackend>, StateBackendBuildError> {
         match self {
@@ -178,11 +188,20 @@ impl StateBackendConfig {
             }
             Self::ObjectStore {
                 url,
+                storage,
                 instance_id,
                 vnode_capacity,
                 ..
             } => {
-                let store = build_object_store(url)?;
+                // Collected into the builder's std-HashMap parameter by
+                // inference (cold path, runs once at startup).
+                let store = crate::checkpoint::object_store_builder::build_object_store(
+                    url,
+                    &storage
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )?;
                 Ok(Arc::new(ObjectStoreBackend::new(
                     store,
                     instance_id,
@@ -221,7 +240,15 @@ impl StateBackendConfig {
                     .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
                 Ok(Some(Arc::new(fs)))
             }
-            Self::ObjectStore { url, .. } => Ok(Some(build_object_store(url)?)),
+            Self::ObjectStore { url, storage, .. } => Ok(Some(
+                crate::checkpoint::object_store_builder::build_object_store(
+                    url,
+                    &storage
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )?,
+            )),
         }
     }
 
@@ -240,26 +267,6 @@ impl StateBackendConfig {
             | Self::Local { vnode_capacity, .. }
             | Self::ObjectStore { vnode_capacity, .. } => *vnode_capacity,
         }
-    }
-}
-
-/// Dispatch a URL to the matching `object_store` implementation.
-///
-/// Supported: `file://<path>`.
-/// Returns `NotImplemented` for `s3://`, `gs://`, `az://` — these will
-/// be added in a later iteration once the workspace pulls in
-/// `url::Url` and the corresponding `object_store` features.
-fn build_object_store(
-    url: &str,
-) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
-    if let Some(path) = url.strip_prefix("file://") {
-        let path = path.trim_start_matches('/');
-        std::fs::create_dir_all(path).map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-        let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
-            .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-        Ok(Arc::new(fs))
-    } else {
-        Err(StateBackendBuildError::NotImplemented("object_store"))
     }
 }
 
@@ -400,13 +407,38 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         assert_eq!(&got[..], b"z");
     }
 
+    /// Without the `aws` feature an `s3://` URL must fail with the
+    /// missing-feature error, not silently fall back to local.
+    #[cfg(not(feature = "aws"))]
     #[tokio::test]
-    async fn build_object_store_s3_returns_not_implemented() {
+    async fn build_object_store_s3_requires_aws_feature() {
         let c = StateBackendConfig::object_store("s3://bucket/path", "node-0");
-        assert!(matches!(
-            c.build().await,
-            Err(StateBackendBuildError::NotImplemented("object_store"))
-        ));
+        match c.build().await {
+            Err(e) => assert!(e.to_string().contains("aws"), "got: {e}"),
+            Ok(_) => panic!("s3 must not build without the aws feature"),
+        }
+    }
+
+    /// With the `aws` feature, an `s3://` URL + explicit `storage`
+    /// credentials builds a client (construction is offline — no
+    /// network until first use).
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn build_object_store_s3_builds_with_storage_options() {
+        let toml = r#"
+backend = "object_store"
+url = "s3://bucket/laminar"
+instance_id = "node-0"
+
+[storage]
+endpoint = "http://127.0.0.1:9000"
+aws_access_key_id = "k"
+aws_secret_access_key = "s"
+region = "us-east-1"
+allow_http = "true"
+"#;
+        let c: StateBackendConfig = toml::from_str(toml).unwrap();
+        c.build().await.expect("s3 client must build offline");
     }
 
     #[test]

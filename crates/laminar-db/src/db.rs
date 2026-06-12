@@ -22,7 +22,6 @@ use crate::handle::{
     UntypedSourceHandle,
 };
 use crate::pipeline::ControlMsg;
-use crate::pipeline_lifecycle::url_to_checkpoint_prefix;
 use crate::sql_utils;
 
 /// Cloneable async sender for the live-DDL control channel.
@@ -2253,16 +2252,16 @@ impl LaminarDB {
         );
 
         if let Some(ref url) = self.config.object_store_url {
+            // The builder roots the store at the URL's path prefix.
             let obj_store = laminar_core::storage::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
             )
             .ok()?;
-            let prefix = url_to_checkpoint_prefix(url);
             Some(Box::new(
                 laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     obj_store,
-                    prefix,
+                    String::new(),
                     max_retained,
                 )
                 .with_vnode_count(vnode_count),

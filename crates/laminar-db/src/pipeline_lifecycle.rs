@@ -103,30 +103,6 @@ async fn resolve_stream_output_schemas(
     result.map(|()| out)
 }
 
-pub(crate) fn url_to_checkpoint_prefix(url: &str) -> String {
-    // Strip scheme
-    let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
-
-    // For file:// URLs, the prefix is empty (LocalFileSystem already has the root)
-    if url.starts_with("file://") {
-        return String::new();
-    }
-
-    // For cloud URLs like s3://bucket/prefix → extract everything after bucket
-    if let Some(slash_pos) = after_scheme.find('/') {
-        let prefix = &after_scheme[slash_pos + 1..];
-        if prefix.is_empty() {
-            String::new()
-        } else if prefix.ends_with('/') {
-            prefix.to_string()
-        } else {
-            format!("{prefix}/")
-        }
-    } else {
-        String::new()
-    }
-}
-
 impl LaminarDB {
     /// Shut down the database gracefully.
     pub fn close(&self) {
@@ -250,15 +226,17 @@ impl LaminarDB {
                 Box<dyn laminar_core::storage::CheckpointStore>,
                 Arc<dyn object_store::ObjectStore>,
             ) = if let Some(ref url) = self.config.object_store_url {
+                // The builder roots the store at the URL's path prefix,
+                // so the checkpoint store (and the decision store
+                // sharing `obj`) need no extra key prefix.
                 let obj = laminar_core::storage::object_store_builder::build_object_store(
                     url,
                     &self.config.object_store_options,
                 )
                 .map_err(|e| DbError::Config(format!("object store: {e}")))?;
-                let prefix = url_to_checkpoint_prefix(url);
                 let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     Arc::clone(&obj),
-                    prefix,
+                    String::new(),
                     max_retained,
                 )
                 .with_vnode_count(vnode_count);

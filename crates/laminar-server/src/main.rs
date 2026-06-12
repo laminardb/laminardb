@@ -165,15 +165,13 @@ fn build_checkpoint_store(
             .with_vnode_count(vnode_count),
         ))
     } else {
-        // Cloud URL: extract prefix from URL path (bucket is handled by object_store).
-        let prefix = url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
-            .unwrap_or_default();
+        // Cloud URL: the builder already rooted the store at the URL's
+        // path prefix.
         Some(Box::new(
             laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                obj_store, prefix, 3,
+                obj_store,
+                String::new(),
+                3,
             )
             .with_vnode_count(vnode_count),
         ))

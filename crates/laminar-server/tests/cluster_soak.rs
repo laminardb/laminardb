@@ -22,10 +22,11 @@
 //! - `LAMINAR_SOAK_SECONDS`      total soak duration (default 90)
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; floor 100)
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  e.g. `s3://bucket/soak` for MinIO/S3
-//!   (default: shared `file://` dir). For MinIO also set the usual
-//!   `[checkpoint.storage]` keys via `LAMINAR_SOAK_S3_*` below.
+//!   (default: shared `file://` dir).
+//! - `LAMINAR_SOAK_STATE_URL`  the `[state]` backend (vnode partials +
+//!   durability gate); also takes `s3://` (default: shared `file://`).
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` /
-//!   `_REGION`  forwarded into the checkpoint storage map.
+//!   `_REGION`  forwarded into both storage maps.
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -176,6 +177,8 @@ url = "{state_url}"
 instance_id = "n{id}"
 vnode_capacity = 64
 
+[state.storage]
+{storage}
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
