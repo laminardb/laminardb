@@ -249,13 +249,22 @@ wipe), round-trip, concurrent fetch-under-write.
 >   its whole result from memory, so dropping groups would shrink query
 >   output (same restriction as idle-TTL eviction).
 >
-> Open items carried to the next phases: (1) the whole-state manifest blob
-> (`checkpoint()`) does not contain demoted groups — the recovery path for
-> tier-enabled operators must restore from vnode partials, audit before
-> enabling the trigger; (2) per-vnode capture currently requires the
-> cluster shuffle config — single-node tiering needs `snapshot_state_by_vnode`
-> to take a vnode count from the single-owner registry (and accept the
-> capture-cost regression only when the tier is enabled).
+> Open items carried to the next phases — **(1) is a hard precondition for
+> the trigger**:
+>
+> 1. **Restart recovery must learn to read vnode partials.** Audited
+>    2026-06-12: plain restart restores operator state from the manifest's
+>    whole-state blob only; per-vnode partials are consulted exclusively by
+>    the cluster rebalance/acquisition path. The manifest blob does not
+>    contain demoted groups, so enabling demotion today would lose them on
+>    any restart. Phase 4 must extend restart recovery for tier-capable
+>    operators to also replay their owned vnodes' partial chains (the
+>    decode + reference-resolution + `apply_vnode_state` machinery already
+>    exists on the acquisition path).
+> 2. Per-vnode capture currently requires the cluster shuffle config —
+>    single-node tiering needs `snapshot_state_by_vnode` to take a vnode
+>    count from the single-owner registry (and accept the capture-cost
+>    regression only when the tier is enabled).
 
 1. **Restorable-epoch visibility.** Coordinator publishes the latest
    restorable epoch into a shared atomic readable by the pipeline callback /
