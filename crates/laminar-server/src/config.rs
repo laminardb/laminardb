@@ -385,7 +385,7 @@ impl std::fmt::Debug for Secret {
 }
 
 /// `[checkpoint]` section.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct CheckpointSection {
     /// Storage URL: file:///path, s3://bucket/prefix, gs://bucket/prefix.
     #[serde(default = "default_checkpoint_url")]
@@ -418,6 +418,27 @@ impl Default for CheckpointSection {
             max_in_flight_epochs: None,
             max_staged_bytes: None,
         }
+    }
+}
+
+// Manual Debug: `storage` values can hold cloud secrets.
+impl std::fmt::Debug for CheckpointSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointSection")
+            .field("url", &self.url)
+            .field("interval", &self.interval)
+            .field("max_retained", &self.max_retained)
+            .field(
+                "storage",
+                &self
+                    .storage
+                    .keys()
+                    .map(|k| (k, "[REDACTED]"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("max_in_flight_epochs", &self.max_in_flight_epochs)
+            .field("max_staged_bytes", &self.max_staged_bytes)
+            .finish()
     }
 }
 

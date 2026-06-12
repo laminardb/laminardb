@@ -156,7 +156,15 @@ fn build_checkpoint_store(
 
     // file:// URLs use the local FS path directly; cloud URLs need a prefix.
     if url.starts_with("file://") {
-        let path = url.strip_prefix("file://").unwrap_or(url);
+        // Shared normalization handles the Windows drive-letter slash
+        // (`file:///C:/x` must become `C:/x`, not `/C:/x`).
+        let path = match laminar_core::storage::object_store_builder::file_url_path(url) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(url = %url, error = %e, "invalid file:// checkpoint url");
+                return None;
+            }
+        };
         Some(Box::new(
             laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),

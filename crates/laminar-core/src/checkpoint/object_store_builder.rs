@@ -107,23 +107,27 @@ fn url_path_prefix(url: &str) -> &str {
         .map_or("", |i| after_scheme[i + 1..].trim_matches('/'))
 }
 
-/// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
-fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    // file:///path/to/dir → /path/to/dir
+/// Normalized filesystem path from a `file://` URL: scheme stripped and
+/// the Windows drive-letter slash removed (`file:///C:/x` → `C:/x`).
+///
+/// # Errors
+/// Returns [`ObjectStoreBuilderError::InvalidUrl`] when the scheme is
+/// missing or the path is empty.
+pub fn file_url_path(url: &str) -> Result<&str, ObjectStoreBuilderError> {
     let path = url
         .strip_prefix("file://")
         .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(url.to_string()))?;
-
     if path.is_empty() {
         return Err(ObjectStoreBuilderError::InvalidUrl(
             "file:// URL has empty path".to_string(),
         ));
     }
+    Ok(strip_windows_leading_slash(path))
+}
 
-    // On Windows, file:///C:/path yields "/C:/path" after stripping the
-    // scheme. The leading slash before the drive letter is invalid — strip
-    // it so `LocalFileSystem::new_with_prefix` receives "C:/path".
-    let path = strip_windows_leading_slash(path);
+/// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
+fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    let path = file_url_path(url)?;
 
     // Ensure the directory exists — LocalFileSystem doesn't create it.
     std::fs::create_dir_all(path).map_err(|e| {

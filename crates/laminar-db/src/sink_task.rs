@@ -624,6 +624,129 @@ mod tests {
         assert_eq!(writes.load(Ordering::Relaxed), 2);
     }
 
+    /// Records `rollback_epoch` calls; `preserves` controls the
+    /// abandon capability, `fail_writes` poisons the epoch.
+    struct RollbackProbeSink {
+        rollbacks: Arc<AtomicU64>,
+        preserves: bool,
+        fail_writes: bool,
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    impl RollbackProbeSink {
+        fn new(preserves: bool, fail_writes: bool) -> (Self, Arc<AtomicU64>) {
+            let rollbacks = Arc::new(AtomicU64::new(0));
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+            (
+                Self {
+                    rollbacks: Arc::clone(&rollbacks),
+                    preserves,
+                    fail_writes,
+                    schema,
+                },
+                rollbacks,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for RollbackProbeSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            if self.fail_writes {
+                Err(ConnectorError::WriteError("synthetic".into()))
+            } else {
+                Ok(WriteResult {
+                    records_written: 1,
+                    bytes_written: 0,
+                })
+            }
+        }
+
+        async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+            self.rollbacks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+            let caps = laminar_connectors::connector::SinkConnectorCapabilities::new(
+                Duration::from_secs(5),
+            );
+            if self.preserves {
+                caps.with_preserves_pending_on_abandon()
+            } else {
+                caps
+            }
+        }
+    }
+
+    /// The abandon/rollback decision matrix: a healthy sink that
+    /// declares `preserves_pending_on_abandon` keeps its pending output
+    /// (no connector rollback); without the capability — or once the
+    /// epoch is poisoned — the connector rolls back. Forced rollback
+    /// (restart/recovery) always rolls back.
+    #[tokio::test]
+    async fn abandon_rollback_decision_matrix() {
+        // Preserving + healthy → abandon keeps pending output.
+        let (sink, rollbacks) = RollbackProbeSink::new(true, false);
+        let (handle, _ev) = spawn_with_defaults("p", Box::new(sink), Duration::from_secs(5));
+        handle.abandon_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            0,
+            "preserving sink kept output"
+        );
+        // …but a forced rollback still rolls back.
+        handle.rollback_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            1,
+            "forced rollback is unconditional"
+        );
+        handle.close().await;
+
+        // Non-preserving + healthy → abandon rolls back.
+        let (sink, rollbacks) = RollbackProbeSink::new(false, false);
+        let (handle, _ev) = spawn_with_defaults("np", Box::new(sink), Duration::from_secs(5));
+        handle.abandon_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            1,
+            "non-preserving sink rolled back"
+        );
+        handle.close().await;
+
+        // Preserving + poisoned epoch → abandon rolls back anyway.
+        let (sink, rollbacks) = RollbackProbeSink::new(true, true);
+        let (handle, _ev) = spawn_with_defaults("poison", Box::new(sink), Duration::from_secs(5));
+        handle.write_batch(test_batch()).await.unwrap();
+        handle.sync().await.unwrap(); // write error lands → epoch poisoned
+        handle.abandon_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            1,
+            "poisoned epoch forces a real rollback even on a preserving sink",
+        );
+        handle.close().await;
+    }
+
     /// Sink whose `write_batch` sleeps longer than the configured timeout.
     struct SlowSink {
         schema: arrow::datatypes::SchemaRef,

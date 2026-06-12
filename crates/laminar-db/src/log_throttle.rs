@@ -45,9 +45,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_event_passes_then_throttles() {
-        let t = LogThrottle::every(Duration::from_secs(60));
+    fn first_event_passes_then_throttles_then_reopens() {
+        let t = LogThrottle::every(Duration::from_millis(10));
         assert!(t.allow());
         assert!(!t.allow());
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(t.allow(), "an elapsed interval must reopen the gate");
     }
 }

@@ -631,12 +631,22 @@ impl ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Acquire);
         self.follower_tail.begin(epoch);
 
+        // Charge the in-flight slot + staged bytes on followers too —
+        // without it, follower memory between capture and upload is
+        // unaccounted and unbounded by the admission caps.
+        let in_flight = EpochInFlightGuard::claim(
+            &self.checkpoint_in_flight,
+            &self.staged_bytes,
+            staged_request_bytes(&request, &vnode_states),
+        );
         let coordinator = Arc::clone(&self.coordinator);
         let tail = Arc::clone(&self.follower_tail);
         let complete_tx = self.checkpoint_complete_tx.clone();
         let cc = self.cluster_controller.clone();
         async move {
             use crate::checkpoint_coordinator::CheckpointCoordinator;
+
+            let _in_flight = in_flight; // released on drop, even on panic
 
             let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
             if let Some(ref cc) = cc {

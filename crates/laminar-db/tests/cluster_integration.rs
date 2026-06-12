@@ -129,7 +129,6 @@ mod smoke {
 }
 
 mod failures {
-    use std::collections::HashSet;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -385,21 +384,29 @@ mod failures {
 
         // Rotation handed the crashed node's vnodes to the survivor,
         // which rehydrated their phase-A state and processed phase C
-        // for them — so the survivor now serves EVERY key.
-        let expected_keys: HashSet<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
+        // for them — so the survivor now serves EVERY key, and the
+        // crashed node's keys total phase A + phase C (`input_batch`
+        // pushes value = key*10). Asserting TOTALS, not just presence:
+        // a lost rehydration would still show the key (phase C creates
+        // the group) but with only phase C's contribution.
+        let mut expected: std::collections::HashMap<i64, i64> =
+            key_buckets[0].1.iter().map(|&k| (k, k * 10)).collect();
+        for &k in &follower_keys {
+            expected.insert(k, k * 10 * 2);
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
-            let keys: HashSet<i64> = post_crash_leader.iter().map(|(k, _)| *k).collect();
-            if keys == expected_keys {
+            let got: std::collections::HashMap<i64, i64> =
+                read_mv_sums(&harness.nodes[0].db, "sums")
+                    .await
+                    .into_iter()
+                    .collect();
+            if got == expected {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "survivor never served all keys: got {keys:?}, want {expected_keys:?}",
+                "survivor never served all recovered totals: got {got:?}, want {expected:?}",
             );
             sleep(Duration::from_millis(200)).await;
         }

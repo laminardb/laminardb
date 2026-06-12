@@ -546,6 +546,16 @@ async fn send_phase_rpc(
     })
 }
 
+/// Typed prepare-failure classification for the quorum wait:
+/// `Unreachable` counts toward `TimedOut{missing}` (the peer cannot
+/// participate), `Nack` toward `Failed` (a live follower answered
+/// `ok = false`).
+#[cfg(feature = "cluster")]
+enum PeerFailure {
+    Unreachable,
+    Nack(String),
+}
+
 /// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
@@ -807,11 +817,16 @@ impl BarrierCoordinator {
 
         let kv_latest: Option<BarrierAnnouncement> =
             match self.kv.read_from(leader, ANNOUNCEMENT_KEY).await {
-                Some(json) => serde_json::from_str(&json).map(Some).map_err(|e| {
+                Some(json) => match serde_json::from_str(&json) {
+                    Ok(a) => Some(a),
                     // A decode failure on the KV path is fatal only when
                     // there is no gRPC value to fall back on.
-                    e.to_string()
-                })?,
+                    Err(e) if grpc_latest.is_some() => {
+                        tracing::warn!(error = %e, "corrupt gossip announcement; using gRPC value");
+                        None
+                    }
+                    Err(e) => return Err(e.to_string()),
+                },
                 None => None,
             };
 
@@ -859,6 +874,8 @@ impl BarrierCoordinator {
 
     /// Leader-side: wait until quorum or `deadline`.
     #[allow(clippy::too_many_lines)]
+    // `PeerFailure` (module level, below) classifies each peer's
+    // prepare outcome.
     pub async fn wait_for_quorum(
         &self,
         epoch: u64,
@@ -892,7 +909,7 @@ impl BarrierCoordinator {
                     futures.push(async move {
                         let client_opt = get_barrier_client(peer, &clients_pool, &kv).await;
                         let Some(mut client) = client_opt else {
-                            return Err((peer, "Discovery failed".to_string()));
+                            return Err((peer, PeerFailure::Unreachable));
                         };
 
                         let mut req = tonic::Request::new(barrier_v1::PrepareRequest {
@@ -910,25 +927,30 @@ impl BarrierCoordinator {
                                 } else {
                                     Err((
                                         peer,
-                                        ack.error.unwrap_or_else(|| {
+                                        PeerFailure::Nack(ack.error.unwrap_or_else(|| {
                                             "Unknown prepare failure".to_string()
-                                        }),
+                                        })),
                                     ))
                                 }
                             }
-                            Ok(Err(e)) => {
+                            Ok(Err(status)) => {
                                 clients_pool.lock().remove(&peer);
-                                // Transport-level failure (connect refused,
-                                // reset): the peer is unreachable — the same
-                                // epistemic state as a timeout, NOT an
-                                // application-level NACK. Classified as
-                                // missing below so `Failed` keeps meaning
-                                // "a live follower answered ok = false".
-                                Err((peer, format!("unreachable: {e}")))
+                                // Classify by gRPC status code, not message
+                                // text: transport-level codes mean the peer
+                                // cannot participate (same epistemic state
+                                // as a timeout); anything else is a live
+                                // server refusing the call.
+                                match status.code() {
+                                    tonic::Code::Unavailable
+                                    | tonic::Code::DeadlineExceeded
+                                    | tonic::Code::Cancelled
+                                    | tonic::Code::Aborted => Err((peer, PeerFailure::Unreachable)),
+                                    _ => Err((peer, PeerFailure::Nack(status.to_string()))),
+                                }
                             }
                             Err(_) => {
                                 clients_pool.lock().remove(&peer);
-                                Err((peer, "Timeout".to_string()))
+                                Err((peer, PeerFailure::Unreachable))
                             }
                         }
                     });
@@ -952,16 +974,8 @@ impl BarrierCoordinator {
                                 });
                             }
                         }
-                        Err((peer, msg)) => {
-                            if msg.contains("Timeout")
-                                || msg.contains("deadline exceeded")
-                                || msg.starts_with("unreachable:")
-                            {
-                                timed_out.push(peer);
-                            } else {
-                                failures.push((peer, msg));
-                            }
-                        }
+                        Err((peer, PeerFailure::Unreachable)) => timed_out.push(peer),
+                        Err((peer, PeerFailure::Nack(msg))) => failures.push((peer, msg)),
                     }
                 }
 

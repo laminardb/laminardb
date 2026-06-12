@@ -70,7 +70,8 @@ log_level = "info"
 backend = "local"           # "in_process", "local", or "object_store"
 path = "./data/state"       # required when backend = "local"
 # When backend = "object_store": url = "s3://bucket/state" (same schemes as
-# [checkpoint]); credentials from provider env vars or [state.storage].
+# [checkpoint]) and instance_id = "node-0" (required, unique per node);
+# credentials from provider env vars or [state.storage].
 
 [checkpoint]
 # Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the

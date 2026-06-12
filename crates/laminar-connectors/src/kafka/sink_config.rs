@@ -453,6 +453,30 @@ impl KafkaSinkConfig {
             config.set(key, value);
         }
 
+        // Re-apply the transactional invariant AFTER pass-throughs: a
+        // user override of either timeout must not reintroduce
+        // message.timeout.ms > transaction.timeout.ms, which librdkafka
+        // rejects at producer creation.
+        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            let get_ms = |cfg: &ClientConfig, key: &str| -> Option<u64> {
+                cfg.get(key).and_then(|v| v.parse().ok())
+            };
+            if let (Some(msg), Some(txn)) = (
+                get_ms(&config, "message.timeout.ms"),
+                get_ms(&config, "transaction.timeout.ms"),
+            ) {
+                if msg > txn {
+                    tracing::warn!(
+                        msg,
+                        txn,
+                        "clamping message.timeout.ms to transaction.timeout.ms \
+                         (librdkafka rejects transactional producers otherwise)"
+                    );
+                    config.set("message.timeout.ms", txn.to_string());
+                }
+            }
+        }
+
         config
     }
 

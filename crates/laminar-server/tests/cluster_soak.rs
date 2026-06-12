@@ -265,9 +265,28 @@ fn verify_exactly_once_output(brokers: &str) {
             .set("isolation.level", "read_committed")
             .create()
             .expect("diff consumer");
+        // Assign every partition from broker metadata — hard-coding
+        // partition 0 silently misses data if the broker auto-creates
+        // the topic with more than one partition.
+        let metadata = consumer
+            .fetch_metadata(Some(&topic), Duration::from_secs(10))
+            .expect("topic metadata");
+        let partitions: Vec<i32> = metadata
+            .topics()
+            .first()
+            .map(|t| {
+                t.partitions()
+                    .iter()
+                    .map(rdkafka::metadata::MetadataPartition::id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(!partitions.is_empty(), "{topic}: no partitions in metadata");
         let mut tpl = TopicPartitionList::new();
-        tpl.add_partition_offset(&topic, 0, Offset::Beginning)
-            .unwrap();
+        for p in partitions {
+            tpl.add_partition_offset(&topic, p, Offset::Beginning)
+                .unwrap();
+        }
         consumer.assign(&tpl).expect("assign");
 
         // Read until the topic goes idle (the LSO stops a
@@ -354,14 +373,20 @@ fn cluster_commits(nodes: &[Node]) -> f64 {
 /// epoch floor for logging. Leadership is a NodeId-hash order, not
 /// spawn order, so rounds kill nodes round-robin — over the soak both
 /// leader and followers get hit.
-fn assert_progress(nodes: &[Node], _floor: f64, window: Duration, label: &str) -> f64 {
+fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) -> f64 {
     let target = cluster_commits(nodes) + 2.0;
     wait_for(
         &format!("{label}: cluster commits to reach {target}"),
         window,
         || cluster_commits(nodes) >= target,
     );
-    cluster_epoch(nodes)
+    let new_epoch = cluster_epoch(nodes);
+    // Abandonment leaves gaps, never reuse — epochs must be monotonic.
+    assert!(
+        new_epoch >= floor,
+        "{label}: cluster epoch regressed: {new_epoch} < previous floor {floor}",
+    );
+    new_epoch
 }
 
 #[test]
