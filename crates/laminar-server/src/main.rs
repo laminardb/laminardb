@@ -98,11 +98,7 @@ async fn main() -> Result<()> {
 }
 
 async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<()> {
-    let store = build_checkpoint_store(config);
-    let Some(store) = store else {
-        info!("No checkpoint configuration found — nothing to validate");
-        return Ok(());
-    };
+    let store = build_checkpoint_store(config)?;
 
     info!("Validating checkpoints...");
     let report = store
@@ -135,22 +131,18 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     Ok(())
 }
 
+/// Build the checkpoint store for `--validate-checkpoints`. Errors
+/// fail the validation run: `checkpoint.url` always has a default, so
+/// there is no "not configured" case to skip.
 fn build_checkpoint_store(
     config: &config::ServerConfig,
-) -> Option<Box<dyn laminar_core::storage::checkpoint_store::CheckpointStore>> {
+) -> Result<Box<dyn laminar_core::storage::checkpoint_store::CheckpointStore>> {
     let cp = &config.checkpoint;
     let url = &cp.url;
 
-    let obj_store = match laminar_core::storage::object_store_builder::build_object_store(
-        url,
-        &cp.storage,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(url = %url, error = %e, "failed to build object store for checkpoint validation");
-            return None;
-        }
-    };
+    let obj_store =
+        laminar_core::storage::object_store_builder::build_object_store(url, &cp.storage)
+            .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
 
     let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
 
@@ -158,14 +150,9 @@ fn build_checkpoint_store(
     if url.starts_with("file://") {
         // Shared normalization handles the Windows drive-letter slash
         // (`file:///C:/x` must become `C:/x`, not `/C:/x`).
-        let path = match laminar_core::storage::object_store_builder::file_url_path(url) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(url = %url, error = %e, "invalid file:// checkpoint url");
-                return None;
-            }
-        };
-        Some(Box::new(
+        let path = laminar_core::storage::object_store_builder::file_url_path(url)
+            .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
+        Ok(Box::new(
             laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
                 3,
@@ -175,7 +162,7 @@ fn build_checkpoint_store(
     } else {
         // Cloud URL: the builder already rooted the store at the URL's
         // path prefix.
-        Some(Box::new(
+        Ok(Box::new(
             laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                 obj_store,
                 String::new(),
