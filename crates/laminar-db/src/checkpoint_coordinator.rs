@@ -866,7 +866,9 @@ impl CheckpointCoordinator {
         // off exponentially: fast for the common local/in-process case,
         // ~1 LIST/s steady-state per slow epoch on S3 (gates also
         // serialize on the coordinator mutex, so at most one loop polls
-        // at a time regardless of pipelining depth).
+        // at a time regardless of pipelining depth). Push-driven
+        // follower upload-completion acks are the protocol-level
+        // replacement for this poll (tracked in the plan).
         const INITIAL_POLL: Duration = Duration::from_millis(100);
         const MAX_POLL: Duration = Duration::from_secs(1);
 

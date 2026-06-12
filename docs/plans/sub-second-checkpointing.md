@@ -65,10 +65,16 @@ Coordinator (`laminar-db/src/checkpoint_coordinator.rs`):
 - Leader (`checkpoint_inner`, cluster): `await_prepare_quorum` moved
   **before** the leader's own pre-commit/manifest/partial writes; on
   quorum it announces `Aligned`. The durability gate became
-  `await_restorable_gate`: it **polls** `epoch_complete` (100ms with exponential backoff to 1s, up to
-  `CheckpointConfig::restorable_gate_timeout`, default 30s) because
+  `await_restorable_gate`: it **polls** `epoch_complete` (100ms with
+  exponential backoff to 1s, up to
+  `CheckpointConfig::restorable_gate_timeout`, default 10s) because
   followers now upload after acking. Split-brain commit markers still
   abort immediately; transient I/O errors retry until the deadline.
+  Replacing the poll with push-driven follower upload-completion acks
+  (a second, "restorable" ack on the barrier channel once a node's
+  partials land) is the protocol-level follow-up — it removes the
+  steady-state object-store LISTs and shrinks commit latency to one
+  ack round-trip.
 - Follower (`follower_checkpoint`): the ack moved **before**
   `follower_prepare` — it now means "aligned + captured", not
   "durably prepared". On a prepare failure after acking, a
