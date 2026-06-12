@@ -122,10 +122,11 @@ fn parse_args() -> Args {
     args
 }
 
+const VNODES: u64 = 256;
+
 /// Key layout mirrors the engine's: operator name, vnode, then (group mode
 /// only) the group key — so prefix locality matches what the tier will see.
 fn make_key(mode: Mode, i: u64, buf: &mut Vec<u8>) {
-    const VNODES: u64 = 256;
     buf.clear();
     buf.extend_from_slice(b"agg-0/");
     match mode {
@@ -170,7 +171,50 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+mod sys {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS,
+    };
+
+    /// Bytes this process has written (buffered-write transfer count — a
+    /// fair write-amplification proxy, counted at the write call).
+    pub fn write_bytes() -> Option<u64> {
+        unsafe {
+            let mut io: IO_COUNTERS = std::mem::zeroed();
+            (GetProcessIoCounters(GetCurrentProcess(), &mut io) != 0)
+                .then_some(io.WriteTransferCount)
+        }
+    }
+
+    /// Total process CPU time (user + kernel).
+    pub fn cpu_time() -> Option<std::time::Duration> {
+        unsafe {
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            ) == 0
+            {
+                return None;
+            }
+            let ft = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            // FILETIME ticks are 100 ns.
+            Some(std::time::Duration::from_nanos(
+                (ft(kernel) + ft(user)) * 100,
+            ))
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 mod sys {
     pub fn write_bytes() -> Option<u64> {
         None
@@ -230,16 +274,44 @@ fn main() {
         .expect("open keyspace");
 
     // ---- Phase A: bulk load every key once (the demoted working set). ----
+    // Loaded in key-sorted order (vnode-major in group mode) so the bulk
+    // load doesn't pay full compaction churn before measurement starts.
     let load_start = Instant::now();
     let mut rng = SmallRng::seed_from_u64(42);
     let mut key = Vec::with_capacity(64);
     let mut value = vec![0u8; args.value_bytes];
     let mut logical_bytes: u64 = 0;
-    for i in 0..args.keys {
+    let mut loaded: u64 = 0;
+    let progress_every = (args.keys / 10).max(1);
+    let mut load_one = |i: u64| {
         make_key(args.mode, i, &mut key);
         fill_value(&mut rng, &mut value);
         ks.insert(&key, &value).expect("load insert");
         logical_bytes += (key.len() + value.len()) as u64;
+        loaded += 1;
+        if loaded.is_multiple_of(progress_every) {
+            println!(
+                "  load: {loaded}/{} ({:.0}s)",
+                args.keys,
+                load_start.elapsed().as_secs_f64()
+            );
+        }
+    };
+    match args.mode {
+        Mode::Group => {
+            for v in 0..VNODES.min(args.keys) {
+                let mut i = v;
+                while i < args.keys {
+                    load_one(i);
+                    i += VNODES;
+                }
+            }
+        }
+        Mode::Slice => {
+            for i in 0..args.keys {
+                load_one(i);
+            }
+        }
     }
     db.persist(fjall::PersistMode::SyncAll).expect("persist");
     println!(
@@ -369,7 +441,7 @@ fn main() {
                 logical as f64 / (1 << 20) as f64
             );
         }
-        _ => println!("write amplification: n/a (needs /proc, run on Linux)"),
+        _ => println!("write amplification: n/a (unsupported platform)"),
     }
     match (cpu_before, sys::cpu_time()) {
         (Some(before), Some(after)) => {
@@ -380,7 +452,7 @@ fn main() {
                 100.0 * cpu.as_secs_f64() / steady_wall.as_secs_f64()
             );
         }
-        _ => println!("process CPU: n/a (needs /proc, run on Linux)"),
+        _ => println!("process CPU: n/a (unsupported platform)"),
     }
     println!(
         "on-disk size: {:.1} MiB ({:.2}x of logical loaded)",

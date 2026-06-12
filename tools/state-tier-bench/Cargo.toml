@@ -11,6 +11,12 @@ rand = "0.9"
 rand_distr = "0.5"
 hdrhistogram = "7"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 # Standalone on purpose: fjall must not enter the main workspace lockfile
 # until the benchmark gate passes.
 [workspace]
