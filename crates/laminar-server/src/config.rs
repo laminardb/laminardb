@@ -219,15 +219,23 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
         }
-        // Distributed 2PC has a per-barrier cost of ~1-3s (manifest
-        // persist + durability gate + sink commit). Cadences tighter
-        // than 2s spend more than half their time on coordination.
-        if config.checkpoint.interval < Duration::from_secs(2) {
+        // Below 100ms the capture-quorum round-trip itself dominates
+        // the barrier; above it, the admission caps degrade cadence to
+        // upload speed instead of building an unbounded backlog.
+        if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(
-                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 2s",
+                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 100ms",
                 config.checkpoint.interval,
             ));
         }
+    }
+    // 0 would pause barrier admission permanently (staged >= cap is
+    // always true), silently wedging checkpointing.
+    if config.checkpoint.max_staged_bytes == Some(0) {
+        errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
+    }
+    if config.checkpoint.max_in_flight_epochs == Some(0) {
+        errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
     }
 
     validate_ai(config, &mut errors);
@@ -377,7 +385,7 @@ impl std::fmt::Debug for Secret {
 }
 
 /// `[checkpoint]` section.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct CheckpointSection {
     /// Storage URL: file:///path, s3://bucket/prefix, gs://bucket/prefix.
     #[serde(default = "default_checkpoint_url")]
@@ -390,6 +398,14 @@ pub struct CheckpointSection {
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
+    /// Max epochs between capture and restorable (the upload backlog).
+    /// Default 4; exactly-once pipelines are capped at 1 regardless.
+    #[serde(default)]
+    pub max_in_flight_epochs: Option<u64>,
+    /// Cap on captured-state bytes held by in-flight epochs awaiting
+    /// upload; admission pauses at the cap. Default 512 MiB.
+    #[serde(default)]
+    pub max_staged_bytes: Option<u64>,
 }
 
 impl Default for CheckpointSection {
@@ -399,7 +415,30 @@ impl Default for CheckpointSection {
             interval: default_checkpoint_interval(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
+            max_in_flight_epochs: None,
+            max_staged_bytes: None,
         }
+    }
+}
+
+// Manual Debug: `storage` values can hold cloud secrets.
+impl std::fmt::Debug for CheckpointSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointSection")
+            .field("url", &self.url)
+            .field("interval", &self.interval)
+            .field("max_retained", &self.max_retained)
+            .field(
+                "storage",
+                &self
+                    .storage
+                    .keys()
+                    .map(|k| (k, "[REDACTED]"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("max_in_flight_epochs", &self.max_in_flight_epochs)
+            .field("max_staged_bytes", &self.max_staged_bytes)
+            .finish()
     }
 }
 
@@ -1172,8 +1211,8 @@ sql = "SELECT 2"
 
     #[test]
     fn test_cluster_mode_rejects_tight_checkpoint_interval() {
-        // Two-phase commit in cluster mode can't keep up with sub-2s
-        // cadence.
+        // Below 100ms the capture-quorum round-trip itself dominates
+        // the barrier.
         let toml = r#"
 node_id = "n1"
 
@@ -1181,7 +1220,7 @@ node_id = "n1"
 mode = "cluster"
 
 [checkpoint]
-interval = "500ms"
+interval = "50ms"
 
 [discovery]
 strategy = "static"

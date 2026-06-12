@@ -103,30 +103,6 @@ async fn resolve_stream_output_schemas(
     result.map(|()| out)
 }
 
-pub(crate) fn url_to_checkpoint_prefix(url: &str) -> String {
-    // Strip scheme
-    let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
-
-    // For file:// URLs, the prefix is empty (LocalFileSystem already has the root)
-    if url.starts_with("file://") {
-        return String::new();
-    }
-
-    // For cloud URLs like s3://bucket/prefix → extract everything after bucket
-    if let Some(slash_pos) = after_scheme.find('/') {
-        let prefix = &after_scheme[slash_pos + 1..];
-        if prefix.is_empty() {
-            String::new()
-        } else if prefix.ends_with('/') {
-            prefix.to_string()
-        } else {
-            format!("{prefix}/")
-        }
-    } else {
-        String::new()
-    }
-}
-
 impl LaminarDB {
     /// Shut down the database gracefully.
     pub fn close(&self) {
@@ -250,15 +226,17 @@ impl LaminarDB {
                 Box<dyn laminar_core::storage::CheckpointStore>,
                 Arc<dyn object_store::ObjectStore>,
             ) = if let Some(ref url) = self.config.object_store_url {
+                // The builder roots the store at the URL's path prefix,
+                // so the checkpoint store (and the decision store
+                // sharing `obj`) need no extra key prefix.
                 let obj = laminar_core::storage::object_store_builder::build_object_store(
                     url,
                     &self.config.object_store_options,
                 )
                 .map_err(|e| DbError::Config(format!("object store: {e}")))?;
-                let prefix = url_to_checkpoint_prefix(url);
                 let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     Arc::clone(&obj),
-                    prefix,
+                    String::new(),
                     max_retained,
                 )
                 .with_vnode_count(vnode_count);
@@ -279,10 +257,17 @@ impl LaminarDB {
                 (Box::new(cs), obj)
             };
 
+            let defaults = CkpConfig::default();
             let config = CkpConfig {
                 interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
                 max_retained,
-                ..CkpConfig::default()
+                max_in_flight_epochs: cp_config
+                    .max_in_flight_epochs
+                    .unwrap_or(defaults.max_in_flight_epochs),
+                max_staged_bytes: cp_config
+                    .max_staged_bytes
+                    .unwrap_or(defaults.max_staged_bytes),
+                ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
             if let Some(ref prom) = *self.engine_metrics.lock() {
@@ -1601,8 +1586,46 @@ impl LaminarDB {
             u64,
             rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>,
         )>(16);
-        // Shared in-flight flag: callback sets it per persist, coordinator gates on it.
-        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Shared admission state: the callback claims a slot (and staged
+        // bytes) per in-flight epoch; the streaming coordinator gates new
+        // barriers on the caps. A single-open-transaction sink cannot
+        // overlap epochs, so depth is capped at 1 whenever ANY registered
+        // sink is exactly-once — not just when the pipeline-level
+        // guarantee says so. (DDL/server-configured sinks declare
+        // exactly-once via connector capabilities without ever setting
+        // the pipeline-level guarantee; keying off the pipeline config
+        // alone would pipeline epochs over an open Kafka transaction.)
+        let has_exactly_once_sink = sinks
+            .iter()
+            .any(|(_, handle, _, _, _)| handle.exactly_once());
+        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let staged_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (epoch_allocator, ckpt_quorum_timeout, max_in_flight_epochs, max_staged_bytes) = {
+            let guard = coordinator.lock().await;
+            match guard.as_ref() {
+                Some(coord) => {
+                    let cfg = coord.config();
+                    let depth = if has_exactly_once_sink
+                        || pipeline_config.delivery_guarantee
+                            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+                    {
+                        1
+                    } else {
+                        cfg.max_in_flight_epochs.max(1)
+                    };
+                    (
+                        Some(coord.epoch_allocator()),
+                        cfg.quorum_timeout,
+                        depth,
+                        // 0 would pause admission permanently.
+                        cfg.max_staged_bytes.max(1),
+                    )
+                }
+                None => (None, std::time::Duration::from_secs(3), 1, u64::MAX),
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let _ = ckpt_quorum_timeout;
 
         let static_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_sources
             .iter()
@@ -1646,7 +1669,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             cluster_controller: self.cluster_controller.lock().clone(),
             #[cfg(feature = "cluster")]
-            last_follower_epoch: None,
+            follower_tail: Arc::default(),
             #[cfg(feature = "cluster")]
             barrier_injectors: Vec::new(),
             #[cfg(feature = "cluster")]
@@ -1660,6 +1683,11 @@ impl LaminarDB {
             static_stream_names,
             checkpoint_complete_tx,
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
+            staged_bytes: Arc::clone(&staged_bytes),
+            epoch_allocator,
+            #[cfg(feature = "cluster")]
+            quorum_timeout: ckpt_quorum_timeout,
+            exactly_once_sinks: has_exactly_once_sink,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1680,7 +1708,12 @@ impl LaminarDB {
             )
             .await?
             .with_checkpoint_complete_rx(checkpoint_complete_rx)
-            .with_checkpoint_in_flight(checkpoint_in_flight);
+            .with_checkpoint_admission(
+                checkpoint_in_flight,
+                max_in_flight_epochs,
+                staged_bytes,
+                max_staged_bytes,
+            );
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();

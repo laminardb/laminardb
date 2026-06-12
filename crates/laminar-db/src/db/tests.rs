@@ -721,7 +721,8 @@ async fn test_connector_registry_accessor() {
     // With feature flags enabled, built-in connectors are auto-registered.
     // Without any features, registry should be empty.
     #[allow(unused_mut)]
-    let mut expected_sources = 0;
+    // The generator source is unconditional (no feature gate).
+    let mut expected_sources = 1;
     #[allow(unused_mut)]
     let mut expected_sinks = 0;
 

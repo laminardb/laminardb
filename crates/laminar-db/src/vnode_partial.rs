@@ -20,12 +20,21 @@ use crate::error::DbError;
 /// The bytes are exactly what the operator's per-vnode checkpoint produced
 /// (e.g. an rkyv-encoded `AggStateCheckpoint` holding only this vnode's
 /// groups), so the apply path can hand them straight back to the operator.
+///
+/// `base_epoch = Some(N)` makes this a *reference* artifact: the
+/// vnode's state is byte-identical to the full partial it
+/// uploaded at epoch `N`, so `operators` is empty and the reader follows
+/// the reference (a single hop — references always point at a full
+/// artifact, never at another reference). The writer re-emits a full
+/// partial before the base can leave the prune retention window.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct VnodePartial {
     /// Checkpoint id this partial was sealed under — for audit/logging.
     pub checkpoint_id: u64,
-    /// `(operator_name, vnode-slice bytes)`.
+    /// `(operator_name, vnode-slice bytes)`. Empty for references.
     pub operators: Vec<(String, Vec<u8>)>,
+    /// `Some(epoch)` = unchanged since that epoch's full partial.
+    pub base_epoch: Option<u64>,
 }
 
 impl VnodePartial {
@@ -64,6 +73,7 @@ mod tests {
                 ("agg".to_string(), vec![1, 2, 3]),
                 ("other".to_string(), vec![]),
             ],
+            base_epoch: None,
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
@@ -78,10 +88,24 @@ mod tests {
         let p = VnodePartial {
             checkpoint_id: 7,
             operators: Vec::new(),
+            base_epoch: None,
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
         assert_eq!(back.checkpoint_id, 7);
+        assert!(back.operators.is_empty());
+    }
+
+    #[test]
+    fn reference_round_trips() {
+        let p = VnodePartial {
+            checkpoint_id: 9,
+            operators: Vec::new(),
+            base_epoch: Some(4),
+        };
+        let bytes = p.encode().unwrap();
+        let back = VnodePartial::decode(&bytes).unwrap();
+        assert_eq!(back.base_epoch, Some(4));
         assert!(back.operators.is_empty());
     }
 

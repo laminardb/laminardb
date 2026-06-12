@@ -728,17 +728,17 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
+            // An already-open transaction is the continuation case: an
+            // abandoned epoch keeps its pending rows and the next
+            // epoch's commit covers them. Aborting here would lose them
+            // (a live abort is never replayed).
             if self.transaction_active {
-                warn!(epoch, "aborting stale transaction before new epoch");
-                let txn_timeout = self.config.transaction_timeout;
-                Self::producer_blocking(producer, move |p| p.abort_transaction(txn_timeout))
-                    .await
-                    .map_err(|e| {
-                        ConnectorError::TransactionError(format!(
-                            "cannot begin epoch {epoch}: abort of stale transaction failed: {e}"
-                        ))
-                    })?;
-                self.transaction_active = false;
+                debug!(
+                    epoch,
+                    "transaction already open — pending rows ride into this epoch"
+                );
+                self.partitioner.reset();
+                return Ok(());
             }
 
             Self::producer_blocking(producer, FutureProducer::begin_transaction)
@@ -758,12 +758,19 @@ impl SinkConnector for KafkaSink {
     }
 
     async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        if epoch != self.current_epoch {
+        // Monotonic, not strict equality: the coordinator abandons
+        // failed epochs (ids are never reused), so the epoch sealing
+        // the currently open transaction may skip past the one
+        // `begin_epoch` was called with. Only a STALE epoch is an
+        // error — there is one open transaction and it always holds
+        // the rows since the last barrier.
+        if epoch < self.current_epoch {
             return Err(ConnectorError::TransactionError(format!(
-                "epoch mismatch in pre_commit: expected {}, got {epoch}",
+                "stale epoch in pre_commit: current {}, got {epoch}",
                 self.current_epoch
             )));
         }
+        self.current_epoch = epoch;
 
         // Flush all pending messages to Kafka brokers (phase 1).
         if let Some(ref producer) = self.producer {
@@ -781,12 +788,14 @@ impl SinkConnector for KafkaSink {
     }
 
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        if epoch != self.current_epoch {
+        // Monotonic for the same reason as `pre_commit`.
+        if epoch < self.current_epoch {
             return Err(ConnectorError::TransactionError(format!(
-                "epoch mismatch: expected {}, got {epoch}",
+                "stale epoch in commit: current {}, got {epoch}",
                 self.current_epoch
             )));
         }
+        self.current_epoch = epoch;
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             let producer = self
@@ -869,7 +878,14 @@ impl SinkConnector for KafkaSink {
             .with_partitioned();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once().with_two_phase_commit();
+            // The single open transaction holds all rows since the last
+            // commit, so an abandoned epoch's rows ride into the next
+            // epoch's commit — no rollback needed (or wanted) on a live
+            // coordination failure.
+            caps = caps
+                .with_exactly_once()
+                .with_two_phase_commit()
+                .with_preserves_pending_on_abandon();
         }
 
         if self.schema_registry.is_some() {

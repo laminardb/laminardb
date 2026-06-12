@@ -183,6 +183,39 @@ impl<'a> VnodeRehydrator<'a> {
         for &vnode in vnodes {
             match self.backend.read_partial(vnode, epoch).await {
                 Ok(Some(bytes)) => {
+                    // An unchanged-vnode partial is a reference to the
+                    // epoch of its last full upload —
+                    // follow the single hop to the real state. A blob
+                    // that doesn't decode is handed through unchanged
+                    // (the apply path skips undecodable partials).
+                    let bytes = match crate::vnode_partial::VnodePartial::decode(&bytes) {
+                        Ok(p) => match p.base_epoch {
+                            Some(base) => match self.backend.read_partial(vnode, base).await {
+                                Ok(Some(base_bytes)) => base_bytes,
+                                Ok(None) => {
+                                    warn!(
+                                        vnode,
+                                        epoch,
+                                        base,
+                                        "[LDB-6052] reference partial's base is missing — \
+                                         vnode starts fresh"
+                                    );
+                                    report.missing.push(vnode);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        vnode, epoch, base, error = %e,
+                                        "[LDB-6051] rehydrate: base read failed — vnode starts fresh"
+                                    );
+                                    report.errors.insert(vnode, e.to_string());
+                                    continue;
+                                }
+                            },
+                            None => bytes,
+                        },
+                        Err(_) => bytes,
+                    };
                     debug!(
                         vnode,
                         epoch,
@@ -1257,6 +1290,47 @@ mod rehydration_tests {
 
         assert_eq!(report.epoch, Some(9), "must read the highest sealed epoch");
         assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"new"[..]));
+    }
+
+    /// A reference partial resolves (one hop) to the
+    /// full partial it points at.
+    #[tokio::test]
+    async fn rehydrate_resolves_reference_partials() {
+        let backend = InProcessBackend::new(4);
+
+        let full = crate::vnode_partial::VnodePartial {
+            checkpoint_id: 1,
+            operators: vec![("agg".into(), vec![1, 2, 3])],
+            base_epoch: None,
+        };
+        backend
+            .write_partial(0, 5, 0, Bytes::from(full.encode().unwrap()))
+            .await
+            .unwrap();
+        assert!(backend.epoch_complete(5, &[0]).await.unwrap());
+
+        let reference = crate::vnode_partial::VnodePartial {
+            checkpoint_id: 2,
+            operators: Vec::new(),
+            base_epoch: Some(5),
+        };
+        backend
+            .write_partial(0, 6, 0, Bytes::from(reference.encode().unwrap()))
+            .await
+            .unwrap();
+        assert!(backend.epoch_complete(6, &[0]).await.unwrap());
+
+        let report = VnodeRehydrator::new(&backend).rehydrate(&[0]).await;
+        assert_eq!(report.epoch, Some(6));
+        let restored = crate::vnode_partial::VnodePartial::decode(
+            report.restored.get(&0).expect("vnode restored"),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.base_epoch, None,
+            "the resolved partial must be the full base, not the reference",
+        );
+        assert_eq!(restored.operators[0].1, vec![1, 2, 3]);
     }
 
     #[tokio::test]

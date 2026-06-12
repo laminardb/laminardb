@@ -57,8 +57,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // `laminardb` is the BIN crate: main.rs/cluster.rs etc.
+                // log under that target, not `laminar_server` (the lib
+                // name) — without it the server's own startup logs are
+                // silently filtered out.
                 format!(
-                    "laminar_server={l},laminar_db={l},laminar_core={l},\
+                    "laminardb={l},laminar_server={l},laminar_db={l},laminar_core={l},\
                      laminar_sql={l},laminar_connectors={l}",
                     l = args.log_level
                 )
@@ -94,11 +98,7 @@ async fn main() -> Result<()> {
 }
 
 async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<()> {
-    let store = build_checkpoint_store(config);
-    let Some(store) = store else {
-        info!("No checkpoint configuration found — nothing to validate");
-        return Ok(());
-    };
+    let store = build_checkpoint_store(config)?;
 
     info!("Validating checkpoints...");
     let report = store
@@ -131,29 +131,28 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     Ok(())
 }
 
+/// Build the checkpoint store for `--validate-checkpoints`. Errors
+/// fail the validation run: `checkpoint.url` always has a default, so
+/// there is no "not configured" case to skip.
 fn build_checkpoint_store(
     config: &config::ServerConfig,
-) -> Option<Box<dyn laminar_core::storage::checkpoint_store::CheckpointStore>> {
+) -> Result<Box<dyn laminar_core::storage::checkpoint_store::CheckpointStore>> {
     let cp = &config.checkpoint;
     let url = &cp.url;
 
-    let obj_store = match laminar_core::storage::object_store_builder::build_object_store(
-        url,
-        &cp.storage,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(url = %url, error = %e, "failed to build object store for checkpoint validation");
-            return None;
-        }
-    };
+    let obj_store =
+        laminar_core::storage::object_store_builder::build_object_store(url, &cp.storage)
+            .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
 
     let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
 
     // file:// URLs use the local FS path directly; cloud URLs need a prefix.
     if url.starts_with("file://") {
-        let path = url.strip_prefix("file://").unwrap_or(url);
-        Some(Box::new(
+        // Shared normalization handles the Windows drive-letter slash
+        // (`file:///C:/x` must become `C:/x`, not `/C:/x`).
+        let path = laminar_core::storage::object_store_builder::file_url_path(url)
+            .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
+        Ok(Box::new(
             laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
                 3,
@@ -161,15 +160,13 @@ fn build_checkpoint_store(
             .with_vnode_count(vnode_count),
         ))
     } else {
-        // Cloud URL: extract prefix from URL path (bucket is handled by object_store).
-        let prefix = url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
-            .unwrap_or_default();
-        Some(Box::new(
+        // Cloud URL: the builder already rooted the store at the URL's
+        // path prefix.
+        Ok(Box::new(
             laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                obj_store, prefix, 3,
+                obj_store,
+                String::new(),
+                3,
             )
             .with_vnode_count(vnode_count),
         ))

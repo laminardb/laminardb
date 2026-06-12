@@ -129,7 +129,6 @@ mod smoke {
 }
 
 mod failures {
-    use std::collections::HashSet;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -304,8 +303,14 @@ mod failures {
         out
     }
 
+    /// A hard crash sheds the dead node's vnodes to the survivor,
+    /// which rehydrates their checkpointed state and takes over their
+    /// keys (rows in flight at the crash are lost — the at-least-once
+    /// failover window). Before dead-node rotation engaged, the
+    /// survivor kept only its own keys and the cluster could not
+    /// commit at all until the node returned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn crash_mid_stream_loses_in_flight() {
+    async fn crash_sheds_vnodes_to_survivor() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
         let leader_idx = harness.leader_idx();
         let follower_idx = harness.follower_idxs()[0];
@@ -356,7 +361,19 @@ mod failures {
         let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
         drop(crashed_runtime);
         crashed_node.crash().await;
-        sleep(Duration::from_secs(4)).await;
+
+        // Wait for rotation to hand every vnode to the survivor.
+        // Detection is time-based (phi-accrual Suspected flip →
+        // debounce → rotation → rehydration), so a fixed sleep flakes
+        // under parallel test load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "survivor never acquired the crashed node's vnodes",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
 
         let phase_c = input_batch(&follower_keys);
         let src = harness.nodes[0]
@@ -364,14 +381,35 @@ mod failures {
             .source_untyped("src")
             .expect("source_untyped on surviving leader");
         src.push_arrow(phase_c).expect("push phase_c");
-        sleep(Duration::from_millis(500)).await;
 
-        let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
-        let post_crash_leader_keys: HashSet<i64> =
-            post_crash_leader.iter().map(|(k, _)| *k).collect();
-
-        let expected_keys: HashSet<i64> = key_buckets[0].1.iter().copied().collect();
-        assert_eq!(post_crash_leader_keys, expected_keys);
+        // Rotation handed the crashed node's vnodes to the survivor,
+        // which rehydrated their phase-A state and processed phase C
+        // for them — so the survivor now serves EVERY key, and the
+        // crashed node's keys total phase A + phase C (`input_batch`
+        // pushes value = key*10). Asserting TOTALS, not just presence:
+        // a lost rehydration would still show the key (phase C creates
+        // the group) but with only phase C's contribution.
+        let mut expected: std::collections::HashMap<i64, i64> =
+            key_buckets[0].1.iter().map(|&k| (k, k * 10)).collect();
+        for &k in &follower_keys {
+            expected.insert(k, k * 10 * 2);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got: std::collections::HashMap<i64, i64> =
+                read_mv_sums(&harness.nodes[0].db, "sums")
+                    .await
+                    .into_iter()
+                    .collect();
+            if got == expected {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "survivor never served all recovered totals: got {got:?}, want {expected:?}",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
 
         harness.shutdown().await;
     }

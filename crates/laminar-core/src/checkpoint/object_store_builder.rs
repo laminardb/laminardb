@@ -57,6 +57,13 @@ impl From<object_store::Error> for ObjectStoreBuilderError {
 /// | `gs://` | `gcs` | `GoogleCloudStorageBuilder` |
 /// | `az://`, `abfs://` | `azure` | `MicrosoftAzureBuilder` |
 ///
+/// The URL's path (everything after the bucket/container) is applied as a
+/// key prefix on the returned store, so every consumer — checkpoint
+/// manifests, decision markers, control plane, state partials — is rooted
+/// under it. The cloud builders themselves only consume the bucket from the
+/// URL; without the wrapper, two clusters sharing a bucket with different
+/// path prefixes would silently collide at the bucket root.
+///
 /// # Errors
 ///
 /// Returns [`ObjectStoreBuilderError`] if the scheme is unsupported, requires
@@ -71,34 +78,56 @@ pub fn build_object_store(
         .map(|i| &url[..i])
         .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(format!("no scheme in '{url}'")))?;
 
-    match scheme {
-        "file" => build_local_file_system(url),
+    let store = match scheme {
+        // file:// uses the whole path as the filesystem root — already rooted.
+        "file" => return build_local_file_system(url),
         "s3" => build_s3(url, options),
         "gs" => build_gcs(url, options),
         "az" | "abfs" | "abfss" => build_azure(url, options),
         other => Err(ObjectStoreBuilderError::UnsupportedScheme(
             other.to_string(),
         )),
-    }
+    }?;
+
+    Ok(match url_path_prefix(url) {
+        "" => store,
+        prefix => Arc::new(object_store::prefix::PrefixStore::new(
+            store,
+            object_store::path::Path::from(prefix),
+        )),
+    })
 }
 
-/// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
-fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    // file:///path/to/dir → /path/to/dir
+/// The key prefix encoded in a cloud URL's path: everything after the
+/// bucket/container authority, e.g. `s3://bucket/a/b/` → `a/b`.
+fn url_path_prefix(url: &str) -> &str {
+    let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
+    after_scheme
+        .find('/')
+        .map_or("", |i| after_scheme[i + 1..].trim_matches('/'))
+}
+
+/// Normalized filesystem path from a `file://` URL: scheme stripped and
+/// the Windows drive-letter slash removed (`file:///C:/x` → `C:/x`).
+///
+/// # Errors
+/// Returns [`ObjectStoreBuilderError::InvalidUrl`] when the scheme is
+/// missing or the path is empty.
+pub fn file_url_path(url: &str) -> Result<&str, ObjectStoreBuilderError> {
     let path = url
         .strip_prefix("file://")
         .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(url.to_string()))?;
-
     if path.is_empty() {
         return Err(ObjectStoreBuilderError::InvalidUrl(
             "file:// URL has empty path".to_string(),
         ));
     }
+    Ok(strip_windows_leading_slash(path))
+}
 
-    // On Windows, file:///C:/path yields "/C:/path" after stripping the
-    // scheme. The leading slash before the drive letter is invalid — strip
-    // it so `LocalFileSystem::new_with_prefix` receives "C:/path".
-    let path = strip_windows_leading_slash(path);
+/// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
+fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    let path = file_url_path(url)?;
 
     // Ensure the directory exists — LocalFileSystem doesn't create it.
     std::fs::create_dir_all(path).map_err(|e| {
@@ -305,6 +334,22 @@ mod tests {
             let err = result.unwrap_err().to_string();
             assert!(err.contains("azure"), "got: {err}");
         }
+    }
+
+    /// The URL path roots ALL consumers of the store (manifests,
+    /// decision markers, control plane, state partials) — two clusters
+    /// sharing a bucket must not collide at the root.
+    #[test]
+    fn url_path_prefix_extraction() {
+        assert_eq!(url_path_prefix("s3://bucket"), "");
+        assert_eq!(url_path_prefix("s3://bucket/"), "");
+        assert_eq!(url_path_prefix("s3://bucket/a"), "a");
+        assert_eq!(url_path_prefix("s3://bucket/a/b/"), "a/b");
+        assert_eq!(url_path_prefix("gs://bucket/x"), "x");
+        assert_eq!(
+            url_path_prefix("abfss://container@account.dfs.core.windows.net/p/q"),
+            "p/q"
+        );
     }
 
     #[test]

@@ -13,10 +13,19 @@ syntax = "proto3";
 package laminar.barrier.v1;
 
 service BarrierSync {
-  // Phase 1. Snapshot state and pre-commit sinks, then report
-  // readiness. The follower returns its local watermark so the leader
-  // can fold a cluster-wide minimum for the matching Commit.
+  // Phase 1. Align + capture state locally, then report readiness.
+  // The follower returns its local watermark so the leader can fold a
+  // cluster-wide minimum for the matching Aligned/Commit. The durable
+  // tail (sink pre-commit, manifest, state uploads) runs after the ack
+  // — the ack means "captured", not "durable".
   rpc Prepare(PrepareRequest) returns (Ack);
+
+  // Intermediate (success). Every node has aligned the shuffle and
+  // captured the epoch locally; pipelines may resume the next epoch.
+  // The epoch is NOT yet restorable — Commit follows once the
+  // durability gate passes. Carries the cluster-wide minimum
+  // watermark computed from the Prepare acks.
+  rpc Aligned(AlignedRequest) returns (Ack);
 
   // Phase 2 (success). The durability gate passed cluster-wide; commit
   // sinks. Carries the cluster-wide minimum watermark.
@@ -33,6 +42,16 @@ message PrepareRequest {
   // Reserved for unaligned / other barrier flags (mirrors
   // `BarrierAnnouncement.flags`).
   uint64 flags = 3;
+}
+
+message AlignedRequest {
+  uint64 epoch = 1;
+  uint64 checkpoint_id = 2;
+  uint64 flags = 3;
+  // Cluster-wide minimum watermark folded from the Prepare acks, so
+  // followers see cluster-wide event-time progress at resume rather
+  // than waiting for the (upload-gated) Commit.
+  optional int64 min_watermark_ms = 4;
 }
 
 message CommitRequest {

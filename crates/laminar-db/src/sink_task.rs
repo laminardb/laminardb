@@ -88,9 +88,15 @@ pub(crate) enum SinkCommand {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// Abort a failed epoch.
+    /// Abort a failed epoch. `force = true` (restart/recovery) always
+    /// rolls the connector back; `force = false` (live coordination
+    /// failure) keeps a healthy sink's pending transactional output —
+    /// sources do not rewind on a live abort, so an aborted
+    /// transaction's rows would be lost forever. The next successful
+    /// epoch's commit covers them.
     RollbackEpoch {
         epoch: u64,
+        force: bool,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// No-op barrier: acks once every prior command has been processed.
@@ -257,14 +263,36 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("commit"))?
     }
 
-    /// Abort a failed epoch.
+    /// Roll the connector back unconditionally (restart/recovery, or
+    /// cleanup of a partially-begun epoch).
     pub async fn rollback_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
-            .send(SinkCommand::RollbackEpoch { epoch, ack: ack_tx })
+            .send(SinkCommand::RollbackEpoch {
+                epoch,
+                force: true,
+                ack: ack_tx,
+            })
             .await
             .map_err(|_| self.closed_err())?;
         ack_rx.await.map_err(|_| self.ack_dropped_err("rollback"))?
+    }
+
+    /// Live coordination failure: abandon the epoch but keep a healthy
+    /// sink's pending transactional output for the next epoch's commit
+    /// (see [`SinkCommand::RollbackEpoch`]). Rolls back for real only
+    /// if the sink itself failed (poisoned epoch).
+    pub async fn abandon_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::oneshot();
+        self.tx
+            .send(SinkCommand::RollbackEpoch {
+                epoch,
+                force: false,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("abandon"))?
     }
 
     /// Signals the sink task to close and waits for it to finish (30s timeout).
@@ -310,6 +338,7 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
     // Skip the first immediate tick.
     flush_timer.tick().await;
 
+    let preserves_pending_on_abandon = inner.sink.capabilities().preserves_pending_on_abandon;
     let mut current_epoch: u64 = 0;
     let epoch_poisoned = AtomicBool::new(false);
 
@@ -402,8 +431,26 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                         };
                         ack.send(result);
                     }
-                    SinkCommand::RollbackEpoch { epoch, ack } => {
-                        let result = inner.sink.rollback_epoch(epoch).await;
+                    SinkCommand::RollbackEpoch { epoch, force, ack } => {
+                        // Keeping pending output across an abandoned
+                        // epoch is only sound when the CONNECTOR says
+                        // so (`preserves_pending_on_abandon`, e.g. a
+                        // Kafka transactional producer); a staging-style
+                        // sink must roll back or its per-epoch state
+                        // diverges.
+                        let result = if force
+                            || !preserves_pending_on_abandon
+                            || epoch_poisoned.load(Ordering::Acquire)
+                        {
+                            inner.sink.rollback_epoch(epoch).await
+                        } else {
+                            tracing::debug!(
+                                sink = %inner.name, epoch,
+                                "coordination rollback — keeping pending sink \
+                                 output for the next epoch's commit"
+                            );
+                            Ok(())
+                        };
                         if let Err(ref e) = result {
                             tracing::warn!(
                                 sink = %inner.name, epoch, error = %e,
@@ -575,6 +622,129 @@ mod tests {
         handle1.close().await;
 
         assert_eq!(writes.load(Ordering::Relaxed), 2);
+    }
+
+    /// Records `rollback_epoch` calls; `preserves` controls the
+    /// abandon capability, `fail_writes` poisons the epoch.
+    struct RollbackProbeSink {
+        rollbacks: Arc<AtomicU64>,
+        preserves: bool,
+        fail_writes: bool,
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    impl RollbackProbeSink {
+        fn new(preserves: bool, fail_writes: bool) -> (Self, Arc<AtomicU64>) {
+            let rollbacks = Arc::new(AtomicU64::new(0));
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+            (
+                Self {
+                    rollbacks: Arc::clone(&rollbacks),
+                    preserves,
+                    fail_writes,
+                    schema,
+                },
+                rollbacks,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for RollbackProbeSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            if self.fail_writes {
+                Err(ConnectorError::WriteError("synthetic".into()))
+            } else {
+                Ok(WriteResult {
+                    records_written: 1,
+                    bytes_written: 0,
+                })
+            }
+        }
+
+        async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+            self.rollbacks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+            let caps = laminar_connectors::connector::SinkConnectorCapabilities::new(
+                Duration::from_secs(5),
+            );
+            if self.preserves {
+                caps.with_preserves_pending_on_abandon()
+            } else {
+                caps
+            }
+        }
+    }
+
+    /// The abandon/rollback decision matrix: a healthy sink that
+    /// declares `preserves_pending_on_abandon` keeps its pending output
+    /// (no connector rollback); without the capability — or once the
+    /// epoch is poisoned — the connector rolls back. Forced rollback
+    /// (restart/recovery) always rolls back.
+    #[tokio::test]
+    async fn abandon_rollback_decision_matrix() {
+        // Preserving + healthy → abandon keeps pending output.
+        let (sink, rollbacks) = RollbackProbeSink::new(true, false);
+        let (handle, _ev) = spawn_with_defaults("p", Box::new(sink), Duration::from_secs(5));
+        handle.abandon_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            0,
+            "preserving sink kept output"
+        );
+        // …but a forced rollback still rolls back.
+        handle.rollback_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            1,
+            "forced rollback is unconditional"
+        );
+        handle.close().await;
+
+        // Non-preserving + healthy → abandon rolls back.
+        let (sink, rollbacks) = RollbackProbeSink::new(false, false);
+        let (handle, _ev) = spawn_with_defaults("np", Box::new(sink), Duration::from_secs(5));
+        handle.abandon_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            1,
+            "non-preserving sink rolled back"
+        );
+        handle.close().await;
+
+        // Preserving + poisoned epoch → abandon rolls back anyway.
+        let (sink, rollbacks) = RollbackProbeSink::new(true, true);
+        let (handle, _ev) = spawn_with_defaults("poison", Box::new(sink), Duration::from_secs(5));
+        handle.write_batch(test_batch()).await.unwrap();
+        handle.sync().await.unwrap(); // write error lands → epoch poisoned
+        handle.abandon_epoch(1).await.unwrap();
+        assert_eq!(
+            rollbacks.load(Ordering::Relaxed),
+            1,
+            "poisoned epoch forces a real rollback even on a preserving sink",
+        );
+        handle.close().await;
     }
 
     /// Sink whose `write_batch` sleeps longer than the configured timeout.

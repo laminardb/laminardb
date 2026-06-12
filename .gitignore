@@ -77,3 +77,6 @@ agent_handoff.json
 agent_rules.md
 .subtask3-report.md
 /target_new
+
+# Machine-local cargo config (linker overrides etc.)
+/.cargo/config.toml

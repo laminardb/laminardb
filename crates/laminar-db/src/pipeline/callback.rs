@@ -116,9 +116,13 @@ pub trait PipelineCallback: Send + 'static {
     ) -> Option<u64>;
 
     /// Called when all sources have aligned on a barrier.
+    /// `checkpoint_id` identifies the barrier round the offsets were
+    /// captured under — implementations must not attribute them to a
+    /// different (e.g. newer, post-abandonment) announcement.
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        checkpoint_id: u64,
     ) -> BarrierOutcome;
 
     /// Record cycle metrics.

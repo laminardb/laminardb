@@ -19,7 +19,7 @@
 //!                            Sinks
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -125,9 +125,18 @@ pub struct StreamingCoordinator {
     control_rx: ControlMsgRx,
     checkpoint_complete_rx:
         Option<crossfire::AsyncRx<crossfire::mpsc::Array<CheckpointCompletion>>>,
-    /// True while a background checkpoint persists; gates `maybe_checkpoint` to
-    /// one in-flight checkpoint at a time. Shared with the callback.
-    checkpoint_in_flight: Arc<AtomicBool>,
+    /// Epochs between admission and restorable (durable tails still
+    /// running). Shared with the callback; gated against
+    /// `max_in_flight_epochs`.
+    checkpoint_in_flight: Arc<AtomicU64>,
+    /// Barrier admission cap on `checkpoint_in_flight`. Exactly-once
+    /// pipelines are wired with 1.
+    max_in_flight_epochs: u64,
+    /// Captured-state bytes held by in-flight epochs (shared with the
+    /// callback).
+    staged_bytes: Arc<AtomicU64>,
+    /// Barrier admission cap on `staged_bytes`.
+    max_staged_bytes: u64,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -164,6 +173,21 @@ impl PendingBarrier {
 
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Throttled (~once/10s) WARN while barrier admission is paused at the
+/// staged-state cap — this check runs every coordinator tick, so an
+/// unthrottled warn would spam under a sustained upload backlog.
+fn warn_staged_cap_throttled(staged_bytes: u64, cap: u64) {
+    static THROTTLE: crate::log_throttle::LogThrottle =
+        crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
+    if THROTTLE.allow() {
+        tracing::warn!(
+            staged_bytes,
+            cap,
+            "checkpoint admission paused: staged-state cap reached"
+        );
+    }
+}
 
 /// What woke a source task's select loop.
 enum SourceWake {
@@ -440,14 +464,27 @@ impl StreamingCoordinator {
             committed_offsets,
             control_rx,
             checkpoint_complete_rx: None,
-            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
         })
     }
 
-    /// Share the callback's in-flight checkpoint flag so the coordinator holds
-    /// off a new checkpoint while a background persist is still running.
-    pub(crate) fn with_checkpoint_in_flight(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.checkpoint_in_flight = flag;
+    /// Share the callback's admission state so the coordinator admits a
+    /// new barrier only while in-flight epochs and staged bytes are
+    /// under their caps.
+    pub(crate) fn with_checkpoint_admission(
+        mut self,
+        in_flight: Arc<AtomicU64>,
+        max_in_flight_epochs: u64,
+        staged_bytes: Arc<AtomicU64>,
+        max_staged_bytes: u64,
+    ) -> Self {
+        self.checkpoint_in_flight = in_flight;
+        self.max_in_flight_epochs = max_in_flight_epochs.max(1);
+        self.staged_bytes = staged_bytes;
+        self.max_staged_bytes = max_staged_bytes;
         self
     }
 
@@ -913,7 +950,10 @@ impl StreamingCoordinator {
             // offsets, ack tokens) advances only with the durable manifest.
             let fan_out = checkpoints.clone();
             let checkpoint_id = self.pending_barrier.checkpoint_id;
-            match callback.checkpoint_with_barrier(checkpoints).await {
+            match callback
+                .checkpoint_with_barrier(checkpoints, checkpoint_id)
+                .await
+            {
                 BarrierOutcome::Committed(epoch) => {
                     self.broadcast_epoch_committed(epoch, &fan_out);
                     // Wire barrier = durable epoch.
@@ -947,8 +987,17 @@ impl StreamingCoordinator {
         if self.pending_barrier.active {
             return; // Already tracking a barrier.
         }
-        if self.checkpoint_in_flight.load(Ordering::Acquire) {
-            return; // A background checkpoint persist is still running.
+        if self.checkpoint_in_flight.load(Ordering::Acquire) >= self.max_in_flight_epochs {
+            return; // The in-flight epoch backlog is at its cap.
+        }
+        if self.staged_bytes.load(Ordering::Acquire) >= self.max_staged_bytes {
+            // Cadence degrades to upload speed rather than buffering
+            // unbounded captured state.
+            warn_staged_cap_throttled(
+                self.staged_bytes.load(Ordering::Acquire),
+                self.max_staged_bytes,
+            );
+            return;
         }
 
         // Always give the callback a chance to run cluster-follower
@@ -1086,6 +1135,7 @@ mod tests {
         async fn checkpoint_with_barrier(
             &mut self,
             _source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+            _checkpoint_id: u64,
         ) -> BarrierOutcome {
             BarrierOutcome::Committed(1)
         }
@@ -1136,7 +1186,10 @@ mod tests {
             pending_offsets: vec![None],
             control_rx,
             checkpoint_complete_rx: None,
-            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
         };
 
         let callback = MockCallback::new();
@@ -1208,7 +1261,10 @@ mod tests {
             pending_offsets: vec![None],
             control_rx,
             checkpoint_complete_rx: None,
-            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
         };
 
         let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1282,7 +1338,10 @@ mod tests {
             pending_offsets: vec![None, None],
             control_rx: control_rx2,
             checkpoint_complete_rx: None,
-            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
         };
 
         let mut callback = MockCallback::new();
@@ -1486,8 +1545,9 @@ mod tests {
         async fn checkpoint_with_barrier(
             &mut self,
             cp: FxHashMap<String, SourceCheckpoint>,
+            checkpoint_id: u64,
         ) -> BarrierOutcome {
-            self.inner.checkpoint_with_barrier(cp).await
+            self.inner.checkpoint_with_barrier(cp, checkpoint_id).await
         }
         fn record_cycle(&self, e: u64, b: u64, ns: u64) {
             self.inner.record_cycle(e, b, ns);
@@ -1547,7 +1607,10 @@ mod tests {
             pending_offsets: vec![None],
             control_rx,
             checkpoint_complete_rx: None,
-            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));

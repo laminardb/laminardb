@@ -34,6 +34,14 @@ pub struct ClusterController {
     draining: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
+    /// Peers that recently failed a capture quorum (no ack within the
+    /// timeout), keyed by node id. Gossip failure detection can lag a
+    /// hard kill by tens of seconds; this is the leader's faster local
+    /// signal, consulted by the checkpoint durability gate to fail
+    /// doomed epochs instead of burning their full timeout. Entries
+    /// clear when the peer acks again, and expire after
+    /// [`UNRESPONSIVE_TTL`].
+    unresponsive: Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, std::time::Instant>>>,
     /// This node's own failure-domain locality (peers carry theirs in
     /// `members_rx`; self is only known by id). Set once at startup.
     self_locality: parking_lot::RwLock<Locality>,
@@ -74,6 +82,7 @@ impl ClusterController {
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             self_locality: parking_lot::RwLock::new(Locality::default()),
             #[cfg(feature = "cluster")]
             query_handler: Arc::new(parking_lot::RwLock::new(None)),
@@ -186,6 +195,34 @@ impl ClusterController {
         ids
     }
 
+    /// Record peers that failed to ack a capture quorum in time.
+    pub fn note_unresponsive(&self, peers: &[NodeId]) {
+        let now = std::time::Instant::now();
+        let mut map = self.unresponsive.lock();
+        for p in peers {
+            map.insert(p.0, now);
+        }
+    }
+
+    /// Clear peers that acked (they are demonstrably alive).
+    pub fn note_responsive(&self, peers: &[NodeId]) {
+        let mut map = self.unresponsive.lock();
+        for p in peers {
+            map.remove(&p.0);
+        }
+    }
+
+    /// Whether `peer` failed a capture quorum within the TTL window.
+    #[must_use]
+    pub fn is_recently_unresponsive(&self, peer: NodeId) -> bool {
+        /// How long a quorum miss keeps a peer suspect for the gate.
+        const UNRESPONSIVE_TTL: Duration = Duration::from_secs(60);
+        self.unresponsive
+            .lock()
+            .get(&peer.0)
+            .is_some_and(|at| at.elapsed() < UNRESPONSIVE_TTL)
+    }
+
     /// Mark this node as draining. Idempotent.
     pub fn begin_drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
@@ -292,10 +329,12 @@ impl ClusterController {
 
     /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
-    /// As a side effect, a `Commit` announcement with a populated
-    /// `min_watermark_ms` updates the shared cluster-min-watermark
-    /// atomic so operators on this instance see the cluster-wide
-    /// minimum without a separate polling path.
+    /// As a side effect, an `Aligned` or `Commit` announcement with a
+    /// populated `min_watermark_ms` updates the shared
+    /// cluster-min-watermark atomic so operators on this instance see
+    /// the cluster-wide minimum without a separate polling path
+    /// (`Aligned` carries it so a resuming pipeline sees fresh
+    /// event-time progress before the upload-gated `Commit`).
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::observe`] errors.
@@ -305,7 +344,7 @@ impl ClusterController {
         };
         let observed = self.barrier.observe(leader).await?;
         if let Some(ref ann) = observed {
-            if ann.phase == Phase::Commit {
+            if matches!(ann.phase, Phase::Commit | Phase::Aligned) {
                 if let Some(wm) = ann.min_watermark_ms {
                     // Monotonic publish — never lower the watermark,
                     // even if a stale announcement re-gossips.
@@ -333,6 +372,61 @@ impl ClusterController {
     /// Propagates [`BarrierCoordinator::ack`] errors.
     pub async fn ack_barrier(&self, ack: &BarrierAck) -> Result<(), String> {
         self.barrier.ack(ack).await
+    }
+
+    /// Wait until [`Self::observe_barrier`] yields an announcement
+    /// matching `pred`, or `timeout` expires (→ `None`). Push-driven
+    /// off the gRPC announcement watch when available; gossip-KV-only
+    /// deployments (and KV-only announcements) are covered by a
+    /// fallback poll — 250ms with the watch, 25ms without.
+    #[cfg(feature = "cluster")]
+    pub async fn wait_for_barrier<F>(
+        &self,
+        mut pred: F,
+        timeout: Duration,
+    ) -> Option<BarrierAnnouncement>
+    where
+        F: FnMut(&BarrierAnnouncement) -> bool,
+    {
+        let mut watch = self.barrier.announcement_watch();
+        // Recomputed per iteration: when the watch sender drops
+        // mid-wait, the fallback must tighten to the no-watch cadence.
+        let poll_for = |watch: &Option<_>| {
+            if watch.is_some() {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(25)
+            }
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(Some(ann)) = self.observe_barrier().await {
+                if pred(&ann) {
+                    return Some(ann);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            let poll = poll_for(&watch);
+            let pushed = async {
+                match watch.as_mut() {
+                    Some(w) => w.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                ok = pushed => {
+                    if !ok {
+                        // Sender gone (server shutdown) — degrade to
+                        // polling instead of spinning on the error.
+                        watch = None;
+                    }
+                }
+                () = tokio::time::sleep(poll) => {}
+                () = tokio::time::sleep_until(deadline) => return None,
+            }
+        }
     }
 
     /// Leader-side: poll until quorum or `deadline`.

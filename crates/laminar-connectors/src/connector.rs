@@ -208,6 +208,15 @@ pub struct SinkConnectorCapabilities {
     /// Whether the sink supports partitioned writes.
     pub partitioned: bool,
 
+    /// Whether output pending in an abandoned epoch survives into the
+    /// next epoch's commit WITHOUT a connector rollback (e.g. a Kafka
+    /// transactional producer's single open transaction). When set, a
+    /// live coordination failure skips the connector rollback so the
+    /// pending rows are not discarded — sources only rewind on
+    /// restart, never on a live abort. When unset, live failures roll
+    /// the connector back.
+    pub preserves_pending_on_abandon: bool,
+
     /// Default per-call `write_batch` I/O timeout. Users can override via
     /// the `sink.write.timeout.ms` connector property.
     pub suggested_write_timeout: std::time::Duration,
@@ -226,8 +235,17 @@ impl SinkConnectorCapabilities {
             two_phase_commit: false,
             schema_evolution: false,
             partitioned: false,
+            preserves_pending_on_abandon: false,
             suggested_write_timeout,
         }
+    }
+
+    /// Declare that pending output survives an abandoned epoch into the
+    /// next commit without a rollback (see the field docs).
+    #[must_use]
+    pub fn with_preserves_pending_on_abandon(mut self) -> Self {
+        self.preserves_pending_on_abandon = true;
+        self
     }
 
     /// Enable exactly-once semantics (requires epoch + 2PC impl).

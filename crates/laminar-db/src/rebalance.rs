@@ -40,8 +40,12 @@ impl Default for RebalanceConfig {
         Self {
             watcher_poll: Duration::from_secs(2),
             rebalance_debounce: Duration::from_secs(5),
-            checkpoint_timeout: Duration::from_secs(60),
-            retry_delay: Duration::from_secs(10),
+            // A healthy pre-rotation drain commits in well under a
+            // second; a long budget only delays recovery when a node
+            // dies mid-drain (the drain then cannot succeed and the
+            // rotation is what restores commit availability).
+            checkpoint_timeout: Duration::from_secs(15),
+            retry_delay: Duration::from_secs(2),
             placement_isolation_tier: 0,
         }
     }
@@ -190,9 +194,13 @@ pub fn spawn_rebalance_controller(
                 biased;
                 () = shutdown.notified() => return,
                 res = members.changed() => {
-                    if res.is_err() { return; }
+                    if res.is_err() {
+                        warn!("membership watch sender dropped; rebalance controller exiting");
+                        return;
+                    }
                 }
             }
+            debug!("membership change observed; debouncing");
 
             // Debounce: absorb further churn before acting.
             loop {
@@ -215,6 +223,7 @@ pub fn spawn_rebalance_controller(
             // leave the cluster on a stale assignment.
             loop {
                 if !controller.is_leader() {
+                    debug!("membership changed; not the leader — skipping rotation check");
                     break;
                 }
                 // Use assignable (Active, non-draining) instances so
@@ -309,20 +318,52 @@ async fn try_rebalance(
     }
 
     // Drain in-flight shuffle rows into durable state at the old
-    // fence version before rotating.
-    let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
-        .await
-        .map_err(|_| {
-            format!(
-                "pre-rotation checkpoint did not complete within {}s",
-                config.checkpoint_timeout.as_secs()
-            )
-        })?
-        .map_err(|e| e.to_string())?;
-    if !ckpt.success {
-        return Err(ckpt
-            .error
-            .unwrap_or_else(|| "checkpoint returned success=false".into()));
+    // fence version before rotating. When the rotation sheds a DEAD
+    // node, skip the drain entirely: its durability gate needs captures
+    // from a node that will never provide them, so it can only burn its
+    // full timeout and abort — deadlocking rotation against the gate
+    // when rotation is the only thing that restores commit
+    // availability. The dead node's in-flight rows are unrecoverable
+    // regardless; survivors rehydrate its vnodes from the last
+    // committed epoch — the same at-least-once duplication window every
+    // ungraceful failover already has.
+    //
+    // "Dead" must be judged from MEMBERSHIP, not the assignable set:
+    // a Draining node is excluded from assignment but is alive and can
+    // checkpoint — its graceful handoff depends on this drain sealing
+    // its in-flight rows before the rotation takes its vnodes.
+    let shedding_dead = {
+        use laminar_core::cluster::discovery::NodeState;
+        let owners = current.to_vnode_vec(registry.vnode_count());
+        let members = controller.members_watch().borrow().clone();
+        owners.iter().filter(|o| !live.contains(o)).any(|&o| {
+            let dead_in_membership = match members.iter().find(|m| m.id.0 == o.0) {
+                Some(node) => matches!(node.state, NodeState::Suspected | NodeState::Left),
+                None => true,
+            };
+            dead_in_membership || controller.is_recently_unresponsive(o)
+        })
+    };
+    if shedding_dead {
+        warn!(
+            "rotation sheds a dead node — skipping the pre-rotation drain \
+             checkpoint (it cannot seal without the dead node's captures)"
+        );
+    } else {
+        let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
+            .await
+            .map_err(|_| {
+                format!(
+                    "pre-rotation checkpoint did not complete within {}s",
+                    config.checkpoint_timeout.as_secs()
+                )
+            })?
+            .map_err(|e| e.to_string())?;
+        if !ckpt.success {
+            return Err(ckpt
+                .error
+                .unwrap_or_else(|| "checkpoint returned success=false".into()));
+        }
     }
 
     let proposal = current.next(new_vnodes);

@@ -14,6 +14,13 @@ pub struct StreamCheckpointConfig {
     /// Barrier-alignment timeout in milliseconds at fan-in operators.
     /// `None` = default (`30_000`).
     pub alignment_timeout_ms: Option<u64>,
+    /// Max epochs admitted between capture and restorable (the upload
+    /// backlog). `None` = default (4). Exactly-once pipelines are
+    /// capped at 1 regardless.
+    pub max_in_flight_epochs: Option<u64>,
+    /// Cap on captured-state bytes held by in-flight epochs; admission
+    /// pauses at the cap. `None` = default (512 MiB).
+    pub max_staged_bytes: Option<u64>,
 }
 
 /// Errors from checkpoint operations.

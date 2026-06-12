@@ -1939,7 +1939,7 @@ impl OperatorGraph {
         use laminar_core::cluster::control::Phase;
         use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
 
-        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
@@ -2061,6 +2061,22 @@ impl OperatorGraph {
                             if ann.checkpoint_id == checkpoint_id && ann.phase == Phase::Abort {
                                 return Err(DbError::Pipeline(format!(
                                     "checkpoint {checkpoint_id} was aborted by leader"
+                                )));
+                            }
+                            // Observation is latest-wins, so this checkpoint's
+                            // Abort can be superseded before we ever see it. A
+                            // NEWER announcement is just as conclusive: ids are
+                            // never reused (failed epochs are abandoned), and
+                            // the leader only moves on once this checkpoint is
+                            // aligned cluster-wide or dead — either way the
+                            // peer barriers we are waiting for will never
+                            // arrive. Without this release, a rejoining node
+                            // livelocks one epoch behind the cluster, timing
+                            // out every alignment.
+                            if ann.checkpoint_id > checkpoint_id {
+                                return Err(DbError::Pipeline(format!(
+                                    "checkpoint {checkpoint_id} superseded by {} — alignment abandoned",
+                                    ann.checkpoint_id
                                 )));
                             }
                         }

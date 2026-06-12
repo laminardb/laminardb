@@ -39,6 +39,7 @@ pub mod config;
 
 /// Core connector traits (`SourceConnector`, `SinkConnector`).
 pub mod connector;
+pub mod generator;
 
 /// Connector checkpoint types.
 pub mod checkpoint;

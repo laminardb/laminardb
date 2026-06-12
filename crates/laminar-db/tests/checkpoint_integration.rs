@@ -194,6 +194,7 @@ mod exactly_once {
         async fn checkpoint_with_barrier(
             &mut self,
             source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+            _checkpoint_id: u64,
         ) -> laminar_db::pipeline::BarrierOutcome {
             let epoch = self.barrier_checkpoints.len() as u64 + 1;
             self.barrier_checkpoints.push(source_checkpoints);
