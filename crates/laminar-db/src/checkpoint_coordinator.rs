@@ -1424,10 +1424,8 @@ impl CheckpointCoordinator {
             let handle = sink.handle.clone();
             let name = sink.name.clone();
             async move {
-                // Live abandon, not a hard rollback: a healthy sink
-                // keeps its pending transactional output for the next
-                // epoch's commit — sources don't rewind on a live
-                // abort, so discarding it would lose the rows.
+                // Live abandon, not a hard rollback — a healthy sink
+                // keeps its pending output (see `SinkCommand::RollbackEpoch`).
                 // Restart-time rollback (recovery manager) stays hard.
                 let result = handle.abandon_epoch(epoch).await;
                 (name, result)
@@ -1804,11 +1802,8 @@ impl CheckpointCoordinator {
             false
         };
         // Commit and rollback both close the sinks' open transaction;
-        // open the next epoch's so subsequent writes are transactional.
-        // The leader does this inside `checkpoint_inner`/`fail_epoch`;
-        // without the follower mirror, the first commit left
-        // exactly-once sinks transaction-less and every later write
-        // failed (found by the kill -9 exactly-once soak).
+        // open the next epoch's so subsequent writes are transactional
+        // (the leader's mirror lives in `checkpoint_inner`/`fail_epoch`).
         self.begin_next_epoch_bounded().await;
         clean
     }
@@ -4083,10 +4078,8 @@ mod tests {
     }
 
     /// A pre-commit failure abandons the epoch but must NOT hard-roll
-    /// the connector back: sources do not rewind on a live abort, so
-    /// discarding a healthy sink's pending transactional output would
-    /// lose those rows forever (measured as gaps by the exactly-once
-    /// soak). The pending output rides into the next epoch's commit.
+    /// a healthy connector back (see `SinkCommand::RollbackEpoch`):
+    /// the pending output rides into the next epoch's commit.
     #[tokio::test]
     async fn pre_commit_failure_abandons_without_connector_rollback() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -4134,8 +4127,7 @@ mod tests {
         assert_eq!(
             rollback_count.load(std::sync::atomic::Ordering::Relaxed),
             0,
-            "a healthy sink must keep its pending output on a live \
-             abandon — connector rollback would lose unreplayable rows"
+            "a healthy sink must keep its pending output on a live abandon"
         );
     }
 

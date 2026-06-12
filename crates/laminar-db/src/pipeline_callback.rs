@@ -614,10 +614,8 @@ impl ConnectorPipelineCallback {
     /// pre-commit, manifest save, vnode-partial uploads, the
     /// leader-decision wait, and the 2PC commit/rollback. Spawned to a
     /// background task so the pipeline can resume on `Aligned`, or
-    /// awaited inline for exactly-once pipelines (a single
-    /// transactional producer must not receive post-barrier rows while
-    /// the epoch's transaction is still open — resuming early would
-    /// commit them with epoch N and duplicate them on replay).
+    /// awaited inline for exactly-once pipelines (see
+    /// [`Self::exactly_once_sinks`]).
     /// The capture ack is sent before
     /// queuing on the coordinator mutex — an earlier epoch's tail may
     /// hold it for the duration of its uploads, and the leader's quorum
@@ -835,10 +833,7 @@ impl ConnectorPipelineCallback {
         // Durable tail off the pipeline task; resume once every node has
         // captured (Aligned). Completion is reported asynchronously via
         // `checkpoint_complete_tx`, so there is no epoch to return here.
-        // Exactly-once: the tail runs INLINE — the single transactional
-        // producer must not receive post-barrier rows while the epoch's
-        // transaction is open (resuming on Aligned would commit them
-        // with this epoch and duplicate them on replay).
+        // Exactly-once runs the tail inline (see `exactly_once_sinks`).
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
@@ -1815,10 +1810,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             quorum_timeout: self.quorum_timeout,
         };
         if self.exactly_once_sinks {
-            // Inline: the single transactional producer must not see
-            // post-barrier rows while the epoch's transaction is open —
-            // an early resume would commit them with this epoch and
-            // duplicate them on replay. (Producer pooling lifts this.)
+            // Inline — no early resume (see `exactly_once_sinks`).
             Self::run_leader_tail(tail).await;
         } else {
             tokio::spawn(Self::run_leader_tail(tail));

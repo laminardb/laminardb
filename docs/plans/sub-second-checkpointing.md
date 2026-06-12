@@ -250,15 +250,11 @@ Gates closed (2026-06-12):
 3. ~~Exactly-once sink-output diff~~ — per-node exactly-once Kafka
    sinks + read_committed dense-sequence diff
    (`LAMINAR_SOAK_KAFKA_BROKERS`): 7 fault rounds, 143k committed
-   records across 3 topics, zero duplicates, zero gaps. Surfaced and
-   fixed four defects: self-rejecting default timeouts
-   (message.timeout > transaction.timeout), follower never beginning
-   the next transaction after commit/rollback, the depth-1 cap keying
-   off pipeline-level config only (DDL-configured sinks bypassed it),
-   and live coordination aborts discarding pending transactional
-   output that sources never replay (the keep-pending abandon
-   semantics fix). Exactly-once pipelines now run durable tails
-   INLINE — no Aligned early-resume — until producer pooling lands.
+   records across 3 topics, zero duplicates, zero gaps. Surfaced four
+   pre-existing exactly-once defects, fixed in `a0250aad` (the
+   cluster exactly-once path had never run end-to-end before this
+   gate). Exactly-once pipelines now run durable tails INLINE — no
+   Aligned early-resume — until producer pooling lands.
 
 Still open:
 

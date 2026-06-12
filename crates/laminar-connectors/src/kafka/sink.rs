@@ -728,10 +728,10 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            // An already-open transaction is the CONTINUATION case: a
-            // coordination-failed epoch keeps its pending rows (sources
-            // do not rewind on a live abort), and the next epoch's
-            // commit covers them. Aborting here would lose them.
+            // An already-open transaction is the continuation case: an
+            // abandoned epoch keeps its pending rows and the next
+            // epoch's commit covers them. Aborting here would lose them
+            // (a live abort is never replayed).
             if self.transaction_active {
                 debug!(
                     epoch,

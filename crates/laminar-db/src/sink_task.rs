@@ -435,9 +435,8 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                             inner.sink.rollback_epoch(epoch).await
                         } else {
                             // Healthy sink, live coordination failure:
-                            // keep the pending output (see the command's
-                            // docs — the exactly-once soak measured the
-                            // gaps an unconditional abort produced).
+                            // keep the pending output (see the command
+                            // docs above).
                             tracing::debug!(
                                 sink = %inner.name, epoch,
                                 "coordination rollback — keeping pending sink \
