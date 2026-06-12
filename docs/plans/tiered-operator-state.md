@@ -97,6 +97,12 @@ own merits. ADR-005 should get a short amendment recording this v1/v2 split.
 
 ### Phase 0 — Benchmark gate (ADR precondition; no engine changes)
 
+> **Status: harness built 2026-06-12** (`tools/state-tier-bench`, standalone
+> crate with its own lockfile — fjall stays out of the main workspace until
+> the gate passes). Both modes smoke-tested on Windows; **gate numbers still
+> owed from target-class Linux NVMe with a beyond-RAM dataset** — see the
+> tool's README for the exact invocations.
+
 Build a standalone harness (e.g. `tools/state-tier-bench`, not in the default
 workspace build) that exercises fjall with our workload shape:
 
