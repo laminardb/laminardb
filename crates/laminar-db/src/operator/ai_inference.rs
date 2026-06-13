@@ -97,7 +97,7 @@ pub(crate) struct AiInferenceOperator {
     output_column: String,
     params_version: u64,
     cache: Arc<AiResultCache>,
-    submit_tx: mpsc::Sender<WorkItem>,
+    submit_tx: crate::ai_worker::SubmitTx,
     result_rx: mpsc::Receiver<WorkResult>,
     pending: FxHashMap<u64, PendingBatch>,
     /// Work items the worker was too busy to accept; retried next cycle.
@@ -141,7 +141,7 @@ impl AiInferenceOperator {
         };
         let params_version = params_version(&params);
 
-        let (submit_tx, submit_rx) = mpsc::channel(SUBMIT_CAPACITY);
+        let (submit_tx, submit_rx) = crossfire::mpsc::bounded_async(SUBMIT_CAPACITY);
         let (result_tx, result_rx) = mpsc::channel(RESULT_CAPACITY);
 
         let worker_ctx = WorkerContext {
@@ -278,12 +278,12 @@ impl AiInferenceOperator {
     fn flush_unsubmitted(&mut self) {
         while let Some(item) = self.unsubmitted.pop_front() {
             match self.submit_tx.try_send(item) {
-                Err(mpsc::error::TrySendError::Full(item)) => {
+                Err(crossfire::TrySendError::Full(item)) => {
                     self.unsubmitted.push_front(item);
                     break;
                 }
                 // Delivered, or the worker is gone (shutdown) — nothing to retry.
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Ok(()) | Err(crossfire::TrySendError::Disconnected(_)) => {}
             }
         }
     }
@@ -295,9 +295,9 @@ impl AiInferenceOperator {
             return;
         }
         match self.submit_tx.try_send(item) {
-            Err(mpsc::error::TrySendError::Full(item)) => self.unsubmitted.push_back(item),
+            Err(crossfire::TrySendError::Full(item)) => self.unsubmitted.push_back(item),
             // Delivered, or the worker is gone (shutdown) — nothing to queue.
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) | Err(crossfire::TrySendError::Disconnected(_)) => {}
         }
     }
 
