@@ -299,6 +299,40 @@ after demotion.
 
 ### Phase 4 — Promotion (async, never blocking)
 
+> **Status: implemented 2026-06-13** on `feat/state-memory-budget`
+> (`0eb26a33` promotion, `88ad6a13` restart recovery). Promotion mirrors
+> the lookup-enrich decoupling exactly as sketched below: cold-vnode rows
+> defer, a Ring-1 fetch runs off the compute thread, and rows replay after
+> the slice merges via `apply_vnode_state` + `mark_vnode_hot`;
+> `watermark_hold`/`wants_input` were added to the agg operator. Cold
+> detection reuses the cluster shuffle hashing (`row_vnodes`). The operator
+> checkpoint became `AggOpCheckpoint { agg, deferred, cold_vnodes }` —
+> deferred promotion batches are carried across restart, and the manifest
+> blob omits demoted vnodes' groups (listed in `cold_vnodes`).
+>
+> **Restart recovery (the audited precondition, item 1 below): DONE.** A
+> tier operator's demoted vnodes are replayed from their durable partials
+> on restart — `take_tier_cold_vnodes` collects each operator's cold list,
+> `VnodeRehydrator` reads those vnodes (resolving reference partials), and
+> `apply_vnode_slice` applies **only the demoting operator's slice** of each
+> vnode (the partial bundles every operator; the rest already restored from
+> the manifest, so a blanket apply would double-count). Closes the
+> data-loss gap. Open item 2 (single-node capture without cluster shuffle)
+> still stands — tiering rides the cluster path for now.
+>
+> **NOT done — the budget→demote trigger (Phase 3 item 3/4, the enablement).**
+> Demotion machinery, promotion, and recovery are all in place and tested,
+> but nothing wires the budget pressure to actually demote in production:
+> still needed are (a) creating the `StateTierStore` + worker at pipeline
+> build and sharing the sender with both the graph (`set_state_tier`) and
+> the coordinator (`set_state_tier`), (b) a config surface to enable the
+> tier + its directory, (c) the trigger pass (over the demote watermark →
+> `demotion_candidates` → write slices to tier → `graph.demote_vnode` →
+> `coordinator.mark_vnode_demoted`), driven from the callback's maintenance
+> phase, and (d) publishing the restorable epoch the candidates filter on.
+> This is the live-fire step and is paired with the Phase 5 soaks below —
+> do them together.
+
 Copy the lookup-enrich pattern into the agg path:
 
 1. On `process_batch`, partition input rows by vnode (`key_hash % vnode_count`,
