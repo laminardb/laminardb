@@ -186,9 +186,16 @@ impl AggPromotion {
 /// operator can carry them across a restart.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct AggOpCheckpoint {
+    /// In-memory group state — only the resident (hot) vnodes; demoted
+    /// vnodes are listed in `cold_vnodes` and recovered from their durable
+    /// partials on restart.
     agg: Option<AggStateCheckpoint>,
     /// `(ingest watermark, IPC-serialized pre-aggregate batch)`.
     deferred: Vec<(i64, Vec<u8>)>,
+    /// Vnodes demoted to the cold tier at capture time. Their groups are
+    /// absent from `agg`; restart recovery replays each from its vnode
+    /// partial (the tier itself is wiped on restart). Empty without tiering.
+    cold_vnodes: Vec<u32>,
 }
 
 pub(crate) struct SqlQueryOperator {
@@ -216,6 +223,11 @@ pub(crate) struct SqlQueryOperator {
     /// promotion buffer once `lazy_init` builds it.
     #[cfg(feature = "state-tier")]
     pending_deferred: Vec<(i64, RecordBatch)>,
+    /// Vnodes that were demoted at the restored checkpoint; the restart path
+    /// drains this (`take_tier_cold_vnodes`) to know which durable partials
+    /// to replay back into `pending_restore` before `lazy_init`.
+    #[cfg(feature = "state-tier")]
+    pending_cold_rehydrate: Vec<u32>,
 }
 
 impl SqlQueryOperator {
@@ -246,6 +258,8 @@ impl SqlQueryOperator {
             tier_sender: None,
             #[cfg(feature = "state-tier")]
             pending_deferred: Vec::new(),
+            #[cfg(feature = "state-tier")]
+            pending_cold_rehydrate: Vec::new(),
         }
     }
 
@@ -945,10 +959,24 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "state-tier"))]
         let deferred: Vec<(i64, Vec<u8>)> = Vec::new();
 
-        if agg.is_none() && deferred.is_empty() {
+        // Demoted vnodes are absent from `agg` (their groups are not in
+        // memory); list them so restart recovery replays them from partials.
+        #[cfg(feature = "state-tier")]
+        let cold_vnodes: Vec<u32> = match self.state {
+            QueryState::Agg(ref agg_state) => agg_state.cold_vnodes().iter().copied().collect(),
+            _ => Vec::new(),
+        };
+        #[cfg(not(feature = "state-tier"))]
+        let cold_vnodes: Vec<u32> = Vec::new();
+
+        if agg.is_none() && deferred.is_empty() && cold_vnodes.is_empty() {
             return Ok(None);
         }
-        let cp = AggOpCheckpoint { agg, deferred };
+        let cp = AggOpCheckpoint {
+            agg,
+            deferred,
+            cold_vnodes,
+        };
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
             .map(|v| v.to_vec())
             .map_err(|e| {
@@ -990,6 +1018,13 @@ impl GraphOperator for SqlQueryOperator {
                 "dropping checkpointed promotion-deferred batches — \
                  this binary has no state-tier support"
             );
+        }
+
+        // Remember which vnodes were demoted so the restart path can replay
+        // their durable partials into `pending_restore` before `lazy_init`.
+        #[cfg(feature = "state-tier")]
+        if !cp.cold_vnodes.is_empty() {
+            self.pending_cold_rehydrate = cp.cold_vnodes;
         }
 
         let Some(agg_cp) = cp.agg else {
@@ -1117,6 +1152,11 @@ impl GraphOperator for SqlQueryOperator {
         } else {
             self.tier_sender = Some(tier);
         }
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_cold_rehydrate)
     }
 
     #[cfg(feature = "cluster")]
@@ -1408,6 +1448,85 @@ mod promotion_tests {
             final_a,
             Some(5),
             "the restored deferred row replays, not dropped"
+        );
+    }
+
+    /// Simulates a restart: a tier operator demotes every vnode, checkpoints
+    /// (the manifest blob then holds no groups, only the cold-vnode list),
+    /// and a fresh operator restores from it and rehydrates each demoted
+    /// vnode from its saved partial slice — exactly what the restart path
+    /// does with `VnodeRehydrator`. Recovered state must be complete: a new
+    /// row sees the rehydrated prior contribution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_rehydrates_demoted_vnodes_from_partials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
+        );
+        let tier_tx = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::clone(&store),
+            64,
+        );
+        let mut op = build_op(tier_tx.clone()).await;
+
+        op.process(&[vec![events_batch(&["a", "b", "c"], &[1, 2, 3])]], &[10])
+            .await
+            .unwrap();
+
+        // Capture every vnode's slice (the bytes a partial would carry), then
+        // demote every vnode.
+        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
+        let mut saved: FxHashMap<u32, bytes::Bytes> = FxHashMap::default();
+        for (v, slice) in &staged {
+            if let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice {
+                saved.insert(*v, bytes.clone());
+            }
+        }
+        for &v in staged.keys() {
+            assert!(op.demote_vnode(v, VNODES));
+        }
+
+        // The manifest blob now omits the demoted groups but lists them.
+        let manifest = op.checkpoint().unwrap().expect("non-empty manifest");
+        let decoded: AggOpCheckpoint =
+            rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&manifest.data).unwrap();
+        assert!(
+            decoded.agg.as_ref().is_some_and(|a| a.groups.is_empty()),
+            "all vnodes demoted → manifest carries no groups"
+        );
+        let mut cold_listed: Vec<u32> = decoded.cold_vnodes.clone();
+        cold_listed.sort_unstable();
+        let mut cold_expected: Vec<u32> = staged.keys().copied().collect();
+        cold_expected.sort_unstable();
+        assert_eq!(
+            cold_listed, cold_expected,
+            "manifest lists the demoted vnodes"
+        );
+
+        // Fresh operator restores from the manifest, then the restart path
+        // replays each demoted vnode from its partial slice.
+        let mut op2 = build_op(tier_tx).await;
+        op2.restore(manifest).unwrap();
+        let cold = op2.take_tier_cold_vnodes();
+        assert_eq!(cold.len(), cold_expected.len());
+        for v in cold {
+            let slice = saved
+                .get(&v)
+                .expect("a slice was saved for every demoted vnode");
+            op2.apply_vnode_state(v, slice).unwrap();
+        }
+
+        // A new row for 'a' must reflect the rehydrated prior value (1 + 5),
+        // proving the demoted state survived the simulated restart.
+        let out = op2
+            .process(&[vec![events_batch(&["a"], &[5])]], &[30])
+            .await
+            .unwrap();
+        assert_eq!(
+            inserts(&out).get("a"),
+            Some(&6),
+            "rehydrated demoted state: original 1 + new 5"
         );
     }
 }

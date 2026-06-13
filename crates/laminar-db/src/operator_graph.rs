@@ -123,6 +123,15 @@ pub(crate) trait GraphOperator: Send {
         _tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
     ) {
     }
+
+    /// Drain the vnodes this operator had demoted at the restored checkpoint
+    /// (the cold tier is wiped on restart, so they must be replayed from
+    /// their durable partials). Default: none. The restart path applies each
+    /// vnode's slice via [`apply_vnode_state`](Self::apply_vnode_state).
+    #[cfg(feature = "state-tier")]
+    fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -2244,6 +2253,45 @@ impl OperatorGraph {
             .iter_mut()
             .find(|n| !n.removed && &*n.name == operator)
             .is_some_and(|n| n.operator.demote_vnode(vnode, vnode_count))
+    }
+
+    /// After a restart restore, the vnodes each operator had demoted to the
+    /// cold tier — their groups are absent from the manifest blob and must be
+    /// replayed from their durable partials. `(operator_name, cold_vnodes)`.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn take_tier_cold_vnodes(&mut self) -> Vec<(String, Vec<u32>)> {
+        let mut out = Vec::new();
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            let cold = node.operator.take_tier_cold_vnodes();
+            if !cold.is_empty() {
+                out.push((node.name.to_string(), cold));
+            }
+        }
+        out
+    }
+
+    /// Apply one operator's slice of one vnode's partial (restart cold-vnode
+    /// rehydration). Targets a single operator by name so a vnode partial,
+    /// which bundles every operator's slice, doesn't double-apply operators
+    /// already recovered from the manifest.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn apply_vnode_slice(
+        &mut self,
+        operator: &str,
+        vnode: u32,
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        match self
+            .nodes
+            .iter_mut()
+            .find(|n| !n.removed && &*n.name == operator)
+        {
+            Some(node) => node.operator.apply_vnode_state(vnode, bytes),
+            None => Ok(()),
+        }
     }
 
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {

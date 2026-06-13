@@ -110,6 +110,76 @@ impl LaminarDB {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Replay each operator's demoted vnodes from their durable partials on
+    /// restart (the cold tier itself is wiped, and the manifest blob carries
+    /// only resident vnodes). Best-effort: a missing or undecodable partial
+    /// logs and leaves that vnode empty — the same outcome as any lost
+    /// partial. Applies only the demoting operator's slice of each vnode so a
+    /// partial (which bundles every operator) does not double-apply operators
+    /// already recovered from the manifest.
+    #[cfg(feature = "state-tier")]
+    async fn rehydrate_cold_vnodes(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        cold_map: &[(String, Vec<u32>)],
+    ) {
+        let Some(backend) = self.state_backend.lock().clone() else {
+            tracing::warn!(
+                "tier operators report demoted vnodes but no state backend is \
+                 wired — demoted state lost on restart"
+            );
+            return;
+        };
+        let mut all_cold: Vec<u32> = cold_map
+            .iter()
+            .flat_map(|(_, vs)| vs.iter().copied())
+            .collect();
+        all_cold.sort_unstable();
+        all_cold.dedup();
+        let rehy = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+            .rehydrate(&all_cold)
+            .await;
+
+        let (mut applied, mut lost) = (0usize, 0usize);
+        for (op_name, cold_vnodes) in cold_map {
+            for &v in cold_vnodes {
+                let Some(partial_bytes) = rehy.restored.get(&v) else {
+                    tracing::warn!(
+                        operator = %op_name, vnode = v,
+                        "demoted-vnode partial missing on restart — state lost"
+                    );
+                    lost += 1;
+                    continue;
+                };
+                let partial = match crate::vnode_partial::VnodePartial::decode(partial_bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(vnode = v, error = %e, "demoted-vnode partial decode failed");
+                        lost += 1;
+                        continue;
+                    }
+                };
+                // The rehydrator resolves reference partials to their base, so
+                // `operators` is populated; an operator absent from it simply
+                // held no groups in this vnode.
+                if let Some((_, slice)) = partial.operators.iter().find(|(n, _)| n == op_name) {
+                    match graph.apply_vnode_slice(op_name, v, slice) {
+                        Ok(()) => applied += 1,
+                        Err(e) => {
+                            tracing::warn!(operator = %op_name, vnode = v, error = %e, "demoted-vnode apply failed");
+                            lost += 1;
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            applied,
+            lost,
+            "Rehydrated demoted vnodes from durable partials on restart"
+        );
+    }
+
     /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
@@ -1049,6 +1119,21 @@ impl LaminarDB {
                                 "Found old stream_executor checkpoint format; \
                                  skipping restore (clean break). Starting fresh."
                             );
+                        }
+
+                        // Tier-capable operators keep only their resident
+                        // (hot) vnodes in the manifest blob; the cold tier is
+                        // wiped on restart, so replay each demoted vnode from
+                        // its durable partial. Only the demoting operator's
+                        // slice of each vnode is applied — the partial bundles
+                        // every operator, and the others already restored from
+                        // the manifest (double-applying would corrupt them).
+                        #[cfg(feature = "state-tier")]
+                        if !graph_restore_failed {
+                            let cold_map = graph.take_tier_cold_vnodes();
+                            if !cold_map.is_empty() {
+                                self.rehydrate_cold_vnodes(&mut graph, &cold_map).await;
+                            }
                         }
 
                         // Skip MV restore when operator state failed to load —
