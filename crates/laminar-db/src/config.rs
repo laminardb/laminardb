@@ -69,6 +69,11 @@ pub struct LaminarConfig {
     /// pauses source intake (backpressure, not failure) until state drains
     /// below the budget. `None` = unlimited.
     pub state_memory_budget_bytes: Option<usize>,
+    /// Local directory for the disk cold tier. When set together with
+    /// `state_memory_budget_bytes`, operator state approaching the budget is
+    /// demoted here (off-heap) instead of backpressuring. `None` = no tier.
+    /// Requires the `state-tier` build feature; ignored otherwise.
+    pub state_tier_dir: Option<PathBuf>,
 
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
@@ -99,6 +104,7 @@ impl Default for LaminarConfig {
             delivery_guarantee: DeliveryGuarantee::default(),
             max_state_bytes_per_operator: None,
             state_memory_budget_bytes: None,
+            state_tier_dir: None,
             pipeline_channel_capacity: None,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,

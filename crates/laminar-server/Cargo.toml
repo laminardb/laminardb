@@ -193,4 +193,6 @@ cluster = [
     "dep:tokio-util",
     "dep:reqwest",
 ]
+# Disk cold tier for demoted operator state (experimental). Implies cluster.
+state-tier = ["cluster", "laminar-db/state-tier"]
 vendored-openssl = ["dep:openssl"]

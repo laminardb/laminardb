@@ -320,18 +320,32 @@ after demotion.
 > data-loss gap. Open item 2 (single-node capture without cluster shuffle)
 > still stands — tiering rides the cluster path for now.
 >
-> **NOT done — the budget→demote trigger (Phase 3 item 3/4, the enablement).**
-> Demotion machinery, promotion, and recovery are all in place and tested,
-> but nothing wires the budget pressure to actually demote in production:
-> still needed are (a) creating the `StateTierStore` + worker at pipeline
-> build and sharing the sender with both the graph (`set_state_tier`) and
-> the coordinator (`set_state_tier`), (b) a config surface to enable the
-> tier + its directory, (c) the trigger pass (over the demote watermark →
-> `demotion_candidates` → write slices to tier → `graph.demote_vnode` →
-> `coordinator.mark_vnode_demoted`), driven from the callback's maintenance
-> phase, and (d) publishing the restorable epoch the candidates filter on.
-> This is the live-fire step and is paired with the Phase 5 soaks below —
-> do them together.
+> **DONE — the budget→demote trigger (Phase 3 item 3/4, the enablement),
+> 2026-06-13.** The pipeline build opens a `StateTierStore` + worker when
+> `state_tier_dir` is configured AND the per-vnode path is live (cluster
+> shuffle + state backend), sharing one request channel with the graph
+> (promotion), the coordinator (forced-full re-uploads), and the callback
+> (demotion). `maybe_demote_state` runs in the cycle's maintenance phase:
+> over the 80%-of-budget watermark it plans idle candidates
+> (`demotion_candidates`) and drains down to 65%, writing each slice to the
+> tier then dropping it from memory (`graph.demote_vnode`, which refuses if
+> the vnode was touched since its capture → tier write rolled back) and
+> marking it cold per operator (`mark_slice_demoted`). **Load-bearing safety
+> gate: demotion runs only when `checkpoint_in_flight == 0`**, so the latest
+> per-vnode capture is committed and a clean vnode's resident state equals
+> the durable upload bytes handed to the tier (no half-staged newer epoch to
+> disagree with); `restorable_epoch` (tracked from `publish_barrier`) bounds
+> candidates further. Config: `state_tier_dir` (builder + `[server]`, behind
+> the `state-tier` feature). Tested end-to-end (`demotion_pass_sheds_idle_slices`:
+> agg state → checkpoint → pass → slices in tier, dropped from memory,
+> marked cold). The tier wipes on every restart — recovery replays demoted
+> vnodes from durable partials (Phase 4a), so the tier never needs to
+> survive a restart, and `StateTierStore::shutdown`'s clean-reuse path is
+> intentionally unused in the lifecycle.
+>
+> Still owed (Phase 5): the live soaks — kill-9 exactly-once with the tier
+> enabled, and a bounded-RSS run on a high-cardinality workload — plus the
+> formal fjall benchmark gate on Linux NVMe.
 
 Copy the lookup-enrich pattern into the agg path:
 

@@ -526,7 +526,6 @@ impl OperatorGraph {
     /// operator (and, via the stored copy, every operator added later by
     /// DDL). Vnode-sharded aggregates use it for promotion; others ignore it.
     #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // wired in pipeline_lifecycle once the demotion trigger lands
     pub(crate) fn set_state_tier(
         &mut self,
         tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,

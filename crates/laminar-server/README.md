@@ -63,6 +63,11 @@ log_level = "info"
 # drains below the budget; watch `state_bytes` / `state_over_budget` in
 # /metrics. Unset = unlimited.
 # state_memory_budget_bytes = 8589934592
+# Optional disk cold tier (experimental; needs a `state-tier` build). With a
+# memory budget set, idle aggregate state approaching the budget is demoted
+# here (local NVMe) and fetched back on demand instead of backpressuring.
+# Watch `state_tier_bytes` / `state_tier_slices` / `state_tier_demote_total`.
+# state_tier_dir = "/var/lib/laminardb/state-tier"
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.

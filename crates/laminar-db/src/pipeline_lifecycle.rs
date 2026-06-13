@@ -599,6 +599,67 @@ impl LaminarDB {
                 .unwrap_or_else(tokio::runtime::Handle::current),
         );
 
+        // Disk cold tier: when `state_tier_dir` is configured and the
+        // per-vnode capture path is live (cluster shuffle + state backend),
+        // open the tier, spawn its Ring-1 worker, and share the channel with
+        // the graph (promotion) and — below — the coordinator (forced-full
+        // re-uploads) and the callback (demotion trigger). Without the
+        // preconditions a set dir is a loud no-op, never silent data loss.
+        // `set_state_tier` must precede `add_query` so operators built below
+        // pick up the stored sender.
+        #[cfg(feature = "state-tier")]
+        let state_tier_sender: Option<
+            tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
+        > = {
+            match self.config.state_tier_dir.clone() {
+                Some(dir) => {
+                    let has_backend = self.state_backend.lock().is_some();
+                    let has_shuffle = graph.cluster_shuffle_config().is_some();
+                    if has_backend && has_shuffle {
+                        let handle = self
+                            .ai_handle
+                            .clone()
+                            .unwrap_or_else(tokio::runtime::Handle::current);
+                        let metrics = self.engine_metrics.lock().clone();
+                        match crate::state_tier::StateTierStore::open(&dir, metrics) {
+                            Ok(store) => {
+                                // The worker owns the only `Arc`; the store
+                                // lives until the pipeline's senders drop, then
+                                // wipes on the next restart (recovery replays
+                                // demoted vnodes from durable partials, so the
+                                // tier never needs to survive a restart).
+                                let sender =
+                                    crate::state_tier::spawn_worker(&handle, Arc::new(store), 256);
+                                graph.set_state_tier(sender.clone());
+                                tracing::info!(dir = %dir.display(), "state cold tier enabled");
+                                Some(sender)
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, dir = %dir.display(), "failed to open state cold tier — demotion disabled");
+                                None
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            has_backend,
+                            has_shuffle,
+                            "state_tier_dir set but cluster shuffle and/or state \
+                             backend missing — demotion disabled"
+                        );
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        #[cfg(feature = "state-tier")]
+        if let Some(ref sender) = state_tier_sender {
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                coord.set_state_tier(sender.clone());
+            }
+        }
+
         for reg in stream_regs.values() {
             graph.add_query(
                 reg.name.clone(),
@@ -1779,6 +1840,10 @@ impl LaminarDB {
                 .checked_sub(std::time::Duration::from_secs(3600))
                 .unwrap_or_else(std::time::Instant::now),
             state_budget_exceeded: false,
+            #[cfg(feature = "state-tier")]
+            state_tier: state_tier_sender,
+            #[cfg(feature = "state-tier")]
+            restorable_epoch: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

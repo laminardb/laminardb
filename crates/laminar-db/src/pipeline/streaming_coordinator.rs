@@ -684,6 +684,15 @@ impl StreamingCoordinator {
                 self.maybe_checkpoint(&mut callback).await;
             }
 
+            // Step: Cold-tier demotion — shed idle state to disk as it nears
+            // the memory budget. Cheap to skip (the callback gates on a wired
+            // tier, the budget watermark, and no checkpoint in flight), so it
+            // runs whenever there's background headroom.
+            #[allow(clippy::cast_possible_truncation)]
+            if (bg_start.elapsed().as_nanos() as u64) < bg_budget {
+                callback.maybe_demote_state().await;
+            }
+
             // Step: Poll table sources — skip if cycle OR background budget
             // exceeded (lowest priority background work).
             #[allow(clippy::cast_possible_truncation)]

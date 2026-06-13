@@ -149,6 +149,18 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// When a cold tier is wired and operator state approaches the memory
+    /// budget, shed idle vnode slices to disk (demotion) so the budget is
+    /// relieved before intake backpressures. Runs in the cycle's maintenance
+    /// phase (off the hot path); a no-op without a tier or budget.
+    ///
+    /// The default body is a ready future expression (not an `async {}`
+    /// block): `trait_variant` rewrites the signature to return
+    /// `impl Future`, so a default must already be a future.
+    fn maybe_demote_state(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+
     /// Returns `true` when deferred operators have pending input to drain.
     fn has_deferred_input(&self) -> bool {
         false

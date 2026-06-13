@@ -652,10 +652,22 @@ impl CheckpointCoordinator {
     /// after the tier write is confirmed and the operator dropped the
     /// groups). The reference-partial flow then keys off the cold marker.
     #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
+    #[allow(dead_code)] // exercised by tests; the trigger uses the per-op variant
     pub(crate) fn mark_vnode_demoted(&mut self, vnode: u32) {
         if let Some((_, slices)) = self.last_vnode_uploads.get_mut(&vnode) {
             for s in slices.values_mut() {
+                *s = UploadedSlice::Cold;
+            }
+        }
+    }
+
+    /// Release one operator's byte pin for a demoted `(operator, vnode)`
+    /// slice. The trigger demotes per operator (a vnode may carry several),
+    /// so a refusal by one operator doesn't strand the others' records.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn mark_slice_demoted(&mut self, vnode: u32, operator: &str) {
+        if let Some((_, slices)) = self.last_vnode_uploads.get_mut(&vnode) {
+            if let Some(s) = slices.get_mut(operator) {
                 *s = UploadedSlice::Cold;
             }
         }

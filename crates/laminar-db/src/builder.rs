@@ -282,6 +282,16 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Enable the disk cold tier at `dir`. With a memory budget set, operator
+    /// state approaching the budget is demoted here instead of
+    /// backpressuring, and fetched back on demand. Requires the `state-tier`
+    /// build feature; ignored without it.
+    #[must_use]
+    pub fn state_tier_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.state_tier_dir = Some(dir.into());
+        self
+    }
+
     /// Set checkpoint configuration.
     #[must_use]
     pub fn checkpoint(mut self, config: StreamCheckpointConfig) -> Self {
