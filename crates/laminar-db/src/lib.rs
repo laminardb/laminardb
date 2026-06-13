@@ -84,6 +84,9 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
+/// Disk cold tier for demoted operator state.
+#[cfg(feature = "state-tier")]
+mod state_tier;
 /// External `SUBSCRIBE` substrate: per-name broadcast channel and the
 /// per-portal pump task.
 pub mod subscription;
@@ -126,6 +129,8 @@ pub use handle::{
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
     StreamInfo, TypedSubscription, UntypedSourceHandle,
 };
+#[cfg(feature = "state-tier")]
+pub use metrics::TierMetrics;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};

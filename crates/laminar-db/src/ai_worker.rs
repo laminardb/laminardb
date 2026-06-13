@@ -38,6 +38,13 @@ pub(crate) struct WorkItem {
     pub rows: Vec<MissRow>,
 }
 
+/// Submit (request) channel to the worker. Crossfire, like the engine's other
+/// compute-thread/runtime channels (the `MAsyncTx` is `Send + Sync`, so the
+/// operator stores it). The result channel stays tokio mpsc — the operator
+/// stores its *receiver*, which must be `Sync`, and crossfire's is `!Sync`.
+pub(crate) type SubmitTx = crossfire::MAsyncTx<crossfire::mpsc::Array<WorkItem>>;
+pub(crate) type SubmitRx = crossfire::AsyncRx<crossfire::mpsc::Array<WorkItem>>;
+
 /// The worker's reply for one [`WorkItem`].
 pub(crate) struct WorkResult {
     /// Id of the originating pending batch.
@@ -72,10 +79,11 @@ pub(crate) struct WorkerContext {
 /// Drive the worker until the submit channel closes (operator dropped).
 pub(crate) async fn run_worker(
     ctx: WorkerContext,
-    mut submit_rx: mpsc::Receiver<WorkItem>,
+    submit_rx: SubmitRx,
     result_tx: mpsc::Sender<WorkResult>,
 ) {
-    while let Some(item) = submit_rx.recv().await {
+    // `recv` errors once the operator drops its submit sender.
+    while let Ok(item) = submit_rx.recv().await {
         let result = infer_one(&ctx, item).await;
         if result_tx.send(result).await.is_err() {
             break;

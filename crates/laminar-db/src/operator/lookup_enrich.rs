@@ -58,6 +58,14 @@ pub(crate) struct LookupEnrichConfig {
 
 // ── Ring 1 worker ────────────────────────────────────────────────
 
+/// Submit (request) channel to the worker. Crossfire — like the engine's
+/// other compute-thread/runtime channels; the `MAsyncTx` is `Send + Sync` so
+/// the operator stores it in `Resolved`. The result channel stays tokio mpsc
+/// because the operator stores its *receiver* (which must be `Sync`, and
+/// crossfire's `AsyncRx` is `!Sync`).
+type SubmitTx = crossfire::MAsyncTx<crossfire::mpsc::Array<WorkItem>>;
+type SubmitRx = crossfire::AsyncRx<crossfire::mpsc::Array<WorkItem>>;
+
 /// A batch of cache-miss keys submitted to the worker.
 struct WorkItem {
     batch_id: u64,
@@ -78,10 +86,11 @@ struct WorkResult {
 async fn run_worker(
     source: Arc<dyn LookupSourceDyn>,
     projection: Vec<ColumnId>,
-    mut submit_rx: mpsc::Receiver<WorkItem>,
+    submit_rx: SubmitRx,
     result_tx: mpsc::Sender<WorkResult>,
 ) {
-    while let Some(item) = submit_rx.recv().await {
+    // `recv` errors once the operator drops its submit sender.
+    while let Ok(item) = submit_rx.recv().await {
         let key_refs: Vec<&[u8]> = item.keys.iter().map(Vec::as_slice).collect();
         let outputs = match tokio::time::timeout(
             FETCH_TIMEOUT,
@@ -136,7 +145,7 @@ struct Resolved {
     key_checks: Vec<(String, DataType)>,
     lookup_schema: SchemaRef,
     /// `None` = cache-only mode (no source); misses resolve to not-found.
-    submit_tx: Option<mpsc::Sender<WorkItem>>,
+    submit_tx: Option<SubmitTx>,
     result_rx: Option<mpsc::Receiver<WorkResult>>,
     _worker: Option<JoinHandle<()>>,
 }
@@ -285,7 +294,7 @@ impl LookupEnrichOperator {
 
         let (submit_tx, result_rx, worker) = match source {
             Some(src) => {
-                let (submit_tx, submit_rx) = mpsc::channel(SUBMIT_CAPACITY);
+                let (submit_tx, submit_rx) = crossfire::mpsc::bounded_async(SUBMIT_CAPACITY);
                 let (result_tx, result_rx) = mpsc::channel(RESULT_CAPACITY);
                 let handle = self.runtime.spawn(run_worker(
                     Arc::clone(src),
@@ -554,11 +563,11 @@ impl LookupEnrichOperator {
         };
         while let Some(item) = self.unsubmitted.pop_front() {
             match tx.try_send(item) {
-                Err(mpsc::error::TrySendError::Full(item)) => {
+                Err(crossfire::TrySendError::Full(item)) => {
                     self.unsubmitted.push_front(item);
                     break;
                 }
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Ok(()) | Err(crossfire::TrySendError::Disconnected(_)) => {}
             }
         }
     }
@@ -571,7 +580,7 @@ impl LookupEnrichOperator {
             self.unsubmitted.push_back(item);
             return;
         }
-        if let Err(mpsc::error::TrySendError::Full(item)) = tx.try_send(item) {
+        if let Err(crossfire::TrySendError::Full(item)) = tx.try_send(item) {
             self.unsubmitted.push_back(item);
         }
     }
@@ -1246,12 +1255,15 @@ mod tests {
         .await;
 
         // node1 sees every key, keeps its own, ships node2's; pump both until
-        // all keys surface (the worker + loopback are async).
+        // all keys surface (the worker + loopback are async). The budget is
+        // generous (breaks early on delivery): under a fully parallel test
+        // run with CPU-heavy neighbors, 500ms of pumping was not enough on
+        // an 8-core box.
         let customers: Vec<Option<i64>> = all.iter().map(|&k| Some(k)).collect();
         let input = stream_batch(&vec![0; all.len()], &customers);
         let mut a = node1.process(&[vec![input]], &[0]).await.unwrap();
         let mut b = node2.process(&[vec![]], &[0]).await.unwrap();
-        for _ in 0..100 {
+        for _ in 0..600 {
             if a.iter().chain(&b).map(RecordBatch::num_rows).sum::<usize>() >= all.len() {
                 break;
             }

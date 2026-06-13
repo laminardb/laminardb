@@ -375,6 +375,13 @@ impl Connection {
         self.inner.metrics()
     }
 
+    /// Cold-tier demotion/promotion metrics (single-node observability).
+    #[cfg(feature = "state-tier")]
+    #[must_use]
+    pub fn tier_metrics(&self) -> crate::TierMetrics {
+        self.inner.tier_metrics()
+    }
+
     /// Get metrics for a specific source.
     #[must_use]
     pub fn source_metrics(&self, name: &str) -> Option<crate::SourceMetrics> {

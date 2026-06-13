@@ -274,6 +274,24 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Cap total operator state held in memory. Crossing the budget pauses
+    /// source intake (backpressure, not failure) until state drains below it.
+    #[must_use]
+    pub fn state_memory_budget_bytes(mut self, bytes: usize) -> Self {
+        self.config.state_memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Enable the disk cold tier at `dir`. With a memory budget set, operator
+    /// state approaching the budget is demoted here instead of
+    /// backpressuring, and fetched back on demand. Requires the `state-tier`
+    /// build feature; ignored without it.
+    #[must_use]
+    pub fn state_tier_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.state_tier_dir = Some(dir.into());
+        self
+    }
+
     /// Set checkpoint configuration.
     #[must_use]
     pub fn checkpoint(mut self, config: StreamCheckpointConfig) -> Self {
@@ -468,7 +486,9 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
 
-        // State backend and vnode registry must be paired.
+        // State backend and vnode registry must be paired. Single-node (no
+        // controller) tiering uses a single-owner registry — the durability
+        // gate wires the coordinator from it without a controller.
         match (&self.state_backend, &self.vnode_registry) {
             (Some(_), None) => {
                 return Err(DbError::Config(

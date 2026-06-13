@@ -110,6 +110,76 @@ impl LaminarDB {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Replay each operator's demoted vnodes from their durable partials on
+    /// restart (the cold tier itself is wiped, and the manifest blob carries
+    /// only resident vnodes). Best-effort: a missing or undecodable partial
+    /// logs and leaves that vnode empty — the same outcome as any lost
+    /// partial. Applies only the demoting operator's slice of each vnode so a
+    /// partial (which bundles every operator) does not double-apply operators
+    /// already recovered from the manifest.
+    #[cfg(feature = "state-tier")]
+    async fn rehydrate_cold_vnodes(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        cold_map: &[(String, Vec<u32>)],
+    ) {
+        let Some(backend) = self.state_backend.lock().clone() else {
+            tracing::warn!(
+                "tier operators report demoted vnodes but no state backend is \
+                 wired — demoted state lost on restart"
+            );
+            return;
+        };
+        let mut all_cold: Vec<u32> = cold_map
+            .iter()
+            .flat_map(|(_, vs)| vs.iter().copied())
+            .collect();
+        all_cold.sort_unstable();
+        all_cold.dedup();
+        let rehy = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+            .rehydrate(&all_cold)
+            .await;
+
+        let (mut applied, mut lost) = (0usize, 0usize);
+        for (op_name, cold_vnodes) in cold_map {
+            for &v in cold_vnodes {
+                let Some(partial_bytes) = rehy.restored.get(&v) else {
+                    tracing::warn!(
+                        operator = %op_name, vnode = v,
+                        "demoted-vnode partial missing on restart — state lost"
+                    );
+                    lost += 1;
+                    continue;
+                };
+                let partial = match crate::vnode_partial::VnodePartial::decode(partial_bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(vnode = v, error = %e, "demoted-vnode partial decode failed");
+                        lost += 1;
+                        continue;
+                    }
+                };
+                // The rehydrator resolves reference partials to their base, so
+                // `operators` is populated; an operator absent from it simply
+                // held no groups in this vnode.
+                if let Some((_, slice)) = partial.operators.iter().find(|(n, _)| n == op_name) {
+                    match graph.apply_vnode_slice(op_name, v, slice) {
+                        Ok(()) => applied += 1,
+                        Err(e) => {
+                            tracing::warn!(operator = %op_name, vnode = v, error = %e, "demoted-vnode apply failed");
+                            lost += 1;
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            applied,
+            lost,
+            "Rehydrated demoted vnodes from durable partials on restart"
+        );
+    }
+
     /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
@@ -528,6 +598,80 @@ impl LaminarDB {
                 .clone()
                 .unwrap_or_else(tokio::runtime::Handle::current),
         );
+
+        // Disk cold tier: when `state_tier_dir` is configured and the per-vnode
+        // capture path can run (a vnode topology + a durable state backend),
+        // open the tier, spawn its Ring-1 worker, and share the channel with
+        // the graph (promotion) and — below — the coordinator (forced-full
+        // re-uploads) and the callback (demotion trigger). Cluster mode already
+        // installed a vnode count from the shuffle registry; a single node
+        // without a controller takes it from its vnode registry here, so the
+        // tier works without cluster row transport. The backend stays mandatory — it holds
+        // the demoted truth that restart replays. A set dir without a backend is
+        // a loud no-op, never silent data loss. `set_state_tier` must precede
+        // `add_query` so operators built below pick up the stored sender.
+        #[cfg(feature = "state-tier")]
+        let state_tier_sender: Option<crate::state_tier::TierTx> = {
+            match self.config.state_tier_dir.clone() {
+                Some(dir) => {
+                    let has_backend = self.state_backend.lock().is_some();
+                    // Cluster mode set the vnode count from the shuffle registry.
+                    // A single node (no controller/shuffle) takes it from its
+                    // vnode registry directly — the same registry the durability
+                    // gate already wired the coordinator from — so per-vnode
+                    // capture and demotion run without cluster row transport.
+                    if graph.vnode_count().is_none() {
+                        if let Some(registry) = self.vnode_registry.lock().clone() {
+                            graph.set_vnode_count(registry.vnode_count());
+                        }
+                    }
+                    let has_topology = graph.vnode_count().is_some();
+                    if has_backend && has_topology {
+                        let handle = self
+                            .ai_handle
+                            .clone()
+                            .unwrap_or_else(tokio::runtime::Handle::current);
+                        let metrics = self.engine_metrics.lock().clone();
+                        match crate::state_tier::StateTierStore::open(&dir, metrics) {
+                            Ok(store) => {
+                                // The worker owns the only `Arc`; the store
+                                // lives until the pipeline's senders drop, then
+                                // wipes on the next restart (recovery replays
+                                // demoted vnodes from durable partials, so the
+                                // tier never needs to survive a restart).
+                                let sender =
+                                    crate::state_tier::spawn_worker(&handle, Arc::new(store), 256);
+                                graph.set_state_tier(sender.clone());
+                                tracing::info!(dir = %dir.display(), "state cold tier enabled");
+                                Some(sender)
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, dir = %dir.display(), "failed to open state cold tier — demotion disabled");
+                                None
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            has_backend,
+                            has_topology,
+                            "state_tier_dir set but demotion disabled — the tier \
+                             needs a durable [state] backend (holds demoted state \
+                             for restart) and a vnode registry (single-node: a \
+                             single-owner registry)"
+                        );
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        #[cfg(feature = "state-tier")]
+        if let Some(ref sender) = state_tier_sender {
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                coord.set_state_tier(sender.clone());
+            }
+        }
 
         for reg in stream_regs.values() {
             graph.add_query(
@@ -1049,6 +1193,21 @@ impl LaminarDB {
                                 "Found old stream_executor checkpoint format; \
                                  skipping restore (clean break). Starting fresh."
                             );
+                        }
+
+                        // Tier-capable operators keep only their resident
+                        // (hot) vnodes in the manifest blob; the cold tier is
+                        // wiped on restart, so replay each demoted vnode from
+                        // its durable partial. Only the demoting operator's
+                        // slice of each vnode is applied — the partial bundles
+                        // every operator, and the others already restored from
+                        // the manifest (double-applying would corrupt them).
+                        #[cfg(feature = "state-tier")]
+                        if !graph_restore_failed {
+                            let cold_map = graph.take_tier_cold_vnodes();
+                            if !cold_map.is_empty() {
+                                self.rehydrate_cold_vnodes(&mut graph, &cold_map).await;
+                            }
                         }
 
                         // Skip MV restore when operator state failed to load —
@@ -1688,6 +1847,14 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             quorum_timeout: ckpt_quorum_timeout,
             exactly_once_sinks: has_exactly_once_sink,
+            state_memory_budget_bytes: self.config.state_memory_budget_bytes,
+            // Backdated so the first cycle probes immediately.
+            state_budget_probe_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(3600))
+                .unwrap_or_else(std::time::Instant::now),
+            state_budget_exceeded: false,
+            #[cfg(feature = "state-tier")]
+            state_tier: state_tier_sender,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

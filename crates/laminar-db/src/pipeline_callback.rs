@@ -124,7 +124,7 @@ struct LeaderTail {
     >,
     request: crate::checkpoint_coordinator::CheckpointRequest,
     #[allow(clippy::disallowed_types)]
-    vnode_states: std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
     fan_out: FxHashMap<String, SourceCheckpoint>,
     local_watermark_ms: Option<i64>,
     /// `Some` when this node admitted the barrier as cluster leader.
@@ -142,7 +142,7 @@ struct LeaderTail {
 #[allow(clippy::disallowed_types)]
 fn staged_request_bytes(
     request: &crate::checkpoint_coordinator::CheckpointRequest,
-    vnode_states: &std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    vnode_states: &crate::checkpoint_coordinator::StagedVnodeStates,
 ) -> u64 {
     let ops: usize = request
         .operator_states
@@ -152,7 +152,11 @@ fn staged_request_bytes(
     let vnodes: usize = vnode_states
         .values()
         .flat_map(|m| m.values())
-        .map(bytes::Bytes::len)
+        .map(|s| match s {
+            crate::checkpoint_coordinator::StagedSlice::Bytes(b) => b.len(),
+            // Cold slices stage no bytes — they hold tier capacity, not RAM.
+            crate::checkpoint_coordinator::StagedSlice::Cold => 0,
+        })
         .sum();
     (ops + vnodes) as u64
 }
@@ -332,6 +336,150 @@ pub(crate) struct ConnectorPipelineCallback {
     /// would commit them with epoch N and duplicate them on replay.
     /// Producer pooling is the follow-up that lifts this.
     pub(crate) exactly_once_sinks: bool,
+    /// Node-level cap on total operator state bytes; `None` = unlimited.
+    /// See [`PipelineCallback::state_over_budget`].
+    pub(crate) state_memory_budget_bytes: Option<usize>,
+    /// When the budget was last probed (the probe is throttled).
+    pub(crate) state_budget_probe_at: std::time::Instant,
+    /// Verdict of the last probe, served between probes.
+    pub(crate) state_budget_exceeded: bool,
+    /// Cold-tier request channel; demote candidates over the watermark are
+    /// written here before being dropped from memory. `None` = no tier.
+    #[cfg(feature = "state-tier")]
+    pub(crate) state_tier: Option<crate::state_tier::TierTx>,
+}
+
+/// Minimum interval between state-memory-budget probes. Each probe sums
+/// every operator's state estimate and refreshes the state gauges.
+const STATE_BUDGET_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Fraction of the memory budget at which demotion begins shedding idle
+/// vnodes to the cold tier — below the 100% backpressure point so demotion
+/// relieves pressure before intake stalls.
+#[cfg(feature = "state-tier")]
+const STATE_DEMOTE_WATERMARK_NUM: usize = 4;
+#[cfg(feature = "state-tier")]
+const STATE_DEMOTE_WATERMARK_DEN: usize = 5;
+/// Demotion drains down to this fraction of the budget per pass (hysteresis
+/// so it doesn't thrash right at the watermark).
+#[cfg(feature = "state-tier")]
+const STATE_DEMOTE_TARGET_NUM: usize = 13;
+#[cfg(feature = "state-tier")]
+const STATE_DEMOTE_TARGET_DEN: usize = 20;
+/// Cap on vnodes demoted per maintenance pass — bounds the per-pass tier
+/// write volume and keeps the compute thread's maintenance slice short.
+#[cfg(feature = "state-tier")]
+const STATE_DEMOTE_MAX_PER_PASS: usize = 32;
+
+/// Write one demoted slice to the cold tier and wait for confirmation.
+/// `true` = durably written; `false` = the worker is gone or errored (the
+/// caller then leaves the slice resident).
+#[cfg(feature = "state-tier")]
+async fn tier_demote(
+    tier: &crate::state_tier::TierTx,
+    operator: &str,
+    vnode: u32,
+    bytes: bytes::Bytes,
+) -> bool {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let req = crate::state_tier::TierRequest::Demote {
+        operator: Arc::from(operator),
+        vnode,
+        bytes,
+        reply,
+    };
+    if tier.send(req).await.is_err() {
+        return false;
+    }
+    matches!(rx.await, Ok(Ok(())))
+}
+
+/// Roll back a tier write when the operator refused to drop the slice (it was
+/// touched since the last capture, so it stays resident).
+#[cfg(feature = "state-tier")]
+async fn tier_drop(tier: &crate::state_tier::TierTx, operator: &str, vnode: u32) {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let req = crate::state_tier::TierRequest::Drop {
+        operator: Arc::from(operator),
+        vnode,
+        reply,
+    };
+    if tier.send(req).await.is_ok() {
+        let _ = rx.await;
+    }
+}
+
+/// Shed idle vnode slices to the cold tier until projected memory falls below
+/// `target_bytes` (or candidates / the per-pass cap run out). Candidates are
+/// pre-filtered to operators that can demote the vnode now (clean since their
+/// last capture), so a dirty vnode is skipped before any tier I/O. For each
+/// surviving `(operator, vnode)`: persist its durable bytes, then drop the
+/// groups — the drop is still guarded and rolls the write back on the rare
+/// race, but the common dirty case no longer costs a write. Returns the number
+/// of slices demoted.
+///
+/// Caller-side safety contract: invoke only with no checkpoint in flight, so
+/// the bytes recorded for a candidate equal the operator's resident state.
+#[cfg(feature = "state-tier")]
+pub(crate) async fn run_demotion_pass(
+    graph: &mut crate::operator_graph::OperatorGraph,
+    coordinator: &Arc<
+        tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>,
+    >,
+    tier: &crate::state_tier::TierTx,
+    total_bytes: usize,
+    target_bytes: usize,
+) -> u64 {
+    // Plan under the coordinator lock: rank idle candidates and copy their
+    // durable slice bytes. Release the lock before any tier I/O.
+    let plan: Vec<(u32, Vec<(String, bytes::Bytes)>)> = {
+        let guard = coordinator.lock().await;
+        let Some(coord) = guard.as_ref() else {
+            return 0;
+        };
+        let mut plan = Vec::new();
+        let mut freed = 0usize;
+        for (vnode, bytes) in coord.demotion_candidates() {
+            if plan.len() >= STATE_DEMOTE_MAX_PER_PASS
+                || total_bytes.saturating_sub(freed) < target_bytes
+            {
+                break;
+            }
+            // Keep only operators that can demote this vnode *now* (clean since
+            // their last capture). Filtering here, before any tier write, turns
+            // a dirty candidate into a no-op instead of a write-then-rollback.
+            let eligible: Vec<(String, bytes::Bytes)> = coord
+                .slices_for_demotion(vnode)
+                .into_iter()
+                .filter(|(op, _)| graph.can_demote(op, vnode))
+                .collect();
+            if eligible.is_empty() {
+                continue;
+            }
+            freed = freed.saturating_add(bytes);
+            plan.push((vnode, eligible));
+        }
+        plan
+    };
+
+    let mut demoted = 0u64;
+    for (vnode, slices) in plan {
+        for (op, bytes) in &slices {
+            if !tier_demote(tier, op, vnode, bytes.clone()).await {
+                continue;
+            }
+            if graph.demote_vnode(op, vnode) {
+                let mut guard = coordinator.lock().await;
+                if let Some(coord) = guard.as_mut() {
+                    coord.mark_slice_demoted(vnode, op);
+                }
+                demoted += 1;
+            } else {
+                tier_drop(tier, op, vnode).await;
+            }
+        }
+    }
+    demoted
 }
 
 impl ConnectorPipelineCallback {
@@ -1051,9 +1199,7 @@ impl ConnectorPipelineCallback {
     /// empty map — the partial then carries no operator state for that epoch,
     /// exactly as the legacy marker did, so the checkpoint still succeeds.
     #[allow(clippy::unused_self, clippy::disallowed_types)] // matches the coordinator/graph map shape
-    fn capture_vnode_states(
-        &mut self,
-    ) -> std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>> {
+    fn capture_vnode_states(&mut self) -> crate::checkpoint_coordinator::StagedVnodeStates {
         #[cfg(feature = "cluster")]
         {
             match self.graph.snapshot_state_by_vnode() {
@@ -1878,9 +2024,85 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         bp
     }
 
+    fn state_over_budget(&mut self) -> bool {
+        let Some(budget) = self.state_memory_budget_bytes else {
+            return false;
+        };
+        // Probing walks every operator's estimate (each O(1)-ish, but e.g.
+        // the temporal filter still walks its buffer), so throttle it; the
+        // verdict between probes is the cached one.
+        if self.state_budget_probe_at.elapsed() >= STATE_BUDGET_PROBE_INTERVAL {
+            self.state_budget_probe_at = std::time::Instant::now();
+            #[allow(clippy::cast_possible_wrap)]
+            self.prom.state_memory_budget_bytes.set(budget as i64);
+            let mut total = 0usize;
+            for (name, bytes) in self.graph.state_bytes_per_operator() {
+                #[allow(clippy::cast_possible_wrap)]
+                self.prom
+                    .operator_state_bytes
+                    .with_label_values(&[name.as_ref()])
+                    .set(bytes as i64);
+                total = total.saturating_add(bytes);
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            self.prom.state_bytes.set(total as i64);
+            let exceeded = total >= budget;
+            if exceeded != self.state_budget_exceeded {
+                if exceeded {
+                    tracing::warn!(
+                        state_bytes = total,
+                        budget_bytes = budget,
+                        "operator state over memory budget — pausing source intake"
+                    );
+                } else {
+                    tracing::info!(
+                        state_bytes = total,
+                        budget_bytes = budget,
+                        "operator state back under memory budget — resuming source intake"
+                    );
+                }
+            }
+            self.state_budget_exceeded = exceeded;
+            self.prom.state_over_budget.set(i64::from(exceeded));
+        }
+        if self.state_budget_exceeded {
+            self.prom.state_budget_paused_cycles.inc();
+        }
+        self.state_budget_exceeded
+    }
+
     fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
         self.subscription_registry
             .broadcast_barrier(epoch, checkpoint_id);
+    }
+
+    #[cfg(feature = "state-tier")]
+    async fn maybe_demote_state(&mut self) {
+        use std::sync::atomic::Ordering;
+        let Some(tier) = self.state_tier.clone() else {
+            return;
+        };
+        let Some(budget) = self.state_memory_budget_bytes else {
+            return;
+        };
+        // Demote only with no checkpoint in flight: the latest per-vnode
+        // capture is then committed, so a clean vnode's in-memory state
+        // equals the durable upload bytes handed to the tier (no half-staged
+        // newer epoch to disagree with).
+        if self.checkpoint_in_flight.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let total: usize = self.graph.state_bytes_per_operator().map(|(_, b)| b).sum();
+        let watermark = budget / STATE_DEMOTE_WATERMARK_DEN * STATE_DEMOTE_WATERMARK_NUM;
+        if total < watermark {
+            return;
+        }
+        let target = budget / STATE_DEMOTE_TARGET_DEN * STATE_DEMOTE_TARGET_NUM;
+        let coordinator = Arc::clone(&self.coordinator);
+        let demoted = run_demotion_pass(&mut self.graph, &coordinator, &tier, total, target).await;
+        if demoted > 0 {
+            tracing::debug!(demoted, "demoted idle vnode slices to the cold tier");
+        }
     }
 
     fn has_deferred_input(&self) -> bool {
@@ -2407,5 +2629,154 @@ mod tests {
         assert_eq!(tail.committed(), Some(5));
         tail.finish(7, true);
         assert_eq!(tail.committed(), Some(7));
+    }
+}
+
+#[cfg(all(test, feature = "state-tier"))]
+mod demotion_tests {
+    use super::run_demotion_pass;
+    use crate::operator_graph::OperatorGraph;
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_core::state::{NodeId, StateBackend, VnodeRegistry};
+    use laminar_sql::parser::EmitClause;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    const VNODES: u32 = 8;
+
+    fn events_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]))
+    }
+
+    fn events_batch(keys: &[&str], vals: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            events_schema(),
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())),
+                Arc::new(Int64Array::from(vals.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn single_node_shuffle() -> crate::operator::sql_query::ClusterShuffleConfig {
+        let registry = Arc::new(VnodeRegistry::new(VNODES));
+        let assignment: Arc<[NodeId]> = (0..VNODES).map(|_| NodeId(1)).collect::<Vec<_>>().into();
+        registry.set_assignment(assignment);
+        let sender = laminar_core::shuffle::ShuffleSender::new(1);
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        crate::operator::sql_query::ClusterShuffleConfig {
+            registry,
+            sender: Arc::new(sender),
+            receiver,
+            self_id: NodeId(1),
+        }
+    }
+
+    async fn build_agg_graph(tier: crate::state_tier::TierTx) -> OperatorGraph {
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.set_cluster_shuffle(single_node_shuffle().await);
+        graph.set_state_tier(tier);
+        graph.set_runtime_handle(tokio::runtime::Handle::current());
+        graph.register_source_schema("events".to_string(), events_schema());
+        graph.add_query(
+            "out".to_string(),
+            "SELECT key, SUM(val) AS total FROM events GROUP BY key".to_string(),
+            Some(EmitClause::Changes),
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.take_build_errors().unwrap();
+        graph
+    }
+
+    fn graph_state_bytes(graph: &OperatorGraph) -> usize {
+        graph.state_bytes_per_operator().map(|(_, b)| b).sum()
+    }
+
+    /// End-to-end trigger: an agg with resident vnode state, checkpointed so
+    /// the coordinator holds durable upload bytes, is demoted by the pass —
+    /// the slices land in the tier, drop from operator memory, and the
+    /// coordinator marks them cold (no longer candidates).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demotion_pass_sheds_idle_slices() {
+        use crate::checkpoint_coordinator::{
+            CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
+        };
+        use laminar_core::state::InProcessBackend;
+        use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
+        );
+        let tier_tx = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::clone(&store),
+            64,
+        );
+
+        let mut graph = build_agg_graph(tier_tx.clone()).await;
+        let mut src: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
+        src.insert(
+            Arc::from("events"),
+            vec![events_batch(&["a", "b", "c", "d"], &[1, 2, 3, 4])],
+        );
+        graph.execute_cycle(&src, i64::MAX, None).await.unwrap();
+        let before = graph_state_bytes(&graph);
+        assert!(before > 0, "operator should hold group state");
+
+        // Capture per-vnode state and commit it through a coordinator so the
+        // durable upload bytes are recorded.
+        let states = graph.snapshot_state_by_vnode().unwrap();
+        assert!(!states.is_empty(), "agg state should partition by vnode");
+
+        let ckpt_dir = tempfile::tempdir().unwrap();
+        let store_box = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
+        let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store_box)
+            .await
+            .unwrap();
+        coord.set_state_backend(Arc::new(InProcessBackend::new(VNODES)) as Arc<dyn StateBackend>);
+        coord.set_vnode_set((0..VNODES).collect());
+        coord.set_pending_vnode_states(states);
+        let r = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(r.success, "checkpoint must commit: {:?}", r.error);
+        assert!(
+            !coord.demotion_candidates().is_empty(),
+            "committed slices should be demotion candidates"
+        );
+        let coordinator = Arc::new(tokio::sync::Mutex::new(Some(coord)));
+
+        // Drain target 0 → demote every candidate.
+        let demoted = run_demotion_pass(&mut graph, &coordinator, &tier_tx, before, 0).await;
+        assert!(demoted > 0, "the pass should demote at least one slice");
+
+        assert_eq!(
+            graph_state_bytes(&graph),
+            0,
+            "demoted slices leave operator memory"
+        );
+        assert!(
+            store.logical_slices() > 0,
+            "demoted slices are written to the tier"
+        );
+        let guard = coordinator.lock().await;
+        assert!(
+            guard.as_ref().unwrap().demotion_candidates().is_empty(),
+            "demoted slices are marked cold and no longer candidates"
+        );
     }
 }

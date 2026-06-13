@@ -84,6 +84,25 @@ impl LaminarDB {
         }
     }
 
+    /// Cold-tier demotion/promotion metrics — the embedded equivalent of the
+    /// server's `laminardb_state_tier_*` gauges. All zero until the tier is
+    /// active.
+    #[cfg(feature = "state-tier")]
+    #[must_use]
+    pub fn tier_metrics(&self) -> crate::metrics::TierMetrics {
+        let guard = self.engine_metrics.lock();
+        guard
+            .as_ref()
+            .map_or_else(crate::metrics::TierMetrics::default, |m| {
+                crate::metrics::TierMetrics {
+                    demote_total: m.state_tier_demote_total.get(),
+                    fetch_total: m.state_tier_fetch_total.get(),
+                    resident_bytes: m.state_tier_bytes.get(),
+                    resident_slices: m.state_tier_slices.get(),
+                }
+            })
+    }
+
     /// Get metrics for a single source by name.
     #[must_use]
     pub fn source_metrics(&self, name: &str) -> Option<crate::metrics::SourceMetrics> {

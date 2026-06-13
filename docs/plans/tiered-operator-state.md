@@ -1,0 +1,426 @@
+# Tiered Operator State — Implementation Plan
+
+Implements ADR-005 (in-memory hot tier, fjall cold tier, object-store truth).
+Plan written 2026-06-12 against `main` @ `6a397a13` (sub-second checkpointing
+landed, PR #428).
+
+Convention note: **no ADR references in code**. Source, comments, config keys,
+metric names, and log messages describe behavior in their own terms
+(`state tier`, `cold tier`, `memory budget`, `demote`/`promote`). ADR citations
+live only in `docs/`.
+
+---
+
+## 1. Where the codebase actually is (survey results)
+
+| ADR-005 assumption | What landed | Consequence |
+|---|---|---|
+| ADR-003 phases 1–3 (restorable epochs, delta artifacts, staging window) | Landed in PR #428 — but "incremental snapshots" are **vnode-level byte-identity reference partials**, not group-level deltas | See §2 — this changes the safe demotion granularity for v1 |
+| `estimated_state_bytes` hook exists | Yes — `GraphOperator::estimated_state_bytes` (`operator_graph.rs:41`), implemented by agg (`sql_query.rs:713`), joins, lookup-enrich, AI op | Budget precursor builds on it |
+| Budget → backpressure | Only a per-operator **hard-fail** limit exists: `max_state_bytes_per_operator` → `DbError::Pipeline` at 100%, warn at 80% (`operator_graph.rs:1675-1691`) | Precursor must add node-level budget + backpressure instead of error |
+| Async-decoupling pattern reusable | Yes — `LookupEnrichOperator` (`operator/lookup_enrich.rs`): `PendingBatch` slots, bounded `mpsc::channel(256)`, worker on the main runtime handle, `try_recv` drain per cycle, `watermark_hold()` + `wants_input()` backpressure, pending-row checkpoint/replay | Promotion path copies this wholesale |
+| Rebalance hand-off needs no new mechanism | Confirmed — `merge_groups` is additive (`aggregate_state.rs:1376`), `apply_vnode_state` (`sql_query.rs:767`) handles live + pending-restore | Holds for the chosen v1 granularity |
+
+Other load-bearing facts found:
+
+- **Per-epoch capture serializes ALL groups.** Every barrier,
+  `capture_vnode_states` (`pipeline_callback.rs:1054`) →
+  `checkpoint_by_vnode` (`sql_query.rs:740`) →
+  `checkpoint_groups_by_vnode` (`aggregate_state.rs:1308`) rkyv-encodes every
+  group, every vnode. Dedup happens later in the coordinator by byte
+  comparison. At 100 ms cadence this is O(total state) CPU per epoch — an
+  independent scaling ceiling that the v1 design happens to improve (demoted
+  vnodes are no longer serialized each epoch).
+- **The coordinator pins last-upload bytes in RAM.**
+  `last_vnode_uploads: HashMap<vnode, (epoch, HashMap<op, Bytes>)>`
+  (`checkpoint_coordinator.rs:771-829`) retains the full serialized slice per
+  vnode to do the byte-identity comparison. For large state this is a second
+  full copy of state in memory; tiering must remove this pin for cold vnodes.
+- **References are forced back to full before their base leaves the
+  `max_retained` prune window** (`checkpoint_coordinator.rs:742-747`,
+  `max_ref_age` check at `:767,:781`). Any demotion design must be able to
+  produce full bytes on demand for that re-upload.
+- **`estimated_state_bytes` for agg is O(groups) per call**
+  (`aggregate_state.rs:1181-1190` walks every group summing `acc.size()`).
+  Fine as an occasional probe; too expensive to evaluate per cycle as a
+  budget. Needs an incrementally-maintained estimate.
+- **Per-vnode partials are `cluster`-feature code** (`sql_query.rs:740` is
+  `#[cfg(feature = "cluster")]`), and `cluster` is in the server's default
+  feature set. v1 tiering rides the per-vnode path and is therefore gated the
+  same way; non-cluster lib builds simply never tier.
+- The aggregation state shape: `AHashMap<arrow::row::OwnedRow, GroupEntry>`
+  (`aggregate_state.rs:241`), `GroupEntry { accs, last_updated_ms }`
+  (`:316`). `last_updated_ms` already gives an idle signal per group; per-vnode
+  idle is derivable.
+- Restorable-epoch knowledge lives in the checkpoint coordinator / barrier
+  path; nothing currently publishes "epoch N is restorable" toward the
+  operator graph. Small plumbing needed (an atomic/watch is enough).
+
+## 2. The one real design decision: demotion granularity
+
+ADR-005 says "demote clean **groups**" and claims delta epochs are unaffected
+because "demoted groups are clean, so deltas never include them". That
+reasoning assumed group-level delta artifacts. What actually landed is
+different: each epoch re-serializes the **whole vnode slice** from the
+in-memory map and the coordinator emits a reference partial only if the bytes
+are identical to the last full upload.
+
+Under that format, group-granularity demotion is **unsafe as-is**: dropping
+cold groups from the map changes the serialized vnode bytes, so the next full
+upload for that vnode would silently omit the demoted groups — truth (the
+object store) loses state. Making group granularity safe requires group-level
+delta artifacts (base + changed-group chains), which is exactly the "artifact
+format change" the ADR promised to avoid.
+
+Decision for v1: **demote at (operator, vnode)-slice granularity** — the unit
+at which byte-identity already proves cleanliness.
+
+- A slice that the coordinator has been emitting reference partials for is, by
+  construction, byte-identical to a durable full upload at a restorable epoch.
+  That is precisely the ADR's "clean" condition, proven by machinery that
+  already exists.
+- The cold tier stores the exact uploaded bytes, so the forced full re-upload
+  (base aging out of `max_retained`) streams those bytes from fjall on Ring 1
+  without promoting anything.
+- No artifact format change, no recovery-path change, no prune-logic change.
+- Bonus wins: demoted vnodes drop out of the per-epoch O(state) serialization,
+  and their `last_vnode_uploads` byte pin moves to disk.
+
+Cost: granularity is coarse — one hot key keeps its whole vnode slice
+resident. For skewed/idle-heavy workloads (the realistic huge-cardinality
+case) this captures most of the win. True group granularity is deferred to a
+v2 that introduces group-level delta artifacts — which is also the fix for the
+per-epoch O(state) serialization ceiling, so it will likely be wanted on its
+own merits. ADR-005 should get a short amendment recording this v1/v2 split.
+
+## 3. Phases
+
+### Phase 0 — Benchmark gate (ADR precondition; no engine changes)
+
+> **Status: harness built 2026-06-12** (`tools/state-tier-bench`, standalone
+> crate with its own lockfile — fjall stays out of the main workspace until
+> the gate passes). **Formal gate numbers still owed from target-class Linux
+> NVMe** — see the tool's README for the exact invocations.
+>
+> **Dev-box results 2026-06-12** (Windows 11, 31 GB RAM, Crucial P3 Plus 2 TB
+> — consumer DRAM-less QLC; indicative only). Group mode, 300M keys × 240 B
+> (74 GB logical, 2.4× RAM), uniform cold reads from a dedicated thread,
+> fjall 3.1.5 with a 2 GiB block cache unless noted:
+>
+> | sustained writes | p50 | p90 | p99 | p999 | 1ms gate |
+> |---|---|---|---|---|---|
+> | ~88k/s (ingest-saturated, default cache) | 532µs | 1.4ms | 7.7ms | 33ms | FAIL |
+> | ~88k/s (ingest-saturated) | 386µs | 909µs | 6.9ms | 29ms | FAIL |
+> | 10k/s | 307µs | 443µs | 1.43ms | 7.9ms | FAIL (marginal) |
+> | 100/s | 332µs | 428µs | 554µs | 2.0ms | PASS |
+>
+> Slice mode (the v1 demotion unit): 15,360 slices × 4 MiB (60 GB logical),
+> KV separation on, slice rewrites targeted at 10/s, uniform slice fetches:
+>
+> | metric | result |
+> |---|---|
+> | cold slice fetch (4 MiB) | p90 11ms, p99 18.4ms, p999 80ms (p50 4µs cached) |
+> | fetch throughput | 273/s ≈ 1.1 GB/s sustained |
+> | write amplification | **1.57×** (KV separation) |
+> | space amp / CPU | 1.35× / 28% of one core |
+> | achieved rewrite rate | **4/s of the 10/s target** (~17 MB/s logical single-writer blob ingest; bulk load averaged 34 MB/s) |
+>
+> The 1ms gate line doesn't apply to 4 MiB fetches (transfer alone is
+> ms-scale); the relevant comparison is the ~100ms object-store GET this
+> replaces. The slice-ingest throughput ceiling (~17–34 MB/s here) bounds
+> demotion speed (~100 MB of operator state ≈ 3–6 s) — fine for background
+> demotion, but a sizing input for budget-pressure response time.
+>
+> Findings: the cold-read tail is **write-pressure-coupled, not an intrinsic
+> floor** — sub-ms p99 at light write rates, ~7ms at ingest saturation.
+> Sizing the block cache (filters+indexes resident) improves the body of the
+> distribution ~30% but not the tail. Single-keyspace ingest ceiling on this
+> box ≈ 88k upserts/s; write amplification 5.1× at saturation, 6.8–9.2× at
+> low rates (flush/journal floor); compaction CPU bounded (≤123% of one
+> core); space amplification 1.10×. Read for the design: v1's slice-demotion
+> write rates sit near the passing end; sustained group-granularity churn
+> (v2) is the case that pressures the gate. The deciding run must happen on
+> datacenter-class Linux NVMe — this drive is the pessimistic case.
+
+Build a standalone harness (e.g. `tools/state-tier-bench`, not in the default
+workspace build) that exercises fjall with our workload shape:
+
+- Keys: Zipfian-distributed `(operator, vnode, group-key)` byte strings.
+- Values: rkyv-encoded accumulator states, 100 B – 4 KiB.
+- Two access patterns: (a) slice-granularity (one value per (op, vnode), tens
+  of KB – tens of MB, matching v1) and (b) group-granularity point upserts
+  (matching v2) — measure both so the v2 decision is informed now.
+- Measure on target NVMe: cold-read p99 from a non-compute thread under
+  sustained write load (gate: ≤ 1 ms), compaction CPU and whether fjall's
+  background threads can be pinned/limited away from compute cores, write
+  amplification at sustained upsert rates.
+
+Exit: numbers recorded in the ADR (flip to Accepted, or pivot to the named
+hash-log fallback). Also verify here: fjall's sync API behaves from
+`spawn_blocking`, keyspace-per-operator works, point-in-time snapshot/iterator
+semantics, crash-recovery behavior without per-write fsync.
+
+### Phase 1 — State memory budget (independently shippable, ships first)
+
+> **Status: implemented 2026-06-12** on `feat/state-memory-budget`. Notes vs.
+> the plan below: the agg estimate is a generation-counter + min-2s-rewalk
+> cache (not a running counter — fewer mutation-path hooks, same O(1) read);
+> the budget gate reuses the coordinator's existing skip-drain backpressure
+> (intake throttles to one message per cycle so checkpoint barriers keep
+> flowing — a full intake halt would starve them) and additionally skips
+> `tick_idle_watermark()` while paused so a budget-paused source is not
+> idle-demoted (which would late-drop its queued rows on resume). Config:
+> `state_memory_budget_bytes` (builder + `[server]`). Metrics: `state_bytes`,
+> `operator_state_bytes{operator}`, `state_memory_budget_bytes`,
+> `state_over_budget`, `state_budget_paused_cycles_total`.
+
+1. **Cheap state-size accounting.** Make the agg estimate incrementally
+   maintained (running byte counter updated on group insert/remove plus a
+   periodic accumulator resample), so reading it per cycle is O(1). Keep the
+   trait hook signature unchanged.
+2. **Node-level budget.** New config: `DbConfig::state_memory_budget_bytes`
+   (server: `[state] memory_budget_bytes`). The graph sums
+   `estimated_state_bytes` across nodes once per cycle.
+3. **Backpressure, not failure.** Over budget → stop ingesting source input
+   (the graph stops offering new batches; sources pause naturally), hold
+   watermarks at the gate, raise `state_over_budget` gauge + rate-limited
+   error log. Existing per-operator hard limit stays as the kill switch.
+4. **Metrics**: `state_bytes{operator}`, `state_memory_budget_bytes`,
+   `state_over_budget`, time-over-budget counter.
+
+Exit: a workload exceeding budget throttles instead of OOM-killing; metrics
+visible in `/metrics`; soak with a tiny budget shows stable RSS.
+
+### Phase 2 — Cold-tier service (no operator wiring yet)
+
+> **Status: implemented 2026-06-12** on `feat/state-memory-budget`
+> (`1159df64`). Deviation from the sketch below: a **single KV-separated
+> keyspace** keyed `operator \0 vnode_be32` instead of a keyspace per
+> operator — avoids keyspace-name sanitization, gives prefix-scoped
+> operator drop, and KV separation is the right layout for slice blobs
+> (1.57× WA in the bench). Marker persists logical counters so a clean
+> reuse restores gauges without scanning blobs. Worker is single-flight
+> by design (bench: read tails degrade under concurrent write pressure).
+
+New module `crates/laminar-db/src/state_tier/` behind a new `state-tier`
+feature (implies `cluster`); fjall is the only new dependency, major version
+pinned.
+
+- `StateTierStore`: owns the fjall `Keyspace` under
+  `<data_dir>/state-tier/`, one fjall partition per operator. Sync API only,
+  called exclusively from Ring 1 (`spawn_blocking` / worker task).
+- **Lifecycle**: on open, validate a marker file (engine version + clean-flag
+  + per-instance nonce). Missing/mismatched/unclean → wipe directory and start
+  empty (state rehydrates from checkpoints exactly like today's recovery).
+  Clean shutdown writes the marker; runtime operation never fsyncs per write.
+- `StateTierWorker`: Ring-1 task (spawned on the main runtime handle, the
+  `set_runtime_handle` pattern at `operator_graph.rs:355`), bounded mpsc
+  request/response channels, request types: `Demote{key, bytes}`,
+  `Fetch{key}`, `Drop{key}`, `SnapshotRead{...}`.
+- Metrics: tier size bytes, keys, demote/promote counters, fetch latency
+  histogram, wipe events.
+
+Exit: unit tests for lifecycle (clean reuse, unclean wipe, version-mismatch
+wipe), round-trip, concurrent fetch-under-write.
+
+### Phase 3 — Demotion (agg operator + coordinator)
+
+> **Status: substrate implemented 2026-06-12** on `feat/state-memory-budget`
+> (mechanism only — the budget→demote trigger ships with promotion, since a
+> cold vnode receiving rows needs the promotion path first). Design changes
+> vs. the sketch below, all simplifications found during implementation:
+>
+> - **Demotion is coordinator-driven, not operator-serialized**: the
+>   coordinator's `last_vnode_uploads` already retains each slice's exact
+>   uploaded bytes for the reference-partial comparison, so demotion hands
+>   *those* bytes to the tier (truth-identical by construction) and then
+>   swaps the entry to a `Cold` marker — releasing the RAM pin. No
+>   restorable-epoch atomic is needed: candidates carry their base epoch
+>   and the caller (the pipeline callback, which observes epoch
+>   completions) filters against it.
+> - Staged slices are now `StagedSlice::{Bytes, Cold}` end-to-end (operator
+>   → graph → callback → coordinator). `Cold` counts as unchanged in the
+>   reference comparison; a forced full re-upload fetches the bytes back
+>   from the tier, and **a tier miss fails the epoch** rather than writing
+>   a partial that silently drops the slice from recovery truth.
+> - The operator keeps a per-vnode dirty set (re-baselined at each capture)
+>   and `demote_vnode` refuses dirty vnodes, bulk-restored/merged state,
+>   and — load-bearing — **non-changelog aggs**: a full-emit agg rebuilds
+>   its whole result from memory, so dropping groups would shrink query
+>   output (same restriction as idle-TTL eviction).
+>
+> Open items carried to the next phases — **(1) is a hard precondition for
+> the trigger**:
+>
+> 1. **Restart recovery must learn to read vnode partials.** Audited
+>    2026-06-12: plain restart restores operator state from the manifest's
+>    whole-state blob only; per-vnode partials are consulted exclusively by
+>    the cluster rebalance/acquisition path. The manifest blob does not
+>    contain demoted groups, so enabling demotion today would lose them on
+>    any restart. Phase 4 must extend restart recovery for tier-capable
+>    operators to also replay their owned vnodes' partial chains (the
+>    decode + reference-resolution + `apply_vnode_state` machinery already
+>    exists on the acquisition path).
+> 2. Per-vnode capture currently requires the cluster shuffle config —
+>    single-node tiering needs `snapshot_state_by_vnode` to take a vnode
+>    count from the single-owner registry (and accept the capture-cost
+>    regression only when the tier is enabled).
+
+1. **Restorable-epoch visibility.** Coordinator publishes the latest
+   restorable epoch into a shared atomic readable by the pipeline callback /
+   graph (one `Arc<AtomicU64>`, no new channels).
+2. **Cold-slice tracking in the coordinator.** Extend the pending-state
+   contract so a vnode-operator slice can be staged as `Unchanged` (no bytes)
+   instead of full bytes; the coordinator emits the reference partial from its
+   recorded base as it does today. When `max_ref_age` forces a full re-upload
+   of a cold slice, the coordinator requests the bytes from the tier worker
+   (Ring 1, during the existing staging window) instead of from memory.
+   `last_vnode_uploads` keeps `(epoch, hash)` for cold slices — exact bytes
+   live in fjall; full bytes are retained in RAM only for hot slices.
+3. **Demotion trigger.** When the Phase-1 budget crosses a demote watermark
+   (default 80%), the graph asks tier-capable operators for demotion
+   candidates: vnode slices ranked by idle time (max `last_updated_ms` in the
+   slice), eligible only if the coordinator's records show the slice is
+   currently in reference state (byte-identical to a durable upload at a
+   restorable epoch ≤ the published atomic).
+4. **Demotion execution** (two-step, crash-safe in either order because the
+   object store stays truth): Ring 1 writes the slice bytes to fjall →
+   confirms → next cycle the operator drops those groups from the map and
+   marks the vnode cold. New `GraphOperator` default-method hooks:
+   `demotion_candidates()`, `demote_vnode(vnode)`, `cold_vnodes()` — only the
+   agg operator implements them in v1.
+5. **Capture-path change.** `checkpoint_groups_by_vnode` skips cold vnodes;
+   `capture_vnode_states` stages them as `Unchanged`.
+
+Exit: unit tests — demoted slice keeps emitting references; forced full
+re-upload streams from fjall and matches byte-for-byte; recovery from a
+checkpoint taken while slices were cold restores all groups; budget falls
+after demotion.
+
+### Phase 4 — Promotion (async, never blocking)
+
+> **Status: implemented 2026-06-13** on `feat/state-memory-budget`
+> (`0eb26a33` promotion, `88ad6a13` restart recovery). Promotion mirrors
+> the lookup-enrich decoupling exactly as sketched below: cold-vnode rows
+> defer, a Ring-1 fetch runs off the compute thread, and rows replay after
+> the slice merges via `apply_vnode_state` + `mark_vnode_hot`;
+> `watermark_hold`/`wants_input` were added to the agg operator. Cold
+> detection reuses the cluster shuffle hashing (`row_vnodes`). The operator
+> checkpoint became `AggOpCheckpoint { agg, deferred, cold_vnodes }` —
+> deferred promotion batches are carried across restart, and the manifest
+> blob omits demoted vnodes' groups (listed in `cold_vnodes`).
+>
+> **Restart recovery (the audited precondition, item 1 below): DONE.** A
+> tier operator's demoted vnodes are replayed from their durable partials
+> on restart — `take_tier_cold_vnodes` collects each operator's cold list,
+> `VnodeRehydrator` reads those vnodes (resolving reference partials), and
+> `apply_vnode_slice` applies **only the demoting operator's slice** of each
+> vnode (the partial bundles every operator; the rest already restored from
+> the manifest, so a blanket apply would double-count). Closes the
+> data-loss gap. Open item 2 (single-node capture without cluster shuffle)
+> still stands — tiering rides the cluster path for now.
+>
+> **DONE — the budget→demote trigger (Phase 3 item 3/4, the enablement),
+> 2026-06-13.** The pipeline build opens a `StateTierStore` + worker when
+> `state_tier_dir` is configured AND the per-vnode path is live (cluster
+> shuffle + state backend), sharing one request channel with the graph
+> (promotion), the coordinator (forced-full re-uploads), and the callback
+> (demotion). `maybe_demote_state` runs in the cycle's maintenance phase:
+> over the 80%-of-budget watermark it plans idle candidates
+> (`demotion_candidates`) and drains down to 65%, writing each slice to the
+> tier then dropping it from memory (`graph.demote_vnode`, which refuses if
+> the vnode was touched since its capture → tier write rolled back) and
+> marking it cold per operator (`mark_slice_demoted`). **Load-bearing safety
+> gate: demotion runs only when `checkpoint_in_flight == 0`**, so the latest
+> per-vnode capture is committed and a clean vnode's resident state equals
+> the durable upload bytes handed to the tier (no half-staged newer epoch to
+> disagree with); `restorable_epoch` (tracked from `publish_barrier`) bounds
+> candidates further. Config: `state_tier_dir` (builder + `[server]`, behind
+> the `state-tier` feature). Tested end-to-end (`demotion_pass_sheds_idle_slices`:
+> agg state → checkpoint → pass → slices in tier, dropped from memory,
+> marked cold). The tier wipes on every restart — recovery replays demoted
+> vnodes from durable partials (Phase 4a), so the tier never needs to
+> survive a restart, and `StateTierStore::shutdown`'s clean-reuse path is
+> intentionally unused in the lifecycle.
+>
+> Still owed (Phase 5): the live soaks — kill-9 exactly-once with the tier
+> enabled, and a bounded-RSS run on a high-cardinality workload — plus the
+> formal fjall benchmark gate on Linux NVMe.
+
+Copy the lookup-enrich pattern into the agg path:
+
+1. On `process_batch`, partition input rows by vnode (`key_hash % vnode_count`,
+   `state/vnode.rs:302`). Rows hitting cold vnodes go into a `PendingBatch`
+   (slots + `ingest_watermark`); a `Fetch` is submitted for each cold vnode
+   (deduped while in flight).
+2. Worker fetches slice bytes from fjall, returns them; next cycle the
+   operator decodes `AggStateCheckpoint` and `merge_groups` it back in
+   (`aggregate_state.rs:1376` — additive, but the slice was dropped from
+   memory so the merge is into an empty key range; assert no overlap), marks
+   the vnode hot, notifies the coordinator the slice is hot again (bytes
+   retained in RAM resume; fjall entry dropped), and replays deferred rows.
+3. Backpressure identical to lookup-enrich: `watermark_hold()` = min pending
+   ingest watermark; `wants_input()` caps in-flight deferred rows.
+4. Checkpoint while promotion is in flight: serialize pending batches +
+   replay queue with their ingest watermark, exactly as lookup-enrich does
+   (`lookup_enrich.rs:740-779`). A barrier does not wait for promotion.
+5. Promotion storms: cap concurrent in-flight promotions; over cap defers via
+   `wants_input()`.
+
+Exit: unit tests — deferred rows produce identical results to never-demoted
+baseline (golden diff); checkpoint/restore mid-promotion; watermark held while
+rows pending; thrash test (alternating hot/cold access) stays correct.
+
+### Phase 5 — Recovery, rebalance, soaks
+
+- **Unclean restart**: tier wiped, vnode set rehydrates from last restorable
+  epoch via the existing path — verify with the kill -9 exactly-once diff soak
+  extended to run with `state-tier` on and a small budget (forces demotion
+  under load).
+- **Rebalance**: releasing a vnode drops its fjall entries; acquiring one goes
+  through the existing object-store rehydration into memory (it arrives hot,
+  may demote later). Extend `cluster_integration` with a rebalance while
+  slices are cold on the donor.
+- **Bounded-RAM soak**: open-key-space workload (high-cardinality GROUP BY)
+  with state ≫ budget; assert stable RSS, no OOM, correct final answers, and
+  demotion/promotion counters moving.
+- Grafana: panel set for tier size, promotions/sec, fetch p99, over-budget.
+
+### Deferred v2 — group granularity (separate ADR amendment + plan)
+
+Group-level delta artifacts (`VnodePartial` gains a delta form: base epoch +
+changed groups), dirty-group tracking in `AggregateState`, chain-resolving
+recovery and prune, compaction epochs streaming the cold portion from a fjall
+snapshot. Unlocks: per-group demotion (skew-proof), per-epoch capture cost
+O(dirty) instead of O(state). Do not start until v1 telemetry shows vnode
+granularity leaving real memory on the table, and price it against the ADR's
+stated evolution path (point-readable artifacts + cache-over-truth) before
+committing — group-level deltas are a step toward SST-like artifacts anyway.
+
+## 4. Risks / open items
+
+- **fjall behavior under our shape is unproven** — that's what Phase 0 is
+  for; the fallback (purpose-built hash-log) is named in the ADR.
+- **Compaction CPU on a pinned engine**: verify thread-count/affinity control
+  in Phase 0; if fjall can't bound it, that's a gate failure.
+- **Uniform-access workloads don't demote at vnode granularity**: accepted v1
+  limitation; budget backpressure (Phase 1) is the safety net; v2 fixes it.
+- **Coordinator/operator cold-state handshake** (who believes a slice is
+  cold) must be single-writer: the graph cycle drives all transitions;
+  coordinator only reads staged markers. Keep the state machine in one place
+  (operator side) to avoid split-brain between `pending_vnode_states` and the
+  map.
+- **Dirty-set pinning** (ADR negative): a workload touching every vnode every
+  epoch never has clean slices → nothing demotes → backpressure. Surfaced by
+  the over-budget metric; correct by design but worth a docs note.
+- **Windows dev environment**: fjall is pure Rust (no perl/openssl issues),
+  but Phase-0 numbers must come from target-like Linux NVMe, not the dev box.
+
+## 5. Suggested PR slicing
+
+1. PR-1: Phase 1 (budget + accounting + metrics) — no fjall, no feature flag.
+2. PR-2: Phase 0 harness + recorded results + ADR status flip/amendment.
+3. PR-3: Phase 2 tier service (feature-gated, dormant).
+4. PR-4: Phase 3 demotion + coordinator `Unchanged` staging.
+5. PR-5: Phase 4 promotion + correctness tests.
+6. PR-6: Phase 5 soaks/integration + Grafana + docs.
