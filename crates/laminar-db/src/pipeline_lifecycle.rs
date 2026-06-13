@@ -608,9 +608,7 @@ impl LaminarDB {
         // `set_state_tier` must precede `add_query` so operators built below
         // pick up the stored sender.
         #[cfg(feature = "state-tier")]
-        let state_tier_sender: Option<
-            tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-        > = {
+        let state_tier_sender: Option<crate::state_tier::TierTx> = {
             match self.config.state_tier_dir.clone() {
                 Some(dir) => {
                     let has_backend = self.state_backend.lock().is_some();

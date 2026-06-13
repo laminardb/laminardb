@@ -7,14 +7,28 @@
 //! into `spawn_blocking`. Single-flight is deliberate — it serializes tier
 //! I/O the way the demotion/promotion protocol expects, and matches the
 //! dev-box finding that read tails degrade under concurrent write pressure.
+//!
+//! The request channel is `crossfire` (a multi-producer mpsc, like the
+//! engine's other compute-thread/runtime plumbing). The per-request replies
+//! stay `tokio::oneshot`: the promotion operator stores its in-flight reply
+//! receivers in a field, and that operator must be `Sync` (its `process`
+//! future holds `&self` across an await), which crossfire's `!Sync`
+//! `RxOneshot` cannot satisfy — the same reason the lookup-enrich and AI
+//! workers store tokio receivers.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use super::StateTierStore;
 use crate::error::DbError;
+
+/// Multi-producer sender for cold-tier requests — the compute thread
+/// (promotion), the coordinator (forced-full re-uploads), and the pipeline
+/// callback (demotion) all submit through one channel.
+pub(crate) type TierTx = crossfire::MAsyncTx<crossfire::mpsc::Array<TierRequest>>;
+type TierRx = crossfire::AsyncRx<crossfire::mpsc::Array<TierRequest>>;
 
 /// One request to the tier. Every variant carries a reply channel: even
 /// fire-and-forget callers need the completion signal before they may act
@@ -56,14 +70,15 @@ pub(crate) fn spawn_worker(
     runtime: &tokio::runtime::Handle,
     store: Arc<StateTierStore>,
     queue_capacity: usize,
-) -> mpsc::Sender<TierRequest> {
-    let (tx, rx) = mpsc::channel(queue_capacity);
+) -> TierTx {
+    let (tx, rx) = crossfire::mpsc::bounded_async(queue_capacity);
     runtime.spawn(run_worker(store, rx));
     tx
 }
 
-async fn run_worker(store: Arc<StateTierStore>, mut rx: mpsc::Receiver<TierRequest>) {
-    while let Some(req) = rx.recv().await {
+async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
+    // `recv` errors once every sender has dropped (pipeline shutdown).
+    while let Ok(req) = rx.recv().await {
         let store = Arc::clone(&store);
         match req {
             TierRequest::Demote {

@@ -392,7 +392,7 @@ pub struct CheckpointCoordinator {
     /// Cold-tier request channel; lets a forced full re-upload of a
     /// demoted slice fetch its bytes back from the tier.
     #[cfg(feature = "state-tier")]
-    state_tier: Option<tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>>,
+    state_tier: Option<crate::state_tier::TierTx>,
     /// `Some` in cluster mode, `None` in single-instance / embedded.
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -526,10 +526,7 @@ impl CheckpointCoordinator {
     /// demoted slices fetch their bytes through it).
     #[cfg(feature = "state-tier")]
     #[allow(dead_code)] // wired once the demotion trigger lands with promotion
-    pub(crate) fn set_state_tier(
-        &mut self,
-        tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-    ) {
+    pub(crate) fn set_state_tier(&mut self, tier: crate::state_tier::TierTx) {
         self.state_tier = Some(tier);
     }
 

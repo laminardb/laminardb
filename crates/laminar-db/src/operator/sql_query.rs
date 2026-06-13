@@ -28,8 +28,11 @@ use bytes::Bytes;
 use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(feature = "state-tier")]
 use std::collections::VecDeque;
+// Reply receivers are stored across cycles in `AggPromotion.inflight`, so they
+// must be `Sync` (this operator's `process` future holds `&self` across an
+// await); crossfire's `RxOneshot` is `!Sync`, so replies use tokio oneshot.
 #[cfg(feature = "state-tier")]
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 /// Internal state for the query operator (lazy initialization).
 enum QueryState {
@@ -89,7 +92,7 @@ impl std::fmt::Debug for ClusterShuffleConfig {
 #[cfg(feature = "state-tier")]
 struct AggPromotion {
     op_name: Arc<str>,
-    tier: mpsc::Sender<crate::state_tier::TierRequest>,
+    tier: crate::state_tier::TierTx,
     /// Pre-aggregate batches deferred because they touch a cold vnode, each
     /// with the watermark it was first ingested at (replayed at that
     /// watermark, like lookup-enrich, so a late replay is not mis-aged).
@@ -105,7 +108,7 @@ const MAX_DEFERRED_PROMOTION_ROWS: usize = 8192;
 
 #[cfg(feature = "state-tier")]
 impl AggPromotion {
-    fn new(op_name: Arc<str>, tier: mpsc::Sender<crate::state_tier::TierRequest>) -> Self {
+    fn new(op_name: Arc<str>, tier: crate::state_tier::TierTx) -> Self {
         Self {
             op_name,
             tier,
@@ -156,6 +159,7 @@ impl AggPromotion {
             vnode,
             reply,
         };
+        // crossfire `try_send`: full or closed channel → backpressure, retry.
         if self.tier.try_send(req).is_ok() {
             self.inflight.insert(vnode, rx);
         }
@@ -218,7 +222,7 @@ pub(crate) struct SqlQueryOperator {
     /// Cold-tier sender held until `lazy_init` builds the aggregate state;
     /// then moved into `promotion`. `None` = no tier wired.
     #[cfg(feature = "state-tier")]
-    tier_sender: Option<mpsc::Sender<crate::state_tier::TierRequest>>,
+    tier_sender: Option<crate::state_tier::TierTx>,
     /// Deferred batches restored from a checkpoint, replayed into the
     /// promotion buffer once `lazy_init` builds it.
     #[cfg(feature = "state-tier")]
@@ -1143,7 +1147,7 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "state-tier")]
-    fn attach_state_tier(&mut self, tier: mpsc::Sender<crate::state_tier::TierRequest>) {
+    fn attach_state_tier(&mut self, tier: crate::state_tier::TierTx) {
         // Promotion only runs on the aggregate path. If the state is already
         // resolved to aggregate, build the buffer now; otherwise hold the
         // sender until `lazy_init` builds it.
@@ -1284,9 +1288,7 @@ mod promotion_tests {
         }
     }
 
-    async fn build_op(
-        tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-    ) -> SqlQueryOperator {
+    async fn build_op(tier: crate::state_tier::TierTx) -> SqlQueryOperator {
         let ctx = laminar_sql::create_session_context();
         let mem = datafusion::datasource::MemTable::try_new(
             events_schema(),

@@ -339,7 +339,7 @@ impl StateTierStore {
 
 mod worker;
 #[allow(unused_imports)] // consumed by the demotion/promotion wiring (and tests)
-pub(crate) use worker::{spawn_worker, TierRequest};
+pub(crate) use worker::{spawn_worker, TierRequest, TierTx};
 
 #[cfg(test)]
 mod tests;

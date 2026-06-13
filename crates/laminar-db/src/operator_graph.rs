@@ -118,11 +118,7 @@ pub(crate) trait GraphOperator: Send {
     /// vnode-sharded aggregate operator promotes. The same channel feeds the
     /// coordinator's forced-full re-uploads.
     #[cfg(feature = "state-tier")]
-    fn attach_state_tier(
-        &mut self,
-        _tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-    ) {
-    }
+    fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
 
     /// Drain the vnodes this operator had demoted at the restored checkpoint
     /// (the cold tier is wiped on restart, so they must be replayed from
@@ -346,7 +342,7 @@ pub(crate) struct OperatorGraph {
     /// operators for promotion of demoted slices. `None` until a state tier
     /// is wired; kept so operators hot-added by DDL also receive it.
     #[cfg(feature = "state-tier")]
-    state_tier: Option<tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>>,
+    state_tier: Option<crate::state_tier::TierTx>,
 }
 
 impl OperatorGraph {
@@ -526,10 +522,7 @@ impl OperatorGraph {
     /// operator (and, via the stored copy, every operator added later by
     /// DDL). Vnode-sharded aggregates use it for promotion; others ignore it.
     #[cfg(feature = "state-tier")]
-    pub(crate) fn set_state_tier(
-        &mut self,
-        tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-    ) {
+    pub(crate) fn set_state_tier(&mut self, tier: crate::state_tier::TierTx) {
         for node in &mut self.nodes {
             node.operator.attach_state_tier(tier.clone());
         }

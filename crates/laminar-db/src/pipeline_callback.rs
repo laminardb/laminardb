@@ -346,7 +346,7 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Cold-tier request channel; demote candidates over the watermark are
     /// written here before being dropped from memory. `None` = no tier.
     #[cfg(feature = "state-tier")]
-    pub(crate) state_tier: Option<tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>>,
+    pub(crate) state_tier: Option<crate::state_tier::TierTx>,
     /// Highest epoch known restorable (committed), tracked from
     /// [`publish_barrier`](PipelineCallback::publish_barrier). A slice is
     /// demotable only once its base upload is durable at or below this.
@@ -381,7 +381,7 @@ const STATE_DEMOTE_MAX_PER_PASS: usize = 32;
 /// caller then leaves the slice resident).
 #[cfg(feature = "state-tier")]
 async fn tier_demote(
-    tier: &tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
+    tier: &crate::state_tier::TierTx,
     operator: &str,
     vnode: u32,
     bytes: bytes::Bytes,
@@ -402,11 +402,7 @@ async fn tier_demote(
 /// Roll back a tier write when the operator refused to drop the slice (it was
 /// touched since the last capture, so it stays resident).
 #[cfg(feature = "state-tier")]
-async fn tier_drop(
-    tier: &tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-    operator: &str,
-    vnode: u32,
-) {
+async fn tier_drop(tier: &crate::state_tier::TierTx, operator: &str, vnode: u32) {
     let (reply, rx) = tokio::sync::oneshot::channel();
     let req = crate::state_tier::TierRequest::Drop {
         operator: Arc::from(operator),
@@ -433,7 +429,7 @@ pub(crate) async fn run_demotion_pass(
     coordinator: &Arc<
         tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>,
     >,
-    tier: &tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
+    tier: &crate::state_tier::TierTx,
     total_bytes: usize,
     target_bytes: usize,
     restorable: u64,
@@ -2697,9 +2693,7 @@ mod demotion_tests {
         }
     }
 
-    async fn build_agg_graph(
-        tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
-    ) -> OperatorGraph {
+    async fn build_agg_graph(tier: crate::state_tier::TierTx) -> OperatorGraph {
         let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
         graph.set_cluster_shuffle(single_node_shuffle().await);
         graph.set_state_tier(tier);
