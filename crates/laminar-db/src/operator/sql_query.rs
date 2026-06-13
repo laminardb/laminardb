@@ -79,16 +79,11 @@ impl std::fmt::Debug for ClusterShuffleConfig {
     }
 }
 
-/// Async-decoupled promotion of demoted (cold-tier) aggregate state.
-///
-/// When a pre-aggregate row's group hashes to a vnode that was demoted to
-/// the cold tier, the row cannot process inline — the group's accumulators
-/// are not in memory. Mirroring the lookup-enrich / AI-operator pattern,
-/// the row is deferred, a Ring-1 fetch of the vnode's slice runs off the
-/// compute thread (the cold read never stalls the pipeline), and the row
-/// replays a later cycle once the slice is merged back in. The output
+/// Async-decoupled promotion of demoted (cold-tier) aggregate state: a row
+/// hitting a demoted vnode is deferred, its slice is fetched off the compute
+/// thread, and the row replays once the slice is merged back. The output
 /// watermark is held behind the oldest deferred row so its eventual
-/// contribution is not treated as late downstream.
+/// contribution is not treated as late.
 #[cfg(feature = "state-tier")]
 struct AggPromotion {
     op_name: Arc<str>,

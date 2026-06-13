@@ -1,20 +1,14 @@
 //! The cold tier's off-compute worker.
 //!
-//! Mirrors the lookup-enrich / AI-operator decoupling: the compute thread
-//! `try_send`s requests into a bounded channel and drains replies on later
-//! cycles; this worker (a task on the main tokio runtime, never the compute
-//! thread) services them one at a time, pushing each synchronous fjall call
-//! into `spawn_blocking`. Single-flight is deliberate — it serializes tier
-//! I/O the way the demotion/promotion protocol expects, and matches the
-//! dev-box finding that read tails degrade under concurrent write pressure.
+//! The compute thread `try_send`s requests onto a bounded channel; this
+//! worker (a task on the main runtime) services them one at a time via
+//! `spawn_blocking`, so a synchronous fjall call never stalls compute.
+//! Single-flight serializes tier I/O as the demotion/promotion protocol
+//! expects.
 //!
-//! The request channel is `crossfire` (a multi-producer mpsc, like the
-//! engine's other compute-thread/runtime plumbing). The per-request replies
-//! stay `tokio::oneshot`: the promotion operator stores its in-flight reply
-//! receivers in a field, and that operator must be `Sync` (its `process`
-//! future holds `&self` across an await), which crossfire's `!Sync`
-//! `RxOneshot` cannot satisfy — the same reason the lookup-enrich and AI
-//! workers store tokio receivers.
+//! Requests use a `crossfire` channel; replies stay `tokio::oneshot`
+//! because the promotion operator stores reply receivers in a field and so
+//! must be `Sync`, which crossfire's `!Sync` `RxOneshot` is not.
 
 use std::sync::Arc;
 
@@ -30,25 +24,21 @@ use crate::error::DbError;
 pub(crate) type TierTx = crossfire::MAsyncTx<crossfire::mpsc::Array<TierRequest>>;
 type TierRx = crossfire::AsyncRx<crossfire::mpsc::Array<TierRequest>>;
 
-/// One request to the tier. Every variant carries a reply channel: even
-/// fire-and-forget callers need the completion signal before they may act
-/// on it (a demotion must not drop groups from memory until the slice is
-/// confirmed written).
+/// One request to the tier. Each carries a reply channel; demotion waits on
+/// it (groups must not leave memory until the slice is durably written),
+/// while `Drop` callers may ignore it (best-effort cleanup).
 pub(crate) enum TierRequest {
-    /// Write a demoted slice.
     Demote {
         operator: Arc<str>,
         vnode: u32,
         bytes: Bytes,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
-    /// Read a slice for promotion.
     Fetch {
         operator: Arc<str>,
         vnode: u32,
         reply: oneshot::Sender<Result<Option<Bytes>, DbError>>,
     },
-    /// Drop a promoted (or released) slice.
     Drop {
         operator: Arc<str>,
         vnode: u32,
