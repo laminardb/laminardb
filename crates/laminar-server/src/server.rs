@@ -129,6 +129,18 @@ pub async fn run_server(
         builder = builder.state_memory_budget_bytes(budget);
     }
     if let Some(ref dir) = config.server.state_tier_dir {
+        // The cold tier holds demoted state whose truth lives in the [state]
+        // backend (restart wipes the tier and replays from it). An in-process
+        // backend would lose that on restart, so refuse rather than tier into
+        // the void — single-node tiering needs a durable [state] backend.
+        if !config.state.is_durable() {
+            return Err(ServerError::Build(
+                "state_tier_dir requires a durable [state] backend (a local path \
+                 or object store); an in-process backend would lose demoted state \
+                 on restart"
+                    .to_string(),
+            ));
+        }
         builder = builder.state_tier_dir(dir);
     }
 

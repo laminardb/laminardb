@@ -67,6 +67,10 @@ log_level = "info"
 # memory budget set, idle aggregate state approaching the budget is demoted
 # here (local NVMe) and fetched back on demand instead of backpressuring.
 # Watch `state_tier_bytes` / `state_tier_slices` / `state_tier_demote_total`.
+# Works single-node (no cluster) — the server derives the vnode topology from
+# [state]. Requires a durable [state] backend (`local`/`object_store`): the
+# tier's demoted state is replayed from it on restart, so an `in_process`
+# backend is rejected. Set a memory budget too, or nothing is demoted.
 # state_tier_dir = "/var/lib/laminardb/state-tier"
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
