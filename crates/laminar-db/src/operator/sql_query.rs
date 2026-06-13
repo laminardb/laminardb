@@ -165,14 +165,12 @@ impl AggPromotion {
         }
     }
 
-    /// Best-effort delete of a vnode's slice from the tier after it was
-    /// promoted back into memory, so resident bytes track only truly-cold
-    /// vnodes. Fire-and-forget (the reply is ignored): a full channel just
-    /// leaves the slice to be overwritten by the next demotion or wiped on
-    /// restart. Race-safe against a re-demotion of the same vnode — promotion
-    /// marks the vnode dirty, so it cannot be demoted again until the next
-    /// capture, which happens strictly after this Drop is enqueued, and the
-    /// tier request channel is FIFO.
+    /// Best-effort delete of a vnode's slice after promotion put it back in
+    /// memory, so resident bytes track only truly-cold vnodes. Fire-and-forget:
+    /// a full channel just leaves the slice for the next demotion to overwrite
+    /// or restart to wipe. Race-safe against a re-demote — promotion marks the
+    /// vnode dirty (no re-demote until the next capture, after this Drop is
+    /// enqueued) and the request channel is FIFO.
     fn drop_slice(&self, vnode: u32) {
         let (reply, _rx) = oneshot::channel();
         let req = crate::state_tier::TierRequest::Drop {

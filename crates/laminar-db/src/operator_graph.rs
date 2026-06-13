@@ -99,7 +99,6 @@ pub(crate) trait GraphOperator: Send {
     /// touched since the last capture (the tier bytes would be stale) or
     /// the operator can't demote at all. Default: refuse.
     #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // called once the demotion trigger lands with promotion
     fn demote_vnode(&mut self, _vnode: u32, _vnode_count: u32) -> bool {
         false
     }

@@ -1600,8 +1600,8 @@ impl IncrementalAggState {
         &self.cold_vnodes
     }
 
-    /// Drop one vnode's groups after their captured bytes were confirmed
-    /// in the cold tier. Refuses (`false`) unless it is provably safe:
+    /// Whether [`Self::demote_vnode`] would succeed for `vnode` now, without
+    /// dropping anything. Refuses (`false`) unless it is provably safe:
     ///
     /// - the agg emits a changelog — a full-emit agg rebuilds its entire
     ///   result from memory each cycle, so dropping groups would shrink
@@ -1611,13 +1611,8 @@ impl IncrementalAggState {
     ///   past the bytes sitting in the tier;
     /// - the capture baseline used this `vnode_count`.
     ///
-    /// No retractions are emitted: unlike eviction, demotion is invisible
-    /// downstream — the materialized rows stay, and a future update for a
-    /// cold group goes through promotion first.
-    /// The eligibility guard for [`Self::demote_vnode`], without dropping
-    /// anything: a changelog agg, clean since the last per-vnode capture, whose
-    /// capture baseline used this `vnode_count`. The demotion pass checks this
-    /// before writing the slice to the tier so a dirty vnode costs no I/O.
+    /// Checked before writing the slice to the tier, so a dirty candidate
+    /// costs no I/O.
     pub(crate) fn can_demote(&self, vnode: u32, vnode_count: u32) -> bool {
         self.emit_changelog
             && !self.dirty_all
@@ -1625,7 +1620,10 @@ impl IncrementalAggState {
             && self.tier_vnode_count == Some(vnode_count)
     }
 
-    #[allow(dead_code)] // called once the demotion trigger lands with promotion
+    /// Drop one vnode's groups after their captured bytes were confirmed in
+    /// the cold tier. No retractions are emitted: unlike eviction, demotion is
+    /// invisible downstream — the materialized rows stay, and a future update
+    /// for a cold group goes through promotion first.
     pub(crate) fn demote_vnode(&mut self, vnode: u32, vnode_count: u32) -> bool {
         if !self.can_demote(vnode, vnode_count) {
             return false;
@@ -1667,11 +1665,9 @@ impl IncrementalAggState {
         }
     }
 
-    /// Mark one vnode dirty (touched since the last capture) so it cannot be
-    /// demoted until the next capture re-baselines it. Called after merging a
-    /// vnode's state in (promotion or rebalance acquisition): `mark_vnode_hot`
-    /// only marks vnodes that were cold, so a rebalance-acquired vnode — never
-    /// cold here — needs this to be protected from demotion against stale bytes.
+    /// Mark one vnode dirty so it can't be demoted until the next capture.
+    /// `apply_vnode_state` calls this after merging a vnode in; `mark_vnode_hot`
+    /// only dirties vnodes that were *cold*, so a rebalance-acquired one needs it.
     pub(crate) fn mark_vnode_dirty(&mut self, vnode: u32) {
         self.dirty_vnodes.insert(vnode);
     }
