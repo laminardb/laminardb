@@ -54,11 +54,6 @@ pub(crate) enum TierRequest {
         vnode: u32,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
-    /// Drop every slice of an operator removed from the graph.
-    DropOperator {
-        operator: Arc<str>,
-        reply: oneshot::Sender<Result<usize, DbError>>,
-    },
 }
 
 /// Spawn the worker on `runtime` and return its request channel.
@@ -111,15 +106,6 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
             } => {
                 let res =
                     tokio::task::spawn_blocking(move || store.remove(operator.as_ref(), vnode))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(DbError::Storage(format!("state tier worker: {e}")))
-                        });
-                let _ = reply.send(res);
-            }
-            TierRequest::DropOperator { operator, reply } => {
-                let res =
-                    tokio::task::spawn_blocking(move || store.remove_operator(operator.as_ref()))
                         .await
                         .unwrap_or_else(|e| {
                             Err(DbError::Storage(format!("state tier worker: {e}")))

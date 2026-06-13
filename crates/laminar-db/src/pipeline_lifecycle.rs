@@ -1840,8 +1840,6 @@ impl LaminarDB {
             state_budget_exceeded: false,
             #[cfg(feature = "state-tier")]
             state_tier: state_tier_sender,
-            #[cfg(feature = "state-tier")]
-            restorable_epoch: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

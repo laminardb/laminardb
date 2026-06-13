@@ -51,9 +51,6 @@ pub struct EngineMetrics {
     pub state_tier_fetch_total: IntCounter,
     /// Cold-tier fetch latency (the promotion path's disk read).
     pub state_tier_fetch_duration: Histogram,
-    /// Cold-tier directories wiped at open (unclean shutdown, version
-    /// mismatch, corrupt marker) — each one implies a rehydration.
-    pub state_tier_wipes_total: IntCounter,
     /// Global pipeline watermark.
     pub pipeline_watermark: IntGauge,
     /// Per-source watermark (epoch-ms). Label: `source`.
@@ -244,11 +241,6 @@ impl EngineMetrics {
                     "Cold-tier slice fetch latency"
                 )
                 .buckets(prometheus::exponential_buckets(0.0005, 2.0, 18).unwrap()),
-            )
-            .unwrap()),
-            state_tier_wipes_total: reg!(IntCounter::new(
-                "state_tier_wipes_total",
-                "Cold-tier directories wiped at open"
             )
             .unwrap()),
             pipeline_watermark: reg!(IntGauge::new(

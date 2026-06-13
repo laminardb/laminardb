@@ -347,11 +347,6 @@ pub(crate) struct ConnectorPipelineCallback {
     /// written here before being dropped from memory. `None` = no tier.
     #[cfg(feature = "state-tier")]
     pub(crate) state_tier: Option<crate::state_tier::TierTx>,
-    /// Highest epoch known restorable (committed), tracked from
-    /// [`publish_barrier`](PipelineCallback::publish_barrier). A slice is
-    /// demotable only once its base upload is durable at or below this.
-    #[cfg(feature = "state-tier")]
-    pub(crate) restorable_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Minimum interval between state-memory-budget probes. Each probe sums
@@ -432,7 +427,6 @@ pub(crate) async fn run_demotion_pass(
     tier: &crate::state_tier::TierTx,
     total_bytes: usize,
     target_bytes: usize,
-    restorable: u64,
 ) -> u64 {
     // Plan under the coordinator lock: rank idle candidates and copy their
     // durable slice bytes. Release the lock before any tier I/O.
@@ -443,7 +437,7 @@ pub(crate) async fn run_demotion_pass(
         };
         let mut plan = Vec::new();
         let mut freed = 0usize;
-        for (vnode, _base, bytes) in coord.demotion_candidates(restorable) {
+        for (vnode, bytes) in coord.demotion_candidates() {
             if plan.len() >= STATE_DEMOTE_MAX_PER_PASS
                 || total_bytes.saturating_sub(freed) < target_bytes
             {
@@ -2071,12 +2065,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
         self.subscription_registry
             .broadcast_barrier(epoch, checkpoint_id);
-        // A published barrier is a committed (restorable) epoch — the demote
-        // trigger only sheds slices whose base upload is durable at or below
-        // it.
-        #[cfg(feature = "state-tier")]
-        self.restorable_epoch
-            .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "state-tier")]
@@ -2101,17 +2089,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return;
         }
         let target = budget / STATE_DEMOTE_TARGET_DEN * STATE_DEMOTE_TARGET_NUM;
-        let restorable = self.restorable_epoch.load(Ordering::Relaxed);
         let coordinator = Arc::clone(&self.coordinator);
-        let demoted = run_demotion_pass(
-            &mut self.graph,
-            &coordinator,
-            &tier,
-            total,
-            target,
-            restorable,
-        )
-        .await;
+        let demoted = run_demotion_pass(&mut self.graph, &coordinator, &tier, total, target).await;
         if demoted > 0 {
             tracing::debug!(demoted, "demoted idle vnode slices to the cold tier");
         }
@@ -2766,15 +2745,14 @@ mod demotion_tests {
             .await
             .unwrap();
         assert!(r.success, "checkpoint must commit: {:?}", r.error);
-        let epoch = r.epoch;
         assert!(
-            !coord.demotion_candidates(epoch).is_empty(),
+            !coord.demotion_candidates().is_empty(),
             "committed slices should be demotion candidates"
         );
         let coordinator = Arc::new(tokio::sync::Mutex::new(Some(coord)));
 
         // Drain target 0 → demote every candidate.
-        let demoted = run_demotion_pass(&mut graph, &coordinator, &tier_tx, before, 0, epoch).await;
+        let demoted = run_demotion_pass(&mut graph, &coordinator, &tier_tx, before, 0).await;
         assert!(demoted > 0, "the pass should demote at least one slice");
 
         assert_eq!(
@@ -2788,11 +2766,7 @@ mod demotion_tests {
         );
         let guard = coordinator.lock().await;
         assert!(
-            guard
-                .as_ref()
-                .unwrap()
-                .demotion_candidates(epoch)
-                .is_empty(),
+            guard.as_ref().unwrap().demotion_candidates().is_empty(),
             "demoted slices are marked cold and no longer candidates"
         );
     }

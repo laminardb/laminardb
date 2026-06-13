@@ -593,24 +593,22 @@ impl CheckpointCoordinator {
     }
 
     /// Vnodes eligible for demotion: every recorded slice still
-    /// memory-resident, and the base epoch already durable at or below
-    /// `restorable_epoch` (the demoted bytes must be recoverable without
-    /// the tier). Returns `(vnode, base_epoch, total_bytes)`, largest
-    /// first — demoting big idle slices first frees the most memory.
+    /// memory-resident (`Bytes`, not already `Cold`). Returns
+    /// `(vnode, total_bytes)`, largest first — demoting big idle slices
+    /// first frees the most memory. The caller only invokes this with no
+    /// checkpoint in flight, so every recorded upload is already durable.
     #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
-    pub(crate) fn demotion_candidates(&self, restorable_epoch: u64) -> Vec<(u32, u64, usize)> {
-        let mut out: Vec<(u32, u64, usize)> = self
+    pub(crate) fn demotion_candidates(&self) -> Vec<(u32, usize)> {
+        let mut out: Vec<(u32, usize)> = self
             .last_vnode_uploads
             .iter()
-            .filter(|(_, (base, slices))| {
-                *base <= restorable_epoch
-                    && !slices.is_empty()
+            .filter(|(_, (_, slices))| {
+                !slices.is_empty()
                     && slices
                         .values()
                         .all(|s| matches!(s, UploadedSlice::Bytes(_)))
             })
-            .map(|(v, (base, slices))| {
+            .map(|(v, (_, slices))| {
                 let total = slices
                     .values()
                     .map(|s| match s {
@@ -618,10 +616,10 @@ impl CheckpointCoordinator {
                         UploadedSlice::Cold => 0,
                     })
                     .sum();
-                (*v, *base, total)
+                (*v, total)
             })
             .collect();
-        out.sort_by_key(|&(_, _, total)| std::cmp::Reverse(total));
+        out.sort_by_key(|&(_, total)| std::cmp::Reverse(total));
         out
     }
 
@@ -629,7 +627,6 @@ impl CheckpointCoordinator {
     /// are exactly the bytes of the slice's last durable full upload, so a
     /// demotion writes truth-identical state by construction.
     #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // wired once the demotion trigger lands with promotion
     pub(crate) fn slices_for_demotion(&self, vnode: u32) -> Vec<(String, bytes::Bytes)> {
         self.last_vnode_uploads
             .get(&vnode)
@@ -645,22 +642,11 @@ impl CheckpointCoordinator {
             .unwrap_or_default()
     }
 
-    /// Release the in-memory byte pins for a demoted vnode (call only
-    /// after the tier write is confirmed and the operator dropped the
-    /// groups). The reference-partial flow then keys off the cold marker.
-    #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // exercised by tests; the trigger uses the per-op variant
-    pub(crate) fn mark_vnode_demoted(&mut self, vnode: u32) {
-        if let Some((_, slices)) = self.last_vnode_uploads.get_mut(&vnode) {
-            for s in slices.values_mut() {
-                *s = UploadedSlice::Cold;
-            }
-        }
-    }
-
     /// Release one operator's byte pin for a demoted `(operator, vnode)`
-    /// slice. The trigger demotes per operator (a vnode may carry several),
-    /// so a refusal by one operator doesn't strand the others' records.
+    /// slice — call only after the tier write is confirmed and the operator
+    /// dropped the groups. The reference-partial flow then keys off the cold
+    /// marker. Per operator (a vnode may carry several) so a refusal by one
+    /// doesn't strand the others' records.
     #[cfg(feature = "state-tier")]
     pub(crate) fn mark_slice_demoted(&mut self, vnode: u32, operator: &str) {
         if let Some((_, slices)) = self.last_vnode_uploads.get_mut(&vnode) {
@@ -3956,19 +3942,12 @@ mod tests {
         assert!(r1.success);
 
         // Demote: release the in-memory pin; subsequent captures stage Cold.
-        assert_eq!(
-            coord.demotion_candidates(r1.epoch),
-            vec![(0, r1.epoch, b"state-v1".len())]
-        );
-        assert!(
-            coord.demotion_candidates(r1.epoch - 1).is_empty(),
-            "a base newer than the restorable epoch must not be a candidate"
-        );
+        assert_eq!(coord.demotion_candidates(), vec![(0, b"state-v1".len())]);
         let slices = coord.slices_for_demotion(0);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].1.as_ref(), b"state-v1");
-        coord.mark_vnode_demoted(0);
-        assert!(coord.demotion_candidates(r1.epoch).is_empty());
+        coord.mark_slice_demoted(0, "agg");
+        assert!(coord.demotion_candidates().is_empty());
 
         // Epoch 2: Cold staged → reference to epoch 1, no bytes needed.
         let cold = || {
@@ -4050,7 +4029,7 @@ mod tests {
             .await
             .unwrap();
         assert!(r1.success);
-        coord.mark_vnode_demoted(0);
+        coord.mark_slice_demoted(0, "agg");
 
         let cold = || {
             let mut ops = std::collections::HashMap::new();
