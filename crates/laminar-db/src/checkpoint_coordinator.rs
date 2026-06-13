@@ -33,6 +33,11 @@ use tracing::{debug, error, info, warn};
 use crate::error::DbError;
 
 /// One operator's staged slice for one vnode of the next checkpoint.
+///
+/// Both variants are only constructed on the per-vnode capture path
+/// (`cluster`); without it the coordinator still carries the type but never
+/// builds one.
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum StagedSlice {
     /// Freshly serialized memory-resident state.
@@ -52,6 +57,9 @@ pub(crate) type StagedVnodeStates = HashMap<u32, HashMap<String, StagedSlice>>;
 /// byte source for coordinator-driven demotion), or a cold marker once the
 /// slice was demoted — the bytes then live only in the tier, releasing the
 /// in-memory pin.
+/// `Cold` is only recorded when a demotion lands (`state-tier`); the plain
+/// `cluster` build records bytes but never a cold marker.
+#[cfg_attr(not(feature = "state-tier"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum UploadedSlice {
     Bytes(bytes::Bytes),

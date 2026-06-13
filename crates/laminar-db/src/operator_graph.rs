@@ -112,6 +112,17 @@ pub(crate) trait GraphOperator: Send {
     fn apply_vnode_state(&mut self, _vnode: u32, _bytes: &[u8]) -> Result<(), DbError> {
         Ok(())
     }
+
+    /// Wire the cold-tier request channel so the operator can fetch demoted
+    /// vnode slices back into memory (promotion). Default no-op — only the
+    /// vnode-sharded aggregate operator promotes. The same channel feeds the
+    /// coordinator's forced-full re-uploads.
+    #[cfg(feature = "state-tier")]
+    fn attach_state_tier(
+        &mut self,
+        _tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
+    ) {
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -322,6 +333,11 @@ pub(crate) struct OperatorGraph {
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     rehydrated_vnode_state:
         Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
+    /// Cold-tier request channel, threaded to vnode-sharded aggregate
+    /// operators for promotion of demoted slices. `None` until a state tier
+    /// is wired; kept so operators hot-added by DDL also receive it.
+    #[cfg(feature = "state-tier")]
+    state_tier: Option<tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>>,
 }
 
 impl OperatorGraph {
@@ -350,6 +366,8 @@ impl OperatorGraph {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
+            #[cfg(feature = "state-tier")]
+            state_tier: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -493,6 +511,21 @@ impl OperatorGraph {
         config: crate::operator::sql_query::ClusterShuffleConfig,
     ) {
         self.cluster_shuffle = Some(config);
+    }
+
+    /// Wire the cold-tier request channel and hand it to every current
+    /// operator (and, via the stored copy, every operator added later by
+    /// DDL). Vnode-sharded aggregates use it for promotion; others ignore it.
+    #[cfg(feature = "state-tier")]
+    #[allow(dead_code)] // wired in pipeline_lifecycle once the demotion trigger lands
+    pub(crate) fn set_state_tier(
+        &mut self,
+        tier: tokio::sync::mpsc::Sender<crate::state_tier::TierRequest>,
+    ) {
+        for node in &mut self.nodes {
+            node.operator.attach_state_tier(tier.clone());
+        }
+        self.state_tier = Some(tier);
     }
 
     /// The installed cluster row-shuffle config, if any; lets the pipeline
@@ -1445,7 +1478,10 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "cluster", feature = "state-tier")),
+            allow(unused_mut)
+        )]
         let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
@@ -1457,6 +1493,10 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
+        }
+        #[cfg(feature = "state-tier")]
+        if let Some(ref tier) = self.state_tier {
+            op.attach_state_tier(tier.clone());
         }
         Box::new(op)
     }
