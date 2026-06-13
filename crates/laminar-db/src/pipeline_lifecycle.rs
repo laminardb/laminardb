@@ -605,8 +605,8 @@ impl LaminarDB {
         // the graph (promotion) and — below — the coordinator (forced-full
         // re-uploads) and the callback (demotion trigger). Cluster mode already
         // installed a vnode count from the shuffle registry; a single node
-        // without a controller gets a fixed local count here, so the tier works
-        // without cluster row transport. The backend stays mandatory — it holds
+        // without a controller takes it from its vnode registry here, so the
+        // tier works without cluster row transport. The backend stays mandatory — it holds
         // the demoted truth that restart replays. A set dir without a backend is
         // a loud no-op, never silent data loss. `set_state_tier` must precede
         // `add_query` so operators built below pick up the stored sender.

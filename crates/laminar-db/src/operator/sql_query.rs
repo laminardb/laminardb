@@ -251,7 +251,7 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "state-tier")]
     pending_cold_rehydrate: Vec<u32>,
     /// Vnode count for promotion's cold-vnode detection. Set by the graph from
-    /// the shuffle registry (cluster) or the single-node tier count; `1` until
+    /// the vnode registry (the shuffle registry in cluster mode); `1` until
     /// then. Single-node has no shuffle config to read it from, so it is
     /// threaded in separately.
     #[cfg(feature = "state-tier")]
@@ -294,8 +294,8 @@ impl SqlQueryOperator {
     }
 
     /// Set the vnode count used by cold-tier promotion to detect rows landing
-    /// on demoted vnodes. Threaded from the graph's topology (shuffle registry
-    /// in cluster mode, or the fixed single-node count).
+    /// on demoted vnodes. Threaded from the graph's topology (the vnode
+    /// registry; the shuffle registry in cluster mode).
     #[cfg(feature = "state-tier")]
     pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
         self.vnode_count = vnode_count;

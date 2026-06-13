@@ -341,8 +341,8 @@ pub(crate) struct OperatorGraph {
     /// Vnode count for per-vnode state capture and cold-tier demotion — the
     /// only piece of the shuffle topology that path needs (groups bucket by
     /// `key_hash % vnode_count`). Set from the shuffle registry in cluster
-    /// mode, or to a fixed single-node count when the tier runs without a
-    /// controller. `None` = no per-vnode capture.
+    /// mode, or from the vnode registry directly on a single node (no
+    /// controller). `None` = no per-vnode capture.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
     /// Shared handle to the DB's staged per-vnode rehydration map. Drained at
