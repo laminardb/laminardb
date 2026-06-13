@@ -410,11 +410,13 @@ async fn tier_drop(tier: &crate::state_tier::TierTx, operator: &str, vnode: u32)
 }
 
 /// Shed idle vnode slices to the cold tier until projected memory falls below
-/// `target_bytes` (or candidates / the per-pass cap run out). For each
-/// `(operator, vnode)` candidate: persist its durable bytes, then ask the
-/// operator to drop the groups — which it refuses if the vnode was touched
-/// since its last capture, in which case the tier write is rolled back.
-/// Returns the number of slices demoted.
+/// `target_bytes` (or candidates / the per-pass cap run out). Candidates are
+/// pre-filtered to operators that can demote the vnode now (clean since their
+/// last capture), so a dirty vnode is skipped before any tier I/O. For each
+/// surviving `(operator, vnode)`: persist its durable bytes, then drop the
+/// groups — the drop is still guarded and rolls the write back on the rare
+/// race, but the common dirty case no longer costs a write. Returns the number
+/// of slices demoted.
 ///
 /// Caller-side safety contract: invoke only with no checkpoint in flight, so
 /// the bytes recorded for a candidate equal the operator's resident state.
@@ -443,12 +445,19 @@ pub(crate) async fn run_demotion_pass(
             {
                 break;
             }
-            let slices = coord.slices_for_demotion(vnode);
-            if slices.is_empty() {
+            // Keep only operators that can demote this vnode *now* (clean since
+            // their last capture). Filtering here, before any tier write, turns
+            // a dirty candidate into a no-op instead of a write-then-rollback.
+            let eligible: Vec<(String, bytes::Bytes)> = coord
+                .slices_for_demotion(vnode)
+                .into_iter()
+                .filter(|(op, _)| graph.can_demote(op, vnode))
+                .collect();
+            if eligible.is_empty() {
                 continue;
             }
             freed = freed.saturating_add(bytes);
-            plan.push((vnode, slices));
+            plan.push((vnode, eligible));
         }
         plan
     };

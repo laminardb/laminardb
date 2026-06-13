@@ -104,6 +104,16 @@ pub(crate) trait GraphOperator: Send {
         false
     }
 
+    /// Whether [`demote_vnode`](Self::demote_vnode) would succeed for `vnode`
+    /// right now — the same eligibility guard, without dropping anything. The
+    /// demotion pass checks this *before* writing the slice to the tier so a
+    /// dirty vnode is skipped cheaply instead of written-then-rolled-back.
+    /// Default: not demotable.
+    #[cfg(feature = "state-tier")]
+    fn can_demote(&self, _vnode: u32, _vnode_count: u32) -> bool {
+        false
+    }
+
     /// Merge one vnode's rehydrated state slice (produced by
     /// [`checkpoint_by_vnode`](Self::checkpoint_by_vnode) on whichever node
     /// last owned the vnode) into this operator. Default no-op for operators
@@ -2241,10 +2251,35 @@ impl OperatorGraph {
             return false;
         };
         let vnode_count = cfg.registry.vnode_count();
-        self.nodes
+        let demoted = self
+            .nodes
             .iter_mut()
             .find(|n| !n.removed && &*n.name == operator)
-            .is_some_and(|n| n.operator.demote_vnode(vnode, vnode_count))
+            .is_some_and(|n| n.operator.demote_vnode(vnode, vnode_count));
+        // Count only effective demotions (the slice actually left memory), so
+        // the metric is not inflated by tier writes that get rolled back.
+        if demoted {
+            if let Some(ref prom) = self.prom {
+                prom.state_tier_demote_total.inc();
+            }
+        }
+        demoted
+    }
+
+    /// Whether the named operator could demote `vnode` right now (clean since
+    /// its last capture). Lets the demotion pass skip dirty candidates before
+    /// any tier I/O. `false` when there is no shuffle topology or no such
+    /// operator.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn can_demote(&self, operator: &str, vnode: u32) -> bool {
+        let Some(cfg) = &self.cluster_shuffle else {
+            return false;
+        };
+        let vnode_count = cfg.registry.vnode_count();
+        self.nodes
+            .iter()
+            .find(|n| !n.removed && &*n.name == operator)
+            .is_some_and(|n| n.operator.can_demote(vnode, vnode_count))
     }
 
     /// After a restart restore, the vnodes each operator had demoted to the

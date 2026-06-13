@@ -165,6 +165,24 @@ impl AggPromotion {
         }
     }
 
+    /// Best-effort delete of a vnode's slice from the tier after it was
+    /// promoted back into memory, so resident bytes track only truly-cold
+    /// vnodes. Fire-and-forget (the reply is ignored): a full channel just
+    /// leaves the slice to be overwritten by the next demotion or wiped on
+    /// restart. Race-safe against a re-demotion of the same vnode — promotion
+    /// marks the vnode dirty, so it cannot be demoted again until the next
+    /// capture, which happens strictly after this Drop is enqueued, and the
+    /// tier request channel is FIFO.
+    fn drop_slice(&self, vnode: u32) {
+        let (reply, _rx) = oneshot::channel();
+        let req = crate::state_tier::TierRequest::Drop {
+            operator: Arc::clone(&self.op_name),
+            vnode,
+            reply,
+        };
+        let _ = self.tier.try_send(req);
+    }
+
     fn defer(&mut self, watermark: i64, batch: RecordBatch) {
         self.deferred.push_back((watermark, batch));
     }
@@ -545,7 +563,15 @@ impl SqlQueryOperator {
             .unwrap_or_default();
         for (vnode, slice) in ready {
             match slice {
-                Some(bytes) => self.apply_vnode_state(vnode, &bytes)?,
+                Some(bytes) => {
+                    self.apply_vnode_state(vnode, &bytes)?;
+                    // Slice is back in memory and the vnode is now dirty (so it
+                    // can't be re-demoted before the next capture) — delete the
+                    // redundant tier copy so resident bytes track only cold vnodes.
+                    if let Some(p) = self.promotion.as_ref() {
+                        p.drop_slice(vnode);
+                    }
+                }
                 None => {
                     // The tier no longer has the slice (should not happen
                     // mid-run). Re-issue; the deferred batch keeps waiting.
@@ -1147,6 +1173,14 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "state-tier")]
+    fn can_demote(&self, vnode: u32, vnode_count: u32) -> bool {
+        match self.state {
+            QueryState::Agg(ref agg_state) => agg_state.can_demote(vnode, vnode_count),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "state-tier")]
     fn attach_state_tier(&mut self, tier: crate::state_tier::TierTx) {
         // Promotion only runs on the aggregate path. If the state is already
         // resolved to aggregate, build the buffer now; otherwise hold the
@@ -1177,8 +1211,15 @@ impl GraphOperator for SqlQueryOperator {
                 let merged = agg_state.merge_groups(&cp)?;
                 // Whether this is a rebalance acquisition or a promotion
                 // from the cold tier, the vnode's state now lives in memory.
+                // `mark_vnode_hot` clears the cold flag (promotion only);
+                // `mark_vnode_dirty` then protects *this* vnode from demotion
+                // until the next capture — without it a rebalance-acquired
+                // vnode (never cold) could be demoted against stale tier bytes.
                 #[cfg(feature = "state-tier")]
-                agg_state.mark_vnode_hot(vnode);
+                {
+                    agg_state.mark_vnode_hot(vnode);
+                    agg_state.mark_vnode_dirty(vnode);
+                }
                 tracing::debug!(
                     query = %self.op_name, vnode, groups = merged,
                     "applied rehydrated vnode aggregate state"

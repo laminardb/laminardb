@@ -115,9 +115,9 @@ impl StateTierStore {
             self.logical_bytes.fetch_add(new_total, Ordering::Relaxed);
             self.logical_slices.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(ref m) = self.metrics {
-            m.state_tier_demote_total.inc();
-        }
+        // `state_tier_demote_total` counts *effective* demotions, incremented by
+        // the graph only when the operator actually drops the vnode — not here,
+        // where a write may still be rolled back if the vnode turns out dirty.
         self.publish_gauges();
         Ok(())
     }

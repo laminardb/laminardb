@@ -1585,12 +1585,10 @@ impl IncrementalAggState {
 
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
-        // Merged-in state changes an unknown set of vnodes; refuse
-        // demotions until the next capture re-baselines.
-        #[cfg(feature = "state-tier")]
-        {
-            self.dirty_all = true;
-        }
+        // No `dirty_all` here: every caller (`apply_vnode_state`) merges exactly
+        // one vnode and marks *that* vnode dirty itself, so demotion of other
+        // clean vnodes stays available. Blanket-dirtying here would block all
+        // demotion after a single promotion or rebalance-acquired vnode.
         Ok(checkpoint.groups.len())
     }
 }
@@ -1616,13 +1614,20 @@ impl IncrementalAggState {
     /// No retractions are emitted: unlike eviction, demotion is invisible
     /// downstream — the materialized rows stay, and a future update for a
     /// cold group goes through promotion first.
+    /// The eligibility guard for [`Self::demote_vnode`], without dropping
+    /// anything: a changelog agg, clean since the last per-vnode capture, whose
+    /// capture baseline used this `vnode_count`. The demotion pass checks this
+    /// before writing the slice to the tier so a dirty vnode costs no I/O.
+    pub(crate) fn can_demote(&self, vnode: u32, vnode_count: u32) -> bool {
+        self.emit_changelog
+            && !self.dirty_all
+            && !self.dirty_vnodes.contains(&vnode)
+            && self.tier_vnode_count == Some(vnode_count)
+    }
+
     #[allow(dead_code)] // called once the demotion trigger lands with promotion
     pub(crate) fn demote_vnode(&mut self, vnode: u32, vnode_count: u32) -> bool {
-        if !self.emit_changelog
-            || self.dirty_all
-            || self.dirty_vnodes.contains(&vnode)
-            || self.tier_vnode_count != Some(vnode_count)
-        {
+        if !self.can_demote(vnode, vnode_count) {
             return false;
         }
         let global = self.num_group_cols == 0;
@@ -1660,6 +1665,15 @@ impl IncrementalAggState {
         if self.cold_vnodes.remove(&vnode) {
             self.dirty_vnodes.insert(vnode);
         }
+    }
+
+    /// Mark one vnode dirty (touched since the last capture) so it cannot be
+    /// demoted until the next capture re-baselines it. Called after merging a
+    /// vnode's state in (promotion or rebalance acquisition): `mark_vnode_hot`
+    /// only marks vnodes that were cold, so a rebalance-acquired vnode — never
+    /// cold here — needs this to be protected from demotion against stale bytes.
+    pub(crate) fn mark_vnode_dirty(&mut self, vnode: u32) {
+        self.dirty_vnodes.insert(vnode);
     }
 }
 
@@ -2730,6 +2744,74 @@ mod tests {
         assert!(
             !state.demote_vnode(v, VNODES),
             "vnode touched since capture must refuse demotion"
+        );
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn merge_groups_does_not_block_demotion_of_other_vnodes() {
+        // Regression: merge_groups used to set `dirty_all`, so a single
+        // promotion or rebalance-acquired vnode blocked demotion of *every*
+        // other clean vnode until the next capture. It must now leave other
+        // untouched vnodes demotable (per-vnode dirtying is the caller's job).
+        const VNODES: u32 = 8;
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            pre_agg_schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a", "b", "c", "d", "e", "f", "g", "h",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+                ])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
+
+        // Clean baseline spanning several vnodes.
+        let buckets = state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        let vnodes: Vec<u32> = buckets.keys().copied().collect();
+        assert!(vnodes.len() >= 2, "need groups in at least two vnodes");
+        let (v_merge, v_other) = (vnodes[0], vnodes[1]);
+        assert!(state.can_demote(v_merge, VNODES));
+        assert!(state.can_demote(v_other, VNODES));
+
+        // Merge a vnode's slice back (the promotion / rebalance apply path).
+        let slice = buckets.get(&v_merge).unwrap();
+        state.merge_groups(slice).unwrap();
+        assert!(
+            state.can_demote(v_other, VNODES),
+            "merge_groups must not block demotion of other clean vnodes",
         );
     }
 
