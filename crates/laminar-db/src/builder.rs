@@ -486,7 +486,9 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
 
-        // State backend and vnode registry must be paired.
+        // State backend and vnode registry must be paired. Single-node (no
+        // controller) tiering uses a single-owner registry — the durability
+        // gate wires the coordinator from it without a controller.
         match (&self.state_backend, &self.vnode_registry) {
             (Some(_), None) => {
                 return Err(DbError::Config(

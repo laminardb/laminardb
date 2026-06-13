@@ -338,6 +338,13 @@ pub(crate) struct OperatorGraph {
     /// pre-aggregate rows can be hash-routed to vnode owners.
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
+    /// Vnode count for per-vnode state capture and cold-tier demotion — the
+    /// only piece of the shuffle topology that path needs (groups bucket by
+    /// `key_hash % vnode_count`). Set from the shuffle registry in cluster
+    /// mode, or to a fixed single-node count when the tier runs without a
+    /// controller. `None` = no per-vnode capture.
+    #[cfg(feature = "cluster")]
+    vnode_count: Option<u32>,
     /// Shared handle to the DB's staged per-vnode rehydration map. Drained at
     /// the start of each cycle by [`apply_rehydrated_vnodes`](Self::apply_rehydrated_vnodes):
     /// vnodes this node newly acquired in a rebalance have their committed
@@ -378,6 +385,8 @@ impl OperatorGraph {
             max_state_bytes: None,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            vnode_count: None,
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
             #[cfg(feature = "state-tier")]
@@ -524,7 +533,23 @@ impl OperatorGraph {
         &mut self,
         config: crate::operator::sql_query::ClusterShuffleConfig,
     ) {
+        self.vnode_count = Some(config.registry.vnode_count());
         self.cluster_shuffle = Some(config);
+    }
+
+    /// Install a vnode count for per-vnode capture and cold-tier demotion
+    /// without a full shuffle config — the single-node tier path, where there
+    /// is no controller or row transport but state still partitions by vnode.
+    /// Must stay stable across restarts (demoted partials are keyed by vnode).
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
+        self.vnode_count = Some(vnode_count);
+    }
+
+    /// The vnode count used for per-vnode capture/demotion, if any.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn vnode_count(&self) -> Option<u32> {
+        self.vnode_count
     }
 
     /// Wire the cold-tier request channel and hand it to every current
@@ -1505,8 +1530,14 @@ impl OperatorGraph {
             op.attach_cluster_shuffle(cfg.clone());
         }
         #[cfg(feature = "state-tier")]
-        if let Some(ref tier) = self.state_tier {
-            op.attach_state_tier(tier.clone());
+        if let Some(tier) = self.state_tier.clone() {
+            op.attach_state_tier(tier);
+            // Cold-tier promotion needs the vnode count to detect rows landing
+            // on demoted vnodes (single-node has no shuffle config to read it
+            // from, so it is threaded separately).
+            if let Some(vnode_count) = self.vnode_count {
+                op.set_vnode_count(vnode_count);
+            }
         }
         Box::new(op)
     }
@@ -2210,18 +2241,17 @@ impl OperatorGraph {
     ///
     /// Returns `vnode → (operator_name → vnode-slice bytes)` for every operator
     /// that opts into per-vnode checkpointing (see
-    /// [`GraphOperator::checkpoint_by_vnode`]). Empty outside cluster mode (no
-    /// shuffle config means no vnode topology to partition by). The vnode count
-    /// is taken from the registry the cluster shuffle was wired with, so the
-    /// partition matches the routing that delivered each key here.
+    /// [`GraphOperator::checkpoint_by_vnode`]). Empty when no vnode topology is
+    /// installed. The count comes from the shuffle registry in cluster mode, or
+    /// the single-node tier count — the same partition the routing (or, single
+    /// node, all-local ownership) delivered each key under.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
     pub fn snapshot_state_by_vnode(
         &mut self,
     ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, DbError> {
-        let vnode_count = match &self.cluster_shuffle {
-            Some(cfg) => cfg.registry.vnode_count(),
-            None => return Ok(std::collections::HashMap::new()),
+        let Some(vnode_count) = self.vnode_count else {
+            return Ok(std::collections::HashMap::new());
         };
         let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
             std::collections::HashMap::new();
@@ -2244,12 +2274,10 @@ impl OperatorGraph {
     /// was confirmed in the cold tier. `false` = refused (the vnode was
     /// touched since the last capture, or the operator can't demote).
     #[cfg(feature = "state-tier")]
-    #[allow(dead_code)] // called once the demotion trigger lands with promotion
     pub(crate) fn demote_vnode(&mut self, operator: &str, vnode: u32) -> bool {
-        let Some(cfg) = &self.cluster_shuffle else {
+        let Some(vnode_count) = self.vnode_count else {
             return false;
         };
-        let vnode_count = cfg.registry.vnode_count();
         let demoted = self
             .nodes
             .iter_mut()
@@ -2267,14 +2295,13 @@ impl OperatorGraph {
 
     /// Whether the named operator could demote `vnode` right now (clean since
     /// its last capture). Lets the demotion pass skip dirty candidates before
-    /// any tier I/O. `false` when there is no shuffle topology or no such
+    /// any tier I/O. `false` when there is no vnode topology or no such
     /// operator.
     #[cfg(feature = "state-tier")]
     pub(crate) fn can_demote(&self, operator: &str, vnode: u32) -> bool {
-        let Some(cfg) = &self.cluster_shuffle else {
+        let Some(vnode_count) = self.vnode_count else {
             return false;
         };
-        let vnode_count = cfg.registry.vnode_count();
         self.nodes
             .iter()
             .find(|n| !n.removed && &*n.name == operator)

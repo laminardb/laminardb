@@ -599,21 +599,34 @@ impl LaminarDB {
                 .unwrap_or_else(tokio::runtime::Handle::current),
         );
 
-        // Disk cold tier: when `state_tier_dir` is configured and the
-        // per-vnode capture path is live (cluster shuffle + state backend),
+        // Disk cold tier: when `state_tier_dir` is configured and the per-vnode
+        // capture path can run (a vnode topology + a durable state backend),
         // open the tier, spawn its Ring-1 worker, and share the channel with
         // the graph (promotion) and — below — the coordinator (forced-full
-        // re-uploads) and the callback (demotion trigger). Without the
-        // preconditions a set dir is a loud no-op, never silent data loss.
-        // `set_state_tier` must precede `add_query` so operators built below
-        // pick up the stored sender.
+        // re-uploads) and the callback (demotion trigger). Cluster mode already
+        // installed a vnode count from the shuffle registry; a single node
+        // without a controller gets a fixed local count here, so the tier works
+        // without cluster row transport. The backend stays mandatory — it holds
+        // the demoted truth that restart replays. A set dir without a backend is
+        // a loud no-op, never silent data loss. `set_state_tier` must precede
+        // `add_query` so operators built below pick up the stored sender.
         #[cfg(feature = "state-tier")]
         let state_tier_sender: Option<crate::state_tier::TierTx> = {
             match self.config.state_tier_dir.clone() {
                 Some(dir) => {
                     let has_backend = self.state_backend.lock().is_some();
-                    let has_shuffle = graph.cluster_shuffle_config().is_some();
-                    if has_backend && has_shuffle {
+                    // Cluster mode set the vnode count from the shuffle registry.
+                    // A single node (no controller/shuffle) takes it from its
+                    // vnode registry directly — the same registry the durability
+                    // gate already wired the coordinator from — so per-vnode
+                    // capture and demotion run without cluster row transport.
+                    if graph.vnode_count().is_none() {
+                        if let Some(registry) = self.vnode_registry.lock().clone() {
+                            graph.set_vnode_count(registry.vnode_count());
+                        }
+                    }
+                    let has_topology = graph.vnode_count().is_some();
+                    if has_backend && has_topology {
                         let handle = self
                             .ai_handle
                             .clone()
@@ -640,9 +653,11 @@ impl LaminarDB {
                     } else {
                         tracing::warn!(
                             has_backend,
-                            has_shuffle,
-                            "state_tier_dir set but cluster shuffle and/or state \
-                             backend missing — demotion disabled"
+                            has_topology,
+                            "state_tier_dir set but demotion disabled — the tier \
+                             needs a durable [state] backend (holds demoted state \
+                             for restart) and a vnode registry (single-node: a \
+                             single-owner registry)"
                         );
                         None
                     }

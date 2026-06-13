@@ -129,6 +129,8 @@ pub use handle::{
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
     StreamInfo, TypedSubscription, UntypedSourceHandle,
 };
+#[cfg(feature = "state-tier")]
+pub use metrics::TierMetrics;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};

@@ -180,6 +180,13 @@ impl AggPromotion {
         self.deferred.push_back((watermark, batch));
     }
 
+    /// In-flight fetches or deferred batches still awaiting promotion. The
+    /// operator must keep cycling (even on empty input) while this holds, so
+    /// resolved fetches drain and the held watermark releases.
+    fn has_pending(&self) -> bool {
+        !self.inflight.is_empty() || !self.deferred.is_empty()
+    }
+
     fn take_deferred(&mut self) -> Vec<(i64, RecordBatch)> {
         self.deferred.drain(..).collect()
     }
@@ -243,6 +250,12 @@ pub(crate) struct SqlQueryOperator {
     /// to replay back into `pending_restore` before `lazy_init`.
     #[cfg(feature = "state-tier")]
     pending_cold_rehydrate: Vec<u32>,
+    /// Vnode count for promotion's cold-vnode detection. Set by the graph from
+    /// the shuffle registry (cluster) or the single-node tier count; `1` until
+    /// then. Single-node has no shuffle config to read it from, so it is
+    /// threaded in separately.
+    #[cfg(feature = "state-tier")]
+    vnode_count: u32,
 }
 
 impl SqlQueryOperator {
@@ -275,7 +288,17 @@ impl SqlQueryOperator {
             pending_deferred: Vec::new(),
             #[cfg(feature = "state-tier")]
             pending_cold_rehydrate: Vec::new(),
+            #[cfg(feature = "state-tier")]
+            vnode_count: 1,
         }
+    }
+
+    /// Set the vnode count used by cold-tier promotion to detect rows landing
+    /// on demoted vnodes. Threaded from the graph's topology (shuffle registry
+    /// in cluster mode, or the fixed single-node count).
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
+        self.vnode_count = vnode_count;
     }
 
     /// Install the row-shuffle config. When present and the query
@@ -284,6 +307,10 @@ impl SqlQueryOperator {
     /// `IncrementalAggState`.
     #[cfg(feature = "cluster")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        #[cfg(feature = "state-tier")]
+        {
+            self.vnode_count = config.registry.vnode_count();
+        }
         self.cluster_shuffle = Some(config);
     }
 
@@ -590,10 +617,7 @@ impl SqlQueryOperator {
             QueryState::Agg(ref agg) => agg.num_group_cols(),
             _ => unreachable!("process_with_promotion on non-agg state"),
         };
-        let vnode_count = self
-            .cluster_shuffle
-            .as_ref()
-            .map_or(1, |c| c.registry.vnode_count());
+        let vnode_count = self.vnode_count;
         let cold: FxHashSet<u32> = match self.state {
             QueryState::Agg(ref agg) => agg.cold_vnodes().clone(),
             _ => FxHashSet::default(),
@@ -897,12 +921,21 @@ impl GraphOperator for SqlQueryOperator {
                 // input gracefully (pre-agg on empty → empty pre-agg,
                 // shuffle drain supplies any remote rows).
                 #[cfg(feature = "cluster")]
-                {
-                    if self.cluster_shuffle.is_some() {
-                        return self.execute_agg(input_batches, watermark).await;
-                    }
+                if self.cluster_shuffle.is_some() {
+                    return self.execute_agg(input_batches, watermark).await;
                 }
-                // Single-node: no shuffle to drain — just emit current state.
+                // Cold-tier promotion: resolved fetches must still be drained on
+                // an empty cycle, or a deferred row (single-node, no shuffle to
+                // force execute_agg) waits indefinitely behind its held watermark.
+                #[cfg(feature = "state-tier")]
+                if self
+                    .promotion
+                    .as_ref()
+                    .is_some_and(AggPromotion::has_pending)
+                {
+                    return self.execute_agg(input_batches, watermark).await;
+                }
+                // Otherwise nothing to drain — just emit current state.
                 return self.emit_agg_output(watermark).await;
             }
             return Ok(Vec::new());
