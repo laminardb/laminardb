@@ -1114,11 +1114,16 @@ impl LaminarDB {
                 ts.rebuild_xor_filter(name);
                 ts.set_ready(name, true);
             }
-            // Don't downgrade temporal join tables (Versioned) to Snapshot.
-            if matches!(
-                self.lookup_registry.get_entry(name),
-                Some(laminar_sql::datafusion::RegisteredLookup::Versioned(_))
-            ) {
+            // Setup built the Versioned (temporal-join) state before the
+            // snapshot existed; rebuild it over the snapshot now instead of
+            // downgrading it to a plain Snapshot.
+            let entry = self.lookup_registry.get_entry(name);
+            if let Some(laminar_sql::datafusion::RegisteredLookup::Versioned(v)) = &entry {
+                if let Some(batch) = self.table_store.read().to_record_batch(name) {
+                    if let Some(state) = crate::pipeline_callback::rebuild_versioned_state(v, batch) {
+                        self.lookup_registry.register_versioned(name, state);
+                    }
+                }
             } else if let Some(batch) = self.table_store.read().to_record_batch(name) {
                 self.lookup_registry
                     .register(name, laminar_sql::datafusion::LookupSnapshot { batch });

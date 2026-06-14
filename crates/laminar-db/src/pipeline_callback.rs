@@ -1937,48 +1937,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 }
                             }
                         };
-                        let key_indices: Vec<usize> = versioned
-                            .key_columns
-                            .iter()
-                            .filter_map(|k| combined.schema().index_of(k).ok())
-                            .collect();
-                        let Ok(version_col_idx) =
-                            combined.schema().index_of(&versioned.version_column)
-                        else {
+                        let Some(state) = rebuild_versioned_state(versioned, combined) else {
                             tracing::warn!(
-                                table=%name,
-                                version_col=%versioned.version_column,
-                                "Version column not found; skipping index rebuild"
+                                table=%name, version_col=%versioned.version_column,
+                                "versioned index rebuild skipped (version column missing or build failed)"
                             );
                             continue;
                         };
-                        let index =
-                            match laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
-                                &combined,
-                                &key_indices,
-                                version_col_idx,
-                                versioned.max_versions_per_key,
-                            ) {
-                                Ok(idx) => Arc::new(idx),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        table=%name, error=%e,
-                                        "Versioned index build error"
-                                    );
-                                    continue;
-                                }
-                            };
-                        self.lookup_registry.register_versioned(
-                            name,
-                            laminar_sql::datafusion::VersionedLookupState {
-                                batch: combined,
-                                index,
-                                key_columns: versioned.key_columns.clone(),
-                                version_column: versioned.version_column.clone(),
-                                stream_time_column: versioned.stream_time_column.clone(),
-                                max_versions_per_key: versioned.max_versions_per_key,
-                            },
-                        );
+                        self.lookup_registry.register_versioned(name, state);
                         let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                             #[allow(clippy::cast_possible_truncation)]
@@ -2112,6 +2078,36 @@ fn update_partial_cache_from_batch(
             partial.lookup_cache.insert(key.as_ref(), row_batch);
         }
     }
+}
+
+/// Rebuild a versioned lookup state over `batch`, reusing the prior state's key
+/// and version columns. `None` if the version column is absent or the index
+/// fails to build.
+pub(crate) fn rebuild_versioned_state(
+    prior: &laminar_sql::datafusion::VersionedLookupState,
+    batch: RecordBatch,
+) -> Option<laminar_sql::datafusion::VersionedLookupState> {
+    let key_indices: Vec<usize> = prior
+        .key_columns
+        .iter()
+        .filter_map(|k| batch.schema().index_of(k).ok())
+        .collect();
+    let version_col_idx = batch.schema().index_of(&prior.version_column).ok()?;
+    let index = laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
+        &batch,
+        &key_indices,
+        version_col_idx,
+        prior.max_versions_per_key,
+    )
+    .ok()?;
+    Some(laminar_sql::datafusion::VersionedLookupState {
+        batch,
+        index: Arc::new(index),
+        key_columns: prior.key_columns.clone(),
+        version_column: prior.version_column.clone(),
+        stream_time_column: prior.stream_time_column.clone(),
+        max_versions_per_key: prior.max_versions_per_key,
+    })
 }
 
 /// Encode an Arrow schema as a hex-encoded IPC flatbuffer.
