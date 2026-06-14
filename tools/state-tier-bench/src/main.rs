@@ -132,6 +132,17 @@ fn parse_args() -> Args {
             Mode::Slice => 4 << 20,
         };
     }
+    // Slice keys index a u32 space (see `make_key`); a larger count would
+    // alias every overflowing key onto the same slice and silently
+    // deduplicate the workload. Reject it instead of skewing the benchmark.
+    if matches!(args.mode, Mode::Slice) && args.keys > u64::from(u32::MAX) {
+        eprintln!(
+            "--keys {} exceeds u32::MAX ({}) in slice mode",
+            args.keys,
+            u32::MAX
+        );
+        usage();
+    }
     args
 }
 
@@ -149,7 +160,9 @@ fn make_key(mode: Mode, i: u64, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&i.to_be_bytes());
         }
         Mode::Slice => {
-            buf.extend_from_slice(&u32::try_from(i).unwrap_or(u32::MAX).to_be_bytes());
+            // `parse_args` rejects slice-mode key counts above u32::MAX, so
+            // every `i` fits — no silent aliasing onto a saturated index.
+            buf.extend_from_slice(&u32::try_from(i).unwrap().to_be_bytes());
         }
     }
 }

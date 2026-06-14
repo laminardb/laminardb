@@ -283,9 +283,9 @@ impl LaminarDbBuilder {
     }
 
     /// Enable the disk cold tier at `dir`. With a memory budget set, operator
-    /// state approaching the budget is demoted here instead of
-    /// backpressuring, and fetched back on demand. Requires the `state-tier`
-    /// build feature; ignored without it.
+    /// state approaching the budget is demoted here instead of backpressuring,
+    /// and fetched back on demand. Requires the `state-tier` build feature.
+    #[cfg(feature = "state-tier")]
     #[must_use]
     pub fn state_tier_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.state_tier_dir = Some(dir.into());

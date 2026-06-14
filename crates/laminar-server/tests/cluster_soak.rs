@@ -39,7 +39,7 @@
 //!   then asserts demotion AND promotion counters moved across the
 //!   kill -9 rounds. Knobs (tier mode only): `LAMINAR_SOAK_BUDGET_BYTES`
 //!   (default 256 KiB), `LAMINAR_SOAK_VNODES` (256), `LAMINAR_SOAK_RPS`
-//!   (400), `LAMINAR_SOAK_GROUPS` (4000 — the agg key-space size).
+//!   (400), `LAMINAR_SOAK_GROUPS` (2000 — the agg key-space size).
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;

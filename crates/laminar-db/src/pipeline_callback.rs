@@ -439,7 +439,7 @@ pub(crate) async fn run_demotion_pass(
         };
         let mut plan = Vec::new();
         let mut freed = 0usize;
-        for (vnode, bytes) in coord.demotion_candidates() {
+        for (vnode, _) in coord.demotion_candidates() {
             if plan.len() >= STATE_DEMOTE_MAX_PER_PASS
                 || total_bytes.saturating_sub(freed) < target_bytes
             {
@@ -456,7 +456,9 @@ pub(crate) async fn run_demotion_pass(
             if eligible.is_empty() {
                 continue;
             }
-            freed = freed.saturating_add(bytes);
+            // Credit only the eligible slices' bytes; overcounting ends the pass early.
+            let eligible_bytes: usize = eligible.iter().map(|(_, b)| b.len()).sum();
+            freed = freed.saturating_add(eligible_bytes);
             plan.push((vnode, eligible));
         }
         plan

@@ -593,13 +593,11 @@ impl StreamingCoordinator {
             // the counter on idle timeouts.
             let mut drain_count = 0;
             let drain_budget_ns = self.config.drain_budget_ns;
-            // Over the state memory budget, intake throttles to the one
-            // message the select loop already received: skipping the
-            // coalescing drain leaves the rest queued in the channel
-            // (senders block when it fills) while barriers keep flowing
-            // and operators keep draining state.
+            // Over budget: skip the coalescing drain (queued messages stay in the
+            // channel as backpressure). Holds on idle wakeups too, hence not gated
+            // on `had_data`; `is_backpressured()` bumps a counter, so that is.
             let state_paused = callback.state_over_budget();
-            let backpressured = had_data && (state_paused || callback.is_backpressured());
+            let backpressured = state_paused || (had_data && callback.is_backpressured());
             if backpressured {
                 tracing::debug!("operator graph backpressured — skipping drain");
             }

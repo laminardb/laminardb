@@ -592,21 +592,18 @@ impl CheckpointCoordinator {
         )))
     }
 
-    /// Vnodes eligible for demotion: every recorded slice still
-    /// memory-resident (`Bytes`, not already `Cold`). Returns
-    /// `(vnode, total_bytes)`, largest first — demoting big idle slices
-    /// first frees the most memory. The caller only invokes this with no
-    /// checkpoint in flight, so every recorded upload is already durable.
+    /// Vnodes with at least one `Bytes` (memory-resident) slice, as
+    /// `(vnode, resident_bytes)` over those slices, largest first. Caller
+    /// invokes only with no checkpoint in flight, so every upload is durable.
     #[cfg(feature = "state-tier")]
     pub(crate) fn demotion_candidates(&self) -> Vec<(u32, usize)> {
         let mut out: Vec<(u32, usize)> = self
             .last_vnode_uploads
             .iter()
             .filter(|(_, (_, slices))| {
-                !slices.is_empty()
-                    && slices
-                        .values()
-                        .all(|s| matches!(s, UploadedSlice::Bytes(_)))
+                slices
+                    .values()
+                    .any(|s| matches!(s, UploadedSlice::Bytes(_)))
             })
             .map(|(v, (_, slices))| {
                 let total = slices
