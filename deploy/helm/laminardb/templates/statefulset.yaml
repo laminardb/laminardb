@@ -142,7 +142,7 @@ spec:
               mountPath: /var/lib/laminardb/checkpoints
             {{- if .Values.laminardb.state.tier.enabled }}
             - name: state-tier
-              mountPath: {{ .Values.laminardb.state.tier.path }}
+              mountPath: "{{ .Values.laminardb.state.tier.path }}"
             {{- end }}
             {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
             - name: pgwire-tls

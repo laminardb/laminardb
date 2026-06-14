@@ -47,7 +47,10 @@ nats = ["laminar-connectors/nats"]
 cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
 # Disk cold tier for demoted operator state. Implies `cluster` because the
 # demotion unit is the (operator, vnode) checkpoint slice. fjall's major
-# version is pinned: its on-disk format is a storage-format commitment.
+# version is pinned: its on-disk format is a storage-format commitment. The
+# tier is rebuildable scratch (truth lives in checkpoints; wiped and replayed
+# on restart), so a storage-engine fault costs a rehydration, not data — which
+# bounds the integrity risk of the embedded LSM.
 state-tier = ["cluster", "dep:fjall"]
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]

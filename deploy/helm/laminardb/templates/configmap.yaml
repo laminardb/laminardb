@@ -50,8 +50,8 @@ data:
     {{- with $pg.users }}
 
     [server.pgwire_users]
-    {{- range $user, $pass := . }}
-    {{ $user }} = "{{ $pass }}"
+    {{- range $user, $env := . }}
+    {{ $user }} = {{ printf "${%s}" $env | quote }}
     {{- end }}
     {{- end }}
     {{- end }}

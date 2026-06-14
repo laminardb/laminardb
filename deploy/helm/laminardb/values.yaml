@@ -91,9 +91,11 @@ laminardb:
     bind: "0.0.0.0:5432"
     # -- Required to bind on a non-loopback address (always true in K8s).
     allowRemote: true
-    # -- MD5 auth users. Empty = trust auth (loopback only). Values land in the
-    # -- ConfigMap, so use pre-hashed "md5<hex>" passwords (pg_authid style).
+    # -- MD5 auth users, mapping username -> env var holding the pre-hashed
+    # -- "md5<hex>" password. Supply the env vars from a Secret via extraEnv /
+    # -- extraEnvFrom; only the env reference (not the hash) enters the ConfigMap.
     users: {}
+    #   alice: PGWIRE_ALICE   # then set PGWIRE_ALICE=md5<hex> from a Secret
     # -- Concurrent session cap.
     maxConnections: 256
     # -- Per-IP auth failures per 60s window (0 disables).

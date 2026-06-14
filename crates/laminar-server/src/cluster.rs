@@ -453,6 +453,16 @@ pub async fn start_cluster(
     }
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
+        // The tier replays demoted state from [state] on restart, so a
+        // non-durable (in-process) backend would lose it.
+        if !config.state.is_durable() {
+            return Err(ClusterStartupError::EngineConstruction(
+                "state_tier_dir requires a durable [state] backend (a local path \
+                 or object store); an in-process backend would lose demoted state \
+                 on restart"
+                    .to_string(),
+            ));
+        }
         // Demotion is budget-driven; with no budget the tier never demotes,
         // so a dir alone is a silent no-op.
         if config.server.state_memory_budget_bytes.is_none() {
