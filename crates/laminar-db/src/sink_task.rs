@@ -13,9 +13,7 @@ use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming::Producer;
 use tokio::task::JoinHandle;
 
-/// Cloneable async sender for the sink command channel.
 type SinkCommandTx = MAsyncTx<mpsc::Array<SinkCommand>>;
-/// Single-consumer async receiver for the sink command channel.
 type SinkCommandRx = AsyncRx<mpsc::Array<SinkCommand>>;
 
 /// Default capacity for the sink command channel.
@@ -24,13 +22,9 @@ pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 /// Default periodic flush interval for sink tasks.
 pub(crate) const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Capacity of the sink event channel. Events are exception-path; a
-/// generous bound is fine and avoids unbounded growth on stuck drains.
 pub(crate) const SINK_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// Out-of-band events emitted by a sink task. Drained once per cycle by
-/// the pipeline callback to update metrics and suppress checkpoints.
-/// Fields are read via `Debug` when the drain loop logs them.
+/// Out-of-band events emitted by a sink task; drained once per cycle.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum SinkEvent {
@@ -51,10 +45,8 @@ pub(crate) enum SinkEvent {
     },
 }
 
-/// Configuration for spawning a sink task.
 pub(crate) struct SinkTaskConfig {
     pub name: String,
-    /// Stable identifier carried in [`SinkEvent`]s.
     pub sink_id: Arc<str>,
     pub connector: Box<dyn SinkConnector>,
     pub exactly_once: bool,
@@ -64,46 +56,37 @@ pub(crate) struct SinkTaskConfig {
     pub event_tx: Producer<SinkEvent>,
 }
 
-/// Commands sent to a sink's dedicated task.
 pub(crate) enum SinkCommand {
-    /// Write a batch to the sink.
-    WriteBatch { batch: RecordBatch },
-    /// Begin a new epoch (starts Kafka transaction for exactly-once sinks).
+    WriteBatch {
+        batch: RecordBatch,
+    },
     BeginEpoch {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// Explicitly flush buffered data (test-only).
     #[cfg(test)]
     Flush {
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// Checkpoint 2PC phase 1: flush and prepare.
     PreCommit {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// Checkpoint 2PC phase 2: finalize transaction.
     CommitEpoch {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// Abort a failed epoch. `force = true` (restart/recovery) always
-    /// rolls the connector back; `force = false` (live coordination
-    /// failure) keeps a healthy sink's pending transactional output —
-    /// sources do not rewind on a live abort, so an aborted
-    /// transaction's rows would be lost forever. The next successful
-    /// epoch's commit covers them.
+    /// `force = false` keeps a healthy sink's pending transactional output —
+    /// sources don't rewind on a live abort so those rows must not be discarded.
     RollbackEpoch {
         epoch: u64,
         force: bool,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    /// No-op barrier: acks once every prior command has been processed.
-    /// Used by the pipeline to make sure write results have surfaced as
-    /// `SinkEvent`s before checkpoint suppression decisions.
-    Sync { ack: oneshot::TxOneshot<()> },
-    /// Flush + close the connector and exit the task (test-only).
+    /// Acks once all prior commands have been processed.
+    Sync {
+        ack: oneshot::TxOneshot<()>,
+    },
     #[cfg(test)]
     Close,
 }
@@ -115,14 +98,9 @@ pub(crate) struct SinkTaskHandle {
     sink_id: Arc<str>,
     tx: SinkCommandTx,
     exactly_once: bool,
-    /// Held so `close()` can join the task; implicit shutdown happens
-    /// when the command channel drops. `parking_lot::Mutex` is correct
-    /// here because `close()` extracts the handle under the lock and
-    /// awaits on it *after* dropping the guard — the lock never spans
-    /// an `.await`.
+    // `close()` extracts the handle under the lock then awaits outside it — lock never spans `.await`.
     #[allow(dead_code)]
     task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
-    /// Used by `write_batch` to emit `ChannelClosed` if the task is gone.
     event_tx: Producer<SinkEvent>,
 }
 
@@ -171,14 +149,10 @@ impl SinkTaskHandle {
         }
     }
 
-    /// Builds the error returned when the command channel is closed —
-    /// i.e. the sink task has exited and our `send()` failed.
     fn closed_err(&self) -> ConnectorError {
         ConnectorError::ConnectionFailed(format!("sink task '{}' closed unexpectedly", self.name))
     }
 
-    /// Builds the error returned when the sink task drops its ack sender
-    /// before responding to `op` — usually because the task panicked mid-op.
     fn ack_dropped_err(&self, op: &'static str) -> ConnectorError {
         ConnectorError::ConnectionFailed(format!(
             "sink task '{}' dropped {op} acknowledgment",
@@ -186,9 +160,7 @@ impl SinkTaskHandle {
         ))
     }
 
-    /// Sends a batch to be written. Backpressures via the bounded channel
-    /// when the sink task is behind. On channel-closed, emits
-    /// `SinkEvent::ChannelClosed` and returns an error.
+    /// Send a batch; backpressures when the sink is behind.
     pub async fn write_batch(&self, batch: RecordBatch) -> Result<(), ConnectorError> {
         self.tx
             .send(SinkCommand::WriteBatch { batch })
@@ -201,8 +173,7 @@ impl SinkTaskHandle {
             })
     }
 
-    /// Sends a no-op `Sync` barrier and waits for the sink task to ack.
-    /// When it returns, every previously queued command has been processed.
+    /// Wait until all previously queued commands have been processed.
     pub async fn sync(&self) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -212,10 +183,7 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("sync"))
     }
 
-    /// Begins a new epoch (starts a Kafka transaction for exactly-once sinks).
-    ///
-    /// Must be called before `write_batch()` for each epoch when using
-    /// exactly-once delivery. For at-least-once sinks this is a no-op.
+    /// Begin a new epoch; starts a transaction for exactly-once sinks.
     pub async fn begin_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -227,10 +195,6 @@ impl SinkTaskHandle {
             .map_err(|_| self.ack_dropped_err("begin-epoch"))?
     }
 
-    /// Requests an explicit flush and waits for acknowledgment.
-    ///
-    /// Not called on the normal shutdown path (channel drop triggers
-    /// flush implicitly in `run_sink_task`). Available for manual use.
     #[cfg(test)]
     pub async fn flush(&self) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
@@ -241,7 +205,7 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("flush"))?
     }
 
-    /// Checkpoint 2PC phase 1: pre-commit.
+    /// 2PC phase 1: flush and prepare.
     pub async fn pre_commit(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -253,7 +217,7 @@ impl SinkTaskHandle {
             .map_err(|_| self.ack_dropped_err("pre-commit"))?
     }
 
-    /// Checkpoint 2PC phase 2: commit epoch.
+    /// 2PC phase 2: finalize the transaction.
     pub async fn commit_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -263,8 +227,7 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("commit"))?
     }
 
-    /// Roll the connector back unconditionally (restart/recovery, or
-    /// cleanup of a partially-begun epoch).
+    /// Roll back unconditionally (restart/recovery path).
     pub async fn rollback_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -278,10 +241,7 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("rollback"))?
     }
 
-    /// Live coordination failure: abandon the epoch but keep a healthy
-    /// sink's pending transactional output for the next epoch's commit
-    /// (see [`SinkCommand::RollbackEpoch`]). Rolls back for real only
-    /// if the sink itself failed (poisoned epoch).
+    /// Live coordination failure: keep pending output unless the epoch is poisoned.
     pub async fn abandon_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -295,29 +255,20 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("abandon"))?
     }
 
-    /// Signals the sink task to close and waits for it to finish (30s timeout).
-    ///
-    /// Not called on the normal shutdown path — dropping the `SinkTaskHandle`
-    /// closes the command channel, which triggers flush+close in `run_sink_task`.
-    /// This method is for explicit shutdown when you need to wait for completion.
     #[cfg(test)]
     pub async fn close(&self) {
         let _ = self.tx.send(SinkCommand::Close).await;
-        // Extract under the lock, release before awaiting. Keeps the
-        // lock scope a handful of ns instead of seconds.
         let handle = self.task.lock().take();
         if let Some(handle) = handle {
             let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
         }
     }
 
-    /// Returns whether this sink supports exactly-once semantics.
     pub fn exactly_once(&self) -> bool {
         self.exactly_once
     }
 }
 
-/// Owned state for a single sink task. Constructed by `spawn`.
 struct SinkTaskInner {
     name: String,
     sink_id: Arc<str>,
@@ -328,15 +279,12 @@ struct SinkTaskInner {
     event_tx: Producer<SinkEvent>,
 }
 
-/// Main loop for a sink task. Owns the `SinkConnector` exclusively.
-/// `epoch_poisoned` is local: `pre_commit`/`commit_epoch` reject poisoned
-/// epochs, which the coordinator surfaces and turns into `rollback_sinks`.
+// `epoch_poisoned` causes `pre_commit`/`commit_epoch` to fail so the coordinator rolls back.
 #[allow(clippy::too_many_lines)]
 async fn run_sink_task(mut inner: SinkTaskInner) {
     let mut flush_timer = tokio::time::interval(inner.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Skip the first immediate tick.
-    flush_timer.tick().await;
+    flush_timer.tick().await; // skip the first immediate tick
 
     let preserves_pending_on_abandon = inner.sink.capabilities().preserves_pending_on_abandon;
     let mut current_epoch: u64 = 0;
@@ -346,7 +294,6 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
         tokio::select! {
             cmd = inner.rx.recv() => {
                 let Ok(cmd) = cmd else {
-                    // All senders dropped — shut down gracefully.
                     tracing::debug!(sink = %inner.name, "Sink command channel closed");
                     if let Err(e) = inner.sink.flush().await {
                         tracing::warn!(sink = %inner.name, error = %e,
@@ -432,12 +379,6 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                         ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch, force, ack } => {
-                        // Keeping pending output across an abandoned
-                        // epoch is only sound when the CONNECTOR says
-                        // so (`preserves_pending_on_abandon`, e.g. a
-                        // Kafka transactional producer); a staging-style
-                        // sink must roll back or its per-epoch state
-                        // diverges.
                         let result = if force
                             || !preserves_pending_on_abandon
                             || epoch_poisoned.load(Ordering::Acquire)
@@ -478,10 +419,6 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                 }
             }
             _ = flush_timer.tick() => {
-                // `SinkConnector::flush` is contract-bound to be internally
-                // bounded; wrapping it in an outer tokio timeout here used
-                // to orphan `spawn_blocking` flush tasks on the blocking
-                // pool when the backstop fired before the inner deadline.
                 if let Err(e) = inner.sink.flush().await {
                     tracing::warn!(sink = %inner.name, error = %e, "Periodic sink flush error");
                 }

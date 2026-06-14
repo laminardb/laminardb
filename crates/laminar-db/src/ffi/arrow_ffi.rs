@@ -12,24 +12,10 @@ use crate::api::ApiError;
 
 /// Export a `RecordBatch` to the Arrow C Data Interface.
 ///
-/// The batch is exported as a struct array (Arrow convention for record batches).
-/// The caller must allocate the `ArrowArray` and `ArrowSchema` structs before calling.
-///
-/// # Arguments
-///
-/// * `batch` - Record batch to export
-/// * `out_array` - Pointer to caller-allocated `ArrowArray` struct
-/// * `out_schema` - Pointer to caller-allocated `ArrowSchema` struct
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `batch` must be a valid batch handle
-/// * `out_array` and `out_schema` must be valid pointers to uninitialized structs
-/// * Caller must eventually call the release callbacks on both structs
+/// `batch`, `out_array`, and `out_schema` must be valid non-null pointers;
+/// caller must call the release callbacks on both output structs.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_batch_export(
     batch: *mut LaminarRecordBatch,
@@ -42,17 +28,14 @@ pub unsafe extern "C" fn laminar_batch_export(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: batch is non-null (checked above)
     let batch_ref = unsafe { &(*batch) };
     let record_batch = batch_ref.inner();
 
-    // Convert RecordBatch to StructArray for export (Arrow convention)
     let struct_array: StructArray = record_batch.clone().into();
     let data = struct_array.into_data();
 
     match to_ffi(&data) {
         Ok((array, schema)) => {
-            // SAFETY: out_array and out_schema are non-null (checked above)
             unsafe {
                 std::ptr::write(out_array, array);
                 std::ptr::write(out_schema, schema);
@@ -68,22 +51,9 @@ pub unsafe extern "C" fn laminar_batch_export(
 
 /// Export just the schema to the Arrow C Data Interface.
 ///
-/// Useful when consumers need the schema before receiving data.
-///
-/// # Arguments
-///
-/// * `schema` - Schema to export
-/// * `out_schema` - Pointer to caller-allocated `ArrowSchema` struct
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `schema` must be a valid schema handle
-/// * `out_schema` must be a valid pointer to an uninitialized struct
-/// * Caller must eventually call the release callback
+/// `schema` and `out_schema` must be valid non-null pointers; caller must call the release callback.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_schema_export(
     schema: *mut LaminarSchema,
@@ -95,12 +65,10 @@ pub unsafe extern "C" fn laminar_schema_export(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: schema is non-null (checked above)
     let schema_ref = unsafe { (*schema).schema() };
 
     match FFI_ArrowSchema::try_from(schema_ref.as_ref()) {
         Ok(ffi_schema) => {
-            // SAFETY: out_schema is non-null (checked above)
             unsafe {
                 std::ptr::write(out_schema, ffi_schema);
             }
@@ -117,23 +85,10 @@ pub unsafe extern "C" fn laminar_schema_export(
 
 /// Export a single column from a `RecordBatch` to the Arrow C Data Interface.
 ///
-/// # Arguments
-///
-/// * `batch` - Record batch containing the column
-/// * `column_index` - Zero-based index of the column to export
-/// * `out_array` - Pointer to caller-allocated `ArrowArray` struct
-/// * `out_schema` - Pointer to caller-allocated `ArrowSchema` struct
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `batch` must be a valid batch handle
-/// * `column_index` must be less than the number of columns
-/// * `out_array` and `out_schema` must be valid pointers
-/// * Caller must eventually call the release callbacks
+/// `batch`, `out_array`, and `out_schema` must be valid non-null pointers;
+/// `column_index` must be in range; caller must call the release callbacks.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_batch_export_column(
     batch: *mut LaminarRecordBatch,
@@ -147,7 +102,6 @@ pub unsafe extern "C" fn laminar_batch_export_column(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: batch is non-null (checked above)
     let batch_ref = unsafe { &(*batch) };
     let record_batch = batch_ref.inner();
 
@@ -164,7 +118,6 @@ pub unsafe extern "C" fn laminar_batch_export_column(
 
     match to_ffi(&data) {
         Ok((array, schema)) => {
-            // SAFETY: out_array and out_schema are non-null (checked above)
             unsafe {
                 std::ptr::write(out_array, array);
                 std::ptr::write(out_schema, schema);
@@ -180,26 +133,12 @@ pub unsafe extern "C" fn laminar_batch_export_column(
     }
 }
 
-/// Import a `RecordBatch` from the Arrow C Data Interface.
-///
-/// Takes ownership of the `ArrowArray` and `ArrowSchema` structs.
-/// The release callbacks will be called automatically.
-///
-/// # Arguments
-///
-/// * `array` - Pointer to `ArrowArray` struct (ownership transferred)
-/// * `schema` - Pointer to `ArrowSchema` struct (ownership transferred)
-/// * `out` - Pointer to receive the new batch handle
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Import a `RecordBatch` from the Arrow C Data Interface, taking ownership of both structs.
 ///
 /// # Safety
 ///
-/// * `array` and `schema` must be valid Arrow C Data Interface structs
-/// * Ownership is transferred - the structs will be released by this function
-/// * `out` must be a valid pointer
+/// `array`, `schema`, and `out` must be valid non-null pointers;
+/// ownership of `array` and `schema` is transferred and they are released by this function.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_batch_import(
     array: *mut FFI_ArrowArray,
@@ -212,13 +151,10 @@ pub unsafe extern "C" fn laminar_batch_import(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: array and schema are non-null (checked above)
-    // Take ownership by reading the structs
     let ffi_array = unsafe { std::ptr::read(array) };
     let ffi_schema = unsafe { std::ptr::read(schema) };
 
-    // Clear the original pointers to prevent double-free
-    // (The consumer should not use these after calling import)
+    // Zero the originals to prevent double-free; callers must not use them after this.
     unsafe {
         std::ptr::write_bytes(array, 0, 1);
         std::ptr::write_bytes(schema, 0, 1);
@@ -226,12 +162,10 @@ pub unsafe extern "C" fn laminar_batch_import(
 
     match from_ffi(ffi_array, &ffi_schema) {
         Ok(data) => {
-            // Convert ArrayData to StructArray then to RecordBatch
             let struct_array = StructArray::from(data);
             let batch = RecordBatch::from(struct_array);
 
             let handle = Box::new(LaminarRecordBatch::new(batch));
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = Box::into_raw(handle) };
             LAMINAR_OK
         }
@@ -242,14 +176,11 @@ pub unsafe extern "C" fn laminar_batch_import(
     }
 }
 
-/// Create a `RecordBatch` from Arrow C Data Interface for writing.
-///
-/// This is an alias for `laminar_batch_import` for clarity when the
-/// intent is to create data for writing rather than receiving query results.
+/// Alias for [`laminar_batch_import`] for use when creating data for writing.
 ///
 /// # Safety
 ///
-/// Same requirements as `laminar_batch_import`.
+/// Same requirements as [`laminar_batch_import`].
 #[no_mangle]
 pub unsafe extern "C" fn laminar_batch_create(
     array: *mut FFI_ArrowArray,

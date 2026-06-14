@@ -18,15 +18,12 @@ use tokio::sync::oneshot;
 use super::StateTierStore;
 use crate::error::DbError;
 
-/// Multi-producer sender for cold-tier requests — the compute thread
-/// (promotion), the coordinator (forced-full re-uploads), and the pipeline
-/// callback (demotion) all submit through one channel.
+/// Multi-producer sender for cold-tier requests.
 pub(crate) type TierTx = crossfire::MAsyncTx<crossfire::mpsc::Array<TierRequest>>;
 type TierRx = crossfire::AsyncRx<crossfire::mpsc::Array<TierRequest>>;
 
-/// One request to the tier. Each carries a reply channel; demotion waits on
-/// it (groups must not leave memory until the slice is durably written),
-/// while `Drop` callers may ignore it (best-effort cleanup).
+/// One request to the cold tier. Demotion awaits the reply before releasing memory;
+/// Drop callers may ignore it for best-effort cleanup.
 pub(crate) enum TierRequest {
     Demote {
         operator: Arc<str>,
@@ -47,10 +44,7 @@ pub(crate) enum TierRequest {
 }
 
 /// Spawn the worker on `runtime` and return its request channel.
-///
-/// The channel is bounded; submitters on the compute thread must use
-/// `try_send` and treat a full channel as backpressure (defer and retry
-/// next cycle), never block.
+/// The channel is bounded; compute-thread submitters must use `try_send` and back off on full.
 pub(crate) fn spawn_worker(
     runtime: &tokio::runtime::Handle,
     store: Arc<StateTierStore>,
@@ -62,7 +56,6 @@ pub(crate) fn spawn_worker(
 }
 
 async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
-    // `recv` errors once every sender has dropped (pipeline shutdown).
     while let Ok(req) = rx.recv().await {
         let store = Arc::clone(&store);
         match req {

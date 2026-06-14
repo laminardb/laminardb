@@ -31,16 +31,8 @@ enum SinkFilterDispatch {
     None,
 }
 
-/// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
-/// the event-driven pipeline coordinator to the rest of the database (stream
-/// executor, sinks, watermarks, checkpoints, table sources).
-///
-/// `ConnectorPipelineCallback` runs on a dedicated single-threaded tokio runtime
-/// (laminar-compute thread). Serialization and checkpoint I/O run inline because:
-/// 1. `tokio::spawn` on `current_thread` has no parallelism benefit
-/// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
-/// 3. The compute thread is dedicated — blocking is acceptable
-// Throttled (~once/10s) WARN so silent watermark drops are diagnosable.
+/// Bridges the coordinator to the rest of the database (sinks, watermarks, checkpoints).
+// Throttled WARN so silent watermark drops are diagnosable.
 fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize) {
     static THROTTLE: crate::log_throttle::LogThrottle =
         crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
@@ -57,18 +49,14 @@ fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize
     );
 }
 
-/// Bounded subscription-routing channel depth; drop-on-full caps memory when a
-/// subscriber peer stalls.
+/// Subscription routing channel depth; drop-on-full caps memory when a subscriber stalls.
 #[cfg(feature = "cluster")]
 const SUB_ROUTE_CAPACITY: usize = 1024;
 
-/// Per-peer send timeout in the routing consumer, so one slow peer can't
-/// head-of-line block delivery to the others.
+/// Per-peer send timeout so one slow peer can't head-of-line block others.
 #[cfg(feature = "cluster")]
 const SUB_ROUTE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Throttled (~once/10s) WARN when subscription routing drops a batch, tagged
-/// with `cause` so a full queue isn't confused with a slow peer.
 #[cfg(feature = "cluster")]
 fn warn_subscription_route_drop(cause: &str) {
     static THROTTLE: crate::log_throttle::LogThrottle =
@@ -78,9 +66,7 @@ fn warn_subscription_route_drop(cause: &str) {
     }
 }
 
-/// Releases an in-flight epoch's admission slot and staged-bytes
-/// budget on drop, so a panicking tail can't leave them leaked and
-/// permanently stall checkpoint admission.
+/// RAII guard that releases an epoch's admission slot and staged-byte budget on drop.
 struct EpochInFlightGuard {
     in_flight: Arc<std::sync::atomic::AtomicU64>,
     staged_bytes: Arc<std::sync::atomic::AtomicU64>,
@@ -88,7 +74,7 @@ struct EpochInFlightGuard {
 }
 
 impl EpochInFlightGuard {
-    /// Claim one admission slot and `bytes` of the staged budget.
+    /// Claim one admission slot and `bytes` of staged budget.
     fn claim(
         in_flight: &Arc<std::sync::atomic::AtomicU64>,
         staged_bytes: &Arc<std::sync::atomic::AtomicU64>,
@@ -113,8 +99,7 @@ impl Drop for EpochInFlightGuard {
     }
 }
 
-/// Everything the leader's spawned durable tail needs
-/// (see [`ConnectorPipelineCallback::run_leader_tail`]).
+/// State for the leader's spawned durable tail.
 struct LeaderTail {
     in_flight: EpochInFlightGuard,
     coordinator:
@@ -127,7 +112,6 @@ struct LeaderTail {
     vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
     fan_out: FxHashMap<String, SourceCheckpoint>,
     local_watermark_ms: Option<i64>,
-    /// `Some` when this node admitted the barrier as cluster leader.
     leader_ids: Option<(u64, u64)>,
     #[cfg(feature = "cluster")]
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -135,10 +119,7 @@ struct LeaderTail {
     quorum_timeout: Duration,
 }
 
-/// Captured-state bytes a pending [`CheckpointRequest`]
-/// (plus per-vnode slices) holds in memory while its epoch is between
-/// capture and upload — the unit the `max_staged_bytes` admission cap
-/// counts.
+/// Bytes held in memory by a pending checkpoint (operator states + per-vnode slices).
 #[allow(clippy::disallowed_types)]
 fn staged_request_bytes(
     request: &crate::checkpoint_coordinator::CheckpointRequest,
@@ -154,26 +135,20 @@ fn staged_request_bytes(
         .flat_map(|m| m.values())
         .map(|s| match s {
             crate::checkpoint_coordinator::StagedSlice::Bytes(b) => b.len(),
-            // Cold slices stage no bytes — they hold tier capacity, not RAM.
+            // Cold slices are on disk; they hold no RAM.
             crate::checkpoint_coordinator::StagedSlice::Cold => 0,
         })
         .sum();
     (ops + vnodes) as u64
 }
 
-/// Follower durable-tail bookkeeping shared between the pipeline task
-/// and the spawned tail task. Epochs
-/// start at 1, so `0` encodes "none".
+/// Follower durable-tail bookkeeping. Epoch `0` encodes "none" (epochs start at 1).
 #[cfg(feature = "cluster")]
 #[derive(Debug, Default)]
 pub(crate) struct FollowerTailState {
-    /// Epoch whose durable tail (prepare + decision wait + 2PC commit)
-    /// is currently running in a background task.
+    /// Epoch whose durable tail is currently running.
     in_flight_epoch: std::sync::atomic::AtomicU64,
-    /// Highest epoch this follower has successfully committed; dedups
-    /// the leader's idempotent `Prepare` re-announcements. Advanced
-    /// only on commit so a failed-then-retried epoch is reprocessed,
-    /// not deduped.
+    /// Highest committed epoch; advanced only on commit so a failed epoch is retried, not deduped.
     committed_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -204,9 +179,7 @@ impl FollowerTailState {
             .store(epoch, std::sync::atomic::Ordering::Release);
     }
 
-    /// Record the tail's outcome. The in-flight slot is cleared only if
-    /// it still belongs to `epoch` so a late-finishing stale tail can't
-    /// clobber a newer epoch's bookkeeping.
+    /// Record the tail's outcome; clears the in-flight slot only if it still belongs to `epoch`.
     fn finish(&self, epoch: u64, committed: bool) {
         if committed {
             self.committed_epoch
@@ -235,7 +208,6 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
     pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
     pub(crate) source_ids: FxHashMap<String, usize>,
-    /// Pre-interned source names keyed by source id; avoids `Arc::from` per cycle.
     pub(crate) source_name_arcs: FxHashMap<usize, Arc<str>>,
     pub(crate) source_wms_buf: FxHashMap<Arc<str>, i64>,
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
@@ -251,63 +223,42 @@ pub(crate) struct ConnectorPipelineCallback {
     )>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
-    /// Mirrors `MvStore::has_any`; read per cycle to skip the write lock.
+    /// Mirrors `MvStore::has_any` so the per-cycle check skips the write lock.
     pub(crate) mv_store_has_any: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     pub(crate) filter_ctx: SessionContext,
     pub(crate) compiled_sink_filters: Vec<SinkFilter>,
     pub(crate) pending_sink_filter_compiles: usize,
     pub(crate) last_checkpoint: std::time::Instant,
-    /// `None` = no automatic checkpointing (manual only via coordinator).
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
-    /// Maximum time to wait for operator state serialization.
     pub(crate) serialization_timeout: Duration,
-    /// Drained once per cycle by `write_to_sinks` to update sink metrics.
     pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
-    /// Set when a sink write times out in this cycle. Suppresses the next
-    /// checkpoint to preserve the replay window.
+    /// Set when a sink write times out; suppresses the next checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
-    /// Cluster control facade. Present only when this instance was
-    /// built with a controller. Used to gate the periodic checkpoint
-    /// trigger on `is_leader()` and to run `follower_checkpoint` on
-    /// non-leaders.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
-    /// Shared follower durable-tail bookkeeping: the epoch whose tail is
-    /// in flight and the highest committed epoch (dedup, advanced only
-    /// on commit — see [`Self::follower_should_skip`]). Epochs awaiting
-    /// local source barriers are tracked separately by
-    /// [`Self::pending_follower_checkpoint`].
+    /// In-flight epoch + highest committed epoch for follower tail dedup.
     #[cfg(feature = "cluster")]
     pub(crate) follower_tail: Arc<FollowerTailState>,
-    /// Local source barrier injectors to trigger follower-side checkpoints.
     #[cfg(feature = "cluster")]
     pub(crate) barrier_injectors: Vec<(
         Arc<str>,
         laminar_core::checkpoint::CheckpointBarrierInjector,
     )>,
-    /// Pending follower checkpoint announcement from gossip, waiting for local sources to align.
     #[cfg(feature = "cluster")]
     pub(crate) pending_follower_checkpoint:
         Option<laminar_core::cluster::control::BarrierAnnouncement>,
-    /// Inbound channel for `db.checkpoint()` requests. The db sends a
-    /// oneshot sender here; on the next cycle the callback captures
-    /// operator state (via `checkpoint_with_barrier`-style path) and
-    /// replies on that sender. Without this, `db.checkpoint()` reaches
-    /// the coordinator with an empty `CheckpointRequest` and the
-    /// leader's manifest is useless for restart recovery.
+    /// Receives `db.checkpoint()` requests; the callback captures state and replies on the oneshot.
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// Stream/MV name → subscribing node ids, written by the gossip poller and
-    /// read each cycle to route output to remote subscribers.
+    /// Stream → subscribing node ids; written by the gossip poller, read each cycle.
     #[cfg(feature = "cluster")]
     pub(crate) active_subs:
         Arc<parking_lot::RwLock<std::collections::HashMap<String, std::collections::HashSet<u64>>>>,
-    /// Ordered single-consumer channel shipping SUBSCRIBE output to remote
-    /// subscribers; one consumer preserves order a per-cycle spawn would not.
+    /// Single-consumer SUBSCRIBE routing channel; one consumer preserves emission order.
     #[cfg(feature = "cluster")]
     pub(crate) sub_route:
         std::sync::OnceLock<tokio::sync::mpsc::Sender<(String, RecordBatch, Vec<u64>)>>,
@@ -315,65 +266,43 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
         crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
     >,
-    /// Count of epochs between admission and restorable (tails still
-    /// running). The streaming coordinator compares it against
-    /// `max_in_flight_epochs` to admit the next barrier.
+    /// In-flight epoch count; the coordinator gates new barriers against `max_in_flight_epochs`.
     pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
-    /// Captured-state bytes held by in-flight epochs; admission pauses
-    /// at `max_staged_bytes`.
     pub(crate) staged_bytes: Arc<std::sync::atomic::AtomicU64>,
-    /// Shared id allocator (cloned from the coordinator) so barrier
-    /// admission claims ids without the coordinator mutex, which an
-    /// earlier epoch's durable tail may hold.
+    /// Lock-free id allocator shared with the coordinator so barrier admission doesn't
+    /// queue behind an earlier epoch's durable tail holding the coordinator mutex.
     pub(crate) epoch_allocator: Option<Arc<crate::checkpoint_coordinator::EpochAllocator>>,
-    /// Copied from `CheckpointConfig` for the pre-mutex quorum stage.
     #[cfg(feature = "cluster")]
     pub(crate) quorum_timeout: Duration,
-    /// True when any registered sink is exactly-once: durable tails
-    /// then run INLINE (pipeline blocked until the commit decision).
-    /// A single transactional producer must not receive post-barrier
-    /// rows while the epoch's transaction is open — an early resume
-    /// would commit them with epoch N and duplicate them on replay.
-    /// Producer pooling is the follow-up that lifts this.
+    /// When true, durable tails run inline so a transactional producer never sees
+    /// post-barrier rows while its epoch-N transaction is still open.
     pub(crate) exactly_once_sinks: bool,
-    /// Node-level cap on total operator state bytes; `None` = unlimited.
-    /// See [`PipelineCallback::state_over_budget`].
     pub(crate) state_memory_budget_bytes: Option<usize>,
-    /// When the budget was last probed (the probe is throttled).
     pub(crate) state_budget_probe_at: std::time::Instant,
-    /// Verdict of the last probe, served between probes.
     pub(crate) state_budget_exceeded: bool,
-    /// Cold-tier request channel; demote candidates over the watermark are
-    /// written here before being dropped from memory. `None` = no tier.
+    /// Cold-tier send channel; `None` = no tier configured.
     #[cfg(feature = "state-tier")]
     pub(crate) state_tier: Option<crate::state_tier::TierTx>,
 }
 
-/// Minimum interval between state-memory-budget probes. Each probe sums
-/// every operator's state estimate and refreshes the state gauges.
+/// Minimum interval between budget probes; each probe walks all operator estimates.
 const STATE_BUDGET_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Fraction of the memory budget at which demotion begins shedding idle
-/// vnodes to the cold tier — below the 100% backpressure point so demotion
-/// relieves pressure before intake stalls.
+/// Demotion begins at 4/5 of the budget — below the 100% backpressure point.
 #[cfg(feature = "state-tier")]
 const STATE_DEMOTE_WATERMARK_NUM: usize = 4;
 #[cfg(feature = "state-tier")]
 const STATE_DEMOTE_WATERMARK_DEN: usize = 5;
-/// Demotion drains down to this fraction of the budget per pass (hysteresis
-/// so it doesn't thrash right at the watermark).
+/// Demotion target per pass: 13/20 of the budget (hysteresis against thrash).
 #[cfg(feature = "state-tier")]
 const STATE_DEMOTE_TARGET_NUM: usize = 13;
 #[cfg(feature = "state-tier")]
 const STATE_DEMOTE_TARGET_DEN: usize = 20;
-/// Cap on vnodes demoted per maintenance pass — bounds the per-pass tier
-/// write volume and keeps the compute thread's maintenance slice short.
+/// Max vnodes demoted per maintenance pass.
 #[cfg(feature = "state-tier")]
 const STATE_DEMOTE_MAX_PER_PASS: usize = 32;
 
-/// Write one demoted slice to the cold tier and wait for confirmation.
-/// `true` = durably written; `false` = the worker is gone or errored (the
-/// caller then leaves the slice resident).
+/// Send a slice to the cold tier; returns `false` if the worker is gone.
 #[cfg(feature = "state-tier")]
 async fn tier_demote(
     tier: &crate::state_tier::TierTx,
@@ -394,8 +323,7 @@ async fn tier_demote(
     matches!(rx.await, Ok(Ok(())))
 }
 
-/// Roll back a tier write when the operator refused to drop the slice (it was
-/// touched since the last capture, so it stays resident).
+/// Roll back a tier write when the operator refused to drop the slice (dirty since capture).
 #[cfg(feature = "state-tier")]
 async fn tier_drop(tier: &crate::state_tier::TierTx, operator: &str, vnode: u32) {
     let (reply, rx) = tokio::sync::oneshot::channel();
@@ -409,17 +337,10 @@ async fn tier_drop(tier: &crate::state_tier::TierTx, operator: &str, vnode: u32)
     }
 }
 
-/// Shed idle vnode slices to the cold tier until projected memory falls below
-/// `target_bytes` (or candidates / the per-pass cap run out). Candidates are
-/// pre-filtered to operators that can demote the vnode now (clean since their
-/// last capture), so a dirty vnode is skipped before any tier I/O. For each
-/// surviving `(operator, vnode)`: persist its durable bytes, then drop the
-/// groups — the drop is still guarded and rolls the write back on the rare
-/// race, but the common dirty case no longer costs a write. Returns the number
-/// of slices demoted.
+/// Demote idle vnode slices to the cold tier until memory falls below `target_bytes`.
 ///
-/// Caller-side safety contract: invoke only with no checkpoint in flight, so
-/// the bytes recorded for a candidate equal the operator's resident state.
+/// Only candidates clean since their last capture are eligible, so dirty vnodes
+/// are skipped before any tier I/O. Must be called with no checkpoint in flight.
 #[cfg(feature = "state-tier")]
 pub(crate) async fn run_demotion_pass(
     graph: &mut crate::operator_graph::OperatorGraph,
@@ -430,8 +351,7 @@ pub(crate) async fn run_demotion_pass(
     total_bytes: usize,
     target_bytes: usize,
 ) -> u64 {
-    // Plan under the coordinator lock: rank idle candidates and copy their
-    // durable slice bytes. Release the lock before any tier I/O.
+    // Build the plan under the lock; release before any tier I/O.
     let plan: Vec<(u32, Vec<(String, bytes::Bytes)>)> = {
         let guard = coordinator.lock().await;
         let Some(coord) = guard.as_ref() else {
@@ -445,9 +365,7 @@ pub(crate) async fn run_demotion_pass(
             {
                 break;
             }
-            // Keep only operators that can demote this vnode *now* (clean since
-            // their last capture). Filtering here, before any tier write, turns
-            // a dirty candidate into a no-op instead of a write-then-rollback.
+            // Pre-filter to operators that can demote now; avoids a write-then-rollback.
             let eligible: Vec<(String, bytes::Bytes)> = coord
                 .slices_for_demotion(vnode)
                 .into_iter()
@@ -456,7 +374,6 @@ pub(crate) async fn run_demotion_pass(
             if eligible.is_empty() {
                 continue;
             }
-            // Credit only the eligible slices' bytes; overcounting ends the pass early.
             let eligible_bytes: usize = eligible.iter().map(|(_, b)| b.len()).sum();
             freed = freed.saturating_add(eligible_bytes);
             plan.push((vnode, eligible));
@@ -485,7 +402,7 @@ pub(crate) async fn run_demotion_pass(
 }
 
 impl ConnectorPipelineCallback {
-    /// `BackpressureFail` raises `shutdown`; coordinator exits via its drain path.
+    /// Map a graph error to a string; `BackpressureFail` also triggers shutdown.
     fn map_graph_error(err: &crate::error::DbError, shutdown: &tokio::sync::Notify) -> String {
         if let crate::error::DbError::BackpressureFail(msg) = err {
             tracing::error!(reason = %msg, "backpressure_policy=Fail tripped; halting pipeline");
@@ -494,10 +411,9 @@ impl ConnectorPipelineCallback {
         format!("{err}")
     }
 
-    /// Cap each source's tracker-reported watermark by the cluster-wide
-    /// minimum, when one has been published. A `None` `cluster_wm`
-    /// leaves the map untouched — blindly capping to MIN would freeze
-    /// every downstream event-time decision and hang the pipeline.
+    /// Cap each source watermark by the cluster-wide min, if one has been published.
+    ///
+    /// `None` leaves the map untouched — capping to `i64::MIN` would freeze the pipeline.
     #[cfg(feature = "cluster")]
     fn cap_source_watermarks_by_cluster_min(
         source_wms: &mut FxHashMap<Arc<str>, i64>,
@@ -511,8 +427,7 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Ship this cycle's output to remote subscribers under the `__sub::<stream>`
-    /// shuffle stage (disjoint from operator stages). No-op without remote interest.
+    /// Route this cycle's output to remote SUBSCRIBE peers. No-op without remote interest.
     #[cfg(feature = "cluster")]
     fn route_to_remote_subscribers(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         use laminar_core::shuffle::ShuffleMessage;
@@ -548,8 +463,7 @@ impl ConnectorPipelineCallback {
             return;
         }
 
-        // One long-lived consumer drains in order so emission order survives to
-        // the peer; a per-cycle spawn would let later batches overtake earlier.
+        // One long-lived consumer preserves emission order to the peer.
         let tx = self.sub_route.get_or_init(|| {
             let (tx, mut rx) =
                 tokio::sync::mpsc::channel::<(String, RecordBatch, Vec<u64>)>(SUB_ROUTE_CAPACITY);
@@ -570,7 +484,7 @@ impl ConnectorPipelineCallback {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
                                 prom.remote_subscription_batches_dropped.inc();
-                                tracing::warn!(node, error = %e, "subscription batch send failed");
+                                tracing::warn!(node, error = %e, "subscription send failed");
                             }
                             Err(_) => {
                                 prom.remote_subscription_batches_dropped.inc();
@@ -582,8 +496,7 @@ impl ConnectorPipelineCallback {
             });
             tx
         });
-        // Bounded, best-effort: if a stalled peer backs the queue up, drop the
-        // batch (subscriptions are at-most-once under backpressure) and warn.
+        // At-most-once under backpressure: drop if the routing queue is full.
         for item in to_send {
             if tx.try_send(item).is_err() {
                 self.prom.remote_subscription_batches_dropped.inc();
@@ -592,25 +505,14 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Follower-side dispatch: poll the leader's announcement, and
-    /// if a fresh PREPARE is visible, capture local state and run
-    /// `CheckpointCoordinator::follower_checkpoint`. Returns `true`
-    /// when a checkpoint was driven this tick.
-    /// Driven by `db.checkpoint()` via the `force_ckpt_rx` channel.
-    /// Captures operator state (plus table/watermark metadata) and
-    /// commits the manifest through the coordinator, returning the
-    /// full `CheckpointResult` for the caller. Mirrors
-    /// `checkpoint_with_barrier` but without the barrier-alignment
-    /// gate — the caller has chosen to take a consistent snapshot
-    /// of whatever state is currently in the accumulators.
+    /// Capture operator state and commit a checkpoint for a `db.checkpoint()` request.
     async fn force_capture_and_checkpoint(
         &mut self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         self.sync_sinks_and_drain_events().await;
 
-        // Ids allocated at alignment must be threaded through to the
-        // checkpoint, otherwise the inner allocation would burn a second
-        // pair and checkpoint a different epoch than was announced.
+        // Thread the pre-allocated ids through; a second allocation would checkpoint
+        // a different epoch than the one announced.
         #[cfg(feature = "cluster")]
         let leader_ids = self.align_shuffle_for_leader().await?;
         #[cfg(not(feature = "cluster"))]
@@ -630,8 +532,6 @@ impl ConnectorPipelineCallback {
             )
         })?;
         coord.set_pending_vnode_states(vnode_states);
-        // Seed leader-side local watermark so `await_prepare_quorum`
-        // can fold it into the cluster-wide min.
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
@@ -655,11 +555,7 @@ impl ConnectorPipelineCallback {
         Ok(result)
     }
 
-    /// Skip a follower `Prepare` for `ann_epoch` only if it is already
-    /// committed (`last_committed`), already awaiting local source
-    /// barriers (`pending`), or its durable tail is already running
-    /// (`tail_in_flight`). Comparisons are monotonic — leaders abandon
-    /// failed epochs, so gaps in the announced sequence are normal.
+    /// `true` when `ann_epoch` is already committed, pending, or in flight.
     #[cfg(feature = "cluster")]
     fn follower_should_skip(
         last_committed: Option<u64>,
@@ -672,17 +568,11 @@ impl ConnectorPipelineCallback {
             || tail_in_flight.is_some_and(|e| e >= ann_epoch)
     }
 
-    /// The leader's durable tail, spawned per admitted barrier
-    /// (`run_leader_tail`). Stage 1 (cluster): capture quorum +
-    /// `Aligned` announce, run *before* the coordinator mutex so the
-    /// resume gate never queues behind an earlier epoch's uploads.
-    /// Stage 2: the durable remainder under the FIFO mutex, which keeps
-    /// epochs restorable in order. Commit completion flows back through
-    /// `complete_tx` (`EpochCommitted` fan-out + wire barrier).
+    /// Leader durable tail: quorum + `Aligned` pre-mutex, then durable writes under the FIFO mutex.
     async fn run_leader_tail(tail: LeaderTail) {
         use crate::checkpoint_coordinator::QuorumStage;
 
-        let _in_flight = tail.in_flight; // released on drop, even on panic
+        let _in_flight = tail.in_flight; // released on drop
 
         #[allow(unused_mut)]
         let mut quorum = QuorumStage::RunInline;
@@ -759,14 +649,9 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Build the follower's durable tail — capture ack, durable
-    /// prepare, decision wait, 2PC commit/rollback. Spawned so the
-    /// pipeline resumes on `Aligned`, or awaited inline for
-    /// exactly-once (see [`Self::exactly_once_sinks`]). The capture
-    /// ack is sent before queuing on the coordinator mutex so the
-    /// leader's quorum never waits on an earlier epoch's uploads.
-    /// Commit completion flows through `checkpoint_complete_tx` — the
-    /// same path the leader's background persist uses.
+    /// Build the follower's durable tail future (ack → prepare → decision wait → 2PC).
+    ///
+    /// Spawned for at-least-once (resumes on `Aligned`) or awaited inline for exactly-once.
     #[cfg(feature = "cluster")]
     fn follower_tail_future(
         &mut self,
@@ -781,9 +666,7 @@ impl ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Acquire);
         self.follower_tail.begin(epoch);
 
-        // Charge the in-flight slot + staged bytes on followers too —
-        // without it, follower memory between capture and upload is
-        // unaccounted and unbounded by the admission caps.
+        // Charge followers too; otherwise their capture-to-upload memory is unaccounted.
         let in_flight = EpochInFlightGuard::claim(
             &self.checkpoint_in_flight,
             &self.staged_bytes,
@@ -796,7 +679,7 @@ impl ConnectorPipelineCallback {
         async move {
             use crate::checkpoint_coordinator::CheckpointCoordinator;
 
-            let _in_flight = in_flight; // released on drop, even on panic
+            let _in_flight = in_flight; // released on drop
 
             let wm_opt = if wm == i64::MIN { None } else { Some(wm) };
             if let Some(ref cc) = cc {
@@ -810,7 +693,6 @@ impl ConnectorPipelineCallback {
                 .ok();
             }
 
-            // Stage 1: durable prepare under the FIFO mutex.
             let decision_store = {
                 let mut guard = coordinator.lock().await;
                 match guard.as_mut() {
@@ -832,9 +714,7 @@ impl ConnectorPipelineCallback {
                 }
             };
 
-            // Stage 2: await the leader's decision WITHOUT the mutex —
-            // the next epoch's prepare/uploads must not queue behind a
-            // wait that can last the full decision timeout.
+            // Await the decision outside the mutex so the next epoch's prepare can proceed.
             let committed = match (decision_store, cc.as_ref()) {
                 (Some(decision_store), Some(cc)) => {
                     let verdict = CheckpointCoordinator::await_follower_decision(
@@ -845,7 +725,6 @@ impl ConnectorPipelineCallback {
                         std::time::Duration::from_secs(10),
                     )
                     .await;
-                    // Stage 3: act on the verdict under the mutex.
                     let mut guard = coordinator.lock().await;
                     match guard.as_mut() {
                         Some(coord) => {
@@ -864,8 +743,6 @@ impl ConnectorPipelineCallback {
                 _ => false,
             };
 
-            // Record only on commit so a failed-then-retried epoch is
-            // reprocessed, not deduped.
             tail.finish(epoch, committed);
             if committed {
                 let _ = complete_tx.send((epoch, fan_out)).await;
@@ -873,15 +750,10 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Block the pipeline until the leader announces `Aligned` for
-    /// `epoch` (full-membership capture quorum): no peer may ship
-    /// epoch-N+1 shuffle rows while another node is still folding
-    /// pre-barrier rows into its epoch-N snapshot. `Commit`, `Abort`,
-    /// or any newer epoch's announcement also releases the gate.
+    /// Hold the pipeline until the leader announces `Aligned` (or `Commit`/`Abort`/newer epoch).
     ///
-    /// No-op without a cross-node shuffle; bounded — on timeout the
-    /// pipeline resumes and the epoch aborts via the leader's gate.
-    /// Associated fn (no `&self`) so callers' futures stay `Send`.
+    /// Prevents epoch-N+1 shuffle rows from reaching a peer still snapshotting epoch-N.
+    /// No-op without a cross-node shuffle; bounded — on timeout the epoch aborts via the leader.
     #[cfg(feature = "cluster")]
     async fn wait_for_aligned_resume(
         has_cluster_shuffle: bool,
@@ -936,8 +808,6 @@ impl ConnectorPipelineCallback {
             return None;
         }
 
-        // Inject barriers into local sources so they flow through this node's
-        // streaming tasks and emit the shuffle barriers required for alignment.
         for (name, injector) in &self.barrier_injectors {
             tracing::debug!(
                 source = %name,
@@ -957,8 +827,6 @@ impl ConnectorPipelineCallback {
             return None;
         }
 
-        // Drain + align the cross-node shuffle on the leader's checkpoint id so
-        // the snapshot includes peers' pre-checkpoint rows.
         {
             let live: Vec<u64> = controller.live_instances().iter().map(|n| n.0).collect();
             let wm = self
@@ -977,10 +845,6 @@ impl ConnectorPipelineCallback {
         let request =
             self.build_checkpoint_request(std::collections::HashMap::new(), &source_offsets);
 
-        // Durable tail off the pipeline task; resume once every node has
-        // captured (Aligned). Completion is reported asynchronously via
-        // `checkpoint_complete_tx`, so there is no epoch to return here.
-        // Exactly-once runs the tail inline (see `exactly_once_sinks`).
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
@@ -1006,8 +870,6 @@ impl ConnectorPipelineCallback {
     ) -> crate::pipeline::BarrierOutcome {
         use crate::pipeline::BarrierOutcome;
 
-        // Owned clone: `controller` outlives the `&mut self` calls below
-        // (state capture, tail spawn) without borrowing `self`.
         let Some(controller) = self.cluster_controller.clone() else {
             return BarrierOutcome::Failed;
         };
@@ -1038,13 +900,6 @@ impl ConnectorPipelineCallback {
         };
         let request = self.build_checkpoint_request(operator_states, &source_checkpoints);
 
-        // Durable tail (pre-commit + manifest + uploads + decision wait
-        // + 2PC) off the pipeline task; resume processing once every
-        // node has captured (Aligned) instead of stalling until Commit.
-        // Commit completion flows through `checkpoint_complete_tx`
-        // (EpochCommitted fan-out + wire barrier), so the outcome here
-        // is Async, not Committed. Exactly-once runs the tail inline
-        // (see `run_follower_checkpoint_deferred`).
         let stall_start = std::time::Instant::now();
         let epoch = ann.epoch;
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
@@ -1063,15 +918,10 @@ impl ConnectorPipelineCallback {
         BarrierOutcome::Async
     }
 
-    /// Leader-side barrier admission: allocate this barrier's ids
-    /// (lock-free — an earlier epoch's durable tail may hold the
-    /// coordinator mutex), announce `Prepare` so followers begin
-    /// aligning, then drain + align the cross-node shuffle so the
-    /// snapshot includes peers' pre-barrier rows. Returns the allocated
-    /// `(epoch, checkpoint_id)`; `None` when this node isn't the
-    /// cluster leader or no coordinator is wired. On alignment failure
-    /// the allocated epoch is abandoned (Abort + rollback + next epoch
-    /// begun).
+    /// Allocate barrier ids, announce `Prepare`, and align the cross-node shuffle.
+    ///
+    /// Returns `None` when not the leader or no coordinator is wired. On alignment
+    /// failure the epoch is abandoned.
     #[cfg(feature = "cluster")]
     async fn align_shuffle_for_leader(&mut self) -> Result<Option<(u64, u64)>, DbError> {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
@@ -1118,11 +968,7 @@ impl ConnectorPipelineCallback {
         Ok(Some((epoch, checkpoint_id)))
     }
 
-    /// Assemble a [`CheckpointRequest`](crate::checkpoint_coordinator::CheckpointRequest)
-    /// from the given operator states and barrier-captured source
-    /// offsets, folding in table-source offsets and per-source
-    /// watermarks. Shared by every checkpoint entry point (leader
-    /// barrier, follower, timer, forced).
+    /// Build a `CheckpointRequest` from operator states and source offsets.
     fn build_checkpoint_request(
         &self,
         operator_states: std::collections::HashMap<String, bytes::Bytes>,
@@ -1169,7 +1015,6 @@ impl ConnectorPipelineCallback {
             Ok(None) => return Ok(operator_states),
             Err(e) => return Err(format!("snapshot failed: {e}")),
         };
-        // Offload CPU-bound serialization to blocking thread pool.
         let timeout = self.serialization_timeout;
         let bytes = tokio::time::timeout(
             timeout,
@@ -1183,7 +1028,6 @@ impl ConnectorPipelineCallback {
         .map_err(|e| format!("serialize error: {e}"))?;
         operator_states.insert("operator_graph".to_string(), bytes::Bytes::from(bytes));
 
-        // Serialize MV result store — each MV gets its own entry keyed "mv:{name}".
         let mv_states = self
             .mv_store
             .read()
@@ -1194,12 +1038,10 @@ impl ConnectorPipelineCallback {
         Ok(operator_states)
     }
 
-    /// Per-vnode operator-state slices for the in-flight checkpoint
-    /// (`vnode → operator_name → bytes`), staged on the coordinator so each
-    /// owned vnode's `partial.bin` carries real, rehydratable state. Empty
-    /// outside cluster mode. Best-effort: a snapshot error logs and yields an
-    /// empty map — the partial then carries no operator state for that epoch,
-    /// exactly as the legacy marker did, so the checkpoint still succeeds.
+    /// Capture per-vnode operator state for the in-flight checkpoint.
+    ///
+    /// Empty outside cluster mode. On error, logs and returns an empty map so the
+    /// checkpoint still succeeds (the partial carries no operator state for this epoch).
     #[allow(clippy::unused_self, clippy::disallowed_types)] // matches the coordinator/graph map shape
     fn capture_vnode_states(&mut self) -> crate::checkpoint_coordinator::StagedVnodeStates {
         #[cfg(feature = "cluster")]
@@ -1221,9 +1063,7 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Wait for every sink to finish processing previously-enqueued
-    /// `WriteBatch` commands, then drain any `SinkEvent`s they produced.
-    /// Callers rely on `sink_timed_out` being current after this returns.
+    /// Sync all sinks and drain their events; `sink_timed_out` is current after this returns.
     async fn sync_sinks_and_drain_events(&mut self) {
         let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
             let name = name.clone();
@@ -1238,8 +1078,6 @@ impl ConnectorPipelineCallback {
         self.drain_sink_events();
     }
 
-    /// Non-blocking drain of `sink_event_rx` into Prometheus counters and
-    /// `sink_timed_out`.
     fn drain_sink_events(&mut self) {
         while let Ok(event) = self.sink_event_rx.try_recv() {
             tracing::debug!(?event, "sink event");
@@ -1341,8 +1179,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
-        // Cluster mode: ship this cycle's output to any remote nodes holding a
-        // SUBSCRIBE interest before publishing to local subscribers below.
         #[cfg(feature = "cluster")]
         self.route_to_remote_subscribers(results);
 
@@ -1365,10 +1201,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        // Ephemeral/dynamic streams (e.g. console live queries) have no
-        // downstream sink, so they aren't in `stream_sources` and the loop
-        // above never forwards them — push their batches to any subscribers.
-        // MVs are skipped here; they reach subscribers via their own path.
+        // Ephemeral streams (console live queries) aren't in `stream_sources`; push them here.
+        // MVs reach subscribers via their own path below.
         let mv_has_any = self
             .mv_store_has_any
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1430,7 +1264,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         self.compile_pending_sink_filters(results).await;
 
-        // Share per-stream batches across sinks so fan-out doesn't reclone the Vec.
+        // Shared Arc per stream so multiple sinks don't each clone the Vec.
         let mut shared_inputs: FxHashMap<&str, Arc<[RecordBatch]>> = FxHashMap::default();
 
         let sink_futures: Vec<_> = self
@@ -1439,7 +1273,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .enumerate()
             .filter_map(
                 |(sink_idx, (sink_name, handle, _filter_sql, sink_input, changelog_capable))| {
-                    // Route by FROM clause: only send matching results.
                     let batches = results.get(sink_input.as_str())?;
                     if batches.is_empty() {
                         return None;
@@ -1450,7 +1283,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         .clone();
                     let sink_name = sink_name.clone();
                     let handle = handle.clone();
-                    // Rejected → drop (fail-closed). Pending → None (no filter SQL set).
                     let filter_state = match self.compiled_sink_filters.get(sink_idx).cloned() {
                         Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
                         Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
@@ -1508,14 +1340,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .collect();
         futures::future::join_all(sink_futures).await;
 
-        // Opportunistic; the strict "all prior writes settled" barrier
-        // runs in the checkpoint paths, not on every cycle.
+        // Opportunistic; the strict barrier runs in the checkpoint path.
         self.drain_sink_events();
     }
 
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
         if let Some(wm_state) = self.watermark_states.get_mut(source_name) {
-            // Check external watermarks from Source::watermark() calls.
             if let Some(entry) = self.source_entries_for_wm.get(source_name) {
                 let external_wm = entry.source.current_watermark();
                 if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
@@ -1536,7 +1366,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
 
-            // Extract watermark from batch data.
             if let Ok(max_ts) = wm_state.extractor.extract(batch) {
                 if let Some(wm) = wm_state.generator.on_event(max_ts) {
                     if let Some(entry) = self.source_entries_for_wm.get(source_name) {
@@ -1560,7 +1389,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        // Update ingestion counters.
         #[allow(clippy::cast_possible_truncation)]
         let row_count = batch.num_rows() as u64;
         self.prom.events_ingested.inc_by(row_count);
@@ -1569,10 +1397,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
         if let Some(wm_state) = self.watermark_states.get(source_name) {
-            // A processing-time watermark is wall-clock, not derived from the event
-            // column — every real (past) timestamp is "older than" it, so filtering
-            // would drop all rows. Windows still close on the wall-clock watermark;
-            // window-level late handling applies downstream.
+            // Processing-time watermarks are wall-clock; filtering would drop every real row.
             if wm_state.generator.is_processing_time() {
                 return Some(batch.clone());
             }
@@ -1602,7 +1427,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         return out;
                     }
                     Err(e) => {
-                        // Schema drift, not lateness: fail-safe drop + error.
+                        // Schema drift, not lateness.
                         tracing::error!(
                             source = source_name,
                             column = %wm_state.column,
@@ -1614,7 +1439,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         }
-        // No watermark configured → pass through all rows.
         Some(batch.clone())
     }
 
@@ -1637,8 +1461,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let Some(ref mut trk) = self.tracker else {
             return;
         };
-        // Drive periodic generators (ProcessingTime) and pull external
-        // `Source::watermark()` so a quiet source still advances the frontier.
         for (name, state) in &mut self.watermark_states {
             if let Some(wm) = state.generator.on_periodic() {
                 if let Some(&id) = self.source_ids.get(name) {
@@ -1664,8 +1486,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         }
-        // `update_combined` is monotone, so a re-activating source with an
-        // older watermark can't regress the combined value.
         if let Some(global) = trk.check_idle_sources() {
             self.pipeline_watermark
                 .store(global.timestamp(), std::sync::atomic::Ordering::Relaxed);
@@ -1682,25 +1502,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    /// Timer-based checkpoint (at-least-once semantics).
-    ///
-    /// Source offsets are captured BEFORE operator state. On recovery:
-    /// consumer replays from offset → operator may re-process some
-    /// records. This is correct for at-least-once but NOT exactly-once.
-    /// For exactly-once, use barrier-aligned checkpoints instead.
+    /// Timer-based checkpoint (at-least-once). For exactly-once use barrier-aligned checkpoints.
     async fn maybe_checkpoint(
         &mut self,
         force: bool,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64> {
-        // Drain any pending `db.checkpoint()` requests first. Each
-        // request gets a capture of operator state (the same path the
-        // periodic barrier-aligned checkpoint uses), committed through
-        // the coordinator, and the full `CheckpointResult` returned on
-        // the oneshot. Without this, `db.checkpoint()` reaches the
-        // coordinator with an empty `CheckpointRequest` and the
-        // manifest has no operator state — restart loses every
-        // `IncrementalAggState` accumulator on the invoking node.
+        // Drain `db.checkpoint()` requests; each gets a full operator-state capture.
         let mut force_reqs: Vec<
             crossfire::oneshot::TxOneshot<
                 Result<crate::checkpoint_coordinator::CheckpointResult, DbError>,
@@ -1717,24 +1525,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             reply_tx.send(result);
         }
 
-        // Cluster mode: only the leader fires periodic checkpoints.
-        // Followers mirror the leader's epoch via `follower_checkpoint`
-        // on observed PREPARE announcements. Forced checkpoints
-        // (shutdown) run on whatever instance is shutting down.
+        // Only the leader fires periodic checkpoints; followers pick up PREPARE via gossip.
         #[cfg(feature = "cluster")]
         if !force {
             if let Some(cc) = self.cluster_controller.clone() {
                 if cc.is_leader() {
-                    // Leader in cluster mode: do not trigger timer-based checkpoints here.
-                    // Periodic checkpoints are driven by barrier injection from the streaming coordinator.
+                    // Periodic checkpoints are injected by the coordinator, not here.
                     return None;
                 }
                 return self.maybe_follower_checkpoint(cc, source_offsets).await;
             }
         }
 
-        // Under exactly-once, only barrier-aligned checkpoints are consistent.
-        // Timer-based checkpoints are skipped (barrier path handles exactly-once).
         if !force
             && self.delivery_guarantee
                 == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
@@ -1749,10 +1551,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         self.sync_sinks_and_drain_events().await;
 
-        // After a sink timeout, skip one checkpoint cycle so that source
-        // offsets don't advance past the dropped batch. The NEXT cycle will
-        // clear this flag and checkpoint normally. This preserves at-least-once:
-        // on recovery, the source replays from the pre-drop checkpoint.
+        // Skip after a sink timeout so offsets don't advance past the dropped batch.
         if !force && self.sink_timed_out {
             self.sink_timed_out = false;
             tracing::info!("skipping checkpoint after sink timeout to preserve replay window");
@@ -1760,18 +1559,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         if !force {
-            let Some(interval) = self.checkpoint_interval else {
-                return None; // no auto-checkpointing configured
-            };
+            let interval = self.checkpoint_interval?;
             if self.last_checkpoint.elapsed() < interval {
                 return None;
             }
         }
 
-        // Capture stream executor aggregate state and serialize on blocking thread.
-        // Abort the checkpoint if serialization fails — persisting source
-        // offsets without matching operator state would cause data loss on
-        // recovery (offsets advance past unreplayable state).
+        // Abort if serialization fails — advancing offsets without matching operator state
+        // would lose data on recovery.
         let operator_states = match self.capture_and_serialize_operator_state().await {
             Ok(states) => states,
             Err(e) => {
@@ -1784,7 +1579,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let vnode_states = self.capture_vnode_states();
         let mut committed = None;
         if force {
-            // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 coord.set_pending_vnode_states(vnode_states);
@@ -1806,8 +1600,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Persist in the background; the in-flight slot + staged
-            // bytes are released by the guard when the tail finishes.
             let in_flight = EpochInFlightGuard::claim(
                 &self.checkpoint_in_flight,
                 &self.staged_bytes,
@@ -1816,7 +1608,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             let coordinator_clone = Arc::clone(&self.coordinator);
             let tx = self.checkpoint_complete_tx.clone();
             tokio::spawn(async move {
-                let _in_flight = in_flight; // released on drop, even on panic
+                let _in_flight = in_flight; // released on drop
                 let mut guard = coordinator_clone.lock().await;
                 if let Some(ref mut coord) = *guard {
                     coord.set_pending_vnode_states(vnode_states);
@@ -1855,10 +1647,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if let Some(cc) = self.cluster_controller.clone() {
             if !cc.is_leader() {
                 if let Some(ann) = self.pending_follower_checkpoint.take() {
-                    // Leaders abandon failed epochs, so a slow barrier
-                    // round can complete after its announcement was
-                    // superseded — the captured offsets must never be
-                    // attributed to the newer epoch's announcement.
+                    // A slow round can finish after its epoch was abandoned; never attribute
+                    // captured offsets to a newer announcement.
                     if ann.checkpoint_id != checkpoint_id {
                         tracing::warn!(
                             round_checkpoint_id = checkpoint_id,
@@ -1884,20 +1674,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         self.sync_sinks_and_drain_events().await;
 
-        // Clear after one suppression — the timer-based path that also
-        // clears this flag is unreachable when barrier checkpointing is active.
+        // Clear after one suppression; the timer path is unreachable under barrier checkpointing.
         if self.sink_timed_out {
             self.sink_timed_out = false;
             return BarrierOutcome::Skipped(SkipReason::PreservingReplayWindowAfterSinkTimeout);
         }
 
-        // Everything from here until the Aligned resume gate releases is
-        // pipeline stall — what checkpoint_pipeline_stall_duration measures.
         let stall_start = std::time::Instant::now();
 
-        // Drain + align the cross-node shuffle before capture so peers'
-        // pre-barrier rows enter the snapshot (announces Prepare early).
-        // The returned ids key this barrier's tail and resume gate.
+        // Align the shuffle before capture so peers' pre-barrier rows enter the snapshot.
         #[cfg(feature = "cluster")]
         let leader_ids = match self.align_shuffle_for_leader().await {
             Ok(ids) => ids,
@@ -1909,10 +1694,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         #[cfg(not(feature = "cluster"))]
         let leader_ids: Option<(u64, u64)> = None;
 
-        // Capture stream executor aggregate state — now consistent because
-        // all pre-barrier data has been executed. Serialize on blocking thread.
-        // Abort if serialization fails — persisting source offsets without
-        // matching operator state would cause data loss on recovery.
         let operator_states = match self.capture_and_serialize_operator_state().await {
             Ok(states) => states,
             Err(e) => {
@@ -1921,15 +1702,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         };
 
-        // The barrier-captured source offsets are consistent with the
-        // operator state at the barrier point and must not be re-queried
-        // from the live connectors.
         let vnode_states = self.capture_vnode_states();
         let request = self.build_checkpoint_request(operator_states, &source_checkpoints);
 
-        // Two-stage tail: capture quorum + `Aligned` run pre-mutex
-        // (never queued behind an earlier epoch's uploads); the durable
-        // remainder serializes on the FIFO mutex.
         let in_flight = EpochInFlightGuard::claim(
             &self.checkpoint_in_flight,
             &self.staged_bytes,
@@ -1953,17 +1728,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             quorum_timeout: self.quorum_timeout,
         };
         if self.exactly_once_sinks {
-            // Inline — no early resume (see `exactly_once_sinks`).
             Self::run_leader_tail(tail).await;
         } else {
             tokio::spawn(Self::run_leader_tail(tail));
 
-            // Leader resume gate: hold the pipeline until the tail
-            // above announces `Aligned` (full-membership capture
-            // quorum) — resuming earlier could ship epoch-N+1 shuffle
-            // rows to a peer still folding pre-barrier rows into its
-            // epoch-N snapshot. Abort (quorum miss) also releases; the
-            // gate is bounded.
             #[cfg(feature = "cluster")]
             if let (Some((epoch, _)), Some(cc)) = (leader_ids, self.cluster_controller.clone()) {
                 let has_shuffle = self.graph.cluster_shuffle_config().is_some();
@@ -1979,7 +1747,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {
-        let _ = events_ingested; // already recorded in extract_watermark
+        let _ = events_ingested; // counted in extract_watermark
         self.prom.cycles.inc();
         #[allow(clippy::cast_precision_loss)]
         self.prom
@@ -2030,9 +1798,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let Some(budget) = self.state_memory_budget_bytes else {
             return false;
         };
-        // Probing walks every operator's estimate (each O(1)-ish, but e.g.
-        // the temporal filter still walks its buffer), so throttle it; the
-        // verdict between probes is the cached one.
+        // Probe is throttled; cached verdict is served between probes.
         if self.state_budget_probe_at.elapsed() >= STATE_BUDGET_PROBE_INTERVAL {
             self.state_budget_probe_at = std::time::Instant::now();
             #[allow(clippy::cast_possible_wrap)]
@@ -2087,10 +1853,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let Some(budget) = self.state_memory_budget_bytes else {
             return;
         };
-        // Demote only with no checkpoint in flight: the latest per-vnode
-        // capture is then committed, so a clean vnode's in-memory state
-        // equals the durable upload bytes handed to the tier (no half-staged
-        // newer epoch to disagree with).
+        // Require no checkpoint in flight: a clean vnode's resident state then equals
+        // the durable bytes recorded by the coordinator.
         if self.checkpoint_in_flight.load(Ordering::Acquire) != 0 {
             return;
         }
@@ -2108,10 +1872,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn has_deferred_input(&self) -> bool {
-        // In cluster mode, always claim pending input so the coordinator
-        // runs `execute_cycle` each idle tick — otherwise a follower with
-        // no local source events never drains the shuffle receiver and
-        // remote rows sit stranded. Non-cluster path unchanged.
+        // In cluster mode, always return true so the coordinator runs `execute_cycle` each idle
+        // tick; without this a follower with no local sources never drains the shuffle receiver.
         #[cfg(feature = "cluster")]
         {
             if self.cluster_controller.is_some() {
@@ -2130,7 +1892,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
             match source.poll_changes().await {
                 Ok(Some(batch)) => {
-                    // Single registry lookup — dispatch by variant.
                     let entry = self.lookup_registry.get_entry(name);
                     if let Some(
                         laminar_sql::datafusion::lookup_join_exec::RegisteredLookup::Partial(
@@ -2156,8 +1917,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         ),
                     ) = &entry
                     {
-                        // Versioned path: append new CDC rows, preserving
-                        // all versions for temporal point-in-time lookups.
                         let combined = if versioned.batch.num_rows() == 0
                             || versioned.batch.schema().fields().is_empty()
                         {
@@ -2174,13 +1933,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                         "Versioned table concat error (schema mismatch?); \
                                          keeping existing state"
                                     );
-                                    // Preserve existing versioned history rather than
-                                    // discarding it. The CDC batch is silently dropped.
                                     continue;
                                 }
                             }
                         };
-                        // Build versioned index from the combined batch.
                         let key_indices: Vec<usize> = versioned
                             .key_columns
                             .iter()
@@ -2253,9 +2009,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 ts.to_record_batch(name)
                             }
                         };
-                        // Update lookup registry for join operators.
-                        // DataFusion table registration is NOT needed here — all
-                        // tables use ReferenceTableProvider which reads live data.
+                        // `ReferenceTableProvider` reads live data; no DataFusion re-registration needed.
                         if let Some(rb) = maybe_batch {
                             self.lookup_registry.register(
                                 name,
@@ -2273,8 +2027,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn next_checkpoint_id(&self) -> Option<u64> {
-        // Lock-free: an in-flight epoch's tail may hold the coordinator
-        // mutex for the duration of its uploads.
+        // Lock-free: an in-flight tail may hold the coordinator mutex.
         self.epoch_allocator.as_ref().map(|a| a.peek().1)
     }
 
@@ -2296,12 +2049,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 }
 
-/// Update a partial lookup cache from a CDC batch by inserting or deleting
-/// each row keyed by the primary key column(s).
+/// Upsert or delete each row in a CDC batch from the partial lookup cache.
 ///
-/// CDC delete detection: if the batch has a column named `__op`, `__operation`,
-/// or `op` with values `"d"`, `"D"`, `"delete"`, or `"DELETE"`, the row is
-/// removed from the cache instead of upserted.
+/// Deletes are detected via an `__op`/`__operation`/`op` column with value `d`/`D`/`delete`/`DELETE`.
 fn update_partial_cache_from_batch(
     partial: &laminar_sql::datafusion::PartialLookupState,
     batch: &RecordBatch,
@@ -2334,7 +2084,6 @@ fn update_partial_cache_from_batch(
         return;
     };
 
-    // Detect CDC operation column for delete handling.
     let op_col_idx = batch
         .schema()
         .fields()
@@ -2365,7 +2114,7 @@ fn update_partial_cache_from_batch(
     }
 }
 
-/// Encode an Arrow schema as a hex-encoded IPC flatbuffer for `ConnectorConfig`.
+/// Encode an Arrow schema as a hex-encoded IPC flatbuffer.
 pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
     laminar_connectors::config::encode_arrow_schema_ipc(schema)
 }

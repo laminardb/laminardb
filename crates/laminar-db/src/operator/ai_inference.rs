@@ -1,27 +1,9 @@
 //! Async-decoupled AI inference operator.
 //!
-//! This is the one operator that does not do its work inside `process`.
-//! `GraphOperator::process` runs on the `laminar-compute` thread (Ring 0), where
-//! network and blocking calls are forbidden, so the model call cannot happen
-//! there. Instead `process` is **decoupled across cycles**:
-//!
-//! - serve cache hits inline (a memory lookup);
-//! - hand cache misses to the Ring 1 worker over a bounded channel and return;
-//! - drain whatever results the worker has completed since the last cycle and
-//!   emit those batches.
-//!
-//! Crucially, `process` contains no `await` on the inference path — it only does
-//! synchronous channel and Arrow work — so it provably cannot block on a model
-//! call. Enriched rows are therefore emitted in a later cycle than they arrived
-//! (see the checkpoint handling for how in-flight rows survive recovery).
-//!
-//! Backpressure: once in-flight misses exceed a cap, `wants_input` returns
-//! false, so the graph stops draining this node's input buffer and the source
-//! is throttled through the existing input-buffer gate (effective when
-//! input-buffer caps are configured). The output watermark is held behind the
-//! oldest in-flight batch (`watermark_hold`) so async-enriched rows aren't
-//! dropped as late by a downstream window. `estimated_state_bytes` reports
-//! retained input batches plus queued miss text.
+//! Cache hits serve inline; misses go to a Ring 1 worker over a bounded channel
+//! and emit in a later cycle. `process` never awaits on the inference path.
+//! Backpressure via `wants_input`; output watermark held behind oldest in-flight
+//! batch so enriched rows aren't dropped late by a downstream window.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -48,44 +30,31 @@ use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 
-/// Temp table the enriched batch is registered under for the residual
-/// projection. Must match `sql_analysis`'s `AI_TMP_TABLE` (the generated
-/// `projection_sql` reads from this name).
+/// Must match `sql_analysis::AI_TMP_TABLE` — `projection_sql` reads from this name.
 const AI_TMP_TABLE: &str = "__ai_tmp";
 
 const SUBMIT_CAPACITY: usize = 256;
 const RESULT_CAPACITY: usize = 256;
-/// In-flight miss rows above which the operator refuses new input, so its input
-/// buffer fills and the graph backpressures the source (when input-buffer caps
-/// are configured).
 const MAX_IN_FLIGHT_ROWS: usize = 8192;
 
 /// Static configuration for an [`AiInferenceOperator`].
 pub(crate) struct AiOperatorConfig {
-    /// The task this operator performs.
     pub task: Task,
-    /// The backend kind (selects the worker's adapter path).
     pub kind: BackendKind,
-    /// Stable per-model integer for the cache key.
     pub model_id: u32,
-    /// Provider/runtime model identifier.
     pub model: String,
-    /// Name of the input column to read text from.
     pub input_column: String,
-    /// Name of the output column to append.
     pub output_column: String,
-    /// Effective labels (local classification + cache versioning).
     pub labels: Option<Vec<String>>,
 }
 
-/// A batch awaiting enrichment: the original rows plus per-row outputs that fill
-/// in as the worker resolves them. `pending` counts rows still in flight.
+/// A batch awaiting enrichment: original rows plus per-row outputs that fill in as
+/// the worker resolves them. `pending` counts rows still in flight.
 struct PendingBatch {
     batch: RecordBatch,
     outputs: Vec<Option<CachedOutput>>,
     pending: usize,
-    /// Input watermark when this batch was ingested. Holds the operator's output
-    /// watermark until the batch emits, so its rows aren't late downstream.
+    // Held until the batch emits so its rows aren't dropped late downstream.
     ingest_watermark: i64,
 }
 
@@ -100,19 +69,13 @@ pub(crate) struct AiInferenceOperator {
     submit_tx: crate::ai_worker::SubmitTx,
     result_rx: mpsc::Receiver<WorkResult>,
     pending: FxHashMap<u64, PendingBatch>,
-    /// Work items the worker was too busy to accept; retried next cycle.
+    // Rejected by a saturated worker; retried next cycle in order.
     unsubmitted: VecDeque<WorkItem>,
-    /// Input batches awaiting (re-)ingestion, each with the watermark it was
-    /// originally ingested under — filled on restore so recovered rows re-ingest
-    /// at their original watermark, not a newer one (else they'd be dropped as
-    /// late downstream).
+    // Recovered batches queued with their original ingest watermark so they
+    // don't re-ingest under a newer watermark and get dropped late downstream.
     replay: VecDeque<(i64, RecordBatch)>,
     next_batch_id: u64,
-    /// In-flight cap; above this, [`wants_input`](Self::wants_input) is false.
     max_in_flight: usize,
-    /// Residual projection applied to enriched batches (the user's SELECT with
-    /// the `ai_*` call rewritten to its alias column). Bounded local work — not
-    /// the inference path.
     projection: ProjectingJoinState,
     _worker: tokio::task::JoinHandle<()>,
 }
@@ -120,11 +83,8 @@ pub(crate) struct AiInferenceOperator {
 impl AiInferenceOperator {
     /// Build the operator and spawn its Ring 1 worker on `runtime`.
     ///
-    /// `runtime` MUST be the engine's main (multi-threaded) runtime handle, not
-    /// the `laminar-compute` runtime — the worker must run off the compute
-    /// thread. When wiring construction during a dynamic DDL hot-add (which
-    /// itself runs on the compute thread), pass the main handle captured at
-    /// start, never `Handle::current()`.
+    /// `runtime` must be the main (multi-threaded) runtime handle, not the
+    /// `laminar-compute` one. Never pass `Handle::current()` from a compute thread.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: &str,
@@ -175,7 +135,6 @@ impl AiInferenceOperator {
         }
     }
 
-    /// Total miss rows currently in flight (submitted-but-unresolved + queued).
     fn in_flight_rows(&self) -> usize {
         let pending: usize = self.pending.values().map(|pb| pb.pending).sum();
         let queued: usize = self.unsubmitted.iter().map(|item| item.rows.len()).sum();
@@ -187,9 +146,6 @@ impl AiInferenceOperator {
         self.max_in_flight = cap;
     }
 
-    /// Resolve a row against the cache, or queue it as a miss. `watermark` is the
-    /// input watermark at ingest, used to hold the output watermark while the
-    /// batch is in flight.
     fn ingest(
         &mut self,
         batch: RecordBatch,
@@ -245,14 +201,13 @@ impl AiInferenceOperator {
         Ok(())
     }
 
-    /// Apply a worker result, emitting the batch if it is now fully resolved.
     fn apply_result(
         &mut self,
         result: &WorkResult,
         out: &mut Vec<RecordBatch>,
     ) -> Result<(), DbError> {
         let Some(pb) = self.pending.get_mut(&result.batch_id) else {
-            return Ok(()); // batch no longer tracked (e.g. cleared on restore)
+            return Ok(()); // cleared on restore
         };
         for (position, &row_index) in result.row_indices.iter().enumerate() {
             if pb.outputs[row_index].is_some() {
@@ -274,7 +229,6 @@ impl AiInferenceOperator {
         Ok(())
     }
 
-    /// Retry work items the worker rejected while saturated, preserving order.
     fn flush_unsubmitted(&mut self) {
         while let Some(item) = self.unsubmitted.pop_front() {
             match self.submit_tx.try_send(item) {
@@ -282,13 +236,11 @@ impl AiInferenceOperator {
                     self.unsubmitted.push_front(item);
                     break;
                 }
-                // Delivered, or the worker is gone (shutdown) — nothing to retry.
                 Ok(()) | Err(crossfire::TrySendError::Disconnected(_)) => {}
             }
         }
     }
 
-    /// Submit a work item, queueing it if the worker is saturated.
     fn submit(&mut self, item: WorkItem) {
         if !self.unsubmitted.is_empty() {
             self.unsubmitted.push_back(item);
@@ -296,12 +248,10 @@ impl AiInferenceOperator {
         }
         match self.submit_tx.try_send(item) {
             Err(crossfire::TrySendError::Full(item)) => self.unsubmitted.push_back(item),
-            // Delivered, or the worker is gone (shutdown) — nothing to queue.
             Ok(()) | Err(crossfire::TrySendError::Disconnected(_)) => {}
         }
     }
 
-    /// Extract the input column as per-row optional text.
     fn input_texts<'a>(&self, batch: &'a RecordBatch) -> Result<Vec<Option<&'a str>>, DbError> {
         let column = batch.column_by_name(&self.input_column).ok_or_else(|| {
             DbError::InvalidOperation(format!(
@@ -323,7 +273,6 @@ impl AiInferenceOperator {
             .collect())
     }
 
-    /// Append the AI output column to a batch.
     fn build_output(
         &self,
         batch: &RecordBatch,
@@ -361,11 +310,6 @@ impl AiInferenceOperator {
 
 #[async_trait]
 impl GraphOperator for AiInferenceOperator {
-    // The only `await` is the residual projection — bounded local DataFusion
-    // work over the just-enriched batches, the same step every join operator
-    // runs. The model call never happens here: misses go to the Ring 1 worker
-    // and results are drained on a later cycle, so this cannot block on
-    // inference (R1).
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -389,18 +333,13 @@ impl GraphOperator for AiInferenceOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // Capture every not-yet-emitted input batch: in-flight pending batches
-        // plus any queued for replay. In-flight requests are not treated as
-        // complete; on restore they are re-ingested and re-run (local is
-        // deterministic, remote dedups via the content-hash cache).
+        // In-flight requests are re-run on restore; local is deterministic,
+        // remote dedups via the content-hash cache.
         let serialize = |b: &RecordBatch| {
             serialize_batch_stream(b).map_err(|e| {
                 DbError::Pipeline(format!("ai operator: checkpoint serialization: {e}"))
             })
         };
-        // Each entry keeps the watermark its batch was ingested under, so on
-        // restore the rows re-ingest at the same watermark and aren't dropped as
-        // late by a downstream window.
         let mut blobs: Vec<(i64, Vec<u8>)> =
             Vec::with_capacity(self.pending.len() + self.replay.len());
         for pb in self.pending.values() {
@@ -452,15 +391,10 @@ impl GraphOperator for AiInferenceOperator {
         pending + replay + unsubmitted
     }
 
-    /// Hold the output watermark behind the oldest in-flight batch so async
-    /// enrichment isn't dropped as late by a downstream window.
     fn watermark_hold(&self) -> Option<i64> {
         self.pending.values().map(|pb| pb.ingest_watermark).min()
     }
 
-    /// Refuse new input once the in-flight cap is reached. The graph then leaves
-    /// this node's input buffered (backpressuring the source) while still
-    /// stepping the operator with empty input so it drains and emits.
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
     }
@@ -486,8 +420,6 @@ fn build_text_array(outputs: &[Option<CachedOutput>]) -> Result<ArrayRef, DbErro
     Ok(Arc::new(builder.finish()))
 }
 
-/// Build the `Float64` score column for `ai_sentiment`. A null input or a
-/// failed inference yields a null score.
 fn build_score_array(outputs: &[Option<CachedOutput>]) -> Result<ArrayRef, DbError> {
     let mut builder = Float64Builder::new();
     for output in outputs {

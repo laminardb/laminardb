@@ -1,7 +1,4 @@
-//! Operator implementations for the `OperatorGraph`.
-//!
-//! Each module contains a `GraphOperator` implementation that wraps an existing
-//! state type from `StreamExecutor`'s decomposed state maps.
+//! `GraphOperator` implementations for each streaming operator type.
 
 use std::sync::Arc;
 
@@ -12,10 +9,7 @@ use datafusion::prelude::SessionContext;
 use crate::error::DbError;
 use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
 
-/// Execute a pre-built physical plan. The plan's source leaves are
-/// `LiveSourceExec` (registered once at startup), so re-executing reads
-/// fresh per-cycle data without re-running the analyzer/optimizer/physical
-/// planner. All EOWC and multi-source operator paths go through this.
+/// Re-execute a cached physical plan without re-planning; source leaves are swapped per cycle.
 pub(crate) async fn execute_cached_physical(
     ctx: &SessionContext,
     op_name: &str,
@@ -27,19 +21,13 @@ pub(crate) async fn execute_cached_physical(
         .map_err(|e| DbError::query_pipeline(op_name, &e))
 }
 
-/// Pre-built physical plan whose only source leaf is a
-/// `LiveSourceProvider` — callers swap fresh batches in via the handle
-/// and re-execute without re-planning. Underpins HAVING-SQL fallback
-/// (see [`HavingSqlCache`]) and raw-EOWC close-cycle execution.
+/// Cached physical plan over a `LiveSourceProvider`; callers swap fresh batches in each cycle.
 pub(crate) struct LiveSqlCache {
     handle: laminar_sql::datafusion::LiveSourceHandle,
     physical: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 }
 
 impl LiveSqlCache {
-    /// Register a `LiveSourceProvider` under `table_name`, plan `sql`
-    /// against it, and cache the physical plan. `what` is used in error
-    /// messages to identify the caller (`"HAVING"`, `"raw EOWC"`, ...).
     pub(crate) async fn build(
         ctx: &SessionContext,
         table_name: &str,
@@ -78,10 +66,7 @@ impl LiveSqlCache {
     }
 }
 
-/// HAVING-SQL fallback: a [`LiveSqlCache`] over `SELECT cols FROM
-/// table WHERE having_sql`. Used by both `EowcQueryOperator` and
-/// `SqlQueryOperator` when the HAVING predicate can't compile to a
-/// `PhysicalExpr`.
+/// `LiveSqlCache` wrapping HAVING SQL; used when the predicate can't compile to a `PhysicalExpr`.
 pub(crate) struct HavingSqlCache(LiveSqlCache);
 
 impl HavingSqlCache {
@@ -167,9 +152,7 @@ fn apply_compiled_post_projection(
         .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
 }
 
-/// Lazily populated caches for the post-projection step. The compiled
-/// `PhysicalExpr` path is preferred; if it can't be built we fall back to a
-/// [`LiveSqlCache`] (built once, re-used every cycle) rather than re-planning.
+/// Compiled-expr or `LiveSqlCache` fallback for post-projection; populated on first use.
 #[derive(Default)]
 pub(crate) struct PostProjectionCache {
     compiled: Option<CompiledPostProjection>,
@@ -177,7 +160,7 @@ pub(crate) struct PostProjectionCache {
     sql_cache: Option<LiveSqlCache>,
 }
 
-/// Post-projection state shared by the four join operators.
+/// Post-projection state shared by join operators.
 pub(crate) struct ProjectingJoinState {
     pub(crate) op_name: Arc<str>,
     ctx: SessionContext,
@@ -234,7 +217,6 @@ pub(crate) async fn apply_post_projection(
         return Ok(Vec::new());
     }
 
-    // Try compiled path
     if cache.compiled.is_none() && !cache.compile_failed {
         let schema = batches[0].schema();
         match try_compile_post_projection(ctx, proj_sql, tmp_table_name, &schema).await {
@@ -254,11 +236,6 @@ pub(crate) async fn apply_post_projection(
         return Ok(result);
     }
 
-    // SQL fallback: build a `LiveSqlCache` once (registers a
-    // `LiveSourceProvider` under `tmp_table_name`, plans `proj_sql`, and
-    // caches the physical plan), then re-use it every cycle by swapping in
-    // fresh batches — avoids re-registering a `MemTable` and re-planning on
-    // each call.
     if cache.sql_cache.is_none() {
         let schema = batches[0].schema();
         cache.sql_cache =

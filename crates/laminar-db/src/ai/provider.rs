@@ -1,62 +1,48 @@
-//! The single transport abstraction over a model backend.
+//! [`InferenceProvider`] trait and request/response types.
 //!
-//! An [`InferenceProvider`] does I/O only: a homogeneous batch of inputs in, a
-//! homogeneous batch of outputs plus usage out. It knows nothing about SQL tasks
-//! or output columns — framing a request and turning the response into a task's
-//! output column is the adapter's job. Implementors: Anthropic, an
-//! OpenAI-compatible provider (OpenAI / Azure / vLLM via `base_url`), and a
-//! local ONNX Runtime provider.
+//! Providers are I/O only: inputs in, outputs + usage out. Task framing and
+//! response parsing belong to the adapter.
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::ai::registry::Task;
 
-/// One batch of inputs to run through a model. A request is homogeneous: a
-/// single task, a single model, and one input string per row in order.
+/// One homogeneous batch of inputs for a single task and model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceRequest {
-    /// The task being performed.
+    /// Task to perform.
     pub task: Task,
-    /// Runtime model identifier — the vendor model id for remote backends, or
-    /// the weight source for local backends.
+    /// Vendor model id for remote backends; weight source for local.
     pub model: String,
     /// One input string per row, in row order.
     pub inputs: Vec<String>,
-    /// Task-shaping parameters that also version the result cache.
+    /// Task-shaping parameters; also versions the result cache.
     pub params: InferenceParams,
 }
 
-/// Knobs that shape a request and contribute to the cache's `params_version`,
-/// so the same text under different parameters never collides. Generation knobs
-/// (`max_tokens`, `temperature`, …) are added here as backends consume them.
+/// Parameters that shape a request and version the result cache.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InferenceParams {
-    /// Candidate label set for classification (required for remote classify;
-    /// for local classifiers it must match or be a subset of the model's
-    /// intrinsic labels, validated at plan time).
+    /// Candidate labels for classification. Required for remote classify;
+    /// must match or be a subset of a local classifier's intrinsic labels.
     pub labels: Option<Vec<String>>,
 }
 
-/// Per-row outputs of a batch. Homogeneous for a given request: a classify or
-/// generate batch yields text; an embed batch — or a local classifier's raw
-/// logits awaiting softmax in the adapter — yields numeric vectors; a sentiment
-/// batch yields one scalar score per row (the adapter's output, never a raw
-/// provider shape).
+/// Per-row outputs of a batch. Shape is homogeneous within a request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceOutputs {
-    /// One text output per input row.
+    /// Text outputs (classify, complete, …).
     Text(Vec<String>),
-    /// One numeric vector per input row (embeddings, or classifier logits).
+    /// Numeric vectors (embeddings, or classifier logits before adapter post-processing).
     Vectors(Vec<Vec<f32>>),
-    /// One scalar score per input row. Produced by the adapter for
-    /// `ai_sentiment` (continuous, in `[-1, 1]`); providers never return this
-    /// shape directly.
+    /// Scalar sentiment scores in `[-1, 1]`. Produced by the adapter; providers
+    /// never return this shape directly.
     Scores(Vec<f64>),
 }
 
 impl InferenceOutputs {
-    /// Number of rows produced. Must equal the request's input count.
+    /// Number of output rows.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -66,27 +52,26 @@ impl InferenceOutputs {
         }
     }
 
-    /// Whether no rows were produced.
+    /// Whether no rows are present.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-/// Token and cost accounting for a single batch call. Local backends report
-/// [`Usage::ZERO`]; remote backends report what the provider charged.
+/// Token and cost accounting for a batch call. Local backends report [`Usage::ZERO`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     /// Prompt/input tokens billed.
     pub input_tokens: u64,
     /// Completion/output tokens billed.
     pub output_tokens: u64,
-    /// Metered cost in micro-USD (millionths of a dollar); 0 for local.
+    /// Micro-USD (millionths); 0 for local.
     pub cost_micros: u64,
 }
 
 impl Usage {
-    /// Zero usage — what local, deterministic backends report.
+    /// Zero usage for local backends.
     pub const ZERO: Usage = Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -94,19 +79,17 @@ impl Usage {
     };
 }
 
-/// The result of a batch inference call: outputs aligned 1:1 with the request's
-/// inputs, plus usage.
+/// Result of a batch inference call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceResponse {
     /// Per-row outputs, in input order.
     pub outputs: InferenceOutputs,
-    /// Token/cost accounting for the call.
+    /// Token/cost accounting.
     pub usage: Usage,
 }
 
-/// Transport over a model backend. Implementors perform I/O only — no task
-/// framing, no result parsing. Shared as `Arc<dyn InferenceProvider>` and
-/// driven from the Ring 1 inference worker, never from Ring 0.
+/// I/O transport over a model backend. Shared as `Arc<dyn InferenceProvider>`;
+/// driven from Ring 1, never Ring 0.
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
     /// Run one batch of inputs through the model.
@@ -120,15 +103,12 @@ pub trait InferenceProvider: Send + Sync {
         request: InferenceRequest,
     ) -> Result<InferenceResponse, ProviderError>;
 
-    /// Stable backend-kind identity for logging and the `laminar.ai_calls`
-    /// log (e.g. `anthropic`, `openai`, `local`). Constant per implementor.
+    /// Backend name for logging (e.g. `anthropic`, `openai`, `local`).
     fn name(&self) -> &'static str;
 
-    /// Classifier labels intrinsic to a model, discovered from its own metadata.
-    /// Returns `None` for backends that have none (remote providers, embedding
-    /// models). A local classifier returns its `config.json` `id2label` once the
-    /// model is on disk — the seam that lets a lazily downloaded classifier score
-    /// without the labels having been known at startup. The default is `None`.
+    /// Labels intrinsic to a local classifier (`config.json` `id2label`).
+    /// Returns `None` for remote providers and embedding models. Lets a lazily
+    /// downloaded classifier return labels without them being known at startup.
     fn intrinsic_labels(&self, _model: &str) -> Option<Vec<String>> {
         None
     }

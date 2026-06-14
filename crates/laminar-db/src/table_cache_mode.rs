@@ -1,24 +1,16 @@
-//! Cache mode configuration for reference tables.
-//!
-//! Controls how dimension table rows are cached in memory:
-//! - `Full`: all rows in memory (default, suitable for small tables)
-//! - `Partial`: LRU cache of hot keys with xor filter for negative lookups
-//! - `None`: no caching (direct backing store access)
+//! Cache mode for reference tables: Full (all rows), Partial (LRU), or None.
 
 use crate::error::DbError;
 
 /// How a reference table's rows are cached in memory.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TableCacheMode {
-    /// All rows kept in memory (default). Best for tables < 10M rows.
+    /// All rows in memory (default).
     #[default]
     Full,
-    /// LRU cache of hot keys. Cold keys fall through to the backing store.
-    Partial {
-        /// Maximum number of entries in the LRU cache.
-        max_entries: usize,
-    },
-    /// No caching — every lookup goes to the backing store.
+    /// LRU cache; cold keys fall through to the backing store.
+    Partial { max_entries: usize },
+    /// No caching.
     None,
 }
 
@@ -26,8 +18,7 @@ pub enum TableCacheMode {
 const DEFAULT_PARTIAL_MAX_ENTRIES: usize = 500_000;
 
 impl TableCacheMode {
-    /// Return the max entries for partial mode, or `None` for other modes.
-    #[allow(dead_code)] // test verification API
+    #[allow(dead_code)] // test-only
     pub fn max_entries(&self) -> Option<usize> {
         match self {
             Self::Partial { max_entries } => Some(*max_entries),
@@ -35,7 +26,6 @@ impl TableCacheMode {
         }
     }
 
-    /// Create a `Partial` mode with the default max entries.
     pub fn partial_default() -> Self {
         Self::Partial {
             max_entries: DEFAULT_PARTIAL_MAX_ENTRIES,
@@ -43,12 +33,7 @@ impl TableCacheMode {
     }
 }
 
-/// Parse a cache mode string from DDL `WITH (cache_mode = '...')`.
-///
-/// Supported values:
-/// - `"full"` → `TableCacheMode::Full`
-/// - `"partial"` → `TableCacheMode::Partial { max_entries: 500_000 }`
-/// - `"none"` → `TableCacheMode::None`
+/// Parse a `cache_mode` DDL option; accepts `"full"`, `"partial"`, `"none"`.
 pub(crate) fn parse_cache_mode(s: &str) -> Result<TableCacheMode, DbError> {
     match s.to_lowercase().as_str() {
         "full" => Ok(TableCacheMode::Full),

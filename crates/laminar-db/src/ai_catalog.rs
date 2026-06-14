@@ -1,13 +1,5 @@
-//! Read-only `laminar.*` AI catalog views.
-//!
-//! - `laminar.models` — the model registry: each model's kind, tasks, source,
-//!   and determinism/cost properties.
-//! - `laminar.ai_calls` — the inference call log: one row per batch call, with
-//!   tokens, cost, latency, and status.
-//!
-//! Both are a single [`SystemView`] parameterized by a column-builder, registered
-//! as a `laminar` schema on the query context. Each `scan()` reads the live
-//! [`AiRuntime`], so the views always reflect current state.
+//! Read-only `laminar.models` and `laminar.ai_calls` catalog views.
+//! Each is a [`SystemView`] that snapshots the live [`AiRuntime`] on every scan.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -26,10 +18,8 @@ use crate::ai::{AiRuntime, BackendKind, ModelBackend};
 
 use crate::error::DbError;
 
-/// Reserved schema for AI catalog views.
 pub(crate) const LAMINAR_SCHEMA: &str = "laminar";
 
-/// Snapshots the live runtime into a view's columns (schema order).
 type ColumnBuilder = fn(&AiRuntime) -> Vec<ArrayRef>;
 
 /// Register `laminar.models` and `laminar.ai_calls` on `ctx`.
@@ -67,8 +57,7 @@ pub(crate) fn register_ai_catalog(
     Ok(())
 }
 
-/// A read-only catalog view: a fixed schema plus a function that snapshots the
-/// live [`AiRuntime`] into its columns on each scan.
+/// A read-only catalog view backed by a live runtime snapshot.
 struct SystemView {
     schema: SchemaRef,
     columns: ColumnBuilder,

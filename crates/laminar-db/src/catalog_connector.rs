@@ -20,11 +20,7 @@ use laminar_core::streaming;
 
 use crate::catalog::ArrowRecord;
 
-/// A source connector that bridges catalog SPSC subscriptions into the pipeline.
-///
-/// Implements `SourceConnector` by polling a `streaming::Subscription<ArrowRecord>`
-/// so that `db.insert()` data participates in the fan-out/fan-in pipeline alongside
-/// external connectors (Kafka, WebSocket, etc.).
+/// Bridges a catalog SPSC subscription into the pipeline alongside external connectors.
 pub(crate) struct CatalogSourceConnector {
     subscription: streaming::Subscription<ArrowRecord>,
     schema: SchemaRef,
@@ -33,7 +29,6 @@ pub(crate) struct CatalogSourceConnector {
 }
 
 impl CatalogSourceConnector {
-    /// Create a new bridge connector.
     pub fn new(
         subscription: streaming::Subscription<ArrowRecord>,
         schema: SchemaRef,
@@ -51,7 +46,6 @@ impl CatalogSourceConnector {
 #[async_trait]
 impl SourceConnector for CatalogSourceConnector {
     async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        // Already connected via the subscription — nothing to do.
         Ok(())
     }
 
@@ -79,9 +73,7 @@ impl SourceConnector for CatalogSourceConnector {
             return Ok(None);
         }
 
-        // Fast path: skip concat_batches when there's only one batch
-        // (common case for embedded sources). Avoids a memcpy of the
-        // entire RecordBatch (~1-5μs for typical batch sizes).
+        // Skip concat when there's only one batch (common case; saves a memcpy).
         let records = if batches.len() == 1 {
             batches.into_iter().next().expect("len==1 checked above")
         } else {
@@ -111,7 +103,6 @@ impl SourceConnector for CatalogSourceConnector {
     }
 
     async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        // In-memory, non-replayable — nothing to restore.
         Ok(())
     }
 

@@ -1,21 +1,8 @@
-//! Processing-time equi-join: a bounded stateful inner join between two windowed
-//! views, joined on their equi-key (e.g. `bucket_start`).
+//! Processing-time equi-join for two windowed views joined on a shared key.
 //!
-//! The two sides do **not** close a bucket in the same cycle — an upstream AI
-//! operator's watermark hold delays one side by its scoring latency — so a
-//! stateless per-cycle join would drop buckets. Each side keeps its unmatched
-//! rows and matches whenever the second side arrives, via the symmetric hash-join
-//! rule (new×buffered, buffered×new, new×new; buffered×buffered already emitted).
-//!
-//! Retention is **watermark-driven**: a side's buffered rows are evicted once the
-//! *opposite* side's watermark has passed them — the partner can no longer arrive
-//! — so state is bounded by the real cross-side skew, not a fixed count, and an
-//! unmatched row ages out (correct for an inner join). Eviction runs **after** the
-//! join, so a row still matches a partner arriving in the same cycle it would age
-//! out. `MAX_BUFFERED_ROWS` is a hard memory backstop for when watermarks don't
-//! advance (e.g. an idle or watermark-less source). The cached `DataFusion`
-//! `HashJoin` can't serve this: it memoizes its build side across cycles
-//! (`OnceAsync`).
+//! Symmetric hash-join across cycles: each side buffers unmatched rows and
+//! matches when the partner arrives. Eviction is watermark-driven (opposite-side
+//! progress), with `MAX_BUFFERED_ROWS` as a memory backstop.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,14 +22,9 @@ use crate::key_column::extract_key_column;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 
-/// Hard memory backstop per side: when watermarks don't advance, retention falls
-/// back to keeping at most this many newest rows. With watermarks it is rarely
-/// reached — the cross-side skew is a handful of windows.
+// Backstop for when watermarks don't advance; normally the cross-side skew stays small.
 const MAX_BUFFERED_ROWS: usize = 4096;
 
-/// One join side's unmatched rows. Each cycle's arrivals are a chunk tagged with
-/// the input watermark at which they arrived; eviction drops whole chunks the
-/// opposite side has advanced past, oldest first.
 #[derive(Default)]
 struct SideBuffer {
     chunks: VecDeque<(i64, RecordBatch)>,
@@ -55,7 +37,6 @@ impl SideBuffer {
         }
     }
 
-    /// All buffered rows as one batch to probe against, or `None` when empty.
     fn concat(&self) -> Result<Option<RecordBatch>, DbError> {
         let Some((_, first)) = self.chunks.front() else {
             return Ok(None);
@@ -65,8 +46,6 @@ impl SideBuffer {
             .map_err(|e| DbError::Pipeline(format!("process-time join: concat buffer: {e}")))
     }
 
-    /// Evict rows the opposite side has passed (`tag < opposite_watermark`), then
-    /// enforce the memory backstop oldest-first.
     fn evict(&mut self, opposite_watermark: i64) {
         while self
             .chunks
@@ -75,8 +54,6 @@ impl SideBuffer {
         {
             self.chunks.pop_front();
         }
-        // Memory backstop: keep the newest MAX_BUFFERED_ROWS, slicing the oldest
-        // chunk rather than dropping a whole (possibly large) batch wholesale.
         let mut rows: usize = self.chunks.iter().map(|(_, b)| b.num_rows()).sum();
         while rows > MAX_BUFFERED_ROWS {
             let overage = rows - MAX_BUFFERED_ROWS;
@@ -88,7 +65,7 @@ impl SideBuffer {
                 self.chunks.pop_front();
                 rows -= front_rows;
             } else if let Some((_, front)) = self.chunks.front_mut() {
-                *front = front.slice(overage, front_rows - overage); // drop oldest `overage`
+                *front = front.slice(overage, front_rows - overage);
                 rows -= overage;
             }
         }
@@ -109,7 +86,6 @@ pub(crate) struct ProcessTimeJoinOperator {
     config: StreamJoinConfig,
     left: SideBuffer,
     right: SideBuffer,
-    /// The user's SELECT with the join's columns rewritten over the temp table.
     projection: ProjectingJoinState,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
@@ -126,8 +102,6 @@ impl ProcessTimeJoinOperator {
             config,
             left: SideBuffer::default(),
             right: SideBuffer::default(),
-            // The `FROM` name `build_stream_join_projection_sql` emits (shared
-            // with the interval join; registered transiently per `apply`).
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
@@ -214,8 +188,6 @@ impl ProcessTimeJoinOperator {
         Ok(local)
     }
 
-    /// Inner-join two batches on the equi-key. `None` when either is empty or
-    /// nothing matches.
     fn join_pair(
         &self,
         left: &RecordBatch,
@@ -227,8 +199,6 @@ impl ProcessTimeJoinOperator {
         let left_keys = extract_key_column(left, &self.config.left_key)?;
         let right_keys = extract_key_column(right, &self.config.right_key)?;
 
-        // Hash-index the right side, probe with the left; collisions are resolved
-        // by `keys_equal`.
         let mut index: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
         for j in 0..right.num_rows() {
             if let Some(h) = right_keys.hash_at(j) {
@@ -272,7 +242,6 @@ impl ProcessTimeJoinOperator {
             .map_err(|e| DbError::Pipeline(format!("process-time join: build output: {e}")))
     }
 
-    /// Concat this cycle's batches for one side into one (or `None` if empty).
     fn concat_new(batches: &[RecordBatch]) -> Result<Option<RecordBatch>, DbError> {
         let Some(schema) = batches
             .iter()
@@ -339,10 +308,7 @@ impl GraphOperator for ProcessTimeJoinOperator {
         let wm_left = watermarks.first().copied().unwrap_or(i64::MIN);
         let wm_right = watermarks.get(1).copied().unwrap_or(i64::MIN);
 
-        // Emit against the OLD buffers first, then fold the new rows in — so each
-        // pair emits exactly once (when its later side arrives) and old×old is
-        // never re-emitted. Only concat a buffer when there are new rows to probe
-        // it with.
+        // Emit old×new, new×old, new×new in order so each pair emits once (on its later side).
         let right_buf = if new_left.is_some() {
             self.right.concat()?
         } else {
@@ -371,8 +337,7 @@ impl GraphOperator for ProcessTimeJoinOperator {
             self.right.push(wm_right, nr);
         }
 
-        // Evict AFTER joining (a row can match a partner arriving the same cycle it
-        // ages out): each side is bounded by the OPPOSITE side's progress.
+        // Evict after joining so a row can match a partner arriving the same cycle it ages out.
         self.left.evict(wm_right);
         self.right.evict(wm_left);
 
@@ -399,8 +364,7 @@ impl GraphOperator for ProcessTimeJoinOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // (side, watermark, batch-blob); side 0 = left, 1 = right.
-        let mut blobs: Vec<(u8, i64, Vec<u8>)> = Vec::new();
+        let mut blobs: Vec<(u8, i64, Vec<u8>)> = Vec::new(); // (side 0=left/1=right, watermark, blob)
         let mut serialize =
             |side: u8, chunks: &VecDeque<(i64, RecordBatch)>| -> Result<(), DbError> {
                 for (tag, batch) in chunks {

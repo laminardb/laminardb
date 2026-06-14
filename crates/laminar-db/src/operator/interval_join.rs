@@ -1,10 +1,7 @@
 //! Interval join operator for the `OperatorGraph`.
 //!
-//! Wraps `crate::interval_join::IntervalJoinState` and the standalone
-//! `execute_interval_join_cycle` function. The operator is **stateful**
-//! across cycles: it buffers left/right rows and matches pairs where
-//! `|left_ts - right_ts| <= time_bound_ms`. Expired rows are evicted
-//! when the watermark advances.
+//! Buffers left/right rows across cycles and matches pairs where
+//! `|left_ts - right_ts| <= time_bound_ms`; evicts expired rows on watermark advance.
 
 use std::sync::Arc;
 

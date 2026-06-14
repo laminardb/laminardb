@@ -58,10 +58,6 @@ pub struct SourceRegistration {
     /// Whether this source supports replay from a checkpointed position.
     pub supports_replay: bool,
     /// Checkpoint to restore on startup (set during recovery).
-    ///
-    /// When `Some`, the source adapter calls `connector.restore()` after
-    /// `open()` to seek to the checkpointed position. This is how Kafka
-    /// sources resume from their last checkpoint offset on recovery.
     pub restore_checkpoint: Option<SourceCheckpoint>,
 }
 
@@ -69,14 +65,14 @@ pub struct SourceRegistration {
 /// Trait exists for test seam; production impl is `ConnectorPipelineCallback`.
 #[trait_variant::make(Send)]
 pub trait PipelineCallback: Send + 'static {
-    /// Called with accumulated source batches to execute a SQL cycle.
+    /// Execute a SQL cycle over the accumulated source batches.
     async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String>;
 
-    /// Called with results to push to stream subscriptions.
+    /// Push cycle results to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
     /// Update materialized view stores with cycle results.
@@ -84,25 +80,24 @@ pub trait PipelineCallback: Send + 'static {
         let _ = results;
     }
 
-    /// Called with results to write to sinks.
+    /// Write cycle results to sinks.
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
     /// Extract watermark from a batch for a given source.
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch);
 
-    /// Filter late rows from a batch. Returns the filtered batch (or None if all late).
+    /// Filter late rows from a batch.
     fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch>;
 
-    /// Get the current pipeline watermark.
+    /// Current pipeline watermark.
     fn current_watermark(&self) -> i64;
 
-    /// Returns `true` if this node is the leader in cluster mode, or if running in single-node mode.
+    /// `true` if this node is the cluster leader, or in single-node mode.
     fn is_leader(&self) -> bool {
         true
     }
 
-    /// Per drain cycle: demote sources idle past their timeout so a quiet
-    /// input doesn't hold back the combined watermark. Default: no-op.
+    /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 
     /// Perform a periodic (timer-based) checkpoint. At-least-once semantics.
@@ -116,9 +111,6 @@ pub trait PipelineCallback: Send + 'static {
     ) -> Option<u64>;
 
     /// Called when all sources have aligned on a barrier.
-    /// `checkpoint_id` identifies the barrier round the offsets were
-    /// captured under — implementations must not attribute them to a
-    /// different (e.g. newer, post-abandonment) announcement.
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
@@ -134,44 +126,39 @@ pub trait PipelineCallback: Send + 'static {
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
 
-    /// Returns `true` when internal buffers are near capacity.
+    /// `true` when internal buffers are near capacity.
     fn is_backpressured(&self) -> bool {
         false
     }
 
-    /// Returns `true` while total operator state exceeds the configured
-    /// memory budget. The coordinator then stops coalescing extra source
-    /// messages into the cycle (intake throttles to the select loop's one
-    /// message per cycle, so checkpoint barriers keep flowing) and skips
-    /// idle-watermark ticking, so a paused source is not demoted and its
-    /// queued rows are not dropped as late on resume. Default: never.
+    /// `true` while total operator state exceeds the configured memory budget.
+    ///
+    /// When over budget, the coordinator throttles intake to one message per cycle
+    /// and skips idle-watermark ticking so a paused source is not treated as idle.
     fn state_over_budget(&mut self) -> bool {
         false
     }
 
-    /// When a cold tier is wired and operator state approaches the memory
-    /// budget, shed idle vnode slices to disk (demotion) so the budget is
-    /// relieved before intake backpressures. Runs in the cycle's maintenance
-    /// phase (off the hot path); a no-op without a tier or budget.
+    /// Shed idle vnode slices to the cold tier when state approaches the memory budget.
     ///
-    /// The default body is a ready future expression (not an `async {}`
-    /// block): `trait_variant` rewrites the signature to return
-    /// `impl Future`, so a default must already be a future.
+    /// Runs in the maintenance phase; no-op without a tier or budget.
+    /// The default is a `ready` expression, not `async {}`, because `trait_variant`
+    /// rewrites the signature to `impl Future`.
     fn maybe_demote_state(&mut self) -> impl std::future::Future<Output = ()> + Send {
         std::future::ready(())
     }
 
-    /// Returns `true` when deferred operators have pending input to drain.
+    /// `true` when deferred operators have pending input to drain.
     fn has_deferred_input(&self) -> bool {
         false
     }
 
-    /// Forward a durable checkpoint epoch to external SUBSCRIBE consumers.
+    /// Forward a committed epoch to external SUBSCRIBE consumers.
     fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
         let _ = (epoch, checkpoint_id);
     }
 
-    /// Get the next checkpoint ID if managed externally.
+    /// Next checkpoint ID when managed externally.
     fn next_checkpoint_id(&self) -> Option<u64> {
         None
     }

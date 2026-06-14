@@ -8,19 +8,7 @@ use arrow::datatypes::SchemaRef;
 use super::error::ApiError;
 use crate::catalog::ArrowRecord;
 
-/// Untyped subscription returning Arrow `RecordBatch`es.
-///
-/// Unlike `TypedSubscription<T>`, this doesn't require Rust trait bounds,
-/// making it suitable for FFI where the binding language handles deserialization.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let sub = conn.subscribe("ohlc_stream")?;
-/// while let Some(batch) = sub.try_next()? {
-///     // Process batch via Arrow C Data Interface
-/// }
-/// ```
+/// Untyped subscription returning Arrow `RecordBatch`es; no Rust trait bounds, suitable for FFI.
 pub struct ArrowSubscription {
     inner: laminar_core::streaming::Subscription<ArrowRecord>,
     schema: SchemaRef,
@@ -120,8 +108,7 @@ impl ArrowSubscription {
     }
 }
 
-// SAFETY: ArrowSubscription wraps Subscription<ArrowRecord> which uses
-// lock-free channels with atomic operations.
+// SAFETY: ArrowSubscription wraps Subscription<ArrowRecord> which uses lock-free channels.
 unsafe impl Send for ArrowSubscription {}
 
 #[cfg(test)]

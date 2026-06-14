@@ -1,10 +1,4 @@
-//! Live `DataFusion` table providers for `TableStore` and streaming sources.
-//!
-//! [`ReferenceTableProvider`] reads directly from the `TableStore` on each
-//! `scan()` call, so queries always see the latest data without re-registration.
-//!
-//! [`SourceSnapshotProvider`] serves point-in-time snapshots of buffered
-//! source data, enabling `SELECT * FROM source` on streaming sources.
+//! `DataFusion` table providers for `TableStore`, streaming sources, and materialized views.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -21,10 +15,7 @@ use crate::catalog::SourceEntry;
 use crate::mv_store::MvStore;
 use crate::table_store::TableStore;
 
-/// A `DataFusion` table provider that reads live data from `TableStore`.
-///
-/// Registered once at CREATE TABLE time and never needs re-registration —
-/// each `scan()` fetches the current snapshot from the backing store.
+/// Live `DataFusion` table provider over `TableStore`; each `scan()` sees the current snapshot.
 pub(crate) struct ReferenceTableProvider {
     table_name: String,
     schema: SchemaRef,
@@ -32,7 +23,6 @@ pub(crate) struct ReferenceTableProvider {
 }
 
 impl ReferenceTableProvider {
-    /// Create a new provider for the given table.
     pub fn new(
         table_name: String,
         schema: SchemaRef,
@@ -94,25 +84,14 @@ impl std::fmt::Debug for ReferenceTableProvider {
     }
 }
 
-/// A `DataFusion` table provider that serves point-in-time snapshots of a
-/// streaming source's buffered data.
-///
-/// Registered at `CREATE SOURCE` time. Each `scan()` reads the current
-/// snapshot from `SourceEntry::snapshot()` and distributes batches
-/// round-robin across `num_partitions` partitions to enable parallel
-/// query execution.
+/// Point-in-time snapshot provider for a streaming source's buffered data.
 pub(crate) struct SourceSnapshotProvider {
     source_entry: Arc<SourceEntry>,
     num_partitions: usize,
 }
 
 impl SourceSnapshotProvider {
-    /// Create a new provider backed by the given source entry.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_entry` - The source entry to snapshot
-    /// * `num_partitions` - Number of partitions for parallel scans (clamped to 1..=256)
+    /// `num_partitions` is clamped to `1..=256`.
     pub fn new(source_entry: Arc<SourceEntry>, num_partitions: usize) -> Self {
         Self {
             source_entry,
@@ -145,12 +124,9 @@ impl TableProvider for SourceSnapshotProvider {
         let batches = self.source_entry.snapshot();
         let schema = self.source_entry.schema.clone();
         let data = if batches.is_empty() {
-            // Produce the right number of (empty) partitions
             (0..self.num_partitions).map(|_| Vec::new()).collect()
         } else {
-            // Distribute batches round-robin across partitions.
-            // Assumes roughly uniform batch sizes; skew is acceptable
-            // for ad-hoc snapshot queries (not on the streaming hot path).
+            // Round-robin distribution; skew is fine for ad-hoc snapshot queries.
             let mut partitions: Vec<Vec<_>> =
                 (0..self.num_partitions).map(|_| Vec::new()).collect();
             for (i, batch) in batches.into_iter().enumerate() {
@@ -172,10 +148,7 @@ impl std::fmt::Debug for SourceSnapshotProvider {
     }
 }
 
-/// A `DataFusion` table provider for materialized view results.
-///
-/// Registered once at `CREATE MATERIALIZED VIEW` time. Each `scan()` reads
-/// the latest results from the shared `MvStore`.
+/// `DataFusion` table provider for materialized view results.
 pub(crate) struct MvTableProvider {
     mv_name: String,
     schema: SchemaRef,
@@ -183,7 +156,6 @@ pub(crate) struct MvTableProvider {
 }
 
 impl MvTableProvider {
-    /// Create a new provider for the given materialized view.
     pub fn new(
         mv_name: String,
         schema: SchemaRef,

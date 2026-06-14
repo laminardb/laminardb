@@ -1,12 +1,6 @@
-//! The assembled AI subsystem: the model registry, the provider clients that
-//! back it, the shared result cache, and the call log.
-//!
-//! Built once from server configuration and threaded into the engine. Given a
-//! model name referenced in SQL, [`AiRuntime::resolve`] returns everything the
-//! inference operator needs to run it: the backend kind, a stable cache id, the
-//! provider client, the provider-side model id, and any labels. The registry is
-//! kept whole (it also backs the `laminar.models` catalog view), even for models
-//! whose backend has no provider wired yet.
+//! Assembled AI subsystem: registry, provider clients, result cache, and call log.
+//! Built once at startup; [`AiRuntime::resolve`] returns everything the inference
+//! operator needs to run a named model.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,24 +17,24 @@ use crate::ai::registry::{BackendKind, ModelBackend, ModelRegistry, RegistryErro
 pub struct ResolvedModel {
     /// Backend kind (selects the adapter path).
     pub kind: BackendKind,
-    /// Stable per-run integer id for the result-cache key.
+    /// Stable per-run integer for the result-cache key.
     pub model_id: u32,
-    /// The transport client.
+    /// Transport client.
     pub provider: Arc<dyn InferenceProvider>,
-    /// The provider-side model identifier passed in the request.
+    /// Provider-side model identifier.
     pub provider_model: String,
-    /// Intrinsic labels (local classifiers), if known.
+    /// Intrinsic labels for local classifiers.
     pub labels: Option<Vec<String>>,
 }
 
 /// Errors from resolving a model to a runnable backend.
 #[derive(Debug, Error)]
 pub enum AiRuntimeError {
-    /// The model is not registered, or it cannot perform the requested task.
+    /// The model is not registered or cannot perform the requested task.
     #[error(transparent)]
     Registry(#[from] RegistryError),
 
-    /// A remote model names a provider that was not configured.
+    /// A remote model references an unconfigured provider.
     #[error("model '{model}' references provider '{provider}', which is not configured")]
     UnknownProvider {
         /// The model name.
@@ -49,7 +43,7 @@ pub enum AiRuntimeError {
         provider: String,
     },
 
-    /// A local model was referenced but the local backend is not available.
+    /// Local model referenced but the local backend is not enabled.
     #[error("model '{0}' is local, but the local backend is not enabled in this build")]
     LocalBackendUnavailable(String),
 }
@@ -65,9 +59,8 @@ pub struct AiRuntime {
 }
 
 impl AiRuntime {
-    /// Assemble a runtime. `providers` is keyed by provider name (matching a
-    /// model's `provider`); `local_provider`, when present, serves every local
-    /// model. Each registered model is assigned a stable cache id.
+    /// Assemble a runtime. `providers` is keyed by provider name; `local_provider`
+    /// serves all local models. Each model gets a stable cache id.
     #[must_use]
     pub fn new(
         registry: ModelRegistry,
@@ -91,19 +84,19 @@ impl AiRuntime {
         }
     }
 
-    /// The model registry (backs `laminar.models` and plan-time validation).
+    /// Model registry (backs `laminar.models`).
     #[must_use]
     pub fn registry(&self) -> &ModelRegistry {
         &self.registry
     }
 
-    /// The shared result cache.
+    /// Shared result cache.
     #[must_use]
     pub fn cache(&self) -> &Arc<AiResultCache> {
         &self.cache
     }
 
-    /// The call log (backs `laminar.ai_calls`).
+    /// Call log (backs `laminar.ai_calls`).
     #[must_use]
     pub fn call_log(&self) -> &Arc<AiCallLog> {
         &self.call_log
@@ -113,8 +106,8 @@ impl AiRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`AiRuntimeError`] if the model is unknown, names an unconfigured
-    /// provider, or is local while the local backend is unavailable.
+    /// Returns [`AiRuntimeError`] if the model is unknown, the provider is not
+    /// configured, or the local backend is unavailable.
     pub fn resolve(&self, model_name: &str) -> Result<ResolvedModel, AiRuntimeError> {
         let entry = self.registry.resolve(model_name)?;
         let model_id = self.model_ids.get(model_name).copied().unwrap_or(u32::MAX);

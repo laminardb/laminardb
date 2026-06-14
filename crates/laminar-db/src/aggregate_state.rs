@@ -1,21 +1,8 @@
 //! Incremental aggregation state for streaming GROUP BY queries.
 //!
-//! ## Scope
-//!
-//! This module owns the **single-process** aggregate operator: one
-//! `IncrementalAggState` per pipeline, one `DataFusion` `Accumulator`
-//! per aggregate per group. State is captured for checkpointing via
-//! the DataFusion-canonical `Accumulator::state() -> Vec<ScalarValue>`
-//! / `merge_batch(&arrays)` pair (see `checkpoint_groups` /
-//! `restore_groups`), serialized through Arrow IPC.
-//!
-//! The cross-vnode fan-in path — where the same aggregate runs on many
-//! vnodes and a merger instance combines their partials — lives in
-//! [`laminar_core::state::partial_aggregate`] and is a distinct tool
-//! solving a distinct problem (monoid `merge`, not format round-trip).
-//! Do not try to unify the two contracts: `DataFusion` already covers
-//! DISTINCT / FILTER / HAVING / UDAs on the single-process path, which
-//! `PartialAggregate` deliberately does not attempt.
+//! One `IncrementalAggState` per pipeline; one `DataFusion` `Accumulator` per
+//! aggregate per group. Cross-vnode partial merges live in
+//! `laminar_core::state::partial_aggregate` and are a separate concern.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -165,10 +152,7 @@ impl AggFuncSpec {
         })
     }
 
-    /// Create a weight-aware retractable accumulator for changelog streams.
-    ///
-    /// These accumulators receive the `__weight` column as the last input
-    /// in `update_batch` and handle retraction internally.
+    /// Create a retractable accumulator for changelog streams (`__weight` as last input).
     pub(crate) fn create_retractable_accumulator(
         &self,
     ) -> Result<Box<dyn datafusion_expr::Accumulator>, DbError> {
@@ -182,14 +166,9 @@ impl AggFuncSpec {
 
 /// Snapshot an accumulator's state for a checkpoint and rebuild it in place.
 ///
-/// `Accumulator::state()` may drain internal collections (e.g. the DISTINCT
-/// hash set) — `DataFusion` only requires it to be valid once, since partial
-/// accumulators are discarded after `state()`. The window/group checkpoint
-/// paths call it on the *live* accumulator that keeps running, so we rebuild
-/// it from the snapshot (the same constructor + `merge_batch` round-trip used
-/// on restore). `retractable` must match how this accumulator was created —
-/// changelog/`__weight` groups use the retractable accumulator, so rebuilding
-/// it as a plain one would drop retraction handling. Returns the IPC state.
+/// `Accumulator::state()` may drain internal state (e.g. DISTINCT hash sets);
+/// we rebuild the accumulator from the snapshot so it keeps running correctly.
+/// `retractable` must match how the accumulator was created.
 pub(crate) fn snapshot_and_rebuild(
     acc: &mut Box<dyn datafusion_expr::Accumulator>,
     spec: &AggFuncSpec,
@@ -198,8 +177,8 @@ pub(crate) fn snapshot_and_rebuild(
     let state = acc
         .state()
         .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-    // `state()` already drained the accumulator; rebuild it before serializing
-    // so a `scalars_to_ipc` failure can't leave it empty for the next cycle.
+    // Rebuild before serializing: a scalars_to_ipc failure must not leave
+    // the accumulator empty for the next cycle.
     let arrays: Vec<ArrayRef> = state
         .iter()
         .map(|sv| {
@@ -220,9 +199,6 @@ pub(crate) fn snapshot_and_rebuild(
     Ok(ipc)
 }
 
-/// Convert an accumulator's restored state tuple to the `ArrayRef`s
-/// `Accumulator::merge_batch` expects. Mirrors the inline conversion in
-/// [`IncrementalAggState::restore_groups`].
 #[cfg(feature = "cluster")]
 fn scalars_to_arrays(scalars: &[ScalarValue]) -> Result<Vec<ArrayRef>, DbError> {
     scalars
@@ -234,20 +210,14 @@ fn scalars_to_arrays(scalars: &[ScalarValue]) -> Result<Vec<ArrayRef>, DbError> 
         .collect()
 }
 
-/// Minimum interval between full size re-walks in
-/// [`IncrementalAggState::estimated_size_bytes`]. The walk is O(groups);
-/// between walks the cached figure is served, so a per-cycle memory-budget
-/// probe stays O(1) while staleness stays bounded.
+/// Minimum interval between full O(groups) size re-walks.
 const SIZE_REWALK_MIN_INTERVAL_MS: u64 = 2_000;
 
-/// Cached result of the O(groups) size walk. Atomic because the read path
-/// (`estimated_size_bytes`) takes `&self` but refreshes the cache lazily,
-/// and the operator's `process` future must stay `Send` (which demands
-/// `Sync` of state held across awaits). Single-threaded in practice;
-/// `Relaxed` ordering suffices.
+// Atomic fields let `estimated_size_bytes` update the cache through `&self`
+// without requiring a write lock. Single-threaded in practice; Relaxed suffices.
 struct SizeEstimateCache {
     bytes: AtomicUsize,
-    /// `state_gen` at the last walk; `u64::MAX` forces the next read to walk.
+    // u64::MAX forces the next read to re-walk regardless of elapsed time.
     walked_gen: AtomicU64,
     walked_at_ms: AtomicU64,
 }
@@ -261,8 +231,7 @@ impl SizeEstimateCache {
         }
     }
 
-    /// Force the next `estimated_size_bytes` call to re-walk, bypassing the
-    /// rewalk-interval throttle. For bulk-replacement paths (restore, merge).
+    /// Force the next size probe to re-walk, bypassing the interval throttle.
     fn invalidate(&self) {
         self.walked_gen.store(u64::MAX, Ordering::Relaxed);
     }
@@ -280,14 +249,11 @@ pub(crate) struct IncrementalAggState {
     group_types: Vec<DataType>,
     agg_specs: Vec<AggFuncSpec>,
     groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
-    /// Monotonic count of mutations to `groups`; lets the size cache skip
-    /// re-walking idle state entirely.
     state_gen: u64,
     size_cache: SizeEstimateCache,
     row_converter: arrow::row::RowConverter,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
-    /// Built once; `LiveSourceExec` leaves carry fresh data per execute.
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     having_sql: Option<String>,
@@ -296,31 +262,22 @@ pub(crate) struct IncrementalAggState {
     last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(crate) idle_ttl_ms: Option<u64>,
     weight_col_idx: Option<usize>,
-    /// Vnode count for dirty tracking, learned at the first per-vnode
-    /// capture. `None` = no captures yet, so nothing can be demoted and
-    /// dirty tracking is off.
+    // None = no per-vnode capture yet; dirty tracking is off.
     #[cfg(feature = "state-tier")]
     tier_vnode_count: Option<u32>,
-    /// Vnodes whose groups changed since the last per-vnode capture —
-    /// their in-memory state no longer matches the captured bytes, so
-    /// demoting them would lose the changes.
+    // Vnodes touched since the last capture; demoting them would lose changes.
     #[cfg(feature = "state-tier")]
     dirty_vnodes: rustc_hash::FxHashSet<u32>,
-    /// Set when state was bulk-replaced (restore/merge) since the last
-    /// capture: every vnode is suspect, refuse all demotions until the
-    /// next capture re-baselines.
+    // Bulk restore/merge happened since the last capture; block all demotions.
     #[cfg(feature = "state-tier")]
     dirty_all: bool,
-    /// Vnodes demoted to the cold tier: their groups are not in memory and
-    /// per-vnode captures stage a cold marker for them.
+    // Groups for these vnodes were dropped; captures stage a cold marker.
     #[cfg(feature = "state-tier")]
     cold_vnodes: rustc_hash::FxHashSet<u32>,
 }
 
 impl IncrementalAggState {
-    /// Number of leading GROUP BY columns in this aggregate's pre-agg
-    /// output. Used by the cluster row-shuffle path to know which
-    /// columns to hash.
+    /// Number of leading GROUP BY columns; used by the shuffle path for hashing.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub(crate) fn num_group_cols(&self) -> usize {
@@ -328,10 +285,7 @@ impl IncrementalAggState {
     }
 }
 
-/// Name of the Z-set weight column appended to changelog output.
-///
-/// Re-exported from the shared changelog contract in `laminar-core` so the MV
-/// producer and the upsert-sink consumers agree on the column name.
+/// Z-set weight column name shared between the MV producer and upsert-sink consumers.
 pub(crate) use laminar_core::changelog::WEIGHT_COLUMN;
 
 /// Build a weighted `RecordBatch` from collected keys, values, and weights.
@@ -399,8 +353,7 @@ impl IncrementalAggState {
 
         let plan = df.logical_plan();
 
-        // Use the top-level plan's output schema for column names — this
-        // includes user-specified aliases (e.g., `SUM(x) AS total`).
+        // Top-level schema preserves user aliases (e.g. `SUM(x) AS total`).
         let top_schema = Arc::new(plan.schema().as_arrow().clone());
 
         let Some(agg_info) = find_aggregate(plan) else {
@@ -417,15 +370,9 @@ impl IncrementalAggState {
             return Ok(None);
         }
 
-        // Bail out if the top-level plan has a non-trivial projection above
-        // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
-        // The incremental accumulator emits raw aggregate outputs and cannot
-        // apply post-aggregate projections.  Fall through to EOWC raw-batch.
-        //
-        // Check both field count AND types — a coincidental count match (e.g.,
-        // 2 group keys + 3 aggregates == 5 SELECT items after projection drops
-        // a group key and adds a computed column) can mask a projection that
-        // remaps group columns to aggregate aliases.
+        // Bail if there's a non-trivial projection above the Aggregate
+        // (e.g. SUM(a)/SUM(b) AS ratio). Check field count AND types: a
+        // coincidental count match can still hide a remapping projection.
         if top_schema.fields().len() != agg_schema.fields().len() {
             return Ok(None);
         }
@@ -437,9 +384,6 @@ impl IncrementalAggState {
 
         let num_group_cols = group_exprs.len();
 
-        // Resolve group-by column names and types.
-        // Use top-level schema for names (preserves aliases) and agg schema
-        // for types (accurate data types from the aggregate node).
         let mut group_col_names = Vec::new();
         let mut group_types = Vec::new();
         for i in 0..num_group_cols {
@@ -449,8 +393,7 @@ impl IncrementalAggState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        // Determine if we should attempt to compile pre-agg expressions.
-        // Use single_source_table (counts occurrences) to reject self-joins.
+        // single_source_table rejects self-joins where compilation is unsafe.
         let compile_source = crate::sql_analysis::single_source_table(sql);
         let state = ctx.state();
         let props = state.execution_props();
@@ -462,9 +405,6 @@ impl IncrementalAggState {
         let mut agg_specs = Vec::new();
         let mut pre_agg_select_items: Vec<String> = Vec::new();
 
-        // For simple column refs, quote as identifier. For complex
-        // expressions (EXTRACT, CASE WHEN, etc.), generate the SQL
-        // expression with an alias so the source query evaluates it.
         for (i, group_expr) in group_exprs.iter().enumerate() {
             if let datafusion_expr::Expr::Column(col) = group_expr {
                 pre_agg_select_items.push(format!("\"{}\"", col.name));
@@ -473,7 +413,6 @@ impl IncrementalAggState {
                 pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
             }
 
-            // Compile group expression
             if compile_ok {
                 match create_physical_expr(group_expr, input_df_schema, props) {
                     Ok(phys) => {
@@ -492,7 +431,6 @@ impl IncrementalAggState {
             }
         }
 
-        // Column index tracker for pre-agg output
         let mut next_col_idx = num_group_cols;
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
@@ -509,20 +447,17 @@ impl IncrementalAggState {
                 let udf = Arc::clone(&agg_func.func);
                 let is_distinct = agg_func.params.distinct;
 
-                // Collect input column indices and add input expressions
-                // to the pre-agg SELECT
                 let mut input_col_indices = Vec::new();
                 let mut input_types = Vec::new();
 
                 if agg_func.params.args.is_empty() {
-                    // COUNT(*) — no input columns needed, pass a dummy boolean
+                    // COUNT(*): no input column needed; pass a dummy boolean.
                     let col_idx = next_col_idx;
                     next_col_idx += 1;
                     pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
 
-                    // Compile literal TRUE
                     if compile_ok {
                         match create_physical_expr(
                             &datafusion_expr::lit(true),
@@ -546,16 +481,13 @@ impl IncrementalAggState {
                         next_col_idx += 1;
                         let expr_sql = expr_to_sql(arg_expr);
 
-                        // If FILTER clause present, wrap input with
-                        // CASE WHEN so filtered rows become NULL (ignored
-                        // by accumulators)
+                        // FILTER: wrap with CASE WHEN so filtered rows become NULL.
                         if let Some(filter_expr) = &agg_func.params.filter {
                             let filter_sql = expr_to_sql(filter_expr);
                             pre_agg_select_items.push(format!(
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
 
-                            // Compile: CASE WHEN filter THEN arg ELSE NULL END
                             if compile_ok {
                                 let case_expr =
                                     datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
@@ -589,7 +521,6 @@ impl IncrementalAggState {
                             pre_agg_select_items
                                 .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
 
-                            // Compile the arg expression directly
                             if compile_ok {
                                 match create_physical_expr(arg_expr, input_df_schema, props) {
                                     Ok(phys) => {
@@ -616,8 +547,6 @@ impl IncrementalAggState {
                     }
                 }
 
-                // Add a boolean filter column for masking rows
-                // in process_batch when FILTER clause is present
                 let filter_col_index = if let Some(filter_expr) = &agg_func.params.filter {
                     let col_idx = next_col_idx;
                     next_col_idx += 1;
@@ -626,7 +555,6 @@ impl IncrementalAggState {
                             "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                         ));
 
-                    // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
                     if compile_ok {
                         let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
                             expr: None,
@@ -669,17 +597,13 @@ impl IncrementalAggState {
                     filter_col_index,
                 });
             } else {
-                // Non-aggregate expression in the aggregate output —
-                // this shouldn't happen for well-formed plans.
                 return Ok(None);
             }
         }
 
         let clauses = extract_clauses(sql);
 
-        // Detect __weight in upstream source for cascaded changelog aggregation.
-        // Check the registered table schema (not the pruned plan schema, which
-        // may have dropped unreferenced columns).
+        // Check the registered schema, not the pruned plan schema, to detect __weight.
         let source_has_weight = if let Ok(tp) = ctx
             .table_provider(clauses.from_clause.trim_matches('"'))
             .await
@@ -690,9 +614,6 @@ impl IncrementalAggState {
         };
 
         let weight_col_idx = if source_has_weight {
-            // Validate that all aggregates support retractable changelog
-            // semantics. Retractable accumulators handle the weight column
-            // internally (SUM, COUNT, AVG, MIN, MAX).
             for spec in &agg_specs {
                 if spec.distinct {
                     return Err(DbError::Pipeline(format!(
@@ -724,12 +645,9 @@ impl IncrementalAggState {
             clauses.where_clause,
         );
 
-        // Build compiled projection for single-source queries.
-        // Skip compilation when upstream has __weight — the compiled path
-        // doesn't include the weight column, so process_batch would read
-        // the wrong index. The cached plan path handles it via pre_agg_sql.
+        // Skip compilation when upstream has __weight: the compiled path omits
+        // it, which would shift column indices in process_batch.
         let compiled_projection = if compile_ok && weight_col_idx.is_none() {
-            // Compile WHERE predicate
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
                     Some(phys)
@@ -769,7 +687,6 @@ impl IncrementalAggState {
         }
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        // Compile HAVING filter.
         let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
         let having_sql = if having_filter.is_none() {
             having_predicate.as_ref().map(expr_to_sql)
@@ -777,7 +694,7 @@ impl IncrementalAggState {
             None
         };
 
-        // Plan once at init; `LiveSourceProvider` leaves carry fresh data.
+        // Plan once at init; LiveSourceProvider leaves carry fresh data per execute.
         let cached_pre_agg_physical =
             if compiled_projection.is_none() {
                 let logical = ctx.sql(&pre_agg_sql).await.map_err(|e| {
@@ -828,8 +745,7 @@ impl IncrementalAggState {
         }))
     }
 
-    /// Evict idle groups and return retraction records. Only produces output
-    /// when both `emit_changelog` and `idle_ttl_ms` are set.
+    /// Evict idle groups and return retraction records. Requires both `emit_changelog` and `idle_ttl_ms`.
     pub fn evict_idle(&mut self, watermark: i64) -> Result<Vec<RecordBatch>, DbError> {
         let Some(ttl) = self.idle_ttl_ms else {
             return Ok(Vec::new());
@@ -852,7 +768,6 @@ impl IncrementalAggState {
             return Ok(Vec::new());
         }
 
-        // Collect retraction data from last_emitted before removing.
         let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
 
@@ -912,8 +827,7 @@ impl IncrementalAggState {
             .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
-        // Local map keyed by borrowed Row: one OwnedRow alloc per unique
-        // group, not per row.
+        // One OwnedRow alloc per unique group, not per row.
         let estimated_groups = (batch.num_rows() / 4).max(16);
         let mut group_indices: FxHashMap<arrow::row::Row<'_>, Vec<u32>> =
             FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
@@ -975,13 +889,12 @@ impl IncrementalAggState {
         Ok(())
     }
 
-    /// Fast path for global aggregates (COUNT(*), SUM(x), etc. with no GROUP BY).
+    /// Fast path for global aggregates (no GROUP BY).
     fn process_batch_no_groups(
         &mut self,
         batch: &RecordBatch,
         watermark_ms: i64,
     ) -> Result<(), DbError> {
-        // Global aggregates capture into vnode 0.
         #[cfg(feature = "state-tier")]
         if self.tier_vnode_count.is_some() {
             self.dirty_vnodes.insert(0);
@@ -1019,11 +932,7 @@ impl IncrementalAggState {
         )
     }
 
-    /// Update accumulators for a single group given the row indices.
-    ///
-    /// Takes a batch and a slice of row indices, does a single `take()` per
-    /// column per accumulator, and feeds the resulting sub-arrays to
-    /// `Accumulator::update_batch`. This avoids per-row allocation.
+    /// Update accumulators for a group: one `take()` per column per accumulator, no per-row allocation.
     pub(crate) fn update_group_accumulators(
         accs: &mut [Box<dyn datafusion_expr::Accumulator>],
         batch: &RecordBatch,
@@ -1050,7 +959,6 @@ impl IncrementalAggState {
                 input_arrays.push(arr);
             }
 
-            // Apply per-accumulator FILTER mask.
             let filtered_weight = if let Some(filter_idx) = spec.filter_col_index {
                 let filter_arr = compute::take(batch.column(filter_idx), &index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
@@ -1066,7 +974,6 @@ impl IncrementalAggState {
                         );
                     }
                     input_arrays = filtered;
-                    // Also filter weight array through the same mask.
                     weight_arr
                         .as_ref()
                         .map(|w| {
@@ -1081,7 +988,6 @@ impl IncrementalAggState {
                 weight_arr.clone()
             };
 
-            // Retractable accumulators receive weight as the last input.
             if let Some(w) = &filtered_weight {
                 input_arrays.push(Arc::clone(w));
             }
@@ -1093,8 +999,7 @@ impl IncrementalAggState {
         Ok(())
     }
 
-    /// Does NOT reset the accumulators — they continue accumulating for the
-    /// next cycle (running totals).
+    /// Emit current aggregate state; accumulators keep running (no reset).
     pub fn emit(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         if self.emit_changelog {
             return self.emit_changelog_delta();
@@ -1102,7 +1007,6 @@ impl IncrementalAggState {
         self.emit_running_state()
     }
 
-    /// Emit full running state (all groups, every cycle). No __weight column.
     fn emit_running_state(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         if self.groups.is_empty() {
             return Ok(Vec::new());
@@ -1147,8 +1051,7 @@ impl IncrementalAggState {
     }
 
     fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
-        // Without `idle_ttl_ms`, `last_emitted` never shrinks. Warn once
-        // every ~5min so operators see the leak before OOM.
+        // Without idle_ttl_ms, last_emitted never shrinks; warn periodically.
         if self.idle_ttl_ms.is_none() && self.last_emitted.len() > 10_000 {
             use std::sync::atomic::{AtomicI64, Ordering};
             static LAST_WARN_S: AtomicI64 = AtomicI64::new(0);
@@ -1165,7 +1068,6 @@ impl IncrementalAggState {
                 );
             }
         }
-        // Collect retractions and inserts.
         let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
         let mut insert_keys: Vec<arrow::row::OwnedRow> = Vec::new();
@@ -1180,8 +1082,8 @@ impl IncrementalAggState {
                 .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
 
             if let Some(old) = self.last_emitted.get(key) {
-                // `ScalarValue::eq` says NaN != NaN; treat both-NaN as
-                // equal to avoid an infinite retract+insert loop.
+                // ScalarValue::eq treats NaN != NaN; short-circuit to avoid
+                // an infinite retract+insert loop on float aggregates.
                 let changed = old.iter().zip(current.iter()).any(|(a, b)| match (a, b) {
                     (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y)))
                         if x.is_nan() && y.is_nan() =>
@@ -1202,7 +1104,6 @@ impl IncrementalAggState {
                     insert_vals.push(current.clone());
                     self.last_emitted.insert(key.clone(), current);
                 }
-                // Unchanged: skip (true delta semantics).
             } else {
                 insert_keys.push(key.clone());
                 insert_vals.push(current.clone());
@@ -1210,7 +1111,6 @@ impl IncrementalAggState {
             }
         }
 
-        // Detect deleted groups (in last_emitted but not in groups).
         let deleted: Vec<arrow::row::OwnedRow> = self
             .last_emitted
             .keys()
@@ -1228,7 +1128,6 @@ impl IncrementalAggState {
             return Ok(Vec::new());
         }
 
-        // Build batch: retracts first (-1), then inserts (+1).
         let mut all_keys = Vec::with_capacity(total);
         let mut all_vals = Vec::with_capacity(total);
         let mut weights = Vec::with_capacity(total);
@@ -1278,12 +1177,7 @@ impl IncrementalAggState {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
 
-    /// Approximate bytes held by group state, from a lazily-refreshed cache.
-    ///
-    /// The underlying walk is O(groups), so the cache re-walks only when the
-    /// state has mutated since the last walk AND at least
-    /// [`SIZE_REWALK_MIN_INTERVAL_MS`] has elapsed — idle state is never
-    /// re-walked, and a per-cycle caller pays O(1) with bounded staleness.
+    /// Approximate bytes held by group state (lazily refreshed; O(1) between re-walks).
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let gen = self.state_gen;
         let walked_gen = self.size_cache.walked_gen.load(Ordering::Relaxed);
@@ -1328,7 +1222,6 @@ impl IncrementalAggState {
                 last_updated_ms: entry.last_updated_ms,
             });
         }
-        // Serialize last_emitted for changelog recovery.
         let mut last_emitted_cp = Vec::new();
         if self.emit_changelog {
             for (row_key, vals) in &self.last_emitted {
@@ -1359,8 +1252,8 @@ impl IncrementalAggState {
                 checkpoint.fingerprint, current_fp
             )));
         }
-        // Two-phase: build maps locally then swap, so a mid-list decode
-        // error doesn't leave `last_emitted` partially populated.
+        // Build locally then swap so a mid-list decode error can't leave
+        // last_emitted partially populated.
         let mut new_groups: AHashMap<arrow::row::OwnedRow, GroupEntry> =
             AHashMap::with_capacity(checkpoint.groups.len());
         for gc in &checkpoint.groups {
@@ -1410,8 +1303,7 @@ impl IncrementalAggState {
         self.last_emitted = new_last_emitted;
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
-        // Restored state lives fully in memory: no vnode is cold anymore,
-        // and none can be demoted until the next capture re-baselines.
+        // All state is in memory; block demotion until the next capture re-baselines.
         #[cfg(feature = "state-tier")]
         {
             self.cold_vnodes.clear();
@@ -1420,19 +1312,7 @@ impl IncrementalAggState {
         Ok(checkpoint.groups.len())
     }
 
-    /// Partition this state into one [`AggStateCheckpoint`] per vnode.
-    ///
-    /// Each group key is mapped to its vnode with the **same** hashing the
-    /// cluster shuffle uses to route rows
-    /// (`laminar_core::state::key_hash(row_key.as_ref()) % vnode_count`), so a
-    /// vnode's slice here is exactly the set of groups whose rows the shuffle
-    /// delivered to this node. A global aggregate (`num_group_cols == 0`)
-    /// hashes to vnode 0, mirroring the routing fast-path.
-    ///
-    /// Reuses the per-group serialization of [`Self::checkpoint_groups`]; the
-    /// union of the returned slices is byte-for-byte the groups that method
-    /// would emit. Only vnodes with at least one group (or emitted entry) are
-    /// present in the result.
+    /// Partition state into one [`AggStateCheckpoint`] per vnode using the same hash as the shuffle.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     pub(crate) fn checkpoint_groups_by_vnode(
@@ -1500,9 +1380,7 @@ impl IncrementalAggState {
             }
         }
 
-        // This capture is the new clean baseline: the staged bytes match
-        // memory exactly as of now, so dirty tracking restarts here (and
-        // the vnode count it is keyed to is pinned).
+        // New baseline: staged bytes match memory; dirty tracking restarts.
         #[cfg(feature = "state-tier")]
         {
             self.tier_vnode_count = Some(vnode_count);
@@ -1513,14 +1391,10 @@ impl IncrementalAggState {
         Ok(buckets)
     }
 
-    /// Merge a restored [`AggStateCheckpoint`] into the live state.
+    /// Fold a checkpoint's accumulator states into live state via `merge_batch`.
     ///
-    /// Unlike [`Self::restore_groups`] (which replaces wholesale), this folds
-    /// the checkpoint's accumulator states **into** any groups already present
-    /// via `Accumulator::merge_batch`, and inserts the rest. Because standard
-    /// accumulators merge associatively, the result is correct regardless of
-    /// how many rows the operator already processed for these keys before the
-    /// rebalanced state arrived. Used by the cross-node vnode rehydration path.
+    /// Unlike `restore_groups` (wholesale replace), this merges into existing
+    /// groups associatively. Used by the cross-node vnode rehydration path.
     #[cfg(feature = "cluster")]
     pub(crate) fn merge_groups(
         &mut self,
@@ -1585,34 +1459,21 @@ impl IncrementalAggState {
 
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
-        // No `dirty_all` here: every caller (`apply_vnode_state`) merges exactly
-        // one vnode and marks *that* vnode dirty itself, so demotion of other
-        // clean vnodes stays available. Blanket-dirtying here would block all
-        // demotion after a single promotion or rebalance-acquired vnode.
+        // No dirty_all: callers mark only the merged vnode dirty, so other
+        // clean vnodes remain demotable.
         Ok(checkpoint.groups.len())
     }
 }
 
 #[cfg(feature = "state-tier")]
 impl IncrementalAggState {
-    /// Vnodes currently demoted to the cold tier.
+    /// Vnodes demoted to the cold tier.
     pub(crate) fn cold_vnodes(&self) -> &rustc_hash::FxHashSet<u32> {
         &self.cold_vnodes
     }
 
-    /// Whether [`Self::demote_vnode`] would succeed for `vnode` now, without
-    /// dropping anything. Refuses (`false`) unless it is provably safe:
-    ///
-    /// - the agg emits a changelog — a full-emit agg rebuilds its entire
-    ///   result from memory each cycle, so dropping groups would shrink
-    ///   the query output (same restriction as idle-TTL eviction);
-    /// - the vnode is untouched since the last per-vnode capture, and no
-    ///   bulk restore/merge happened since — otherwise memory has moved
-    ///   past the bytes sitting in the tier;
-    /// - the capture baseline used this `vnode_count`.
-    ///
-    /// Checked before writing the slice to the tier, so a dirty candidate
-    /// costs no I/O.
+    /// Whether demotion of `vnode` is safe: changelog mode, untouched since last capture,
+    /// and the capture used this `vnode_count`.
     pub(crate) fn can_demote(&self, vnode: u32, vnode_count: u32) -> bool {
         self.emit_changelog
             && !self.dirty_all
@@ -1620,10 +1481,7 @@ impl IncrementalAggState {
             && self.tier_vnode_count == Some(vnode_count)
     }
 
-    /// Drop one vnode's groups after their captured bytes were confirmed in
-    /// the cold tier. No retractions are emitted: unlike eviction, demotion is
-    /// invisible downstream — the materialized rows stay, and a future update
-    /// for a cold group goes through promotion first.
+    /// Drop a vnode's groups after cold-tier confirmation. No retractions; materialized rows stay.
     pub(crate) fn demote_vnode(&mut self, vnode: u32, vnode_count: u32) -> bool {
         if !self.can_demote(vnode, vnode_count) {
             return false;
@@ -1655,19 +1513,14 @@ impl IncrementalAggState {
         true
     }
 
-    /// The vnode's state is back in memory (promotion applied) or never
-    /// left (tier write failed after the drop was rolled back): captures
-    /// stage bytes again, and the slice counts as changed until the next
-    /// capture re-baselines it.
+    /// Mark a vnode hot (promoted or tier write rolled back); dirty until next capture.
     pub(crate) fn mark_vnode_hot(&mut self, vnode: u32) {
         if self.cold_vnodes.remove(&vnode) {
             self.dirty_vnodes.insert(vnode);
         }
     }
 
-    /// Mark one vnode dirty so it can't be demoted until the next capture.
-    /// `apply_vnode_state` calls this after merging a vnode in; `mark_vnode_hot`
-    /// only dirties vnodes that were *cold*, so a rebalance-acquired one needs it.
+    /// Mark a vnode dirty to block demotion until the next capture.
     pub(crate) fn mark_vnode_dirty(&mut self, vnode: u32) {
         self.dirty_vnodes.insert(vnode);
     }

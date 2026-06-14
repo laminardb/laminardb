@@ -1,4 +1,4 @@
-//! SQL utility functions for multi-statement parsing and config variable substitution.
+//! SQL parsing utilities: statement splitting and config variable substitution.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -8,10 +8,6 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::error::DbError;
 
-/// Build a byte-offset index for each line in `sql`.
-///
-/// Returns a `Vec` where entry `i` is the byte offset of the start of
-/// 1-based line `i+1`. Line 1 always starts at byte 0.
 fn build_line_starts(sql: &str) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (i, b) in sql.bytes().enumerate() {
@@ -22,17 +18,11 @@ fn build_line_starts(sql: &str) -> Vec<usize> {
     starts
 }
 
-/// Convert a 1-based `(line, column)` from sqlparser's `Location` to a byte
-/// offset in `sql`.
-///
-/// sqlparser's `column` counts *characters* (via `Peekable<Chars>`), not
-/// bytes, so we walk with `char_indices()` for multi-byte correctness.
+// sqlparser's column counts characters, not bytes — walk with char_indices for multi-byte safety.
 fn location_to_byte_offset(sql: &str, line_starts: &[usize], line: u64, column: u64) -> usize {
     let line_idx = usize::try_from(line).unwrap_or(1).saturating_sub(1);
     let line_start = line_starts.get(line_idx).copied().unwrap_or(0);
-    let col_chars = usize::try_from(column).unwrap_or(1).saturating_sub(1); // 1-based → 0-based
-
-    // Walk `col_chars` characters from `line_start` to find the byte offset.
+    let col_chars = usize::try_from(column).unwrap_or(1).saturating_sub(1);
     sql[line_start..]
         .char_indices()
         .nth(col_chars)
@@ -41,13 +31,11 @@ fn location_to_byte_offset(sql: &str, line_starts: &[usize], line: u64, column: 
 
 /// Split a SQL string into individual statements on unquoted semicolons.
 ///
-/// Uses the sqlparser tokenizer to correctly handle quoted strings,
-/// single-line comments (`--`), and block comments (`/* ... */`).
-/// Empty statements (whitespace/comments only) are skipped.
+/// Uses the sqlparser tokenizer to handle quoted strings, line comments, and block comments.
+/// Empty statements are skipped.
 pub fn split_statements(sql: &str) -> Vec<&str> {
     let dialect = GenericDialect {};
-    // On tokenizer failure, return the whole string as one statement
-    // so that the downstream parser can produce a proper error.
+    // On tokenizer failure, return the whole string so the parser can emit the real error.
     let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() else {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
@@ -84,7 +72,6 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
         }
     }
 
-    // Trailing segment (no semicolon)
     if has_significant {
         let stmt = sql[seg_start..].trim();
         if !stmt.is_empty() {
@@ -95,13 +82,12 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     statements
 }
 
-/// Resolve `${VAR_NAME}` placeholders in a SQL string with values from the given map.
+/// Resolve `${VAR_NAME}` placeholders in `sql` from `vars`.
 ///
 /// # Errors
 ///
-/// Returns `DbError::InvalidOperation` if a referenced variable is not found
-/// and `strict` is true. In permissive mode (strict=false), unresolved
-/// variables are left as-is.
+/// Returns `DbError::InvalidOperation` for an unknown variable when `strict` is true.
+/// When `strict` is false, unresolved placeholders are left in place.
 pub fn resolve_config_vars(
     sql: &str,
     vars: &HashMap<String, String>,
@@ -114,20 +100,15 @@ pub fn resolve_config_vars(
 
     while i < len {
         if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-            // Found ${
             let start = i;
-            i += 2; // skip ${
+            i += 2;
             let var_start = i;
-
-            // Find closing }
             while i < len && bytes[i] != b'}' {
                 i += 1;
             }
-
             if i < len {
                 let var_name = &sql[var_start..i];
-                i += 1; // skip }
-
+                i += 1;
                 if let Some(value) = vars.get(var_name) {
                     result.push_str(value);
                 } else if strict {
@@ -135,11 +116,9 @@ pub fn resolve_config_vars(
                         "Unresolved config variable: ${{{var_name}}}"
                     )));
                 } else {
-                    // Permissive: leave as-is
                     result.push_str(&sql[start..i]);
                 }
             } else {
-                // No closing }, copy literal
                 result.push_str(&sql[start..]);
             }
         } else {
@@ -151,12 +130,9 @@ pub fn resolve_config_vars(
     Ok(result)
 }
 
-// -- SQL value extraction helpers ----------------------------------------
-
 /// Extract a string representation from a SQL expression.
 ///
-/// Handles literals, quoted strings, numbers, booleans, NULL, and
-/// unary minus (negative numbers).
+/// Handles literals, quoted strings, numbers, booleans, NULL, and unary minus.
 pub fn expr_to_string(expr: Option<&sqlparser::ast::Expr>) -> Option<String> {
     use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -177,7 +153,7 @@ pub fn expr_to_string(expr: Option<&sqlparser::ast::Expr>) -> Option<String> {
     }
 }
 
-/// Extract an `i64` from a SQL expression.
+/// Extract an `i64` from a SQL number literal or negated literal.
 pub fn expr_to_i64(expr: Option<&sqlparser::ast::Expr>) -> Option<i64> {
     use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -195,7 +171,7 @@ pub fn expr_to_i64(expr: Option<&sqlparser::ast::Expr>) -> Option<i64> {
     }
 }
 
-/// Extract an `f64` from a SQL expression.
+/// Extract an `f64` from a SQL number literal or negated literal.
 pub fn expr_to_f64(expr: Option<&sqlparser::ast::Expr>) -> Option<f64> {
     use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -213,7 +189,7 @@ pub fn expr_to_f64(expr: Option<&sqlparser::ast::Expr>) -> Option<f64> {
     }
 }
 
-/// Extract a `bool` from a SQL expression.
+/// Extract a `bool` from a SQL boolean literal.
 pub fn expr_to_bool(expr: Option<&sqlparser::ast::Expr>) -> Option<bool> {
     use sqlparser::ast::{Expr, Value};
 
@@ -227,8 +203,7 @@ pub fn expr_to_bool(expr: Option<&sqlparser::ast::Expr>) -> Option<bool> {
     }
 }
 
-/// Narrow `i64` SQL literals to a smaller signed Arrow integer type,
-/// erroring on out-of-range values rather than silently wrapping.
+/// Narrow `i64` SQL literals to a smaller signed Arrow type, erroring on overflow.
 fn narrow_i64_col<N: TryFrom<i64>>(
     values: &[Vec<sqlparser::ast::Expr>],
     col_idx: usize,
@@ -254,13 +229,11 @@ fn narrow_i64_col<N: TryFrom<i64>>(
 
 /// Convert SQL `VALUES (...)` rows into an Arrow `RecordBatch`.
 ///
-/// Each inner `Vec<Expr>` is one row. Columns are matched positionally
-/// against the provided `schema`.
+/// Columns are matched positionally against `schema`.
 ///
 /// # Errors
 ///
-/// Returns `DbError::InsertError` if the batch cannot be constructed
-/// (e.g. column count mismatch).
+/// Returns `DbError::InsertError` if the batch cannot be constructed.
 #[allow(clippy::cast_possible_truncation)] // SQL float literals widened to Arrow f32
 pub fn sql_values_to_record_batch(
     schema: &arrow::datatypes::SchemaRef,
@@ -320,7 +293,6 @@ pub fn sql_values_to_record_batch(
                 columns.push(std::sync::Arc::new(arr));
             }
             _ => {
-                // For Utf8 and any other type, convert to string
                 let strs: Vec<Option<String>> = values
                     .iter()
                     .map(|row| expr_to_string(row.get(col_idx)))

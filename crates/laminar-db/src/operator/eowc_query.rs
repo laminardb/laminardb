@@ -1,6 +1,5 @@
-//! EOWC (Emit On Window Close) operator. First `process()` picks one of
-//! three paths — `CoreWindowState`, `IncrementalEowcState`, or raw-batch
-//! accumulation — then commits to it.
+//! EOWC (Emit On Window Close) operator: routes to `CoreWindowState`,
+//! `IncrementalEowcState`, or raw-batch accumulation on first `process()`.
 
 use std::sync::Arc;
 
@@ -18,27 +17,19 @@ use crate::sql_analysis::compute_closed_boundary;
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
 
-/// Maximum rows an EOWC raw-batch accumulator may hold before coalescing.
-/// Prevents unbounded memory growth when windows fail to close or late
-/// data keeps arriving.
+/// Row cap for the raw-batch accumulator; triggers coalescing to bound memory.
 const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 
-/// Wrapper for checkpoint data that discriminates between state variants.
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 enum EowcCheckpointEnvelope {
-    /// Checkpoint from `CoreWindowState`.
     CoreWindow(CoreWindowCheckpoint),
-    /// Checkpoint from `IncrementalEowcState`.
     EowcAgg(EowcStateCheckpoint),
-    /// Non-aggregate path: accumulated batches + boundary. Empty
-    /// `ipc` means no rows were buffered.
+    /// Non-aggregate path; empty `ipc` means no rows were buffered.
     Raw(RawCheckpoint),
 }
 
-/// Snapshot of the raw-EOWC accumulator. Source replay alone may not
-/// cover the window on recovery, so we ship the buffered batches.
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -47,28 +38,22 @@ struct RawCheckpoint {
     last_closed_boundary: i64,
 }
 
-/// Lazy-initialized EOWC state. The variant is chosen on the first
-/// `process()` call by probing the SQL plan.
+/// Lazy-initialized EOWC state, variant chosen on the first `process()` call.
 enum EowcInnerState {
     Uninit,
     CoreWindow(Box<CoreWindowState>),
     EowcAgg(Box<IncrementalEowcState>),
-    /// Non-aggregate EOWC: accumulate batches and replay via SQL when
-    /// windows close.
+    /// Non-aggregate path: accumulate batches, replay SQL when windows close.
     Raw {
         accumulated: Vec<RecordBatch>,
         last_closed_boundary: i64,
         accumulated_rows: usize,
-        /// Lazy cache: `LiveSourceProvider` registered under a private
-        /// table name + the user SQL rewritten to reference it + cached
-        /// physical plan. Built on the first close-cycle, when the
-        /// source schema is known.
+        // Built on first close-cycle; cached thereafter to avoid re-planning.
         sql_cache: Option<RawSqlCache>,
     },
 }
 
-/// Raw-EOWC close-cycle cache: the user's SQL with its single source
-/// AST-rewritten to a private table backed by [`LiveSqlCache`].
+/// User SQL with its source AST-rewritten to a private table; cached physical plan.
 struct RawSqlCache(super::LiveSqlCache);
 
 impl RawSqlCache {
@@ -78,8 +63,6 @@ impl RawSqlCache {
         original_sql: &str,
         source_schema: arrow::datatypes::SchemaRef,
     ) -> Result<Self, DbError> {
-        // Single source only — multi-source raw EOWC can't be safely
-        // rewritten (which side do we swap?). Fail loud.
         let source = crate::sql_analysis::single_source_table(original_sql).ok_or_else(|| {
             DbError::Unsupported(format!(
                 "[LDB-1001] non-aggregate EMIT ON WINDOW CLOSE on multi-source \
@@ -125,16 +108,12 @@ fn restore_raw(cp: &RawCheckpoint) -> Result<Vec<RecordBatch>, DbError> {
         .map_err(|e| DbError::Pipeline(format!("EOWC raw restore: {e}")))
 }
 
-/// Walk a parsed SQL statement, replacing every `TableFactor::Table` whose
-/// unqualified name equals `source` with `temp`. AST-based so qualified
-/// names / aliases / nested joins / subqueries all preserve their structure.
+/// Replace every unqualified `source` table reference in SQL with `temp`.
 fn rewrite_source(sql: &str, source: &str, temp: &str) -> Result<String, DbError> {
     use sqlparser::ast::{Ident, ObjectName, SetExpr, Statement, TableFactor};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    // Compare on the unqualified tail of both sides so `db.events` and
-    // bare `events` match when either form names the registered source.
     fn unqualify(s: &str) -> &str {
         s.rsplit('.').next().unwrap_or(s)
     }
@@ -224,8 +203,6 @@ impl EowcQueryOperator {
         }
     }
 
-    /// Lazy initialization: probe `CoreWindowState`, then
-    /// `IncrementalEowcState`, then fall back to `Raw`.
     async fn initialize(&mut self) -> Result<(), DbError> {
         if let Some(ref cfg) = self.window_config {
             let emit_ref = self.emit_clause.as_ref();
@@ -242,8 +219,7 @@ impl EowcQueryOperator {
                     return Ok(());
                 }
                 Ok(None) => {}
-                // Propagate wallclock misuse; let other feature gaps
-                // (CUMULATE, hop cap, ...) fall through.
+                // Propagate wallclock misuse; other gaps fall through.
                 Err(e @ DbError::Unsupported(_))
                     if {
                         let s = e.to_string();
@@ -261,8 +237,8 @@ impl EowcQueryOperator {
                 }
             }
 
-            // Guard: session windows MUST route through CoreWindowState.
-            // If it rejected, skip incremental EOWC (its session path panics).
+            // Session windows must go through CoreWindowState; the incremental
+            // path would panic on a session query.
             if matches!(
                 cfg.window_type,
                 laminar_sql::translator::WindowType::Session
@@ -307,12 +283,10 @@ impl EowcQueryOperator {
             accumulated_rows: 0,
             sql_cache: None,
         };
-        // Apply any pending Raw checkpoint that landed before init.
         self.apply_pending_restore()?;
         Ok(())
     }
 
-    /// Apply a deferred checkpoint after `initialize()` has set the state.
     fn apply_pending_restore(&mut self) -> Result<(), DbError> {
         let Some(envelope) = self.pending_restore.take() else {
             return Ok(());
@@ -365,11 +339,8 @@ impl EowcQueryOperator {
                     EowcCheckpointEnvelope::EowcAgg(_) => "EowcAgg",
                     EowcCheckpointEnvelope::Raw(_) => "Raw",
                 };
-                // Fail loud rather than silently dropping state and
-                // re-emitting freshly-zeroed windows after restart —
-                // a benign-looking edit (WHERE clause change re-routes
-                // the operator path) would otherwise produce duplicate
-                // window output, breaking exactly-once on the sink.
+                // Fail loud: silently discarding state here re-emits zeroed windows
+                // on restart, breaking exactly-once on the sink.
                 return Err(DbError::Pipeline(format!(
                     "EOWC checkpoint variant mismatch for '{}': state={} checkpoint={}; \
                      refusing to silently discard partial state. Drop the checkpoint or \
@@ -381,7 +352,6 @@ impl EowcQueryOperator {
         Ok(())
     }
 
-    /// Execute the `CoreWindowState` path: pre-agg, update, close.
     async fn process_core_window(
         cw: &mut CoreWindowState,
         inputs: &[RecordBatch],
@@ -389,9 +359,6 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Resolve a `now()` WHERE clause against the event-time watermark
-        // (replay-deterministic) and pre-filter the inputs. No-op for
-        // predicates without `now()`.
         let now_filtered = cw.apply_dynamic_now_filter(ctx, inputs, watermark)?;
         let inputs: &[RecordBatch] = now_filtered.as_deref().unwrap_or(inputs);
 
@@ -421,12 +388,10 @@ impl EowcQueryOperator {
             )));
         };
 
-        // Update windowed state
         for batch in &pre_agg_batches {
             cw.update_batch(batch)?;
         }
 
-        // Close windows and apply HAVING filter
         let having_filter = cw.having_filter().cloned();
         let having_sql = cw.having_sql().map(String::from);
         let mut batches = cw.close_windows(watermark)?;
@@ -441,7 +406,6 @@ impl EowcQueryOperator {
         Ok(batches)
     }
 
-    /// Execute the `IncrementalEowcState` path: pre-agg, update, close.
     async fn process_eowc_agg(
         eowc: &mut IncrementalEowcState,
         inputs: &[RecordBatch],
@@ -475,12 +439,10 @@ impl EowcQueryOperator {
             )));
         };
 
-        // Update windowed state
         for batch in &pre_agg_batches {
             eowc.update_batch(batch)?;
         }
 
-        // Close windows and apply HAVING filter
         let having_filter = eowc.having_filter().cloned();
         let having_sql = eowc.having_sql().map(String::from);
         let mut batches = eowc.close_windows(watermark)?;
@@ -496,8 +458,6 @@ impl EowcQueryOperator {
         Ok(batches)
     }
 
-    /// Execute the raw accumulation path: accumulate batches, replay SQL
-    /// when windows close.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn process_raw(
         accumulated: &mut Vec<RecordBatch>,
@@ -511,7 +471,6 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Accumulate new input batches
         for batch in inputs {
             if batch.num_rows() > 0 {
                 *accumulated_rows += batch.num_rows();
@@ -519,7 +478,6 @@ impl EowcQueryOperator {
             }
         }
 
-        // Memory pressure guard: coalesce when over the row limit
         if *accumulated_rows > MAX_EOWC_ACCUMULATED_ROWS && accumulated.len() > 1 {
             tracing::warn!(
                 query = op_name,
@@ -538,12 +496,10 @@ impl EowcQueryOperator {
             }
         }
 
-        // Compute closed-window boundary
         let closed_cut =
             window_config.map_or(watermark, |cfg| compute_closed_boundary(watermark, cfg));
 
         if closed_cut <= *last_closed_boundary {
-            // No new windows closed
             return Ok(Vec::new());
         }
 
@@ -552,16 +508,12 @@ impl EowcQueryOperator {
             return Ok(Vec::new());
         }
 
-        // Split accumulated data: closed-window rows for query, retained for
-        // the next cycle. If we have a time column, filter by timestamp.
         let (query_batches, retained_batches) = if let Some(cfg) = window_config {
             split_by_timestamp(accumulated, &cfg.time_column, closed_cut)
         } else {
-            // No window config means all data is emitted
             (std::mem::take(accumulated), Vec::new())
         };
 
-        // Replace accumulated state with retained batches
         *accumulated = retained_batches;
         *accumulated_rows = accumulated.iter().map(RecordBatch::num_rows).sum();
         *last_closed_boundary = closed_cut;
@@ -570,9 +522,6 @@ impl EowcQueryOperator {
             return Ok(Vec::new());
         }
 
-        // Lazy-init the per-operator LiveSourceProvider + cached physical
-        // plan. The user SQL is AST-rewritten once to reference the temp
-        // table; subsequent closes just swap data and re-collect.
         if sql_cache.is_none() {
             *sql_cache =
                 Some(RawSqlCache::build(ctx, op_name, sql, query_batches[0].schema()).await?);
@@ -596,7 +545,6 @@ impl GraphOperator for EowcQueryOperator {
         // Flatten inputs from port 0
         let input_batches: Vec<RecordBatch> = inputs.first().cloned().unwrap_or_default();
 
-        // Lazy initialization on first call
         if matches!(self.state, EowcInnerState::Uninit) {
             self.initialize().await?;
         }
@@ -641,8 +589,8 @@ impl GraphOperator for EowcQueryOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         let envelope = match &mut self.state {
             EowcInnerState::Uninit => {
-                // If we have a pending restore, re-serialize it so a
-                // restore->checkpoint cycle before first process() preserves data.
+                // Re-serialize a pending restore so a restore→checkpoint before
+                // the first process() doesn't silently drop buffered state.
                 if let Some(ref env) = self.pending_restore {
                     let data = rkyv::to_bytes::<rkyv::rancor::Error>(env)
                         .map(|v| v.to_vec())
@@ -733,21 +681,15 @@ impl GraphOperator for EowcQueryOperator {
             EowcInnerState::Uninit => 0,
             EowcInnerState::CoreWindow(cw) => cw.estimated_size_bytes(),
             EowcInnerState::EowcAgg(eowc) => eowc.estimated_size_bytes(),
-            EowcInnerState::Raw { accumulated, .. } => {
-                // Rough estimate: sum of batch memory sizes
-                accumulated
-                    .iter()
-                    .map(RecordBatch::get_array_memory_size)
-                    .sum()
-            }
+            EowcInnerState::Raw { accumulated, .. } => accumulated
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum(),
         }
     }
 }
 
-/// Apply a HAVING filter expressed as SQL against the candidate batches.
-/// First call builds a `LiveSourceProvider`-backed cache; subsequent calls
-/// swap batches into the handle and re-run the cached physical plan — no
-/// per-cycle SQL parse/plan/optimize.
+/// Apply a HAVING predicate via SQL using a cached physical plan.
 async fn apply_having_via_sql(
     ctx: &SessionContext,
     query_name: &str,
@@ -771,10 +713,7 @@ async fn apply_having_via_sql(
         .await
 }
 
-/// Split accumulated batches into closed-window rows (ts < boundary) and
-/// retained rows (ts >= boundary). When the time column is missing or the
-/// wrong type the whole batch goes to `closed` — there is no way to split
-/// it by time, and leaking it into both buckets would double-emit.
+/// Split batches at `boundary` into closed (ts < boundary) and retained rows.
 fn split_by_timestamp(
     batches: &[RecordBatch],
     time_column: &str,

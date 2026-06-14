@@ -1,12 +1,7 @@
-//! Async-decoupled on-demand lookup-enrich join.
+//! Async-decoupled lookup-enrich join for `partial`/`none` lookup tables.
 //!
-//! `partial`/`none` lookup joins run here instead of inside a `DataFusion` plan so
-//! a cache-miss source fetch never blocks the `laminar-compute` thread. Like
-//! [`AiInferenceOperator`](super::ai_inference), `process` is decoupled across
-//! cycles: cache hits are served inline, misses go to a Ring 1 worker over a
-//! bounded channel, and resolved batches emit in a later cycle. The output
-//! watermark is held behind the oldest in-flight batch so enriched rows are not
-//! dropped as late downstream.
+//! Cache hits serve inline; misses go to a Ring 1 worker and emit in a later cycle.
+//! Output watermark held behind the oldest in-flight batch.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -42,44 +37,33 @@ use laminar_core::shuffle::ShuffleMessage;
 const SUBMIT_CAPACITY: usize = 256;
 const RESULT_CAPACITY: usize = 256;
 const MAX_IN_FLIGHT_ROWS: usize = 8192;
-/// Deadline for one worker fetch; on timeout the item is retried next cycle.
+// On timeout the item is retried next cycle.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const LOOKUP_TMP_TABLE: &str = "__lookup_enrich_tmp";
 
-/// Static config produced by the planner detector and routed by `create_operator`.
+/// Config produced by the planner detector.
 pub(crate) struct LookupEnrichConfig {
-    /// Name of the registered (partial/none) lookup table.
     pub table_name: String,
-    /// Stream-side join-key column names, in lookup primary-key order.
+    /// Stream-side join-key columns in lookup primary-key order.
     pub key_columns: Vec<String>,
-    /// `Inner` (drop non-matches) or `LeftOuter` (NULL non-matches).
     pub join_type: LookupJoinType,
 }
 
-// ── Ring 1 worker ────────────────────────────────────────────────
-
-/// Submit (request) channel to the worker. Crossfire — like the engine's
-/// other compute-thread/runtime channels; the `MAsyncTx` is `Send + Sync` so
-/// the operator stores it in `Resolved`. The result channel stays tokio mpsc
-/// because the operator stores its *receiver* (which must be `Sync`, and
-/// crossfire's `AsyncRx` is `!Sync`).
+// `MAsyncTx` is `Send+Sync`; result channel uses tokio mpsc because `AsyncRx` is `!Sync`.
 type SubmitTx = crossfire::MAsyncTx<crossfire::mpsc::Array<WorkItem>>;
 type SubmitRx = crossfire::AsyncRx<crossfire::mpsc::Array<WorkItem>>;
 
-/// A batch of cache-miss keys submitted to the worker.
 struct WorkItem {
     batch_id: u64,
     row_indices: Vec<usize>,
     keys: Vec<Vec<u8>>,
 }
 
-/// The worker's reply. `keys` echo back so the operator can populate the cache
-/// (positive and negative) keyed by the same bytes it submitted.
+/// `keys` echo back so the operator can populate the cache with the same bytes.
 struct WorkResult {
     batch_id: u64,
     row_indices: Vec<usize>,
     keys: Vec<Vec<u8>>,
-    /// Per-key lookup rows aligned to `row_indices`, or a batch-level error.
     outputs: Result<Vec<Option<RecordBatch>>, String>,
 }
 
@@ -89,7 +73,6 @@ async fn run_worker(
     submit_rx: SubmitRx,
     result_tx: mpsc::Sender<WorkResult>,
 ) {
-    // `recv` errors once the operator drops its submit sender.
     while let Ok(item) = submit_rx.recv().await {
         let key_refs: Vec<&[u8]> = item.keys.iter().map(Vec::as_slice).collect();
         let outputs = match tokio::time::timeout(
@@ -116,16 +99,11 @@ async fn run_worker(
     }
 }
 
-// ── Operator ─────────────────────────────────────────────────────
-
-/// One row's lookup result: `Pending` (in flight) or `Resolved` (hit = `Some`,
-/// miss = `None`).
 enum Slot {
     Pending,
     Resolved(Option<RecordBatch>),
 }
 
-/// A held batch whose `Pending` slots fill in as the worker resolves them.
 struct PendingBatch {
     batch: RecordBatch,
     slots: Vec<Slot>,
@@ -133,18 +111,15 @@ struct PendingBatch {
     ingest_watermark: i64,
 }
 
-/// Registry-resolved state, materialised on the first `process` (the
-/// `PartialLookupState` is only registered at pipeline start).
+/// Registry-resolved state, populated on the first `process` call.
 struct Resolved {
     cache: Arc<LookupMemoryCache>,
     converter: RowConverter,
     key_indices: Vec<usize>,
-    /// `(lookup key column, expected type)` per key, used to fail fast with a
-    /// clear message if the input join-key type differs from the lookup
-    /// primary-key type (otherwise the row-encoder errors cryptically later).
+    // (lookup key, expected type) for fast type-mismatch errors before encoding.
     key_checks: Vec<(String, DataType)>,
     lookup_schema: SchemaRef,
-    /// `None` = cache-only mode (no source); misses resolve to not-found.
+    // None = cache-only mode; misses resolve to not-found.
     submit_tx: Option<SubmitTx>,
     result_rx: Option<mpsc::Receiver<WorkResult>>,
     _worker: Option<JoinHandle<()>>,
@@ -152,8 +127,7 @@ struct Resolved {
 
 pub(crate) struct LookupEnrichOperator {
     table_name: String,
-    /// This operator's output (MV) name; used as the shuffle stage tag in
-    /// cluster mode so peers route this join's rows back to this operator.
+    // Shuffle stage tag in cluster mode so peers route rows back here.
     #[cfg(feature = "cluster")]
     op_name: Arc<str>,
     key_columns: Vec<String>,
@@ -164,16 +138,11 @@ pub(crate) struct LookupEnrichOperator {
     resolved: Option<Resolved>,
     pending: FxHashMap<u64, PendingBatch>,
     unsubmitted: VecDeque<WorkItem>,
-    /// Input batches awaiting (re-)ingestion, with their original watermark.
     replay: VecDeque<(i64, RecordBatch)>,
     next_batch_id: u64,
     max_in_flight: usize,
-    /// Per-table cache/source/in-flight metrics, when the engine has a registry.
     metrics: Option<Arc<EngineMetrics>>,
-    /// Cluster key-shuffle config; `None` outside cluster mode (the operator
-    /// then runs purely per-node). When set, `process` key-shards incoming
-    /// stream rows across the cluster by lookup key before probing the cache,
-    /// so each node caches only the key range it owns (cache affinity).
+    // When set, process key-shards by lookup key for cache affinity.
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
 }
@@ -209,16 +178,11 @@ impl LookupEnrichOperator {
         }
     }
 
-    /// Install the cluster key-shuffle config. When present, `process`
-    /// key-shards incoming stream rows by lookup key across the cluster
-    /// (shipping rows whose key-vnode this node does not own to the owner,
-    /// and ingesting rows peers ship here) before probing the cache.
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
     }
 
-    /// Record per-batch cache effectiveness, if metrics are wired.
     fn record_cache(&self, hits: u64, misses: u64) {
         if let Some(m) = &self.metrics {
             if hits > 0 {
@@ -234,7 +198,6 @@ impl LookupEnrichOperator {
         }
     }
 
-    /// Publish the current in-flight row count to the gauge, if metrics are wired.
     fn publish_in_flight(&self) {
         if let Some(m) = &self.metrics {
             let rows = i64::try_from(self.in_flight_rows()).unwrap_or(i64::MAX);
@@ -244,8 +207,7 @@ impl LookupEnrichOperator {
         }
     }
 
-    /// Resolve the `PartialLookupState` from the registry and spawn the worker.
-    /// Idempotent: a no-op once resolved.
+    /// Resolve the `PartialLookupState` from the registry and spawn the worker. Idempotent.
     fn ensure_resolved(&mut self) -> Result<(), DbError> {
         if self.resolved.is_some() {
             return Ok(());
@@ -270,7 +232,6 @@ impl LookupEnrichOperator {
         let converter = RowConverter::new(key_sort_fields.clone())
             .map_err(|e| DbError::Pipeline(format!("lookup-enrich: row converter: {e}")))?;
 
-        // Expected input join-key types = the lookup table's primary-key types.
         let key_checks: Vec<(String, DataType)> = key_columns
             .iter()
             .map(|name| {
@@ -281,8 +242,7 @@ impl LookupEnrichOperator {
             })
             .collect();
 
-        // The worker fetches only the projected columns, so the joined-in lookup
-        // rows carry the projected schema. Empty projection = the full schema.
+        // Empty projection = the full schema (worker fetches all columns).
         let lookup_schema: SchemaRef = if projection.is_empty() {
             Arc::clone(schema)
         } else {
@@ -326,11 +286,7 @@ impl LookupEnrichOperator {
         pending + queued
     }
 
-    /// Resolve the stream-side key-column indices against the input schema
-    /// once, failing fast if a join-key type differs from the lookup
-    /// primary-key type (the row encoder would otherwise error cryptically
-    /// deep in the hot path). Idempotent once the indices are populated.
-    /// Shared by [`Self::ingest`] and the cluster key-shuffle.
+    // Resolves key-column indices on the first call; fails fast on type mismatch.
     fn ensure_key_indices(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         let resolved = self.resolved.as_mut().expect("resolved before ingest");
         if !resolved.key_indices.is_empty() {
@@ -362,8 +318,6 @@ impl LookupEnrichOperator {
         Ok(())
     }
 
-    /// Probe the cache for every row; serve a fully-resolved batch immediately,
-    /// else hold it and submit the misses to the worker.
     fn ingest(
         &mut self,
         batch: RecordBatch,
@@ -446,9 +400,6 @@ impl LookupEnrichOperator {
         Ok(())
     }
 
-    /// Apply a worker reply: populate the cache, fill slots, and emit when the
-    /// batch is fully resolved. On fetch error, re-queue for retry next cycle so
-    /// a transient source failure backpressures rather than NULL-fills.
     fn apply_result(
         &mut self,
         result: WorkResult,
@@ -503,8 +454,6 @@ impl LookupEnrichOperator {
         Ok(())
     }
 
-    /// Assemble stream columns + lookup columns. Inner drops non-matches;
-    /// `LeftOuter` keeps all rows with NULL lookup columns for misses.
     fn build_output(&self, stream: &RecordBatch, slots: &[Slot]) -> Result<RecordBatch, DbError> {
         let resolved = self.resolved.as_ref().expect("resolved");
         let lookup_schema = &resolved.lookup_schema;
@@ -585,7 +534,6 @@ impl LookupEnrichOperator {
         }
     }
 
-    /// Drain whatever the worker has resolved since the last cycle.
     fn drain_results(&mut self, out: &mut Vec<RecordBatch>) -> Result<(), DbError> {
         loop {
             let Some(rx) = self.resolved.as_mut().and_then(|r| r.result_rx.as_mut()) else {
@@ -598,10 +546,6 @@ impl LookupEnrichOperator {
         }
     }
 
-    /// In cluster mode, route each input row to the node owning its lookup-key
-    /// vnode: ship rows this node doesn't own, drain rows peers shipped here,
-    /// and return the local set to enrich. Forward-only — any node can look up
-    /// any key. `None` config (single node) is a pass-through.
     #[cfg(feature = "cluster")]
     async fn shuffle_input(
         &mut self,
@@ -619,8 +563,7 @@ impl LookupEnrichOperator {
                 continue;
             }
             self.ensure_key_indices(batch)?;
-            // Hash the same key columns the cache uses, so a key's vnode and its
-            // cache slot agree — the owner is the node that caches it.
+            // Hash by the same key columns the cache uses so vnode ownership and cache slot agree.
             let key_indices = &self.resolved.as_ref().expect("resolved").key_indices;
             let vnodes = laminar_core::shuffle::row_vnodes(batch, key_indices, vnode_count);
             for &v in &vnodes {
@@ -651,18 +594,13 @@ impl LookupEnrichOperator {
             }
         }
 
-        // Ship remote slices; fail the cycle on send error so offsets don't
-        // advance past undelivered rows. The await is a socket write bounded by
-        // TCP backpressure (same as the aggregate shuffle).
+        // Fail on send error so offsets don't advance past undelivered rows.
         for (peer, msg) in outbound {
             cfg.sender.send_to(peer, &msg).await.map_err(|e| {
                 DbError::Pipeline(format!("lookup-enrich: shuffle send to peer {peer}: {e}"))
             })?;
         }
 
-        // Drain rows peers shipped here, but only with in-flight headroom so a
-        // backpressured node lets them queue (TCP backpressure) instead of
-        // overrunning the cap.
         if self.wants_input() {
             for batch in cfg.receiver.drain_vnode_data_for(&self.op_name) {
                 if batch.num_rows() > 0 {
@@ -675,10 +613,8 @@ impl LookupEnrichOperator {
     }
 }
 
-/// Disambiguated name for a lookup column in the flattened join output: a
-/// lookup column whose name also exists on the stream side is suffixed with the
-/// lookup table name. The plan-time projection rewriter applies the identical
-/// rule, so its column references match this schema.
+/// Suffix a lookup column with the table name when it collides with a stream column.
+/// The plan-time projection rewriter uses the same rule.
 pub(crate) fn disambiguated_lookup_name(
     lookup_col: &str,
     stream_cols: &[String],
@@ -691,8 +627,6 @@ pub(crate) fn disambiguated_lookup_name(
     }
 }
 
-/// Output schema: stream fields followed by lookup fields (collision-suffixed
-/// per [`disambiguated_lookup_name`]; lookup fields forced nullable for `LeftOuter`).
 fn output_schema(
     stream: &arrow_schema::Schema,
     lookup: &SchemaRef,
@@ -727,10 +661,6 @@ impl GraphOperator for LookupEnrichOperator {
             self.ingest(batch, wm, &mut enriched)?;
         }
 
-        // New input: in cluster mode, key-shard across the cluster first (ship
-        // rows whose key-vnode we don't own to the owner, receive ours), then
-        // ingest the local + inbound set. Replayed batches above bypass the
-        // shuffle — they are already local. Single-node: a straight passthrough.
         let new_input = inputs.first().map_or(&[][..], Vec::as_slice);
         #[cfg(feature = "cluster")]
         let to_ingest = self.shuffle_input(new_input).await?;
@@ -747,9 +677,7 @@ impl GraphOperator for LookupEnrichOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // Capture every not-yet-emitted input batch (in-flight + replay) with its
-        // ingest watermark. On restore they re-ingest and re-fetch; source reads
-        // are idempotent, so replay is safe.
+        // In-flight batches re-ingest and re-fetch on restore; source reads are idempotent.
         let mut blobs: Vec<(i64, Vec<u8>)> =
             Vec::with_capacity(self.pending.len() + self.replay.len());
         for pb in self.pending.values() {
@@ -816,9 +744,7 @@ impl GraphOperator for LookupEnrichOperator {
         batch: RecordBatch,
         watermark: i64,
     ) -> Result<(), DbError> {
-        // Peer-shipped rows are already owned by this node. Queue them on the
-        // replay path — which bypasses the shuffle and is itself checkpointed —
-        // so they enter this snapshot and re-ingest idempotently on restore.
+        // Replay path is checkpointed and bypasses the shuffle, so restore is idempotent.
         self.replay.push_back((watermark, batch));
         Ok(())
     }

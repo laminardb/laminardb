@@ -1,13 +1,6 @@
-//! Ring 1 inference worker.
-//!
-//! Runs off the compute thread on the main tokio runtime. It pulls cache-miss
-//! batches submitted by [`AiInferenceOperator`](crate::operator::ai_inference),
-//! runs them through the provider, parses the response into the task's output,
-//! writes the result cache and the `laminar.ai_calls` log, and returns the
-//! per-row outputs over a channel. The operator never blocks on any of this —
-//! it submits and later drains, so the model call never touches Ring 0.
-//!
-//! One `infer_batch` call per work item; cross-item concurrency, retry,
+//! Ring 1 inference worker: pulls cache-miss batches off the compute thread,
+//! runs them through the provider, writes the result cache + `laminar.ai_calls`
+//! log, and returns per-row outputs. One `infer_batch` per work item; retry,
 //! backoff, and timeout are the provider's concern.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -20,59 +13,41 @@ use crate::ai::{
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// A row that missed the cache and needs inference.
+/// A cache-miss row awaiting inference.
 pub(crate) struct MissRow {
-    /// Row index within the originating batch.
     pub row_index: usize,
-    /// Input text to run through the model.
     pub text: String,
-    /// Cache key under which the result is stored.
     pub key: AiCacheKey,
 }
 
 /// A batch of cache-miss rows submitted to the worker.
 pub(crate) struct WorkItem {
-    /// Id of the originating pending batch.
     pub batch_id: u64,
-    /// The miss rows, in input order.
     pub rows: Vec<MissRow>,
 }
 
-/// Submit (request) channel to the worker. Crossfire, like the engine's other
-/// compute-thread/runtime channels (the `MAsyncTx` is `Send + Sync`, so the
-/// operator stores it). The result channel stays tokio mpsc — the operator
-/// stores its *receiver*, which must be `Sync`, and crossfire's is `!Sync`.
+// Crossfire submit channel (its `MAsyncTx` is `Send + Sync`, so the operator can
+// hold it); results come back over tokio mpsc, whose receiver is `Sync`.
 pub(crate) type SubmitTx = crossfire::MAsyncTx<crossfire::mpsc::Array<WorkItem>>;
 pub(crate) type SubmitRx = crossfire::AsyncRx<crossfire::mpsc::Array<WorkItem>>;
 
 /// The worker's reply for one [`WorkItem`].
 pub(crate) struct WorkResult {
-    /// Id of the originating pending batch.
     pub batch_id: u64,
-    /// Row indices the item covered, in order — present even on failure so the
-    /// operator knows which rows to resolve (to NULL on failure).
+    /// Present even on failure, so the operator knows which rows to NULL out.
     pub row_indices: Vec<usize>,
-    /// Per-row outputs aligned to `row_indices`, or a batch-level error message.
     pub outputs: Result<Vec<CachedOutput>, String>,
 }
 
 /// Immutable inference context shared by the worker across items.
 pub(crate) struct WorkerContext {
-    /// Transport backend.
     pub provider: Arc<dyn InferenceProvider>,
-    /// Result cache (written on success).
     pub cache: Arc<AiResultCache>,
-    /// Call log (written for every call, success or failure).
     pub call_log: Arc<AiCallLog>,
-    /// The task performed.
     pub task: Task,
-    /// The backend kind (selects the adapter path).
     pub kind: BackendKind,
-    /// Provider/runtime model identifier.
     pub model: String,
-    /// Request parameters (labels).
     pub params: InferenceParams,
-    /// Effective labels for local classification.
     pub labels: Option<Vec<String>>,
 }
 
@@ -82,7 +57,6 @@ pub(crate) async fn run_worker(
     submit_rx: SubmitRx,
     result_tx: mpsc::Sender<WorkResult>,
 ) {
-    // `recv` errors once the operator drops its submit sender.
     while let Ok(item) = submit_rx.recv().await {
         let result = infer_one(&ctx, item).await;
         if result_tx.send(result).await.is_err() {
@@ -150,9 +124,8 @@ async fn run_request(
         .await
         .map_err(|e| e.to_string())?;
     let usage = response.usage;
-    // Labels known at startup win; otherwise fall back to the backend's intrinsic
-    // labels, now resolvable since the call above ensured the model is on disk —
-    // this is what lets a lazily downloaded local classifier score.
+    // Startup labels win; else the backend's intrinsic labels, resolvable now
+    // that the call above ensured the model is on disk (lazy local classifiers).
     let labels = ctx
         .labels
         .clone()

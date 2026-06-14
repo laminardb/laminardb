@@ -1,7 +1,4 @@
-//! Materialized view result storage.
-//!
-//! Stores the latest results for each materialized view so they can be
-//! queried via `SELECT * FROM mv_name`.
+//! Materialized view result storage, queryable via `SELECT * FROM mv_name`.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::{HashMap, VecDeque};
@@ -24,7 +21,7 @@ const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// How a materialized view accumulates results.
 #[derive(Debug, Clone)]
 pub(crate) enum MvStorageMode {
-    /// GROUP BY queries: replace entire result set per cycle.
+    /// GROUP BY queries: replace the result set each cycle.
     Aggregate,
     /// Non-aggregate queries: append with bounded retention.
     Append { max_batches: usize },
@@ -91,13 +88,10 @@ impl MvEntry {
     }
 }
 
-/// Store for all materialized view results.
-///
-/// Shared between the compute thread (writes) and query threads (reads)
-/// via `Arc<parking_lot::RwLock<MvStore>>`.
+/// Store for all materialized view results; shared via `Arc<RwLock<MvStore>>`.
 pub(crate) struct MvStore {
     entries: HashMap<String, MvEntry>,
-    /// Mirrors `!entries.is_empty()`; lets the hot path skip the write lock.
+    /// Lets the hot path skip the write lock when no MVs exist.
     has_any: Arc<AtomicBool>,
 }
 
@@ -145,8 +139,7 @@ impl MvStore {
         self.entries.values().map(|e| e.approx_bytes).sum()
     }
 
-    /// Returns per-MV IPC-serialized bytes for checkpoint.
-    /// Each entry is keyed `"mv:{name}"` for use in the `operator_states` map.
+    /// Serialize all MV results for checkpoint; keys are `"mv:{name}"`.
     pub fn checkpoint_states(&self) -> Result<HashMap<String, bytes::Bytes>, DbError> {
         let mut out = HashMap::new();
         for (name, entry) in &self.entries {
@@ -159,16 +152,14 @@ impl MvStore {
         Ok(out)
     }
 
-    /// Restore a single MV from checkpoint IPC bytes.
-    /// Returns `Ok(true)` if restored, `Ok(false)` if the MV is no longer registered.
+    /// Restore a single MV from checkpoint IPC bytes; `Ok(false)` if not registered.
     pub fn restore_from_ipc(&mut self, name: &str, bytes: &[u8]) -> Result<bool, DbError> {
         let Some(entry) = self.entries.get_mut(name) else {
             return Ok(false);
         };
         let batches = ipc_to_batches(bytes)
             .map_err(|e| DbError::Storage(format!("MV restore '{name}': {e}")))?;
-        // Validate schema compatibility — reject stale checkpoints from
-        // before a schema change rather than panicking in concat_batches.
+        // Reject stale checkpoints from before a schema change rather than panicking later.
         if let Some(first) = batches.first() {
             if first.schema() != entry.schema {
                 return Err(DbError::Storage(format!(
