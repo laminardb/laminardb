@@ -23,9 +23,9 @@ required-features = ["cluster"]
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
-laminar-core = { path = "../laminar-core", version = "0.25.1" }
-laminar-db = { path = "../laminar-db", version = "0.25.1", features = ["api", "remote", "local"] }
-laminar-sql = { path = "../laminar-sql", version = "0.25.1" }
+laminar-core = { path = "../laminar-core", version = "0.26.0" }
+laminar-db = { path = "../laminar-db", version = "0.26.0", features = ["api", "remote", "local"] }
+laminar-sql = { path = "../laminar-sql", version = "0.26.0" }
 
 # For pgwire dispatch on parsed AST
 sqlparser = { workspace = true }
@@ -152,6 +152,7 @@ default = [
     "parquet-lookup",
     "otel",
     "cluster",
+    "state-tier",
     "aws",
     "gcs",
     "azure",

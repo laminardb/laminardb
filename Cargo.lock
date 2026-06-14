@@ -4895,7 +4895,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4968,7 +4968,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5014,7 +5014,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5069,7 +5069,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "laminar-connectors",
@@ -5081,7 +5081,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5140,7 +5140,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-array",
