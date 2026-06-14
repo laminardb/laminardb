@@ -32,6 +32,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "laminardb.serviceAccountName" . }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.initContainers }}
@@ -53,7 +56,7 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
-            {{- if .Values.service.pgEnabled }}
+            {{- if .Values.laminardb.pgwire.enabled }}
             - name: pg
               containerPort: 5432
               protocol: TCP
@@ -137,6 +140,15 @@ spec:
             {{- end }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
+            {{- if .Values.laminardb.state.tier.enabled }}
+            - name: state-tier
+              mountPath: {{ .Values.laminardb.state.tier.path }}
+            {{- end }}
+            {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
+            - name: pgwire-tls
+              mountPath: /etc/laminardb/pgwire-tls
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -146,10 +158,32 @@ spec:
             name: {{ include "laminardb.fullname" . }}
         - name: tmp
           emptyDir: {}
+        {{- if and .Values.persistence.state.enabled .Values.persistence.state.useEmptyDir }}
+        # PVC mode supplies `state` via volumeClaimTemplates; the ephemeral
+        # path needs an explicit emptyDir here instead.
+        - name: state
+          emptyDir:
+            {{- if .Values.persistence.state.emptyDirMedium }}
+            medium: {{ .Values.persistence.state.emptyDirMedium }}
+            {{- end }}
+        {{- end }}
         {{- if not .Values.persistence.checkpoints.enabled }}
         # Volatile fallback so the file:// checkpoint path stays writable.
         - name: checkpoints
           emptyDir: {}
+        {{- end }}
+        {{- if .Values.laminardb.state.tier.enabled }}
+        # Cold-tier scratch; rebuilt from checkpoints on restart, so ephemeral.
+        - name: state-tier
+          emptyDir:
+            {{- if .Values.laminardb.state.tier.emptyDirMedium }}
+            medium: {{ .Values.laminardb.state.tier.emptyDirMedium }}
+            {{- end }}
+        {{- end }}
+        {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
+        - name: pgwire-tls
+          secret:
+            secretName: {{ .Values.laminardb.pgwire.tls.existingSecret }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

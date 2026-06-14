@@ -23,6 +23,12 @@ nameOverride: ""
 # -- Override the full release name
 fullnameOverride: ""
 
+# -- Image for the `helm test` connection-check hook (override for air-gapped registries).
+testConnection:
+  image:
+    repository: busybox
+    tag: "1.36"
+
 # -- LaminarDB server configuration
 laminardb:
   # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering)
@@ -52,6 +58,16 @@ laminardb:
     vnodeCapacity: 256
     # -- Optional static vnode list (only for object_store backend)
     vnodes: []
+    # -- Node-level memory budget for operator state, in bytes (0 = unlimited).
+    # -- Crossing it backpressures intake, or demotes to the cold tier below.
+    memoryBudgetBytes: 0
+    # -- Disk cold tier for demoted state. Needs memoryBudgetBytes > 0 and a
+    # -- durable backend. Scratch only: wiped on restart, rebuilt from checkpoints.
+    tier:
+      enabled: false
+      path: /var/lib/laminardb/tier
+      # -- emptyDir medium for tier scratch ("Memory" for tmpfs).
+      emptyDirMedium: ""
 
   # -- Checkpoint configuration
   checkpoint:
@@ -66,6 +82,29 @@ laminardb:
     mode: aligned
     # -- Snapshot strategy: "full", "incremental", or "fork_cow"
     snapshotStrategy: full
+
+  # -- PostgreSQL wire protocol (SUBSCRIBE + queries via psql/JDBC/psycopg).
+  pgwire:
+    # -- Enable the pgwire listener and expose its port.
+    enabled: false
+    # -- Bind address. Non-loopback requires allowRemote: true.
+    bind: "0.0.0.0:5432"
+    # -- Required to bind on a non-loopback address (always true in K8s).
+    allowRemote: true
+    # -- MD5 auth users. Empty = trust auth (loopback only). Values land in the
+    # -- ConfigMap, so use pre-hashed "md5<hex>" passwords (pg_authid style).
+    users: {}
+    # -- Concurrent session cap.
+    maxConnections: 256
+    # -- Per-IP auth failures per 60s window (0 disables).
+    maxAuthFailuresPerMin: 10
+    tls:
+      # -- Secret with tls.crt + tls.key (+ ca.crt when mtls). Empty = no TLS.
+      existingSecret: ""
+      # -- Require client certs chained to the Secret's ca.crt (mTLS).
+      mtls: false
+      # -- Minimum TLS version: "1.2" or "1.3".
+      minVersion: "1.2"
 
   # -- Bearer token for the control-plane (console) HTTP API, read from an
   # -- existing Secret. Empty existingSecret = unauthenticated API (dev only).
@@ -197,10 +236,8 @@ service:
   type: ClusterIP
   # -- HTTP API port
   httpPort: 8080
-  # -- PostgreSQL wire protocol port (future)
+  # -- PostgreSQL wire protocol port (exposed when laminardb.pgwire.enabled)
   pgPort: 5432
-  # -- Enable PostgreSQL wire protocol port
-  pgEnabled: false
   # -- Gossip port for cluster mode discovery
   gossipPort: 7946
   # -- Raft port for cluster mode coordination
@@ -268,6 +305,10 @@ nodeSelector: {}
 tolerations: []
 # -- Affinity rules
 affinity: {}
+
+# -- Shutdown grace period. Cluster mode drains owned vnodes on SIGTERM (<=30s);
+# -- keep this above that so Kubernetes does not SIGKILL mid-drain.
+terminationGracePeriodSeconds: 60
 
 # -- For thread-per-core: request guaranteed CPU.
 # -- Set to true to use Guaranteed QoS class (requests == limits).

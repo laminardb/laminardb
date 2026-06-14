@@ -27,6 +27,34 @@ data:
     {{- with .Values.laminardb.consoleCorsAllowedOrigins }}
     console_cors_allowed_origins = [{{ range $i, $o := . }}{{ if $i }}, {{ end }}"{{ $o }}"{{ end }}]
     {{- end }}
+    {{- if gt (.Values.laminardb.state.memoryBudgetBytes | int64) 0 }}
+    state_memory_budget_bytes = {{ .Values.laminardb.state.memoryBudgetBytes }}
+    {{- end }}
+    {{- if .Values.laminardb.state.tier.enabled }}
+    state_tier_dir = "{{ .Values.laminardb.state.tier.path }}"
+    {{- end }}
+    {{- if .Values.laminardb.pgwire.enabled }}
+    {{- $pg := .Values.laminardb.pgwire }}
+    pgwire_bind = "{{ $pg.bind }}"
+    pgwire_allow_remote = {{ $pg.allowRemote }}
+    pgwire_max_connections = {{ $pg.maxConnections }}
+    pgwire_max_auth_failures_per_min = {{ $pg.maxAuthFailuresPerMin }}
+    pgwire_tls_min_version = "{{ $pg.tls.minVersion }}"
+    {{- if $pg.tls.existingSecret }}
+    pgwire_tls_cert = "/etc/laminardb/pgwire-tls/tls.crt"
+    pgwire_tls_key = "/etc/laminardb/pgwire-tls/tls.key"
+    {{- if $pg.tls.mtls }}
+    pgwire_tls_client_ca = "/etc/laminardb/pgwire-tls/ca.crt"
+    {{- end }}
+    {{- end }}
+    {{- with $pg.users }}
+
+    [server.pgwire_users]
+    {{- range $user, $pass := . }}
+    {{ $user }} = "{{ $pass }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"
