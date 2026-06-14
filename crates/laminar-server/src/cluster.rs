@@ -451,38 +451,11 @@ pub async fn start_cluster(
     if let Some(budget) = config.server.state_memory_budget_bytes {
         builder = builder.state_memory_budget_bytes(budget);
     }
+    // The state_tier_dir contract (durable backend + budget + feature) is
+    // enforced by config validation at load; here we only wire the dir.
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
-        // The tier replays demoted state from [state] on restart, so a
-        // non-durable (in-process) backend would lose it.
-        if !config.state.is_durable() {
-            return Err(ClusterStartupError::EngineConstruction(
-                "state_tier_dir requires a durable [state] backend (a local path \
-                 or object store); an in-process backend would lose demoted state \
-                 on restart"
-                    .to_string(),
-            ));
-        }
-        // Demotion is budget-driven; with no budget the tier never demotes,
-        // so a dir alone is a silent no-op.
-        if config.server.state_memory_budget_bytes.is_none() {
-            return Err(ClusterStartupError::EngineConstruction(
-                "state_tier_dir requires state_memory_budget_bytes — demotion to \
-                 the cold tier is triggered by the memory budget, so a tier dir \
-                 without a budget would never demote"
-                    .to_string(),
-            ));
-        }
         builder = builder.state_tier_dir(dir);
-    }
-    #[cfg(not(feature = "state-tier"))]
-    if config.server.state_tier_dir.is_some() {
-        return Err(ClusterStartupError::EngineConstruction(
-            "state_tier_dir is set but this binary was built without the \
-             'state-tier' feature; rebuild with --features state-tier or remove \
-             state_tier_dir from the [server] config"
-                .to_string(),
-        ));
     }
 
     if let Some(path) = config.state.local_storage_dir() {

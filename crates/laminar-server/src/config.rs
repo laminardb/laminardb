@@ -240,12 +240,48 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 
     validate_ai(config, &mut errors);
     validate_cluster_tls(config, &mut errors);
+    validate_state_tier(config, &mut errors);
 
     if !errors.is_empty() {
         return Err(ConfigError::ValidationErrors { errors });
     }
 
     Ok(())
+}
+
+/// The `state_tier_dir` contract, validated once here so the embedded and
+/// cluster startup paths share it instead of each re-checking and drifting.
+fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
+    if config.server.state_tier_dir.is_none() {
+        return;
+    }
+    #[cfg(feature = "state-tier")]
+    {
+        // The tier replays demoted state from [state] on restart, so a
+        // non-durable backend would lose it; demotion is budget-driven, so a
+        // dir without a budget never demotes.
+        if !config.state.is_durable() {
+            errors.push(
+                "state_tier_dir requires a durable [state] backend (a local path or \
+                 object store); an in-process backend would lose demoted state on restart"
+                    .to_string(),
+            );
+        }
+        if config.server.state_memory_budget_bytes.is_none() {
+            errors.push(
+                "state_tier_dir requires state_memory_budget_bytes — demotion to the cold \
+                 tier is triggered by the memory budget, so a tier dir without a budget \
+                 would never demote"
+                    .to_string(),
+            );
+        }
+    }
+    #[cfg(not(feature = "state-tier"))]
+    errors.push(
+        "state_tier_dir is set but this binary was built without the 'state-tier' \
+         feature; rebuild with --features state-tier or remove state_tier_dir"
+            .to_string(),
+    );
 }
 
 /// Top-level server configuration deserialized from `laminardb.toml`.
