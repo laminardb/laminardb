@@ -176,10 +176,16 @@ impl LaminarDB {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn is_pipeline_running(&self) -> bool {
+    /// Whether connector lifecycle DDL (add/remove a source or sink) must be
+    /// rejected. Connectors are spawned/torn-down only at `start()`/`stop()`, so
+    /// mutating them while the pipeline serves data (or is tearing down) can't
+    /// take effect. `Starting` is deliberately allowed: catalog-manifest replay
+    /// runs there, before `start_inner` instantiates connectors, so a replayed
+    /// `CREATE SOURCE`/`SINK` is picked up by the same startup.
+    pub(crate) fn connector_ddl_rejected(&self) -> bool {
         matches!(
             DbState::load(&self.state),
-            DbState::Running | DbState::Starting | DbState::ShuttingDown
+            DbState::Running | DbState::ShuttingDown
         )
     }
 

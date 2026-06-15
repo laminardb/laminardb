@@ -130,6 +130,69 @@ pub fn resolve_config_vars(
     Ok(result)
 }
 
+/// Resolve `${VAR}` and `${VAR:-default}` placeholders in `sql` from the process
+/// environment. Mirrors the server's TOML config substitution so environment
+/// variables behave the same in dynamically-submitted SQL (e.g. connector
+/// options over the HTTP API) as in `[[pipelines]]` config.
+///
+/// # Errors
+///
+/// Returns `DbError::InvalidOperation` for a `${VAR}` whose variable is unset and
+/// carries no `:-default`.
+pub fn resolve_env_vars(sql: &str) -> Result<String, DbError> {
+    // Fast path: the overwhelmingly common case has no placeholders, and we must
+    // not trip over PostgreSQL `$1` / `$$` dollar-quoting (neither matches `${`).
+    if !sql.contains("${") {
+        return Ok(sql.to_string());
+    }
+
+    let mut result = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
+            let start = i;
+            i += 2;
+            let inner_start = i;
+            while i < len && bytes[i] != b'}' {
+                i += 1;
+            }
+            if i >= len {
+                // Unterminated placeholder — emit the remainder verbatim.
+                result.push_str(&sql[start..]);
+                break;
+            }
+            let inner = &sql[inner_start..i];
+            i += 1; // consume '}'
+            let (name, default) = inner
+                .split_once(":-")
+                .map_or((inner, None), |(n, d)| (n, Some(d)));
+            match std::env::var(name) {
+                Ok(val) => result.push_str(&val),
+                Err(_) => match default {
+                    Some(d) => result.push_str(d),
+                    None => {
+                        return Err(DbError::InvalidOperation(format!(
+                            "Unresolved environment variable: ${{{name}}}"
+                        )));
+                    }
+                },
+            }
+        } else {
+            let ch = sql[i..]
+                .chars()
+                .next()
+                .expect("valid index on char boundary");
+            result.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    Ok(result)
+}
+
 /// Extract a string representation from a SQL expression.
 ///
 /// Handles literals, quoted strings, numbers, booleans, NULL, and unary minus.
@@ -455,5 +518,53 @@ mod tests {
         let vars = HashMap::new();
         let result = resolve_config_vars("${UNCLOSED", &vars, false).unwrap();
         assert_eq!(result, "${UNCLOSED");
+    }
+
+    #[test]
+    fn env_var_resolves_from_process_environment() {
+        std::env::set_var("LAMINAR_TEST_ENV_BROKERS", "broker-1:9092");
+        let result =
+            resolve_env_vars("'bootstrap.servers' = '${LAMINAR_TEST_ENV_BROKERS}'").unwrap();
+        assert_eq!(result, "'bootstrap.servers' = 'broker-1:9092'");
+        std::env::remove_var("LAMINAR_TEST_ENV_BROKERS");
+    }
+
+    #[test]
+    fn env_var_default_used_when_unset() {
+        std::env::remove_var("LAMINAR_TEST_ENV_UNSET_A");
+        let result =
+            resolve_env_vars("host = ${LAMINAR_TEST_ENV_UNSET_A:-localhost:9092}").unwrap();
+        assert_eq!(result, "host = localhost:9092");
+    }
+
+    #[test]
+    fn env_var_set_value_wins_over_default() {
+        std::env::set_var("LAMINAR_TEST_ENV_WITH_DEFAULT", "real-host");
+        let result = resolve_env_vars("${LAMINAR_TEST_ENV_WITH_DEFAULT:-fallback}").unwrap();
+        assert_eq!(result, "real-host");
+        std::env::remove_var("LAMINAR_TEST_ENV_WITH_DEFAULT");
+    }
+
+    #[test]
+    fn env_var_missing_without_default_is_error() {
+        std::env::remove_var("LAMINAR_TEST_ENV_UNSET_B");
+        let err = resolve_env_vars("${LAMINAR_TEST_ENV_UNSET_B}").unwrap_err();
+        assert!(err.to_string().contains("Unresolved environment variable"));
+    }
+
+    #[test]
+    fn env_var_fast_path_leaves_plain_sql_untouched() {
+        // No `${` — including PostgreSQL `$1` params and `$$` quoting.
+        let sql = "SELECT * FROM t WHERE id = $1 AND tag = $$x$$";
+        assert_eq!(resolve_env_vars(sql).unwrap(), sql);
+    }
+
+    #[test]
+    fn env_var_unclosed_placeholder_left_verbatim() {
+        std::env::remove_var("LAMINAR_TEST_ENV_UNCLOSED");
+        assert_eq!(
+            resolve_env_vars("prefix ${LAMINAR_TEST_ENV_UNCLOSED").unwrap(),
+            "prefix ${LAMINAR_TEST_ENV_UNCLOSED"
+        );
     }
 }

@@ -34,7 +34,7 @@ impl LaminarDB {
         // Connectors are instantiated in start() — reject mid-run DDL.
         let has_connector =
             create.connector_type.is_some() || create.with_options.contains_key("connector");
-        if has_connector && self.is_pipeline_running() {
+        if has_connector && self.connector_ddl_rejected() {
             let name = &create.name;
             return Err(DbError::Pipeline(format!(
                 "Cannot create source '{name}' with connector while pipeline is running. \
@@ -237,7 +237,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let has_connector =
             create.connector_type.is_some() || create.with_options.contains_key("connector");
-        if has_connector && self.is_pipeline_running() {
+        if has_connector && self.connector_ddl_rejected() {
             let name = &create.name;
             return Err(DbError::Pipeline(format!(
                 "Cannot create sink '{name}' with connector while pipeline is running. \
@@ -517,7 +517,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        if self.is_pipeline_running() {
+        if self.connector_ddl_rejected() {
             return Err(DbError::Pipeline(format!(
                 "Cannot drop source '{name_str}' while pipeline is running. \
                  Stop the pipeline first."
@@ -626,7 +626,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        if self.is_pipeline_running() {
+        if self.connector_ddl_rejected() {
             return Err(DbError::Pipeline(format!(
                 "Cannot drop sink '{name_str}' while pipeline is running. \
                  Stop the pipeline first."

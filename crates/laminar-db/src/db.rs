@@ -1100,27 +1100,47 @@ impl LaminarDB {
             return Err(DbError::Shutdown);
         }
 
-        let resolved = if self.config_vars.is_empty() {
-            sql.to_string()
-        } else {
-            sql_utils::resolve_config_vars(sql, &self.config_vars, true)?
-        };
-
-        let stmts = sql_utils::split_statements(&resolved);
-        if stmts.is_empty() {
+        // Split the *raw* SQL first so each statement is stored verbatim (with
+        // `${VAR}` intact) for catalog-manifest replay, while variables resolve
+        // per execution. Splitting before substitution also keeps a `;` inside a
+        // resolved value from being mistaken for a statement separator.
+        let raw_stmts = sql_utils::split_statements(sql);
+        if raw_stmts.is_empty() {
             return Err(DbError::InvalidOperation("Empty SQL statement".into()));
         }
 
         let mut last_result = None;
-        for stmt_sql in &stmts {
-            last_result = Some(self.execute_single(stmt_sql).await?);
+        for raw_stmt in &raw_stmts {
+            let resolved = self.resolve_sql_vars(raw_stmt)?;
+            last_result = Some(self.execute_single(&resolved, raw_stmt).await?);
         }
 
         last_result.ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
     }
 
+    /// Resolve `${VAR}` placeholders, with configured `config_vars` taking
+    /// precedence over the process environment. Config vars run non-strict so a
+    /// placeholder they don't cover falls through to the environment resolver,
+    /// which is strict (a truly unknown variable is an error, not a silent
+    /// literal that would later surface as a bogus broker/host).
+    fn resolve_sql_vars(&self, sql: &str) -> Result<String, DbError> {
+        let after_config = if self.config_vars.is_empty() {
+            std::borrow::Cow::Borrowed(sql)
+        } else {
+            std::borrow::Cow::Owned(sql_utils::resolve_config_vars(
+                sql,
+                &self.config_vars,
+                false,
+            )?)
+        };
+        sql_utils::resolve_env_vars(&after_config)
+    }
+
+    /// `sql` is the variable-resolved statement used for parsing/execution;
+    /// `raw_sql` is the verbatim form (placeholders intact) persisted via
+    /// `store_ddl` so the catalog manifest re-resolves on replay.
     #[allow(clippy::too_many_lines)]
-    async fn execute_single(&self, sql: &str) -> Result<ExecuteResult, DbError> {
+    async fn execute_single(&self, sql: &str, raw_sql: &str) -> Result<ExecuteResult, DbError> {
         let statements = parse_streaming_sql(sql)?;
 
         if statements.is_empty() {
@@ -1135,7 +1155,7 @@ impl LaminarDB {
                 if let ExecuteResult::Ddl(ref info) = result {
                     self.connector_manager
                         .lock()
-                        .store_ddl(&info.object_name, sql);
+                        .store_ddl(&info.object_name, raw_sql);
                 }
                 Ok(result)
             }
@@ -1144,7 +1164,7 @@ impl LaminarDB {
                 if let ExecuteResult::Ddl(ref info) = result {
                     self.connector_manager
                         .lock()
-                        .store_ddl(&info.object_name, sql);
+                        .store_ddl(&info.object_name, raw_sql);
                 }
                 Ok(result)
             }
@@ -1168,7 +1188,7 @@ impl LaminarDB {
                 if let ExecuteResult::Ddl(ref info) = result {
                     self.connector_manager
                         .lock()
-                        .store_ddl(&info.object_name, sql);
+                        .store_ddl(&info.object_name, raw_sql);
                 }
                 Ok(result)
             }
@@ -1181,7 +1201,7 @@ impl LaminarDB {
                     if let ExecuteResult::Ddl(ref info) = result {
                         self.connector_manager
                             .lock()
-                            .store_ddl(&info.object_name, sql);
+                            .store_ddl(&info.object_name, raw_sql);
                     }
                     Ok(result)
                 } else if let sqlparser::ast::Statement::Drop {
@@ -1288,7 +1308,7 @@ impl LaminarDB {
                 if let ExecuteResult::Ddl(ref info) = result {
                     self.connector_manager
                         .lock()
-                        .store_ddl(&info.object_name, sql);
+                        .store_ddl(&info.object_name, raw_sql);
                 }
                 Ok(result)
             }

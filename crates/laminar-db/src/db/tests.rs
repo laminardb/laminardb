@@ -3741,6 +3741,39 @@ async fn test_connectorless_source_does_not_break_pipeline() {
     );
 }
 
+#[tokio::test]
+async fn execute_resolves_env_vars_in_dynamic_sql() {
+    // Dynamic SQL over the engine (the HTTP API path) must honor `${VAR}` the
+    // same way TOML config does. Here the source name itself comes from the
+    // environment, so a successful create proves resolution ran before parsing.
+    std::env::set_var("LAMINAR_TEST_DYN_SRC", "env_named_src");
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE ${LAMINAR_TEST_DYN_SRC} (id BIGINT)")
+        .await
+        .unwrap();
+    assert!(
+        db.source_untyped("env_named_src").is_ok(),
+        "source should be created under the resolved name"
+    );
+    std::env::remove_var("LAMINAR_TEST_DYN_SRC");
+}
+
+#[tokio::test]
+async fn execute_errors_on_unresolved_env_var() {
+    // A missing `${VAR}` without a default is a hard error, not a silent literal
+    // that would later surface as a bogus broker/host the connector can't reach.
+    std::env::remove_var("LAMINAR_TEST_DYN_ABSENT");
+    let db = LaminarDB::open().unwrap();
+    let err = db
+        .execute("CREATE SOURCE s (id BIGINT) WITH ('k' = '${LAMINAR_TEST_DYN_ABSENT}')")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Unresolved environment variable"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Poll an MV until it has at least `min_rows` rows, or timeout.
 async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
     // 90s, not 2s: CI runners are CPU-starved (this MV emits in ~0.1s locally but
