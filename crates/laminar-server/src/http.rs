@@ -429,11 +429,11 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
         )
             .into_response()
     } else {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("pipeline is {pipeline_state}, not Running"),
-        )
-        .into_response()
+        let mut msg = format!("pipeline is {pipeline_state}, not Running");
+        if let Some(fault) = state.db.last_fault() {
+            msg.push_str(&format!(" (last fault: {})", fault.message));
+        }
+        error_response(StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
     }
 }
 
@@ -922,11 +922,14 @@ async fn start_pipeline(
 
 async fn pipeline_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pipeline_state = state.db.pipeline_state();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "pipeline_state": pipeline_state })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({ "pipeline_state": pipeline_state });
+    // Surface why a Faulted pipeline crashed so the operator isn't left digging
+    // through logs; the panic happened after the original DDL/start call returned.
+    if let Some(fault) = state.db.last_fault() {
+        body["last_error"] = serde_json::Value::String(fault.message);
+        body["faulted_at_ms"] = serde_json::Value::Number(fault.at_ms.into());
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------

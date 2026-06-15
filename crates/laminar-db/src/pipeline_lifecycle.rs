@@ -192,6 +192,9 @@ impl LaminarDB {
     /// Start the streaming pipeline. Idempotent if already running.
     ///
     /// On failure the instance is reset to `Created` so the caller can retry.
+    /// A `Faulted` pipeline (compute thread crashed) is recoverable: this
+    /// rebuilds it from the surviving catalog, so an operator can drop the
+    /// offending object and restart without a process bounce.
     ///
     /// # Errors
     ///
@@ -209,7 +212,9 @@ impl LaminarDB {
                     "cannot start pipeline: shutdown/stop in progress".into(),
                 ));
             }
-            DbState::Created => {}
+            // Faulted is recoverable — fall through and rebuild. Created is the
+            // fresh-start path.
+            DbState::Created | DbState::Faulted => {}
         }
 
         DbState::Starting.store(&self.state);
@@ -228,6 +233,7 @@ impl LaminarDB {
 
         match self.start_inner().await {
             Ok(()) => {
+                *self.last_fault.lock() = None;
                 DbState::Running.store(&self.state);
                 Ok(())
             }
@@ -1674,6 +1680,10 @@ impl LaminarDB {
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
+            // Captured by the compute thread so an operator panic is recorded
+            // (surfaced via pipeline status) rather than only logged.
+            let fault_slot = Arc::clone(&self.last_fault);
+            let fault_metrics = self.engine_metrics.lock().clone();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -1702,7 +1712,19 @@ impl LaminarDB {
                             .or_else(|| panic.downcast_ref::<&str>().copied())
                             .unwrap_or("unknown");
                         tracing::error!(panic = msg, "laminar-compute thread panicked");
-                        // done_tx dropped → done_rx returns Err, logged by the watcher
+                        // Record the reason before dropping done_tx so the watcher
+                        // (which observes the drop) sees a populated fault slot.
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                        *fault_slot.lock() = Some(crate::db::PipelineFault {
+                            message: msg.to_string(),
+                            at_ms,
+                        });
+                        if let Some(ref m) = fault_metrics {
+                            m.pipeline_faults_total.inc();
+                        }
+                        // done_tx dropped → done_rx returns Err; watcher sets Faulted.
                         return;
                     }
                     done_tx.send(());
@@ -1727,10 +1749,27 @@ impl LaminarDB {
 
             let watcher_state = Arc::clone(&self.state);
             let watcher_shutdown = Arc::clone(&self.shutdown_signal);
+            let watcher_fault = Arc::clone(&self.last_fault);
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_err() {
                     tracing::error!("laminar-compute thread exited unexpectedly");
-                    DbState::Stopped.store(&watcher_state);
+                    // The panic branch records the reason before dropping done_tx;
+                    // fall back to a generic note if it exited some other way.
+                    {
+                        let mut slot = watcher_fault.lock();
+                        if slot.is_none() {
+                            let at_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                            *slot = Some(crate::db::PipelineFault {
+                                message: "compute thread exited unexpectedly".to_string(),
+                                at_ms,
+                            });
+                        }
+                    }
+                    // Faulted (not Stopped) so the pipeline is recoverable: an
+                    // operator can drop the offending object and restart.
+                    DbState::Faulted.store(&watcher_state);
                     watcher_shutdown.notify_one();
                 }
             });

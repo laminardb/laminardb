@@ -4,6 +4,12 @@ Addresses issue #2 from the dynamic-source debugging session: a pipeline
 submitted over the HTTP API that **panics an operator on the compute thread**
 leaves the node permanently unhealthy with no error surfaced to the operator.
 
+> **Status: implemented** (phases 1–2, **manual** restart policy). Landed:
+> recoverable `DbState::Faulted`, `PipelineFault` capture, `last_fault()`
+> accessor, `pipeline_faults_total` metric, and surfacing via
+> `/api/v1/pipeline/status` + `/ready`. §3.4 policy B (auto-restart) and §3.5
+> (cluster-health review) and §3.6 (per-operator isolation) remain open.
+
 ## 1. Current behavior (what actually happens)
 
 The compute thread (`pipeline_lifecycle.rs:1677-1716`) runs the

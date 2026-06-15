@@ -130,6 +130,8 @@ pub struct EngineMetrics {
     pub placement_vnodes_per_domain: IntGaugeVec,
     /// Largest single domain's share of all vnodes (`[0, 1]`) — the blast radius.
     pub placement_blast_radius_ratio: Gauge,
+    /// Unexpected compute-thread exits (operator panics) that faulted the pipeline.
+    pub pipeline_faults_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -442,6 +444,11 @@ impl EngineMetrics {
             placement_blast_radius_ratio: reg!(Gauge::new(
                 "placement_blast_radius_ratio",
                 "Largest single domain's share of all vnodes (0-1); state that goes Restoring if it fails"
+            )
+            .unwrap()),
+            pipeline_faults_total: reg!(IntCounter::new(
+                "pipeline_faults_total",
+                "Compute-thread crashes that faulted the pipeline"
             )
             .unwrap()),
         }

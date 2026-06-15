@@ -36,6 +36,11 @@ pub(crate) enum DbState {
     Running = 2,
     ShuttingDown = 3,
     Stopped = 4,
+    /// The compute thread exited unexpectedly (operator panic). Unlike `Stopped`
+    /// (intentional terminal shutdown) this is recoverable: `start()` rebuilds
+    /// the pipeline from the surviving catalog after the operator fixes the
+    /// offending object. The reason is held in `LaminarDB::last_fault`.
+    Faulted = 5,
 }
 
 impl DbState {
@@ -46,6 +51,7 @@ impl DbState {
             2 => Self::Running,
             3 => Self::ShuttingDown,
             4 => Self::Stopped,
+            5 => Self::Faulted,
             _ => return None,
         })
     }
@@ -77,6 +83,16 @@ impl DbState {
     }
 }
 
+/// Why the compute thread last exited unexpectedly, surfaced via pipeline
+/// status/health so a crash isn't buried in logs.
+#[derive(Debug, Clone)]
+pub struct PipelineFault {
+    /// Panic message from the crashed compute thread.
+    pub message: String,
+    /// Unix-epoch milliseconds when the fault was recorded.
+    pub at_ms: i64,
+}
+
 fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
     (mem.as_bytes() / 256).max(1024) as usize
 }
@@ -98,6 +114,9 @@ pub struct LaminarDB {
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
+    /// Set when the compute thread exits unexpectedly (`Faulted`); cleared on a
+    /// clean start. Surfaced via `pipeline_status`/health.
+    pub(crate) last_fault: Arc<parking_lot::Mutex<Option<PipelineFault>>>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     pub(crate) engine_metrics:
@@ -350,6 +369,7 @@ impl LaminarDB {
                 crate::table_store::TableStore::new(),
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
+            last_fault: Arc::new(parking_lot::Mutex::new(None)),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             engine_metrics: parking_lot::Mutex::new(None),

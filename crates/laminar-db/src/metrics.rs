@@ -15,6 +15,8 @@ pub enum PipelineState {
     ShuttingDown,
     /// Stopped.
     Stopped,
+    /// Compute thread crashed (operator panic); recoverable via restart.
+    Faulted,
 }
 
 impl std::fmt::Display for PipelineState {
@@ -25,6 +27,7 @@ impl std::fmt::Display for PipelineState {
             Self::Running => write!(f, "Running"),
             Self::ShuttingDown => write!(f, "ShuttingDown"),
             Self::Stopped => write!(f, "Stopped"),
+            Self::Faulted => write!(f, "Faulted"),
         }
     }
 }

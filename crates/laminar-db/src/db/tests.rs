@@ -3774,6 +3774,38 @@ async fn execute_errors_on_unresolved_env_var() {
     );
 }
 
+#[tokio::test]
+async fn faulted_pipeline_recovers_and_clears_fault() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE s (id BIGINT)").await.unwrap();
+
+    // Simulate a compute-thread crash: terminal-looking state + recorded reason.
+    DbState::Faulted.store(&db.state);
+    *db.last_fault.lock() = Some(PipelineFault {
+        message: "operator boom".into(),
+        at_ms: 1,
+    });
+    assert_eq!(db.pipeline_state(), "Faulted");
+    assert_eq!(db.last_fault().unwrap().message, "operator boom");
+
+    // A Faulted pipeline is recoverable (unlike terminal Stopped): start()
+    // rebuilds it and clears the fault.
+    db.start().await.unwrap();
+    assert_eq!(db.pipeline_state(), "Running");
+    assert!(db.last_fault().is_none());
+}
+
+#[tokio::test]
+async fn connector_ddl_allowed_while_faulted() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE s (id BIGINT)").await.unwrap();
+
+    DbState::Faulted.store(&db.state);
+    // The DDL guard blocks only Running/ShuttingDown, so an operator can drop
+    // the offending object while Faulted and then restart.
+    db.execute("DROP SOURCE s").await.unwrap();
+}
+
 /// Poll an MV until it has at least `min_rows` rows, or timeout.
 async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
     // 90s, not 2s: CI runners are CPU-starved (this MV emits in ~0.1s locally but
