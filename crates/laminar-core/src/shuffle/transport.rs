@@ -270,7 +270,10 @@ mod grpc {
             let raw = kv
                 .read_from(crate::cluster::discovery::NodeId(peer), SHUFFLE_ADDR_KEY)
                 .await?;
-            let addr: SocketAddr = raw.parse().ok()?;
+            let addr = match raw.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(_) => tokio::net::lookup_host(&raw).await.ok()?.next()?,
+            };
             self.peers.lock().insert(peer, addr);
             Some(addr)
         }
