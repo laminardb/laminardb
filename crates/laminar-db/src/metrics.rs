@@ -146,6 +146,7 @@ mod tests {
         assert_eq!(PipelineState::Running.to_string(), "Running");
         assert_eq!(PipelineState::ShuttingDown.to_string(), "ShuttingDown");
         assert_eq!(PipelineState::Stopped.to_string(), "Stopped");
+        assert_eq!(PipelineState::Faulted.to_string(), "Faulted");
     }
 
     #[test]

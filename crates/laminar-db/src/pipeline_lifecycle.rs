@@ -211,6 +211,9 @@ impl LaminarDB {
         }
 
         DbState::Starting.store(&self.state);
+        // Clear on entry, not after start_inner — otherwise a panic during this
+        // startup (watcher → Faulted + reason) would be immediately overwritten.
+        *self.last_fault.lock() = None;
 
         {
             let mut guard = self.engine_metrics.lock();
@@ -224,10 +227,19 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         self.restore_catalog_from_manifest().await;
 
+        // Drain a shutdown permit a prior fault's `notify_one()` left with no
+        // waiter, so the new coordinator's `notified()` doesn't fire at once.
+        tokio::select! {
+            biased;
+            () = self.shutdown_signal.notified() => {}
+            () = std::future::ready(()) => {}
+        }
+
         match self.start_inner().await {
+            // CAS, not store: don't clobber a Faulted set by the watcher if the
+            // compute thread already panicked during startup.
             Ok(()) => {
-                *self.last_fault.lock() = None;
-                DbState::Running.store(&self.state);
+                let _ = DbState::compare_exchange(DbState::Starting, DbState::Running, &self.state);
                 Ok(())
             }
             Err(e) => {

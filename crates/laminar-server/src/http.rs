@@ -429,11 +429,13 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
         )
             .into_response()
     } else {
-        let mut msg = format!("pipeline is {pipeline_state}, not Running");
-        if let Some(reason) = state.db.last_fault() {
-            msg.push_str(&format!(" (last fault: {reason})"));
-        }
-        error_response(StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+        // Generic on the unauthenticated probe — the fault reason (which may echo
+        // SQL/connector config) is exposed only on the authed status endpoint.
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("pipeline is {pipeline_state}, not Running"),
+        )
+        .into_response()
     }
 }
 
