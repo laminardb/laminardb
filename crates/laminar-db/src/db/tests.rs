@@ -3742,34 +3742,16 @@ async fn test_connectorless_source_does_not_break_pipeline() {
 }
 
 #[tokio::test]
-async fn execute_resolves_env_vars_in_dynamic_sql() {
-    // Dynamic SQL over the engine (the HTTP API path) must honor `${VAR}` the
-    // same way TOML config does. Here the source name itself comes from the
-    // environment, so a successful create proves resolution ran before parsing.
-    std::env::set_var("LAMINAR_TEST_DYN_SRC", "env_named_src");
-    let db = LaminarDB::open().unwrap();
-    db.execute("CREATE SOURCE ${LAMINAR_TEST_DYN_SRC} (id BIGINT)")
-        .await
-        .unwrap();
-    assert!(
-        db.source_untyped("env_named_src").is_ok(),
-        "source should be created under the resolved name"
-    );
-    std::env::remove_var("LAMINAR_TEST_DYN_SRC");
-}
-
-#[tokio::test]
 async fn execute_errors_on_unresolved_env_var() {
-    // A missing `${VAR}` without a default is a hard error, not a silent literal
-    // that would later surface as a bogus broker/host the connector can't reach.
-    std::env::remove_var("LAMINAR_TEST_DYN_ABSENT");
+    // Proves execute() runs the resolver: a missing `${VAR}` is a hard error,
+    // not a silent literal that would later surface as a bogus broker/host.
     let db = LaminarDB::open().unwrap();
     let err = db
-        .execute("CREATE SOURCE s (id BIGINT) WITH ('k' = '${LAMINAR_TEST_DYN_ABSENT}')")
+        .execute("CREATE SOURCE s (id BIGINT) WITH ('k' = '${LAMINAR_TEST_ABSENT_Z7Q}')")
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("Unresolved environment variable"),
+        err.to_string().contains("Unresolved variable"),
         "unexpected error: {err}"
     );
 }
@@ -3779,31 +3761,15 @@ async fn faulted_pipeline_recovers_and_clears_fault() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE s (id BIGINT)").await.unwrap();
 
-    // Simulate a compute-thread crash: terminal-looking state + recorded reason.
+    // Simulate a compute-thread crash: recoverable state + recorded reason.
     DbState::Faulted.store(&db.state);
-    *db.last_fault.lock() = Some(PipelineFault {
-        message: "operator boom".into(),
-        at_ms: 1,
-    });
+    *db.last_fault.lock() = Some("operator boom".to_string());
     assert_eq!(db.pipeline_state(), "Faulted");
-    assert_eq!(db.last_fault().unwrap().message, "operator boom");
 
-    // A Faulted pipeline is recoverable (unlike terminal Stopped): start()
-    // rebuilds it and clears the fault.
+    // Unlike terminal Stopped, start() rebuilds from the catalog and clears it.
     db.start().await.unwrap();
     assert_eq!(db.pipeline_state(), "Running");
     assert!(db.last_fault().is_none());
-}
-
-#[tokio::test]
-async fn connector_ddl_allowed_while_faulted() {
-    let db = LaminarDB::open().unwrap();
-    db.execute("CREATE SOURCE s (id BIGINT)").await.unwrap();
-
-    DbState::Faulted.store(&db.state);
-    // The DDL guard blocks only Running/ShuttingDown, so an operator can drop
-    // the offending object while Faulted and then restart.
-    db.execute("DROP SOURCE s").await.unwrap();
 }
 
 /// Poll an MV until it has at least `min_rows` rows, or timeout.

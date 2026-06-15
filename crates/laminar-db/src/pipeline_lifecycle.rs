@@ -176,12 +176,9 @@ impl LaminarDB {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether connector lifecycle DDL (add/remove a source or sink) must be
-    /// rejected. Connectors are spawned/torn-down only at `start()`/`stop()`, so
-    /// mutating them while the pipeline serves data (or is tearing down) can't
-    /// take effect. `Starting` is deliberately allowed: catalog-manifest replay
-    /// runs there, before `start_inner` instantiates connectors, so a replayed
-    /// `CREATE SOURCE`/`SINK` is picked up by the same startup.
+    /// Connector add/remove DDL can't take effect while serving — connectors are
+    /// built only at `start()`. `Starting` is allowed so catalog-manifest replay
+    /// (which runs before `start_inner` builds connectors) is picked up.
     pub(crate) fn connector_ddl_rejected(&self) -> bool {
         matches!(
             DbState::load(&self.state),
@@ -1712,19 +1709,12 @@ impl LaminarDB {
                             .or_else(|| panic.downcast_ref::<&str>().copied())
                             .unwrap_or("unknown");
                         tracing::error!(panic = msg, "laminar-compute thread panicked");
-                        // Record the reason before dropping done_tx so the watcher
-                        // (which observes the drop) sees a populated fault slot.
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-                        *fault_slot.lock() = Some(crate::db::PipelineFault {
-                            message: msg.to_string(),
-                            at_ms,
-                        });
+                        // Record the reason before dropping done_tx → the watcher
+                        // (which observes the drop) sets Faulted with it in hand.
+                        *fault_slot.lock() = Some(msg.to_string());
                         if let Some(ref m) = fault_metrics {
                             m.pipeline_faults_total.inc();
                         }
-                        // done_tx dropped → done_rx returns Err; watcher sets Faulted.
                         return;
                     }
                     done_tx.send(());
@@ -1753,20 +1743,10 @@ impl LaminarDB {
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_err() {
                     tracing::error!("laminar-compute thread exited unexpectedly");
-                    // The panic branch records the reason before dropping done_tx;
-                    // fall back to a generic note if it exited some other way.
-                    {
-                        let mut slot = watcher_fault.lock();
-                        if slot.is_none() {
-                            let at_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-                            *slot = Some(crate::db::PipelineFault {
-                                message: "compute thread exited unexpectedly".to_string(),
-                                at_ms,
-                            });
-                        }
-                    }
+                    // The panic branch records the reason before dropping done_tx.
+                    watcher_fault
+                        .lock()
+                        .get_or_insert_with(|| "compute thread exited unexpectedly".to_string());
                     // Faulted (not Stopped) so the pipeline is recoverable: an
                     // operator can drop the offending object and restart.
                     DbState::Faulted.store(&watcher_state);

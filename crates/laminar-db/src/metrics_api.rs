@@ -46,10 +46,10 @@ impl LaminarDB {
         }
     }
 
-    /// The reason the pipeline last faulted (compute-thread crash), if any.
-    /// Populated when state is `Faulted`; cleared on a clean start.
+    /// The panic message from the last compute-thread crash, if any. Populated
+    /// when state is `Faulted`; cleared on a clean start.
     #[must_use]
-    pub fn last_fault(&self) -> Option<crate::db::PipelineFault> {
+    pub fn last_fault(&self) -> Option<String> {
         self.last_fault.lock().clone()
     }
 

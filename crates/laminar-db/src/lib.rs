@@ -121,7 +121,7 @@ pub use checkpoint_coordinator::{
     CheckpointStats,
 };
 pub use config::{BackpressurePolicy, LaminarConfig};
-pub use db::{LaminarDB, PipelineFault};
+pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
 pub use handle::{

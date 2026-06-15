@@ -83,16 +83,6 @@ impl DbState {
     }
 }
 
-/// Why the compute thread last exited unexpectedly, surfaced via pipeline
-/// status/health so a crash isn't buried in logs.
-#[derive(Debug, Clone)]
-pub struct PipelineFault {
-    /// Panic message from the crashed compute thread.
-    pub message: String,
-    /// Unix-epoch milliseconds when the fault was recorded.
-    pub at_ms: i64,
-}
-
 fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
     (mem.as_bytes() / 256).max(1024) as usize
 }
@@ -114,9 +104,9 @@ pub struct LaminarDB {
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
-    /// Set when the compute thread exits unexpectedly (`Faulted`); cleared on a
-    /// clean start. Surfaced via `pipeline_status`/health.
-    pub(crate) last_fault: Arc<parking_lot::Mutex<Option<PipelineFault>>>,
+    /// Panic message when the compute thread exits unexpectedly (`Faulted`);
+    /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
+    pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     pub(crate) engine_metrics:
@@ -1138,22 +1128,16 @@ impl LaminarDB {
         last_result.ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
     }
 
-    /// Resolve `${VAR}` placeholders, with configured `config_vars` taking
-    /// precedence over the process environment. Config vars run non-strict so a
-    /// placeholder they don't cover falls through to the environment resolver,
-    /// which is strict (a truly unknown variable is an error, not a silent
-    /// literal that would later surface as a bogus broker/host).
+    /// Resolve `${VAR}` placeholders: configured `config_vars` first, then the
+    /// process environment. Strict — an unknown variable is an error, not a
+    /// silent literal that would later surface as a bogus broker/host.
     fn resolve_sql_vars(&self, sql: &str) -> Result<String, DbError> {
-        let after_config = if self.config_vars.is_empty() {
-            std::borrow::Cow::Borrowed(sql)
-        } else {
-            std::borrow::Cow::Owned(sql_utils::resolve_config_vars(
-                sql,
-                &self.config_vars,
-                false,
-            )?)
-        };
-        sql_utils::resolve_env_vars(&after_config)
+        sql_utils::substitute_vars(sql, |name| {
+            self.config_vars
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        })
     }
 
     /// `sql` is the variable-resolved statement used for parsing/execution;
