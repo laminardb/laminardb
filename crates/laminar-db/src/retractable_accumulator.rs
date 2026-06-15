@@ -1,23 +1,5 @@
-//! Weight-aware accumulators for Z-set changelog aggregation.
-//!
-//! When aggregating over a changelog stream (one with a `__weight` column),
-//! standard `DataFusion` accumulators produce incorrect results because they
-//! are purely additive — they have no concept of retraction.
-//!
-//! This module provides [`datafusion_expr::Accumulator`] implementations that
-//! receive the weight as the **last element** of `update_batch` inputs and
-//! handle retraction internally.
-//!
-//! # Supported aggregates
-//!
-//! | Function | Strategy | State | Retract |
-//! |----------|----------|-------|---------|
-//! | SUM | `SUM(value * weight)` | `(sum, count)` | O(1) |
-//! | COUNT(\*) | `SUM(weight)` | `count` | O(1) |
-//! | COUNT(col) | `SUM(weight)` where col IS NOT NULL | `count` | O(1) |
-//! | AVG | `SUM(value * weight) / SUM(weight)` | `(sum, wt_sum)` | O(1) |
-//! | MIN | Counted multiset, result = first key | `BTreeMap` | O(log n) |
-//! | MAX | Counted multiset, result = last key | `BTreeMap` | O(log n) |
+//! `DataFusion` accumulators that understand Z-set weights (`__weight` column, last in `update_batch`).
+//! SUM/COUNT/AVG retract in O(1); MIN/MAX use a counted multiset (`BTreeMap`) in O(log n).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -30,10 +12,8 @@ use datafusion_expr::Accumulator;
 
 use crate::error::DbError;
 
-/// Extract `i64` weights from the last array in the inputs slice.
-/// Returns an error rather than panicking if the contract is violated
-/// (empty input, wrong dtype) — the upstream is internal but a corrupt
-/// checkpoint or hand-rolled CDC source must not crash the engine task.
+/// Extracts `__weight` (last input column) as `Int64Array`. Errors instead of panicking
+/// so a corrupt checkpoint or hand-rolled CDC source can't crash the engine task.
 fn weight_array(values: &[ArrayRef]) -> datafusion_common::Result<&arrow::array::Int64Array> {
     let last = values.last().ok_or_else(|| {
         datafusion_common::DataFusionError::Internal(
@@ -50,7 +30,6 @@ fn weight_array(values: &[ArrayRef]) -> datafusion_common::Result<&arrow::array:
         })
 }
 
-/// Cast a numeric array element at `row` to `f64`.
 fn to_f64(arr: &ArrayRef, row: usize) -> Option<f64> {
     if arr.is_null(row) {
         return None;
@@ -101,7 +80,6 @@ fn to_f64(arr: &ArrayRef, row: usize) -> Option<f64> {
     }
 }
 
-/// Convert an `f64` value back to the target `ScalarValue` type.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -122,11 +100,11 @@ fn f64_to_scalar(v: f64, dt: &DataType) -> ScalarValue {
     }
 }
 
-/// Create a retractable accumulator for the given aggregate function name.
+/// Create a retractable accumulator for the named aggregate function.
 ///
-/// Returns `Ok(accumulator)` for supported functions, or `Err` for unsupported.
-/// The `return_type` is the expected output data type (used for casting on
-/// evaluate).
+/// # Errors
+///
+/// Returns `DbError::Pipeline` for unsupported function names.
 pub(crate) fn create_retractable(
     func_name: &str,
     return_type: &DataType,
@@ -157,13 +135,6 @@ pub(crate) fn create_retractable(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// SUM
-// ═══════════════════════════════════════════════════════════════════
-
-/// Read an integer-typed value as `i128` (covers Int8/16/32/64,
-/// UInt8/16/32/64, and Decimal128). Returns `None` for nulls or
-/// non-integer types.
 fn read_i128(arr: &ArrayRef, row: usize) -> Option<i128> {
     if arr.is_null(row) {
         return None;
@@ -204,9 +175,7 @@ fn read_i128(arr: &ArrayRef, row: usize) -> Option<i128> {
     }
 }
 
-/// Cast an `i128` sum back to a `ScalarValue` of the target type.
-/// Saturates on out-of-range integer targets so a pathological sum can
-/// never panic; Decimal128 keeps full precision.
+/// Casts `i128` back to the target type, saturating on out-of-range integers.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn i128_to_scalar(v: i128, dt: &DataType) -> ScalarValue {
     let clamp = |lo: i128, hi: i128| v.clamp(lo, hi);
@@ -228,9 +197,6 @@ fn i128_to_scalar(v: i128, dt: &DataType) -> ScalarValue {
         DataType::UInt32 => ScalarValue::UInt32(Some(clamp(0, i128::from(u32::MAX)) as u32)),
         DataType::UInt64 => ScalarValue::UInt64(Some(clamp(0, i128::from(u64::MAX)) as u64)),
         DataType::Decimal128(p, s) => ScalarValue::Decimal128(Some(v), *p, *s),
-        // Float / unknown: fall back to f64 via i128 → f64 (precision loss
-        // only at very large magnitudes, which couldn't have been an
-        // integer-typed sum to begin with).
         #[allow(clippy::cast_precision_loss)]
         _ => ScalarValue::Float64(Some(v as f64)),
     }
@@ -251,12 +217,7 @@ fn is_integer_or_decimal(dt: &DataType) -> bool {
     )
 }
 
-/// Retractable SUM: `SUM(value * weight)`.
-///
-/// Integer / `Decimal128` types accumulate in `i128` so a SUM beyond
-/// `2^53` no longer silently loses precision — `f64` is reserved for
-/// genuinely floating-point targets where the precision tradeoff is
-/// inherent to the type.
+/// Retractable SUM: integer/Decimal128 paths accumulate in `i128` to preserve precision above 2^53.
 #[derive(Debug)]
 struct RetractableSumAccum {
     return_type: DataType,
@@ -280,7 +241,6 @@ impl RetractableSumAccum {
 }
 
 impl Accumulator for RetractableSumAccum {
-    /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
         let weights = weight_array(values)?;
         let value_arr = &values[0];
@@ -354,20 +314,13 @@ impl Accumulator for RetractableSumAccum {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// COUNT(*)
-// ═══════════════════════════════════════════════════════════════════
-
-/// Retractable COUNT(\*): `SUM(weight)`.
-///
-/// The dummy boolean input column is ignored. Only the weight column matters.
+/// Retractable COUNT(\*): `SUM(weight)`. The dummy boolean input is ignored.
 #[derive(Debug, Default)]
 struct RetractableCountStarAccum {
     count: i64,
 }
 
 impl Accumulator for RetractableCountStarAccum {
-    /// Inputs: `[dummy_bool, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
         let weights = weight_array(values)?;
         for row in 0..weights.len() {
@@ -399,10 +352,6 @@ impl Accumulator for RetractableCountStarAccum {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// COUNT(col)
-// ═══════════════════════════════════════════════════════════════════
-
 /// Retractable COUNT(col): `SUM(weight)` where col IS NOT NULL.
 #[derive(Debug, Default)]
 struct RetractableCountAccum {
@@ -410,7 +359,6 @@ struct RetractableCountAccum {
 }
 
 impl Accumulator for RetractableCountAccum {
-    /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
         let weights = weight_array(values)?;
         let value_arr = &values[0];
@@ -445,10 +393,6 @@ impl Accumulator for RetractableCountAccum {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// AVG
-// ═══════════════════════════════════════════════════════════════════
-
 /// Retractable AVG: `SUM(value * weight) / SUM(weight)`.
 #[derive(Debug, Default)]
 struct RetractableAvgAccum {
@@ -457,7 +401,6 @@ struct RetractableAvgAccum {
 }
 
 impl Accumulator for RetractableAvgAccum {
-    /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
         let weights = weight_array(values)?;
         let value_arr = &values[0];
@@ -509,29 +452,14 @@ impl Accumulator for RetractableAvgAccum {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// MIN / MAX (shared implementation)
-// ═══════════════════════════════════════════════════════════════════
-
-/// Whether the extremum accumulator tracks the minimum or maximum.
 #[derive(Debug, Clone, Copy)]
 enum Extremum {
     Min,
     Max,
 }
 
-/// Retractable MIN/MAX using a counted multiset keyed by an Arrow
-/// row-encoded value. `arrow::row::RowConverter` produces a stable
-/// lexicographically-sortable byte representation for every relevant
-/// scalar type (integers, decimals, dates, timestamps, strings,
-/// binaries, booleans, floats), so the same operator works correctly
-/// for any of them — no more silent NULLs from `to_f64` on Decimal /
-/// Date / Utf8 columns.
-///
-/// On insert (weight > 0): increment count for the value's row key.
-/// On retract (weight < 0): decrement; remove the entry at zero.
-/// Result: first key (MIN) or last key (MAX), re-materialised via the
-/// same row converter back to a `ScalarValue` of the return type.
+/// Retractable MIN/MAX: counted multiset keyed by `arrow::row::RowConverter` bytes.
+/// Handles all scalar types including Decimal, Date, Utf8 — no silent NULLs.
 #[derive(Debug)]
 struct RetractableExtremumAccum {
     counts: BTreeMap<arrow::row::OwnedRow, i64>,
@@ -559,7 +487,6 @@ impl RetractableExtremumAccum {
 }
 
 impl Accumulator for RetractableExtremumAccum {
-    /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
         use std::collections::btree_map::Entry;
         let weights = weight_array(values)?;
@@ -612,14 +539,11 @@ impl Accumulator for RetractableExtremumAccum {
     }
 
     fn size(&self) -> usize {
-        // Each entry: key bytes + 8B count + ~64B BTreeMap node overhead.
         let key_bytes: usize = self.counts.keys().map(|k| k.as_ref().len()).sum();
         std::mem::size_of::<Self>() + key_bytes + self.counts.len() * 72
     }
 
     fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
-        // Materialise the keys back into an Arrow array of the value
-        // type, then expose key+count as List columns.
         let key_arrays = self
             .row_converter
             .convert_rows(self.counts.keys().map(arrow::row::OwnedRow::row))
@@ -679,10 +603,6 @@ impl Accumulator for RetractableExtremumAccum {
         Ok(())
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {

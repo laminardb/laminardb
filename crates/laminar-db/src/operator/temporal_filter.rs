@@ -18,8 +18,7 @@ use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::TemporalFilterConfig;
 
-/// Live buffer encoded as one Arrow IPC batch (data + `__enter`/`__exit`/
-/// `__inserted` bookkeeping columns).
+/// Live buffer encoded as one Arrow IPC batch.
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -29,10 +28,6 @@ pub(crate) struct TemporalFilterCheckpoint {
     batch_ipc: Vec<u8>,
 }
 
-/// `enter_key` = smallest frontier at which the row is a member
-/// (`i64::MIN` ⇒ no upper bound); `exit_key` = smallest frontier at which
-/// it ceases (`i64::MAX` ⇒ no lower bound). Rows share an
-/// `Arc<RecordBatch>` so the per-row cost is one Arc bump.
 #[derive(Clone)]
 struct BufferedRow {
     batch: Arc<RecordBatch>,
@@ -41,14 +36,11 @@ struct BufferedRow {
     exit_key: i64,
 }
 
-/// Which map a row lives in *is* its membership state; `len` is
-/// maintained at every push/remove so the per-cycle metric is O(1).
+// `len` is maintained at every push/remove so the per-cycle buffered-row metric is O(1).
 struct TfState {
     by_enter: BTreeMap<i64, Vec<BufferedRow>>,
     by_exit: BTreeMap<i64, Vec<BufferedRow>>,
-    /// `i64::MIN` = no frontier seen yet, so any first watermark
-    /// (including negative epoch ms) drives `advance`.
-    last_frontier: i64,
+    last_frontier: i64, // i64::MIN = no frontier seen yet
     len: usize,
 }
 
@@ -78,19 +70,14 @@ impl TfState {
         self.by_exit.entry(key).or_default().push(row);
         self.len += 1;
     }
-    /// Drain a key from a map; returns the rows. Caller updates `len`
-    /// based on what it does with them.
     #[inline]
     fn remove_from(map: &mut BTreeMap<i64, Vec<BufferedRow>>, k: i64) -> Vec<BufferedRow> {
         map.remove(&k).unwrap_or_default()
     }
 }
 
-/// `(enter_key, exit_key)` for a row at event time `t_ms` under `cfg`.
-/// Saturating throughout so a pathological timestamp can never panic.
 fn keys_for(t_ms: i64, cfg: &TemporalFilterConfig) -> (i64, i64) {
-    // Lower bound `time_col {>|>=} now()+off` ⇒ member while
-    // `W {<|<=} t-off`. Non-member (exit) at the first `W >= exit_key`.
+    // exit_key: first frontier where the row is no longer a member (lower-bound constraint).
     let exit_key = match cfg.lower {
         Some(b) => {
             let base = t_ms.saturating_sub(b.off_ms);
@@ -102,8 +89,7 @@ fn keys_for(t_ms: i64, cfg: &TemporalFilterConfig) -> (i64, i64) {
         }
         None => i64::MAX,
     };
-    // Upper bound `time_col {<|<=} now()+off` ⇒ member once
-    // `W {>|>=} t-off`. Member at the first `W >= enter_key`.
+    // enter_key: first frontier where the row becomes a member (upper-bound constraint).
     let enter_key = match cfg.upper {
         Some(b) => {
             let base = t_ms.saturating_sub(b.off_ms);
@@ -191,16 +177,14 @@ pub(crate) struct TemporalFilterOperator {
     sql: String,
     cfg: TemporalFilterConfig,
     input_schema: Option<SchemaRef>,
-    /// Output minus `__weight`; may be set early by `restore`.
+    // May be set early by `restore` before the first batch arrives.
     row_schema: Option<SchemaRef>,
     output_schema: Option<SchemaRef>,
-    /// Input-column indices to buffer in projected order; empty for `SELECT *`.
-    proj_indices: Vec<usize>,
+    proj_indices: Vec<usize>, // empty for SELECT *
     time_idx: usize,
     state: TfState,
     prom: Option<Arc<EngineMetrics>>,
-    /// Cap on far-future buffering (`LAMINAR_TEMPORAL_FILTER_HORIZON_MS`,
-    /// falling back to `LAMINAR_MAX_FUTURE_SKEW_MS`; `0` disables).
+    // Reads LAMINAR_TEMPORAL_FILTER_HORIZON_MS (or LAMINAR_MAX_FUTURE_SKEW_MS); 0 disables.
     max_future_ms: i64,
 }
 
@@ -211,8 +195,6 @@ impl TemporalFilterOperator {
         cfg: TemporalFilterConfig,
         prom: Option<Arc<EngineMetrics>>,
     ) -> Self {
-        // Dedicated knob so disabling the source-side future-skew guard
-        // doesn't simultaneously uncap the temporal-filter future buffer.
         let max_future_ms = match std::env::var("LAMINAR_TEMPORAL_FILTER_HORIZON_MS")
             .or_else(|_| std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS"))
         {
@@ -236,7 +218,7 @@ impl TemporalFilterOperator {
         }
     }
 
-    /// Second-floored frontier — matches `apply_dynamic_now_filter`.
+    // Matches the floor in `apply_dynamic_now_filter`.
     fn floor_frontier(wm_ms: i64) -> i64 {
         wm_ms.div_euclid(1000).saturating_mul(1000)
     }
@@ -286,9 +268,7 @@ impl TemporalFilterOperator {
             .map(|&i| schema.field(i).clone())
             .collect();
         if let Some(saved) = &self.row_schema {
-            // `restore` set this from the persisted columns; the live source
-            // must still produce the same projected shape or the buffered
-            // rows can't be combined with new ingest.
+            // Shape must match the restored checkpoint's columns so old and new rows are compatible.
             if saved.fields() != &live_row_fields.clone().into() {
                 return Err(DbError::Pipeline(format!(
                     "[LDB-1001] temporal filter '{}' source schema diverged \
@@ -326,8 +306,6 @@ impl TemporalFilterOperator {
         Ok(crate::aggregate_state::query_fingerprint(&self.sql, schema))
     }
 
-    /// Retractions then insertions; consecutive rows sharing a source
-    /// `Arc<RecordBatch>` are collapsed into one vectorised `take`.
     fn build_delta(
         &self,
         retracts: &[BufferedRow],
@@ -367,8 +345,6 @@ impl TemporalFilterOperator {
         Ok(out_batches)
     }
 
-    /// Already-aged-out rows are dropped (no phantom retract); rows in
-    /// `[enter_key, exit_key)` insert now; the rest park in `by_enter`.
     fn ingest(
         &mut self,
         batch: &RecordBatch,
@@ -400,7 +376,7 @@ impl TemporalFilterOperator {
                 continue;
             }
             if has_frontier && w >= exit_key {
-                *dropped += 1; // arrived already aged out → no emit
+                *dropped += 1; // already aged out
                 continue;
             }
             if has_frontier
@@ -408,7 +384,7 @@ impl TemporalFilterOperator {
                 && enter_key != i64::MIN
                 && enter_key > w.saturating_add(self.max_future_ms)
             {
-                *dropped += 1; // beyond the future horizon → bound the buffer
+                *dropped += 1; // beyond future horizon
                 continue;
             }
             let row = BufferedRow {
@@ -427,7 +403,6 @@ impl TemporalFilterOperator {
         Ok(())
     }
 
-    /// Promote rows whose `enter_key <= w`, retract rows whose `exit_key <= w`.
     fn advance(
         &mut self,
         w: i64,
@@ -437,8 +412,6 @@ impl TemporalFilterOperator {
     ) {
         let entered: Vec<i64> = self.state.by_enter.range(..=w).map(|(k, _)| *k).collect();
         for k in entered {
-            // Each row either drops (len--) or moves to `by_exit` (net 0);
-            // use `entry().push()` directly to avoid double-counting via push_exit.
             for row in TfState::remove_from(&mut self.state.by_enter, k) {
                 if w >= row.exit_key {
                     *dropped += 1;
@@ -462,8 +435,6 @@ impl TemporalFilterOperator {
         self.state.last_frontier = w;
     }
 
-    /// `batch` = first `ncols` data columns + `__tf_enter`/`__tf_exit`/
-    /// `__tf_inserted`; inserted rows go to `by_exit`, the rest to `by_enter`.
     fn rebuild_state(
         batch: &RecordBatch,
         ncols: usize,
@@ -557,7 +528,6 @@ impl GraphOperator for TemporalFilterOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // `by_enter` = inserted=false; `by_exit` = inserted=true.
         let live: Vec<(&BufferedRow, bool)> = self
             .state
             .by_enter
@@ -578,7 +548,6 @@ impl GraphOperator for TemporalFilterOperator {
                 "temporal filter checkpoint: buffered rows but unresolved schema".into(),
             ));
         };
-        // Per-source-batch `take` + `concat` — vectorised.
         let mut data_batches: Vec<RecordBatch> = Vec::new();
         let mut cur_batch: Option<Arc<RecordBatch>> = None;
         let mut cur_idx: Vec<u32> = Vec::new();
@@ -662,8 +631,6 @@ impl GraphOperator for TemporalFilterOperator {
         }
         let ncols = total - 3;
 
-        // `time_idx` and `proj_indices` are re-resolved on the first
-        // post-restore cycle (the time column may not be projected).
         let row_fields: Vec<Field> = (0..ncols)
             .map(|c| batch.schema().field(c).clone())
             .collect();
@@ -692,8 +659,7 @@ impl GraphOperator for TemporalFilterOperator {
     }
 
     fn estimated_state_bytes(&self) -> usize {
-        // Dedup batches by Arc identity so a shared batch's memory is
-        // counted once.
+        // Dedup by Arc identity so a shared batch is counted once.
         let mut seen: rustc_hash::FxHashSet<*const RecordBatch> = rustc_hash::FxHashSet::default();
         let mut batch_bytes = 0usize;
         let mut row_count = 0usize;
@@ -714,8 +680,7 @@ impl GraphOperator for TemporalFilterOperator {
     }
 }
 
-/// Operator that fails every cycle with a fixed typed error — used to
-/// surface planner-level rejections at run time (matches `nonwhere_now`).
+/// Surfaces planner-level rejections at run time (matches `nonwhere_now`).
 pub(crate) struct RejectingOperator {
     message: String,
 }

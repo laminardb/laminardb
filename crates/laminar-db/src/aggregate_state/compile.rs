@@ -15,13 +15,9 @@ pub(crate) struct AggregateInfo {
     pub(crate) group_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) aggr_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) schema: Arc<Schema>,
-    /// Input schema (pre-widening) for resolving aggregate argument types.
     pub(crate) input_schema: Arc<Schema>,
-    /// HAVING predicate (from a Filter node directly above the Aggregate).
     pub(crate) having_predicate: Option<datafusion_expr::Expr>,
-    /// `DFSchema` of the Aggregate's input (for compiling pre-agg expressions).
     pub(crate) input_df_schema: Arc<DFSchema>,
-    /// WHERE predicate from a Filter node below the Aggregate, if any.
     pub(crate) where_predicate: Option<datafusion_expr::Expr>,
 }
 
@@ -49,7 +45,7 @@ fn find_aggregate_inner(
                 where_predicate,
             })
         }
-        // A Filter directly above an Aggregate is a HAVING clause
+        // Filter directly above an Aggregate is a HAVING clause.
         LogicalPlan::Filter(filter) => {
             if matches!(&*filter.input, LogicalPlan::Aggregate(_)) {
                 find_aggregate_inner(&filter.input, Some(&filter.predicate))
@@ -57,7 +53,6 @@ fn find_aggregate_inner(
                 find_aggregate_inner(&filter.input, None)
             }
         }
-        // Walk through wrappers that don't change aggregation semantics
         LogicalPlan::Projection(proj) => find_aggregate_inner(&proj.input, None),
         LogicalPlan::Sort(sort) => find_aggregate_inner(&sort.input, None),
         LogicalPlan::Limit(limit) => find_aggregate_inner(&limit.input, None),
@@ -262,11 +257,8 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
     }
 }
 
-/// Pre-compiled projection for evaluating pre-agg expressions without SQL.
-///
-/// Replaces the `ctx.sql(pre_agg_sql).await.collect().await` hot-path call
-/// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
-/// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
+/// Pre-compiled projection: evaluates pre-agg expressions via `PhysicalExpr::evaluate`
+/// instead of re-planning SQL each cycle.
 pub(crate) struct CompiledProjection {
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
@@ -274,16 +266,12 @@ pub(crate) struct CompiledProjection {
 }
 
 impl CompiledProjection {
-    /// Evaluate the projection against a source batch.
-    ///
-    /// Applies the WHERE filter (if any), then evaluates each expression
-    /// to produce the projected output batch.
+    /// Apply the WHERE filter then evaluate each projection expression.
     pub(crate) fn evaluate(&self, batch: &RecordBatch) -> Result<RecordBatch, DbError> {
         if batch.num_rows() == 0 {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
         }
 
-        // Apply WHERE filter first
         let filtered = if let Some(ref filter) = self.filter {
             let result = filter
                 .evaluate(batch)
@@ -305,7 +293,6 @@ impl CompiledProjection {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
         }
 
-        // Evaluate each projection expression
         let mut arrays = Vec::with_capacity(self.exprs.len());
         for expr in &self.exprs {
             let result = expr
@@ -371,7 +358,7 @@ pub(crate) fn extract_clauses(sql: &str) -> SqlClauses {
     if let Ok(clauses) = extract_clauses_ast(sql) {
         return clauses;
     }
-    // Fallback: heuristic extraction for non-standard SQL
+    // Fallback for non-standard SQL.
     SqlClauses {
         from_clause: extract_from_clause_heuristic(sql),
         where_clause: extract_where_clause_heuristic(sql),
@@ -463,13 +450,10 @@ pub(crate) fn resolve_expr_type(
         datafusion_expr::Expr::Cast(cast) => cast.data_type.clone(),
         datafusion_expr::Expr::TryCast(cast) => cast.data_type.clone(),
         datafusion_expr::Expr::BinaryExpr(bin) => {
-            // For arithmetic, the result type is typically the wider
-            // of the two operands. Resolve the left side as a
-            // reasonable approximation.
+            // Approximate: resolve the left operand's type.
             resolve_expr_type(&bin.left, input_schema, fallback_type)
         }
         datafusion_expr::Expr::ScalarFunction(func) => {
-            // Try to get return type from input types
             let arg_types: Vec<DataType> = func
                 .args
                 .iter()

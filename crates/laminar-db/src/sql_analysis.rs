@@ -1,4 +1,4 @@
-//! SQL analysis and join detection utilities.
+//! SQL analysis: table-reference extraction, join detection, and projection rewriting.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -30,10 +30,6 @@ use laminar_sql::translator::{
     TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
-// ---------------------------------------------------------------------------
-// Emit conversion
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 pub(crate) fn sql_emit_to_core(
     s: &SqlEmitStrategy,
@@ -57,13 +53,9 @@ pub(crate) fn emit_clause_to_core(
     Ok(sql_emit_to_core(&sql_strategy))
 }
 
-// ---------------------------------------------------------------------------
-// Table reference extraction
-// ---------------------------------------------------------------------------
-
-/// Returns a deduplicated set of table names from FROM/JOIN clauses.
-/// Not deduplicated by occurrence count -- for self-join detection use
-/// [`single_source_table`] instead.
+/// Returns the deduplicated set of table names from FROM/JOIN clauses.
+///
+/// For self-join detection use [`single_source_table`] (which counts occurrences).
 pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     let mut tables = FxHashSet::default();
     let dialect = GenericDialect {};
@@ -74,7 +66,7 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
             }
         }
     }
-    // sqlparser drops TEMPORAL PROBE JOIN; merge its tables from the detector.
+    // sqlparser can't parse TEMPORAL PROBE JOIN; pull its tables separately.
     if let (Some(config), _) = detect_temporal_probe_query(sql) {
         tables.insert(config.left_table.clone());
         tables.insert(config.right_table.clone());
@@ -82,16 +74,11 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     tables
 }
 
-/// Column indices of `schema` to fetch for partial lookup `table`, given the
-/// stream `queries` — for projection pushdown. The result is the union of every
-/// column any query referencing `table` uses, plus `pk_cols` (the source
-/// realigns results by the key, so the key must always come back).
+/// Column indices of `schema` to fetch for partial lookup `table`, for projection pushdown.
 ///
-/// Returns an empty vec meaning "fetch all columns": when a referencing query
-/// is anything but a plain wildcard-free `SELECT` (so we can't be sure which
-/// columns it needs), or when the union already covers the whole schema. The
-/// cache is shared per table, so this is deliberately a *superset* — fetching a
-/// spare column is harmless; missing one is not.
+/// Returns the union of columns referenced by any query over `table`, plus `pk_cols`.
+/// Returns an empty vec (fetch all) when a query uses wildcards, subqueries, or
+/// non-table factors, or when the union already covers the whole schema.
 pub(crate) fn compute_lookup_projection(
     schema: &SchemaRef,
     pk_cols: &[String],
@@ -106,7 +93,7 @@ pub(crate) fn compute_lookup_projection(
         }
         match collect_referenced_columns(sql) {
             Some(cols) => referenced.extend(cols),
-            None => return Vec::new(), // can't narrow safely → fetch all
+            None => return Vec::new(),
         }
     }
 
@@ -118,7 +105,6 @@ pub(crate) fn compute_lookup_projection(
         .map(|(i, _)| u32::try_from(i).expect("column index fits u32"))
         .collect();
 
-    // Full coverage → empty keeps the source and operator on the simple path.
     if indices.len() == schema.fields().len() {
         Vec::new()
     } else {
@@ -126,11 +112,7 @@ pub(crate) fn compute_lookup_projection(
     }
 }
 
-/// Column names referenced by `sql`, or `None` when it isn't a plain
-/// wildcard-free `SELECT` over base tables (subquery, `SELECT *`, set op, …) —
-/// shapes where we can't enumerate referenced columns without risking an
-/// under-count. Identifier collection uses sqlparser's exhaustive
-/// `visit_expressions`, so no expression branch is missed.
+// Returns None for shapes that could hide wildcards (subquery, SELECT *, set op, non-table factor).
 fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql).ok()?;
@@ -149,8 +131,6 @@ fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
     if select.projection.iter().any(is_wildcard) {
         return None;
     }
-    // Only plain base-table relations; a derived/subquery factor could hide a
-    // wildcard that yields no identifier expression.
     for twj in &select.from {
         if !matches!(twj.relation, TableFactor::Table { .. }) {
             return None;
@@ -176,8 +156,7 @@ fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
                     cols.insert(last.value.clone());
                 }
             }
-            // A subquery elsewhere (WHERE/SELECT) could reference columns via a
-            // wildcard we can't see — bail rather than under-count.
+            // A subquery could reference columns via a wildcard we can't see.
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
                 complex = true;
                 return ControlFlow::Break(());
@@ -193,10 +172,9 @@ fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
     }
 }
 
-/// Unlike [`extract_table_references`] (which deduplicates), this counts every
-/// FROM/JOIN table occurrence. A self-join like `events e1 JOIN events e2`
-/// returns `None` because there are two occurrences even though the base table
-/// name is the same.
+/// Returns the single source table name only if there is exactly one FROM/JOIN occurrence.
+///
+/// A self-join (`events e1 JOIN events e2`) returns `None` even though the base name repeats.
 pub(crate) fn single_source_table(sql: &str) -> Option<String> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql).ok()?;
@@ -254,7 +232,6 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
     }
 }
 
-/// Not deduplicated -- collects every occurrence for counting.
 fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
     match set_expr {
         SetExpr::Select(select) => {
@@ -264,8 +241,7 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
                     collect_factor_counting(&join.relation, tables);
                 }
             }
-            // UNNEST in the projection expands rows just like a FROM-clause
-            // UNNEST; the single-source fast path can't, so force the full plan.
+            // UNNEST in the projection expands rows; the single-source path can't handle it.
             if projection_has_unnest(&select.projection) {
                 tables.push("\u{0}non_table_factor".to_string());
             }
@@ -281,9 +257,7 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
     }
 }
 
-/// True if any projection item is (or wraps) an `UNNEST(..)`. Checked on the
-/// serialized item, so it's robust to the parser's UNNEST representation; a
-/// false positive only forces the safe full-plan path.
+// Checked on the serialized item; a false positive only forces the safe full-plan path.
 fn projection_has_unnest(items: &[SelectItem]) -> bool {
     items
         .iter()
@@ -306,17 +280,15 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
                 collect_factor_counting(&join.relation, tables);
             }
         }
-        // A non-table factor (lateral UNNEST, TVF, ...) can't be evaluated by
-        // the single-source fast path; count it so the query uses the full
-        // per-cycle plan instead of silently dropping the factor.
+        // Lateral UNNEST, TVFs, etc. block the single-source path.
         _ => tables.push("\u{0}non_table_factor".to_string()),
     }
 }
 
-/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to a `LEFT JOIN … ON ..` for
-/// schema resolution: `DataFusion` can't lower `AsOf`, and the match condition
-/// picks the matching right row at runtime, not the columns. Left keeps the
-/// right side nullable. `None` if there is no ASOF join.
+/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to `LEFT JOIN … ON ..` for schema planning.
+///
+/// `DataFusion` can't lower `AsOf`; left outer keeps the right side nullable. Returns `None`
+/// if the query has no ASOF join.
 pub(crate) fn rewrite_asof_joins_for_planning(sql: &str) -> Option<String> {
     use sqlparser::ast::{JoinConstraint, JoinOperator};
 
@@ -353,18 +325,15 @@ pub(crate) fn rewrite_asof_joins_for_planning(sql: &str) -> Option<String> {
     })
 }
 
-/// Resolve the source table name from a `TableFactor::Table`.
+/// Resolve the real source table from a `TableFactor::Table`.
 ///
-/// sqlparser parses `FROM TUMBLE(events, ts, ...)` as `TableFactor::Table`
-/// with `name = "TUMBLE"` and `args = Some([events, ts, ...])`. For window
-/// TVFs the first argument is the actual source table — return that instead
-/// of the function name.
+/// sqlparser parses `FROM TUMBLE(events, ts, ...)` as a table named `TUMBLE` with args;
+/// for window TVFs the first arg is the actual source.
 fn resolve_tvf_source(
     name: &sqlparser::ast::ObjectName,
     args: Option<&sqlparser::ast::TableFunctionArgs>,
 ) -> String {
     let name_str = name.to_string();
-    // Handle schema-qualified names like "schema.TUMBLE"
     let base_name = name_str.rsplit('.').next().unwrap_or(&name_str);
     if let Some(tfa) = args {
         if is_window_tvf(base_name) {
@@ -383,7 +352,6 @@ fn is_window_tvf(name: &str) -> bool {
         || name.eq_ignore_ascii_case("SLIDE")
 }
 
-/// Extract the first bare identifier from a function arg list.
 fn first_ident_arg(args: &[FunctionArg]) -> Option<String> {
     match args.first()? {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(id.value.clone()),
@@ -401,14 +369,7 @@ fn first_ident_arg(args: &[FunctionArg]) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Compiled post-projection
-// ---------------------------------------------------------------------------
-
-/// Lazily compiled post-join projection for ASOF/temporal queries.
-///
-/// Compiled from the projection SQL (e.g., `SELECT a, b AS alias FROM __asof_tmp`)
-/// on first execution when the join output schema is known.
+/// Compiled post-join projection for ASOF/temporal queries.
 pub(crate) struct CompiledPostProjection {
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) output_schema: SchemaRef,
@@ -422,18 +383,13 @@ impl std::fmt::Debug for CompiledPostProjection {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Projection / filter extraction
-// ---------------------------------------------------------------------------
-
 pub(crate) struct ProjectionFilterInfo {
     pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
     pub(crate) input_df_schema: Arc<datafusion_common::DFSchema>,
 }
 
-/// Returns `Some` only for plans of the shape
-/// `Projection? -> Filter? -> TableScan` (with optional `SubqueryAlias` wrappers).
+/// Returns `Some` only for `Projection? -> Filter? -> TableScan` plans.
 pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
     match plan {
         LogicalPlan::Projection(proj) => {
@@ -446,10 +402,8 @@ pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<Projection
                 }
             })
         }
-        // No Projection wrapper — check for Filter -> TableScan directly
         _ => match extract_filter_or_scan(plan) {
             Some((filter_pred, input_schema, _)) => {
-                // Build identity projection from the scan schema
                 let proj_exprs: Vec<datafusion_expr::Expr> = input_schema
                     .fields()
                     .iter()
@@ -539,17 +493,10 @@ pub(crate) fn extract_projection_exprs(
     Some((exprs, output_schema))
 }
 
-// ---------------------------------------------------------------------------
-// Window boundary computation
-// ---------------------------------------------------------------------------
-
-/// Compute the closed-window boundary given a watermark and window config.
+/// Compute the closed-window boundary for a given watermark.
 ///
-/// - **Tumbling**: floor to nearest window boundary.
-/// - **Session**: `watermark - gap` (best approximation without session state).
-/// - **Sliding**: align to slide interval — the earliest open window starts at
-///   `((watermark - size) / slide + 1) * slide`, so data below that threshold
-///   belongs only to closed windows.
+/// Tumbling: floor to the nearest boundary. Session: `watermark - gap`.
+/// Sliding: first slide-aligned boundary after `watermark - size`.
 pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
     match config.window_type {
         WindowType::Tumbling => {
@@ -558,8 +505,7 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
                 tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            // floor((ts - offset) / size) * size + offset, saturating so
-            // the i64::MIN initial-watermark sentinel doesn't panic.
+            // Saturating so the i64::MIN initial-watermark sentinel doesn't panic.
             let offset = config.offset_ms;
             let adjusted = watermark_ms.saturating_sub(offset);
             let floored = adjusted.div_euclid(size).saturating_mul(size);
@@ -584,10 +530,7 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
                 );
                 return watermark_ms;
             }
-            // The earliest open window starts at the first slide-aligned
-            // boundary after (watermark - size). Data below that start
-            // belongs only to fully closed windows.
-            // Account for window offset to match SlidingWindowAssigner.
+            // Earliest open window starts at first slide-aligned boundary after (watermark - size).
             let offset = config.offset_ms;
             let base = watermark_ms.saturating_sub(offset).saturating_sub(size);
             let boundary = base
@@ -597,8 +540,6 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
             boundary.saturating_add(offset)
         }
         WindowType::Cumulate => {
-            // Cumulate windows share the same epoch alignment as tumbling.
-            // A full epoch is closed when watermark >= epoch_end.
             let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
             if size <= 0 {
                 tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
@@ -612,17 +553,11 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
     }
 }
 
-// ---------------------------------------------------------------------------
-// Join detection
-// ---------------------------------------------------------------------------
-
 pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
-    // Parse using the streaming parser which understands ASOF syntax
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
     };
 
-    // We need a raw sqlparser Statement::Query to inspect the SELECT AST
     let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
         return (None, None);
     };
@@ -639,7 +574,6 @@ pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>,
         return (None, None);
     };
 
-    // Find the first ASOF join step
     let Some(asof_analysis) = multi.joins.iter().find(|j| j.is_asof_join) else {
         return (None, None);
     };
@@ -648,28 +582,20 @@ pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>,
         return (None, None);
     };
 
-    // Build a projection SQL that rewrites the original SELECT list to reference
-    // the flattened __asof_tmp table (no table qualifiers, disambiguated names).
     let projection_sql = build_projection_sql(select, asof_analysis, &config);
 
     (Some(config), Some(projection_sql))
 }
 
-// ---------------------------------------------------------------------------
-// Lookup-enrich detection (on-demand / partial lookup joins → GraphOperator)
-// ---------------------------------------------------------------------------
-
 use crate::operator::lookup_enrich::{disambiguated_lookup_name, LookupEnrichConfig};
 
-/// Detect a `partial`/`none` lookup-enrich join: a single equi-join whose right
-/// table is a registered partial lookup table. Returns the operator config plus
-/// the residual projection over `__lookup_enrich_tmp`. `partial_cols` maps a
-/// partial lookup table to its column names; `source_schemas` supplies the
-/// stream side's columns for collision disambiguation.
+/// Detect a partial lookup-enrich join and return its operator config plus residual projection.
 ///
-/// v1 constraints (else returns `None`, so the existing `DataFusion` path runs):
-/// single join step, single-column key, stream on the left, INNER/LEFT only,
-/// and the stream schema must be known.
+/// `partial_cols` maps each partial lookup table to its columns; `source_schemas` supplies
+/// stream-side schemas for collision disambiguation.
+///
+/// Returns `None` (`DataFusion` path) for anything other than: single INNER/LEFT equi-join step,
+/// single-column key, stream on the left, known stream schema.
 pub(crate) fn detect_lookup_enrich_query(
     sql: &str,
     partial_cols: &FxHashMap<String, Vec<String>>,
@@ -721,7 +647,6 @@ pub(crate) fn detect_lookup_enrich_query(
     {
         return (None, None);
     }
-    // v1: stream on the left, partial lookup table on the right.
     let lookup_table = j.right_table.clone();
     let Some(lookup_cols) = partial_cols.get(&lookup_table) else {
         return (None, None);
@@ -756,8 +681,6 @@ pub(crate) fn detect_lookup_enrich_query(
     (Some(config), Some(projection_sql))
 }
 
-/// Context for rewriting a SELECT to read from the flattened
-/// `__lookup_enrich_tmp` table.
 struct LookupRewriteCtx<'a> {
     stream_alias: Option<&'a str>,
     stream_table: &'a str,
@@ -855,12 +778,6 @@ fn rewrite_lookup_expr(expr: &Expr, ctx: &LookupRewriteCtx) -> String {
     })
 }
 
-// ---------------------------------------------------------------------------
-// AI function detection (plan-time seam)
-// ---------------------------------------------------------------------------
-
-/// AI-function detection, plan-time validation, and query planning. Consumed by
-/// `add_query` routing in `operator_graph`.
 mod ai {
     use super::{
         BackendKind, DbError, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
@@ -868,28 +785,19 @@ mod ai {
         Task,
     };
 
-    /// The temp table the AI operator registers its enriched batches under for
-    /// the residual projection.
     pub(crate) const AI_TMP_TABLE: &str = "__ai_tmp";
 
-    /// A query that contains exactly one `ai_*` call: the detected call plus the
-    /// residual projection to run over the operator's enriched output, and the
-    /// single source table the operator reads.
+    /// A query routable to the AI operator: exactly one `ai_*` call plus residual projection.
     pub(crate) struct AiQueryPlan {
-        /// The detected AI call.
         pub call: AiCallSpec,
-        /// Residual SQL over [`AI_TMP_TABLE`] with the `ai_*` projection item
-        /// rewritten to its alias column.
+        /// Residual SQL over [`AI_TMP_TABLE`] with the `ai_*` item rewritten to its alias column.
         pub projection_sql: String,
-        /// The source table the AI operator reads from.
         pub source_table: String,
     }
 
-    /// Plan a query for AI routing. Returns `Some` only when the query has
-    /// exactly one `ai_*` call, written with an `AS` alias, over a single
-    /// (un-joined) source table — the supported shape for v0.1. Multiple AI
-    /// calls, a missing alias, or joins return `None` (the caller rejects or
-    /// routes normally).
+    /// Plan a query for AI routing: exactly one aliased `ai_*` call over a single source table.
+    ///
+    /// Returns `None` for multiple AI calls, missing alias, or any join.
     pub(crate) fn plan_ai_query(sql: &str) -> Option<AiQueryPlan> {
         let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
         let mut statement = match statements.into_iter().next()? {
@@ -910,7 +818,6 @@ mod ai {
             _ => return None,
         };
 
-        // Find the single AI-call projection item.
         let mut found: Option<(usize, AiCallSpec)> = None;
         for (index, item) in select.projection.iter().enumerate() {
             let (expr, alias) = match item {
@@ -920,16 +827,15 @@ mod ai {
             };
             if let Some(spec) = ai_call_from_expr(expr, alias) {
                 if found.is_some() {
-                    return None; // more than one AI call — unsupported in v0.1
+                    return None;
                 }
                 found = Some((index, spec));
             }
         }
         let (index, call) = found?;
 
-        // Rewrite: the AI projection item becomes a plain alias column, and the
-        // FROM table becomes the enriched temp table. Reuse the original alias
-        // `Ident` (an alias is required) so quoted aliases stay quoted.
+        // Rewrite: AI item → bare alias column; FROM → temp table.
+        // Reuse the original alias Ident so quoted aliases stay quoted.
         let SelectItem::ExprWithAlias { alias, .. } = &select.projection[index] else {
             return None;
         };
@@ -950,29 +856,20 @@ mod ai {
     /// One detected `ai_*(...)` call in a query's SELECT projection.
     #[derive(Debug, Clone, PartialEq)]
     pub(crate) struct AiCallSpec {
-        /// The task implied by the function name.
         pub task: Task,
-        /// The model named via `model => '<name>'`, or `None` to use the task default.
         pub model: Option<String>,
-        /// The candidate label set from `labels => [...]`, if supplied.
         pub labels: Option<Vec<String>>,
-        /// The input column name (a simple identifier). Empty if the first
-        /// argument was missing or not a plain column — a parse error.
+        /// Empty when the first argument was missing or not a plain column.
         pub input: String,
-        /// The projection alias, if the call was written `... AS <alias>`.
         pub output_alias: Option<String>,
-        /// Argument-shape errors found while parsing (bad input, wrong argument
-        /// types). Non-empty means the call is malformed; surfaced by
-        /// [`validate_ai_calls`] as a build error rather than silently ignored.
+        /// Non-empty means the call is malformed; surfaced by [`validate_ai_calls`].
         pub parse_errors: Vec<String>,
     }
 
     /// Detect `ai_*` calls in the top-level SELECT projection of `sql`.
     ///
-    /// Only top-level projection calls are recognised in v0.1 (e.g.
-    /// `SELECT ai_classify(text, model => 'finbert') AS label FROM s`); an `ai_*`
-    /// nested inside another expression or in `WHERE` is left for the marker UDF to
-    /// reject. Returns an empty vec if the SQL does not parse or has no AI calls.
+    /// Calls nested in expressions or `WHERE` are not recognised here; the marker UDF
+    /// rejects them. Returns an empty vec if the SQL does not parse or has no AI calls.
     pub(crate) fn detect_ai_functions(sql: &str) -> Vec<AiCallSpec> {
         let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
             return Vec::new();
@@ -1002,7 +899,6 @@ mod ai {
         calls
     }
 
-    /// Extract an [`AiCallSpec`] from a projection expression if it is an `ai_*` call.
     fn ai_call_from_expr(expr: &Expr, alias: Option<String>) -> Option<AiCallSpec> {
         let Expr::Function(func) = expr else {
             return None;
@@ -1026,9 +922,7 @@ mod ai {
                             .push("AI functions take a single positional input column".to_string());
                     } else {
                         seen_input = true;
-                        // The operator looks the input up by column name in the
-                        // source batch, so only a plain column reference is
-                        // supported — an arbitrary expression would fail lookup.
+                        // Only a plain column reference — the operator does a name-based lookup.
                         match column_name(value) {
                             Some(col) => input = Some(col),
                             None => parse_errors.push(format!(
@@ -1078,9 +972,6 @@ mod ai {
         })
     }
 
-    /// A plain column reference (`col`), which the operator can look up in the
-    /// source batch. Anything else (a function call, arithmetic, a qualified
-    /// name) is unsupported as AI input in v0.1.
     fn column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -1088,8 +979,7 @@ mod ai {
         }
     }
 
-    /// Map an `ai_*` function name to its task. Must stay in step with the marker
-    /// list in `laminar-sql`'s `ai_udf`.
+    // Must stay in step with the marker list in laminar-sql's ai_udf.
     fn task_from_ai_function(name: &str) -> Option<Task> {
         match name {
             "ai_classify" => Some(Task::Classify),
@@ -1104,7 +994,6 @@ mod ai {
         }
     }
 
-    /// A single- or double-quoted string literal value.
     fn string_literal(expr: &Expr) -> Option<String> {
         let Expr::Value(value) = expr else {
             return None;
@@ -1116,7 +1005,6 @@ mod ai {
         }
     }
 
-    /// An array literal of string values (`['a', 'b']` or `ARRAY['a', 'b']`).
     fn string_array_literal(expr: &Expr) -> Option<Vec<String>> {
         let Expr::Array(array) = expr else {
             return None;
@@ -1124,9 +1012,9 @@ mod ai {
         array.elem.iter().map(string_literal).collect()
     }
 
-    /// Validate every detected AI call against the model registry. Fails the query
-    /// at plan time for an unknown model, a model that cannot perform the task, or a
-    /// labels-seam violation.
+    /// Validate every detected AI call against the model registry.
+    ///
+    /// Fails at plan time for an unknown model, unsupported task, or a labels mismatch.
     pub(crate) fn validate_ai_calls(
         registry: &ModelRegistry,
         calls: &[AiCallSpec],
@@ -1159,8 +1047,6 @@ mod ai {
             .validate(&model_name, call.task)
             .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
 
-        // The labels seam: ONNX classifiers carry labels intrinsically; remote
-        // classifiers take them as the candidate set at call time.
         match entry.kind() {
             BackendKind::Local => {
                 if let Some(requested) = &call.labels {
@@ -1181,8 +1067,7 @@ mod ai {
                 }
             }
             BackendKind::Remote => {
-                // Remote classification needs a candidate set; remote sentiment is
-                // numeric (the model returns a score), so it needs no labels.
+                // Remote sentiment returns a numeric score, so no candidate set needed.
                 if call.task == Task::Classify && call.labels.is_none() {
                     return Err(DbError::InvalidOperation(format!(
                     "remote classification with model '{model_name}' requires a 'labels' argument"
@@ -1368,32 +1253,26 @@ mod ai {
 
 pub(crate) use ai::{detect_ai_functions, plan_ai_query, validate_ai_calls, AiQueryPlan};
 
-/// Private table a window-frame operator registers its enriched batch under; the
-/// residual projection reads from it. (Mirrors the AI path's `__ai_tmp`.)
+/// Temp table a window-frame operator writes enriched batches to; the residual projection reads from it.
 pub(crate) const FRAME_TMP_TABLE: &str = "__frame_tmp";
 
-/// A single-source query carrying one bivariate moment frame
-/// (`CORR`/`COVAR_SAMP`/`COVAR_POP` `OVER (ORDER BY k ROWS N PRECEDING)`). The
-/// call is lifted out — the operator computes it from carried moments — and
-/// replaced by its alias in the residual projection.
+/// A routable bivariate moment frame query (`CORR`/`COVAR_SAMP`/`COVAR_POP OVER …`).
 pub(crate) struct FrameQueryPlan {
     pub func: MomentFn,
     pub x_column: String,
     pub y_column: String,
     pub output_alias: String,
-    /// Residual SELECT over [`FRAME_TMP_TABLE`] with the stat call replaced by
-    /// its alias column.
+    /// Residual SELECT over [`FRAME_TMP_TABLE`] with the stat call replaced by its alias.
     pub projection_sql: String,
     pub source_table: String,
-    /// `max(PRECEDING)` — rows of preceding history to retain per new row.
+    /// Rows of preceding history to retain per new row (`max(PRECEDING)`).
     pub retain: usize,
 }
 
-/// Plan a query for window-frame routing. Returns `Some` only for the supported
-/// shape: a single (un-joined) source, exactly one bivariate moment call
-/// (`CORR`/`COVAR_SAMP`/`COVAR_POP`) `OVER (ORDER BY … ROWS N PRECEDING) AS
-/// alias`, no `PARTITION BY`, no `FOLLOWING` bound (streaming cannot buffer the
-/// future). Anything else returns `None` (routed normally).
+/// Plan a query for window-frame routing.
+///
+/// Returns `Some` only for: single un-joined source, one `CORR`/`COVAR_SAMP`/`COVAR_POP`
+/// `OVER (ORDER BY … ROWS N PRECEDING) AS alias`, no `PARTITION BY` or `FOLLOWING`.
 pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
     let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
     let mut statement = match statements.into_iter().next()? {
@@ -1401,7 +1280,6 @@ pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
         _ => return None,
     };
 
-    // Validate the frame shape (single ordered series, preceding bounds only).
     let analysis = laminar_sql::parser::analytic_parser::analyze_window_frames(&statement)?;
     if !analysis.partition_columns.is_empty() || analysis.has_following() {
         return None;
@@ -1425,7 +1303,6 @@ pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
         _ => return None,
     };
 
-    // Find the single bivariate-moment OVER (...) AS alias projection item.
     let mut found: Option<(usize, MomentFn, String, String, String)> = None;
     for (index, item) in select.projection.iter().enumerate() {
         let SelectItem::ExprWithAlias { expr, alias } = item else {
@@ -1433,14 +1310,14 @@ pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
         };
         if let Some((func, x, y)) = moment_call(expr) {
             if found.is_some() {
-                return None; // only one frame call is supported
+                return None;
             }
             found = Some((index, func, x, y, alias.value.clone()));
         }
     }
     let (index, func, x_column, y_column, output_alias) = found?;
 
-    // Rewrite: the stat call AS alias → the bare alias column; FROM → temp table.
+    // Rewrite: stat call → bare alias column; FROM → temp table.
     select.projection[index] =
         SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(output_alias.clone())));
     if let TableFactor::Table { name, .. } = &mut select.from[0].relation {
@@ -1460,8 +1337,6 @@ pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
     })
 }
 
-/// The statistic and two plain-column arguments of a bivariate moment call with
-/// an `OVER` clause (`CORR`/`COVAR_SAMP`/`COVAR_POP`), or `None` otherwise.
 fn moment_call(expr: &Expr) -> Option<(MomentFn, String, String)> {
     let Expr::Function(func) = expr else {
         return None;
@@ -1477,7 +1352,6 @@ fn moment_call(expr: &Expr) -> Option<(MomentFn, String, String)> {
     Some((kind, x, y))
 }
 
-/// The two plain-column arguments of a 2-arg function call, or `None`.
 fn bivariate_column_args(func: &sqlparser::ast::Function) -> Option<(String, String)> {
     let FunctionArguments::List(list) = &func.args else {
         return None;
@@ -1673,8 +1547,8 @@ fn expr_mentions_alias(expr: &Expr, alias: &str) -> bool {
     }
 }
 
-/// False for the non-preserved side of an outer join (removing its
-/// WHERE predicate would let NULL-extended rows through).
+// Returns false for the non-preserved side of an outer join; removing its predicate
+// would pass NULL-extended rows that the original WHERE would have rejected.
 fn can_remove_from_post_where(join_type: StreamJoinType, is_left_side: bool) -> bool {
     !matches!(
         (join_type, is_left_side),
@@ -1684,7 +1558,7 @@ fn can_remove_from_post_where(join_type: StreamJoinType, is_left_side: bool) -> 
     )
 }
 
-/// `p.col` → `col`, literals and other nodes pass through via `to_string()`.
+// `p.col` → `col`; literals and other nodes pass through via `to_string()`.
 fn expr_to_sql_strip_alias(expr: &Expr, alias: &str) -> String {
     match expr {
         Expr::CompoundIdentifier(parts)
@@ -1879,7 +1753,6 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
 
     let multi = analyze_joins(select).ok()??;
 
-    // Find the first stream-stream join step (has time_bound, not ASOF/temporal/lookup)
     let stream_analysis = multi.joins.iter().find(|j| {
         j.time_bound.is_some() && !j.is_asof_join && !j.is_temporal_join && !j.is_lookup_join
     })?;
@@ -1890,12 +1763,11 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
         return None;
     };
 
-    // Only route to interval join if we have time columns
     if config.left_time_column.is_empty() || config.right_time_column.is_empty() {
         return None;
     }
 
-    // RightSemi/RightAnti mapped to Inner by translator — reject to avoid wrong semantics.
+    // RightSemi/RightAnti are mapped to Inner by the translator — wrong semantics.
     if matches!(
         stream_analysis.join_type,
         laminar_sql::parser::join_parser::JoinType::RightSemi
@@ -1947,12 +1819,10 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     })
 }
 
-/// Detect a processing-time equi-join: a single `INNER` `a JOIN b ON a.k = b.k`
-/// with no temporal predicate. It routes to a per-cycle batch join that matches
-/// the current cycle's emissions from both sides — what aligns two windowed
-/// views closing the same bucket on processing time. Returns the same shape as
-/// [`detect_stream_join_query`] but with **empty time columns**, which is how
-/// `create_operator` tells the two join operators apart.
+/// Detect a processing-time equi-join: `INNER a JOIN b ON a.k = b.k` with no temporal predicate.
+///
+/// Returns the same shape as [`detect_stream_join_query`] with empty time columns, which is
+/// how `create_operator` distinguishes this from an interval join.
 pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> {
     use laminar_sql::parser::join_parser::JoinType;
 
@@ -1968,16 +1838,13 @@ pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> 
     };
     let multi = analyze_joins(select).ok()??;
 
-    // Exactly one INNER equi-join step, no temporal predicate, distinct tables
-    // (self-joins would collide on the suffixed output schema).
+    // Self-joins would collide on the suffixed output schema.
     if multi.joins.len() != 1 {
         return None;
     }
     let step = &multi.joins[0];
-    // A no-time-bound equi-join is tagged `is_lookup_join` by `analyze_joins`
-    // (it can't tell a windowed-view join from a stream/dim lookup); real lookup
-    // joins never reach this detector — the planner emits a Lookup config, which
-    // turns `needs_specialized_detection` off in `add_query`. So accept it here.
+    // `analyze_joins` tags no-time-bound equi-joins as is_lookup_join; real lookup joins
+    // never reach this detector (the planner emits a Lookup config first), so accept it.
     if step.time_bound.is_some()
         || step.is_asof_join
         || step.is_temporal_join
@@ -1985,9 +1852,7 @@ pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> 
     {
         return None;
     }
-    // Build the StreamStream config directly from the analysis (going through
-    // `from_analysis` would yield a Lookup config for this shape). Empty time
-    // columns are the processing-time marker `create_operator` keys on.
+    // `from_analysis` would yield a Lookup config for this shape; build directly.
     let config = StreamJoinConfig {
         left_key: step.left_key_column.clone(),
         right_key: step.right_key_column.clone(),
@@ -2029,8 +1894,7 @@ pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> 
     })
 }
 
-/// TEMPORAL PROBE JOIN is not in sqlparser's grammar — recognize it by
-/// walking the token stream directly.
+/// Detect a `TEMPORAL PROBE JOIN`, which is not in sqlparser's grammar.
 pub(crate) fn detect_temporal_probe_query(
     sql: &str,
 ) -> (
@@ -2148,7 +2012,7 @@ fn expect(toks: &[&TokenWithSpan], i: &mut usize, want: &Token) -> Option<()> {
     }
 }
 
-/// Reads `a.b.c` and returns the last segment (the column name).
+// Returns the last segment of a dotted path (the column name).
 fn read_qualified(toks: &[&TokenWithSpan], i: &mut usize) -> Option<String> {
     let mut last = ident(toks.get(*i)?)?;
     *i += 1;
@@ -2207,8 +2071,7 @@ fn parse_pair(toks: &[&TokenWithSpan], i: &mut usize) -> Option<(String, String)
     Some((l, r))
 }
 
-// `0s` / `-5s` tokenize as Number + Word / Minus + Number + Word; Display
-// concatenation reassembles the literal for `parse_interval_to_ms`.
+// `0s` tokenizes as Number + Word; concatenate to reassemble for parse_interval_to_ms.
 fn token_text(toks: &[&TokenWithSpan], start: usize, end: usize) -> String {
     toks[start..end]
         .iter()
@@ -2302,15 +2165,9 @@ fn location_to_byte(sql: &str, loc: Location) -> usize {
     sql.len()
 }
 
-// ---------------------------------------------------------------------------
-// Top-K filtering
-// ---------------------------------------------------------------------------
-
-/// Apply a Top-K filter to batches, keeping at most `k` rows total.
+/// Apply a global Top-K limit across all batches.
 ///
-/// `DataFusion` applies `LIMIT N` per micro-batch, but streaming Top-K
-/// needs a global limit across the combined result. This function
-/// concatenates all batches and slices to the first `k` rows.
+/// `DataFusion`'s `LIMIT N` is per micro-batch; this slices the combined result to `k` rows.
 pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
     if batches.is_empty() || k == 0 {
         return Vec::new();
@@ -2321,7 +2178,6 @@ pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<Record
         return batches.to_vec();
     }
 
-    // Slice across batches to keep exactly k rows
     let mut remaining = k;
     let mut result = Vec::new();
     for batch in batches {
@@ -2335,17 +2191,11 @@ pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<Record
     result
 }
 
-// ---------------------------------------------------------------------------
-// Private: shared join-projection expression rewriter
-// ---------------------------------------------------------------------------
-
-/// Rewrite an expression to SQL text over a flattened join temp table.
+/// Rewrite an expression to SQL over a flattened join temp table.
 ///
-/// `leaf` resolves the per-join-type leaves (qualified column references),
-/// returning `None` to fall through to the generic recursion over the
-/// structural variants. This is the single recursion shared by the ASOF,
-/// temporal, stream-stream, and lookup rewriters, which differ only in how they
-/// resolve a `t.col` reference.
+/// `leaf` resolves qualified column references for the specific join type, returning `None`
+/// to fall through to the shared structural recursion. Shared by ASOF, temporal,
+/// stream-stream, and lookup rewriters.
 fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> String {
     if let Some(s) = leaf(expr) {
         return s;
@@ -2444,12 +2294,7 @@ fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> S
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private: ASOF projection rewriting
-// ---------------------------------------------------------------------------
-
-/// Build a `SELECT ... FROM __asof_tmp` projection query from the original
-/// SELECT items, rewriting table-qualified references to plain column names.
+// Build `SELECT … FROM __asof_tmp` rewriting table-qualified refs to plain names.
 fn build_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
@@ -2457,14 +2302,6 @@ fn build_projection_sql(
 ) -> String {
     let left_alias = analysis.left_alias.as_deref();
     let right_alias = analysis.right_alias.as_deref();
-
-    // Collect disambiguation mapping: right-side columns that collide with left
-    // get suffixed with _{right_table} in the output schema.
-    // We don't know the exact schemas here, but we know the key column is shared.
-    // For the right time column, it often collides (e.g., both sides have "ts").
-    // The actual renaming is done in build_output_schema; here we just need to
-    // handle the common case of right-qualified columns referencing their
-    // potentially-renamed counterparts.
 
     let items: Vec<String> = select
         .projection
@@ -2474,7 +2311,6 @@ fn build_projection_sql(
 
     let select_clause = items.join(", ");
 
-    // Rewrite WHERE clause if present
     let where_clause = select.selection.as_ref().map(|expr| {
         let rewritten = rewrite_expr(expr, left_alias, right_alias, config);
         format!(" WHERE {rewritten}")
@@ -2486,7 +2322,6 @@ fn build_projection_sql(
     )
 }
 
-/// Rewrite a single `SelectItem` to remove table qualifiers.
 fn rewrite_select_item(
     item: &SelectItem,
     left_alias: Option<&str>,
@@ -2502,7 +2337,6 @@ fn rewrite_select_item(
         SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
         SelectItem::QualifiedWildcard(name, _) => {
             let table = name.to_string();
-            // t.* or q.* — just use * since all columns are flattened
             if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
                 "*".to_string()
             } else {
@@ -2512,8 +2346,6 @@ fn rewrite_select_item(
     }
 }
 
-/// Recursively rewrite an expression tree to remove table qualifiers
-/// and map right-side columns to their disambiguated names.
 fn rewrite_expr(
     expr: &Expr,
     left_alias: Option<&str>,
@@ -2534,8 +2366,7 @@ fn rewrite_expr(
         Some(if is_left {
             column.to_string()
         } else if is_right {
-            // Right-side columns keep their bare name, except a non-key time
-            // column that shares the left time column's name, which is suffixed.
+            // Suffix right time column if it shares the left time column name.
             if column == config.left_time_column
                 && column == config.right_time_column
                 && column != config.key_column
@@ -2550,12 +2381,6 @@ fn rewrite_expr(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Private: Temporal join projection rewriting
-// ---------------------------------------------------------------------------
-
-/// Build a `SELECT ... FROM __temporal_tmp` projection query from the original
-/// SELECT items, rewriting table-qualified references to plain column names.
 fn build_temporal_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
@@ -2600,9 +2425,6 @@ fn build_temporal_projection_sql(
     )
 }
 
-/// Rewrite an expression tree to remove table qualifiers for temporal joins.
-/// Stream-side columns keep their names. Table-side columns keep their names
-/// (temporal join output is a flat concatenation of both sides).
 fn rewrite_temporal_expr(
     expr: &Expr,
     left_alias: Option<&str>,
@@ -2628,10 +2450,6 @@ fn rewrite_temporal_expr(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Private: Stream-stream join projection rewriting
-// ---------------------------------------------------------------------------
-
 #[allow(clippy::too_many_lines)]
 fn build_stream_join_projection_sql(
     select: &sqlparser::ast::Select,
@@ -2642,16 +2460,13 @@ fn build_stream_join_projection_sql(
     let left_alias = analysis.left_alias.as_deref();
     let right_alias = analysis.right_alias.as_deref();
 
-    // When the original SELECT chains more joins past the stream-stream step
-    // (`A JOIN B ... JOIN C ...`), they run as residual joins in the post-
-    // projection over `__interval_tmp` plus the live source catalog. Step-0
-    // column refs are then prefixed with `__interval_tmp.` so shared names
-    // (e.g. `ka` present in both `__interval_tmp` and `c`) don't collide.
+    // Extra joins beyond the step-0 stream-stream join run as residual joins in the
+    // post-projection over __interval_tmp. Step-0 refs are prefixed with __interval_tmp.
+    // to avoid collisions with downstream table names.
     let has_residual = select.from.len() == 1 && select.from[0].joins.len() > 1;
     let tmp_qual: Option<&str> = has_residual.then_some("__interval_tmp");
 
-    // Count natural-name occurrences so colliding projections (`p.type`,
-    // `a.type`) can be aliased as `{qual}_{col}` instead of duplicate `type`.
+    // Count natural names so colliding projections (p.type, a.type) get {qual}_{col} aliases.
     let mut natural_counts: FxHashMap<String, usize> = FxHashMap::default();
     if has_residual {
         for item in &select.projection {
@@ -2675,9 +2490,6 @@ fn build_stream_join_projection_sql(
             SelectItem::UnnamedExpr(expr) => {
                 let rewritten =
                     rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
-                // Alias back to the natural column name so projection labels
-                // stay user-visible. On self-join collisions, fall back to
-                // `{qual}_{col}` so output names stay unique.
                 if has_residual {
                     let (qual, natural) = match expr {
                         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
@@ -2733,10 +2545,8 @@ fn build_stream_join_projection_sql(
         String::new()
     };
 
-    // IntervalJoin matches symmetrically (`|left_ts - right_ts| <= N`) but
-    // BETWEEN is directional (`right_ts >= left_ts AND right_ts <= left_ts +
-    // N`). The upper bound is already covered by the symmetric tolerance; we
-    // add `right_ts >= left_ts` here to enforce the lower bound.
+    // IntervalJoin is symmetric but BETWEEN is directional; add right_ts >= left_ts
+    // to enforce the lower bound (the upper is already covered by the tolerance).
     let directional_filter =
         if !config.left_time_column.is_empty() && !config.right_time_column.is_empty() {
             let left_ref = match tmp_qual {
@@ -2765,9 +2575,7 @@ fn build_stream_join_projection_sql(
     )
 }
 
-/// Append residual joins (steps 1..N) onto a projection that selects
-/// from `__interval_tmp`. Unsupported join shapes (CROSS, USING, etc.)
-/// pass through via sqlparser's Display — we only rewrite ON exprs.
+// Unsupported shapes (CROSS, USING, etc.) pass through sqlparser's Display unchanged.
 fn render_residual_joins(
     joins: &[sqlparser::ast::Join],
     config: &StreamJoinConfig,
@@ -2787,7 +2595,6 @@ fn render_residual_joins(
             JoinOperator::Right(JoinConstraint::On(e))
             | JoinOperator::RightOuter(JoinConstraint::On(e)) => ("RIGHT JOIN", e),
             JoinOperator::FullOuter(JoinConstraint::On(e)) => ("FULL JOIN", e),
-            // No ON expr to rewrite — let sqlparser format the whole join.
             _ => {
                 out.push(' ');
                 let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{join}"));
@@ -2803,11 +2610,8 @@ fn render_residual_joins(
     out
 }
 
-/// Rewrite `t.col` references against the `__interval_tmp` schema:
-/// step-0 left columns become bare names, right columns get the
-/// `_<right_table>` suffix that `IntervalJoinState` adds. With
-/// `tmp_qual = Some("__interval_tmp")` the rewritten names are also
-/// prefixed to disambiguate from downstream tables in residual joins.
+// Left columns become bare names; right columns get the _<right_table> suffix from IntervalJoinState.
+// tmp_qual prefixes rewritten names to disambiguate from downstream tables in residual joins.
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
@@ -2842,12 +2646,7 @@ fn rewrite_stream_join_expr(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Private: Temporal probe join projection rewriting
-// ---------------------------------------------------------------------------
-
-/// Pre-process the temporal probe SQL into a standard JOIN that sqlparser
-/// can parse, then walk the AST to build the projection SQL.
+// Rewrites the probe clause to a standard JOIN so sqlparser can parse the rest of the query.
 fn build_probe_projection_via_ast(
     original_sql: &str,
     tpj_pos: usize,
@@ -2858,7 +2657,6 @@ fn build_probe_projection_via_ast(
 ) -> Option<String> {
     let probe = &config.probe_alias;
 
-    // Build standard JOIN to replace the probe clause
     let left_ref = left_alias.unwrap_or(&config.left_table);
     let right_ref = right_alias.unwrap_or(&config.right_table);
     let on_clause = config
@@ -2877,13 +2675,11 @@ fn build_probe_projection_via_ast(
     let after_probe = &original_sql[probe_clause_end..];
     let mut rewritten = format!("{before_probe}{join_clause}{after_probe}");
 
-    // Resolve probe pseudo-columns to plain identifiers before parsing
     rewritten = rewritten.replace(&format!("{probe}.offset_ms"), &format!("{probe}_offset_ms"));
     rewritten = rewritten.replace(&format!("{probe}.probe_ts"), &format!("{probe}_probe_ts"));
     rewritten = rewritten.replace(&format!("{probe}.offset_us"), &format!("{probe}_offset_ms"));
     rewritten = rewritten.replace(&format!("{probe}.timestamp"), &format!("{probe}_probe_ts"));
 
-    // Parse the rewritten SQL
     let stmts = laminar_sql::parse_streaming_sql(&rewritten).ok()?;
     let laminar_sql::parser::StreamingStatement::Standard(stmt) = stmts.first()? else {
         return None;
@@ -2895,7 +2691,6 @@ fn build_probe_projection_via_ast(
         return None;
     };
 
-    // Walk AST to build projection SQL
     let items: Vec<String> = select
         .projection
         .iter()
@@ -2954,10 +2749,6 @@ fn rewrite_probe_select_item(
     }
 }
 
-/// AST-level expression rewriter for temporal probe projection.
-/// Same recursive structure as ASOF `rewrite_expr`, parameterized for
-/// `TemporalProbeConfig` with composite key support and time-column
-/// disambiguation heuristic.
 fn rewrite_probe_expr(
     expr: &Expr,
     left_alias: Option<&str>,
@@ -3036,17 +2827,16 @@ fn rewrite_probe_expr(
     }
 }
 
-// --- Retracting temporal-filter recognition ---
-
-/// One side of `time_col CMP now()+off_ms`. `strict` ⇒ `>`/`<`.
+/// One bound of a `time_col CMP now() ± offset` predicate. `strict` means `>`/`<`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TemporalBound {
     pub(crate) off_ms: i64,
     pub(crate) strict: bool,
 }
 
-/// `SELECT cols FROM <t> WHERE time_col {>|>=|<|<=} now() ± INTERVAL`
-/// (or BETWEEN). Empty `proj_cols` ⇒ `SELECT *`.
+/// Config for a retracting temporal filter (`WHERE time_col CMP now() ± INTERVAL`).
+///
+/// Empty `proj_cols` means `SELECT *`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TemporalFilterConfig {
     pub(crate) source_table: String,
@@ -3059,7 +2849,7 @@ pub(crate) struct TemporalFilterConfig {
 pub(crate) enum TemporalFilterAnalysis {
     NotPresent,
     Recognized(Box<TemporalFilterConfig>),
-    /// `now()` used in some shape we don't support.
+    /// `now()` appears in a shape the retracting filter doesn't support.
     PresentUnrecognized,
 }
 
@@ -3068,8 +2858,7 @@ fn ident_is_wallclock(name: &str) -> bool {
 }
 
 fn expr_is_wallclock(expr: &Expr) -> bool {
-    // Only unquoted single-segment identifiers are the wallclock keyword;
-    // `"now"` is a column, and `events.now` is a column reference.
+    // `"now"` is a column; only unquoted bare `now` / `current_timestamp` is wallclock.
     fn ident(i: &sqlparser::ast::Ident) -> bool {
         i.quote_style.is_none() && ident_is_wallclock(&i.value)
     }
@@ -3167,7 +2956,6 @@ fn strip_nested(expr: &Expr) -> &Expr {
     e
 }
 
-/// `INTERVAL '<n>' <unit>` → magnitude in ms (sub-ms truncated).
 fn interval_to_ms(expr: &Expr) -> Option<i64> {
     let Expr::Interval(iv) = strip_nested(expr) else {
         return None;
@@ -3194,7 +2982,7 @@ fn interval_to_ms(expr: &Expr) -> Option<i64> {
     i64::try_from(value.checked_mul(us)? / 1_000).ok()
 }
 
-/// `now()` ⇒ 0, `now() ± I` ⇒ ±I (ms).
+// now() → 0, now() ± I → ±I (ms).
 fn now_offset_ms(expr: &Expr) -> Option<i64> {
     let expr = strip_nested(expr);
     if expr_is_wallclock(expr) {
@@ -3216,7 +3004,6 @@ fn now_offset_ms(expr: &Expr) -> Option<i64> {
     let mag = interval_to_ms(iv_side)?;
     match op {
         sqlparser::ast::BinaryOperator::Plus => Some(mag),
-        // `now() - I` only (subtraction is not commutative).
         sqlparser::ast::BinaryOperator::Minus if expr_is_wallclock(left) => Some(-mag),
         _ => None,
     }
@@ -3230,8 +3017,7 @@ fn column_name(expr: &Expr) -> Option<String> {
     }
 }
 
-/// Recognise `col CMP now()±I` or `col BETWEEN now()-X AND now()+Y`.
-/// Anything else (conjuncts, disjunctions, ...) ⇒ `None`.
+// Returns None for conjuncts, disjunctions, and other unsupported shapes.
 fn parse_temporal_predicate(
     expr: &Expr,
 ) -> Option<(String, Option<TemporalBound>, Option<TemporalBound>)> {
@@ -3259,7 +3045,7 @@ fn parse_temporal_predicate(
             ))
         }
         Expr::BinaryOp { left, op, right } => {
-            // Normalise to `col OP now()+off` (flip if column is on the right).
+            // Normalise to col OP now()+off (flip the operator when the column is on the right).
             let (col_e, now_e, op) = if column_name(left).is_some() {
                 (left.as_ref(), right.as_ref(), op.clone())
             } else {
@@ -3338,8 +3124,7 @@ pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
         return TemporalFilterAnalysis::NotPresent;
     }
 
-    // Canonical shape only — no DISTINCT/HAVING/TOP/ORDER/GROUP/JOIN/
-    // LIMIT/FETCH; row-limiting doesn't compose with retraction.
+    // Only the canonical shape is supported; row-limiting doesn't compose with retraction.
     let recognised = (|| {
         if query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
             return None;

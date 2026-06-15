@@ -125,6 +125,15 @@ pub async fn run_server(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
+    if let Some(budget) = config.server.state_memory_budget_bytes {
+        builder = builder.state_memory_budget_bytes(budget);
+    }
+    // The state_tier_dir contract (durable backend + budget + feature) is
+    // enforced by config validation at load; here we only wire the dir.
+    #[cfg(feature = "state-tier")]
+    if let Some(ref dir) = config.server.state_tier_dir {
+        builder = builder.state_tier_dir(dir);
+    }
 
     let storage_dir = config.state.local_storage_dir();
     let has_storage = config.state.is_durable();

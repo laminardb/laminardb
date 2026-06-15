@@ -28,7 +28,6 @@ use crate::aggregate_state::{
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
 
-/// Which core window assigner variant is in use.
 enum CoreWindowAssigner {
     Tumbling(TumblingWindowAssigner),
     Hopping(SlidingWindowAssigner),
@@ -41,12 +40,10 @@ struct PostProjection {
     final_schema: SchemaRef,
 }
 
-/// A `WHERE` predicate calling `now()`: kept logical and re-resolved per
-/// cycle (a statically-compiled `now()` errors at `evaluate()` because
-/// `DataFusion` only folds it in the `SimplifyExpressions` pass we skip).
+/// A `WHERE` predicate calling `now()`: kept logical and re-resolved per cycle
+/// because a statically compiled `now()` errors at `evaluate()`.
 struct NowWhereFilter {
     predicate: datafusion_expr::Expr,
-    /// Schema the predicate was planned against (carries table qualifiers).
     df_schema: Arc<DFSchema>,
 }
 
@@ -54,7 +51,6 @@ fn is_wallclock_fn(name: &str) -> bool {
     name.eq_ignore_ascii_case("now") || name.eq_ignore_ascii_case("current_timestamp")
 }
 
-/// True if `expr` calls `now()`/`current_timestamp()`.
 fn expr_uses_wallclock(expr: &datafusion_expr::Expr) -> bool {
     let mut found = false;
     let _ = expr.apply(|e| {
@@ -69,10 +65,8 @@ fn expr_uses_wallclock(expr: &datafusion_expr::Expr) -> bool {
     found
 }
 
-/// Replace `now()`/`current_timestamp()` with a fixed `Timestamp(ns,
-/// "+00:00")` literal — matching `DataFusion`'s own return type so the
-/// analyzer's coercion casts stay valid — so the predicate lowers to a
-/// static `PhysicalExpr` for this cycle.
+/// Substitute `now()`/`current_timestamp()` with a fixed nanosecond literal
+/// matching `DataFusion`'s return type so coercion casts stay valid.
 fn substitute_wallclock(
     expr: datafusion_expr::Expr,
     now_ns: i64,
@@ -108,9 +102,6 @@ struct SessionGroupState {
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
     pub end: i64,
-    /// One Arrow IPC blob per aggregate; each encodes that aggregate's
-    /// `Accumulator::state()` tuple as a one-row batch. See
-    /// [`crate::aggregate_state::scalars_to_ipc`].
     pub acc_states: Vec<Vec<u8>>,
 }
 
@@ -118,7 +109,6 @@ pub(crate) struct SessionCheckpoint {
     Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct SessionGroupCheckpoint {
-    /// Arrow IPC bytes for the group-key tuple.
     pub key: Vec<u8>,
     pub sessions: Vec<SessionCheckpoint>,
 }
@@ -128,30 +118,22 @@ pub(crate) struct SessionGroupCheckpoint {
 )]
 pub(crate) struct CoreWindowCheckpoint {
     pub fingerprint: u64,
-    /// Tumbling / hopping per-window state (reuses EOWC format).
     pub windows: Vec<WindowCheckpoint>,
-    /// Session-assigner per-group state.
     #[serde(default)]
     pub session_state: Vec<SessionGroupCheckpoint>,
-    /// Restore discriminant. No serde default — missing tag must fail
-    /// loud rather than silently routing into the wrong branch.
+    /// No serde default — missing tag must error rather than silently route wrong.
     pub window_type: String,
     pub high_watermark_ms: i64,
 }
 
-/// Core window state for windowed aggregate queries.
-///
-/// Uses the core engine's canonical window assigners for window assignment
-/// and `DataFusion` `Accumulator`s for per-group aggregation.
+/// Core window state for tumbling/hopping/session aggregate queries.
 pub(crate) struct CoreWindowState {
     assigner: CoreWindowAssigner,
-    /// Per-window aggregate state: `window_start` -> per-group accumulators.
     #[allow(clippy::type_complexity)]
     windows:
         BTreeMap<i64, AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
-    /// Per-group session state. Only populated for session windows.
+    // Only populated for session windows.
     session_groups: AHashMap<arrow::row::OwnedRow, SessionGroupState>,
-    /// Persistent row converter for group key encoding/decoding.
     row_converter: arrow::row::RowConverter,
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
@@ -161,37 +143,30 @@ pub(crate) struct CoreWindowState {
     output_schema: SchemaRef,
     having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
-    /// Built once; `LiveSourceExec` leaves carry fresh data per execute.
+    // Built once; LiveSourceExec leaves carry fresh data per execute.
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
-    /// Set when WHERE references `now()`; resolved per cycle.
+    // Set when WHERE references `now()`; resolved per cycle.
     now_where: Option<NowWhereFilter>,
-    /// Compiled `now()` predicate keyed by the second it was built for.
-    /// `Err` caches a compile failure so we don't re-run the analyzer
-    /// every cycle while it's broken; retries at the next second roll.
+    // Compiled `now()` predicate keyed by the second it was compiled for.
+    // Err caches a compile failure; retries at the next second roll.
     #[allow(clippy::type_complexity)]
     now_filter_cache: Option<(i64, Result<Arc<dyn PhysicalExpr>, String>)>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
-    /// Grace after window end; late events within this window are kept.
     allowed_lateness_ms: i64,
-    /// Highest watermark seen via `close_windows`; `i64::MIN` until first close.
     high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     having_sql_cache: Option<crate::operator::HavingSqlCache>,
     scratch_nogroup: AHashMap<i64, Vec<u32>>,
-    /// Bucket map keyed by `(window_start, group_id)`. Group ids come
-    /// from `scratch_group_keys` and are dense within a batch.
+    // Group ids are dense within a batch and index into scratch_group_keys.
     scratch_grouped: AHashMap<(i64, u32), Vec<u32>>,
-    /// Per-batch group-key set; the index is the group id used by
-    /// `scratch_grouped`.
     scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState>,
 }
 
 impl CoreWindowState {
-    /// Attempt to build a `CoreWindowState` by introspecting the logical
-    /// plan of the given SQL query. Returns `None` if the query is not a
-    /// windowed aggregate that can be routed through the core pipeline.
+    /// Build state from SQL; returns `None` if the query is not a windowed
+    /// aggregate that can be routed through the core pipeline.
     #[allow(clippy::too_many_lines)]
     pub async fn try_from_sql(
         ctx: &SessionContext,
@@ -280,8 +255,7 @@ impl CoreWindowState {
             return Ok(None);
         }
 
-        // Determine if we should attempt to compile pre-agg expressions.
-        // Use single_source_table (counts occurrences) to reject self-joins.
+        // single_source_table rejects self-joins before attempting expression compile.
         let compile_source = crate::sql_analysis::single_source_table(sql);
         let state_ref = ctx.state();
         let compile_props = state_ref.execution_props();
@@ -290,8 +264,7 @@ impl CoreWindowState {
         let mut proj_fields: Vec<Field> = Vec::new();
         let mut compile_ok = compile_source.is_some();
 
-        // Detect post-aggregate projection: top schema differs from Aggregate
-        // schema when a Projection sits above the Aggregate.
+        // A Projection above the Aggregate makes the top schema differ.
         let has_projection = {
             let same = top_schema.fields().len() == agg_schema.fields().len()
                 && top_schema
@@ -302,7 +275,6 @@ impl CoreWindowState {
             !same
         };
 
-        // Extract projection expressions + DFSchema (carries table qualifiers).
         let projection_info = if has_projection {
             fn find_projection(
                 plan: &datafusion_expr::LogicalPlan,
@@ -323,10 +295,8 @@ impl CoreWindowState {
             None
         };
 
-        // `now()` re-resolves per cycle only in WHERE; elsewhere
-        // (GROUP BY/SELECT/HAVING/aggregate args+FILTER) it would freeze
-        // at plan time. `Unsupported` (not `Pipeline`) so the EOWC
-        // operator re-propagates rather than falling back to raw.
+        // `now()` in GROUP BY/SELECT/HAVING/aggregate args would freeze at plan time.
+        // `Unsupported` (not `Pipeline`) lets the EOWC operator re-propagate.
         let nonwhere_now = group_exprs.iter().any(expr_uses_wallclock)
             || aggr_exprs.iter().any(expr_uses_wallclock)
             || having_predicate.as_ref().is_some_and(expr_uses_wallclock)
@@ -371,7 +341,6 @@ impl CoreWindowState {
                 pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
             }
 
-            // Compile group expression
             if compile_ok {
                 match create_physical_expr(group_expr, input_df_schema, compile_props) {
                     Ok(phys) => {
@@ -395,8 +364,6 @@ impl CoreWindowState {
         for (i, expr) in aggr_exprs.iter().enumerate() {
             let agg_schema_idx = num_group_cols + i;
             let agg_field = agg_schema.field(agg_schema_idx);
-            // When a projection is present, use the Aggregate output name
-            // so the intermediate batch columns match what PhysicalExpr expects.
             let output_name = if has_projection {
                 agg_field.name().clone()
             } else if agg_schema_idx < top_schema.fields().len() {
@@ -419,7 +386,6 @@ impl CoreWindowState {
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
 
-                    // Compile literal TRUE
                     if compile_ok {
                         match create_physical_expr(
                             &datafusion_expr::lit(true),
@@ -449,7 +415,6 @@ impl CoreWindowState {
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
 
-                            // Compile: CASE WHEN filter THEN arg ELSE NULL END
                             if compile_ok {
                                 let case_expr =
                                     datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
@@ -487,7 +452,6 @@ impl CoreWindowState {
                             pre_agg_select_items
                                 .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
 
-                            // Compile the arg expression directly
                             if compile_ok {
                                 match create_physical_expr(arg_expr, input_df_schema, compile_props)
                                 {
@@ -523,7 +487,6 @@ impl CoreWindowState {
                         "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                     ));
 
-                    // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
                     if compile_ok {
                         let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
                             expr: None,
@@ -570,11 +533,9 @@ impl CoreWindowState {
             }
         }
 
-        // Add time column for window assignment
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
 
-        // Compile time column expression
         if compile_ok {
             let time_expr = datafusion_expr::Expr::Column(
                 datafusion_common::Column::new_unqualified(&window_config.time_column),
@@ -599,11 +560,8 @@ impl CoreWindowState {
             clauses.where_clause,
         );
 
-        // Build compiled projection for single-source queries.
         let compiled_projection = if compile_ok {
-            // Compile WHERE predicate. A `now()`/`current_timestamp()`
-            // predicate cannot be compiled once (it errors at evaluate),
-            // so leave the static filter empty and apply it per cycle.
+            // A `now()` predicate can't be compiled once; apply it per cycle instead.
             let filter = if where_uses_now {
                 None
             } else if let Some(where_pred) = &agg_info.where_predicate {
@@ -629,9 +587,7 @@ impl CoreWindowState {
             None
         };
 
-        // `now()` in WHERE re-resolves per cycle only on the compiled
-        // single-source path; the interpreted cached-plan fallback would
-        // freeze it at plan time. Fail loud at CREATE instead.
+        // The interpreted fallback would freeze `now()` at plan time; fail at CREATE.
         if where_uses_now && compiled_projection.is_none() {
             return Err(DbError::Unsupported(format!(
                 "[{}] now()/current_timestamp() in WHERE requires the single-source \
@@ -663,8 +619,7 @@ impl CoreWindowState {
         let output_schema = Arc::new(Schema::new(output_fields));
 
         let post_projection = if let Some((proj_exprs, agg_df_schema)) = projection_info {
-            // Coerce literal types — NULLIF/CASE accept `(any, any)` and
-            // skip DataFusion's normal cast insertion.
+            // NULLIF/CASE accept `(any, any)` and skip DataFusion's normal cast insertion.
             let mut rewriter = TypeCoercionRewriter::new(&agg_df_schema);
             let mut compiled = Vec::with_capacity(proj_exprs.len());
             for expr in proj_exprs {
@@ -691,7 +646,6 @@ impl CoreWindowState {
             None
         };
 
-        // Compile HAVING filter.
         let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
         let having_sql = if having_filter.is_none() {
             having_predicate.as_ref().map(expr_to_sql)
@@ -699,7 +653,6 @@ impl CoreWindowState {
             None
         };
 
-        // Plan once at init; `LiveSourceProvider` leaves carry fresh data.
         let cached_pre_agg_physical = if compiled_projection.is_none() {
             let df = ctx
                 .sql(&pre_agg_sql)
@@ -741,7 +694,7 @@ impl CoreWindowState {
             now_filter_cache: None,
             having_filter,
             max_groups_per_window: 1_000_000,
-            // EMIT FINAL drops late data, so force lateness=0 (Flink "drop late").
+            // EMIT FINAL drops late data; force lateness to 0.
             allowed_lateness_ms: if matches!(emit_clause, Some(EmitClause::Final)) {
                 0
             } else {
@@ -759,13 +712,7 @@ impl CoreWindowState {
 
     /// Update per-window accumulators with a new pre-aggregation batch.
     ///
-    /// Vectorized batch update: extracts timestamps and group keys at the
-    /// batch level using `RowConverter`, groups row indices by
-    /// `(window_start, group_key)`, then calls `update_group_accumulators`
-    /// once per group with a single `take()` per column.
-    ///
-    /// Session windows fall back to per-row processing because session
-    /// merging depends on insertion order.
+    /// Session windows use per-row processing because merge depends on insertion order.
     #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
@@ -774,12 +721,10 @@ impl CoreWindowState {
 
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
 
-        // Session windows require per-row processing (merge depends on order)
         if matches!(self.assigner, CoreWindowAssigner::Session { .. }) {
             return self.update_batch_session(batch, &ts_array);
         }
 
-        // Batch-level group key extraction via persistent RowConverter
         let rows = if self.num_group_cols > 0 {
             let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
                 .map(|i| Arc::clone(batch.column(i)))
@@ -793,18 +738,14 @@ impl CoreWindowState {
             None
         };
 
-        // Group row indices by (window_start, group_key).
-        // Same pattern as aggregate_state.rs: OwnedRow as HashMap key.
         let has_groups = self.num_group_cols > 0;
-
-        // For no-group case, just group by window_start
         if !has_groups {
             let empty_key = crate::aggregate_state::global_aggregate_key();
             let mut grouped = std::mem::take(&mut self.scratch_nogroup);
             grouped.clear();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
                 if ts_ms == NULL_TIMESTAMP {
-                    continue; // skip rows with null timestamps
+                    continue;
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
@@ -860,7 +801,6 @@ impl CoreWindowState {
             return Ok(());
         }
 
-        // Grouped path: dedup group keys per batch, bucket by integer id.
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
         let mut grouped = std::mem::take(&mut self.scratch_grouped);
         let mut group_keys = std::mem::take(&mut self.scratch_group_keys);
@@ -956,13 +896,12 @@ impl CoreWindowState {
         };
         for (row, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
-                continue; // skip rows with null timestamps
+                continue;
             }
             #[allow(clippy::cast_possible_truncation)]
             let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
             let key = self.extract_group_key_row(batch, &index_array)?;
-            // Drop new keys once `session_groups` hits the cap. Existing
-            // keys still aggregate so in-flight sessions aren't corrupted.
+            // Drop new keys past the cap; existing keys still accumulate.
             if !self.session_groups.contains_key(&key)
                 && self.session_groups.len() >= self.max_groups_per_window
             {
@@ -977,7 +916,6 @@ impl CoreWindowState {
         Ok(())
     }
 
-    /// Extract group key for a single row (scalar fallback for session windows).
     fn extract_group_key_row(
         &self,
         batch: &RecordBatch,
@@ -1012,11 +950,6 @@ impl CoreWindowState {
         let new_start = ts_ms;
         let new_end = ts_ms.saturating_add(gap_ms);
 
-        // BTreeMap range iteration yields unique keys, so `overlapping`
-        // is dedup-by-construction. The unwraps below rely on this and
-        // on the matching `session_groups.get_mut(key)` succeeding when
-        // we just observed `get(key).map(...)`. A debug_assert encodes
-        // the invariant for refactor safety.
         let overlapping: Vec<i64> = self
             .session_groups
             .get(key)
@@ -1135,7 +1068,6 @@ impl CoreWindowState {
         Ok(())
     }
 
-    /// Create fresh accumulators from agg specs.
     fn create_fresh_accumulators(
         &self,
     ) -> Result<Vec<Box<dyn datafusion_expr::Accumulator>>, DbError> {
@@ -1146,7 +1078,6 @@ impl CoreWindowState {
         Ok(accs)
     }
 
-    /// Feed a single row into the given accumulators.
     fn update_accumulators(
         accs: &mut [Box<dyn datafusion_expr::Accumulator>],
         agg_specs: &[AggFuncSpec],
@@ -1186,9 +1117,8 @@ impl CoreWindowState {
         Ok(())
     }
 
-    /// Per-window late-event predicate. Per-window (not per-event) so
-    /// hopping windows whose earlier slices have closed still admit
-    /// the event into their still-open later slices.
+    /// Per-window predicate so hopping windows whose earlier slices closed still
+    /// admit the event into still-open later slices.
     #[inline]
     fn is_window_closed(&self, window_start: i64) -> bool {
         if self.high_watermark_ms == i64::MIN {
@@ -1205,7 +1135,7 @@ impl CoreWindowState {
             <= self.high_watermark_ms
     }
 
-    /// Close windows whose end <= watermark, returning emitted batches.
+    /// Close and emit all windows whose end (plus lateness grace) <= watermark.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
         let batches = match &self.assigner {
@@ -1216,13 +1146,11 @@ impl CoreWindowState {
         self.apply_post_projection(batches)
     }
 
-    /// Close fixed-size windows (tumbling/hopping) whose end <= watermark.
     fn close_fixed_windows(
         &mut self,
         watermark_ms: i64,
         size_ms: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Fast check: if the earliest window hasn't expired, nothing to close.
         if let Some((&first_ws, _)) = self.windows.first_key_value() {
             if first_ws
                 .saturating_add(size_ms)
@@ -1263,9 +1191,7 @@ impl CoreWindowState {
         Ok(result_batches)
     }
 
-    /// Close session windows whose end <= watermark.
     fn close_session_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
-        // Fast check: skip allocation if no sessions are closeable.
         let any_closeable = self.session_groups.values().any(|g| {
             g.sessions
                 .values()
@@ -1314,16 +1240,12 @@ impl CoreWindowState {
             return Ok(Vec::new());
         }
 
-        // Sort by (window_start, window_end) for deterministic output
         rows.sort_by_key(|(ws, we, _, _)| (*ws, *we));
 
         self.emit_session_rows(rows)
     }
 
-    /// Build a `RecordBatch` from closed session rows.
-    /// Output schema: `[group_cols..., agg_outputs...]`.
-    /// Sessions have data-dependent ends, so session boundaries are not
-    /// in the row output; project `MIN(ts)` / `MAX(ts)` upstream instead.
+    /// Emit closed session rows as a `RecordBatch`.
     #[allow(clippy::type_complexity)]
     fn emit_session_rows(
         &self,
@@ -1351,7 +1273,6 @@ impl CoreWindowState {
             }
         }
 
-        // Convert OwnedRow keys back to columnar arrays via RowConverter
         let group_arrays: Vec<ArrayRef> = if self.num_group_cols > 0 {
             let row_refs: Vec<arrow::row::Row<'_>> = row_keys.iter().map(|r| r.row()).collect();
             let cols = self
@@ -1396,7 +1317,6 @@ impl CoreWindowState {
         Ok(vec![batch])
     }
 
-    /// Emit a single window's accumulated state as a `RecordBatch`.
     fn emit_window(
         &self,
         groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
@@ -1410,9 +1330,6 @@ impl CoreWindowState {
         )
     }
 
-    /// Apply compiled post-aggregate projection to emitted batches.
-    /// Input schema is `[group_cols..., agg_outputs...]`; output schema
-    /// is `final_schema` (the user's SELECT list).
     fn apply_post_projection(
         &self,
         batches: Vec<RecordBatch>,
@@ -1474,11 +1391,9 @@ impl CoreWindowState {
         &mut self.having_sql_cache
     }
 
-    /// Filter `inputs` by the `now()` `WHERE` clause, with `now()` bound
-    /// to the event-time watermark (not wall clock) so it is
-    /// replay-deterministic. `watermark_ms == i64::MIN` ⇒ `Ok(None)` (no
-    /// frontier yet — don't drop startup rows). Compiled predicate cached
-    /// per watermark-second.
+    /// Apply the `now()` WHERE predicate with `now()` bound to the watermark
+    /// for replay determinism. Returns `Ok(None)` when no filter is set or the
+    /// watermark is not yet established. Predicate is compiled once per second.
     pub(crate) fn apply_dynamic_now_filter(
         &mut self,
         ctx: &SessionContext,
@@ -1488,8 +1403,7 @@ impl CoreWindowState {
         if self.now_where.is_none() || watermark_ms == i64::MIN {
             return Ok(None);
         }
-        // Bind now() to the watermark, coarsened to whole seconds so the
-        // compiled predicate is reused until the frontier second rolls.
+        // Coarsen to seconds so the compiled predicate is reused within the same second.
         let secs = watermark_ms.div_euclid(1000);
         if self
             .now_filter_cache
@@ -1564,7 +1478,6 @@ impl CoreWindowState {
             f.name().hash(&mut h);
             f.data_type().to_string().hash(&mut h);
         }
-        // Window shape must invalidate the checkpoint on change.
         self.window_type_tag().hash(&mut h);
         match &self.assigner {
             CoreWindowAssigner::Tumbling(t) => t.size_ms().hash(&mut h),
@@ -1578,7 +1491,6 @@ impl CoreWindowState {
         h.finish()
     }
 
-    /// Returns a tag string for the current assigner type.
     fn window_type_tag(&self) -> &'static str {
         match &self.assigner {
             CoreWindowAssigner::Tumbling(_) => "tumbling",
@@ -1587,15 +1499,9 @@ impl CoreWindowState {
         }
     }
 
-    /// Estimated memory usage in bytes across all windows and groups.
-    ///
-    /// For tumbling/hopping windows, iterates over `windows` (`BTreeMap` of
-    /// window-start to per-group accumulators). For session windows, iterates
-    /// over `session_groups`. Uses `ScalarValue::size()` for keys and
-    /// `Accumulator::size()` for accumulator state.
+    /// Estimated memory usage in bytes across all open windows and groups.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let mut total = 0;
-        // Tumbling/hopping windows
         for groups in self.windows.values() {
             for (key, accs) in groups {
                 total += key.as_ref().len();
@@ -1604,21 +1510,18 @@ impl CoreWindowState {
                 }
             }
         }
-        // Session windows
         for (key, group_state) in &self.session_groups {
             total += key.as_ref().len();
             for session in group_state.sessions.values() {
                 for acc in &session.accs {
                     total += acc.size();
                 }
-                // start/end timestamps: 2 × 8 bytes
-                total += 16;
+                total += 16; // start + end timestamps
             }
         }
         total
     }
 
-    /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(&mut self) -> Result<CoreWindowCheckpoint, DbError> {
         use crate::aggregate_state::scalars_to_ipc;
 
@@ -1705,7 +1608,6 @@ impl CoreWindowState {
         }
     }
 
-    /// Restore per-window group states from a checkpoint.
     pub(crate) fn restore_windows(
         &mut self,
         checkpoint: &CoreWindowCheckpoint,
@@ -1729,7 +1631,6 @@ impl CoreWindowState {
         }
     }
 
-    /// Restore fixed (tumbling/hopping) windows from checkpoint.
     fn restore_fixed_windows(
         &mut self,
         checkpoint: &CoreWindowCheckpoint,
@@ -1772,7 +1673,6 @@ impl CoreWindowState {
         Ok(total_groups)
     }
 
-    /// Restore session windows from checkpoint.
     fn restore_session_windows(
         &mut self,
         checkpoint: &CoreWindowCheckpoint,

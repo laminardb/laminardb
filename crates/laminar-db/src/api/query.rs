@@ -8,10 +8,7 @@ use arrow::datatypes::SchemaRef;
 use super::error::ApiError;
 use crate::catalog::ArrowRecord;
 
-/// Materialized query result containing all batches.
-///
-/// This is the result of collecting all streaming results into memory.
-/// Use [`QueryStream`] for streaming consumption.
+/// Materialized query result (all batches in memory). Use [`QueryStream`] for streaming.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     schema: SchemaRef,
@@ -78,10 +75,7 @@ impl QueryResult {
     }
 }
 
-/// Streaming query result.
-///
-/// Provides access to query results as they become available.
-/// Use [`QueryResult`] if you need all results at once.
+/// Streaming query result. Use [`QueryResult`] if you need all results at once.
 #[derive(Debug)]
 pub struct QueryStream {
     schema: SchemaRef,
@@ -170,8 +164,7 @@ impl QueryStream {
     }
 }
 
-// SAFETY: QueryStream uses Arc and Mutex internally for thread safety.
-// The subscription is based on lock-free channels.
+// SAFETY: QueryStream uses Arc and lock-free channels internally.
 unsafe impl Send for QueryStream {}
 
 #[cfg(test)]

@@ -1,17 +1,7 @@
 //! Arrow IPC round-trip for `Vec<ScalarValue>`.
 //!
-//! Each tuple is packed as a one-row `RecordBatch` (one column per
-//! scalar, column types inferred from the scalar's `data_type()`), then
-//! encoded via the IPC stream format. This is strictly faster and more
-//! compact than the previous `serde_json` encoding and avoids the
-//! open-coded type-tag match — Arrow already knows how to round-trip
-//! every `ScalarValue` variant.
-//!
-//! Checkpoint format note: field types on the checkpoint structs
-//! (`GroupCheckpoint::key`, `GroupCheckpoint::acc_states`, …) are
-//! `Vec<u8>` / `Vec<Vec<u8>>` and contain these IPC payloads.
-//! Old-format (`serde_json`) checkpoints do not restore under this
-//! version — per project policy, no external users, clean cut.
+//! Each tuple is a one-row `RecordBatch` encoded via the IPC stream format.
+//! Old `serde_json` checkpoints are incompatible; no migration.
 
 use std::sync::Arc;
 
@@ -22,8 +12,7 @@ use datafusion_common::ScalarValue;
 
 use crate::error::DbError;
 
-/// Encode a tuple of scalars as a one-row Arrow IPC stream. Returns an
-/// empty `Vec` iff `scalars` is empty (no schema to emit).
+/// Encode a scalar tuple as a one-row Arrow IPC stream; empty input → empty `Vec`.
 pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
     if scalars.is_empty() {
         return Ok(Vec::new());
@@ -47,8 +36,7 @@ pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError
         .map_err(|e| DbError::Pipeline(format!("scalar IPC encode: {e}")))
 }
 
-/// Decode a tuple previously produced by [`scalars_to_ipc`]. Empty
-/// input round-trips to an empty `Vec`.
+/// Decode bytes previously produced by [`scalars_to_ipc`]; empty input → empty `Vec`.
 pub(crate) fn ipc_to_scalars(bytes: &[u8]) -> Result<Vec<ScalarValue>, DbError> {
     if bytes.is_empty() {
         return Ok(Vec::new());

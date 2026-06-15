@@ -18,9 +18,7 @@ use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 
-/// Version byte prefixed to the rkyv payload so bad/old checkpoints fail
-/// loudly instead of corrupting state. Bump on any wire-format change to
-/// `AsofBufferCheckpoint`.
+/// Bump on any wire-format change to `AsofBufferCheckpoint`.
 const ASOF_CHECKPOINT_VERSION: u8 = 1;
 
 pub(crate) struct AsofJoinOperator {
@@ -28,10 +26,8 @@ pub(crate) struct AsofJoinOperator {
     projection: ProjectingJoinState,
     right_buffer: AsofRightBuffer,
     last_evicted_watermark: i64,
-    /// Right input schema, captured from the first non-empty right batch. Lets
-    /// a later cycle whose right buffer is empty still emit left rows with null
-    /// right columns, so a downstream projection over a right column keeps
-    /// resolving. `None` until the right side has emitted anything.
+    // Captured from the first non-empty right batch so a later cycle with an
+    // empty right buffer can still emit left rows with null right columns.
     right_schema: Option<SchemaRef>,
 }
 
@@ -68,18 +64,14 @@ impl GraphOperator for AsofJoinOperator {
             &self.config.right_time_column,
         )?;
 
-        // Capture the right schema from the first batch we see, so a later
-        // cycle with an empty right buffer can still emit left rows with null
-        // right columns instead of dropping them.
         if self.right_schema.is_none() {
             if let Some(b) = right_batches.first() {
                 self.right_schema = Some(b.schema());
             }
         }
 
-        // Join before evicting: a batch can carry rows below its own watermark
-        // (they set it) whose backward/nearest match still needs older right
-        // rows. Eviction (below) only constrains future cycles.
+        // Join before evicting: a batch's rows can still backward-match right
+        // rows whose timestamps they themselves set the watermark past.
         let output = if left_batches.is_empty() {
             Vec::new()
         } else {
@@ -96,12 +88,10 @@ impl GraphOperator for AsofJoinOperator {
             }
         };
 
-        // Prune the right buffer to what a future left (ts >= left_wm) can still
-        // match. Backward/Nearest keep the latest right <= left_wm per key; a
-        // bounded tolerance also drops rows below left_wm - tolerance. Forward
-        // drops everything below left_wm. Driving this off the watermark (not a
-        // tolerance-derived cutoff) is what bounds memory with no tolerance,
-        // where the old `left_wm - i64::MAX` cutoff was always i64::MIN.
+        // Prune: Backward/Nearest keep the latest right <= left_wm per key;
+        // bounded tolerance also evicts rows below left_wm - tol. Forward drops
+        // everything below left_wm. Driving off the watermark (not tolerance)
+        // bounds memory even when tolerance is None.
         let left_wm = watermarks.first().copied().unwrap_or(i64::MIN);
         if left_wm > self.last_evicted_watermark {
             match self.config.direction {
@@ -138,8 +128,7 @@ impl GraphOperator for AsofJoinOperator {
             ))
         })?;
 
-        // Version goes in the trailer so rkyv body stays at offset 0
-        // (preserves the alignment invariant `from_bytes` requires).
+        // Version in the trailer so the rkyv body stays at offset 0.
         let mut data = Vec::with_capacity(body.len() + 1);
         data.extend_from_slice(&body);
         data.push(ASOF_CHECKPOINT_VERSION);

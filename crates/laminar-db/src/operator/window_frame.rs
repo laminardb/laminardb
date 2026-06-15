@@ -1,19 +1,8 @@
-//! Sliding-window covariance/correlation operator.
+//! Sliding-window `CORR`/`COVAR_SAMP`/`COVAR_POP` operator.
 //!
-//! Streams the bivariate statistics over a `ROWS N PRECEDING` frame — `CORR`,
-//! `COVAR_SAMP`, `COVAR_POP` — that the batch engine can't slide: `DataFusion`'s
-//! accumulators for them have no `retract_batch`, so they are rejected as
-//! sliding-window accumulators. All three derive from the *same* window moments;
-//! only the final formula differs. The operator recomputes them per window over a
-//! bounded retained buffer — two-pass and mean-centered, which stays accurate for
-//! large-magnitude series where the textbook `nΣxy − ΣxΣy` form loses precision to
-//! cancellation — appends the result column, and re-projects. (`AVG`/`SUM`/… over
-//! frames are a separate concern — `DataFusion` slides those itself.)
-//!
-//! Supports one bivariate call over a single ordered series (no `PARTITION BY`),
-//! preceding bounds only (enforced by `plan_frame_query`). Rows are assumed to
-//! arrive in `ORDER BY` order (true for processing-time buckets), so the buffer
-//! is already ordered and the new arrivals are its tail.
+//! `DataFusion`'s accumulators for these have no `retract_batch`, so they can't
+//! slide natively. This operator recomputes them per window over a bounded buffer
+//! using two-pass mean-centered moments, which avoids precision loss at large magnitudes.
 
 use std::sync::Arc;
 
@@ -30,21 +19,15 @@ use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::FRAME_TMP_TABLE;
 
-/// A bivariate moment-carrying statistic over a sliding frame.
+/// Which bivariate statistic to compute over the sliding frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MomentFn {
-    /// Pearson correlation.
     Corr,
-    /// Sample covariance.
     CovarSamp,
-    /// Population covariance.
     CovarPop,
 }
 
 impl MomentFn {
-    /// Finalize from a window's centered moments — `cxx = Σ(x−x̄)²`, `cyy = Σ(y−ȳ)²`,
-    /// `cxy = Σ(x−x̄)(y−ȳ)` over `n` complete pairs. `None` when the frame has too
-    /// few pairs (or zero variance, for `CORR`).
     fn finalize(self, n: f64, cxx: f64, cyy: f64, cxy: f64) -> Option<f64> {
         match self {
             MomentFn::Corr => {
@@ -56,23 +39,19 @@ impl MomentFn {
     }
 }
 
-/// What the operator computes: the statistic, its two argument columns, the
-/// appended output column, and the rows of preceding history to retain.
+/// Frame config: which statistic, its argument columns, output column, and preceding-row count.
 pub(crate) struct MomentFrameConfig {
     pub func: MomentFn,
     pub x_column: String,
     pub y_column: String,
     pub output_column: String,
-    /// `max(PRECEDING)` — retained so each new row gets a full frame.
-    pub retain: usize,
+    pub retain: usize, // max(PRECEDING) — rows to carry across cycles
 }
 
-/// Streams a sliding-window bivariate statistic (see module docs).
+/// Streams a sliding-window bivariate statistic.
 pub(crate) struct WindowFrameOperator {
     config: MomentFrameConfig,
-    /// Newest `config.retain` input rows, carried across cycles.
-    history: Option<RecordBatch>,
-    /// The user's SELECT with the stat call rewritten to its alias column.
+    history: Option<RecordBatch>, // newest `config.retain` rows carried across cycles
     projection: ProjectingJoinState,
 }
 
@@ -90,7 +69,6 @@ impl WindowFrameOperator {
         }
     }
 
-    /// The newest `n` rows of `batch` (all of it if shorter).
     fn tail(batch: &RecordBatch, n: usize) -> RecordBatch {
         let rows = batch.num_rows();
         if rows <= n {
@@ -100,9 +78,6 @@ impl WindowFrameOperator {
         }
     }
 
-    /// The named column coerced to `Float64`. `CORR`/`COVAR` operate on any
-    /// numeric input (as they do in `DataFusion`, which we bypass), so an integer
-    /// or `Float32` column is cast up; only a genuinely non-numeric column errors.
     fn f64_column(batch: &RecordBatch, name: &str) -> Result<Float64Array, DbError> {
         let column = batch.column_by_name(name).ok_or_else(|| {
             DbError::InvalidOperation(format!("window frame: argument '{name}' not found"))
@@ -119,8 +94,6 @@ impl WindowFrameOperator {
             .clone())
     }
 
-    /// The statistic over the window `lo..=hi` of `x`/`y`. Two passes — means,
-    /// then centered moments — so the result stays precise for large magnitudes.
     fn stat_window(&self, x: &Float64Array, y: &Float64Array, lo: usize, hi: usize) -> Option<f64> {
         let (mut n, mut sx, mut sy) = (0.0_f64, 0.0, 0.0);
         for i in lo..=hi {
@@ -148,7 +121,6 @@ impl WindowFrameOperator {
         self.config.func.finalize(n, cxx, cyy, cxy)
     }
 
-    /// Append the per-new-row statistic column to the `new` batch.
     fn enrich(&self, new: &RecordBatch, buffer: &RecordBatch) -> Result<RecordBatch, DbError> {
         let x = Self::f64_column(buffer, &self.config.x_column)?;
         let y = Self::f64_column(buffer, &self.config.y_column)?;
@@ -196,7 +168,7 @@ impl GraphOperator for WindowFrameOperator {
             .find(|b| b.num_rows() > 0)
             .map(RecordBatch::schema)
         else {
-            return Ok(Vec::new()); // nothing new this cycle
+            return Ok(Vec::new());
         };
 
         let new = concat_batches(&schema, batches.iter())

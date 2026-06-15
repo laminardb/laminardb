@@ -23,13 +23,11 @@ pub(crate) struct SourceRegistration {
 #[derive(Debug, Clone)]
 pub(crate) struct SinkRegistration {
     pub name: String,
-    /// Input source or stream name (schema lookup + routing).
     pub input: String,
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
-    /// WHERE filter expression as SQL text.
     pub filter_expr: Option<String>,
 }
 
@@ -40,9 +38,6 @@ pub(crate) struct StreamRegistration {
     pub emit_clause: Option<laminar_sql::parser::EmitClause>,
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
-    /// Per-step join configs from the planner (one entry per binary step,
-    /// left-deep). Lets the executor skip SQL re-parses when the query
-    /// has no streaming-specific join step.
     pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
 }
 
@@ -55,12 +50,7 @@ pub(crate) struct TableRegistration {
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
     pub refresh: Option<RefreshMode>,
-    /// Byte budget for the on-demand lookup `LookupMemoryCache` (partial mode).
-    /// `None` falls back to the cache's default.
     pub cache_max_bytes: Option<usize>,
-    /// Time-to-live for on-demand lookup cache entries (partial mode). After
-    /// this duration an entry is lazily re-fetched on the next probe. `None`
-    /// means entries live until byte-eviction / CDC invalidation.
     pub cache_ttl: Option<std::time::Duration>,
 }
 
@@ -165,16 +155,12 @@ pub struct ConnectorManager {
     sinks: HashMap<String, SinkRegistration>,
     streams: HashMap<String, StreamRegistration>,
     tables: HashMap<String, TableRegistration>,
-    /// Original DDL text for SHOW CREATE, keyed by object name.
     ddl_store: HashMap<String, String>,
-    /// Object names in creation order. Pairs with `ddl_store` to emit the
-    /// catalog manifest in a dependency-safe replay order (a view selecting
-    /// from another is created after it). Names are removed on DROP.
+    // Creation order for dependency-safe catalog manifest replay.
     ddl_order: Vec<String>,
 }
 
 impl ConnectorManager {
-    /// Create an empty manager.
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
@@ -186,9 +172,7 @@ impl ConnectorManager {
         }
     }
 
-    /// Store DDL text for SHOW CREATE and the catalog manifest. Preserves
-    /// first-seen creation order; a re-`CREATE` (e.g. OR REPLACE) updates the
-    /// text in place without reordering.
+    /// Store DDL text for SHOW CREATE. OR REPLACE updates in place without reordering.
     pub fn store_ddl(&mut self, name: &str, ddl: &str) {
         if self
             .ddl_store
@@ -199,20 +183,17 @@ impl ConnectorManager {
         }
     }
 
-    /// Retrieve stored DDL text.
     pub fn get_ddl(&self, name: &str) -> Option<&str> {
         self.ddl_store.get(name).map(String::as_str)
     }
 
-    /// Forget an object's DDL (on DROP) so it leaves the catalog manifest.
     pub fn remove_ddl(&mut self, name: &str) {
         if self.ddl_store.remove(name).is_some() {
             self.ddl_order.retain(|n| n != name);
         }
     }
 
-    /// All stored DDL as `(name, ddl)` in creation order — the catalog
-    /// manifest's replay sequence.
+    /// Returns stored DDL in creation order for catalog manifest replay.
     #[cfg(feature = "cluster")]
     pub fn ordered_ddl(&self) -> Vec<(String, String)> {
         self.ddl_order
@@ -225,17 +206,14 @@ impl ConnectorManager {
             .collect()
     }
 
-    /// Register a source.
     pub fn register_source(&mut self, reg: SourceRegistration) {
         self.sources.insert(reg.name.clone(), reg);
     }
 
-    /// Register a sink.
     pub fn register_sink(&mut self, reg: SinkRegistration) {
         self.sinks.insert(reg.name.clone(), reg);
     }
 
-    /// Register a stream.
     pub fn register_stream(&mut self, reg: StreamRegistration) {
         self.streams.insert(reg.name.clone(), reg);
     }
@@ -258,7 +236,6 @@ impl ConnectorManager {
         self.streams.remove(name).is_some()
     }
 
-    /// Register a reference/dimension table.
     pub fn register_table(&mut self, reg: TableRegistration) {
         self.tables.insert(reg.name.clone(), reg);
     }
@@ -269,7 +246,6 @@ impl ConnectorManager {
         self.tables.remove(name).is_some()
     }
 
-    /// All table registrations.
     pub fn tables(&self) -> &HashMap<String, TableRegistration> {
         &self.tables
     }
@@ -281,17 +257,14 @@ impl ConnectorManager {
             || self.tables.values().any(|t| t.connector_type.is_some())
     }
 
-    /// All source registrations.
     pub fn sources(&self) -> &HashMap<String, SourceRegistration> {
         &self.sources
     }
 
-    /// All sink registrations.
     pub fn sinks(&self) -> &HashMap<String, SinkRegistration> {
         &self.sinks
     }
 
-    /// All stream registrations.
     pub fn streams(&self) -> &HashMap<String, StreamRegistration> {
         &self.streams
     }

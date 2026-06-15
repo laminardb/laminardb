@@ -240,12 +240,48 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 
     validate_ai(config, &mut errors);
     validate_cluster_tls(config, &mut errors);
+    validate_state_tier(config, &mut errors);
 
     if !errors.is_empty() {
         return Err(ConfigError::ValidationErrors { errors });
     }
 
     Ok(())
+}
+
+/// The `state_tier_dir` contract, validated once here so the embedded and
+/// cluster startup paths share it instead of each re-checking and drifting.
+fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
+    if config.server.state_tier_dir.is_none() {
+        return;
+    }
+    #[cfg(feature = "state-tier")]
+    {
+        // The tier replays demoted state from [state] on restart, so a
+        // non-durable backend would lose it; demotion is budget-driven, so a
+        // dir without a budget never demotes.
+        if !config.state.is_durable() {
+            errors.push(
+                "state_tier_dir requires a durable [state] backend (a local path or \
+                 object store); an in-process backend would lose demoted state on restart"
+                    .to_string(),
+            );
+        }
+        if config.server.state_memory_budget_bytes.is_none() {
+            errors.push(
+                "state_tier_dir requires state_memory_budget_bytes — demotion to the cold \
+                 tier is triggered by the memory budget, so a tier dir without a budget \
+                 would never demote"
+                    .to_string(),
+            );
+        }
+    }
+    #[cfg(not(feature = "state-tier"))]
+    errors.push(
+        "state_tier_dir is set but this binary was built without the 'state-tier' \
+         feature; rebuild with --features state-tier or remove state_tier_dir"
+            .to_string(),
+    );
 }
 
 /// Top-level server configuration deserialized from `laminardb.toml`.
@@ -324,6 +360,16 @@ pub struct ServerSection {
     /// permissive policy (dev only); set this before exposing the console.
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
+    /// Node-level cap on total operator state held in memory, in bytes.
+    /// Crossing it pauses source intake (backpressure, not failure) until
+    /// state drains below the budget. `None` = unlimited.
+    #[serde(default)]
+    pub state_memory_budget_bytes: Option<usize>,
+    /// Local directory for the disk cold tier. With a memory budget set,
+    /// operator state approaching the budget is demoted here instead of
+    /// backpressuring. Requires a `state-tier` build. `None` = no tier.
+    #[serde(default)]
+    pub state_tier_dir: Option<std::path::PathBuf>,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -354,6 +400,8 @@ impl Default for ServerSection {
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
             console_cors_allowed_origins: None,
+            state_memory_budget_bytes: None,
+            state_tier_dir: None,
         }
     }
 }
@@ -1103,6 +1151,31 @@ delivery = "exactly_once"
         assert_eq!(coord.heartbeat_interval, Duration::from_millis(300));
 
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn test_state_memory_budget_parses_and_defaults_off() {
+        let toml = r#"
+[server]
+mode = "embedded"
+state_memory_budget_bytes = 1073741824
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.state_memory_budget_bytes, Some(1_073_741_824));
+
+        let config: ServerConfig = toml::from_str("[server]\nmode = \"embedded\"\n").unwrap();
+        assert_eq!(config.server.state_memory_budget_bytes, None);
+        assert_eq!(config.server.state_tier_dir, None);
+    }
+
+    #[test]
+    fn test_state_tier_dir_parses() {
+        let toml = "[server]\nmode = \"embedded\"\nstate_tier_dir = \"/data/tier\"\n";
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.server.state_tier_dir,
+            Some(std::path::PathBuf::from("/data/tier"))
+        );
     }
 
     #[test]

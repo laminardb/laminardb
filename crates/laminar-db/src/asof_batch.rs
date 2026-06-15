@@ -1,9 +1,6 @@
 #![deny(clippy::disallowed_types)]
 
-//! Batch-level ASOF join execution on `RecordBatch`es.
-//!
-//! Implements the ASOF join algorithm for batch data, matching each left row
-//! to the closest right row by timestamp within the same key partition.
+//! Batch-level ASOF join: matches each left row to the closest right row by timestamp within the same key.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,9 +20,6 @@ use crate::key_column::{
 };
 
 /// Execute an ASOF join on two sets of `RecordBatch`es.
-///
-/// Matches each left row to the closest right row by timestamp, partitioned
-/// by key column, according to the direction and tolerance in `config`.
 ///
 /// # Errors
 ///
@@ -53,7 +47,6 @@ pub(crate) fn execute_asof_join_batch(
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left)", &e))?;
 
     let right_schema = if right_batches.is_empty() {
-        // Build a schema with the same structure but no rows
         Arc::new(Schema::empty())
     } else {
         right_batches[0].schema()
@@ -68,8 +61,6 @@ pub(crate) fn execute_asof_join_batch(
 
     let output_schema = build_output_schema(&left_schema, &right_schema, config);
 
-    // Build right-side index: key_hash -> BTreeMap<timestamp, row_index>
-    // Keyed by hash to avoid per-row String allocations.
     let mut right_index: FxHashMap<u64, BTreeMap<i64, Vec<usize>>> =
         FxHashMap::with_capacity_and_hasher(right.num_rows(), rustc_hash::FxBuildHasher);
     let right_keys_col;
@@ -87,13 +78,12 @@ pub(crate) fn execute_asof_join_batch(
                     .or_default()
                     .push(i);
             }
-            // Null keys are skipped — they can never match per SQL three-valued logic
+            // null keys never match
         }
     } else {
         right_keys_col = None;
     }
 
-    // Extract left key and timestamp columns (zero-alloc borrow)
     let left_keys_col = extract_key_column(&left, &config.key_column)?;
     let left_timestamps = extract_column_as_timestamps(&left, &config.left_time_column)?;
 
@@ -101,7 +91,6 @@ pub(crate) fn execute_asof_join_batch(
         .tolerance
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
-    // For each left row, find matching right row
     let mut left_indices: Vec<usize> = Vec::with_capacity(left.num_rows());
     let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left.num_rows());
 
@@ -115,9 +104,7 @@ pub(crate) fn execute_asof_join_batch(
             continue;
         };
 
-        // Walk timestamps in direction order, verifying key equality at each.
-        // This handles hash collisions: if a different key occupies the closest
-        // timestamp, we continue to the next timestamp rather than giving up.
+        // Verify key equality at each candidate to handle hash collisions.
         let matched_right = right_index.get(&left_hash).and_then(|btree| {
             if let Some(ref rk) = right_keys_col {
                 find_verified_match(
@@ -143,13 +130,10 @@ pub(crate) fn execute_asof_join_batch(
                 left_indices.push(left_idx);
                 right_indices.push(None);
             }
-            (AsofSqlJoinType::Inner, None) => {
-                // Skip unmatched rows for inner join
-            }
+            (AsofSqlJoinType::Inner, None) => {}
         }
     }
 
-    // Build output columns
     build_output_batch(
         &left,
         &right,
@@ -160,9 +144,7 @@ pub(crate) fn execute_asof_join_batch(
     )
 }
 
-/// Walk timestamps in direction order, returning the first row index where the
-/// key matches. Handles hash collisions by continuing to the next-best timestamp
-/// when no key match is found at the closest one.
+/// Closest timestamp match with key-equality verification (handles hash collisions).
 fn find_verified_match(
     btree: &BTreeMap<i64, Vec<usize>>,
     left_ts: i64,
@@ -244,11 +226,7 @@ fn find_verified_match(
     }
 }
 
-/// Build the merged output schema from left and right schemas.
-///
-/// Right-side columns are made nullable for Left joins. Duplicate column
-/// names (collisions between left and right) are disambiguated by appending
-/// `_{right_table}` to the right-side field.
+/// Right columns are made nullable for Left joins; duplicate names get `_{right_table}` suffix.
 fn build_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
@@ -267,7 +245,6 @@ fn build_output_schema(
         .collect();
     let make_nullable = config.join_type == AsofSqlJoinType::Left;
     for field in right_schema.fields() {
-        // Skip duplicate key column (already in left side)
         if field.name() == &config.key_column {
             continue;
         }
@@ -275,7 +252,6 @@ fn build_output_schema(
         if make_nullable {
             f = f.with_nullable(true);
         }
-        // Disambiguate duplicate names by appending _{right_table}
         if left_names.contains(f.name().as_str()) {
             let suffixed_name = format!("{}_{}", f.name(), config.right_table);
             f = f.with_name(suffixed_name);
@@ -286,7 +262,6 @@ fn build_output_schema(
     Arc::new(Schema::new(fields))
 }
 
-/// Build the output `RecordBatch` from matched indices.
 fn build_output_batch(
     left: &RecordBatch,
     right: &RecordBatch,
@@ -298,7 +273,6 @@ fn build_output_batch(
     let num_rows = left_indices.len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
 
-    // Left-side columns: take selected rows
     #[allow(clippy::cast_possible_truncation)]
     let left_idx_array =
         arrow::array::UInt32Array::from(left_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
@@ -309,11 +283,9 @@ fn build_output_batch(
         columns.push(taken);
     }
 
-    // Right-side columns: take selected rows (with nulls for unmatched)
     let right_schema = right.schema();
     for col_idx in 0..right.num_columns() {
         let field_name = right_schema.field(col_idx).name();
-        // Skip duplicate key column
         if field_name == &config.key_column {
             continue;
         }
@@ -329,10 +301,9 @@ fn build_output_batch(
 
 const ASOF_COMPACTION_THRESHOLD: u32 = 32;
 
-/// Right-side index: `key_hash → BTreeMap<timestamp, Vec<row_index>>`.
 type RightIndex = FxHashMap<u64, BTreeMap<i64, Vec<usize>>>;
 
-/// Right-side state for streaming ASOF joins. Persists across execution cycles.
+/// Right-side buffer for streaming ASOF joins. Persists across cycles.
 #[derive(Default)]
 pub(crate) struct AsofRightBuffer {
     index: RightIndex,
@@ -341,8 +312,6 @@ pub(crate) struct AsofRightBuffer {
 }
 
 impl AsofRightBuffer {
-    /// Ingest new right-side batches, appending to the concatenated batch and
-    /// updating the index.
     pub fn ingest(
         &mut self,
         batches: &[RecordBatch],
@@ -353,7 +322,6 @@ impl AsofRightBuffer {
             return Ok(());
         }
 
-        // Filter out CDC negative events (D, U-) before buffering
         let filtered: Vec<RecordBatch> = batches
             .iter()
             .map(crate::changelog_filter::filter_positive_events)
@@ -371,7 +339,7 @@ impl AsofRightBuffer {
         }
 
         let timestamps = extract_column_as_timestamps(&new_batch, time_col)?;
-        // Pre-compute hashes before new_batch is moved into concat.
+        // Pre-compute hashes before new_batch is moved into the concat.
         let key_hashes: Vec<Option<u64>> = {
             let keys = extract_key_column(&new_batch, key_col)?;
             (0..new_batch.num_rows()).map(|i| keys.hash_at(i)).collect()
@@ -402,7 +370,6 @@ impl AsofRightBuffer {
         Ok(())
     }
 
-    /// Evict all rows with `ts < cutoff`.
     pub fn evict_before(&mut self, cutoff: i64) -> Result<(), DbError> {
         for btree in self.index.values_mut() {
             let keep = btree.split_off(&cutoff);
@@ -416,16 +383,12 @@ impl AsofRightBuffer {
         Ok(())
     }
 
-    /// Keep, per key, the latest right row at or below `watermark` plus every
-    /// newer row; drop the rest. A future left (`ts >= watermark`) backward- or
-    /// nearest-matches the latest right `<= its ts`, which is never older than
-    /// the latest right `<= watermark`, so older rows are unreachable. Unlike
-    /// [`Self::evict_before`] this retains the boundary row, making it safe with
-    /// no tolerance.
+    /// Per key, keep the latest row at or below `watermark` plus all newer rows.
+    /// Unlike `evict_before`, retains the boundary row so backward/nearest joins
+    /// with no tolerance still find a match.
     pub fn evict_superseded(&mut self, watermark: i64) -> Result<(), DbError> {
         for btree in self.index.values_mut() {
-            // Greatest ts <= watermark; keep it and everything newer, drop the
-            // rest. `split_off(&keep_ts)` returns the `>= keep_ts` tail.
+            // split_off(&keep_ts) returns the >= keep_ts tail.
             if let Some((&keep_ts, _)) = btree.range(..=watermark).next_back() {
                 *btree = btree.split_off(&keep_ts);
             }
@@ -505,8 +468,7 @@ impl AsofRightBuffer {
     }
 }
 
-/// Execute an ASOF join of left batches against a stateful right buffer.
-/// The right buffer must have been pre-populated via `AsofRightBuffer::ingest`.
+/// ASOF join of left batches against a pre-populated `AsofRightBuffer`.
 pub(crate) fn execute_asof_join_with_state(
     left_batches: &[RecordBatch],
     right_buffer: &AsofRightBuffer,
@@ -522,12 +484,9 @@ pub(crate) fn execute_asof_join_with_state(
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left)", &e))?;
 
     let Some(right) = right_buffer.right_concat.clone() else {
-        // No right data buffered. A Left join emits left rows with null right
-        // columns — but only once the right schema is known (captured from an
-        // earlier batch). Keeping those columns is essential: a downstream
-        // projection that references a right column (e.g. a spike ratio over a
-        // slow-warming baseline) fails to plan if they're dropped. Until the
-        // right schema is known, emit nothing rather than a malformed batch.
+        // Left join: once the right schema is known, emit nulls for unmatched left rows so
+        // downstream projections referencing right columns can still resolve. Before the schema
+        // is known, emit nothing rather than a schema-incomplete batch.
         if config.join_type == AsofSqlJoinType::Left {
             if let Some(right_schema) = right_schema_hint {
                 let output_schema = build_output_schema(&left_schema, right_schema, config);
@@ -604,11 +563,7 @@ pub(crate) fn execute_asof_join_with_state(
     )
 }
 
-/// Serializable checkpoint for `AsofRightBuffer`.
-///
-/// Row indices are `u32` because they index into a single `RecordBatch`
-/// whose row count is itself `u32`-bounded; using `u32` halves the
-/// in-memory footprint of the index-entries vec compared to `usize`.
+/// Serializable checkpoint for `AsofRightBuffer`. Row indices are `u32` (half the footprint of `usize`).
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -647,9 +602,6 @@ impl AsofRightBuffer {
         let mut index_entries = Vec::new();
         for (&key_hash, btree) in &self.index {
             for (&ts, indices) in btree {
-                // Compact via u32. `compact()` was just called above, so indices
-                // are bounded by the row count of `right_concat`, which is itself
-                // u32-bounded.
                 #[allow(clippy::cast_possible_truncation)]
                 let narrow: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
                 index_entries.push((key_hash, ts, narrow));

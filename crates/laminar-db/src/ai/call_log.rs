@@ -1,11 +1,6 @@
 //! Bounded in-memory log of inference calls, surfaced as `laminar.ai_calls`.
-//!
-//! One record per batch call — local and remote alike. Remote calls carry
-//! tokens and cost; local calls report [`Usage::ZERO`](crate::ai::provider::Usage::ZERO).
-//! The log is written from the Ring 1 inference worker and read by queries
-//! against `laminar.ai_calls`, so it is behind a lock; it is never touched on
-//! Ring 0. The buffer is bounded — the oldest record is dropped once full — and
-//! a monotonic counter records how many calls were ever logged.
+//! One record per batch; written from Ring 1, never Ring 0. Oldest record is
+//! dropped when full; a monotonic counter tracks lifetime call count.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,27 +33,27 @@ impl CallOutcome {
 /// One logged inference call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiCallRecord {
-    /// Wall-clock time the call completed (epoch milliseconds).
+    /// Epoch milliseconds at call completion.
     pub timestamp_ms: i64,
-    /// Registry model name (e.g. `finbert`, `haiku`).
+    /// Registry model name.
     pub model: String,
-    /// Backend-kind identity reported by the provider (e.g. `anthropic`).
+    /// Provider name (e.g. `anthropic`).
     pub provider: &'static str,
-    /// The task performed.
+    /// Task performed.
     pub task: Task,
-    /// The backend kind.
+    /// Backend kind.
     pub kind: BackendKind,
     /// Number of rows in the batch.
     pub batch_size: u32,
-    /// Token/cost accounting (zero for local).
+    /// Zero for local calls.
     pub usage: Usage,
-    /// End-to-end latency of the batch call.
+    /// End-to-end latency.
     pub latency_ms: u64,
     /// Outcome.
     pub outcome: CallOutcome,
 }
 
-/// Bounded ring buffer of [`AiCallRecord`]s.
+/// Bounded ring buffer of call records.
 #[derive(Debug)]
 pub struct AiCallLog {
     records: Mutex<VecDeque<AiCallRecord>>,
@@ -67,7 +62,7 @@ pub struct AiCallLog {
 }
 
 impl AiCallLog {
-    /// Create a log retaining at most `capacity` of the most recent records.
+    /// Retain at most `capacity` of the most recent records.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -77,13 +72,13 @@ impl AiCallLog {
         }
     }
 
-    /// Create a log with a default capacity of 2,000 records.
+    /// Create a log with a default capacity of 2 000 records.
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(2_000)
     }
 
-    /// Append a record, evicting the oldest if at capacity.
+    /// Append a record; evicts the oldest if at capacity.
     pub fn record(&self, record: AiCallRecord) {
         let mut records = self.records.lock();
         if records.len() >= self.capacity {
@@ -93,25 +88,25 @@ impl AiCallLog {
         self.recorded.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot the retained records, oldest first. Backs `laminar.ai_calls`.
+    /// Snapshot retained records (oldest first). Backs `laminar.ai_calls`.
     #[must_use]
     pub fn snapshot(&self) -> Vec<AiCallRecord> {
         self.records.lock().iter().cloned().collect()
     }
 
-    /// Number of records currently retained.
+    /// Number of retained records.
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.lock().len()
     }
 
-    /// Whether the log currently holds no records.
+    /// Whether the log holds no records.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.records.lock().is_empty()
     }
 
-    /// Total calls ever logged, including those evicted from the buffer.
+    /// Total calls ever logged, including evicted records.
     #[must_use]
     pub fn total_recorded(&self) -> u64 {
         self.recorded.load(Ordering::Relaxed)

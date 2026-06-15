@@ -1,6 +1,5 @@
-//! Shared helpers for remote (HTTP) providers: task chat prompts and the
-//! retry/backoff policy. Provider-specific request bodies, auth, and response
-//! parsing live in each provider module.
+//! Shared helpers for HTTP providers: chat prompts and retry/backoff.
+//! Provider-specific bodies and auth live in each provider module.
 
 use std::time::Duration;
 
@@ -9,8 +8,7 @@ use serde::de::DeserializeOwned;
 use crate::ai::provider::{ProviderError, Usage};
 use crate::ai::registry::Task;
 
-/// Sum two usage records, saturating. Used to fold per-row chat usage into a
-/// batch total.
+/// Sum two usage records, saturating.
 pub(crate) fn add_usage(a: Usage, b: Usage) -> Usage {
     Usage {
         input_tokens: a.input_tokens.saturating_add(b.input_tokens),
@@ -19,12 +17,8 @@ pub(crate) fn add_usage(a: Usage, b: Usage) -> Usage {
     }
 }
 
-/// Build the `(system, user)` chat messages for a task. `labels` is the
-/// candidate set for classification.
-///
-/// For classification the system prompt constrains the model to emit exactly
-/// one label; the adapter still coerces the reply to the label set as a
-/// backstop. `Embed` never reaches here (it uses the embeddings endpoint).
+/// Build the `(system, user)` chat messages for a task.
+/// `Embed` never reaches here — it uses the embeddings endpoint.
 pub(crate) fn chat_prompt(task: Task, input: &str, labels: Option<&[String]>) -> (String, String) {
     let system = match task {
         Task::Classify => {
@@ -49,8 +43,7 @@ pub(crate) fn chat_prompt(task: Task, input: &str, labels: Option<&[String]>) ->
     (system, input.to_string())
 }
 
-/// Whether an error is worth retrying — transient transport, timeout, or rate
-/// limiting. A malformed response or unsupported task is not.
+/// Whether an error warrants a retry (transport failures, timeout, rate-limited).
 pub(crate) fn retryable(error: &ProviderError) -> bool {
     matches!(
         error,
@@ -58,17 +51,13 @@ pub(crate) fn retryable(error: &ProviderError) -> bool {
     )
 }
 
-/// Exponential backoff for retry `attempt` (1-based), capped at ~3.2s.
+/// Exponential backoff for retry `attempt` (1-based), capped at ~3.2 s.
 pub(crate) fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(100u64.saturating_mul(1u64 << attempt.min(5)))
 }
 
-/// POST a pre-built request (already authenticated, with a JSON body) and decode
-/// the response, retrying transient failures with backoff. `timeout_ms` is used
-/// only to label timeout errors — the client enforces the actual deadline.
-///
-/// Shared by every HTTP provider; each builds its own auth + body, so this stays
-/// vendor-neutral.
+/// POST a request and decode the response, retrying transient failures with
+/// backoff. `timeout_ms` labels timeout errors; the client enforces the deadline.
 pub(crate) async fn post_json<R: DeserializeOwned>(
     builder: reqwest::RequestBuilder,
     max_retries: u32,

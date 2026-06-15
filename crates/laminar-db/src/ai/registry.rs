@@ -1,10 +1,5 @@
-//! The model registry: the curated catalog that maps a SQL-referenced model
-//! name to the backend that runs it and the tasks it can serve.
-//!
-//! The registry is built once at startup from server configuration and is
-//! immutable thereafter. AI functions resolve `model => '<name>'` against it at
-//! plan time and fail the query if the model is unknown or cannot perform the
-//! requested task — never per event.
+//! Model registry: maps SQL-referenced model names to backends and tasks.
+//! Built once at startup; AI functions resolve against it at plan time.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -12,30 +7,29 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-/// A task contract an AI SQL function fulfils. Each `ai_*` function maps to
-/// exactly one task; a model declares the subset of tasks it supports.
+/// Task contract for an AI SQL function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Task {
-    /// Assign one label from a candidate set (`ai_classify`).
+    /// `ai_classify`
     Classify,
-    /// Classify over a fixed sentiment label set (`ai_sentiment`).
+    /// `ai_sentiment`
     Sentiment,
-    /// Produce a dense embedding vector (`ai_embed`).
+    /// `ai_embed`
     Embed,
-    /// Pull structured fields out of text (`ai_extract`).
+    /// `ai_extract`
     Extract,
-    /// Free-form completion (`ai_complete`).
+    /// `ai_complete`
     Complete,
-    /// Summarize text (`ai_summarize`).
+    /// `ai_summarize`
     Summarize,
-    /// Translate text (`ai_translate`).
+    /// `ai_translate`
     Translate,
-    /// Open-ended generation (`ai_gen`).
+    /// `ai_gen`
     Gen,
 }
 
 impl Task {
-    /// Canonical lower-case name, matching the `task = "…"` config spelling.
+    /// Canonical name matching the `task = "…"` config spelling.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -78,46 +72,44 @@ impl FromStr for Task {
 /// Which runtime executes a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
-    /// Local ONNX model run in-process via tract.
+    /// In-process ONNX Runtime.
     Local,
-    /// Model served by a configured remote provider.
+    /// Configured remote provider.
     Remote,
 }
 
 /// Backend-specific wiring for a registered model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelBackend {
-    /// A local ONNX model.
+    /// In-process ONNX model.
     Local {
-        /// Weight source — e.g. `hf:onnx-community/finbert`, or a file /
-        /// object_store URI. Resolved and mmapped by the local backend.
+        /// `hf:org/repo`, `file://<path>`, or a bare path.
         source: String,
-        /// Intrinsic classifier labels (`id2label`), when known at
-        /// registration. `None` until derived from the model's `config.json`.
+        /// `id2label` from config.json; `None` until derived at load time.
         labels: Option<Vec<String>>,
     },
-    /// A model served by a remote provider.
+    /// Remote provider model.
     Remote {
-        /// Key into the configured providers map (e.g. `anthropic`).
+        /// Key into the configured providers map.
         provider: String,
-        /// Provider-specific model id (e.g. `claude-haiku-4-5-20251001`).
+        /// Provider-specific model id.
         model: String,
     },
 }
 
-/// One registered model: its name, the tasks it serves, and its backend.
+/// One registered model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelEntry {
-    /// Registry key — the name referenced as `model => '<id>'` in SQL.
+    /// Name referenced as `model => '<id>'` in SQL.
     pub id: String,
     /// Tasks this model can perform.
     pub tasks: Vec<Task>,
-    /// The backend that runs it.
+    /// Backend that runs it.
     pub backend: ModelBackend,
 }
 
 impl ModelEntry {
-    /// The backend kind (local vs remote).
+    /// Backend kind for this entry.
     #[must_use]
     pub fn kind(&self) -> BackendKind {
         match self.backend {
@@ -126,27 +118,25 @@ impl ModelEntry {
         }
     }
 
-    /// Whether this model can perform `task`.
+    /// Whether this model supports `task`.
     #[must_use]
     pub fn supports(&self, task: Task) -> bool {
         self.tasks.contains(&task)
     }
 
-    /// Deterministic results are cacheable permanently for correctness; only
-    /// local backends are deterministic.
+    /// Whether results are deterministic (local only) and permanently cacheable.
     #[must_use]
     pub fn is_deterministic(&self) -> bool {
         matches!(self.kind(), BackendKind::Local)
     }
 
-    /// Whether calls incur metered cost (remote) versus free (local). Costed
-    /// calls are logged to `laminar.ai_calls` with tokens and cost.
+    /// Whether calls incur metered cost (remote providers).
     #[must_use]
     pub fn is_costed(&self) -> bool {
         matches!(self.kind(), BackendKind::Remote)
     }
 
-    /// Intrinsic labels of a local classifier, if any.
+    /// Intrinsic labels of a local classifier, if known.
     #[must_use]
     pub fn labels(&self) -> Option<&[String]> {
         match &self.backend {
@@ -156,7 +146,7 @@ impl ModelEntry {
     }
 }
 
-/// Curated map of model name → entry, plus a default model per task.
+/// Map of model name to entry, with optional per-task defaults.
 #[derive(Debug, Default)]
 pub struct ModelRegistry {
     models: HashMap<String, ModelEntry>,
@@ -164,7 +154,7 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
-    /// An empty registry.
+    /// Create an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -174,8 +164,7 @@ impl ModelRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::DuplicateModel`] if a model with the same id is
-    /// already registered.
+    /// Returns [`RegistryError::DuplicateModel`] if the id is already registered.
     pub fn register(&mut self, entry: ModelEntry) -> Result<(), RegistryError> {
         if self.models.contains_key(&entry.id) {
             return Err(RegistryError::DuplicateModel(entry.id.clone()));
@@ -184,12 +173,12 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// Set the default model for a task (the `[ai.defaults]` config block).
+    /// Set the default model for a task (`[ai.defaults]` config block).
     pub fn set_default(&mut self, task: Task, model: impl Into<String>) {
         self.defaults.insert(task, model.into());
     }
 
-    /// Default model name for a task, if one is configured.
+    /// Default model for a task, if configured.
     #[must_use]
     pub fn default_for(&self, task: Task) -> Option<&str> {
         self.defaults.get(&task).map(String::as_str)
@@ -199,21 +188,18 @@ impl ModelRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::UnknownModel`] if no model with that name is
-    /// registered.
+    /// Returns [`RegistryError::UnknownModel`] if not registered.
     pub fn resolve(&self, name: &str) -> Result<&ModelEntry, RegistryError> {
         self.models
             .get(name)
             .ok_or_else(|| RegistryError::UnknownModel(name.to_string()))
     }
 
-    /// Resolve a model and confirm it supports `task`. This is the plan-time
-    /// gate behind every AI function call.
+    /// Resolve a model and confirm it supports `task`.
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::UnknownModel`] if the model is not registered,
-    /// or [`RegistryError::TaskUnsupported`] if it cannot perform `task`.
+    /// Returns [`RegistryError::UnknownModel`] or [`RegistryError::TaskUnsupported`].
     pub fn validate(&self, name: &str, task: Task) -> Result<&ModelEntry, RegistryError> {
         let entry = self.resolve(name)?;
         if entry.supports(task) {
@@ -233,19 +219,19 @@ impl ModelRegistry {
         self.models.len()
     }
 
-    /// Whether no models are registered.
+    /// Whether the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
     }
 
-    /// Iterate registered entries in unspecified order. Backs `laminar.models`.
+    /// Iterate entries in unspecified order. Backs `laminar.models`.
     pub fn iter(&self) -> impl Iterator<Item = &ModelEntry> {
         self.models.values()
     }
 }
 
-/// Errors from resolving or validating a model. Surfaced at plan time.
+/// Errors from resolving or validating a model.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
     /// No model with the given name is registered.
@@ -255,11 +241,11 @@ pub enum RegistryError {
     /// The model exists but does not support the requested task.
     #[error("model '{model}' does not support task '{task}' (supports: {supported:?})")]
     TaskUnsupported {
-        /// The referenced model name.
+        /// The model name.
         model: String,
-        /// The task that was requested.
+        /// The requested task.
         task: Task,
-        /// The tasks the model actually supports.
+        /// Tasks the model actually supports.
         supported: Vec<Task>,
     },
 
@@ -267,7 +253,7 @@ pub enum RegistryError {
     #[error("model '{0}' is already registered")]
     DuplicateModel(String),
 
-    /// A `task = "…"` string did not name a known task.
+    /// A `task = "…"` config string named an unknown task.
     #[error("unknown task '{0}'")]
     UnknownTask(String),
 }

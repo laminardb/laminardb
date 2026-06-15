@@ -30,7 +30,7 @@ pub(crate) fn row_to_scalar_key_with_types(
     Ok(sv_key)
 }
 
-/// Singleton row used as the group key when `GROUP BY` is absent.
+/// Stable singleton row key for global aggregates (no GROUP BY).
 pub(crate) fn global_aggregate_key() -> arrow::row::OwnedRow {
     static SENTINEL: OnceLock<arrow::row::OwnedRow> = OnceLock::new();
     SENTINEL

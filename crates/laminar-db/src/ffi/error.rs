@@ -1,15 +1,10 @@
-//! Thread-local error storage for FFI.
-//!
-//! C functions return error codes; this module stores the last error message
-//! so callers can retrieve it via `laminar_last_error()`.
+//! Thread-local error storage for FFI; callers retrieve the last message via `laminar_last_error`.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, CString};
 use std::ptr;
 
 use crate::api::ApiError;
-
-// Error code constants
 
 /// Success return code.
 pub const LAMINAR_OK: i32 = 0;
@@ -36,18 +31,15 @@ pub const LAMINAR_ERR_INTERNAL: i32 = 900;
 /// Database is shutting down.
 pub const LAMINAR_ERR_SHUTDOWN: i32 = 901;
 
-// Thread-local storage for the last error.
 thread_local! {
     static LAST_ERROR: RefCell<Option<StoredError>> = const { RefCell::new(None) };
 }
 
-/// Stored error with pre-allocated C string.
 struct StoredError {
     error: ApiError,
     c_message: CString,
 }
 
-/// Store an error for later retrieval.
 pub(crate) fn set_last_error(err: ApiError) {
     let c_message = CString::new(err.message())
         .unwrap_or_else(|_| CString::new("Error message contained null byte").unwrap());
@@ -59,12 +51,10 @@ pub(crate) fn set_last_error(err: ApiError) {
     });
 }
 
-/// Clear the last error.
 pub(crate) fn clear_last_error() {
     LAST_ERROR.with(|e| *e.borrow_mut() = None);
 }
 
-/// Get the last error code, or 0 if none.
 #[must_use]
 pub(crate) fn last_error_code() -> i32 {
     LAST_ERROR.with(|e| {
@@ -74,7 +64,6 @@ pub(crate) fn last_error_code() -> i32 {
     })
 }
 
-/// Convert `ApiError` to FFI error code.
 fn api_error_to_ffi_code(err: &ApiError) -> i32 {
     use crate::api::codes;
     let code = err.code();
@@ -89,15 +78,11 @@ fn api_error_to_ffi_code(err: &ApiError) -> i32 {
             LAMINAR_ERR_SUBSCRIPTION
         }
         codes::SHUTDOWN => LAMINAR_ERR_SHUTDOWN,
-        // All other codes (including INTERNAL_ERROR) map to INTERNAL
         _ => LAMINAR_ERR_INTERNAL,
     }
 }
 
-/// Get the last error message.
-///
-/// Returns a pointer to a null-terminated string, or null if no error.
-/// The pointer is valid until the next FFI call on the same thread.
+/// Get the last error message as a null-terminated string, or null if no error.
 ///
 /// # Safety
 ///
@@ -110,17 +95,13 @@ pub extern "C" fn laminar_last_error() -> *const c_char {
     })
 }
 
-/// Get the last error code.
-///
-/// Returns 0 (`LAMINAR_OK`) if no error has occurred.
+/// Get the last error code, or `LAMINAR_OK` if none.
 #[no_mangle]
 pub extern "C" fn laminar_last_error_code() -> i32 {
     last_error_code()
 }
 
 /// Clear the last error.
-///
-/// Call this to reset error state before a sequence of operations.
 #[no_mangle]
 pub extern "C" fn laminar_clear_error() {
     clear_last_error();

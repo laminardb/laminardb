@@ -1,12 +1,4 @@
-//! Primary-key-based reference table store.
-//!
-//! Supports upsert, delete, and lookup by primary key for dimension/reference
-//! tables used in enrichment joins (e.g., `JOIN instruments ON t.symbol = i.symbol`).
-//!
-//! Tables can operate in different cache modes:
-//! - **Full**: all rows in memory (default, unchanged behavior)
-//! - **Partial**: LRU cache of hot keys with xor filter for negative lookups
-//! - **None**: no caching, direct backend access (same as Full for in-memory)
+//! Primary-key-based reference table store for dimension/enrichment tables.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -18,37 +10,23 @@ use crate::error::DbError;
 use crate::table_backend::TableBackend;
 use crate::table_cache_mode::TableCacheMode;
 
-/// Internal state for a single reference table.
 struct TableState {
-    /// Arrow schema for this table.
     schema: SchemaRef,
-    /// Name of the primary key column.
     primary_key: String,
-    /// Index of the primary key column in the schema.
     pk_index: usize,
-    /// Backend storage for row data.
     backend: TableBackend,
-    /// Tracked row count (avoids expensive iteration for persistent backends).
     row_count: usize,
-    /// Whether the table has been fully populated (e.g., initial snapshot done).
     ready: bool,
-    /// Connector type backing this table, if any.
     connector: Option<String>,
-    /// Cache mode for this table.
     #[cfg_attr(not(test), allow(dead_code))]
     cache_mode: TableCacheMode,
 }
 
-/// Primary-key-based reference table store.
-///
-/// Manages dimension/reference tables with upsert/delete/lookup semantics.
-/// Each table has a designated primary key column used to key individual rows.
 pub(crate) struct TableStore {
     tables: HashMap<String, TableState>,
 }
 
 impl TableStore {
-    /// Create an empty table store.
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
@@ -56,8 +34,6 @@ impl TableStore {
     }
 
     /// Register a new table with the given schema and primary key column.
-    ///
-    /// Uses the default `Full` cache mode.
     ///
     /// # Errors
     ///
@@ -110,17 +86,14 @@ impl TableStore {
         Ok(())
     }
 
-    /// Remove a table. Returns `true` if it existed.
     pub fn drop_table(&mut self, name: &str) -> bool {
         self.tables.remove(name).is_some()
     }
 
-    /// Check if a table exists.
     pub fn has_table(&self, name: &str) -> bool {
         self.tables.contains_key(name)
     }
 
-    /// List all table names.
     pub fn table_names(&self) -> Vec<String> {
         self.tables.keys().cloned().collect()
     }
@@ -158,20 +131,13 @@ impl TableStore {
         self.tables.get(name).and_then(|t| t.connector.as_deref())
     }
 
-    /// Whether a table uses persistent storage.
     pub fn is_persistent(&self, name: &str) -> bool {
         self.tables
             .get(name)
             .is_some_and(|t| t.backend.is_persistent())
     }
 
-    /// Upsert rows from a `RecordBatch` into a table.
-    ///
-    /// Extracts the primary key column, slices the batch into per-row batches,
-    /// and inserts/overwrites each row by its PK value.
-    /// Invalidates affected LRU cache entries on update.
-    ///
-    /// Returns the number of rows upserted.
+    /// Upsert rows from a `RecordBatch`, keyed by the primary key column.
     ///
     /// # Errors
     ///
@@ -220,9 +186,7 @@ impl TableStore {
         state.backend.get(key).ok().flatten()
     }
 
-    /// Upsert a batch in a single lock scope.
-    ///
-    /// Returns the upserted row count.
+    /// Upsert a batch; returns the row count.
     ///
     /// # Errors
     ///
@@ -235,33 +199,25 @@ impl TableStore {
         self.upsert(name, batch)
     }
 
-    /// Rebuild the cache/indices (no-op since removing hand-rolled caches).
+    // No-op since removing hand-rolled caches.
     #[allow(clippy::unused_self)]
     pub fn rebuild_xor_filter(&mut self, _name: &str) {}
 
-    /// Get the cache mode for a table.
     #[cfg(test)]
     pub fn cache_mode(&self, name: &str) -> Option<&TableCacheMode> {
         self.tables.get(name).map(|t| &t.cache_mode)
     }
 
-    /// Concatenate all rows into a single `RecordBatch`.
-    ///
-    /// Returns `None` if the table does not exist. Returns an empty batch
-    /// (with correct schema) if the table has no rows.
     pub fn to_record_batch(&self, name: &str) -> Option<RecordBatch> {
         let state = self.tables.get(name)?;
         state.backend.to_record_batch(&state.schema).ok().flatten()
     }
 }
 
-/// Extract the string representation of a primary key value at a given row.
 fn extract_pk_string(col: &dyn Array, row: usize) -> String {
-    // Try StringArray first (most common for PKs)
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         return arr.value(row).to_string();
     }
-    // Fall back to generic display via arrow's array formatting
     if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int32Array>() {
         return arr.value(row).to_string();
     }
@@ -271,7 +227,6 @@ fn extract_pk_string(col: &dyn Array, row: usize) -> String {
     if let Some(arr) = col.as_any().downcast_ref::<arrow::array::UInt64Array>() {
         return arr.value(row).to_string();
     }
-    // Generic fallback using array_value_to_string
     arrow::util::display::array_value_to_string(col, row).unwrap_or_default()
 }
 

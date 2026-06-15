@@ -1,4 +1,4 @@
-//! Operator graph for streaming SQL execution.
+//! Operator graph: wires streaming SQL operators into a DAG and drives them in topological order.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,9 +26,7 @@ use laminar_sql::translator::{
 
 #[async_trait]
 pub(crate) trait GraphOperator: Send {
-    /// `watermarks[i]` is the watermark for `inputs[i]`, derived from
-    /// the upstream node's output watermark. Multi-input operators use
-    /// per-input watermarks for independent eviction.
+    /// `watermarks[i]` is the upstream output watermark for `inputs[i]`.
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -42,27 +40,21 @@ pub(crate) trait GraphOperator: Send {
         0
     }
 
-    /// Optional ceiling on this operator's output watermark. The graph holds the
-    /// output watermark at `min(input_wm, hold)` so rows the operator has not yet
-    /// emitted (e.g. async AI enrichment still in flight) are not treated as late
-    /// by a downstream window. `None` = no hold. Default: no hold.
+    /// Output watermark ceiling. Holds the watermark at `min(input_wm, hold)` so
+    /// in-flight rows (e.g. async AI enrichment) aren't treated as late downstream.
+    /// `None` = no hold.
     fn watermark_hold(&self) -> Option<i64> {
         None
     }
 
-    /// Whether the operator can accept new input this cycle. When `false`, the
-    /// graph leaves this node's input buffered — so the source backpressures via
-    /// the existing input-buffer gate — and still steps the operator with empty
-    /// input so it can drain and emit. Default: always accept.
+    /// Whether the operator can accept new input this cycle. When `false`, input
+    /// stays buffered and the operator is still stepped with empty input to drain.
     fn wants_input(&self) -> bool {
         true
     }
 
-    /// Fold a peer-shipped shuffle batch into operator state outside the normal
-    /// `process` path. Checkpoint barrier alignment calls this for rows that
-    /// arrived between cycles so they enter the snapshot. Default: no-op (for
-    /// operators that don't consume the cross-node shuffle). `watermark` is the
-    /// checkpoint watermark.
+    /// Fold a peer-shipped shuffle batch into state outside the normal `process`
+    /// path so barrier-aligned rows enter the snapshot.
     #[cfg(feature = "cluster")]
     async fn ingest_shuffle(
         &mut self,
@@ -73,28 +65,52 @@ pub(crate) trait GraphOperator: Send {
         Ok(())
     }
 
-    /// Serialize this operator's state partitioned by vnode, for cross-node
-    /// rehydration. Returns `Some(map)` from operators that key their state by
-    /// a value the cluster shuffle routes (the aggregation fast-path); `None`
-    /// (default) for operators that aren't vnode-partitionable — those recover
-    /// from the whole-node manifest blob instead. The per-vnode bytes are the
-    /// same encoding the operator's own restore/apply path consumes.
+    /// Per-vnode state snapshot for cross-node rehydration. `None` for operators
+    /// that don't key state by vnode (they recover from the whole-node manifest).
+    /// A cold-tier vnode stages [`StagedSlice::Cold`] rather than bytes so it
+    /// isn't treated as emptied by recovery.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     fn checkpoint_by_vnode(
         &mut self,
         _vnode_count: u32,
-    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
         Ok(None)
     }
 
-    /// Merge one vnode's rehydrated state slice (produced by
-    /// [`checkpoint_by_vnode`](Self::checkpoint_by_vnode) on whichever node
-    /// last owned the vnode) into this operator. Default no-op for operators
-    /// that don't partition by vnode.
+    /// Drop one vnode's in-memory state after the cold-tier write is confirmed.
+    /// Returns `false` if the vnode was modified since the last capture.
+    #[cfg(feature = "state-tier")]
+    fn demote_vnode(&mut self, _vnode: u32, _vnode_count: u32) -> bool {
+        false
+    }
+
+    /// Whether [`demote_vnode`](Self::demote_vnode) would succeed right now.
+    /// Checked before any tier I/O so dirty vnodes are skipped cheaply.
+    #[cfg(feature = "state-tier")]
+    fn can_demote(&self, _vnode: u32, _vnode_count: u32) -> bool {
+        false
+    }
+
+    /// Merge one vnode's rehydrated state slice into this operator.
     #[cfg(feature = "cluster")]
     fn apply_vnode_state(&mut self, _vnode: u32, _bytes: &[u8]) -> Result<(), DbError> {
         Ok(())
+    }
+
+    /// Wire the cold-tier channel for vnode promotion. Only vnode-sharded
+    /// aggregates use it; others ignore it.
+    #[cfg(feature = "state-tier")]
+    fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
+
+    /// Vnodes this operator had demoted at the restored checkpoint; must be
+    /// replayed from durable partials since the cold tier is wiped on restart.
+    #[cfg(feature = "state-tier")]
+    fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -110,12 +126,7 @@ enum GateDecision {
 
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
-/// `operators` uses std `HashMap` so rkyv's stock `Archive`/`Serialize`/
-/// `Deserialize` impls apply (it supports `HashMap<K, V>` natively but
-/// not `HashMap<K, V, FxHasher>`). Cold path — written once per
-/// checkpoint interval, not on the hot query path. The `clippy::disallowed_types`
-/// allow is scoped to the single file-level type alias below rather
-/// than `#![allow]`-ing the whole module.
+// std HashMap: rkyv supports HashMap<K,V> natively but not FxHashMap; cold checkpoint path only.
 #[allow(clippy::disallowed_types)]
 pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
 
@@ -251,21 +262,16 @@ pub(crate) struct OperatorGraph {
     topo_dirty: bool,
     source_map: FxHashMap<Arc<str>, usize>,
     source_list: Vec<(Arc<str>, usize)>,
-    /// Cached set of source node IDs for O(1) lookup in `execute_single_operator`.
     source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
     input_buf_bytes: Vec<Vec<usize>>,
-    /// Per-node, per-input-port upstream node id. `input_sources[node][port] = upstream_node`.
     input_sources: Vec<Vec<usize>>,
-    /// Per-node output watermark, set during `execute_cycle`.
     output_watermarks: Vec<i64>,
     max_input_buf_batches: usize,
     max_input_buf_bytes: Option<usize>,
     backpressure_policy: BackpressurePolicy,
     query_budget_ns: u64,
-    /// Round-robin offset for deferred operator selection. Ensures fair
-    /// scheduling when budget is continuously exceeded (not checkpointed).
     deferred_scan_offset: usize,
     stats_tick: u64,
     max_state_bytes: Option<usize>,
@@ -276,36 +282,29 @@ pub(crate) struct OperatorGraph {
     temporal_configs: Vec<TemporalJoinTranslatorConfig>,
     depends_on_stream: FxHashSet<usize>,
     order_configs: FxHashMap<usize, OrderOperatorConfig>,
-    /// Per-table `LiveSourceHandle` for batch swapping without catalog churn.
-    /// Covers both source tables (from `register_source_schema`) and
-    /// intermediate tables (created lazily on first operator output).
+    // Covers source tables and intermediates (lazily created on first operator output).
     live_handles: FxHashMap<String, LiveSourceHandle>,
-    /// Assembled AI subsystem (registry + providers + cache + call log).
-    /// `None` unless `[ai]`/`[models]` are configured.
+    // None unless [ai]/[models] are configured.
     ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
-    /// Main (multi-threaded) runtime handle for spawning Ring-1 workers (AI
-    /// inference, lookup-enrich fetch) off the compute thread.
+    // Must be the main multi-threaded runtime; Ring-1 workers (AI, lookup-enrich) spawn here.
     main_runtime_handle: Option<tokio::runtime::Handle>,
-    /// Partial (on-demand) lookup tables → their column names. Drives routing of
-    /// lookup-enrich joins to the async operator and output-column disambiguation.
+    // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
-    /// Plan-time AI routing errors collected during `add_query` (which returns
-    /// `()`); surfaced by [`take_build_errors`](Self::take_build_errors) at start.
+    // Plan-time errors from add_query (returns ()); surfaced by take_build_errors at start.
     build_errors: Vec<DbError>,
-    /// Cluster-mode row-shuffle config for streaming aggregates.
-    /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
-    /// pre-aggregate rows can be hash-routed to vnode owners.
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
-    /// Shared handle to the DB's staged per-vnode rehydration map. Drained at
-    /// the start of each cycle by [`apply_rehydrated_vnodes`](Self::apply_rehydrated_vnodes):
-    /// vnodes this node newly acquired in a rebalance have their committed
-    /// state merged into the matching operators before they process new rows.
-    /// `None` outside cluster mode.
+    // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
+    #[cfg(feature = "cluster")]
+    vnode_count: Option<u32>,
+    // Staged per-vnode rehydration map; drained at the top of each cycle.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     rehydrated_vnode_state:
         Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
+    // Stored so DDL-added operators also receive the tier channel.
+    #[cfg(feature = "state-tier")]
+    state_tier: Option<crate::state_tier::TierTx>,
 }
 
 impl OperatorGraph {
@@ -333,7 +332,11 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
+            vnode_count: None,
+            #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
+            #[cfg(feature = "state-tier")]
+            state_tier: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -349,9 +352,7 @@ impl OperatorGraph {
         }
     }
 
-    /// Install the assembled AI subsystem and the main runtime handle its
-    /// inference workers spawn on. The handle MUST be the main multi-threaded
-    /// runtime, never the compute runtime.
+    /// Install the AI subsystem and main runtime handle for inference workers.
     pub fn set_ai_runtime(
         &mut self,
         runtime: Arc<crate::ai::AiRuntime>,
@@ -361,26 +362,21 @@ impl OperatorGraph {
         self.main_runtime_handle = Some(handle);
     }
 
-    /// Install the main runtime handle Ring-1 workers spawn on (independent of
-    /// AI; the lookup-enrich operator needs it too). MUST be the main
-    /// multi-threaded runtime, never the compute runtime.
+    /// Install the main runtime handle for Ring-1 workers (lookup-enrich, AI).
     pub fn set_runtime_handle(&mut self, handle: tokio::runtime::Handle) {
         self.main_runtime_handle = Some(handle);
     }
 
-    /// Register partial (on-demand) lookup tables and their column names so
-    /// `add_query` can route lookup-enrich joins to the async operator.
+    /// Register on-demand lookup tables so `add_query` can route lookup-enrich joins.
     pub fn set_partial_lookup_tables(&mut self, tables: FxHashMap<String, Vec<String>>) {
         self.partial_lookup_tables = tables;
     }
 
-    /// Take the first plan-time AI routing error collected during query
-    /// construction, if any.
+    /// Return the first plan-time build error, if any.
     ///
     /// # Errors
     ///
-    /// Returns the first recorded [`DbError`] (e.g. unknown model, unsupported
-    /// task, malformed AI query).
+    /// Returns the first recorded [`DbError`] (unknown model, unsupported task, etc.).
     pub fn take_build_errors(&mut self) -> Result<(), DbError> {
         match self.build_errors.drain(..).next() {
             Some(e) => Err(e),
@@ -452,6 +448,13 @@ impl OperatorGraph {
         })
     }
 
+    /// Estimated state bytes per operator; cheap (operators maintain a counter).
+    pub(crate) fn state_bytes_per_operator(&self) -> impl Iterator<Item = (&Arc<str>, usize)> {
+        self.nodes
+            .iter()
+            .map(|n| (&n.name, n.operator.estimated_state_bytes()))
+    }
+
     pub fn set_lookup_registry(
         &mut self,
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
@@ -459,18 +462,39 @@ impl OperatorGraph {
         self.lookup_registry = Some(registry);
     }
 
-    /// Install the row-shuffle config used by streaming aggregates in
-    /// cluster mode.
+    /// Install the cluster shuffle config for streaming aggregates.
     #[cfg(feature = "cluster")]
     pub fn set_cluster_shuffle(
         &mut self,
         config: crate::operator::sql_query::ClusterShuffleConfig,
     ) {
+        self.vnode_count = Some(config.registry.vnode_count());
         self.cluster_shuffle = Some(config);
     }
 
-    /// The installed cluster row-shuffle config, if any; lets the pipeline
-    /// callback reuse the shuffle sender to ship subscription output.
+    /// Set the vnode count for the single-node tier path (no shuffle config).
+    /// Must stay stable across restarts; demoted partials are keyed by vnode.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
+        self.vnode_count = Some(vnode_count);
+    }
+
+    /// Vnode count for per-vnode capture/demotion, if set.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn vnode_count(&self) -> Option<u32> {
+        self.vnode_count
+    }
+
+    /// Wire the cold-tier channel to all current operators (and future DDL-added ones).
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn set_state_tier(&mut self, tier: crate::state_tier::TierTx) {
+        for node in &mut self.nodes {
+            node.operator.attach_state_tier(tier.clone());
+        }
+        self.state_tier = Some(tier);
+    }
+
+    /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
     #[cfg(feature = "cluster")]
     pub(crate) fn cluster_shuffle_config(
         &self,
@@ -478,8 +502,7 @@ impl OperatorGraph {
         self.cluster_shuffle.as_ref()
     }
 
-    /// Share the DB's staged per-vnode rehydration map so the graph can drain
-    /// and apply rebalanced state into operators each cycle.
+    /// Share the staged per-vnode rehydration map; drained at the top of each cycle.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     pub fn set_rehydration_handle(
@@ -489,16 +512,6 @@ impl OperatorGraph {
         self.rehydrated_vnode_state = Some(staged);
     }
 
-    /// Drain the staged rehydration map for vnodes this node currently owns and
-    /// merge each operator's committed slice into the matching live operator,
-    /// then flip those vnodes `Restoring → Active`.
-    ///
-    /// Runs at the start of every [`execute_cycle`](Self::execute_cycle) so a
-    /// newly-acquired vnode's state is in place before the operators process
-    /// the cycle's rows. Best-effort: a slice that fails to decode or apply is
-    /// logged and skipped, and the vnode still flips to `Active` (it serves
-    /// from whatever state did apply, exactly like a vnode with no durable
-    /// state). Cheap no-op when nothing is staged.
     #[cfg(feature = "cluster")]
     fn apply_rehydrated_vnodes(&mut self) {
         // Clone owned handles out so no borrow of `self` survives into the
@@ -513,8 +526,7 @@ impl OperatorGraph {
             _ => return,
         };
 
-        // Drain only the staged vnodes we currently own (ownership may have
-        // changed again since the snapshot was staged).
+        // Ownership may have changed again since staging; only drain what we own now.
         let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
             let mut guard = staged_arc.lock();
             if guard.is_empty() {
@@ -570,7 +582,6 @@ impl OperatorGraph {
                     "rehydrated partial decode failed — vnode resumes from current state"
                 ),
             }
-            // The vnode is now serving regardless of apply outcome.
             registry.mark_active(&[vnode]);
         }
     }
@@ -694,10 +705,7 @@ impl OperatorGraph {
         let handle = provider.handle();
         let _ = self.ctx.deregister_table(name);
         if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
-            // This is a programming error — the table was just deregistered,
-            // so registration should always succeed. Panic-worthy in debug,
-            // but in release just log an error. The handle won't be stored,
-            // so subsequent swap() calls will be no-ops for this table.
+            // Table was just deregistered, so re-registration should always succeed.
             tracing::error!(
                 table = %name,
                 error = %e,
@@ -733,7 +741,7 @@ impl OperatorGraph {
         });
         self.input_bufs.push(vec![Vec::new()]);
         self.input_buf_bytes.push(vec![0]);
-        self.input_sources.push(vec![usize::MAX]); // source nodes: no upstream
+        self.input_sources.push(vec![usize::MAX]); // no upstream
         self.output_watermarks.push(i64::MIN);
         self.source_map.insert(name, node_id);
         self.source_node_ids.insert(node_id);
@@ -803,7 +811,7 @@ impl OperatorGraph {
         }
     }
 
-    /// Returns `true` if the query depends on another query (not just raw sources).
+    // Returns true when the node depends on another query output (not just raw sources).
     #[allow(clippy::too_many_arguments)]
     fn wire_query_edges(
         &mut self,
@@ -908,10 +916,6 @@ impl OperatorGraph {
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
 
-        // AI routing: a query with one `ai_*(...)` call becomes an
-        // AiInferenceOperator over its source table, applying the residual
-        // projection. Resolution/validation errors are recorded and surfaced
-        // at start (this fn returns `()`).
         let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
         if ai_calls.len() > 1 {
             self.build_errors.push(DbError::InvalidOperation(
@@ -935,20 +939,13 @@ impl OperatorGraph {
             return;
         }
 
-        // Window-frame routing: a single-source query with a `… OVER (ORDER BY k
-        // ROWS N PRECEDING)` frame (e.g. CORR) becomes a WindowFrameOperator that
-        // retains bounded history and delegates the frame computation to
-        // DataFusion. Detected off the SQL like the AI/join paths.
         if let Some(plan) = crate::sql_analysis::plan_frame_query(&sql) {
             self.build_frame_operator_node(&name, &plan);
             return;
         }
 
-        // The planner's vec lets us short-circuit re-parsing for queries
-        // that have no specialized join step (or no joins at all).
-        // TemporalProbe is parsed off the token stream rather than the
-        // sqlparser AST, so it is never present in `join_config` and
-        // always needs its own detector pass.
+        // TemporalProbe is parsed off the token stream (not the sqlparser AST), so it
+        // never appears in join_config and always needs its own detector pass.
         let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
             jcs.iter().any(|c| {
                 matches!(
@@ -976,9 +973,7 @@ impl OperatorGraph {
             };
         let stream_join_detection =
             if temporal_probe_config.is_none() && needs_specialized_detection {
-                // Interval join (time-bounded) first; else a plain equi-join as a
-                // processing-time join. `create_operator` distinguishes them by
-                // whether the config has time columns.
+                // Interval join first; falls back to processing-time equi-join.
                 detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
             } else {
                 None
@@ -988,9 +983,7 @@ impl OperatorGraph {
             .as_ref()
             .map(|d| d.projection_sql.clone());
 
-        // Lookup-enrich: a partial/on-demand lookup join, hoisted to the
-        // async-decoupled operator. Only when no other specialized join matched
-        // and at least one partial lookup table is registered.
+        // Lookup-enrich: only when no other specialized join matched.
         let (lookup_enrich_config, lookup_projection_sql) = if temporal_probe_config.is_none()
             && asof_config.is_none()
             && temporal_config.is_none()
@@ -1012,7 +1005,6 @@ impl OperatorGraph {
             .or(stream_join_projection_sql)
             .or(lookup_projection_sql);
 
-        // Warn for undetected JOIN+BETWEEN
         if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
             let sql_upper = sql.to_uppercase();
             if sql_upper.contains("JOIN") && sql_upper.contains("BETWEEN") {
@@ -1026,18 +1018,15 @@ impl OperatorGraph {
         }
 
         let mut table_refs = extract_table_references(&sql);
-        // The lookup-enrich operator reads its lookup table from the registry,
-        // not as a graph input — drop it so only the stream side is wired.
+        // Lookup-enrich reads its table from the registry, not as a graph input.
         if let Some(cfg) = &lookup_enrich_config {
             table_refs.remove(&cfg.table_name);
         }
 
-        // Store temporal join config
         if let Some(ref tc) = temporal_config {
             self.temporal_configs.push(tc.clone());
         }
 
-        // Create operator based on detection
         let operator: Box<dyn GraphOperator> = self.create_operator(
             &name,
             &sql,
@@ -1052,7 +1041,6 @@ impl OperatorGraph {
             idle_ttl_ms,
         );
 
-        // Determine input port count
         let input_port_count = if asof_config.is_some()
             || stream_join_config.is_some()
             || temporal_probe_config.is_some()
@@ -1062,13 +1050,6 @@ impl OperatorGraph {
             1
         };
 
-        // Install the operator: replace a SourcePassthrough placeholder for this
-        // name in place if a query referenced it before it was registered (so
-        // downstream edges stay valid), else append a fresh node — see
-        // `place_operator_node`. Source nodes are ensured first so their indices
-        // are stable when wiring edges. The placeholder and fresh paths wire
-        // identically, including `temporal_config`, so an out-of-order temporal
-        // join is wired the same as one registered in order.
         self.ensure_query_source_nodes(
             temporal_probe_config.as_ref(),
             asof_config.as_ref(),
@@ -1096,13 +1077,8 @@ impl OperatorGraph {
         self.topo_dirty = true;
     }
 
-    /// Install an operator for `name`, returning its node id. If a
-    /// `SourcePassthrough` placeholder exists for the name (a downstream query
-    /// referenced it before it was created), replace it in place so the
-    /// placeholder's node id and outbound edges stay valid and downstream nodes
-    /// receive this operator's output; otherwise append a fresh node. Callers
-    /// must still ensure source nodes and wire edges around this. The caller
-    /// owns ordering: ensure source nodes before, wire after.
+    // Replace a SourcePassthrough placeholder in place (preserving its id and outbound edges),
+    // or append a fresh node. Callers must ensure source nodes before and wire edges after.
     fn place_operator_node(
         &mut self,
         name: &str,
@@ -1116,10 +1092,8 @@ impl OperatorGraph {
             self.input_buf_bytes[id] = vec![0; input_port_count];
             self.input_sources[id] = vec![usize::MAX; input_port_count];
             self.source_map.remove(name);
-            // No longer a source: let its output watermark advance per run.
             self.source_node_ids.remove(&id);
-            // Downstream nodes already wired to the placeholder now depend on a
-            // real (possibly stream-fed) query.
+            // Downstream nodes already wired to the placeholder now depend on this query.
             for &(target, _) in &self.nodes[id].output_routes {
                 self.depends_on_stream.insert(target);
             }
@@ -1141,8 +1115,6 @@ impl OperatorGraph {
         }
     }
 
-    /// Build an [`AiInferenceOperator`](crate::operator::ai_inference) for a
-    /// planned AI query and wire it as a single-input node over the source table.
     fn build_ai_operator_node(
         &mut self,
         name: &str,
@@ -1155,8 +1127,6 @@ impl OperatorGraph {
         })?;
         let ctx = self.ctx.clone();
 
-        // All runtime-dependent work happens here; the immutable `ai_runtime`
-        // borrow ends before the `&mut self` node creation below.
         let (operator, table_refs): (Box<dyn GraphOperator>, FxHashSet<String>) = {
             let runtime = self.ai_runtime.as_ref().ok_or_else(|| {
                 DbError::InvalidOperation(
@@ -1165,7 +1135,6 @@ impl OperatorGraph {
                 )
             })?;
 
-            // Plan-time validation (task support + labels seam).
             crate::sql_analysis::validate_ai_calls(
                 runtime.registry(),
                 std::slice::from_ref(&plan.call),
@@ -1218,9 +1187,6 @@ impl OperatorGraph {
             (operator, table_refs)
         };
 
-        // Wire as a single-input node reading the source table (no joins),
-        // replacing a placeholder in place if a downstream query referenced this
-        // name before it was created.
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
         let node_id = self.place_operator_node(name, operator, 1);
         let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
@@ -1232,8 +1198,6 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Build a [`WindowFrameOperator`](crate::operator::window_frame) for a
-    /// planned frame query and wire it as a single-input node over the source.
     fn build_frame_operator_node(
         &mut self,
         name: &str,
@@ -1281,8 +1245,7 @@ impl OperatorGraph {
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
 
-        // On-demand lookup-enrich join → async-decoupled operator. Falls through
-        // to the DataFusion lookup path if the registry/runtime handle is absent.
+        // Falls through to the DataFusion lookup path if the registry/handle is absent.
         if let Some(cfg) = lookup_enrich_config {
             if let (Some(reg), Some(handle)) = (&self.lookup_registry, &self.main_runtime_handle) {
                 #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
@@ -1295,8 +1258,7 @@ impl OperatorGraph {
                     handle.clone(),
                     self.prom.clone(),
                 );
-                // In cluster mode, key-shard the probe side across nodes for
-                // cache affinity (same shuffle config the aggregate path uses).
+                // Key-shard the probe side for cache affinity.
                 #[cfg(feature = "cluster")]
                 if let Some(ref sc) = self.cluster_shuffle {
                     op.attach_cluster_shuffle(sc.clone());
@@ -1336,8 +1298,7 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = stream_join_config {
-            // No time columns ⇒ plain equi-join → per-cycle batch join; with
-            // time columns ⇒ interval join.
+            // No time columns → per-cycle batch join; with time columns → interval join.
             if cfg.left_time_column.is_empty() && cfg.right_time_column.is_empty() {
                 #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
                 let mut op = operator::process_time_join::ProcessTimeJoinOperator::new(
@@ -1366,10 +1327,8 @@ impl OperatorGraph {
             return Box::new(op);
         }
 
-        // Non-windowed `now()` is only valid as the recognised retracting
-        // temporal-filter shape under EMIT CHANGES; anything else gets a
-        // typed LDB-1001 rejection rather than a silently frozen plan-time
-        // `now()`. Windowed queries keep the existing path.
+        // Non-windowed now() is only valid as a retracting temporal filter under EMIT CHANGES;
+        // anything else gets a typed LDB-1001 rejection.
         if window_config.is_none() {
             use crate::sql_analysis::TemporalFilterAnalysis as Tfa;
             match crate::sql_analysis::analyze_temporal_filter(sql) {
@@ -1419,7 +1378,10 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "cluster", feature = "state-tier")),
+            allow(unused_mut)
+        )]
         let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
@@ -1432,6 +1394,14 @@ impl OperatorGraph {
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
         }
+        #[cfg(feature = "state-tier")]
+        if let Some(tier) = self.state_tier.clone() {
+            op.attach_state_tier(tier);
+            // Single-node path has no shuffle config to read the count from.
+            if let Some(vnode_count) = self.vnode_count {
+                op.set_vnode_count(vnode_count);
+            }
+        }
         Box::new(op)
     }
 
@@ -1440,7 +1410,6 @@ impl OperatorGraph {
             return;
         };
 
-        // Collect IDs of this node + any child prefilter nodes (name prefix match).
         let prefix = format!("{name}::");
         let ids_to_remove: smallvec::SmallVec<[usize; 3]> = std::iter::once(node_id)
             .chain(
@@ -1467,7 +1436,6 @@ impl OperatorGraph {
             self.edges.retain(|e| e.source != id && e.target != id);
         }
 
-        // Clean dangling output routes pointing to any removed node
         for node in &mut self.nodes {
             node.output_routes
                 .retain(|&(t, _)| !ids_to_remove.contains(&t));
@@ -1478,7 +1446,6 @@ impl OperatorGraph {
     }
 
     fn compute_topo_order(&mut self) {
-        // Kahn's algorithm
         let n = self.nodes.len();
         let mut in_degree = vec![0usize; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1490,13 +1457,11 @@ impl OperatorGraph {
             }
         }
 
-        // Deduplicate dependents
         for deps in &mut dependents {
             deps.sort_unstable();
             deps.dedup();
         }
 
-        // Recalculate in_degree from deduped
         in_degree.fill(0);
         for deps in &dependents {
             for &dep in deps {
@@ -1522,7 +1487,7 @@ impl OperatorGraph {
             }
         }
 
-        // Fallback: if cycle detected, append missing non-removed nodes
+        // Cycle detected: fall back to insertion order for remaining nodes.
         let active_count = self.nodes.iter().filter(|n| !n.removed).count();
         if self.topo_order.len() < active_count {
             tracing::warn!(
@@ -1551,8 +1516,7 @@ impl OperatorGraph {
             if batches.is_empty() {
                 continue;
             }
-            // Lazily create the provider if register_source_schema wasn't called
-            // (e.g., tests that skip the lifecycle).
+            // Lazily create the provider if register_source_schema wasn't called (e.g. tests).
             if !self.live_handles.contains_key(name.as_ref()) {
                 let schema = batches[0].schema();
                 self.ensure_live_provider(name, &schema);
@@ -1576,9 +1540,6 @@ impl OperatorGraph {
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
-        // If the operator is backpressured (wants_input == false), leave its
-        // input buffered so the upstream gate throttles the source, and step it
-        // with empty input so it can still drain and emit.
         let accept = self.nodes[node_id].operator.wants_input();
         let (mut inputs, mut input_bytes) = if accept {
             (
@@ -1609,17 +1570,13 @@ impl OperatorGraph {
             )
             .await;
 
-        // Source nodes (input_sources = [usize::MAX]) have output_watermarks
-        // pre-seeded from per-source watermarks in execute_cycle. Don't overwrite.
+        // Source nodes have output_watermarks pre-seeded in execute_cycle; don't overwrite.
         if !self.source_node_ids.contains(&node_id) {
             let mut wm = watermarks
                 .iter()
                 .copied()
                 .min()
                 .unwrap_or(current_watermark);
-            // Hold the watermark behind any rows the operator has buffered but
-            // not yet emitted (e.g. in-flight AI enrichment), so a downstream
-            // window doesn't close past them.
             if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
                 wm = wm.min(hold);
             }
@@ -1633,10 +1590,7 @@ impl OperatorGraph {
 
         let batches = match output_result {
             Ok(b) => {
-                // When backpressured (!accept) the input was never taken, so
-                // leave the buffer intact. Otherwise reuse the outer Vecs and
-                // their capacities; the operator borrowed inputs, so the
-                // RecordBatches are still in place. clear() preserves capacity.
+                // Reuse the Vecs (clear preserves capacity); when !accept, leave buffers intact.
                 if accept {
                     for v in &mut inputs {
                         v.clear();
@@ -1649,7 +1603,7 @@ impl OperatorGraph {
             }
             Err(e) => {
                 if accept && self.depends_on_stream.contains(&node_id) {
-                    // Put batches back so they're retried next cycle.
+                    // Upstream not ready; preserve input for retry next cycle.
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
                     tracing::debug!(
@@ -1705,7 +1659,6 @@ impl OperatorGraph {
             let has_routes = !self.nodes[node_id].output_routes.is_empty();
             let is_output = self.output_map.values().any(|&id| id == node_id);
 
-            // Register intermediate for downstream SQL queries (catalog lookup).
             if has_routes {
                 let name_ref = node_name.as_ref();
                 if !self.live_handles.contains_key(name_ref) {
@@ -1717,7 +1670,6 @@ impl OperatorGraph {
                 }
             }
 
-            // Collect output for the caller.
             if is_output {
                 results.insert(node_name, batches.clone());
             }
@@ -1728,10 +1680,7 @@ impl OperatorGraph {
                 let (target, port) = self.nodes[node_id].output_routes[0];
                 self.push_to_port(target, port, batches, bytes);
             } else if route_count > 1 {
-                // Clone batches N-1 times (one for each non-final route);
-                // the final route takes ownership of the original. Reading
-                // routes via an indexed loop avoids cloning output_routes
-                // just to iterate it.
+                // Clone batches N-1 times; the last route takes ownership.
                 for i in 0..route_count - 1 {
                     let (target, port) = self.nodes[node_id].output_routes[i];
                     self.push_to_port(target, port, batches.clone(), bytes);
@@ -1751,9 +1700,6 @@ impl OperatorGraph {
         current_watermark: i64,
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
-        // Merge any rebalanced-in vnode state into operators before they see
-        // this cycle's rows, so the snapshot a new owner resumes from is in
-        // place first.
         #[cfg(feature = "cluster")]
         self.apply_rehydrated_vnodes();
 
@@ -1803,7 +1749,6 @@ impl OperatorGraph {
                 }
             }
 
-            // Budget check
             if i > 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
@@ -1814,9 +1759,7 @@ impl OperatorGraph {
                         "per-query budget exceeded — deferring remaining operators"
                     );
 
-                    // Forward progress: run one deferred operator to prevent
-                    // tail-operator starvation. Round-robin ensures fair
-                    // scheduling under continuous input.
+                    // Run one deferred operator (round-robin) to prevent tail starvation.
                     let deferred_count = topo_len - i;
                     let start = self.deferred_scan_offset % deferred_count;
                     for offset in 0..deferred_count {
@@ -1850,7 +1793,7 @@ impl OperatorGraph {
                             return Err(e);
                         }
                         self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
-                        break; // Only one per cycle
+                        break;
                     }
 
                     break;
@@ -1889,8 +1832,7 @@ impl OperatorGraph {
         Ok(results)
     }
 
-    /// Route one peer-shipped shuffle batch to the operator named `stage`.
-    /// Unknown stage (no such live operator) is dropped.
+    // Unknown stage (no live operator for it) is silently dropped.
     #[cfg(feature = "cluster")]
     async fn ingest_to_stage(
         &mut self,
@@ -1911,21 +1853,14 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Chandy–Lamport alignment of the cross-node shuffle, run just before
-    /// `snapshot_state` so the snapshot captures every pre-checkpoint row a peer
-    /// shipped. Fans out `Barrier(checkpoint_id)` to peers, then drains the
-    /// receiver — folding each `VnodeData` into its operator via `ingest_shuffle`
-    /// — until every peer's barrier is observed. No-op without a cross-node
-    /// shuffle. See `docs/plans/cross-node-shuffle-barrier-alignment.md`.
+    /// Chandy–Lamport shuffle alignment: fan out a barrier to peers, drain rows,
+    /// and wait until every peer's barrier is observed before snapshotting.
     ///
-    /// Relies on **full-membership commit** (`wait_for_quorum` requires every
-    /// live follower): no peer resumes the next epoch until all have aligned, so
-    /// no next-epoch frame can arrive mid-alignment. A move to majority quorum
-    /// would reintroduce that case and need per-peer post-barrier buffering.
+    /// Requires full-membership commit — no peer resumes the next epoch until all
+    /// have aligned, so no next-epoch frame can arrive mid-alignment.
     ///
     /// # Errors
-    /// Fails the checkpoint (caller retries) on timeout or a closed receiver —
-    /// the deliberate degradation under a straggling peer.
+    /// Fails the checkpoint on timeout or closed receiver so the caller can retry.
     #[cfg(feature = "cluster")]
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn align_shuffle_barriers(
@@ -1944,11 +1879,8 @@ impl OperatorGraph {
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
         };
-        // Fan-out set: nodes we ship rows to (other vnode owners). Wait set:
-        // nodes that ship to us — the live producers, but only if we own a vnode
-        // (a node owning none, e.g. drained, receives nothing yet still ships, so
-        // the two sets differ under skewed assignment). Producers = live
-        // membership, not the owners.
+        // Fan-out = nodes we ship to. Wait set = live producers that ship to us
+        // (only if we own a vnode; a drained node still ships but receives nothing).
         let output_peers: Vec<u64> = laminar_core::state::peer_owners(&cfg.registry, cfg.self_id)
             .iter()
             .map(|n| n.0)
@@ -1963,11 +1895,10 @@ impl OperatorGraph {
                     .collect()
             };
         if output_peers.is_empty() && input_peers.is_empty() {
-            return Ok(()); // not part of any cross-node shuffle
+            return Ok(());
         }
 
-        // Rows already pulled into the receiver's per-stage holdover are
-        // pre-barrier (the per-cycle drain carries no barriers).
+        // Pre-staged rows arrived before the barrier; fold them in first.
         for (stage, batch) in cfg.receiver.drain_all_staged() {
             self.ingest_to_stage(&stage, batch, watermark).await?;
         }
@@ -1980,7 +1911,7 @@ impl OperatorGraph {
                 .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
         }
         if input_peers.is_empty() {
-            return Ok(()); // we receive from no peer — nothing to align on
+            return Ok(());
         }
 
         tracing::info!(
@@ -1999,9 +1930,7 @@ impl OperatorGraph {
             .collect();
         tracker.observe(0, barrier); // our own input
 
-        // A peer that fanned its barrier out before we entered alignment had it
-        // stashed by the per-cycle drain (which would otherwise drop it) — observe
-        // those before blocking on the live wire.
+        // Observe any barriers that arrived before we entered alignment (stashed by the drain).
         for (from, b) in cfg.receiver.drain_staged_barriers() {
             if b.checkpoint_id == checkpoint_id {
                 if let Some(&port) = peer_port.get(&from) {
@@ -2063,16 +1992,8 @@ impl OperatorGraph {
                                     "checkpoint {checkpoint_id} was aborted by leader"
                                 )));
                             }
-                            // Observation is latest-wins, so this checkpoint's
-                            // Abort can be superseded before we ever see it. A
-                            // NEWER announcement is just as conclusive: ids are
-                            // never reused (failed epochs are abandoned), and
-                            // the leader only moves on once this checkpoint is
-                            // aligned cluster-wide or dead — either way the
-                            // peer barriers we are waiting for will never
-                            // arrive. Without this release, a rejoining node
-                            // livelocks one epoch behind the cluster, timing
-                            // out every alignment.
+                            // A newer announcement means the leader moved on; our barriers will
+                            // never arrive, and without this check a rejoining node livelocks.
                             if ann.checkpoint_id > checkpoint_id {
                                 return Err(DbError::Pipeline(format!(
                                     "checkpoint {checkpoint_id} superseded by {} — alignment abandoned",
@@ -2092,8 +2013,6 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Append a node with a given operator (test-only, for exercising
-    /// `align_shuffle_barriers` without the full query-build path).
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn push_test_node(&mut self, name: &str, operator: Box<dyn GraphOperator>) {
         self.nodes.push(GraphNode {
@@ -2110,7 +2029,6 @@ impl OperatorGraph {
         self.topo_dirty = true;
     }
 
-    // &mut self: some accumulators need &mut for state()
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
         let mut operators = OperatorStateMap::new();
         for node in &mut self.nodes {
@@ -2130,30 +2048,17 @@ impl OperatorGraph {
         }))
     }
 
-    /// Per-vnode operator-state snapshot for cross-node rehydration.
-    ///
-    /// Returns `vnode → (operator_name → vnode-slice bytes)` for every operator
-    /// that opts into per-vnode checkpointing (see
-    /// [`GraphOperator::checkpoint_by_vnode`]). Empty outside cluster mode (no
-    /// shuffle config means no vnode topology to partition by). The vnode count
-    /// is taken from the registry the cluster shuffle was wired with, so the
-    /// partition matches the routing that delivered each key here.
+    /// Per-vnode state snapshot (`vnode → operator → bytes`) for cross-node rehydration.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
     pub fn snapshot_state_by_vnode(
         &mut self,
-    ) -> Result<
-        std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
-        DbError,
-    > {
-        let vnode_count = match &self.cluster_shuffle {
-            Some(cfg) => cfg.registry.vnode_count(),
-            None => return Ok(std::collections::HashMap::new()),
+    ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, DbError> {
+        let Some(vnode_count) = self.vnode_count else {
+            return Ok(std::collections::HashMap::new());
         };
-        let mut out: std::collections::HashMap<
-            u32,
-            std::collections::HashMap<String, bytes::Bytes>,
-        > = std::collections::HashMap::new();
+        let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
+            std::collections::HashMap::new();
         for node in &mut self.nodes {
             if node.removed {
                 continue;
@@ -2167,6 +2072,74 @@ impl OperatorGraph {
             }
         }
         Ok(out)
+    }
+
+    /// Drop one vnode's state after its cold-tier write is confirmed.
+    /// Returns `false` if the operator refuses (vnode modified since last capture).
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn demote_vnode(&mut self, operator: &str, vnode: u32) -> bool {
+        let Some(vnode_count) = self.vnode_count else {
+            return false;
+        };
+        let demoted = self
+            .nodes
+            .iter_mut()
+            .find(|n| !n.removed && &*n.name == operator)
+            .is_some_and(|n| n.operator.demote_vnode(vnode, vnode_count));
+        if demoted {
+            if let Some(ref prom) = self.prom {
+                prom.state_tier_demote_total.inc();
+            }
+        }
+        demoted
+    }
+
+    /// Whether the named operator could demote `vnode` right now (no tier I/O performed).
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn can_demote(&self, operator: &str, vnode: u32) -> bool {
+        let Some(vnode_count) = self.vnode_count else {
+            return false;
+        };
+        self.nodes
+            .iter()
+            .find(|n| !n.removed && &*n.name == operator)
+            .is_some_and(|n| n.operator.can_demote(vnode, vnode_count))
+    }
+
+    /// Vnodes each operator had demoted at the last checkpoint; absent from the manifest
+    /// and must be replayed from durable partials. Returns `(operator_name, vnodes)`.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn take_tier_cold_vnodes(&mut self) -> Vec<(String, Vec<u32>)> {
+        let mut out = Vec::new();
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            let cold = node.operator.take_tier_cold_vnodes();
+            if !cold.is_empty() {
+                out.push((node.name.to_string(), cold));
+            }
+        }
+        out
+    }
+
+    /// Apply one operator's slice of a vnode partial (cold-vnode rehydration on restart).
+    /// Targets a single operator to avoid double-applying slices recovered from the manifest.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn apply_vnode_slice(
+        &mut self,
+        operator: &str,
+        vnode: u32,
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        match self
+            .nodes
+            .iter_mut()
+            .find(|n| !n.removed && &*n.name == operator)
+        {
+            Some(node) => node.operator.apply_vnode_state(vnode, bytes),
+            None => Ok(()),
+        }
     }
 
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {

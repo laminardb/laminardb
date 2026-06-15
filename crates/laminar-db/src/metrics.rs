@@ -60,6 +60,22 @@ pub struct PipelineMetrics {
     pub mv_bytes_stored: u64,
 }
 
+/// Cold-tier (demoted operator state) metrics. Embedded mode has no
+/// `/metrics` endpoint, so this is the way to observe demotion/promotion on a
+/// single node.
+#[cfg(feature = "state-tier")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TierMetrics {
+    /// Effective demotions — slices that actually left memory for the tier.
+    pub demote_total: u64,
+    /// Promotion fetches — cold slices read back into memory.
+    pub fetch_total: u64,
+    /// Logical bytes currently resident in the tier.
+    pub resident_bytes: i64,
+    /// Slices currently resident in the tier.
+    pub resident_slices: i64,
+}
+
 /// Metrics for a single registered source.
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {

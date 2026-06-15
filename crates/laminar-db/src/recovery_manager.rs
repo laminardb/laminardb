@@ -1,26 +1,5 @@
-//! Unified recovery manager.
-//!
-//! Single recovery path that loads a
-//! [`CheckpointManifest`](laminar_core::storage::checkpoint_manifest::CheckpointManifest) and restores
-//! ALL state: source offsets, sink epochs, operator states, table offsets,
-//! and watermarks.
-//!
-//! ## Recovery Protocol
-//!
-//! 1. `store.load_latest()` → `Option<CheckpointManifest>`
-//! 2. If `None` → fresh start (no recovery needed)
-//! 3. For each source: `source.restore(manifest.source_offsets[name])`
-//! 4. For each table source: `source.restore(manifest.table_offsets[name])`
-//! 5. For each exactly-once sink: `sink.rollback_epoch(manifest.epoch)`
-//! 6. Return recovered state (watermark, epoch, operator states)
-//!    — caller is responsible for restoring DAG/TPC operators from `operator_states`
-//!
-//! ## Fallback Recovery
-//!
-//! If the latest checkpoint is corrupt or fails to restore, the manager
-//! iterates through all available checkpoints in reverse chronological order
-//! until one succeeds. This prevents a single corrupt checkpoint from causing
-//! total data loss.
+//! Checkpoint recovery: loads the latest manifest and restores sources, sinks,
+//! and operator state. Falls back to older checkpoints if the latest is corrupt.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -40,7 +19,7 @@ use crate::error::DbError;
 /// Result of a successful recovery from a checkpoint.
 #[derive(Debug)]
 pub struct RecoveredState {
-    /// The manifest that was loaded and restored from.
+    /// Manifest that was restored from.
     pub manifest: CheckpointManifest,
     /// Number of sources successfully restored.
     pub sources_restored: usize,
@@ -67,13 +46,13 @@ impl RecoveredState {
         self.manifest.watermark
     }
 
-    /// Returns whether there were any errors during recovery.
+    /// Returns `true` if any source or sink failed during recovery.
     #[must_use]
     pub fn has_errors(&self) -> bool {
         !self.source_errors.is_empty() || !self.sink_errors.is_empty()
     }
 
-    /// Returns the recovered operator states (for DAG restoration).
+    /// Returns the recovered operator states.
     #[must_use]
     pub fn operator_states(
         &self,
@@ -81,7 +60,7 @@ impl RecoveredState {
         &self.manifest.operator_states
     }
 
-    /// Returns the table store checkpoint path, if any.
+    /// Table store checkpoint path, if recorded in the manifest.
     #[must_use]
     pub fn table_store_checkpoint_path(&self) -> Option<&str> {
         self.manifest.table_store_checkpoint_path.as_deref()
@@ -90,56 +69,44 @@ impl RecoveredState {
 
 /// Outcome of rehydrating a set of vnodes from durable state.
 ///
-/// Best-effort by construction: a per-vnode read failure is recorded in
-/// [`errors`](Self::errors) rather than aborting the others, so a single
-/// transient object-store hiccup can't strand an entire rebalance.
+/// Per-vnode read failures land in `errors` rather than aborting the rest, so
+/// a transient object-store hiccup can't strand an entire rebalance.
 #[derive(Debug, Default)]
 pub struct VnodeRehydration {
-    /// Committed epoch the partials were read from. `None` when the
-    /// backend reported no committed epoch (every requested vnode is
-    /// treated as a fresh start).
+    /// Committed epoch the partials were read from. `None` when the backend
+    /// has no committed epoch — every vnode starts fresh.
     pub epoch: Option<u64>,
-    /// vnode → restored partial bytes, for vnodes that had durable state
-    /// at [`epoch`](Self::epoch).
+    /// vnode → restored partial bytes at `epoch`.
     pub restored: HashMap<u32, Bytes>,
-    /// Requested vnodes with no durable partial — never written, or
-    /// pruned below the committed epoch. These resume from empty state.
+    /// Vnodes with no durable partial at `epoch`; resume from empty state.
     pub missing: Vec<u32>,
-    /// vnode → error message for reads that failed.
+    /// vnode → error for reads that failed.
     pub errors: HashMap<u32, String>,
 }
 
 impl VnodeRehydration {
-    /// Number of vnodes whose state was successfully read back.
+    /// Number of vnodes successfully read back.
     #[must_use]
     pub fn restored_count(&self) -> usize {
         self.restored.len()
     }
 
-    /// Whether any per-vnode read failed.
+    /// Returns `true` if any per-vnode read failed.
     #[must_use]
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
 }
 
-/// Reads committed per-vnode partial state from a durable
-/// [`StateBackend`] so a node that newly acquires vnodes during a
-/// rebalance resumes from the last committed epoch instead of empty
-/// state.
-///
-/// This is the read half of the rehydration life cycle: it resolves the
-/// highest committed epoch once via
-/// [`StateBackend::latest_committed_epoch`] and pulls each vnode's
-/// `partial.bin` at that epoch. Applying the bytes into live operators is
-/// the caller's responsibility (operators that adopt the per-vnode state
-/// backend consume the staged blobs on their next cycle).
+/// Reads the latest committed `partial.bin` for each requested vnode so a
+/// newly-acquired node resumes from the last committed epoch rather than
+/// empty state. Applying the bytes is the caller's responsibility.
 pub struct VnodeRehydrator<'a> {
     backend: &'a dyn StateBackend,
 }
 
 impl<'a> VnodeRehydrator<'a> {
-    /// Wrap the durable backend the partials live on.
+    /// Create a rehydrator over `backend`.
     #[must_use]
     pub fn new(backend: &'a dyn StateBackend) -> Self {
         Self { backend }
@@ -147,11 +114,10 @@ impl<'a> VnodeRehydrator<'a> {
 
     /// Read the latest committed partial for each vnode in `vnodes`.
     ///
-    /// Resolves the highest committed epoch once, then reads each
-    /// vnode's `partial.bin` at that epoch. Best-effort: a read failure
-    /// for one vnode is recorded in [`VnodeRehydration::errors`] and does
-    /// not abort the rest. Returns an empty report (with `epoch = None`,
-    /// every vnode in `missing`) when the store has no committed epoch.
+    /// Resolves the highest committed epoch once, then reads each vnode's
+    /// `partial.bin` at that epoch. A per-vnode failure is recorded in
+    /// [`VnodeRehydration::errors`] without aborting the rest. Returns an
+    /// empty report when the store has no committed epoch.
     pub async fn rehydrate(&self, vnodes: &[u32]) -> VnodeRehydration {
         let mut report = VnodeRehydration::default();
         if vnodes.is_empty() {
@@ -183,11 +149,9 @@ impl<'a> VnodeRehydrator<'a> {
         for &vnode in vnodes {
             match self.backend.read_partial(vnode, epoch).await {
                 Ok(Some(bytes)) => {
-                    // An unchanged-vnode partial is a reference to the
-                    // epoch of its last full upload —
-                    // follow the single hop to the real state. A blob
-                    // that doesn't decode is handed through unchanged
-                    // (the apply path skips undecodable partials).
+                    // An unchanged-vnode partial is a reference to its last full
+                    // upload — follow the single hop. An undecodable blob passes
+                    // through unchanged (the apply path skips it).
                     let bytes = match crate::vnode_partial::VnodePartial::decode(&bytes) {
                         Ok(p) => match p.base_epoch {
                             Some(base) => match self.backend.read_partial(vnode, base).await {
@@ -254,25 +218,18 @@ impl<'a> VnodeRehydrator<'a> {
     }
 }
 
-/// Recovery manager.
-///
-/// Loads the latest [`CheckpointManifest`] from a [`CheckpointStore`] and
-/// restores all registered sources, sinks, and tables to their checkpointed
-/// state.
+/// Loads the latest [`CheckpointManifest`] and restores sources, sinks, and
+/// tables. In strict mode any restore failure aborts and triggers fallback; in
+/// lenient mode failures are recorded and recovery continues.
 pub struct RecoveryManager<'a> {
     store: &'a dyn CheckpointStore,
-    /// When true, any source/sink restore failure aborts the entire recovery.
-    /// When false (default), failures are logged and recorded in `RecoveredState`
-    /// but recovery continues — the pipeline resumes with potentially
-    /// mismatched offsets.
     strict: bool,
 }
 
 impl<'a> RecoveryManager<'a> {
-    /// Creates a new recovery manager using the given checkpoint store.
+    /// Create a strict recovery manager (any restore failure triggers fallback).
     ///
-    /// Defaults to strict mode: any source/sink restore failure aborts
-    /// the entire recovery. Use [`Self::lenient`] to allow partial recovery.
+    /// Use [`Self::lenient`] to allow partial recovery.
     #[must_use]
     pub fn new(store: &'a dyn CheckpointStore) -> Self {
         Self {
@@ -281,11 +238,10 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
-    /// Creates a lenient recovery manager.
+    /// Create a lenient recovery manager.
     ///
-    /// In lenient mode, source/sink restore failures are logged and
-    /// recorded in `RecoveredState` but do not abort recovery. The
-    /// pipeline resumes with potentially mismatched offsets.
+    /// Restore failures are recorded in `RecoveredState` but do not abort
+    /// recovery; the pipeline resumes with potentially mismatched offsets.
     #[must_use]
     pub fn lenient(store: &'a dyn CheckpointStore) -> Self {
         Self {
@@ -294,27 +250,14 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
-    /// Attempts to recover from the latest checkpoint, with fallback to older
-    /// checkpoints if the latest is corrupt or fails to restore.
+    /// Recover from the latest checkpoint, falling back to older ones on failure.
     ///
-    /// Returns `Ok(None)` if no checkpoint exists (fresh start).
-    /// Returns `Ok(Some(RecoveredState))` on successful recovery.
-    ///
-    /// Recovery is best-effort: individual source/sink failures are recorded
-    /// in `RecoveredState` but do not abort the entire recovery. This allows
-    /// partial recovery (e.g., one source fails to seek but others succeed).
-    ///
-    /// ## Fallback Behavior
-    ///
-    /// If the latest checkpoint fails (corrupt manifest, deserialization error),
-    /// the manager iterates through all available checkpoints in reverse
-    /// chronological order until one succeeds or all are exhausted. This
-    /// prevents a single corrupt checkpoint from causing total data loss.
+    /// Returns `Ok(None)` for a fresh start (no checkpoint found).
     ///
     /// # Errors
     ///
-    /// Returns `DbError::Checkpoint` if the checkpoint store fails, or
-    /// in strict mode, if any source/sink restore fails.
+    /// Returns `DbError::Checkpoint` if the store fails or strict-mode
+    /// restore errors exhaust all available checkpoints.
     pub(crate) async fn recover(
         &self,
         sources: &[RegisteredSource],
@@ -416,16 +359,10 @@ impl<'a> RecoveryManager<'a> {
         Ok(None)
     }
 
-    /// Resolves external operator states by loading the sidecar file.
+    /// Resolve external operator states from the sidecar file into inline entries.
     ///
-    /// For any operator state marked as `external`, loads the corresponding
-    /// bytes from `state.bin` and replaces it with an inline entry. This
-    /// makes the rest of recovery code work uniformly with inline state.
-    ///
-    /// Returns `true` if all external states were resolved successfully.
-    /// Returns `false` if any state could not be resolved (missing sidecar,
-    /// truncated sidecar, or I/O error). In strict mode, the caller should
-    /// treat a `false` return as a corrupt checkpoint and try fallback.
+    /// Returns `true` if all resolved successfully; `false` on missing/truncated
+    /// sidecar. In strict mode the caller treats `false` as corruption.
     async fn resolve_external_states(&self, manifest: &mut CheckpointManifest) -> bool {
         let external_ops: Vec<String> = manifest
             .operator_states
@@ -463,9 +400,7 @@ impl<'a> RecoveryManager<'a> {
                 error!(
                     checkpoint_id = manifest.checkpoint_id,
                     error = %e,
-                    operators = ?external_ops,
-                    "[LDB-6010] failed to load sidecar state.bin — external operator states \
-                     cannot be resolved; operators will start with empty state"
+                    "[LDB-6010] failed to load sidecar state.bin"
                 );
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
@@ -482,9 +417,7 @@ impl<'a> RecoveryManager<'a> {
         let mut all_resolved = true;
         for (name, op) in &mut manifest.operator_states {
             if op.external {
-                // `external_offset`/`external_length` are u64 from the on-disk
-                // manifest; use checked arithmetic so a corrupt/tampered
-                // manifest can't overflow past the length check.
+                // Checked arithmetic: a corrupt manifest can't overflow the length check.
                 let range = match (
                     usize::try_from(op.external_offset),
                     usize::try_from(op.external_length),
@@ -525,10 +458,7 @@ impl<'a> RecoveryManager<'a> {
         all_resolved
     }
 
-    /// Restores pipeline state from a loaded manifest.
-    ///
-    /// This is the inner restore logic shared by both the fast path
-    /// (latest checkpoint) and fallback path (older checkpoints).
+    /// Inner restore logic shared by the fast path and the fallback loop.
     #[allow(clippy::too_many_lines)]
     async fn restore_from(
         &self,
@@ -537,9 +467,7 @@ impl<'a> RecoveryManager<'a> {
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
     ) -> RecoveredState {
-        // Resolve external operator states from sidecar before recovery.
-        // In strict mode, unresolved sidecar state is recorded as a source
-        // error so check_strict() will reject this checkpoint.
+        // In strict mode an unresolved sidecar is recorded so check_strict() rejects this checkpoint.
         let sidecar_ok = self.resolve_external_states(&mut manifest).await;
         if !sidecar_ok && self.strict {
             warn!(
@@ -549,9 +477,7 @@ impl<'a> RecoveryManager<'a> {
             );
         }
 
-        // Validate manifest consistency before restoring state.
-        // `DEFAULT_VNODE_COUNT` is a placeholder; the runtime
-        // `VnodeRegistry` value is not threaded through recovery yet.
+        // DEFAULT_VNODE_COUNT is a placeholder; the runtime registry isn't threaded here yet.
         let validation_errors =
             manifest.validate(laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
         if !validation_errors.is_empty() {
@@ -564,8 +490,7 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
-        // Topology drift detection: compare current sources/sinks against
-        // the checkpoint to warn the operator about changes.
+        // Warn about topology changes since the checkpoint.
         if !manifest.source_names.is_empty() {
             let mut current_sources: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
             current_sources.sort_unstable();
@@ -635,7 +560,6 @@ impl<'a> RecoveryManager<'a> {
             sink_errors: HashMap::new(),
         };
 
-        // Record sidecar failure so check_strict() rejects this checkpoint.
         if !sidecar_ok {
             result.source_errors.insert(
                 "__sidecar__".into(),
@@ -645,7 +569,6 @@ impl<'a> RecoveryManager<'a> {
             );
         }
 
-        // Restore source offsets.
         for source in sources {
             if !source.supports_replay {
                 info!(
@@ -687,7 +610,6 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
-        // Restore table source offsets.
         for table_source in table_sources {
             if let Some(cp) = manifest.table_offsets.get(&table_source.name) {
                 let source_cp = connector_to_source_checkpoint(cp);
@@ -706,11 +628,9 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
-        // Roll back exactly-once sinks that did NOT commit (Pending or Failed).
-        // Already-Committed sinks are left alone.
+        // Roll back exactly-once sinks that did not commit. Committed sinks are left alone.
         for sink in sinks {
             if sink.exactly_once {
-                // Check per-sink commit status — if the sink committed, skip rollback.
                 let already_committed = manifest
                     .sink_commit_statuses
                     .get(&sink.name)
@@ -758,25 +678,12 @@ impl<'a> RecoveryManager<'a> {
         result
     }
 
-    /// Checks whether a checkpoint's sidecar data is corrupt.
-    ///
-    /// Returns `true` if the checkpoint has a `state_checksum` and
-    /// [`CheckpointStore::validate_checkpoint`] reports a checksum mismatch
-    /// or missing sidecar. Returns `false` if there is no sidecar, or
-    /// if the sidecar is valid, or if validation I/O fails (we proceed
-    /// with caution rather than blocking recovery).
     /// Returns `true` if the checkpoint fails integrity validation.
     ///
-    /// Checks both sidecar checksum and manifest validity. Any validation
-    /// failure (sidecar corruption, missing data, or manifest issues like
-    /// epoch=0) causes the checkpoint to be rejected so fallback can try
-    /// an older one.
-    ///
-    /// Only returns `false` (proceed) when validation passes OR when the
-    /// checkpoint has no sidecar to validate.
+    /// I/O errors during validation are treated as corruption — if the sidecar
+    /// can't be verified, don't trust the checkpoint. Returns `false` when there
+    /// is nothing to validate (no sidecar, no state checksum).
     async fn is_checkpoint_corrupt(&self, manifest: &CheckpointManifest) -> bool {
-        // No sidecar and no state_checksum → nothing to validate beyond
-        // manifest parsing (which already succeeded if we got here).
         if manifest.state_checksum.is_none() && manifest.operator_states.is_empty() {
             return false;
         }
@@ -795,8 +702,6 @@ impl<'a> RecoveryManager<'a> {
             }
             Ok(_) => false, // valid
             Err(e) => {
-                // I/O errors during validation are treated as corruption —
-                // if we can't verify the checkpoint, don't trust it.
                 error!(
                     checkpoint_id = manifest.checkpoint_id,
                     error = %e,
@@ -808,12 +713,10 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
-    /// In strict mode, returns an error if any source or sink had restore failures.
-    /// Returns true if any exactly-once sink has Pending commit status.
+    /// Returns `true` if any exactly-once sink has `Pending` commit status.
     ///
-    /// A checkpoint with Pending sinks was persisted before sink commit
-    /// completed. Recovering from it would advance source offsets past
-    /// data the sinks never received — causing silent data loss.
+    /// A Pending sink means the manifest was persisted before commit finished;
+    /// recovering from it advances source offsets past data the sink never wrote.
     fn has_pending_sinks(manifest: &CheckpointManifest) -> bool {
         manifest
             .sink_commit_statuses
@@ -840,9 +743,7 @@ impl<'a> RecoveryManager<'a> {
         )))
     }
 
-    /// Loads the latest manifest without performing recovery.
-    ///
-    /// Useful for inspecting checkpoint state or building a recovery plan.
+    /// Load the latest manifest without restoring state.
     ///
     /// # Errors
     ///
@@ -851,7 +752,7 @@ impl<'a> RecoveryManager<'a> {
         self.store.load_latest().await.map_err(DbError::from)
     }
 
-    /// Loads a specific checkpoint by ID.
+    /// Load a checkpoint by ID.
     ///
     /// # Errors
     ///

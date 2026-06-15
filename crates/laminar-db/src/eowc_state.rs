@@ -89,11 +89,7 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> WindowStarts {
             windows
         }
         EowcWindowType::Session { .. } => {
-            // Session windows MUST be routed through CoreWindowState (Ring 0
-            // operators) which implements proper gap-based merge.  The guard
-            // at stream_executor.rs:973-980 prevents session queries from
-            // reaching IncrementalEowcState.  If we get here, the routing
-            // logic has a bug — crash rather than produce wrong results.
+            // Session queries must be routed to CoreWindowState; reaching here is a bug.
             unreachable!(
                 "session window reached EOWC assign_windows — \
                  this is a routing bug; session queries must use CoreWindowState"
@@ -102,10 +98,7 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> WindowStarts {
     }
 }
 
-/// Per-window accumulator state for EOWC aggregate queries.
-///
-/// Keyed by window start timestamp (ms since epoch). Each window contains
-/// per-group accumulators that are updated incrementally as batches arrive.
+/// Incremental per-window accumulator state for EOWC aggregate queries.
 pub(crate) struct IncrementalEowcState {
     window_type: EowcWindowType,
     #[allow(clippy::type_complexity)]
@@ -119,25 +112,19 @@ pub(crate) struct IncrementalEowcState {
     output_schema: SchemaRef,
     time_col_index: usize,
     compiled_projection: Option<CompiledProjection>,
-    /// See [`CoreWindowState::cached_pre_agg_physical`].
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     having_sql: Option<String>,
     max_groups_per_window: usize,
-    /// Grace period (ms) after window end before closing. Late events
-    /// arriving within this window are included instead of dropped.
-    /// Must match `CoreWindowState::allowed_lateness_ms` behavior.
     allowed_lateness_ms: i64,
-    /// See [`CoreWindowState::high_watermark_ms`].
     high_watermark_ms: i64,
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     having_sql_cache: Option<crate::operator::HavingSqlCache>,
 }
 
 impl IncrementalEowcState {
-    /// Attempt to build an `IncrementalEowcState` by introspecting the logical
-    /// plan of the given SQL query. Returns `None` if the query does not
-    /// contain an `Aggregate` node (not an aggregation query).
+    /// Build state from SQL; returns `None` if the query has no `Aggregate` node
+    /// or uses a plan shape that requires the interpreted fallback.
     #[allow(clippy::too_many_lines)]
     pub async fn try_from_sql(
         ctx: &SessionContext,
@@ -167,8 +154,7 @@ impl IncrementalEowcState {
             return Ok(None);
         }
 
-        // Determine if we should attempt to compile pre-agg expressions.
-        // Use single_source_table (counts occurrences) to reject self-joins.
+        // single_source_table rejects self-joins before attempting expression compile.
         let compile_source = crate::sql_analysis::single_source_table(sql);
         let state = ctx.state();
         let props = state.execution_props();
@@ -177,13 +163,8 @@ impl IncrementalEowcState {
         let mut proj_fields: Vec<Field> = Vec::new();
         let mut compile_ok = compile_source.is_some();
 
-        // Bail out if the top-level plan has a non-trivial projection above
-        // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
-        // The incremental accumulator emits raw aggregate outputs and cannot
-        // apply post-aggregate projections.  Fall through to EOWC raw-batch.
-        //
-        // Check both field count AND types — a coincidental count match can
-        // mask a projection that remaps group columns to computed aggregates.
+        // Bail if there's a post-aggregate projection (e.g. SUM(a)/SUM(b)); fall through
+        // to raw-batch EOWC. Check types too — count match alone can hide remaps.
         if top_schema.fields().len() != agg_schema.fields().len() {
             return Ok(None);
         }
@@ -195,7 +176,6 @@ impl IncrementalEowcState {
 
         let num_group_cols = group_exprs.len();
 
-        // Resolve group-by column names and types
         let mut group_col_names = Vec::new();
         let mut group_types = Vec::new();
         for i in 0..num_group_cols {
@@ -216,7 +196,6 @@ impl IncrementalEowcState {
                 pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
             }
 
-            // Compile group expression
             if compile_ok {
                 match create_physical_expr(group_expr, input_df_schema, props) {
                     Ok(phys) => {
@@ -260,7 +239,6 @@ impl IncrementalEowcState {
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
 
-                    // Compile literal TRUE
                     if compile_ok {
                         match create_physical_expr(
                             &datafusion_expr::lit(true),
@@ -290,7 +268,6 @@ impl IncrementalEowcState {
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
 
-                            // Compile: CASE WHEN filter THEN arg ELSE NULL END
                             if compile_ok {
                                 let case_expr =
                                     datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
@@ -324,7 +301,6 @@ impl IncrementalEowcState {
                             pre_agg_select_items
                                 .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
 
-                            // Compile the arg expression directly
                             if compile_ok {
                                 match create_physical_expr(arg_expr, input_df_schema, props) {
                                     Ok(phys) => {
@@ -359,7 +335,6 @@ impl IncrementalEowcState {
                             "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                         ));
 
-                    // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
                     if compile_ok {
                         let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
                             expr: None,
@@ -406,14 +381,12 @@ impl IncrementalEowcState {
             }
         }
 
-        // Add time column for window assignment
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!(
             "\"{}\" AS \"__eowc_ts\"",
             window_config.time_column
         ));
 
-        // Compile time column expression
         if compile_ok {
             let time_expr = datafusion_expr::Expr::Column(
                 datafusion_common::Column::new_unqualified(&window_config.time_column),
@@ -438,9 +411,7 @@ impl IncrementalEowcState {
             clauses.where_clause,
         );
 
-        // Build compiled projection for single-source queries.
         let compiled_projection = if compile_ok {
-            // Compile WHERE predicate
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
                     Some(phys)
@@ -477,7 +448,6 @@ impl IncrementalEowcState {
         }
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        // Compile HAVING filter.
         let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
         let having_sql = if having_filter.is_none() {
             having_predicate.as_ref().map(expr_to_sql)
@@ -487,9 +457,7 @@ impl IncrementalEowcState {
 
         let window_type = EowcWindowType::from_config(window_config);
 
-        // Plan once at init; `LiveSourceExec` leaves carry fresh data.
-        // No compiled fast-path ⇒ the cached plan is the only path, so
-        // propagate any planning error rather than failing at process time.
+        // Without the compiled path the cached plan is the only path; fail early.
         let cached_pre_agg_physical = if compiled_projection.is_none() {
             let logical = ctx
                 .sql(&pre_agg_sql)
@@ -529,7 +497,7 @@ impl IncrementalEowcState {
             having_filter,
             having_sql,
             max_groups_per_window: 1_000_000,
-            // EMIT FINAL drops late data; see CoreWindowState.
+            // EMIT FINAL drops late data; force lateness to 0.
             allowed_lateness_ms: if matches!(emit_clause, Some(EmitClause::Final)) {
                 0
             } else {
@@ -541,7 +509,6 @@ impl IncrementalEowcState {
         }))
     }
 
-    /// See [`CoreWindowState::is_window_closed`].
     #[inline]
     fn is_window_closed(&self, window_start: i64) -> bool {
         if self.high_watermark_ms == i64::MIN {
@@ -557,10 +524,7 @@ impl IncrementalEowcState {
             <= self.high_watermark_ms
     }
 
-    /// Vectorized batch update: extracts timestamps and group keys at the
-    /// batch level using `RowConverter`, groups row indices by
-    /// `(window_start, group_key)`, then calls `update_group_accumulators`
-    /// once per group with a single `take()` per column.
+    /// Update per-window accumulators with a new pre-aggregation batch.
     #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
@@ -570,7 +534,6 @@ impl IncrementalEowcState {
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
         let has_groups = self.num_group_cols > 0;
 
-        // Batch-level group key extraction via persistent RowConverter
         let rows = if has_groups {
             let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
                 .map(|i| Arc::clone(batch.column(i)))
@@ -584,13 +547,12 @@ impl IncrementalEowcState {
             None
         };
 
-        // Group row indices by (window_start, group_key).
         if !has_groups {
             let empty_key = crate::aggregate_state::global_aggregate_key();
             let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
                 if ts_ms == NULL_TIMESTAMP {
-                    continue; // skip rows with null timestamps
+                    continue;
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
@@ -635,9 +597,8 @@ impl IncrementalEowcState {
             return Ok(());
         }
 
-        // Grouped path. Dedup group keys per batch and bucket by
-        // (window, group_id) so per-window assignment doesn't clone the
-        // OwnedRow for each overlapping window.
+        // Dedup group keys per batch; bucket by (window, group_id) to avoid cloning OwnedRow
+        // for each overlapping window (hopping).
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
         let mut group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState> =
             indexmap::IndexSet::default();
@@ -709,11 +670,7 @@ impl IncrementalEowcState {
         Ok(())
     }
 
-    /// Close windows whose end <= watermark, returning emitted batches.
-    ///
-    /// Iterates the `BTreeMap` from earliest window and closes all windows
-    /// where `window_start + window_size <= watermark_ms`. Closed windows
-    /// are removed from state.
+    /// Close and emit all windows whose end (plus lateness grace) <= watermark.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
         let size_ms = self.window_type.size_ms();
@@ -820,7 +777,6 @@ impl IncrementalEowcState {
             f.name().hash(&mut h);
             f.data_type().to_string().hash(&mut h);
         }
-        // Window shape: see CoreWindowState::query_fingerprint.
         match &self.window_type {
             EowcWindowType::Tumbling { size_ms } => {
                 "tumbling".hash(&mut h);
@@ -840,10 +796,7 @@ impl IncrementalEowcState {
         h.finish()
     }
 
-    /// Estimated memory usage in bytes across all windows and groups.
-    ///
-    /// Iterates over every open window and its per-group accumulators, summing
-    /// `ScalarValue::size()` for keys and `Accumulator::size()` for state.
+    /// Estimated memory usage in bytes across all open windows and groups.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let mut total = 0;
         for groups in self.windows.values() {
@@ -857,7 +810,6 @@ impl IncrementalEowcState {
         total
     }
 
-    /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(&mut self) -> Result<EowcStateCheckpoint, DbError> {
         use crate::aggregate_state::{scalars_to_ipc, GroupCheckpoint, WindowCheckpoint};
 
@@ -898,7 +850,6 @@ impl IncrementalEowcState {
         })
     }
 
-    /// Restore per-window group states from a checkpoint.
     pub(crate) fn restore_windows(
         &mut self,
         checkpoint: &EowcStateCheckpoint,
@@ -950,17 +901,12 @@ impl IncrementalEowcState {
     }
 }
 
-/// Sentinel value for null timestamps. Callers must skip rows with this value
-/// instead of assigning them to the epoch-0 window.
+/// Sentinel for null timestamps; callers must skip rows with this value
+/// rather than assigning them to the epoch-0 window.
 pub(crate) const NULL_TIMESTAMP: i64 = i64::MIN;
 
-/// Extract i64 timestamp values from a batch column.
-///
-/// Handles Int64 columns directly and Arrow Timestamp columns by extracting
-/// the underlying i64 values (already in the native time unit).
-///
-/// Null values are mapped to [`NULL_TIMESTAMP`] (`i64::MIN`). Callers must
-/// check for this sentinel and skip the corresponding rows.
+/// Extract millisecond timestamps from a batch column as `i64`.
+/// Nulls become [`NULL_TIMESTAMP`]; callers must skip those rows.
 pub(crate) fn extract_i64_timestamps(
     batch: &RecordBatch,
     col_index: usize,

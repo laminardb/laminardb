@@ -9,11 +9,12 @@ members = [
 ]
 exclude = [
     "examples/*",
+    "tools/*",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.25.1"
+version = "0.26.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"

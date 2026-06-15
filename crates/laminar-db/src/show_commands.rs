@@ -1,6 +1,4 @@
-//! SHOW and DESCRIBE command builders for `LaminarDB`.
-//!
-//! Reopens `impl LaminarDB` to keep the main `db.rs` focused on dispatch.
+//! SHOW and DESCRIBE command builders; reopens `impl LaminarDB` to keep `db.rs` focused.
 
 use std::sync::Arc;
 
@@ -34,7 +32,6 @@ impl LaminarDB {
             None => (None, vec![]),
         };
 
-        // Build single-row result with checkpoint metadata.
         let (cp_id, epoch, ts_ms, sources, sinks, total_checkpoints) = if let Some(ref m) = latest {
             (
                 m.checkpoint_id,
@@ -156,7 +153,6 @@ impl LaminarDB {
 
         for s in &sinks {
             names.push(s.name.as_str());
-            // Input comes from catalog (always registered), connector metadata from ConnectorManager
             let catalog_input = self.catalog.get_sink_input(&s.name);
             if let Some(reg) = regs.get(&s.name) {
                 inputs.push(Some(reg.input.clone()));
@@ -329,13 +325,10 @@ impl LaminarDB {
 
     /// Build a DESCRIBE result.
     pub(crate) fn build_describe(&self, name: &str) -> Result<RecordBatch, DbError> {
-        // Try sources first
         let schema = if let Some(s) = self.catalog.describe_source(name) {
             s
-        // Then reference/dimension tables
         } else if let Some(s) = self.table_store.read().table_schema(name) {
             s
-        // Then materialized views
         } else if let Some(s) = self
             .mv_registry
             .lock()
@@ -343,12 +336,10 @@ impl LaminarDB {
             .map(|mv| mv.schema.clone())
         {
             s
-        // Then check sinks (no schema, but confirm existence)
         } else if self.catalog.list_sinks().contains(&name.to_string()) {
             return Err(DbError::InvalidOperation(
                 "DESCRIBE is not supported for sinks. Use SHOW SINKS for details.".to_string(),
             ));
-        // Then streams (no stored schema yet)
         } else if self.catalog.list_streams().contains(&name.to_string()) {
             return Err(DbError::InvalidOperation(format!(
                 "Stream '{name}' exists but schema is only available after pipeline start"

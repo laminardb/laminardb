@@ -1,16 +1,7 @@
-//! Result cache for AI inference, keyed `(content_hash, model_id,
-//! params_version)`.
+//! Per-row inference result cache, keyed `(content_hash, model_id, params_version)`.
 //!
-//! The key versions on both the model and its parameters, so a local model and
-//! a remote model — or the same model under different parameters — never
-//! collide on the same input text. Local results are deterministic and cacheable
-//! permanently for correctness; remote results are cached as a cost-saver. The
-//! cache itself does not distinguish the two — that policy lives in the caller.
-//!
-//! The cache is an in-memory [`quick_cache::sync::Cache`] with S3-FIFO-style
-//! eviction, the same crate the lookup and schema-registry caches use. A lookup
-//! is a memory op: cheap enough to gate the inference worker from the operator
-//! without doing the model call inline.
+//! The composite key ensures different models and parameter sets never collide on
+//! the same input. Backed by `quick_cache::sync::Cache` with S3-FIFO eviction.
 
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, Weighter};
@@ -18,55 +9,41 @@ use quick_cache::{DefaultHashBuilder, Weighter};
 use crate::ai::provider::InferenceParams;
 use crate::ai::registry::Task;
 
-/// Cache key. All fields are `Copy`, so lookups need no allocation and no
-/// borrowed-key indirection.
-///
-/// - `content_hash`: xxh3-128 of the input text (see [`content_hash`]).
-/// - `model_id`: a stable per-model integer assigned by the caller (the
-///   registry), distinguishing models without hashing their names on lookup.
-/// - `params_version`: a hash of the request parameters (see [`params_version`]).
+/// Cache key. All fields are `Copy`; lookups need no allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AiCacheKey {
-    /// xxh3-128 hash of the input content.
+    /// xxh3-128 of the input text.
     pub content_hash: u128,
-    /// Stable integer id of the model.
+    /// Stable per-model integer assigned by the registry.
     pub model_id: u32,
-    /// The task — a model can serve several (e.g. classify and sentiment), and
-    /// they produce different outputs for the same input, so it must key the
-    /// cache or results would collide across tasks.
+    /// Task is part of the key because the same model returns different outputs
+    /// for classify vs sentiment on the same input.
     pub task: Task,
-    /// Hash of the request parameters that affect the output.
+    /// Hash of the request parameters (see [`params_version`]).
     pub params_version: u64,
 }
 
-/// One row's cached inference output. Mirrors the per-row shape of
-/// [`crate::ai::provider::InferenceOutputs`] but singular, since the cache is keyed
-/// per row of input.
+/// One row's cached inference output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CachedOutput {
     /// A text output (label, completion, summary, …).
     Text(String),
-    /// A numeric vector output (embedding).
+    /// A numeric embedding vector.
     Vector(Vec<f32>),
-    /// A scalar score output (`ai_sentiment`, continuous in `[-1, 1]`).
+    /// A scalar sentiment score in `[-1, 1]`.
     Score(f64),
 }
 
-/// xxh3-128 of the input content. Not cryptographic; a fast, collision-negligible
-/// key for a result cache.
+/// xxh3-128 of the input content.
 #[must_use]
 pub fn content_hash(input: &str) -> u128 {
     xxhash_rust::xxh3::xxh3_128(input.as_bytes())
 }
 
-/// A stable hash of the parameters that change a model's output for the same
-/// input — currently the candidate label set. Computed once per batch (all rows
-/// in a batch share parameters), not per row.
+/// Hash of the parameters that affect model output (currently the label set).
 ///
-/// Maintenance contract: every field of [`InferenceParams`] that can change the
-/// output must be folded in here. It is hashed field-by-field rather than via a
-/// derived `Hash` because parameters added later (e.g. an `f32` temperature)
-/// are not `Hash`; fold those in explicitly (e.g. `to_bits()`).
+/// Fold every output-affecting field of [`InferenceParams`] here explicitly —
+/// non-`Hash` fields like `f32` temperature must use `to_bits()`.
 #[must_use]
 pub fn params_version(params: &InferenceParams) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -78,9 +55,8 @@ pub fn params_version(params: &InferenceParams) -> u64 {
 /// Configuration for [`AiResultCache`].
 #[derive(Debug, Clone, Copy)]
 pub struct AiResultCacheConfig {
-    /// Memory budget in bytes. Entries are weighted by payload size, so this
-    /// bounds memory directly — an entry count would not, since an embedding
-    /// vector is orders of magnitude larger than a one-word label.
+    /// Memory budget. Entries are weighted by payload size, not count, so
+    /// large embeddings and small labels are both bounded correctly.
     pub capacity_bytes: usize,
 }
 
@@ -92,8 +68,7 @@ impl Default for AiResultCacheConfig {
     }
 }
 
-/// Weight of one cache entry: its payload bytes plus fixed key/bookkeeping
-/// overhead, so tiny entries still count against the budget.
+/// Payload bytes plus key/overhead so tiny entries still count against the budget.
 #[derive(Debug, Clone)]
 struct OutputWeighter;
 
@@ -109,10 +84,6 @@ impl Weighter<AiCacheKey, CachedOutput> for OutputWeighter {
 }
 
 /// `quick_cache`-backed in-memory cache of per-row inference results.
-///
-/// `quick_cache::sync::Cache` is internally sharded with per-shard locks held
-/// only for the duration of a map operation, so [`AiResultCache`] is
-/// `Send + Sync`.
 pub struct AiResultCache {
     cache: Cache<AiCacheKey, CachedOutput, OutputWeighter>,
 }
@@ -121,9 +92,7 @@ impl AiResultCache {
     /// Create a cache with the given configuration.
     #[must_use]
     pub fn new(config: AiResultCacheConfig) -> Self {
-        // Estimated entry count only sizes internal tables; within an order
-        // of magnitude is fine. Assume ~256 B/entry (labels are small,
-        // embeddings large; the byte weighter enforces the real bound).
+        // Rough item count for internal table sizing; ~256 B/entry assumed.
         let estimated_items = (config.capacity_bytes / 256).max(64);
         let cache = Cache::with(
             estimated_items,
@@ -135,7 +104,7 @@ impl AiResultCache {
         Self { cache }
     }
 
-    /// Create a cache with default configuration.
+    /// Create a cache with default configuration (64 MiB).
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(AiResultCacheConfig::default())
@@ -147,18 +116,18 @@ impl AiResultCache {
         self.cache.get(key)
     }
 
-    /// Insert or update a cached result.
+    /// Insert a result.
     pub fn insert(&self, key: AiCacheKey, value: CachedOutput) {
         self.cache.insert(key, value);
     }
 
-    /// Number of entries currently cached.
+    /// Number of cached entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
-    /// Whether the cache is empty.
+    /// Whether the cache holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

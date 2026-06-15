@@ -1,10 +1,6 @@
-//! OpenAI-compatible remote provider.
-//!
-//! Covers OpenAI, Azure OpenAI, vLLM, and local OpenAI-style servers via
-//! `base_url`. Chat completions drive the discriminative and generative tasks
-//! (one bounded-concurrent call per input row); the embeddings endpoint serves
-//! `ai_embed` in a single batched call. This is the embeddings path for the
-//! whole feature — Anthropic exposes no embeddings endpoint.
+//! OpenAI-compatible remote provider (OpenAI, Azure, vLLM, local servers).
+//! Chat completions for discriminative/generative tasks; the embeddings endpoint
+//! for `ai_embed` (the only provider that supports it).
 
 use std::time::Duration;
 
@@ -30,9 +26,7 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// Build a provider for `base_url` (e.g. `https://api.openai.com/v1`),
-    /// authenticating with `api_key` and issuing at most `max_concurrency`
-    /// concurrent chat requests per batch.
+    /// Build an OpenAI-compatible provider.
     ///
     /// # Errors
     ///
@@ -57,9 +51,7 @@ impl OpenAiProvider {
     async fn chat(&self, request: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
 
-        // Build owned request bodies first, then map each to a future. Mapping
-        // over owned `ChatBody` (not `&input`) keeps the future-producing
-        // closure free of an input lifetime to generalize over.
+        // Build owned bodies first so the async closure captures by value, not by reference.
         let bodies: Vec<ChatBody> = request
             .inputs
             .iter()
@@ -206,9 +198,8 @@ struct TokenUsage {
     completion_tokens: u64,
 }
 
-/// Pull the first choice's text and token usage from a chat response. Cost is
-/// left at zero — converting tokens to dollars needs a per-model price table,
-/// which is configured separately.
+/// Extract the first choice's text and token usage. Cost is left at zero;
+/// token-to-dollar conversion needs a per-model price table.
 fn parse_chat(response: ChatResponse) -> Result<(String, Usage), ProviderError> {
     let content = response
         .choices
@@ -219,7 +210,7 @@ fn parse_chat(response: ChatResponse) -> Result<(String, Usage), ProviderError> 
     Ok((content, token_usage(response.usage)))
 }
 
-/// Collect embeddings in input order (sorted by `index`) plus usage.
+/// Sort embeddings by `index` (API may return out of order) and collect usage.
 fn parse_embed(mut response: EmbedResponse) -> (Vec<Vec<f32>>, Usage) {
     response.data.sort_by_key(|d| d.index);
     let usage = token_usage(response.usage);

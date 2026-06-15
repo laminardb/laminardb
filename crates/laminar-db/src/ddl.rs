@@ -1,6 +1,4 @@
-//! DDL (Data Definition Language) handlers for `LaminarDB`.
-//!
-//! Reopens `impl LaminarDB` to keep the main `db.rs` focused on dispatch.
+//! DDL handlers — reopens `impl LaminarDB` to keep `db.rs` focused on dispatch.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -28,14 +26,12 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
 }
 
 impl LaminarDB {
-    /// Handle CREATE SOURCE statement.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_create_source(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
-        // Reject connector-bearing CREATE SOURCE when pipeline is already running.
-        // Connectors are instantiated in start() which is a one-shot operation.
+        // Connectors are instantiated in start() — reject mid-run DDL.
         let has_connector =
             create.connector_type.is_some() || create.with_options.contains_key("connector");
         if has_connector && self.is_pipeline_running() {
@@ -46,7 +42,6 @@ impl LaminarDB {
             )));
         }
 
-        // IF NOT EXISTS: short-circuit before discovery runs any network I/O.
         let source_name = create.name.to_string();
         reject_reserved_namespace(&source_name)?;
         if create.if_not_exists && self.catalog.get_source(&source_name).is_some() {
@@ -56,8 +51,6 @@ impl LaminarDB {
             }));
         }
 
-        // Discover columns from the connector before translating, so
-        // `WATERMARK FOR col` can validate against real columns.
         let source_def = if create.columns.is_empty() && has_connector {
             let resolved = resolve_connector_info(
                 create.connector_type.as_ref(),
@@ -72,8 +65,7 @@ impl LaminarDB {
             })?;
             let normalized = normalize_connector_type(connector_type);
 
-            // Surface unknown-connector errors before discovery so a typo
-            // doesn't get reported as a schema-discovery failure.
+            // Fail on unknown connector before discovery so a typo isn't reported as a schema failure.
             if self.connector_registry.source_info(&normalized).is_none() {
                 return Err(DbError::Config(format!(
                     "source '{source_name}': unknown connector type '{normalized}'"
@@ -132,7 +124,6 @@ impl LaminarDB {
             .as_ref()
             .map(|w| w.max_out_of_orderness);
 
-        // Extract config from source definition
         let buffer_size = if source_def.config.buffer_size > 0 {
             Some(source_def.config.buffer_size)
         } else {
@@ -172,7 +163,6 @@ impl LaminarDB {
             )?)
         };
 
-        // Mark processing-time sources
         if let Some(ref wm) = source_def.watermark {
             if wm.is_processing_time {
                 if let Some(ref entry) = entry {
@@ -183,8 +173,6 @@ impl LaminarDB {
             }
         }
 
-        // Register source as a DataFusion table for ad-hoc SELECT queries.
-        // For OR REPLACE, deregister the old table first.
         if let Some(ref entry) = entry {
             if create.or_replace {
                 let _ = self.ctx.deregister_table(name);
@@ -199,10 +187,8 @@ impl LaminarDB {
             }
         }
 
-        // Register as a base table in the MV registry for dependency tracking
         self.mv_registry.lock().register_base_table(name);
 
-        // Also register in the planner
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
@@ -211,7 +197,6 @@ impl LaminarDB {
             }
         }
 
-        // Register connector info in ConnectorManager if external connector specified.
         let resolved = resolve_connector_info(
             create.connector_type.as_ref(),
             &create.connector_options,
@@ -275,7 +260,6 @@ impl LaminarDB {
             self.catalog.register_sink(&name, &input)?;
         }
 
-        // Register in planner
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSink(Box::new(create.clone()));
@@ -284,7 +268,6 @@ impl LaminarDB {
             }
         }
 
-        // Register connector info in ConnectorManager if external connector specified.
         let resolved = resolve_connector_info(
             create.connector_type.as_ref(),
             &create.connector_options,
@@ -329,7 +312,6 @@ impl LaminarDB {
         let name = create.name.to_string();
         reject_reserved_namespace(&name)?;
 
-        // Build Arrow schema from column definitions
         let fields: Vec<arrow::datatypes::Field> = create
             .columns
             .iter()
@@ -354,10 +336,8 @@ impl LaminarDB {
 
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
 
-        // Extract primary key from column constraints or table constraints
         let mut primary_key: Option<String> = None;
 
-        // Check column-level PRIMARY KEY
         for col in &create.columns {
             for opt in &col.options {
                 if matches!(
@@ -376,7 +356,6 @@ impl LaminarDB {
             }
         }
 
-        // Check table-level PRIMARY KEY constraint
         if primary_key.is_none() {
             for constraint in &create.constraints {
                 if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
@@ -390,7 +369,6 @@ impl LaminarDB {
             }
         }
 
-        // Extract connector options from WITH (...)
         let mut connector_type: Option<String> = None;
         let mut connector_options: HashMap<String, String> = HashMap::with_capacity(8);
         let mut format: Option<String> = None;
@@ -464,7 +442,6 @@ impl LaminarDB {
             }
         }
 
-        // Resolve cache mode: if Partial and cache_max_entries overrides, apply it
         let resolved_cache_mode = match (&cache_mode, cache_max_entries) {
             (Some(crate::table_cache_mode::TableCacheMode::Partial { .. }), Some(max)) => {
                 Some(crate::table_cache_mode::TableCacheMode::Partial { max_entries: max })
@@ -472,10 +449,8 @@ impl LaminarDB {
             _ => cache_mode.clone(),
         };
 
-        // Determine whether this is a persistent table
         let is_persistent = storage.as_deref() == Some("persistent");
 
-        // Register in TableStore if PK found
         if let Some(ref pk) = primary_key {
             let cache = resolved_cache_mode
                 .clone()
@@ -494,7 +469,6 @@ impl LaminarDB {
             }
         }
 
-        // Register connector-backed table in ConnectorManager
         if connector_type.is_some() || !connector_options.is_empty() {
             if let Some(ref pk) = primary_key {
                 if let Some(ref ct) = connector_type {
@@ -517,8 +491,7 @@ impl LaminarDB {
             }
         }
 
-        // Live ReferenceTableProvider: scan() reads current TableStore rows, so
-        // SELECTs need no re-register after INSERTs (lookup joins use the snapshot).
+        // scan() reads current TableStore rows; no re-register needed after INSERTs.
         {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 name.clone(),
@@ -544,8 +517,6 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        // Reject DROP SOURCE while pipeline is running — the running source
-        // task cannot be stopped without dynamic task cancellation support.
         if self.is_pipeline_running() {
             return Err(DbError::Pipeline(format!(
                 "Cannot drop source '{name_str}' while pipeline is running. \
@@ -553,7 +524,6 @@ impl LaminarDB {
             )));
         }
 
-        // Check for dependents: streams and MVs that reference this source
         if cascade {
             self.cascade_drop_dependents(&name_str);
         } else {
@@ -571,7 +541,6 @@ impl LaminarDB {
         if !dropped && !if_exists {
             return Err(DbError::SourceNotFound(name_str));
         }
-        // Deregister from DataFusion so SELECT no longer resolves.
         let _ = self.ctx.deregister_table(&name_str);
         self.connector_manager.lock().unregister_source(&name_str);
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -588,7 +557,6 @@ impl LaminarDB {
         use laminar_sql::parser::AlterSourceOperation;
         let name_str = name.to_string();
 
-        // Verify source exists
         let existing_schema = self
             .catalog
             .describe_source(&name_str)
@@ -602,13 +570,11 @@ impl LaminarDB {
                 )
                 .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
 
-                // Build new schema with the added column
                 let mut fields: Vec<arrow::datatypes::FieldRef> =
                     existing_schema.fields().iter().cloned().collect();
                 fields.push(Arc::new(Field::new(&col_name, arrow_type, true)));
                 let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
 
-                // Re-register the source with the new schema
                 let entry = self.catalog.get_source(&name_str);
                 let (wm_col, max_ooo) = entry.as_ref().map_or((None, None), |e| {
                     (e.watermark_column.clone(), e.max_out_of_orderness)
@@ -623,7 +589,6 @@ impl LaminarDB {
                     None,
                 );
 
-                // Update DataFusion registration
                 let _ = self.ctx.deregister_table(&name_str);
                 let provider = datafusion::datasource::MemTable::try_new(new_schema, vec![vec![]])
                     .map_err(|e| {
@@ -641,7 +606,6 @@ impl LaminarDB {
                 }))
             }
             AlterSourceOperation::SetProperties { properties } => {
-                // Store properties in session config for this source
                 let mut props = self.session_properties.lock();
                 for (key, value) in properties {
                     props.insert(format!("{name_str}.{key}"), value.clone());
@@ -662,8 +626,6 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        // Reject DROP SINK while pipeline is running — the running sink
-        // task cannot be stopped without dynamic task cancellation support.
         if self.is_pipeline_running() {
             return Err(DbError::Pipeline(format!(
                 "Cannot drop sink '{name_str}' while pipeline is running. \
@@ -701,11 +663,7 @@ impl LaminarDB {
 
         let query_sql = query_sql.to_string();
 
-        // Plan the statement to extract emit_clause, window_config, order_config,
-        // and the multi-step join_config (one entry per binary join step).
-        // Planning errors (e.g. unbounded multi-way stream-stream rejection)
-        // surface to the caller — DDL must not silently fall back when the
-        // planner has rejected the query.
+        // Planning errors surface to the caller — DDL must not silently fall back.
         let (plan_emit, plan_window, plan_order, plan_joins) = {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateStream {
@@ -729,7 +687,6 @@ impl LaminarDB {
             }
         };
 
-        // Store the query SQL for stream execution at start()
         {
             let mut mgr = self.connector_manager.lock();
             mgr.register_stream(crate::connector_manager::StreamRegistration {
@@ -742,12 +699,8 @@ impl LaminarDB {
             });
         }
 
-        // Register the stream's output schema as a planning placeholder so MVs and
-        // streams created later resolve `FROM <this stream>`. The running pipeline
-        // reads stream output through the operator graph, not this provider — it
-        // exists only for plan-time name resolution (start() also seeds these for
-        // any not yet present). Best-effort: a stream whose schema can't yet be
-        // planned still registers in the catalog and runs.
+        // Register as a DataFusion placeholder for plan-time name resolution by downstream MVs.
+        // Best-effort: if planning fails, the stream still runs.
         if let Some(schema) =
             crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await
         {
@@ -768,11 +721,7 @@ impl LaminarDB {
             }
         }
 
-        // If the pipeline is already running, send via control channel so
-        // the coordinator picks up the new query on the next cycle. The
-        // catalog is already updated; if the channel is saturated we have
-        // to surface that to the caller — silently dropping the message
-        // would leave the new stream registered but never running.
+        // Hot-add the query while running; a saturated channel is a retryable error.
         if let Some(ref tx) = *self.control_tx.lock() {
             tx.try_send(crate::pipeline::ControlMsg::AddStream {
                 name: name_str.clone(),
@@ -806,7 +755,6 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        // Check for dependents: MVs that reference this stream
         if cascade {
             self.cascade_drop_dependents(&name_str);
         } else {
@@ -828,10 +776,7 @@ impl LaminarDB {
 
         self.subscription_registry.drop_name(&name_str);
 
-        // Notify the running coordinator to remove the query. If the
-        // channel is saturated, surface a transient error so the caller
-        // can retry rather than seeing a successful DROP that leaves the
-        // coordinator still running the query.
+        // A saturated channel surfaces as a retryable error rather than a silent no-op.
         if let Some(ref tx) = *self.control_tx.lock() {
             tx.try_send(crate::pipeline::ControlMsg::DropStream {
                 name: name_str.clone(),
@@ -869,7 +814,6 @@ impl LaminarDB {
                         .join(", ")
                 };
 
-                // Intercept checkpoint_interval for runtime reconfiguration.
                 if key == "checkpoint_interval" {
                     return self.handle_set_checkpoint_interval(&value);
                 }
@@ -917,7 +861,6 @@ impl LaminarDB {
     pub(crate) fn find_dependents(&self, name: &str) -> Vec<String> {
         let mut dependents = Vec::new();
 
-        // Check streams: scan registered streams for SQL references to `name`
         {
             let mgr = self.connector_manager.lock();
             for (stream_name, reg) in mgr.streams() {
@@ -928,7 +871,6 @@ impl LaminarDB {
             }
         }
 
-        // Check MVs via the dependency graph
         {
             let registry = self.mv_registry.lock();
             for dep in registry.get_dependents(name) {
@@ -943,12 +885,10 @@ impl LaminarDB {
     pub(crate) fn cascade_drop_dependents(&self, name: &str) {
         let dependents = self.find_dependents(name);
         for dep in &dependents {
-            // Try dropping as stream first
             if self.catalog.drop_stream(dep) {
                 self.connector_manager.lock().unregister_stream(dep);
                 self.subscription_registry.drop_name(dep);
             }
-            // Try dropping as MV (cascade further)
             {
                 let mut registry = self.mv_registry.lock();
                 if let Ok(views) = registry.unregister_cascade(dep) {
@@ -963,11 +903,7 @@ impl LaminarDB {
         }
     }
 
-    /// Handle CREATE MATERIALIZED VIEW statement.
-    ///
-    /// Registers the view in the MV registry with dependency tracking,
-    /// then executes the backing query through `DataFusion` to obtain the
-    /// output schema.
+    /// Register a materialized view and wire it into the running pipeline.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_create_materialized_view(
@@ -983,7 +919,6 @@ impl LaminarDB {
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
 
-        // Check if the MV already exists
         {
             let registry = self.mv_registry.lock();
             if registry.get(&name_str).is_some() {
@@ -1003,10 +938,7 @@ impl LaminarDB {
 
         let query_sql = query_sql.to_string();
 
-        // Resolve the output schema by planning. Executing the query just to
-        // read its schema is wasteful and yields an empty schema for joins
-        // DataFusion can't lower (ASOF); fall back to execution only if
-        // planning fails.
+        // Planning is cheaper than execution; fall back for ASOF and other joins DataFusion can't lower.
         let schema =
             match crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await {
                 Some(s) => s,
@@ -1020,7 +952,6 @@ impl LaminarDB {
                 },
             };
 
-        // Discover source references via AST-based extraction (not substring matching)
         let table_refs = crate::sql_analysis::extract_table_references(&query_sql);
         let catalog_sources = self.catalog.list_sources();
         let mut sources: Vec<String> = catalog_sources
@@ -1028,7 +959,6 @@ impl LaminarDB {
             .filter(|s| table_refs.contains(s.as_str()))
             .collect();
 
-        // Also check existing MVs as potential sources (cascading MVs)
         {
             let registry = self.mv_registry.lock();
             for view in registry.views() {
@@ -1038,7 +968,6 @@ impl LaminarDB {
             }
         }
 
-        // Register in the MV registry
         {
             let mv =
                 laminar_core::mv::MaterializedView::new(&name_str, sql, sources, schema.clone());
@@ -1046,7 +975,6 @@ impl LaminarDB {
             let mut registry = self.mv_registry.lock();
 
             if or_replace {
-                // Drop existing view (and dependents) before re-registering
                 let _ = registry.unregister_cascade(&name_str);
             }
 
@@ -1055,10 +983,7 @@ impl LaminarDB {
                 .map_err(|e| DbError::MaterializedView(e.to_string()))?;
         }
 
-        // Reuse the planner by wrapping as a CreateStream. The MV's EMIT
-        // clause must be passed through — OperatorGraph routes
-        // EMIT ON WINDOW CLOSE to EowcQueryOperator (close-only emit),
-        // anything else to SqlQueryOperator (per-cycle emit).
+        // EMIT ON WINDOW CLOSE routes to EowcQueryOperator; other emit modes use SqlQueryOperator.
         let (plan_emit, plan_window, plan_order, plan_joins) = {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateStream {
@@ -1081,7 +1006,6 @@ impl LaminarDB {
             }
         };
 
-        // Register the MV as a stream so start() picks it up for execution
         {
             let mut mgr = self.connector_manager.lock();
             mgr.register_stream(crate::connector_manager::StreamRegistration {
@@ -1094,14 +1018,11 @@ impl LaminarDB {
             });
         }
 
-        // Register MV result store + DataFusion table provider.
         {
             use crate::mv_store::MvStorageMode;
 
-            // Non-windowed aggregates (IncrementalAggState) emit ALL groups
-            // every cycle → replace-all is correct.
-            // Windowed aggregates (CoreWindowState) only emit closing windows
-            // → must append to keep previous windows' results.
+            // Non-windowed aggs emit all groups every cycle (replace-all); windowed aggs emit
+            // only closing windows (append) so previous windows aren't overwritten.
             let has_aggregate = self.ctx.sql(&query_sql).await.ok().is_some_and(|df| {
                 crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
             });
@@ -1121,8 +1042,7 @@ impl LaminarDB {
                 self.mv_store.clone(),
             );
 
-            // In cluster mode each node holds only its vnode-owned slice of the
-            // result; wrap the local provider so reads union every peer's slice.
+            // In cluster mode each node owns a vnode slice; wrap to union peers on read.
             #[cfg(feature = "cluster")]
             let provider: Arc<dyn datafusion::datasource::TableProvider> =
                 if let Some(controller) = self.cluster_controller.lock().clone() {
@@ -1146,9 +1066,7 @@ impl LaminarDB {
             })?;
         }
 
-        // If the pipeline is already running, hot-add the query. On a
-        // saturated control channel surface a transient error rather than
-        // leaving the MV catalog-registered but not actually running.
+        // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
         if let Some(ref tx) = *self.control_tx.lock() {
             tx.try_send(crate::pipeline::ControlMsg::AddStream {
                 name: name_str.clone(),
@@ -1159,8 +1077,6 @@ impl LaminarDB {
                 join_config: plan_joins,
             })
             .map_err(|e| {
-                // Roll back every piece of state this DDL wrote so a
-                // retry starts from a clean slate.
                 let _ = self.ctx.deregister_table(&name_str);
                 let _ = self.mv_registry.lock().unregister(&name_str);
                 self.connector_manager.lock().unregister_stream(&name_str);
@@ -1186,7 +1102,6 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        // Collect names to unregister from connector manager
         let dropped_names;
         {
             let mut registry = self.mv_registry.lock();
@@ -1211,11 +1126,7 @@ impl LaminarDB {
             }
         }
 
-        // Notify the coordinator BEFORE the destructive local teardown
-        // so a saturated channel surfaces as a retryable error with
-        // local state still intact. mv_registry was already mutated
-        // above; the coordinator path treats a missing entry as
-        // "already dropped" on retry.
+        // Notify before local teardown so a saturated channel stays retryable.
         if let Some(ref tx) = *self.control_tx.lock() {
             for dropped in &dropped_names {
                 tx.try_send(crate::pipeline::ControlMsg::DropStream {
@@ -1229,7 +1140,6 @@ impl LaminarDB {
             }
         }
 
-        // Coordinator notified; now reap local state.
         {
             let mut mgr = self.connector_manager.lock();
             let mut mv_store = self.mv_store.write();
@@ -1239,7 +1149,6 @@ impl LaminarDB {
                 let _ = self.ctx.deregister_table(dropped);
             }
         }
-        // Drop subscription channels outside the locks (registry never nests in mv_store).
         for dropped in &dropped_names {
             self.subscription_registry.drop_name(dropped);
         }
@@ -1259,13 +1168,8 @@ impl LaminarDB {
         for obj_name in names {
             let name_str = obj_name.to_string();
 
-            // Remove from TableStore
             self.table_store.write().drop_table(&name_str);
-
-            // Remove from ConnectorManager
             self.connector_manager.lock().unregister_table(&name_str);
-
-            // Deregister from DataFusion context
             match self.ctx.deregister_table(&name_str) {
                 Ok(None) if !if_exists => {
                     return Err(DbError::TableNotFound(name_str));
@@ -1320,11 +1224,7 @@ const STREAMING_OPTION_KEYS: &[&str] = &[
     "watermark_delay",
 ];
 
-/// Resolved connector metadata extracted from a CREATE SOURCE/SINK statement.
-///
-/// Both `handle_create_source` and `handle_create_sink` support two syntax
-/// forms (`FROM KAFKA (...)` vs `WITH ('connector' = ...)`). This struct
-/// captures the resolved result so the resolution logic lives in one place.
+/// Normalised connector info after merging the two CREATE SOURCE/SINK syntax forms.
 pub(crate) struct ResolvedConnector {
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
@@ -1332,12 +1232,7 @@ pub(crate) struct ResolvedConnector {
     pub format_options: HashMap<String, String>,
 }
 
-/// Resolve connector info from a DDL statement that has `connector_type`,
-/// `connector_options`, `format`, and `with_options` fields.
-///
-/// Supports:
-///   1. `FROM KAFKA ('topic' = 'events', ...)` — `connector_type` is set
-///   2. `WITH ('connector' = 'kafka', ...)` — extracted from `with_options`
+/// Merge the `FROM <TYPE> (...)` and `WITH ('connector' = ...)` syntax into one result.
 pub(crate) fn resolve_connector_info(
     connector_type: Option<&String>,
     connector_options: &HashMap<String, String>,
@@ -1382,15 +1277,7 @@ pub(crate) fn validate_format(format: Option<&String>) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Extracts connector-specific options from a `WITH (...)` clause map.
-///
-/// When a source or sink is created with the `WITH ('connector' = '...', ...)`
-/// syntax (as opposed to `FROM KAFKA (...)`), the `connector` key selects the
-/// connector type and the `format` key selects the serialisation format.
-/// All remaining entries that are **not** known streaming-engine options are
-/// forwarded as connector options.
-///
-/// Returns `(connector_options, format, format_options)`.
+/// Extract `(connector_options, format, format_options)` from a `WITH (...)` clause.
 pub(crate) fn extract_connector_from_with_options(
     with_options: &HashMap<String, String>,
 ) -> (
@@ -1405,14 +1292,12 @@ pub(crate) fn extract_connector_from_with_options(
     for (key, value) in with_options {
         let lower = key.to_lowercase();
         if lower == "connector" {
-            // Already handled by the caller.
             continue;
         }
         if lower == "format" {
             format = Some(value.clone());
             continue;
         }
-        // Keys starting with "format." are format-specific sub-options.
         if let Some(suffix) = lower.strip_prefix("format.") {
             format_options.insert(suffix.to_string(), value.clone());
             continue;

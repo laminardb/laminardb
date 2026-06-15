@@ -1,9 +1,5 @@
-//! Resolve a raw provider response into a task's per-row output, given the
-//! `(task, backend)` pair. Local classification takes argmax over logits (equal
-//! to argmax of softmax — classify returns only the label, so no softmax).
-//! Sentiment is numeric: local softmaxes the logits to `P(pos) − P(neg)`, remote
-//! parses a number from the reply — a continuous score in `[-1, 1]`. Stays
-//! Arrow-free: returns [`InferenceOutputs`]; the operator builds the column.
+//! Adapt a raw provider response to a task's per-row output. Stays Arrow-free;
+//! the operator builds the column from the returned [`InferenceOutputs`].
 
 use thiserror::Error;
 
@@ -23,7 +19,7 @@ pub enum AdapterError {
     LabelIndexOutOfRange {
         /// The chosen index.
         index: usize,
-        /// The number of labels available.
+        /// Number of available labels.
         len: usize,
     },
 
@@ -31,20 +27,19 @@ pub enum AdapterError {
     #[error("classifier returned no logits for a row")]
     EmptyLogits,
 
-    /// Sentiment scoring needs both a `positive` and a `negative` label among
-    /// the model's labels to map logits to a signed score.
+    /// Sentiment scoring needs both a `positive` and a `negative` label.
     #[error(
         "sentiment scoring requires 'positive' and 'negative' among the labels, got {labels:?}"
     )]
     SentimentLabelsUnusable {
-        /// The labels that were available.
+        /// Labels that were available.
         labels: Vec<String>,
     },
 
     /// A remote sentiment reply contained no parseable number.
     #[error("remote sentiment reply had no parseable score: {reply:?}")]
     UnparseableScore {
-        /// The reply that could not be parsed.
+        /// The unparseable reply string.
         reply: String,
     },
 
@@ -55,9 +50,9 @@ pub enum AdapterError {
         task: Task,
         /// The backend kind.
         kind: BackendKind,
-        /// The shape that was expected (`text` or `vectors`).
+        /// Expected shape name.
         expected: &'static str,
-        /// The shape actually produced.
+        /// Actual shape name.
         got: &'static str,
     },
 
@@ -71,16 +66,16 @@ pub enum AdapterError {
     },
 }
 
-/// Resolve a raw provider response into the task's per-row output column.
+/// Map a raw provider response to the task's per-row output.
 ///
-/// `labels` carries the candidate/intrinsic label set for classification — the
-/// model's `id2label` for a local classifier (required), ignored otherwise.
+/// `labels` is the candidate/intrinsic label set for classification; required
+/// for local classifiers, ignored otherwise.
 ///
 /// # Errors
 ///
-/// Returns [`AdapterError`] if the output shape is wrong for the task, a local
-/// classifier has no labels or argmaxes out of range, or the task cannot run on
-/// the given backend kind.
+/// Returns [`AdapterError`] if the output shape is wrong, a local classifier
+/// has no labels or an out-of-range argmax, or the task/backend combination is
+/// unsupported.
 pub fn parse_response(
     task: Task,
     kind: BackendKind,
@@ -99,8 +94,6 @@ pub fn parse_response(
         Task::Embed => expect_vectors(task, kind, raw),
         Task::Complete | Task::Summarize | Task::Translate | Task::Gen | Task::Extract => {
             if kind != BackendKind::Remote {
-                // Narrow ONNX token-classification extraction is out of v0.1
-                // scope; generation is remote by definition.
                 return Err(AdapterError::UnsupportedCombination { task, kind });
             }
             expect_text(task, kind, raw)
@@ -108,7 +101,7 @@ pub fn parse_response(
     }
 }
 
-/// argmax over each row's logits, mapped to the model's labels.
+/// argmax over each row's logits, mapped to labels.
 fn classify_from_logits(
     kind: BackendKind,
     raw: InferenceOutputs,
@@ -140,12 +133,8 @@ fn classify_from_logits(
     Ok(InferenceOutputs::Text(out))
 }
 
-/// Coerce a remote model's free text toward the candidate label set.
-///
-/// LLMs sometimes wrap the answer ("The sentiment is Positive."). When labels
-/// are known, normalize each reply to a canonical label by exact (case-
-/// insensitive) match, then by containment; otherwise fall back to the trimmed
-/// raw text rather than dropping the row.
+/// Normalize each reply to a canonical label (exact then containment match),
+/// or fall back to trimmed raw text if none matches.
 fn coerce_remote_classification(
     raw: InferenceOutputs,
     labels: Option<&[String]>,
@@ -171,7 +160,7 @@ fn coerce_remote_classification(
     Ok(InferenceOutputs::Text(coerced))
 }
 
-/// Map free text to a canonical label, or the trimmed text if none matches.
+/// Exact (case-insensitive) then containment match; falls back to trimmed text.
 fn coerce_label(text: &str, labels: &[String]) -> String {
     let trimmed = text.trim();
     if let Some(label) = labels.iter().find(|l| l.eq_ignore_ascii_case(trimmed)) {
@@ -187,7 +176,7 @@ fn coerce_label(text: &str, labels: &[String]) -> String {
     trimmed.to_string()
 }
 
-/// Pass text outputs through, rejecting a vector shape.
+/// Pass text outputs through unchanged, rejecting other shapes.
 fn expect_text(
     task: Task,
     kind: BackendKind,
@@ -204,7 +193,7 @@ fn expect_text(
     }
 }
 
-/// Pass vector outputs through, rejecting a text shape.
+/// Pass vector outputs through unchanged, rejecting other shapes.
 fn expect_vectors(
     task: Task,
     kind: BackendKind,
@@ -221,7 +210,7 @@ fn expect_vectors(
     }
 }
 
-/// Static name of an output shape, for error messages.
+/// Static shape name for error messages.
 fn shape_name(raw: &InferenceOutputs) -> &'static str {
     match raw {
         InferenceOutputs::Text(_) => "text",
@@ -230,9 +219,7 @@ fn shape_name(raw: &InferenceOutputs) -> &'static str {
     }
 }
 
-/// Local sentiment: softmax each row's logits, then `P(positive) − P(negative)`,
-/// a signed score in `[-1, 1]`. The model's labels locate the positive and
-/// negative classes; a neutral class (if present) pulls the score toward 0.
+/// Softmax each row's logits, return `P(positive) − P(negative)` in `[-1, 1]`.
 fn sentiment_from_logits(
     raw: InferenceOutputs,
     labels: Option<&[String]>,
@@ -273,7 +260,7 @@ fn sentiment_from_logits(
     Ok(InferenceOutputs::Scores(scores))
 }
 
-/// Remote sentiment: parse a number from each reply and clamp to `[-1, 1]`.
+/// Parse a number from each reply and clamp to `[-1, 1]`.
 fn sentiment_from_text(raw: InferenceOutputs) -> Result<InferenceOutputs, AdapterError> {
     let texts = match raw {
         InferenceOutputs::Text(texts) => texts,
@@ -294,7 +281,7 @@ fn sentiment_from_text(raw: InferenceOutputs) -> Result<InferenceOutputs, Adapte
     Ok(InferenceOutputs::Scores(scores))
 }
 
-/// Numerically stable softmax over a row of logits.
+/// Numerically stable softmax.
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut exps: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
@@ -307,16 +294,15 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     exps
 }
 
-/// Parse the first number out of a reply (`"0.8"`, `"The sentiment is -0.5."`),
-/// or `None` if there is none.
+/// Extract the first number from a reply string, or `None`.
 fn parse_score(reply: &str) -> Option<f64> {
     let trimmed = reply.trim();
     if let Ok(v) = trimmed.parse::<f64>() {
         return Some(v);
     }
     trimmed.split_whitespace().find_map(|token| {
-        // Strip surrounding punctuation: a leading sign/digit may start it, but
-        // only a digit may end it (so a sentence-final '.' isn't kept).
+        // Strip punctuation: leading sign/digit may start; only a digit may end
+        // (so a sentence-final '.' isn't kept).
         token
             .trim_start_matches(|c: char| !(c.is_ascii_digit() || c == '-'))
             .trim_end_matches(|c: char| !c.is_ascii_digit())
@@ -325,7 +311,7 @@ fn parse_score(reply: &str) -> Option<f64> {
     })
 }
 
-/// Index of the maximum value, or `None` for an empty slice.
+/// Index of the maximum value, or `None` if empty.
 fn argmax(values: &[f32]) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (index, &value) in values.iter().enumerate() {

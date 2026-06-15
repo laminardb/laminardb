@@ -15,7 +15,7 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
-    {{- if .Values.service.pgEnabled }}
+    {{- if .Values.laminardb.pgwire.enabled }}
     - port: {{ .Values.service.pgPort }}
       targetPort: pg
       protocol: TCP

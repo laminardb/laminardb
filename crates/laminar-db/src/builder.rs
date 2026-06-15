@@ -36,44 +36,26 @@ pub struct LaminarDbBuilder {
     object_store_options: HashMap<String, String>,
     custom_udfs: Vec<ScalarUDF>,
     custom_udafs: Vec<AggregateUDF>,
-    /// Cluster control facade installed at cluster-mode startup.
-    /// Stays `None` in embedded / single-instance builds.
     #[cfg(feature = "cluster")]
     cluster_controller: Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
-    /// Outbound shuffle handle for cluster-mode streaming aggregates.
-    /// Pair with `shuffle_receiver`; without it, streaming aggregates
-    /// run single-node even when the cluster controller is installed.
     #[cfg(feature = "cluster")]
     shuffle_sender: Option<std::sync::Arc<laminar_core::shuffle::ShuffleSender>>,
-    /// Inbound shuffle handle for cluster-mode streaming aggregates.
     #[cfg(feature = "cluster")]
     shuffle_receiver: Option<std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>>,
-    /// Commit-marker store for cross-instance 2PC.
     #[cfg(feature = "cluster")]
     decision_store: Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
-    /// Assignment-snapshot store for dynamic rebalance.
     #[cfg(feature = "cluster")]
     assignment_snapshot_store:
         Option<std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
-    /// Catalog-manifest store for cluster-wide DDL replay on boot/rebalance.
     #[cfg(feature = "cluster")]
     catalog_manifest_store:
         Option<std::sync::Arc<laminar_core::cluster::control::CatalogManifestStore>>,
-    /// Optional state backend. When paired with `vnode_registry`, the
-    /// coordinator writes per-vnode durability markers each checkpoint
-    /// and consults `epoch_complete` before committing sinks.
     state_backend: Option<std::sync::Arc<dyn laminar_core::state::StateBackend>>,
-    /// Optional vnode topology. See `state_backend`.
     vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
-    /// Extra physical optimizer rules installed on the `SessionState`
-    /// at construction.
     physical_optimizer_rules: Vec<
         std::sync::Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
     >,
-    /// Override for `target_partitions`; cluster mode sets this to
-    /// `vnode_count`. Default 1 for single-instance streaming.
     target_partitions: Option<usize>,
-    /// Assembled AI subsystem; installed when `[ai]`/`[models]` are configured.
     ai_runtime: Option<std::sync::Arc<crate::ai::AiRuntime>>,
 }
 
@@ -111,17 +93,14 @@ impl LaminarDbBuilder {
         }
     }
 
-    /// Install the assembled AI subsystem (model registry + provider clients +
-    /// result cache + call log). Without it, `ai_*` SQL functions fail at plan
-    /// time. Built from server `[ai]`/`[models]` configuration.
+    /// Install the AI subsystem; required for `ai_*` SQL functions.
     #[must_use]
     pub fn ai(mut self, runtime: std::sync::Arc<crate::ai::AiRuntime>) -> Self {
         self.ai_runtime = Some(runtime);
         self
     }
 
-    /// Override `target_partitions`; requires a distributed-aware
-    /// physical optimizer rule to replace `RepartitionExec`.
+    /// Override `target_partitions`.
     #[must_use]
     pub fn target_partitions(mut self, n: usize) -> Self {
         self.target_partitions = Some(n);
@@ -140,9 +119,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a state backend. Must be paired with
-    /// [`Self::vnode_registry`] — `build()` rejects a half-set
-    /// configuration.
+    /// Install a state backend; must be paired with [`Self::vnode_registry`].
     #[must_use]
     pub fn state_backend(
         mut self,
@@ -152,9 +129,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a vnode registry. Must be paired with
-    /// [`Self::state_backend`] — `build()` rejects a half-set
-    /// configuration.
+    /// Install a vnode registry; must be paired with [`Self::state_backend`].
     #[must_use]
     pub fn vnode_registry(
         mut self,
@@ -164,10 +139,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a cluster control facade. Activates cluster-mode
-    /// checkpoint / shuffle semantics inside the engine. Called from
-    /// `laminar-server`'s cluster startup path after discovery has
-    /// converged.
+    /// Install the cluster control facade; activates cluster-mode checkpoint/shuffle.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn cluster_controller(
@@ -178,10 +150,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install the outbound shuffle handle used by cluster-mode streaming
-    /// aggregates. Rows whose group key hashes to a remote vnode are
-    /// shipped through this sender. Pair with [`Self::shuffle_receiver`];
-    /// either alone is a no-op.
+    /// Install the outbound shuffle handle; pair with [`Self::shuffle_receiver`].
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn shuffle_sender(
@@ -192,9 +161,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install the inbound shuffle handle used by cluster-mode streaming
-    /// aggregates. Remote partial-aggregate rows arrive here and are
-    /// drained into the local accumulator each cycle.
+    /// Install the inbound shuffle handle; pair with [`Self::shuffle_sender`].
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn shuffle_receiver(
@@ -274,6 +241,24 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Cap total operator state held in memory. Crossing the budget pauses
+    /// source intake (backpressure, not failure) until state drains below it.
+    #[must_use]
+    pub fn state_memory_budget_bytes(mut self, bytes: usize) -> Self {
+        self.config.state_memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Enable the disk cold tier at `dir`. With a memory budget set, operator
+    /// state approaching the budget is demoted here instead of backpressuring,
+    /// and fetched back on demand. Requires the `state-tier` build feature.
+    #[cfg(feature = "state-tier")]
+    #[must_use]
+    pub fn state_tier_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.state_tier_dir = Some(dir.into());
+        self
+    }
+
     /// Set checkpoint configuration.
     #[must_use]
     pub fn checkpoint(mut self, config: StreamCheckpointConfig) -> Self {
@@ -321,72 +306,42 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Register a custom scalar UDF with the database.
-    ///
-    /// The UDF will be available in SQL queries after `build()`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use datafusion_expr::ScalarUDF;
-    ///
-    /// let db = LaminarDB::builder()
-    ///     .register_udf(my_scalar_udf)
-    ///     .build()
-    ///     .await?;
-    /// ```
+    /// Register a custom scalar UDF; available in SQL after `build()`.
     #[must_use]
     pub fn register_udf(mut self, udf: ScalarUDF) -> Self {
         self.custom_udfs.push(udf);
         self
     }
 
-    /// Register a custom aggregate UDF (UDAF) with the database.
-    ///
-    /// The UDAF will be available in SQL queries after `build()`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use datafusion_expr::AggregateUDF;
-    ///
-    /// let db = LaminarDB::builder()
-    ///     .register_udaf(my_aggregate_udf)
-    ///     .build()
-    ///     .await?;
-    /// ```
+    /// Register a custom aggregate UDF; available in SQL after `build()`.
     #[must_use]
     pub fn register_udaf(mut self, udaf: AggregateUDF) -> Self {
         self.custom_udafs.push(udaf);
         self
     }
 
-    /// Source → coordinator channel capacity (default 64). Increase for
-    /// burst absorption at the cost of memory.
+    /// Source → coordinator channel capacity (default 64).
     #[must_use]
     pub fn pipeline_channel_capacity(mut self, capacity: usize) -> Self {
         self.config.pipeline_channel_capacity = Some(capacity);
         self
     }
 
-    /// Micro-batch coalescing window (default 5ms for connectors, 0 for
-    /// embedded). Larger values amortize per-cycle SQL overhead.
+    /// Micro-batch coalescing window (default 5ms for connectors, 0 for embedded).
     #[must_use]
     pub fn pipeline_batch_window(mut self, window: std::time::Duration) -> Self {
         self.config.pipeline_batch_window = Some(window);
         self
     }
 
-    /// Max time draining the source channel per cycle, in nanoseconds
-    /// (default 1ms). Increase to process more messages per SQL execution.
+    /// Max drain time per cycle in nanoseconds (default 1ms).
     #[must_use]
     pub fn pipeline_drain_budget_ns(mut self, ns: u64) -> Self {
         self.config.pipeline_drain_budget_ns = Some(ns);
         self
     }
 
-    /// Per-query execution budget in nanoseconds (default 8ms). When
-    /// exceeded, remaining queries are deferred to the next cycle.
+    /// Per-query execution budget in nanoseconds (default 8ms).
     #[must_use]
     pub fn pipeline_query_budget_ns(mut self, ns: u64) -> Self {
         self.config.pipeline_query_budget_ns = Some(ns);
@@ -417,22 +372,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Register custom connectors with the `ConnectorRegistry`.
-    ///
-    /// The callback is invoked after the database is created and built-in
-    /// connectors are registered. Use it to add user-defined source/sink
-    /// implementations.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let db = LaminarDB::builder()
-    ///     .register_connector(|registry| {
-    ///         registry.register_source("my-source", info, factory);
-    ///     })
-    ///     .build()
-    ///     .await?;
-    /// ```
+    /// Register custom connectors; the callback runs after built-ins are wired.
     #[must_use]
     pub fn register_connector(
         mut self,
@@ -449,16 +389,13 @@ impl LaminarDbBuilder {
     /// Returns `DbError` if database creation fails.
     #[allow(clippy::unused_async)]
     pub async fn build(mut self) -> Result<LaminarDB, DbError> {
-        // Forward object store settings into the config before profile detection.
         self.config.object_store_url = self.object_store_url;
         self.config.object_store_options = self.object_store_options;
 
-        // Auto-detect profile from config if not explicitly set.
         if !self.profile_explicit {
             self.profile = Profile::from_config(&self.config, false);
         }
 
-        // Validate profile feature gates and config requirements.
         self.profile
             .validate_features()
             .map_err(|e| DbError::Config(e.to_string()))?;
@@ -468,7 +405,7 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
 
-        // State backend and vnode registry must be paired.
+        // state_backend and vnode_registry must be paired or both absent.
         match (&self.state_backend, &self.vnode_registry) {
             (Some(_), None) => {
                 return Err(DbError::Config(
@@ -483,7 +420,6 @@ impl LaminarDbBuilder {
             _ => {}
         }
 
-        // Apply profile defaults for fields the user hasn't set.
         self.profile.apply_defaults(&mut self.config);
 
         let mut db = LaminarDB::open_with_config_and_vars_and_rules(
@@ -493,7 +429,6 @@ impl LaminarDbBuilder {
             self.target_partitions,
         )?;
         if let Some(runtime) = self.ai_runtime {
-            // Inference workers require a running Tokio runtime.
             let handle = tokio::runtime::Handle::try_current().map_err(|_| {
                 DbError::InvalidOperation(
                     "LaminarDB::build() with an AI runtime must run inside a Tokio runtime"
@@ -553,7 +488,6 @@ impl LaminarDbBuilder {
             return Ok(());
         }
 
-        // Non-default policy needs at least one finite, non-zero cap.
         let has_count_cap = config.pipeline_max_input_buf_batches.is_none_or(|c| c > 0);
         let has_byte_cap = config.pipeline_max_input_buf_bytes.is_some_and(|b| b > 0);
         if !has_count_cap && !has_byte_cap {

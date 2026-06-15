@@ -11,25 +11,6 @@ use super::query::{QueryResult, QueryStream};
 use crate::{LaminarConfig, LaminarDB};
 
 /// Thread-safe database connection for FFI.
-///
-/// This is a wrapper around `LaminarDB` that provides:
-/// - Explicit `Send + Sync` markers for FFI safety
-/// - `close()` method returning `Result` for error handling
-/// - Untyped Arrow API without Rust trait bounds
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_db::api::Connection;
-///
-/// let conn = Connection::open()?;
-/// conn.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")?;
-///
-/// let result = conn.query("SELECT * FROM trades")?;
-/// println!("Got {} rows", result.num_rows());
-///
-/// conn.close()?;
-/// ```
 pub struct Connection {
     inner: Arc<LaminarDB>,
 }
@@ -61,9 +42,6 @@ impl Connection {
 
     /// Execute a SQL statement (blocking wrapper around async).
     ///
-    /// Supports: `CREATE SOURCE/SINK/STREAM`, `DROP`, `SELECT`, `INSERT INTO`,
-    /// `SHOW`, `DESCRIBE`, `EXPLAIN`, `CREATE MATERIALIZED VIEW`.
-    ///
     /// # Errors
     ///
     /// Returns `ApiError` if SQL parsing, planning, or execution fails.
@@ -76,9 +54,7 @@ impl Connection {
             return Err(ApiError::shutdown());
         }
 
-        // Create or use existing runtime for blocking
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // Already in async context - use spawn_blocking to avoid nesting
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let inner = Arc::clone(&self.inner);
@@ -89,7 +65,6 @@ impl Connection {
                 .unwrap()
             })
         } else {
-            // No runtime - create one
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -176,7 +151,6 @@ impl Connection {
     ///
     /// Returns `ApiError::table_not_found` if the name is not found.
     pub fn get_schema(&self, name: &str) -> Result<SchemaRef, ApiError> {
-        // Check sources
         for source in self.inner.sources() {
             if source.name == name {
                 return Ok(source.schema);
@@ -242,19 +216,11 @@ impl Connection {
     /// Currently always succeeds.
     #[allow(clippy::unnecessary_wraps)]
     pub fn close(self) -> Result<(), ApiError> {
-        // Signal shutdown
         self.inner.close();
-
-        // Try to get exclusive ownership for cleanup
+        // Exclusive ownership → cleanup runs in drop; else other handles persist.
         match Arc::try_unwrap(self.inner) {
-            Ok(_db) => {
-                // Exclusive ownership - cleanup happens in drop
-                Ok(())
-            }
-            Err(_arc) => {
-                // Other references exist - still marked as closed
-                Ok(())
-            }
+            Ok(_db) => Ok(()),
+            Err(_arc) => Ok(()),
         }
     }
 
@@ -333,7 +299,7 @@ impl Connection {
         self.inner.pipeline_topology()
     }
 
-    /// Get the pipeline state as a string ("Created", "Running", "Stopped", etc.).
+    /// Get the pipeline state as a string.
     #[must_use]
     pub fn pipeline_state(&self) -> String {
         self.inner.pipeline_state().to_string()
@@ -373,6 +339,13 @@ impl Connection {
     #[must_use]
     pub fn metrics(&self) -> crate::PipelineMetrics {
         self.inner.metrics()
+    }
+
+    /// Cold-tier demotion/promotion metrics (single-node observability).
+    #[cfg(feature = "state-tier")]
+    #[must_use]
+    pub fn tier_metrics(&self) -> crate::TierMetrics {
+        self.inner.tier_metrics()
     }
 
     /// Get metrics for a specific source.
@@ -439,11 +412,7 @@ impl Connection {
         result.map_err(ApiError::from)
     }
 
-    /// Subscribe to a named stream, returning an `ArrowSubscription`.
-    ///
-    /// The stream must already exist (created via `CREATE STREAM ... AS SELECT ...`).
-    /// Returns a channel-based subscription that delivers `RecordBatch`es as
-    /// they are produced by the streaming pipeline.
+    /// Subscribe to a named stream.
     ///
     /// # Errors
     ///
@@ -463,20 +432,18 @@ impl Connection {
     }
 }
 
-// Thread safety guarantees for FFI.
 // SAFETY: LaminarDB uses Arc, Mutex, and atomic types internally.
-// All public methods take &self and use internal synchronization.
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
-/// Result of executing a SQL statement (API variant).
+/// Result of executing a SQL statement.
 #[derive(Debug)]
 pub enum ExecuteResult {
-    /// DDL statement completed (CREATE, DROP, ALTER).
+    /// DDL statement completed.
     Ddl(crate::DdlInfo),
-    /// Query is running, results available via stream.
+    /// Query running; results available via stream.
     Query(QueryStream),
-    /// Rows were affected (INSERT INTO).
+    /// Rows affected (INSERT INTO).
     RowsAffected(u64),
     /// Metadata result (SHOW, DESCRIBE).
     Metadata(RecordBatch),

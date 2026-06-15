@@ -30,7 +30,7 @@ pub enum SubscribeStart {
 
 #[derive(Debug)]
 pub(crate) struct ReplayPruned {
-    /// Earliest barrier epoch still in the log, or `0` if none retained.
+    /// Earliest barrier epoch still in the log; `0` if the log is empty.
     pub(crate) earliest_retained: u64,
 }
 
@@ -179,7 +179,6 @@ impl SubscriptionRegistry {
             .map_or(0, |log| log.subscriber_count())
     }
 
-    /// Only the cluster subscription router consults this.
     #[cfg(feature = "cluster")]
     pub(crate) fn active_subscription_names(&self) -> Vec<String> {
         self.streams

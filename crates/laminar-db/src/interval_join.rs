@@ -1,13 +1,7 @@
 #![deny(clippy::disallowed_types)]
 
-//! Stream-stream interval join execution.
-//!
-//! Implements a stateful interval join that buffers rows from both sides
-//! across execution cycles, matching any pair where
-//! `|left_ts - right_ts| <= time_bound_ms`. Expired rows are evicted
-//! when the watermark advances beyond `time_bound_ms`.
-//!
-//! The join state is checkpointed via Arrow IPC serialization.
+//! Stream-stream interval join: buffers both sides and matches pairs where
+//! `|left_ts - right_ts| <= time_bound_ms`. Evicts expired rows on watermark advance.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,23 +17,16 @@ use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
 use crate::key_column::{extract_column_as_timestamps, extract_key_column, KeyColumn};
 
-/// Compact when accumulated batch count exceeds this threshold.
 const COMPACTION_THRESHOLD: usize = 32;
 
-/// Flush partial output once the match buffer reaches this many pairs.
-/// Bounds memory on cross-product shapes.
+/// Caps memory on cross-product shapes.
 const EMIT_THRESHOLD: usize = 65_536;
 
-/// Index type: `key_hash` → sorted `timestamp` → list of `(batch_idx, row_idx)`.
 type SideIndex = FxHashMap<u64, BTreeMap<i64, Vec<(usize, usize)>>>;
 
-/// Per-side state for interval join, persisted across cycles.
 pub(crate) struct SideState {
-    /// Accumulated batches from previous cycles, compacted periodically.
     batches: Vec<RecordBatch>,
-    /// Index: `key_hash` → `BTreeMap<timestamp, Vec<(batch_idx, row_idx)>>`
     index: SideIndex,
-    /// Total buffered rows.
     row_count: usize,
 }
 
@@ -52,7 +39,6 @@ impl SideState {
         }
     }
 
-    /// Add a batch and index its rows.
     pub(crate) fn add_batch(
         &mut self,
         batch: &RecordBatch,
@@ -77,14 +63,13 @@ impl SideState {
                     .push((batch_idx, row_idx));
                 indexed_rows += 1;
             }
-            // Null keys are skipped per SQL three-valued logic
+            // null keys never match (SQL three-valued logic)
         }
         self.row_count += indexed_rows;
         self.batches.push(batch.clone());
         Ok(())
     }
 
-    /// Remove entries matching `(key_hash, timestamp)` with verified key equality.
     pub(crate) fn remove_by_key_ts(
         &mut self,
         key_hash: u64,
@@ -100,7 +85,7 @@ impl SideState {
             return Ok(());
         };
 
-        // `Vec::retain` can't surface errors, so do it by hand.
+        // Vec::retain can't surface errors.
         let mut kept: Vec<(usize, usize)> = Vec::with_capacity(entries.len());
         for &(batch_idx, row_idx) in entries.iter() {
             let stored_key = extract_key_column(&self.batches[batch_idx], key_col_name)?;
@@ -120,31 +105,23 @@ impl SideState {
         Ok(())
     }
 
-    /// Evict all rows with `ts < cutoff`, then compact if batch count exceeds threshold.
     fn evict_before(&mut self, cutoff: i64, key_col: &str, time_col: &str) -> Result<(), DbError> {
-        // Collect entries to remove from each btree
         for btree in self.index.values_mut() {
-            // BTreeMap::split_off returns entries >= cutoff; we keep those.
             let keep = btree.split_off(&cutoff);
-            // Count evicted rows
             for entries in btree.values() {
                 self.row_count = self.row_count.saturating_sub(entries.len());
             }
             *btree = keep;
         }
-        // Remove empty btrees
         self.index.retain(|_, btree| !btree.is_empty());
 
-        // Compact when too many batches have accumulated (dead rows waste memory)
         if self.batches.len() > COMPACTION_THRESHOLD {
             self.compact(key_col, time_col)?;
         }
         Ok(())
     }
 
-    /// Compact all live rows into a single batch, freeing dead batch memory.
     fn compact(&mut self, key_col: &str, time_col: &str) -> Result<(), DbError> {
-        // Collect all live (batch_idx, row_idx) from the index
         let mut live_rows: Vec<(usize, usize)> = Vec::with_capacity(self.row_count);
         for btree in self.index.values() {
             for entries in btree.values() {
@@ -157,10 +134,8 @@ impl SideState {
             return Ok(());
         }
 
-        // Sort by (batch_idx, row_idx) for sequential access
         live_rows.sort_unstable();
 
-        // One `take` per source batch over the contiguous run of live rows.
         let mut taken: Vec<RecordBatch> = Vec::new();
         let mut i = 0;
         while i < live_rows.len() {
@@ -193,7 +168,6 @@ impl SideState {
         let compacted = concat_batches(&schema, &taken)
             .map_err(|e| DbError::query_pipeline_arrow("interval join (compact)", &e))?;
 
-        // Replace batches and rebuild index
         self.batches = vec![compacted];
         self.index.clear();
 
@@ -214,20 +188,16 @@ impl SideState {
     }
 }
 
-/// Complete interval join state for one query.
+/// Per-query interval join state.
 pub(crate) struct IntervalJoinState {
     pub(crate) left: SideState,
     pub(crate) right: SideState,
-    /// Last cutoff used for left-side eviction (derived from right watermark).
     left_evicted_cutoff: i64,
-    /// Last cutoff used for right-side eviction (derived from left watermark).
     right_evicted_cutoff: i64,
-    /// Output schema (left cols + right cols).
     output_schema: Option<SchemaRef>,
 }
 
 impl IntervalJoinState {
-    /// Create empty state.
     pub(crate) fn new() -> Self {
         Self {
             left: SideState::new(),
@@ -238,7 +208,6 @@ impl IntervalJoinState {
         }
     }
 
-    /// Estimated total memory usage in bytes.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let mut size = 0usize;
         for b in &self.left.batches {
@@ -247,15 +216,13 @@ impl IntervalJoinState {
         for b in &self.right.batches {
             size += b.get_array_memory_size();
         }
-        // Rough estimate: index overhead ~64 bytes per entry
         let index_entries: usize = self.left.index.values().map(BTreeMap::len).sum::<usize>()
             + self.right.index.values().map(BTreeMap::len).sum::<usize>();
         size += index_entries * 64;
         size
     }
 
-    /// Serialize to checkpoint. Compacts both sides first so that only live
-    /// rows are serialized (dead/evicted rows in old batches are discarded).
+    /// Compacts both sides before serialization to avoid checkpointing dead rows.
     pub(crate) fn snapshot_checkpoint(
         &mut self,
         left_key: &str,
@@ -263,7 +230,6 @@ impl IntervalJoinState {
         right_key: &str,
         right_time: &str,
     ) -> Result<JoinStateCheckpoint, DbError> {
-        // Compact before serialization to avoid checkpointing dead rows
         if !self.left.batches.is_empty() {
             self.left.compact(left_key, left_time)?;
         }
@@ -303,8 +269,7 @@ impl IntervalJoinState {
         })
     }
 
-    /// Restore from a checkpoint. The index is rebuilt from the deserialized
-    /// batches using the provided key/time column names.
+    /// Restores from a checkpoint, rebuilding the index from deserialized batches.
     pub(crate) fn from_checkpoint(
         cp: &JoinStateCheckpoint,
         left_key_col: &str,
@@ -338,11 +303,8 @@ impl IntervalJoinState {
     }
 }
 
-/// Build the merged output schema from left and right schemas.
-/// The joined output schema: left fields, then right fields suffixed with
-/// `_{right_table}`. Shared with the processing-time join so both produce the
-/// column names the residual projection (built by `build_stream_join_projection_sql`)
-/// expects.
+/// Left fields then right fields suffixed with `_{right_table}`.
+/// Shared with the processing-time join to match the residual projection column names.
 pub(crate) fn build_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
@@ -388,9 +350,7 @@ pub(crate) fn build_output_schema(
     Arc::new(Schema::new(fields))
 }
 
-/// Probe one side's index for matches against a single row from the other side.
-///
-/// Returns all `(batch_idx, row_idx)` where `|probe_ts - candidate_ts| <= bound_ms`.
+/// All `(batch_idx, row_idx)` where `|probe_ts - candidate_ts| <= bound_ms`.
 fn probe_index(
     index: &SideIndex,
     key_hash: u64,
@@ -409,8 +369,6 @@ fn probe_index(
     results
 }
 
-/// Drain `match_pairs` into one output batch via `arrow::compute::interleave` —
-/// one call per column, no per-row slice + concat.
 fn flush_match_pairs(
     match_pairs: &mut Vec<(usize, usize, usize, usize)>,
     output_schema: &SchemaRef,
@@ -470,12 +428,7 @@ fn flush_match_pairs(
     Ok(())
 }
 
-/// Execute one cycle of an interval join.
-///
-/// Bounds are inclusive: `|left_ts - right_ts| <= bound_ms`. NULL keys are
-/// skipped. New left rows probe all right; new right rows probe only old left
-/// (avoids double-emit). State is compacted on eviction when batch count
-/// exceeds `COMPACTION_THRESHOLD`.
+/// One cycle: new left rows probe all right; new right rows probe only old left (avoids double-emit).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_interval_join_cycle(
     state: &mut IntervalJoinState,
@@ -523,7 +476,7 @@ pub(crate) fn execute_interval_join_cycle(
         }
     }
 
-    // A pure-delete CDC batch yields zero positive rows; treat it as None
+    // A pure-delete CDC batch has zero positive rows; treat it as None
     // so new_*_batch_idx never points past the end of state.
     let concat_nonempty =
         |slices: &[RecordBatch], side: &str| -> Result<Option<RecordBatch>, DbError> {
@@ -538,9 +491,8 @@ pub(crate) fn execute_interval_join_cycle(
     let new_left = concat_nonempty(&left_pos, "interval join (left concat)")?;
     let new_right = concat_nonempty(&right_pos, "interval join (right concat)")?;
 
-    // Buffer before probing so every (batch_idx, row_idx) we produce already
-    // points into state.batches — lets flush_match_pairs run mid-probe
-    // without juggling in-flight batch references.
+    // Buffer first so every (batch_idx, row_idx) already points into state.batches,
+    // letting flush_match_pairs run mid-probe without juggling in-flight references.
     let left_old_count = state.left.batches.len();
     let right_old_count = state.right.batches.len();
     if let Some(ref rb) = new_right {
@@ -561,7 +513,6 @@ pub(crate) fn execute_interval_join_cycle(
         StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
     );
 
-    // Refresh the output schema once both sides have been seen.
     {
         let left_schema = state.left.batches.first().map(RecordBatch::schema);
         let right_schema = state.right.batches.first().map(RecordBatch::schema);
@@ -587,11 +538,8 @@ pub(crate) fn execute_interval_join_cycle(
     let is_anti = config.join_type == StreamJoinType::LeftAnti;
     let mut result: Vec<RecordBatch> = Vec::new();
 
-    // Borrow batches immutably for the probe; eviction below needs &mut so
-    // the cached key columns must drop first.
     {
-        // One KeyColumn per buffered batch — saves a schema lookup +
-        // downcast per candidate inside the inner probe loops.
+        // One KeyColumn per buffered batch — avoids a schema lookup + downcast per candidate.
         let left_key_cols: Vec<KeyColumn<'_>> = state
             .left
             .batches
@@ -605,7 +553,6 @@ pub(crate) fn execute_interval_join_cycle(
             .map(|b| extract_key_column(b, &config.right_key))
             .collect::<Result<_, _>>()?;
 
-        // Anti emits only at eviction; don't bother accumulating pairs we'll discard.
         let collect_pairs = !is_anti;
         let mut match_pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut semi_matched: FxHashSet<usize> = FxHashSet::default();
@@ -627,7 +574,7 @@ pub(crate) fn execute_interval_join_cycle(
             )
         };
 
-        // Step 1: probe new left rows against all right (old + new).
+        // Probe new left against all right (old + new).
         if new_left.is_some() {
             let lb_kc = &left_key_cols[new_left_batch_idx];
             let lb_ts = extract_column_as_timestamps(
@@ -662,8 +609,7 @@ pub(crate) fn execute_interval_join_cycle(
             }
         }
 
-        // Step 2: probe new right rows against OLD left rows only — new_left ×
-        // new_right pairs were already produced in step 1.
+        // Probe new right against OLD left only — new_left × new_right already covered above.
         if new_right.is_some() {
             let rb_kc = &right_key_cols[new_right_batch_idx];
             let rb_ts = extract_column_as_timestamps(
@@ -694,8 +640,7 @@ pub(crate) fn execute_interval_join_cycle(
 
         flush(&mut match_pairs, &mut result)?;
 
-        // Step 3: emit unmatched rows about to be evicted (LEFT/RIGHT/FULL/ANTI).
-        // Runs before eviction so the opposite side's state is still complete.
+        // Emit unmatched rows about to be evicted — must run before eviction.
         if matches!(
             config.join_type,
             StreamJoinType::Left | StreamJoinType::Full | StreamJoinType::LeftAnti
@@ -731,9 +676,7 @@ pub(crate) fn execute_interval_join_cycle(
         }
     }
 
-    // Step 4: evict. A left row at ts can only still match right rows with
-    // ts in [left_ts - bound, left_ts + bound], so once the right watermark
-    // passes left_ts + bound it's safe to drop. Symmetric for right.
+    // A left row at ts is evictable once the right watermark passes ts + bound. Symmetric for right.
     let left_cutoff = right_watermark.saturating_sub(bound_ms);
     if left_cutoff > state.left_evicted_cutoff {
         state
@@ -752,8 +695,7 @@ pub(crate) fn execute_interval_join_cycle(
     Ok(result)
 }
 
-/// LEFT/ANTI: emit pre-eviction left rows with no match in current right state.
-/// Output is chunked at `EMIT_THRESHOLD` rows.
+/// LEFT/ANTI: emit pre-eviction left rows with no match in right state.
 fn emit_unmatched_left_rows(
     state: &IntervalJoinState,
     left_key_cols: &[KeyColumn<'_>],
@@ -841,7 +783,6 @@ fn emit_unmatched_left_rows(
     Ok(())
 }
 
-/// RIGHT/FULL: symmetric to `emit_unmatched_left_rows`.
 fn emit_unmatched_right_rows(
     state: &IntervalJoinState,
     left_key_cols: &[KeyColumn<'_>],

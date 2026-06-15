@@ -60,13 +60,8 @@ pub(crate) fn filter_positive_events(batch: &RecordBatch) -> Result<RecordBatch,
         .map_err(|e| DbError::Pipeline(format!("changelog filter: {e}")))
 }
 
-/// For non-changelog sinks, drop rows with non-positive `__weight` and strip
-/// the column. Otherwise the input is borrowed unchanged.
-///
-/// Fail-closed: any error on the filter/strip path returns an empty batch
-/// with `__weight` removed rather than leaking negative weights or an
-/// unexpected column into an append-only sink (which would either corrupt
-/// the table or break its schema).
+/// Drop rows with non-positive `__weight` and strip the column for non-changelog sinks.
+/// Fail-closed: errors return an empty batch rather than leaking negatives into the sink.
 pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> Cow<'_, RecordBatch> {
     if changelog_sink {
         return Cow::Borrowed(batch);
@@ -77,8 +72,6 @@ pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> Cow
     else {
         return Cow::Borrowed(batch);
     };
-    // Schema with `__weight` removed — the only safe fallback for an
-    // append-only sink when we can't filter properly.
     let stripped_schema = {
         let fields: Vec<_> = batch
             .schema()

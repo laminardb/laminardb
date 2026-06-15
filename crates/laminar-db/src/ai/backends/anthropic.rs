@@ -1,8 +1,5 @@
-//! Anthropic Messages API provider.
-//!
-//! Drives the discriminative and generative tasks (one bounded-concurrent call
-//! per input row). Anthropic exposes no embeddings endpoint, so `ai_embed` is
-//! rejected — use the OpenAI-compatible provider for embeddings.
+//! Anthropic Messages API provider. One bounded-concurrent call per input row.
+//! `ai_embed` is unsupported — use the OpenAI-compatible provider for embeddings.
 
 use std::time::Duration;
 
@@ -19,7 +16,7 @@ use crate::ai::registry::Task;
 const REQUEST_TIMEOUT_MS: u64 = 60_000;
 const MAX_RETRIES: u32 = 2;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Messages API requires `max_tokens`; this caps a single reply.
+/// Messages API requires `max_tokens`.
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
 /// Anthropic Messages provider.
@@ -31,9 +28,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    /// Build a provider for `base_url` (e.g. `https://api.anthropic.com`),
-    /// authenticating with `api_key` and issuing at most `max_concurrency`
-    /// concurrent requests per batch.
+    /// Build an Anthropic provider.
     ///
     /// # Errors
     ///
@@ -164,7 +159,7 @@ struct AnthropicUsage {
     output_tokens: u64,
 }
 
-/// Take the first text content block and token usage from a messages response.
+/// Extract the first text block and usage from a messages response.
 fn parse_message(response: MessageResponse) -> Result<(String, Usage), ProviderError> {
     let text = response
         .content

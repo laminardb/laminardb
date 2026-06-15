@@ -45,6 +45,13 @@ files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
 cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
+# Disk cold tier for demoted operator state. Implies `cluster` because the
+# demotion unit is the (operator, vnode) checkpoint slice. fjall's major
+# version is pinned: its on-disk format is a storage-format commitment. The
+# tier is rebuildable scratch (truth lives in checkpoints; wiped and replayed
+# on restart), so a storage-engine fault costs a rehydration, not data — which
+# bounds the integrity risk of the embedded LSM.
+state-tier = ["cluster", "dep:fjall"]
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]
 azure = ["laminar-core/azure"]
@@ -52,9 +59,9 @@ remote = ["dep:reqwest", "dep:governor"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.25.1" }
-laminar-sql = { path = "../laminar-sql", version = "0.25.1" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.25.1" }
+laminar-core = { path = "../laminar-core", version = "0.26.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.26.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.26.0" }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 quick_cache = { workspace = true }
@@ -127,6 +134,9 @@ prometheus = { workspace = true }
 # Zero-copy byte buffers (used by state backend payloads).
 bytes = { workspace = true }
 
+# Cold tier for demoted operator state (feature `state-tier`).
+fjall = { version = "3.1", optional = true }
+
 # Object-store handle for the auto-wired 2PC decision store (single-instance
 # uses `LocalFileSystem`; cluster reuses the configured remote store).
 object_store = { workspace = true }
@@ -138,8 +148,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.25.1" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.25.1", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.26.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.26.0", features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }

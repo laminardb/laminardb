@@ -16,8 +16,7 @@ use arrow::datatypes::SchemaRef;
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig};
 
-/// Control message sent from `LaminarDB` DDL handlers to the running
-/// `StreamingCoordinator` for live schema changes (add/drop streams).
+/// Live DDL message from `LaminarDB` to the running `StreamingCoordinator`.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ControlMsg {
@@ -27,13 +26,13 @@ pub enum ControlMsg {
         name: String,
         /// SQL query text.
         sql: String,
-        /// EMIT clause (e.g., `OnWindowClose`).
+        /// EMIT clause.
         emit_clause: Option<EmitClause>,
-        /// Window configuration (tumbling, hopping, session).
+        /// Window configuration.
         window_config: Option<WindowOperatorConfig>,
         /// ORDER BY configuration.
         order_config: Option<OrderOperatorConfig>,
-        /// Per-step join configs from the planner (left-deep).
+        /// Per-step join configs (left-deep).
         join_config: Option<Vec<JoinOperatorConfig>>,
     },
     /// Remove a streaming query from the running pipeline.
@@ -41,8 +40,7 @@ pub enum ControlMsg {
         /// Stream name to remove.
         name: String,
     },
-    /// Register a new source schema (for queries that depend on a source
-    /// created after `start()`).
+    /// Register a source schema for queries added after `start()`.
     AddSourceSchema {
         /// Source name.
         name: String,

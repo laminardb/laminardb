@@ -1,12 +1,7 @@
-//! Local inference via ONNX Runtime (`ort`, loaded dynamically): encoder models
-//! only (BERT/DistilBERT/MiniLM) — classify/sentiment return logits, embed
-//! returns a mean-pooled vector; generative tasks are rejected. A model is loaded
-//! once per source and cached; the forward pass runs on `spawn_blocking` under
-//! a deadline so a wedged model can't stall the worker. ORT loads at
-//! runtime — `onnxruntime.{dll,so}` (>= 1.24) must be on the search path or named
-//! by `ORT_DYLIB_PATH`. A `source` is `hf:org/repo` (downloaded on first use),
-//! `file://<path>`, or a bare path; labels come from the model's `config.json`
-//! `id2label`.
+//! Local inference via ONNX Runtime (loaded dynamically). Encoder models only:
+//! classify/sentiment return logits, embed returns a mean-pooled vector. Sources:
+//! `hf:org/repo` (downloaded on first use), `file://<path>`, or a bare path.
+//! `onnxruntime.{dll,so}` >= 1.24 must be on the search path or via `ORT_DYLIB_PATH`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -24,35 +19,30 @@ use crate::ai::provider::{
 };
 use crate::ai::registry::Task;
 
-/// Per-batch deadline for the synchronous ONNX Runtime forward pass. Bounds the
-/// inference worker (and the held watermark) against a wedged model. On timeout
-/// the blocking thread is abandoned — it cannot be cancelled — and the batch
-/// fails, releasing the hold.
+/// Deadline for the synchronous ORT forward pass. On timeout the blocking thread
+/// is abandoned (it cannot be cancelled) and the batch fails.
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A loaded model: an ONNX Runtime session, its tokenizer, and the model's input
-/// names (`input_ids`, `attention_mask`, and optionally `token_type_ids`) that
-/// drive how each row is fed. `Session::run` takes `&mut`, so it sits behind a
-/// mutex — a model serves one batch at a time.
+/// A loaded ORT session with its tokenizer and input names. `Session::run` takes
+/// `&mut`, so the session is behind a mutex.
 struct LoadedModel {
     session: Mutex<Session>,
     tokenizer: tokenizers::Tokenizer,
     input_names: Vec<String>,
-    /// `config.json` `id2label`, read once at load; empty if absent.
+    /// `id2label` from config.json; empty if absent.
     labels: Vec<String>,
 }
 
-/// Local ONNX provider, backed by a model cache directory.
+/// Local ONNX provider backed by a model cache directory.
 pub struct LocalProvider {
     cache_dir: PathBuf,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
-    /// Serializes the download-and-compile path so concurrent misses for the
-    /// same model don't fetch and build it more than once.
+    /// Serializes download+compile so concurrent misses don't fetch the same model twice.
     load_lock: tokio::sync::Mutex<()>,
 }
 
 impl LocalProvider {
-    /// Create a provider that resolves models under `cache_dir`.
+    /// Create a provider that caches models under `cache_dir`.
     #[must_use]
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -62,14 +52,12 @@ impl LocalProvider {
         }
     }
 
-    /// Resolve a model to a loaded, cached plan: serve from cache, else download
-    /// (for an absent `hf:` repo) and compile on the blocking pool.
+    /// Serve from cache; otherwise download (for `hf:`) and compile on the blocking pool.
     async fn ensure_model(&self, source: &str) -> Result<Arc<LoadedModel>, ProviderError> {
         if let Some(model) = self.loaded.lock().get(source) {
             return Ok(Arc::clone(model));
         }
-        // Hold the load lock across download+compile and re-check the cache: a
-        // concurrent miss may have finished loading this model while we waited.
+        // Re-check after acquiring the lock: a concurrent miss may have just finished.
         let _load = self.load_lock.lock().await;
         if let Some(model) = self.loaded.lock().get(source) {
             return Ok(Arc::clone(model));
@@ -97,7 +85,7 @@ impl LocalProvider {
 
             let config_path = repo.get("config.json").await.ok();
 
-            // Compiling the ONNX graph is heavy, blocking work — keep it off Ring 1.
+            // Graph compilation is CPU-heavy — keep it off Ring 1.
             tokio::task::spawn_blocking(move || {
                 load_model_from_paths(&onnx_path, &tokenizer_path, config_path.as_deref())
             })
@@ -105,7 +93,7 @@ impl LocalProvider {
             .map_err(|e| ProviderError::Transport(format!("model load task: {e}")))??
         } else {
             let dir = model_dir(&self.cache_dir, source);
-            // Compiling the ONNX graph is heavy, blocking work — keep it off Ring 1.
+            // Graph compilation is CPU-heavy — keep it off Ring 1.
             tokio::task::spawn_blocking(move || load_model(&dir))
                 .await
                 .map_err(|e| ProviderError::Transport(format!("model load task: {e}")))??
@@ -119,8 +107,8 @@ impl LocalProvider {
     }
 }
 
-/// On-disk directory for a model `source`: `hf:org/repo` → `<cache_dir>/org/repo`,
-/// `file://<path>` or a bare path used as-is.
+/// On-disk directory for a source: `hf:org/repo` → `<cache_dir>/org/repo`;
+/// `file://<path>` or bare path used as-is.
 #[must_use]
 pub fn model_dir(cache_dir: &Path, source: &str) -> PathBuf {
     if let Some(repo) = source.strip_prefix("hf:") {
@@ -132,17 +120,14 @@ pub fn model_dir(cache_dir: &Path, source: &str) -> PathBuf {
     }
 }
 
-/// Classifier labels from a model's `config.json` `id2label`, ordered by index.
-/// Empty if the file is absent or has no `id2label` — the registry uses this to
-/// auto-derive a local classifier's labels.
+/// Classifier labels from `config.json` `id2label`, ordered by index. Empty if
+/// absent or unparseable.
 #[must_use]
 pub fn load_labels(cache_dir: &Path, source: &str) -> Vec<String> {
-    // A config.json placed directly under the model dir (hand-placed exports,
-    // `file://`/path sources, and the legacy hf cache layout) wins.
     if let Ok(text) = std::fs::read_to_string(model_dir(cache_dir, source).join("config.json")) {
         return parse_id2label(&text);
     }
-    // Otherwise resolve an hf-hub-downloaded model from its cache snapshot.
+    // Fall back to the hf-hub cache snapshot.
     if let Some(repo_id) = source.strip_prefix("hf:") {
         let cache = hf_hub::Cache::new(cache_dir.to_path_buf());
         let repo = cache.repo(hf_hub::Repo::model(repo_id.to_string()));
@@ -185,8 +170,7 @@ impl InferenceProvider for LocalProvider {
         let loaded = self.ensure_model(&request.model).await?;
         let task = request.task;
         let inputs = request.inputs;
-        // The forward pass is synchronous CPU work — keep it off the Ring 1 task,
-        // under a deadline so a wedged model cannot stall the worker indefinitely.
+        // Synchronous CPU work — keep it off Ring 1, with a deadline.
         let run = tokio::task::spawn_blocking(move || run(&loaded, task, &inputs));
         let outputs = match tokio::time::timeout(INFERENCE_TIMEOUT, run).await {
             Ok(joined) => {
@@ -209,8 +193,7 @@ impl InferenceProvider for LocalProvider {
     }
 
     fn intrinsic_labels(&self, model: &str) -> Option<Vec<String>> {
-        // Served from the loaded model (read once at load); only an unloaded model
-        // — i.e. before its first inference — touches disk here.
+        // Falls back to disk only for a model not yet loaded.
         let labels = self
             .loaded
             .lock()
@@ -220,8 +203,8 @@ impl InferenceProvider for LocalProvider {
     }
 }
 
-/// The model graph: the `onnx/model.onnx` that Optimum / transformers.js exports
-/// produce, falling back to a flat `model.onnx` for a hand-placed directory.
+/// Prefer the nested `onnx/model.onnx` (Optimum/transformers.js layout), fall
+/// back to `model.onnx` at the directory root.
 fn onnx_path(dir: &Path) -> PathBuf {
     let nested = dir.join("onnx").join("model.onnx");
     if nested.exists() {
@@ -352,7 +335,7 @@ fn run(
 
     let mut vectors = Vec::with_capacity(batch_size);
     if task == Task::Embed && shape.len() == 3 {
-        // last_hidden_state [batch_size, seq_out, hidden] → mean-pool over real tokens.
+        // last_hidden_state [batch, seq, hidden] → mean-pool over real tokens.
         let seq_out = usize::try_from(shape[1]).unwrap_or(0);
         let hidden = usize::try_from(shape[2]).unwrap_or(0);
         for (i, encoding) in encodings.iter().enumerate() {
@@ -367,7 +350,7 @@ fn run(
             vectors.push(mean_pool(slice, seq_out, hidden, &mask));
         }
     } else {
-        // classify/sentiment logits, or a pre-pooled embedding.
+        // classify/sentiment logits or a pre-pooled embedding.
         let dim: usize = shape[1..]
             .iter()
             .map(|&d| usize::try_from(d).unwrap_or(0))
@@ -383,7 +366,7 @@ fn run(
     Ok(InferenceOutputs::Vectors(vectors))
 }
 
-/// Mean-pool a row-major `[seq, hidden]` block over non-masked tokens.
+/// Mean-pool a `[seq, hidden]` block over non-masked tokens.
 fn mean_pool(data: &[f32], seq: usize, hidden: usize, mask: &[i64]) -> Vec<f32> {
     let mut pooled = vec![0.0_f32; hidden];
     let mut count = 0.0_f32;

@@ -27,7 +27,7 @@ use crate::sql_utils;
 /// Cloneable async sender for the live-DDL control channel.
 pub(crate) type ControlMsgTx = crossfire::MAsyncTx<crossfire::mpsc::Array<ControlMsg>>;
 
-/// Lifecycle state of a [`LaminarDB`] instance, stored as `AtomicU8`.
+/// Lifecycle state of a [`LaminarDB`] instance.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbState {
@@ -58,8 +58,7 @@ impl DbState {
         atomic.store(self as u8, std::sync::atomic::Ordering::Release);
     }
 
-    /// Atomically transition `current -> new`; returns the observed state on
-    /// failure so callers can claim an exclusive transition.
+    /// Atomically transition `current → new`; returns the observed state on failure.
     pub(crate) fn compare_exchange(
         current: Self,
         new: Self,
@@ -84,9 +83,7 @@ fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -
 
 /// The main `LaminarDB` database handle.
 ///
-/// Provides a unified interface for SQL execution, data ingestion,
-/// and result consumption. All streaming infrastructure (sources, sinks,
-/// channels, subscriptions) is managed internally.
+/// Unified interface for SQL execution, data ingestion, and result consumption.
 pub struct LaminarDB {
     pub(crate) catalog: Arc<SourceCatalog>,
     pub(crate) planner: parking_lot::Mutex<StreamingPlanner>,
@@ -94,7 +91,6 @@ pub struct LaminarDB {
     pub(crate) config: LaminarConfig,
     pub(crate) config_vars: Arc<HashMap<String, String>>,
     pub(crate) shutdown: std::sync::atomic::AtomicBool,
-    /// Populated by `start()`.
     pub(crate) coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     pub(crate) connector_manager: parking_lot::Mutex<crate::connector_manager::ConnectorManager>,
@@ -111,36 +107,30 @@ pub struct LaminarDB {
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
     /// Min of all source watermarks.
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
-    /// The registry of lookup table snapshots.
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
-    /// Assembled AI subsystem (registry + providers + cache + call log).
-    /// `None` unless `[ai]`/`[models]` are configured. Set once in the builder.
+    /// `None` unless `[ai]`/`[models]` are configured.
     pub(crate) ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
-    /// Main runtime handle the AI inference workers spawn on. Set with `ai_runtime`.
+    /// Runtime the AI inference workers spawn on; set alongside `ai_runtime`.
     pub(crate) ai_handle: Option<tokio::runtime::Handle>,
-    /// Live-DDL channel to the running coordinator. `None` outside `start..shutdown`.
+    /// Live-DDL channel; `None` outside `start..shutdown`.
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
-    /// Activates leader/follower checkpoint flow when set. `None` in embedded mode.
+    /// `None` in embedded mode.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
-    /// Pair with `vnode_registry`; the coordinator writes per-vnode durability
-    /// markers each checkpoint and runs the gate when both are installed.
+    /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
     pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
-    /// Applied to both `self.ctx` and the pipeline-side `OperatorGraph` context.
     pub(crate) physical_optimizer_rules:
         Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
     /// `target_partitions` override; cluster mode sets this to `vnode_count`.
     pub(crate) pipeline_target_partitions: Option<usize>,
-    /// Used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to owners.
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
-    /// `Arc`-wrapped so the subscription-router task can hold a weak handle and
-    /// read the receiver lazily (installed after the controller).
+    /// `Arc`-wrapped so the subscription-router task can hold a weak handle.
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_receiver:
         Arc<parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>>,
@@ -150,33 +140,25 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) assignment_snapshot_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
-    /// Cluster-wide catalog manifest store (`catalog/manifest.json` on the
-    /// shared object store). Persisted on each successful checkpoint and
-    /// replayed at boot so a node rebuilds MVs/sources it lacks locally.
+    /// Cluster-wide catalog manifest; persisted on checkpoint, replayed at boot.
     #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
-    /// Committed per-vnode state staged by [`Self::adopt_assignment_snapshot`]
-    /// for vnodes this node newly acquired in a rebalance. Operators that
-    /// adopt the per-vnode state backend drain this on their next cycle to
-    /// resume from the last committed epoch instead of empty state.
-    ///
-    /// `Arc`-wrapped so the same handle is shared with the `OperatorGraph`
-    /// (via [`ClusterShuffleConfig`](crate::operator::sql_query::ClusterShuffleConfig)),
-    /// which drains and applies the staged slices into live operators each cycle.
+    /// Committed vnode state staged during rebalance adoption; operators drain
+    /// this each cycle to resume from the last committed epoch. Shared with
+    /// `OperatorGraph` via `ClusterShuffleConfig`.
     #[cfg(feature = "cluster")]
     pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
-    /// Hands `db.checkpoint()` requests to the pipeline callback so it can capture
-    /// operator state before the manifest is packed. When `None`, falls back to
-    /// the direct coordinator path — only valid for stateless engines.
+    /// Routes `db.checkpoint()` requests to the pipeline callback so operator
+    /// state is captured. When `None`, the coordinator is driven directly
+    /// (stateless / pre-start path).
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// Cluster mode: stream/MV name → subscribing node ids, refreshed from
-    /// gossip by the router task and read each cycle by producers.
+    /// stream/MV name → subscribing node ids; refreshed from gossip by the router task.
     #[cfg(feature = "cluster")]
     pub(crate) active_subs:
         Arc<parking_lot::RwLock<std::collections::HashMap<String, std::collections::HashSet<u64>>>>,
-    /// Stream output schemas resolved at `start()`; consulted by SUBSCRIBE WHERE.
+    /// Resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
 }
@@ -185,8 +167,6 @@ pub struct LaminarDB {
 pub(crate) type ForceCheckpointReply =
     crossfire::oneshot::TxOneshot<Result<crate::checkpoint_coordinator::CheckpointResult, DbError>>;
 
-/// `db.checkpoint()` → pipeline callback request channel. Cold path; the cap
-/// is generous enough that callers never wait.
 pub(crate) type ForceCheckpointTx =
     crossfire::MAsyncTx<crossfire::mpsc::Array<ForceCheckpointReply>>;
 
@@ -195,14 +175,13 @@ pub(crate) type ForceCheckpointRx =
 
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
 
-/// Subscription-router timer period. Drains run every tick, so this bounds
-/// cross-node SUBSCRIBE delivery latency.
+/// Subscription-router drain period; bounds cross-node SUBSCRIBE delivery latency.
 #[cfg(feature = "cluster")]
 const SUB_ROUTER_TICK: std::time::Duration = std::time::Duration::from_millis(10);
-/// Refresh the gossip interest cache ~every 500ms while subscriptions exist.
+/// Gossip interest refresh cadence (~500ms) while subscriptions are active.
 #[cfg(feature = "cluster")]
 const SUB_REFRESH_ACTIVE_TICKS: u64 = 50;
-/// Back off to ~5s when there is no subscription activity anywhere.
+/// Idle refresh cadence (~5s) when no subscriptions are active.
 #[cfg(feature = "cluster")]
 const SUB_REFRESH_IDLE_TICKS: u64 = 500;
 
@@ -229,31 +208,25 @@ pub(crate) fn filter_late_rows(
 
 pub(crate) use laminar_core::time::parse_duration_str;
 
-/// Committed state for a single vnode, staged during rebalance adoption
-/// so newly-acquired vnodes resume from the last committed epoch.
+/// Committed vnode state staged during rebalance adoption for deferred apply.
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone)]
 pub struct RehydratedVnode {
     /// Committed epoch the partial was read from.
     pub epoch: u64,
-    /// The vnode's `partial.bin` bytes at `epoch`.
+    /// `partial.bin` bytes at `epoch`.
     pub bytes: bytes::Bytes,
 }
 
 /// Summary of a single [`LaminarDB::adopt_assignment_snapshot`] call.
-///
-/// Returned so the rebalance control plane can log and meter what each
-/// adoption moved — in particular the vnodes this node gained and how
-/// much of their committed state it rehydrated from durable storage.
 #[cfg(feature = "cluster")]
 #[derive(Debug, Default)]
 pub struct SnapshotAdoption {
-    /// `false` when the snapshot was stale (≤ the current registry
-    /// version) or no registry was installed — nothing changed.
+    /// `false` when the snapshot was stale or no registry was installed.
     pub adopted: bool,
-    /// The snapshot version this call considered.
+    /// The snapshot version considered.
     pub version: u64,
-    /// Vnodes this node owns now but did not before this rotation.
+    /// Vnodes this node gained in this rotation.
     pub newly_acquired: Vec<u32>,
     /// How many of `newly_acquired` had committed state read back.
     pub rehydrated: usize,
@@ -415,17 +388,14 @@ impl LaminarDB {
         })
     }
 
-    /// Install the AI subsystem and the runtime handle its inference workers
-    /// spawn on. Called by the builder before the engine is shared; the handle
-    /// must be the main multi-threaded runtime.
+    /// Install the AI subsystem. Called by the builder; `handle` must be the
+    /// main multi-threaded runtime.
     pub(crate) fn set_ai_runtime(
         &mut self,
         runtime: Arc<crate::ai::AiRuntime>,
         handle: tokio::runtime::Handle,
     ) {
-        // Register the laminar.models / laminar.ai_calls catalog views. A
-        // failure here is non-fatal — inference still works, the views just
-        // aren't queryable.
+        // Non-fatal: inference still works if catalog view registration fails.
         if let Err(e) = crate::ai_catalog::register_ai_catalog(&self.ctx, &runtime) {
             tracing::warn!(error = %e, "failed to register laminar.* AI catalog views");
         }
@@ -487,8 +457,7 @@ impl LaminarDB {
         *self.assignment_snapshot_store.lock() = Some(store);
     }
 
-    /// Install the shared catalog manifest store. Enables catalog-manifest
-    /// persistence (on checkpoint) and boot-time replay.
+    /// Install the shared catalog manifest store.
     #[cfg(feature = "cluster")]
     pub(crate) fn set_catalog_manifest_store(
         &self,
@@ -497,10 +466,8 @@ impl LaminarDB {
         *self.catalog_manifest_store.lock() = Some(store);
     }
 
-    /// Publish this node's current catalog DDL to the shared
-    /// `catalog/manifest.json`. Best-effort and cluster-only — a failure is
-    /// logged, never propagated, since the manifest is an availability aid,
-    /// not a correctness gate. Called after each successful checkpoint.
+    /// Publish this node's catalog DDL to `catalog/manifest.json`. Best-effort;
+    /// failures are logged and never propagated.
     #[cfg(feature = "cluster")]
     pub(crate) async fn persist_catalog_manifest(&self) {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
@@ -518,8 +485,7 @@ impl LaminarDB {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
         let manifest = laminar_core::cluster::control::CatalogManifest {
-            // Wall-clock as a monotonic-in-practice diagnostic version; the
-            // object is overwritten in place, so the value is informational.
+            // Wall-clock as a diagnostic version; the object is overwritten in place.
             version: now_ms.unsigned_abs(),
             updated_at_ms: now_ms,
             entries,
@@ -529,11 +495,8 @@ impl LaminarDB {
         }
     }
 
-    /// Replay catalog DDL from the shared `catalog/manifest.json`, recreating
-    /// any object this node doesn't already have locally. Best-effort and
-    /// cluster-only; runs at boot before the pipeline starts so the operator
-    /// graph for rebalanced-in MVs exists. A per-entry replay failure is
-    /// logged and skipped — the node still serves the objects that did rebuild.
+    /// Replay catalog DDL from the shared manifest, recreating objects this node
+    /// lacks. Runs at boot; per-entry failures are logged and skipped.
     #[cfg(feature = "cluster")]
     pub(crate) async fn restore_catalog_from_manifest(&self) {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
@@ -547,9 +510,8 @@ impl LaminarDB {
                 return;
             }
         };
-        // Detach the manifest store during replay: `execute` otherwise
-        // re-persists this node's still-partial catalog after every DDL, so a
-        // mid-replay failure would truncate the shared manifest. Reinstalled below.
+        // Detach during replay: execute() would re-persist a still-partial catalog
+        // after each DDL, potentially truncating the shared manifest on failure.
         let detached = self.catalog_manifest_store.lock().take();
         for entry in &manifest.entries {
             if self.catalog_object_exists(&entry.name) {
@@ -566,8 +528,7 @@ impl LaminarDB {
         *self.catalog_manifest_store.lock() = detached;
     }
 
-    /// Whether a catalog object with `name` is already registered locally
-    /// (any of source/sink/stream/table). Drives idempotent manifest replay.
+    /// Returns `true` if any catalog type (source/sink/stream/table) is registered under `name`.
     #[cfg(feature = "cluster")]
     fn catalog_object_exists(&self, name: &str) -> bool {
         let mgr = self.connector_manager.lock();
@@ -577,15 +538,12 @@ impl LaminarDB {
             || mgr.tables().contains_key(name)
     }
 
-    /// Adopt a new vnode assignment snapshot atomically across the registry,
-    /// state-backend fence, and coordinator, then rehydrate committed state
-    /// for any vnodes this node newly acquired. Idempotent for versions ≤ the
-    /// current registry version.
+    /// Atomically adopt a new vnode assignment across the registry, state-backend
+    /// fence, and coordinator, then rehydrate committed state for newly-acquired
+    /// vnodes. Idempotent for versions ≤ the current registry version.
     ///
-    /// Rehydration (the durable read of newly-acquired vnodes' partials) runs
-    /// *after* the coordinator lock is released so a slow object store can't
-    /// stall the checkpoint cadence; the recovered bytes are staged in
-    /// [`Self::rehydrated_vnode_state`] for operators to drain.
+    /// Rehydration runs after the coordinator lock is released so a slow
+    /// object-store read can't stall the checkpoint cadence.
     #[cfg(feature = "cluster")]
     pub async fn adopt_assignment_snapshot(
         &self,
@@ -613,9 +571,7 @@ impl LaminarDB {
                 laminar_core::state::NodeId(c.instance_id().0)
             });
 
-        // Hold the coord mutex so registry + fence updates land between
-        // epochs. Snapshot the owned set on both sides of the swap to
-        // derive exactly which vnodes this node gained.
+        // Hold the coord mutex so registry + fence updates land between epochs.
         let mut guard = self.coordinator.lock().await;
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         registry.set_assignment_and_version(new_assignment, snapshot.version);
@@ -630,19 +586,16 @@ impl LaminarDB {
         }
         drop(guard);
 
-        // Newly-acquired vnodes = new \ old.
         let old_set: std::collections::HashSet<u32> = old_owned.into_iter().collect();
         let newly_acquired: Vec<u32> = new_owned
             .into_iter()
             .filter(|v| !old_set.contains(v))
             .collect();
 
-        // Mark every newly-acquired vnode `Restoring` up front — before the
-        // (possibly slow) durable read below — so the operator suppresses
-        // emission for their keys from the moment the shuffle starts routing
-        // their rows here. Vnodes with no durable state are flipped back to
-        // `Active` immediately after the read; the ones we stage stay
-        // `Restoring` until the graph merges their state in.
+        // Mark Restoring before the (slow) durable read so the operator suppresses
+        // emission from the moment the shuffle starts routing rows here. Vnodes
+        // with no durable state flip back to Active immediately; staged ones stay
+        // Restoring until the graph applies their state.
         if !newly_acquired.is_empty() {
             registry.mark_restoring(&newly_acquired);
         }
@@ -655,10 +608,7 @@ impl LaminarDB {
             rehydration_epoch: None,
         };
 
-        // Pull the last committed state for the gained vnodes off the
-        // shared durable backend so they don't resume from empty state.
-        // Clone the Arc out first so the (non-Send) lock guard is dropped
-        // before the rehydration await.
+        // Clone the Arc before the await so the lock guard drops first.
         let backend = self.state_backend.lock().clone();
         if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {
             let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
@@ -666,9 +616,7 @@ impl LaminarDB {
                 .await;
             adoption.rehydrated = report.restored.len();
             adoption.rehydration_epoch = report.epoch;
-            // Vnodes with no durable state to apply serve immediately — flip
-            // them back to `Active` so their emission isn't gated forever. The
-            // graph flips the staged ones once it merges their state in.
+            // No durable state → serve immediately; don't gate emission forever.
             let no_state: Vec<u32> = newly_acquired
                 .iter()
                 .copied()
@@ -684,8 +632,7 @@ impl LaminarDB {
                 }
             }
         } else if !newly_acquired.is_empty() {
-            // No backend / nothing to rehydrate — clear the Restoring marks we
-            // optimistically set so emission isn't gated with no state coming.
+            // No backend — clear the optimistic Restoring marks.
             registry.mark_active(&newly_acquired);
         }
 
@@ -699,10 +646,7 @@ impl LaminarDB {
         adoption
     }
 
-    /// Snapshot of committed per-vnode state staged for newly-acquired
-    /// vnodes during the most recent rebalance adoptions. Keyed by vnode.
-    /// Drained by operators that adopt the per-vnode state backend; exposed
-    /// for inspection and tests.
+    /// Staged vnode state from the most recent rebalance adoptions, keyed by vnode.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn rehydrated_vnode_state(&self) -> HashMap<u32, RehydratedVnode> {
@@ -714,8 +658,7 @@ impl LaminarDB {
         &self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
-        // Serve this node's local MV/table rows to peers. Weak store handles
-        // (not `self`) avoid a reference cycle.
+        // Weak store handles avoid a reference cycle with the DB.
         controller.register_query_handler(Arc::new(DbQueryHandler {
             mv_store: Arc::downgrade(&self.mv_store),
             table_store: Arc::downgrade(&self.table_store),
@@ -728,9 +671,8 @@ impl LaminarDB {
         self.update_sql_cluster_context();
     }
 
-    /// Router task: refreshes the gossip interest cache (cadence backs off when
-    /// idle) and drains remote `__sub::` batches to local subscribers. Weak
-    /// handles, so it exits once the `LaminarDB` is dropped.
+    /// Refresh the gossip interest cache and drain remote `__sub::` batches.
+    /// Weak handles so the task exits when the `LaminarDB` is dropped.
     #[cfg(feature = "cluster")]
     fn spawn_subscription_router(
         &self,
@@ -738,16 +680,14 @@ impl LaminarDB {
     ) {
         use std::collections::{HashMap, HashSet};
 
-        // Needs a running runtime; some unit tests install a controller without
-        // one. Skip — distributed routing is server-mode only.
+        // Some unit tests install a controller without a runtime; server-mode only.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
 
         let kv = Arc::clone(controller.kv());
 
-        // Skip entirely on backends that can't discover subscription interest
-        // (e.g. object store), rather than advertising interest nothing reads.
+        // Object-store backends have no subscription-interest discovery.
         if !kv.supports_subscription_routing() {
             tracing::info!(
                 "distributed SUBSCRIBE routing disabled: coordination backend has \
@@ -779,7 +719,6 @@ impl LaminarDB {
 
                 let local_names = registry.active_subscription_names();
 
-                // Refresh the producer-side interest cache when due.
                 if until_refresh == 0 {
                     let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
                     for (node_id, key, value) in kv.scan_prefix("sub:").await {
@@ -799,8 +738,6 @@ impl LaminarDB {
                 }
                 until_refresh = until_refresh.saturating_sub(1);
 
-                // Advertise newly-added / clear newly-removed local interests
-                // (rare; only on subscription lifecycle changes).
                 for name in &local_names {
                     if advertised.insert(name.clone()) {
                         kv.write(&format!("sub:{name}"), "active".to_string()).await;
@@ -816,9 +753,7 @@ impl LaminarDB {
                     advertised.remove(&name);
                 }
 
-                // Publish remote batches for locally-subscribed streams; one lock
-                // cycle drains every `__sub::` stage (dropped subs fall through
-                // `send_batch` as a no-op rather than piling up in `staged`).
+                // Drain every `__sub::` stage; dropped subs fall through send_batch as a no-op.
                 if !local_names.is_empty() {
                     let receiver = receiver_slot.lock().clone();
                     if let Some(receiver) = receiver {
@@ -849,7 +784,7 @@ impl LaminarDB {
         self.update_sql_cluster_context();
     }
 
-    /// The underlying `DataFusion` `SessionContext`.
+    /// The underlying `DataFusion` session context.
     #[must_use]
     pub fn session_context(&self) -> &SessionContext {
         &self.ctx
@@ -861,11 +796,8 @@ impl LaminarDB {
         LaminarDbBuilder::new()
     }
 
-    /// Register built-in connectors based on enabled features.
     #[allow(unused_variables)]
     fn register_builtin_connectors(registry: &laminar_connectors::registry::ConnectorRegistry) {
-        // Infra-free synthetic source; always available (used by demos
-        // and the cluster soak harness).
         laminar_connectors::generator::register_generator_source(registry);
         #[cfg(feature = "kafka")]
         {
@@ -920,9 +852,6 @@ impl LaminarDB {
         }
     }
 
-    /// Handle `CREATE LOOKUP TABLE` by registering the table in the
-    /// `TableStore`, `ConnectorManager`, `DataFusion` catalog, and lookup
-    /// registry.
     fn handle_register_lookup_table(
         &self,
         info: laminar_sql::planner::LookupTableInfo,
@@ -936,7 +865,6 @@ impl LaminarDB {
         }
         let pk = info.primary_key[0].clone();
 
-        // Register in TableStore for PK-based upsert
         let cache_mode = info.properties.cache_memory.map(|mem| {
             let max_entries = cache_entries_from_memory(mem);
             crate::table_cache_mode::TableCacheMode::Partial { max_entries }
@@ -954,13 +882,10 @@ impl LaminarDB {
                 .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
         }
 
-        // For external connectors: register in ConnectorManager so
-        // start_connector_pipeline() handles snapshot + CDC loading
         if !matches!(info.properties.connector, ConnectorType::Static) {
             self.register_lookup_connector(&info, &pk)?;
         }
 
-        // Register in DataFusion for SELECT/JOIN queries
         {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 info.name.clone(),
@@ -975,8 +900,6 @@ impl LaminarDB {
                 })?;
         }
 
-        // Register snapshot in the lookup registry so the physical
-        // planner can build LookupJoinExec nodes for JOIN queries.
         if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
             self.lookup_registry.register(
                 &info.name,
@@ -984,8 +907,6 @@ impl LaminarDB {
             );
         }
 
-        // Register the logical optimizer rule so JOINs referencing
-        // this table are rewritten to LookupJoinNode.
         self.refresh_lookup_optimizer_rule();
 
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -994,8 +915,6 @@ impl LaminarDB {
         }))
     }
 
-    /// Register an external connector for a lookup table in the
-    /// `ConnectorManager` and `TableStore`.
     #[allow(clippy::unnecessary_wraps)]
     fn register_lookup_connector(
         &self,
@@ -1022,7 +941,7 @@ impl LaminarDB {
         let refresh = match info.properties.strategy {
             laminar_sql::parser::lookup_table::LookupStrategy::Replicated
             | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
-                // Standalone postgres uses snapshot-only (no CDC slot needed).
+                // Postgres has no CDC slot; snapshot-only is sufficient.
                 if matches!(info.properties.connector, ConnectorType::Postgres) {
                     Some(laminar_connectors::reference::RefreshMode::SnapshotOnly)
                 } else {
@@ -1034,9 +953,8 @@ impl LaminarDB {
             }
         };
 
-        // Build connector options and format options from raw WITH clause.
-        // Keys consumed by LookupTableProperties are excluded; keys starting
-        // with "format." are routed to format_options (prefix stripped).
+        // Keys consumed by LookupTableProperties are excluded; "format.*" keys
+        // go to format_options with the prefix stripped.
         let consumed = [
             "connector",
             "strategy",
@@ -1060,15 +978,12 @@ impl LaminarDB {
             }
         }
 
-        // The on-demand lookup cache is byte-weighted; carry the user's
-        // cache_memory budget through as bytes (no lossy entry-count conversion).
+        // Carry as bytes; the partial lookup cache is byte-weighted, not entry-counted.
         let cache_max_bytes = info
             .properties
             .cache_memory
             .map(|m| usize::try_from(m.as_bytes()).unwrap_or(usize::MAX));
 
-        // cache_ttl is specified in seconds; carry it as a Duration so the
-        // partial lookup cache expires stale entries lazily on read.
         let cache_ttl = info
             .properties
             .cache_ttl
@@ -1091,8 +1006,7 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Replaces the `LookupJoinRewriteRule` on the `DataFusion` context
-    /// with one that knows the current set of registered lookup tables.
+    /// Rebuild the lookup optimizer rules for the current set of registered tables.
     fn refresh_lookup_optimizer_rule(&self) {
         use laminar_sql::planner::lookup_join::{LookupColumnPruningRule, LookupJoinRewriteRule};
         use laminar_sql::planner::predicate_split::{
@@ -1100,7 +1014,6 @@ impl LaminarDB {
             SourceCapabilitiesRegistry,
         };
 
-        // Remove old rules if present
         self.ctx.remove_optimizer_rule("lookup_join_rewrite");
         self.ctx.remove_optimizer_rule("predicate_splitter");
         self.ctx.remove_optimizer_rule("lookup_column_pruning");
@@ -1110,7 +1023,6 @@ impl LaminarDB {
             return;
         }
 
-        // Build capabilities registry from table properties
         let mut caps_registry = SourceCapabilitiesRegistry::default();
         for (name, info) in &tables {
             let mode = match info.properties.pushdown_mode {
@@ -1132,7 +1044,6 @@ impl LaminarDB {
             );
         }
 
-        // Register rules in order: rewrite → predicate split → column pruning
         self.ctx
             .add_optimizer_rule(Arc::new(LookupJoinRewriteRule::new(tables)));
         self.ctx
@@ -1141,41 +1052,23 @@ impl LaminarDB {
             .add_optimizer_rule(Arc::new(LookupColumnPruningRule));
     }
 
-    /// Returns the connector registry for registering custom connectors.
-    ///
-    /// Use this to register user-defined source/sink connectors before
-    /// calling `start()`.
+    /// Returns the connector registry for registering custom connectors before `start()`.
     #[must_use]
     pub fn connector_registry(&self) -> &laminar_connectors::registry::ConnectorRegistry {
         &self.connector_registry
     }
 
-    /// Register a custom scalar UDF on the `SessionContext`.
-    ///
-    /// Called by `LaminarDbBuilder::build()` after construction.
+    /// Register a custom scalar UDF. Called by the builder after construction.
     pub(crate) fn register_custom_udf(&self, udf: datafusion_expr::ScalarUDF) {
         self.ctx.register_udf(udf);
     }
 
-    /// Register a custom aggregate UDF (UDAF) on the `SessionContext`.
-    ///
-    /// Called by `LaminarDbBuilder::build()` after construction.
+    /// Register a custom aggregate UDF. Called by the builder after construction.
     pub(crate) fn register_custom_udaf(&self, udaf: datafusion_expr::AggregateUDF) {
         self.ctx.register_udaf(udaf);
     }
 
-    /// Registers a Delta Lake table as a `DataFusion` `TableProvider`.
-    ///
-    /// After registration, the table can be queried via SQL:
-    /// ```sql
-    /// SELECT * FROM my_delta_table WHERE id > 100
-    /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - SQL table name (e.g., `"trades"`)
-    /// * `table_uri` - Path to the Delta Lake table (local, `s3://`, `az://`, `gs://`)
-    /// * `storage_options` - Storage credentials and configuration
+    /// Register a Delta Lake table as a `DataFusion` table provider.
     ///
     /// # Errors
     ///
@@ -1199,16 +1092,6 @@ impl LaminarDB {
 
     /// Execute a SQL statement.
     ///
-    /// Supports:
-    /// - `CREATE SOURCE` / `CREATE SINK` — registers sources and sinks
-    /// - `DROP SOURCE` / `DROP SINK` — removes sources and sinks
-    /// - `SHOW SOURCES` / `SHOW SINKS` / `SHOW QUERIES` — list registered objects
-    /// - `DESCRIBE source_name` — show source schema
-    /// - `SELECT ...` — execute a streaming query
-    /// - `INSERT INTO source_name VALUES (...)` — insert data
-    /// - `CREATE MATERIALIZED VIEW` — create a streaming materialized view
-    /// - `EXPLAIN SELECT ...` — show query plan
-    ///
     /// # Errors
     ///
     /// Returns `DbError` if SQL parsing, planning, or execution fails.
@@ -1217,20 +1100,17 @@ impl LaminarDB {
             return Err(DbError::Shutdown);
         }
 
-        // Apply config variable substitution
         let resolved = if self.config_vars.is_empty() {
             sql.to_string()
         } else {
             sql_utils::resolve_config_vars(sql, &self.config_vars, true)?
         };
 
-        // Split into multiple statements
         let stmts = sql_utils::split_statements(&resolved);
         if stmts.is_empty() {
             return Err(DbError::InvalidOperation("Empty SQL statement".into()));
         }
 
-        // Execute each statement, return the last result (or first error)
         let mut last_result = None;
         for stmt_sql in &stmts {
             last_result = Some(self.execute_single(stmt_sql).await?);
@@ -1239,7 +1119,6 @@ impl LaminarDB {
         last_result.ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
     }
 
-    /// Execute a single SQL statement.
     #[allow(clippy::too_many_lines)]
     async fn execute_single(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         let statements = parse_streaming_sql(sql)?;
@@ -1435,10 +1314,6 @@ impl LaminarDB {
         result
     }
 
-    /// Handle INSERT INTO statement.
-    ///
-    /// Inserts SQL VALUES into a registered source, a `TableStore`-managed
-    /// table (with PK upsert), or a plain `DataFusion` `MemTable`.
     async fn handle_insert_into(
         &self,
         table_name: &sqlparser::ast::ObjectName,
@@ -1447,7 +1322,6 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name = table_name.to_string();
 
-        // Try inserting into a registered source
         if let Some(entry) = self.catalog.get_source(&name) {
             let batch = sql_utils::sql_values_to_record_batch(&entry.schema, values)?;
             entry
@@ -1456,8 +1330,7 @@ impl LaminarDB {
             return Ok(ExecuteResult::RowsAffected(values.len() as u64));
         }
 
-        // Try inserting into a TableStore-managed table (with PK upsert).
-        // Single lock scope avoids TOCTOU race between has_table/schema/upsert.
+        // Single lock scope avoids TOCTOU between has_table/schema/upsert.
         {
             let mut ts = self.table_store.write();
             if ts.has_table(&name) {
@@ -1473,8 +1346,6 @@ impl LaminarDB {
             }
         }
 
-        // Otherwise, insert into a DataFusion MemTable
-        // Look up the table provider
         let table = self
             .ctx
             .table_provider(&name)
@@ -1484,7 +1355,6 @@ impl LaminarDB {
         let schema = table.schema();
         let batch = sql_utils::sql_values_to_record_batch(&schema, values)?;
 
-        // Deregister the old table, then re-register with the new data
         self.ctx
             .deregister_table(&name)
             .map_err(|e| DbError::InsertError(format!("Failed to deregister table: {e}")))?;
@@ -1500,11 +1370,7 @@ impl LaminarDB {
         Ok(ExecuteResult::RowsAffected(values.len() as u64))
     }
 
-    /// Handle RESTORE FROM CHECKPOINT statement (not yet implemented).
-    ///
-    /// Will eventually stop the pipeline, reload state from the checkpoint
-    /// manifest, seek source offsets, and restart the pipeline.
-    #[allow(clippy::unused_self)] // will use self when restore is implemented
+    #[allow(clippy::unused_self)] // will use self when implemented
     fn handle_restore_checkpoint(&self, _checkpoint_id: u64) -> Result<ExecuteResult, DbError> {
         Err(DbError::Unsupported(
             "RESTORE FROM CHECKPOINT is not yet implemented — \
@@ -1514,7 +1380,7 @@ impl LaminarDB {
         ))
     }
 
-    /// Get a session property value.
+    /// Return a session property value.
     #[must_use]
     pub fn get_session_property(&self, key: &str) -> Option<String> {
         self.session_properties
@@ -1523,13 +1389,13 @@ impl LaminarDB {
             .cloned()
     }
 
-    /// Get all session properties.
+    /// Return all session properties.
     #[must_use]
     pub fn session_properties(&self) -> HashMap<String, String> {
         self.session_properties.lock().clone()
     }
 
-    /// Set a session property. Keys are lowercased.
+    /// Set a session property (keys are lowercased).
     pub fn set_session_property(&self, key: &str, value: &str) {
         self.session_properties
             .lock()
@@ -1567,16 +1433,12 @@ impl LaminarDB {
             .ok_or_else(|| DbError::StreamNotFound(name.to_string()))
     }
 
-    /// Schema a `SUBSCRIBE` against `name` would emit, plus a `filterable`
-    /// flag that's `false` only when the schema came from a `StreamEntry`
-    /// sink placeholder (`Schema::empty`) — a `WHERE` clause can't compile
-    /// against that and must be rejected.
+    /// Schema a `SUBSCRIBE` against `name` would emit, plus `filterable`.
     ///
-    /// Lookup order: MV registry → `start()`-resolved stream output →
-    /// `StreamEntry` sink (placeholder). A bare SOURCE is intentionally not
-    /// resolved: only streams/MVs defined over it publish to the registry, so
-    /// subscribing to the source directly would block forever — it falls
-    /// through to `None`, which the caller surfaces as `StreamNotFound`.
+    /// `filterable` is `false` only when the schema comes from a `StreamEntry`
+    /// sink placeholder — a `WHERE` clause can't compile against it.
+    /// Order: MV registry → resolved stream output → `StreamEntry` sink.
+    /// A bare source is not resolved (subscribing to it would block forever).
     #[must_use]
     pub fn lookup_subscription_schema(
         &self,
@@ -1653,11 +1515,8 @@ impl LaminarDB {
         })
     }
 
-    /// Handle EXPLAIN statement — show the streaming query plan.
     fn handle_explain(&self, statement: &StreamingStatement) -> Result<ExecuteResult, DbError> {
         let mut planner = self.planner.lock();
-
-        // Plan the inner statement to extract streaming info
         let plan_result = planner.plan(statement);
 
         let mut rows: Vec<(String, String)> = Vec::new();
@@ -1728,7 +1587,6 @@ impl LaminarDB {
                 }
             }
             Err(e) => {
-                // Even if planning fails, show what we know
                 rows.push(("error".into(), format!("{e}")));
                 rows.push((
                     "statement".into(),
@@ -1757,13 +1615,11 @@ impl LaminarDB {
         Ok(ExecuteResult::Metadata(batch))
     }
 
-    /// Handle EXPLAIN ANALYZE: run the plan and collect execution metrics.
     async fn handle_explain_analyze(
         &self,
         statement: &StreamingStatement,
         original_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
-        // First get the normal EXPLAIN output
         let explain_result = self.handle_explain(statement)?;
         let mut rows: Vec<(String, String)> = Vec::new();
 
@@ -1783,12 +1639,10 @@ impl LaminarDB {
             }
         }
 
-        // Extract the inner SQL from the original EXPLAIN ANALYZE statement
         let upper = original_sql.to_uppercase();
         let inner_start = upper.find("ANALYZE").map_or(0, |pos| pos + "ANALYZE".len());
         let inner_sql = original_sql[inner_start..].trim();
 
-        // Try to execute the inner query via DataFusion and collect metrics
         let start = std::time::Instant::now();
         match self.ctx.sql(inner_sql).await {
             Ok(df) => match df.collect().await {
@@ -1830,10 +1684,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Metadata(batch))
     }
 
-    /// Handle a streaming or standard SQL query.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_query(&self, sql: &str) -> Result<ExecuteResult, DbError> {
-        // Synchronous planning under the lock — released before any await
         let plan = {
             let statements = parse_streaming_sql(sql)?;
             if statements.is_empty() {
@@ -1859,22 +1711,18 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::Query(query_plan) => {
-                // Check for ASOF join — DataFusion can't parse ASOF syntax
                 if let Some(asof_config) = Self::extract_asof_config(&query_plan) {
                     return self.execute_asof_query(&asof_config, sql).await;
                 }
 
                 let plan_sql = query_plan.statement.to_string();
                 let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
-
-                // DataFusion interpreted execution.
                 let df = self.ctx.execute_logical_plan(logical_plan).await?;
                 let stream = df.execute_stream().await?;
 
                 Ok(self.bridge_query_stream(sql, stream))
             }
             laminar_sql::planner::StreamingPlan::Standard(stmt) => {
-                // Async execution without the lock
                 let sql_str = stmt.to_string();
                 let df = self.ctx.sql(&sql_str).await?;
                 let stream = df.execute_stream().await?;
@@ -1898,8 +1746,6 @@ impl LaminarDB {
         }
     }
 
-    /// Bridge a `DataFusion` `SendableRecordBatchStream` into the streaming
-    /// subscription infrastructure and return a `QueryHandle`.
     fn bridge_query_stream(
         &self,
         sql: &str,
@@ -1954,7 +1800,6 @@ impl LaminarDB {
         })
     }
 
-    /// Extract an ASOF join config from a query plan, if present.
     fn extract_asof_config(
         plan: &laminar_sql::planner::QueryPlan,
     ) -> Option<AsofJoinTranslatorConfig> {
@@ -1967,9 +1812,6 @@ impl LaminarDB {
         })
     }
 
-    /// Execute an ASOF join query by fetching left/right tables separately
-    /// and performing the join in-process (bypasses `DataFusion`'s SQL parser
-    /// which doesn't understand ASOF syntax).
     async fn execute_asof_query(
         &self,
         asof_config: &AsofJoinTranslatorConfig,
@@ -2037,15 +1879,12 @@ impl LaminarDB {
         Ok(self.bridge_query_stream(original_sql, stream))
     }
 
-    /// Get a typed source handle for pushing data.
-    ///
-    /// The source must have been created via `CREATE SOURCE`.
+    /// Get a typed handle for pushing data to a registered source.
     ///
     /// # Errors
     ///
     /// Returns `DbError::SourceNotFound` if the source is not registered.
-    /// Returns `DbError::SchemaMismatch` if the Rust type's schema does not
-    /// match the source's SQL schema.
+    /// Returns `DbError::SchemaMismatch` if the Rust type's schema doesn't match.
     pub fn source<T: laminar_core::streaming::Record>(
         &self,
         name: &str,
@@ -2070,7 +1909,7 @@ impl LaminarDB {
         Ok(UntypedSourceHandle::new(entry))
     }
 
-    /// List all registered sources.
+    /// List registered sources.
     pub fn sources(&self) -> Vec<SourceInfo> {
         let names = self.catalog.list_sources();
         names
@@ -2085,7 +1924,7 @@ impl LaminarDB {
             .collect()
     }
 
-    /// List all registered sinks.
+    /// List registered sinks.
     pub fn sinks(&self) -> Vec<SinkInfo> {
         self.catalog
             .list_sinks()
@@ -2094,7 +1933,7 @@ impl LaminarDB {
             .collect()
     }
 
-    /// List all registered materialized views with their SQL and state.
+    /// List registered materialized views.
     pub fn materialized_views(&self) -> Vec<crate::handle::MaterializedViewInfo> {
         let registry = self.mv_registry.lock();
         registry
@@ -2103,7 +1942,7 @@ impl LaminarDB {
             .collect()
     }
 
-    /// List all registered streams with their SQL definitions.
+    /// List registered streams.
     pub fn streams(&self) -> Vec<crate::handle::StreamInfo> {
         let mgr = self.connector_manager.lock();
         mgr.streams()
@@ -2115,22 +1954,15 @@ impl LaminarDB {
             .collect()
     }
 
-    /// Build the pipeline topology graph from registered sources, streams,
-    /// and sinks.
-    ///
-    /// Returns a `PipelineTopology` with nodes for every source, stream,
-    /// and sink, plus edges derived from stream SQL `FROM` references and
-    /// sink `input` fields.
+    /// Build the pipeline topology graph (nodes + edges) from registered sources, streams, and sinks.
     pub fn pipeline_topology(&self) -> crate::handle::PipelineTopology {
         use crate::handle::{PipelineEdge, PipelineNode, PipelineNodeType};
 
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
 
-        // Collect source names for FROM matching
         let source_names = self.catalog.list_sources();
 
-        // Source nodes
         for name in &source_names {
             let schema = self.catalog.get_source(name).map(|e| e.schema.clone());
             nodes.push(PipelineNode {
@@ -2141,7 +1973,6 @@ impl LaminarDB {
             });
         }
 
-        // Stream nodes + edges from SQL FROM references
         let mgr = self.connector_manager.lock();
         let stream_names: Vec<String> = mgr.streams().keys().cloned().collect();
         for (name, reg) in mgr.streams() {
@@ -2152,9 +1983,7 @@ impl LaminarDB {
                 sql: Some(reg.query_sql.clone()),
             });
 
-            // Extract FROM references by checking which known sources/streams
-            // appear in the query SQL. This is a lightweight heuristic that
-            // avoids a full SQL parse.
+            // Lightweight heuristic: substring match instead of a full parse.
             let sql_upper = reg.query_sql.to_uppercase();
             for src in &source_names {
                 if sql_upper.contains(&src.to_uppercase()) {
@@ -2164,7 +1993,6 @@ impl LaminarDB {
                     });
                 }
             }
-            // Also check for stream-to-stream references (cascading)
             for other in &stream_names {
                 if other != name && sql_upper.contains(&other.to_uppercase()) {
                     edges.push(PipelineEdge {
@@ -2175,7 +2003,6 @@ impl LaminarDB {
             }
         }
 
-        // Sink nodes + edges from input field
         for (name, reg) in mgr.sinks() {
             nodes.push(PipelineNode {
                 name: name.clone(),
@@ -2184,7 +2011,6 @@ impl LaminarDB {
                 sql: None,
             });
 
-            // Sinks read from their `input` field
             if !reg.input.is_empty() {
                 edges.push(PipelineEdge {
                     from: reg.input.clone(),
@@ -2193,12 +2019,9 @@ impl LaminarDB {
             }
         }
 
-        // Also add catalog-only sinks (no connector type) that aren't
-        // already in the connector manager
         let cm_sink_names: std::collections::HashSet<&String> = mgr.sinks().keys().collect();
         for name in self.catalog.list_sinks() {
             if !cm_sink_names.contains(&name) {
-                // Check if there's a sink entry in the catalog with input info
                 if let Some(input) = self.catalog.get_sink_input(&name) {
                     nodes.push(PipelineNode {
                         name: name.clone(),
@@ -2221,7 +2044,7 @@ impl LaminarDB {
         crate::handle::PipelineTopology { nodes, edges }
     }
 
-    /// List all active queries.
+    /// List active queries.
     pub fn queries(&self) -> Vec<QueryInfo> {
         self.catalog
             .list_queries()
@@ -2236,23 +2059,16 @@ impl LaminarDB {
         self.config.checkpoint.is_some()
     }
 
-    /// Returns a checkpoint store instance, if checkpointing is configured.
-    ///
-    /// Returns an [`ObjectStoreCheckpointStore`](laminar_core::storage::ObjectStoreCheckpointStore)
-    /// when `object_store_url` is set, otherwise a
-    /// [`FileSystemCheckpointStore`](laminar_core::storage::FileSystemCheckpointStore).
+    /// Return a checkpoint store for the current configuration, if any.
     pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_core::storage::CheckpointStore>> {
         let cp_config = self.config.checkpoint.as_ref()?;
         let max_retained = cp_config.max_retained.unwrap_or(3);
-        // Pass the runtime vnode count through so manifest validation
-        // checks against the real invariant, not a hardcoded default.
         let vnode_count = self.vnode_registry.lock().as_ref().map_or(
             laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
             |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
         );
 
         if let Some(ref url) = self.config.object_store_url {
-            // The builder roots the store at the URL's path prefix.
             let obj_store = laminar_core::storage::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
@@ -2282,18 +2098,12 @@ impl LaminarDB {
         }
     }
 
-    /// Triggers a streaming checkpoint that persists source offsets, sink
-    /// positions, and operator state to disk via the
-    /// [`CheckpointCoordinator`](crate::checkpoint_coordinator::CheckpointCoordinator).
-    ///
-    /// Returns the checkpoint result on success, including the checkpoint ID,
-    /// epoch, and duration.
+    /// Trigger a checkpoint that persists source offsets, sink positions, and operator state.
     ///
     /// # Errors
     ///
-    /// Returns `DbError::Checkpoint` if checkpointing is not enabled, the
-    /// coordinator has not been initialized (call `start()` first), or the
-    /// checkpoint operation fails.
+    /// Returns `DbError::Checkpoint` if checkpointing is disabled, the
+    /// coordinator is not initialized, or the checkpoint fails.
     pub async fn checkpoint(
         &self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
@@ -2331,11 +2141,9 @@ impl LaminarDB {
             }
         }
 
-        // When the streaming pipeline is live, route through the
-        // pipeline callback so it captures operator state (via the same
-        // path that the periodic checkpoint timer uses). Without this,
-        // the manifest has an empty `operator_states` map and restart
-        // loses everything the `IncrementalAggState` accumulators held.
+        // Route through the callback so it captures operator state the same way
+        // the periodic timer does; direct coordinator calls produce an empty
+        // operator_states map and lose accumulator state on restart.
         let tx = self.force_ckpt_tx.lock().clone();
         let result = if let Some(tx) = tx {
             let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
@@ -2348,10 +2156,8 @@ impl LaminarDB {
                 DbError::Checkpoint("pipeline callback dropped oneshot before replying".into())
             })?
         } else {
-            // Fallback: no running pipeline (e.g., engine built but not yet
-            // started). Drive the coordinator directly. Operator state will
-            // be empty, but restart from this manifest is still well-defined
-            // because there's nothing to restore anyway.
+            // No running pipeline; drive the coordinator directly. Operator state
+            // will be empty — safe when there is nothing to restore yet.
             let mut guard = self.coordinator.lock().await;
             let coord = guard.as_mut().ok_or_else(|| {
                 DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
@@ -2361,8 +2167,6 @@ impl LaminarDB {
                 .await
         };
 
-        // Refresh the shared catalog manifest on every successful checkpoint so
-        // a node joining later can rebuild this node's MVs/sources. Best-effort.
         #[cfg(feature = "cluster")]
         if matches!(&result, Ok(r) if r.success) {
             self.persist_catalog_manifest().await;
@@ -2421,9 +2225,7 @@ impl LaminarDB {
         }
     }
 
-    /// Returns checkpoint performance statistics.
-    ///
-    /// Returns `None` if the checkpoint coordinator has not been initialized.
+    /// Returns checkpoint performance statistics, or `None` if the coordinator is not initialized.
     pub async fn checkpoint_stats(&self) -> Option<crate::checkpoint_coordinator::CheckpointStats> {
         let guard = self.coordinator.lock().await;
         guard
@@ -2444,7 +2246,7 @@ impl std::fmt::Debug for LaminarDB {
     }
 }
 
-/// Wraps `DefaultPhysicalPlanner` with lookup join extension support.
+/// `DefaultPhysicalPlanner` with lookup-join extension support.
 struct LookupQueryPlanner {
     extension_planner: Arc<dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync>,
 }
@@ -2473,14 +2275,14 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
     }
 }
 
-/// Serves a node's local MV / reference-table rows to peers (pull path). Weak
-/// store handles, so it never keeps the database alive.
+/// Serves local MV / reference-table rows to peers. Weak store handles so
+/// it never keeps the database alive.
 #[cfg(feature = "cluster")]
 struct DbQueryHandler {
     mv_store: std::sync::Weak<parking_lot::RwLock<crate::mv_store::MvStore>>,
     table_store: std::sync::Weak<parking_lot::RwLock<crate::table_store::TableStore>>,
-    /// Isolated context for compiling a pushed `filter_sql` (only the temp table
-    /// is visible), so a crafted predicate can't reference other tables.
+    /// Isolated context: only the temp table is visible, so a pushed predicate
+    /// can't reference other registered tables.
     filter_ctx: SessionContext,
 }
 
@@ -2504,8 +2306,8 @@ impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
             })
             .ok_or_else(|| format!("table '{table_name}' not found"))?;
 
-        // Apply the pushed predicate before projecting (it may reference dropped
-        // columns); on any failure skip it — the coordinator re-applies it.
+        // Apply before projecting (predicate may reference dropped columns);
+        // on any failure skip — the coordinator re-applies it.
         let batch = match filter_sql {
             Some(sql) => {
                 let schema = batch.schema();

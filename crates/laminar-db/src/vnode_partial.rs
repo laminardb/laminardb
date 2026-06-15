@@ -1,35 +1,18 @@
-//! Per-vnode durable partial state.
+//! Per-vnode durable partial state (`epoch=N/vnode=V/partial.bin`).
 //!
-//! Replaces the old `ckpt:{id}` marker that `partial.bin` used to hold. A
-//! `VnodePartial` is the slice of operator state belonging to a single vnode
-//! at a single committed epoch: when a node acquires that vnode in a
-//! rebalance it reads this blob from the shared object store
-//! (`epoch=N/vnode=V/partial.bin`) and merges each operator's slice into the
-//! corresponding live operator.
-//!
-//! The presence of `partial.bin` still drives the durability gate
-//! (`StateBackend::epoch_complete`), so an empty `operators` map (a vnode this
-//! node owns but for which no operator carried state) is valid and seals the
-//! epoch exactly as the marker did.
+//! An empty `operators` map is valid — it seals the epoch without carrying state,
+//! which is correct for vnodes whose operators hold nothing.
 
 use crate::error::DbError;
 
 /// Operator-state slices for one vnode at one epoch.
 ///
-/// Each entry is `(operator_name, that operator's serialized vnode slice)`.
-/// The bytes are exactly what the operator's per-vnode checkpoint produced
-/// (e.g. an rkyv-encoded `AggStateCheckpoint` holding only this vnode's
-/// groups), so the apply path can hand them straight back to the operator.
-///
-/// `base_epoch = Some(N)` makes this a *reference* artifact: the
-/// vnode's state is byte-identical to the full partial it
-/// uploaded at epoch `N`, so `operators` is empty and the reader follows
-/// the reference (a single hop — references always point at a full
-/// artifact, never at another reference). The writer re-emits a full
-/// partial before the base can leave the prune retention window.
+/// `base_epoch = Some(N)` means the state is byte-identical to the full partial at epoch N;
+/// `operators` is empty and the reader follows this one-hop reference. The writer re-emits a full
+/// partial before the base leaves the prune window.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct VnodePartial {
-    /// Checkpoint id this partial was sealed under — for audit/logging.
+    /// Sealed epoch, for audit.
     pub checkpoint_id: u64,
     /// `(operator_name, vnode-slice bytes)`. Empty for references.
     pub operators: Vec<(String, Vec<u8>)>,
@@ -38,22 +21,13 @@ pub(crate) struct VnodePartial {
 }
 
 impl VnodePartial {
-    /// Serialize for `write_partial`.
     pub(crate) fn encode(&self) -> Result<Vec<u8>, DbError> {
         rkyv::to_bytes::<rkyv::rancor::Error>(self)
             .map(|v| v.to_vec())
             .map_err(|e| DbError::Checkpoint(format!("vnode partial serialization: {e}")))
     }
 
-    /// Deserialize a `partial.bin` blob.
-    ///
-    /// Best-effort by contract at the call site: a blob that isn't a
-    /// `VnodePartial` (a legacy `ckpt:{id}` marker, or hand-written test
-    /// bytes) returns `Err` and the caller skips it rather than aborting the
-    /// rebalance.
-    ///
-    /// Only the cluster rehydration path decodes partials; in a non-cluster
-    /// build this is exercised solely by unit tests.
+    /// Deserialize a `partial.bin` blob; returns `Err` for legacy markers so callers can skip them.
     #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DbError> {
         rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)

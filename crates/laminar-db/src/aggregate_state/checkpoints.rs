@@ -1,16 +1,7 @@
-//! Serializable checkpoint shapes.
+//! Serializable checkpoint shapes for aggregate, join, and window state.
 //!
-//! **Wire format note:** scalar aggregate fields (`GroupCheckpoint.key`,
-//! `GroupCheckpoint.acc_states`, `EmittedCheckpoint.key`,
-//! `EmittedCheckpoint.values`) are Arrow IPC streams produced by
-//! [`scalars_to_ipc`](super::scalars_to_ipc) — one-row batches encoding
-//! a tuple of `ScalarValue`s. Historically these were
-//! `Vec<serde_json::Value>` / `Vec<Vec<serde_json::Value>>`; see
-//! [`scalar_ipc`](super::scalar_ipc) for the rationale.
-//!
-//! `JoinStateCheckpoint.left_batches` / `right_batches` are a different
-//! shape: they hold Arrow IPC streams of full multi-row `RecordBatch`es
-//! and are *not* produced by `scalars_to_ipc`.
+//! Scalar fields (`key`, `acc_states`, `values`) hold Arrow IPC one-row batches
+//! from `scalars_to_ipc`. Join buffer fields hold full multi-row IPC batches.
 
 use std::hash::{Hash, Hasher};
 
@@ -20,10 +11,7 @@ use arrow::datatypes::Schema;
     Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct GroupCheckpoint {
-    /// IPC bytes encoding the group key tuple (`Vec<ScalarValue>`).
     pub key: Vec<u8>,
-    /// One IPC blob per aggregate, each encoding that aggregate's
-    /// `Accumulator::state()` tuple.
     pub acc_states: Vec<Vec<u8>>,
     #[serde(default = "default_last_updated")]
     pub last_updated_ms: i64,
@@ -47,9 +35,7 @@ pub(crate) struct AggStateCheckpoint {
     Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct EmittedCheckpoint {
-    /// IPC bytes for the key tuple.
     pub key: Vec<u8>,
-    /// IPC bytes for the emitted value tuple.
     pub values: Vec<u8>,
 }
 
@@ -67,9 +53,7 @@ pub(crate) struct WindowCheckpoint {
 pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
-    /// Highest watermark at checkpoint time. Bumps the rkyv schema —
-    /// pre-feature checkpoints fail to deserialize and the recovery
-    /// path falls back to a fresh start.
+    // Bumps the rkyv schema; old checkpoints fail to deserialize and recovery restarts fresh.
     pub high_watermark_ms: i64,
 }
 
@@ -95,8 +79,7 @@ fn default_evicted_watermark() -> i64 {
     i64::MIN
 }
 
-/// Stable hash of the pre-aggregate SQL + output schema shape. Used to
-/// invalidate restored state when the query has changed.
+/// Stable hash of the pre-agg SQL and output schema; invalidates restored state on query change.
 pub(crate) fn query_fingerprint(pre_agg_sql: &str, output_schema: &Schema) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     pre_agg_sql.hash(&mut hasher);

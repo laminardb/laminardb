@@ -1,10 +1,4 @@
-//! Temporal probe join operator for the `OperatorGraph`.
-//!
-//! Wraps `crate::temporal_probe::TemporalProbeState` and the
-//! `execute_temporal_probe_cycle` function. The operator is **stateful**
-//! across cycles: it buffers right-side reference data and pending probes
-//! for offsets not yet resolvable. Probes are emitted when the watermark
-//! advances past their probe timestamp.
+//! Temporal probe join operator; stateful wrapper around `TemporalProbeState`.
 
 use std::sync::Arc;
 

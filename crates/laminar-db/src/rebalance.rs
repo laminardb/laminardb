@@ -66,10 +66,7 @@ impl RebalanceConfig {
     }
 }
 
-/// Surface the rehydration outcome of an adopted snapshot. A node that
-/// gained vnodes pulled their last committed state off the shared backend
-/// in [`LaminarDB::adopt_assignment_snapshot`]; log what moved so operators
-/// have an audit trail of every rebalance-driven state transfer.
+/// Log what moved so there's an audit trail of every rebalance-driven state transfer.
 fn log_adoption(source: &str, adoption: &SnapshotAdoption) {
     if adoption.newly_acquired.is_empty() {
         return;
@@ -127,7 +124,6 @@ pub fn spawn_snapshot_watcher(
                 }
             }
 
-            // Refresh placement metrics only when the assignment changed.
             let version = registry.assignment_version();
             if version != published_version {
                 published_version = version;
@@ -145,8 +141,7 @@ pub fn spawn_snapshot_watcher(
     })
 }
 
-/// Publish per-domain owner counts and the blast-radius ratio. The gauge vector
-/// is reset so domains that disappear don't leave stale series.
+/// Publish per-domain owner counts. Resets the gauge so disappeared domains don't leave stale series.
 #[allow(clippy::cast_precision_loss)]
 fn publish_placement_metrics(
     metrics: &EngineMetrics,
@@ -202,7 +197,6 @@ pub fn spawn_rebalance_controller(
             }
             debug!("membership change observed; debouncing");
 
-            // Debounce: absorb further churn before acting.
             loop {
                 tokio::select! {
                     biased;
@@ -219,18 +213,12 @@ pub fn spawn_rebalance_controller(
                 }
             }
 
-            // Retry transient failures so a single hiccup doesn't
-            // leave the cluster on a stale assignment.
             loop {
                 if !controller.is_leader() {
                     debug!("membership changed; not the leader — skipping rotation check");
                     break;
                 }
-                // Use assignable (Active, non-draining) instances so
-                // Draining/Suspected nodes are never handed vnodes. The
-                // weak leader gate above still uses live membership;
-                // `LeaderLeaseManager` is the fencing authority for split-
-                // brain hardening (kept standalone, see leader_lease.rs).
+                // Assignable = Active, non-draining — Draining/Suspected nodes never receive vnodes.
                 let live = controller.assignable_instances();
                 match try_rebalance(&db, &controller, &store, &registry, &live, config).await {
                     Ok(Some(v)) => {
@@ -288,8 +276,6 @@ pub async fn wait_until_drained(
     }
 }
 
-/// `Ok(Some(version))` on rotation (ours or a peer's), `Ok(None)` if
-/// no change is needed.
 async fn try_rebalance(
     db: &Arc<LaminarDB>,
     controller: &Arc<ClusterController>,
@@ -298,9 +284,7 @@ async fn try_rebalance(
     live: &[NodeId],
     config: RebalanceConfig,
 ) -> Result<Option<u64>, String> {
-    // No assignable instances (whole cluster draining/joining) — nothing to
-    // rotate to. Hold the current assignment rather than panicking the
-    // placement call on an empty node set.
+    // Whole cluster draining — hold the current assignment rather than panicking on an empty node set.
     if live.is_empty() {
         return Ok(None);
     }
@@ -317,21 +301,11 @@ async fn try_rebalance(
         return Ok(None);
     }
 
-    // Drain in-flight shuffle rows into durable state at the old
-    // fence version before rotating. When the rotation sheds a DEAD
-    // node, skip the drain entirely: its durability gate needs captures
-    // from a node that will never provide them, so it can only burn its
-    // full timeout and abort — deadlocking rotation against the gate
-    // when rotation is the only thing that restores commit
-    // availability. The dead node's in-flight rows are unrecoverable
-    // regardless; survivors rehydrate its vnodes from the last
-    // committed epoch — the same at-least-once duplication window every
-    // ungraceful failover already has.
-    //
-    // "Dead" must be judged from MEMBERSHIP, not the assignable set:
-    // a Draining node is excluded from assignment but is alive and can
-    // checkpoint — its graceful handoff depends on this drain sealing
-    // its in-flight rows before the rotation takes its vnodes.
+    // When shedding a dead node, skip the pre-rotation drain: the dead node can't provide captures,
+    // so the durability gate would time out and deadlock against rotation — which is the only thing
+    // that restores commit availability. Survivors rehydrate from the last committed epoch.
+    // "Dead" is from MEMBERSHIP, not the assignable set: a Draining node is alive and must drain
+    // before rotation takes its vnodes.
     let shedding_dead = {
         use laminar_core::cluster::discovery::NodeState;
         let owners = current.to_vnode_vec(registry.vnode_count());
@@ -377,8 +351,7 @@ async fn try_rebalance(
             let adoption = db.adopt_assignment_snapshot(proposal).await;
             log_adoption("rebalance", &adoption);
             controller.announce_snapshot_version(v).await;
-            // Keep the current plus one prior as slack for in-flight
-            // readers — `prune_before(v - 1)` retains `[v-1, v]`.
+            // Retain [v-1, v] as slack for in-flight readers.
             let prune = v.saturating_sub(1);
             if let Err(e) = store.prune_before(prune).await {
                 warn!(error = %e, "snapshot prune failed");

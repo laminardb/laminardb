@@ -14,9 +14,7 @@ use crate::error::DbError;
 
 static COMPILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Registers a temporary table on construction and deregisters on drop, so a
-/// concurrent compile or an early return can never leak the registration onto
-/// the shared `SessionContext`.
+/// RAII guard that registers a temp table and deregisters it on drop.
 struct ScopedTable<'a> {
     ctx: &'a SessionContext,
     name: String,
@@ -42,9 +40,7 @@ impl Drop for ScopedTable<'_> {
     }
 }
 
-/// Compile `filter_sql` into a `PhysicalExpr` against `schema`. Each failure
-/// (planner, predicate extraction, physical lowering) is reported with enough
-/// context that the caller can surface a meaningful message to the user.
+/// Compile `filter_sql` into a `PhysicalExpr` against `schema`.
 pub(crate) async fn compile(
     ctx: &SessionContext,
     filter_sql: &str,
@@ -58,8 +54,7 @@ pub(crate) async fn compile(
         .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}': {e}")))?
         .logical_plan()
         .clone();
-    // The predicate columns are qualified by the temp table name; capture
-    // that qualifier into the DFSchema before dropping `scoped`.
+    // Capture the temp-table qualifier into the DFSchema before dropping `scoped`.
     let df_schema = DFSchema::try_from_qualified_schema(scoped.name.as_str(), schema.as_ref())
         .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (df_schema): {e}")))?;
     drop(scoped);
@@ -83,7 +78,7 @@ fn find_predicate(plan: &LogicalPlan) -> Option<Expr> {
     }
 }
 
-/// Apply a compiled boolean predicate. `Ok(None)` if every row is filtered out.
+/// Apply a compiled boolean predicate; `Ok(None)` if every row is filtered out.
 pub(crate) fn apply(
     batch: &RecordBatch,
     expr: &dyn PhysicalExpr,

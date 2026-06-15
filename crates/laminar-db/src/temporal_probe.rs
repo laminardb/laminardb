@@ -1,21 +1,8 @@
 #![deny(clippy::disallowed_types)]
 
-//! Temporal probe join execution.
-//!
-//! For each left event, probes the right stream at multiple fixed time offsets.
-//! Each left row produces N output rows (one per offset) with the ASOF-matched
-//! right value at `event_time + offset_ms`.
-//!
-//! State is watermark-driven: probes with `probe_ts <= watermark` are emitted
-//! immediately. Remaining probes are buffered until the watermark advances.
-//!
-//! ## Known limitations
-//!
-//! - **Column disambiguation**: right-side columns that collide with left-side
-//!   names are suffixed `_{right_table}`. The projection SQL builder needs source
-//!   schemas (available in `add_query`) to detect collisions correctly.
-//! - **Sparse reference streams**: if the correct ASOF match predates the
-//!   eviction cutoff, the lookup returns NULL. Dense reference streams avoid this.
+//! Temporal probe join: each left row fans out N output rows (one per offset),
+//! ASOF-matched against the reference stream at `event_time + offset_ms`.
+//! Probes whose target timestamp exceeds the current watermark are carried until it advances.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,7 +21,6 @@ use crate::key_column::{extract_column_as_timestamps, take_with_nulls, Composite
 const COMPACTION_THRESHOLD: u32 = 32;
 const MAX_PENDING_PROBES: usize = 100_000;
 
-/// Per-key reference stream buffer with ASOF lookup and bounded memory.
 #[derive(Debug, Default)]
 struct RefBuffer {
     index: FxHashMap<u64, BTreeMap<i64, Vec<usize>>>,
@@ -100,7 +86,6 @@ impl RefBuffer {
         Ok(())
     }
 
-    /// ASOF lookup with key verification.
     fn asof_lookup(
         &self,
         key_hash: u64,
@@ -160,7 +145,6 @@ impl RefBuffer {
             idx_map.insert(old_idx, new_idx);
         }
 
-        // Use arrow::compute::take instead of per-row slice + concat
         #[allow(clippy::cast_possible_truncation)]
         let take_indices = arrow::array::UInt32Array::from(
             live_rows.iter().map(|&i| i as u32).collect::<Vec<_>>(),
@@ -529,7 +513,6 @@ pub(crate) fn execute_temporal_probe_cycle(
         }
     }
 
-    // Resolve carried probes from previous cycles
     if !state.carried_probes.is_empty() && watermark > state.last_watermark {
         let mut still_pending = Vec::new();
         #[allow(clippy::type_complexity)]
@@ -623,7 +606,7 @@ pub(crate) fn execute_temporal_probe_cycle(
         }
     }
 
-    // Evict — safe cutoff preserving data for carried probes
+    // Evict: cutoff clamped to the earliest pending probe's target timestamp.
     if watermark > state.last_watermark {
         let min_offset = config.min_offset_ms();
         let base_cutoff = if min_offset < 0 {

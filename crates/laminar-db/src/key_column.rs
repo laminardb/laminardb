@@ -63,7 +63,7 @@ impl KeyColumn<'_> {
             (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
             (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
             (KeyColumn::Timestamp(a), KeyColumn::Timestamp(b)) => a.value(i) == b.value(j),
-            // Cross-type: Int64 epoch-ms ↔ Timestamp(ms) match by value.
+            // Int64 epoch-ms and Timestamp(ms) compare equal by value.
             (KeyColumn::Int64(a), KeyColumn::Timestamp(b)) => a.value(i) == b.value(j),
             (KeyColumn::Timestamp(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
             _ => false,
@@ -93,9 +93,7 @@ pub(crate) fn extract_key_column<'a>(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?,
         )),
-        // Any Timestamp time-unit and timezone — normalised to ms via the
-        // shared cast helper. Cross-type Int64↔Timestamp equality is
-        // handled in `eq_at`.
+        // Any Timestamp variant — normalised to ms; cross-type equality handled in `eq_at`.
         DataType::Timestamp(_, _) => {
             let normalised = cast_to_millis_array(array.as_ref()).map_err(|e| {
                 DbError::Pipeline(format!("Column '{col_name}' timestamp cast: {e}"))

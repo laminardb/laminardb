@@ -33,6 +33,14 @@
 //!   (read_committed) against the generator's deterministic output:
 //!   every seq must appear exactly once, no gaps, no duplicates —
 //!   the exactly-once proof under kill -9.
+//! - `LAMINAR_SOAK_STATE_TIER`  any value: enable the disk cold tier
+//!   (build with `--features state-tier`). Adds a small memory budget
+//!   and an `EMIT CHANGES` aggregation so state is demoted under load,
+//!   then asserts demotion AND promotion counters moved across the
+//!   kill -9 rounds. Knobs (tier mode only): `LAMINAR_SOAK_BUDGET_BYTES`
+//!   (default 256 KiB), `LAMINAR_SOAK_VNODES` (256), `LAMINAR_SOAK_RPS`
+//!   (400), `LAMINAR_SOAK_GROUPS` (2000 — the agg key-space size),
+//!   `LAMINAR_SOAK_SPAN` (12 — consecutive rows per agg key).
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -150,6 +158,28 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
 
+    // Optional disk cold tier (Phase 5 soak). A tiny budget forces
+    // demotion under load, a larger vnode ring keeps most vnodes clean
+    // each capture interval (only clean vnodes are demotable), and the
+    // `soak_agg` pipeline below gives the tier demotable per-vnode state
+    // (the pass-through `soak_stream` has none). Bounded key space (mod
+    // GROUPS) means demoted keys are revisited, driving promotion too.
+    // Gated on the env var so default runs are byte-identical.
+    let tier = std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok();
+    let rps = env_u64("LAMINAR_SOAK_RPS", if tier { 400 } else { 200 });
+    let vnodes = env_u64("LAMINAR_SOAK_VNODES", if tier { 256 } else { 64 });
+    let mut server_extra = String::new();
+    if tier {
+        let budget = env_u64("LAMINAR_SOAK_BUDGET_BYTES", 256 * 1024);
+        let tier_dir = data_dir
+            .join("tier")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        server_extra =
+            format!("state_tier_dir = \"{tier_dir}\"\nstate_memory_budget_bytes = {budget}\n");
+    }
+
     let mut storage = String::new();
     for (env, key) in [
         ("LAMINAR_SOAK_S3_ENDPOINT", "endpoint"),
@@ -173,7 +203,7 @@ storage_dir = "{data}"
 [server]
 mode = "cluster"
 bind = "127.0.0.1:{http}"
-
+{server_extra}
 [discovery]
 strategy = "static"
 seeds = [{seeds}]
@@ -187,7 +217,7 @@ strategy = "raft"
 backend = "object_store"
 url = "{state_url}"
 instance_id = "n{id}"
-vnode_capacity = 64
+vnode_capacity = {vnodes}
 
 [state.storage]
 {storage}
@@ -205,7 +235,7 @@ max_in_flight_epochs = {depth}
 [[source]]
 name = "gen"
 connector = "generator"
-properties = {{ "rows.per.second" = "200", "batch.max.size" = "256" }}
+properties = {{ "rows.per.second" = "{rps}", "batch.max.size" = "256" }}
 
 [[pipeline]]
 name = "soak_stream"
@@ -215,6 +245,28 @@ sql = "SELECT seq, ts_ms, value FROM gen"
         seeds = seeds.join(", "),
         url = checkpoint_url,
     );
+
+    // Demotable per-vnode aggregate state for the cold tier: an EMIT
+    // CHANGES agg over a SLOW-CYCLING bounded key space. Only changelog
+    // aggs are demotable, and demotion only sheds vnodes that are CLEAN
+    // (untouched since the last capture) — so the key must idle long
+    // enough for whole vnodes to fall quiet. `(seq / SPAN) % GROUPS`
+    // writes each key in a burst of SPAN consecutive rows, then moves
+    // on; a key (and its vnode) is then idle for a full GROUPS*SPAN-row
+    // cycle (→ demotable) before the cycle returns to it (→ promotable).
+    // A plain `seq % GROUPS` instead scatters every key across the ring
+    // every cycle, so no vnode is ever idle and demotion just thrashes.
+    if tier {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+"#,
+        ));
+    }
 
     // Optional exactly-once Kafka sink: each node writes its own topic
     // (its generator is an independent seq stream), so each topic must
@@ -451,39 +503,103 @@ fn three_node_kill9_soak() {
     let mut floor = assert_progress(&nodes, 0.0, Duration::from_secs(90), "startup");
     eprintln!("soak: cluster up, epoch {floor}");
 
+    // Cap on kill rounds. `LAMINAR_SOAK_KILLS=0` runs a steady, no-fault
+    // soak — the right vehicle to observe *effective* demotion/promotion,
+    // since rebalance rehydration (every kill) sets `dirty_all` and refuses
+    // demotion until the next capture. Default: kill for the whole window.
+    let max_kills = env_u64("LAMINAR_SOAK_KILLS", u64::MAX);
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
     let mut round = 0u32;
+    let mut kills = 0u64;
     while Instant::now() < deadline {
-        // kill -9 a node mid-epoch (no drain, no final checkpoint —
-        // the cadence guarantees an epoch is in flight). Round-robin:
-        // over the soak this hits the leader and every follower.
-        let victim = (round as usize) % NODES;
         round += 1;
-        eprintln!("soak round {round}: kill -9 node {victim}");
-        nodes[victim].kill9();
-        floor = assert_progress(
-            &nodes,
-            floor,
-            Duration::from_secs(90),
-            "progress after kill",
-        );
+        if kills < max_kills {
+            // kill -9 a node mid-epoch (no drain, no final checkpoint —
+            // the cadence guarantees an epoch is in flight). Round-robin:
+            // over the soak this hits the leader and every follower.
+            let victim = (kills as usize) % NODES;
+            kills += 1;
+            eprintln!("soak round {round}: kill -9 node {victim}");
+            nodes[victim].kill9();
+            floor = assert_progress(
+                &nodes,
+                floor,
+                Duration::from_secs(90),
+                "progress after kill",
+            );
 
-        // Restart it; it must rejoin and the cluster keeps committing.
-        nodes[victim].spawn();
-        wait_for(
-            "killed node serving /metrics again",
-            Duration::from_secs(60),
-            || nodes[victim].epoch().is_some(),
-        );
-        floor = assert_progress(
-            &nodes,
-            floor,
-            Duration::from_secs(90),
-            "progress after rejoin",
-        );
+            // Restart it; it must rejoin and the cluster keeps committing.
+            nodes[victim].spawn();
+            wait_for(
+                "killed node serving /metrics again",
+                Duration::from_secs(60),
+                || nodes[victim].epoch().is_some(),
+            );
+            floor = assert_progress(
+                &nodes,
+                floor,
+                Duration::from_secs(90),
+                "progress after rejoin",
+            );
+        } else {
+            // No-fault steady state: just confirm the cluster keeps
+            // committing, then pace the loop so demotion has clean windows.
+            floor = assert_progress(&nodes, floor, Duration::from_secs(90), "steady progress");
+            std::thread::sleep(Duration::from_secs(5));
+        }
+
+        // Per-round tier snapshot: demotion/promotion evolve across the
+        // run, and the final scrape can land just after a rebalance wiped
+        // a node's tier — logging each round captures the peak.
+        if std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok() {
+            let s = |m: &str| -> f64 { nodes.iter().filter_map(|n| n.metric(m)).sum() };
+            eprintln!(
+                "soak round {round} tier: demotes={} fetches={} resident_bytes={} \
+                 slices={} in_memory_state={}",
+                s("laminardb_state_tier_demote_total"),
+                s("laminardb_state_tier_fetch_total"),
+                s("laminardb_state_tier_bytes"),
+                s("laminardb_state_tier_slices"),
+                s("laminardb_state_bytes"),
+            );
+        }
     }
 
-    eprintln!("soak: completed {round} fault rounds, final epoch {floor}");
+    eprintln!("soak: completed {round} rounds ({kills} kills), final epoch {floor}");
+
+    // Tier validation: scrape while every node is still live (the Kafka
+    // diff below kills them all). Demotions prove the budget→demote
+    // trigger fired on clean vnodes after a committed capture; fetches
+    // prove a row hit a cold vnode and promotion read it back. Both must
+    // survive the kill -9 rounds (restart rehydrates demoted vnodes from
+    // durable partials, not from the wiped tier).
+    if std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok() {
+        let sum = |name: &str| -> f64 { nodes.iter().filter_map(|n| n.metric(name)).sum() };
+        let demotes = sum("laminardb_state_tier_demote_total");
+        let fetches = sum("laminardb_state_tier_fetch_total");
+        let resident = sum("laminardb_state_tier_bytes");
+        let slices = sum("laminardb_state_tier_slices");
+        let state = sum("laminardb_state_bytes");
+        eprintln!(
+            "soak: tier demotes={demotes} fetches={fetches} resident_bytes={resident} \
+             slices={slices} in_memory_state_bytes={state}"
+        );
+        // `demotes` (state_tier_demote_total) counts *effective* demotions —
+        // slices that actually left memory — and resident_bytes/slices show
+        // what the cold tier still holds. Both >0 with fetches >0 proves the
+        // demote→promote cycle ran end-to-end.
+        assert!(
+            demotes > 0.0,
+            "tier enabled but no demotions — set LAMINAR_SOAK_BUDGET_BYTES below \
+             the per-node state (and LAMINAR_SOAK_KILLS=0 to avoid rebalance churn \
+             holding state dirty)",
+        );
+        assert!(
+            fetches > 0.0,
+            "tier demoted but never promoted — lower LAMINAR_SOAK_GROUPS so demoted keys \
+             are revisited (a row must hit a cold vnode to trigger a fetch)",
+        );
+    }
 
     if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
         // Let in-flight epochs commit, then stop every writer so the

@@ -1,9 +1,4 @@
-//! Temporal join operator for the `OperatorGraph`.
-//!
-//! Wraps the versioned temporal join logic from `laminar-sql`. The stream
-//! side arrives via `inputs[0]`, while the lookup table comes from the
-//! `LookupTableRegistry` (pre-registered by the pipeline lifecycle).
-//! The operator is stateless (no cross-cycle state).
+//! Temporal join operator; stateless wrapper around `VersionedLookupJoinExec`.
 
 use std::sync::Arc;
 
@@ -49,7 +44,6 @@ impl TemporalJoinOperator {
         }
     }
 
-    /// Execute the versioned temporal join using the `VersionedLookupJoinExec`.
     #[allow(clippy::too_many_lines)]
     async fn execute_versioned_join(
         &mut self,
@@ -80,7 +74,6 @@ impl TemporalJoinOperator {
             )));
         };
 
-        // Warn once per query when the temporal table shrinks (non-append-only)
         let current_rows = versioned.batch.num_rows();
         if current_rows < self.last_temporal_row_count {
             tracing::warn!(
@@ -138,7 +131,6 @@ impl TemporalJoinOperator {
 
         let output_schema = build_temporal_output_schema(&stream_schema, &table_schema);
 
-        // Build a MemTable from stream batches as the input plan
         let mem_table = datafusion::datasource::MemTable::try_new(
             Arc::clone(&stream_schema),
             vec![stream_batches],
@@ -188,7 +180,6 @@ impl TemporalJoinOperator {
     }
 }
 
-/// Build the merged output schema: stream fields followed by table fields.
 fn build_temporal_output_schema(stream_schema: &SchemaRef, table_schema: &SchemaRef) -> SchemaRef {
     let mut fields = stream_schema.fields().to_vec();
     fields.extend(table_schema.fields().iter().cloned());
@@ -213,13 +204,11 @@ impl GraphOperator for TemporalJoinOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // Stateless — no checkpoint needed.
-        Ok(None)
+        Ok(None) // stateless
     }
 
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        // Stateless — nothing to restore.
-        Ok(())
+        Ok(()) // stateless
     }
 }
 

@@ -9,7 +9,6 @@ mod query;
 mod schema;
 mod writer;
 
-// Re-export all FFI functions
 pub use arrow_ffi::{
     laminar_batch_create, laminar_batch_export, laminar_batch_export_column, laminar_batch_import,
     laminar_schema_export,

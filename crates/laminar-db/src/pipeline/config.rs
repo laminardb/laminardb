@@ -15,62 +15,37 @@ pub struct PipelineConfig {
     /// Channel capacity for per-source `mpsc` sender → coordinator.
     pub channel_capacity: usize,
 
-    /// Fallback poll interval when a source returns `data_ready_notify() == None`.
+    /// Fallback poll interval when a source returns no `data_ready_notify`.
     pub fallback_poll_interval: Duration,
 
-    /// Checkpoint interval (if checkpointing is enabled).
+    /// Timer-based checkpoint interval (at-least-once). `None` disables auto-checkpointing.
     ///
-    /// This controls the **timer-based** checkpoint mode (at-least-once).
-    /// For exactly-once semantics, use barrier-aligned checkpoints via
-    /// [`PipelineCallback::checkpoint_with_barrier`](super::callback::PipelineCallback::checkpoint_with_barrier) instead. Timer-based
-    /// checkpoints capture offsets *before* operator state, which means
-    /// on recovery the consumer replays from the offset and operators may
-    /// re-process some records (at-least-once, not exactly-once).
+    /// For exactly-once, use barrier-aligned checkpoints via
+    /// [`PipelineCallback::checkpoint_with_barrier`](super::callback::PipelineCallback::checkpoint_with_barrier).
     pub checkpoint_interval: Option<Duration>,
 
-    /// Coordinator micro-batch window.
+    /// Sleep after the first event in a cycle to let more data accumulate.
     ///
-    /// After receiving the first event in a cycle, the coordinator sleeps
-    /// for this duration to let more events accumulate in the channel
-    /// before executing the SQL cycle. This bounds the number of SQL
-    /// executions per second while preserving low latency.
-    ///
-    /// During this window the coordinator does **not** drain the channel,
-    /// so the bounded channel provides natural backpressure to source
-    /// tasks (they block on `tx.send().await` when the channel fills).
-    ///
-    /// Set to `Duration::ZERO` to execute immediately (no batching).
+    /// Bounds SQL executions per second without sacrificing data. The bounded
+    /// channel provides natural backpressure during the window. `ZERO` = no batching.
     pub batch_window: Duration,
 
-    /// Maximum time to wait for all sources to align on a checkpoint
-    /// barrier before cancelling the checkpoint.
+    /// Maximum time to wait for all sources to align on a checkpoint barrier.
     pub barrier_alignment_timeout: Duration,
 
     /// End-to-end delivery guarantee for the pipeline.
-    ///
-    /// Validated at startup: `ExactlyOnce` requires all sources to support
-    /// replay, all sinks to support exactly-once, and checkpointing to be
-    /// enabled. See [`DeliveryGuarantee`] for details.
     pub delivery_guarantee: DeliveryGuarantee,
 
-    /// Maximum wall-clock time for a single processing cycle (nanoseconds).
-    /// Logged at DEBUG when exceeded. Default: 10ms.
+    /// Maximum wall-clock time for a single processing cycle (nanoseconds). Default: 10ms.
     pub cycle_budget_ns: u64,
 
-    /// Maximum wall-clock time for the message drain phase (nanoseconds).
-    /// The drain loop terminates early when this budget is exhausted.
-    /// Default: 1ms.
+    /// Maximum wall-clock time for the message drain phase (nanoseconds). Default: 1ms.
     pub drain_budget_ns: u64,
 
-    /// Maximum wall-clock time for per-query execution within a cycle
-    /// (nanoseconds). When elapsed time exceeds this budget, remaining
-    /// queries are deferred to the next cycle. At least one query always
-    /// executes for forward progress. Default: 8ms.
+    /// Maximum wall-clock time for per-query execution within a cycle (nanoseconds). Default: 8ms.
     pub query_budget_ns: u64,
 
-    /// Maximum wall-clock time for background work (barriers, checkpoint,
-    /// table polling) after SQL execution (nanoseconds). When exceeded,
-    /// low-priority tasks (table polling) are skipped. Default: 5ms.
+    /// Maximum wall-clock time for background work after SQL execution (nanoseconds). Default: 5ms.
     pub background_budget_ns: u64,
 
     /// Per-input-port batch cap. Default: 256.

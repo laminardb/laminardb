@@ -1,6 +1,4 @@
-//! Backend storage for reference tables.
-//!
-//! Provides an in-memory backend for storing reference/dimension table rows.
+//! Backend storage for reference/dimension table rows.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -10,36 +8,26 @@ use arrow::datatypes::SchemaRef;
 
 use crate::error::DbError;
 
-/// Backend storage for a single reference table.
 pub(crate) enum TableBackend {
-    /// In-memory storage (default behavior).
-    InMemory {
-        /// Rows keyed by stringified primary key.
-        rows: HashMap<String, RecordBatch>,
-    },
+    InMemory { rows: HashMap<String, RecordBatch> },
 }
 
-// `get`/`remove` are used by `table_store` reference-table read paths that
-// aren't reachable in the minimal (no-default-features) lib build.
+// `get`/`remove` are used by table_store read paths not reachable in minimal builds.
 #[allow(dead_code, clippy::unnecessary_wraps)]
 impl TableBackend {
-    /// Create a new in-memory backend.
     pub fn in_memory() -> Self {
         Self::InMemory {
             rows: HashMap::new(),
         }
     }
 
-    /// Get a row by primary key.
     pub fn get(&self, key: &str) -> Result<Option<RecordBatch>, DbError> {
         match self {
             Self::InMemory { rows } => Ok(rows.get(key).cloned()),
         }
     }
 
-    /// Insert or update a row.
-    ///
-    /// Returns `true` if the key already existed (update), `false` if new.
+    /// Insert or update a row; returns `true` if the key existed.
     pub fn put(&mut self, key: &str, batch: RecordBatch) -> Result<bool, DbError> {
         match self {
             Self::InMemory { rows } => {
@@ -49,21 +37,18 @@ impl TableBackend {
         }
     }
 
-    /// Remove a row by primary key. Returns `true` if the key existed.
     pub fn remove(&mut self, key: &str) -> Result<bool, DbError> {
         match self {
             Self::InMemory { rows } => Ok(rows.remove(key).is_some()),
         }
     }
 
-    /// Collect all keys.
     pub fn keys(&self) -> Result<Vec<String>, DbError> {
         match self {
             Self::InMemory { rows } => Ok(rows.keys().cloned().collect()),
         }
     }
 
-    /// Concatenate all rows into a single `RecordBatch`.
     pub fn to_record_batch(&self, schema: &SchemaRef) -> Result<Option<RecordBatch>, DbError> {
         match self {
             Self::InMemory { rows } => {
@@ -78,7 +63,6 @@ impl TableBackend {
         }
     }
 
-    /// Whether this backend is persistent.
     #[allow(clippy::unused_self)]
     pub fn is_persistent(&self) -> bool {
         false

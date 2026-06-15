@@ -1,13 +1,5 @@
-//! Concrete inference backends.
-//!
-//! Each backend is feature-gated so the default build carries zero HTTP or ML
-//! weight. Backends are transport only: they turn an [`InferenceRequest`] into
-//! provider calls and the responses back into [`InferenceOutputs`]. Task
-//! framing (the chat prompt) and any numeric post-processing live in the shared
-//! helpers and the adapter, not in the wire layer.
-//!
-//! [`InferenceRequest`]: crate::ai::provider::InferenceRequest
-//! [`InferenceOutputs`]: crate::ai::provider::InferenceOutputs
+//! Concrete inference backends, feature-gated so the default build has no HTTP
+//! or ML weight. Transport only: task framing lives in the adapter, not here.
 
 #[cfg(feature = "remote")]
 pub mod anthropic;

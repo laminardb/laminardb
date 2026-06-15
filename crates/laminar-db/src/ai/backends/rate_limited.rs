@@ -1,11 +1,5 @@
-//! Client-side rate limiting for remote providers.
-//!
-//! Wraps any [`InferenceProvider`] in a token bucket (`governor`, the standard
-//! Rust limiter) so request bursts are shaped to a steady requests-per-second
-//! rather than sent unbounded. One cell is acquired per input row before the
-//! batch is dispatched. The wait happens on the Ring 1 inference worker — the
-//! only place `infer_batch` is awaited — never on Ring 0; the limiter itself is
-//! lock-free (atomics), so nothing blocking is reachable from the compute thread.
+//! Client-side token-bucket rate limiting for remote providers. One cell is
+//! acquired per input row before dispatch; the wait happens on Ring 1 only.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -22,7 +16,7 @@ pub struct RateLimitedProvider {
 }
 
 impl RateLimitedProvider {
-    /// Wrap `inner`, limiting to `requests_per_second` (burst up to the same).
+    /// Wrap `inner`, limiting to `requests_per_second`.
     #[must_use]
     pub fn new(inner: Arc<dyn InferenceProvider>, requests_per_second: NonZeroU32) -> Self {
         Self {
@@ -38,7 +32,6 @@ impl InferenceProvider for RateLimitedProvider {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, ProviderError> {
-        // One permit per row: the batch waits until the bucket has paced it.
         for _ in 0..request.inputs.len().max(1) {
             self.limiter.until_ready().await;
         }
