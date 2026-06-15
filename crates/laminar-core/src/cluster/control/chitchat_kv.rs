@@ -59,24 +59,25 @@ impl ClusterKv for ChitchatKv {
         let target = encode_node_id(who);
         let guard = self.chitchat.lock().await;
 
-        let mut best_val = None;
-        let mut highest_gen = 0;
-
+        // Read the key from the node's newest generation — an older generation
+        // must not mask a key the newest generation dropped.
+        let mut best: Option<(u64, Option<String>)> = None;
         for (cc_id, state) in guard.node_states() {
-            if cc_id.node_id == target && cc_id.generation_id >= highest_gen {
-                if let Some(val) = state.get(key) {
-                    highest_gen = cc_id.generation_id;
-                    best_val = Some(val.to_string());
-                }
+            if cc_id.node_id == target
+                && best.as_ref().is_none_or(|&(g, _)| cc_id.generation_id > g)
+            {
+                best = Some((cc_id.generation_id, state.get(key).map(str::to_string)));
             }
         }
-        best_val
+        best.and_then(|(_, val)| val)
     }
 
     async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
         let guard = self.chitchat.lock().await;
         let live: Vec<&chitchat::ChitchatId> = guard.live_nodes().collect();
-        let mut best: std::collections::HashMap<NodeId, (u64, String)> =
+        // Newest generation per node wins, even if it lacks the key — an older
+        // generation must not resurrect a value the newest one dropped.
+        let mut best: std::collections::HashMap<NodeId, (u64, Option<String>)> =
             std::collections::HashMap::new();
         for (cc_id, state) in guard.node_states() {
             if !live.contains(&cc_id) {
@@ -85,17 +86,19 @@ impl ClusterKv for ChitchatKv {
             let Some(node_id) = decode_chitchat_id(cc_id) else {
                 continue;
             };
-            if let Some(value) = state.get(key) {
-                let entry = best
-                    .entry(node_id)
-                    .or_insert_with(|| (cc_id.generation_id, value.to_string()));
-                if cc_id.generation_id > entry.0 {
-                    entry.0 = cc_id.generation_id;
-                    entry.1 = value.to_string();
-                }
+            if best
+                .get(&node_id)
+                .is_none_or(|&(g, _)| cc_id.generation_id > g)
+            {
+                best.insert(
+                    node_id,
+                    (cc_id.generation_id, state.get(key).map(str::to_string)),
+                );
             }
         }
-        best.into_iter().map(|(id, (_, val))| (id, val)).collect()
+        best.into_iter()
+            .filter_map(|(id, (_, val))| val.map(|v| (id, v)))
+            .collect()
     }
 
     async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
