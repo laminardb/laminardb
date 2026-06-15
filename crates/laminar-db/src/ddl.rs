@@ -26,10 +26,18 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
 }
 
 impl LaminarDB {
-    /// Resolve `${VAR}` / `${VAR:-default}` in connector + format option values,
-    /// from config vars then the process environment. Scoped to connector
-    /// options on purpose — `${...}` elsewhere in a statement is left untouched.
-    fn resolve_connector_vars(&self, resolved: &mut ResolvedConnector) -> Result<(), DbError> {
+    /// Merge the CREATE SOURCE/SINK connector syntax, then resolve `${VAR}` /
+    /// `${VAR:-default}` in option values (config vars, then env). Resolution is
+    /// scoped to connector + format options — `${...}` elsewhere is left untouched.
+    fn resolved_connector(
+        &self,
+        connector_type: Option<&String>,
+        connector_options: &HashMap<String, String>,
+        format: Option<&laminar_sql::parser::FormatSpec>,
+        with_options: &HashMap<String, String>,
+    ) -> Result<ResolvedConnector, DbError> {
+        let mut resolved =
+            resolve_connector_info(connector_type, connector_options, format, with_options);
         let lookup = |name: &str| {
             self.config_vars
                 .get(name)
@@ -43,7 +51,7 @@ impl LaminarDB {
         {
             *value = crate::sql_utils::substitute_vars(value, lookup)?;
         }
-        Ok(())
+        Ok(resolved)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -72,13 +80,12 @@ impl LaminarDB {
         }
 
         let source_def = if create.columns.is_empty() && has_connector {
-            let mut resolved = resolve_connector_info(
+            let resolved = self.resolved_connector(
                 create.connector_type.as_ref(),
                 &create.connector_options,
                 create.format.as_ref(),
                 &create.with_options,
-            );
-            self.resolve_connector_vars(&mut resolved)?;
+            )?;
             let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
                 DbError::Config(format!(
                     "source '{source_name}': no columns declared and no connector type resolved"
@@ -218,13 +225,12 @@ impl LaminarDB {
             }
         }
 
-        let mut resolved = resolve_connector_info(
+        let resolved = self.resolved_connector(
             create.connector_type.as_ref(),
             &create.connector_options,
             create.format.as_ref(),
             &create.with_options,
-        );
-        self.resolve_connector_vars(&mut resolved)?;
+        )?;
 
         if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
@@ -290,13 +296,12 @@ impl LaminarDB {
             }
         }
 
-        let mut resolved = resolve_connector_info(
+        let resolved = self.resolved_connector(
             create.connector_type.as_ref(),
             &create.connector_options,
             create.format.as_ref(),
             &create.with_options,
-        );
-        self.resolve_connector_vars(&mut resolved)?;
+        )?;
 
         if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
