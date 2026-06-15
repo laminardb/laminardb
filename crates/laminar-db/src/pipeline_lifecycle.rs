@@ -1120,7 +1120,8 @@ impl LaminarDB {
             let entry = self.lookup_registry.get_entry(name);
             if let Some(laminar_sql::datafusion::RegisteredLookup::Versioned(v)) = &entry {
                 if let Some(batch) = self.table_store.read().to_record_batch(name) {
-                    if let Some(state) = crate::pipeline_callback::rebuild_versioned_state(v, batch) {
+                    if let Some(state) = crate::pipeline_callback::rebuild_versioned_state(v, batch)
+                    {
                         self.lookup_registry.register_versioned(name, state);
                     }
                 }
