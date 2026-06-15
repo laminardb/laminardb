@@ -923,8 +923,7 @@ async fn start_pipeline(
 async fn pipeline_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pipeline_state = state.db.pipeline_state();
     let mut body = serde_json::json!({ "pipeline_state": pipeline_state });
-    // Surface why a Faulted pipeline crashed (the panic is async, after the
-    // original DDL/start call already returned) so it isn't logs-only.
+    // The panic is async (after the DDL/start call returned), so surface it here.
     if let Some(reason) = state.db.last_fault() {
         body["last_error"] = serde_json::Value::String(reason);
     }

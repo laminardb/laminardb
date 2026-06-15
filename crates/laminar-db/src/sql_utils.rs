@@ -80,14 +80,12 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     statements
 }
 
-/// Substitute `${VAR}` / `${VAR:-default}` placeholders, resolving each name via
-/// `lookup`. An unset name falls back to its `:-default`; failing that it's an
-/// error (a silent literal would resurface as a bogus broker/host downstream).
-/// `$1`/`$$` (Postgres params / dollar-quoting) don't match `${` and pass through.
+/// Substitute `${VAR}` / `${VAR:-default}` placeholders via `lookup`; an unset
+/// name with no default is an error. (`$1`/`$$` don't match `${`.)
 ///
 /// # Errors
 ///
-/// Returns `DbError::InvalidOperation` for an unresolved `${VAR}` with no default.
+/// Returns `DbError::InvalidOperation` for an unresolved `${VAR}`.
 pub fn substitute_vars(
     sql: &str,
     lookup: impl Fn(&str) -> Option<String>,

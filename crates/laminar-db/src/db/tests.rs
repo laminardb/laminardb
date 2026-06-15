@@ -3742,17 +3742,33 @@ async fn test_connectorless_source_does_not_break_pipeline() {
 }
 
 #[tokio::test]
-async fn execute_errors_on_unresolved_env_var() {
-    // Proves execute() runs the resolver: a missing `${VAR}` is a hard error,
-    // not a silent literal that would later surface as a bogus broker/host.
-    let db = LaminarDB::open().unwrap();
+async fn connector_options_resolve_vars() {
+    // `${VAR}` resolves in connector option values (config vars, then env) for
+    // both sources and sinks — and only there, not elsewhere in the statement.
+    let db = LaminarDB::builder()
+        .config_var("TOPIC", "events")
+        .build()
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE SOURCE s (id BIGINT) WITH ('connector' = 'generator', 'topic' = '${TOPIC}')",
+    )
+    .await
+    .unwrap();
+    {
+        let mgr = db.connector_manager.lock();
+        let opts = &mgr.sources().get("s").unwrap().connector_options;
+        assert_eq!(opts.get("topic").map(String::as_str), Some("events"));
+    }
+    // Sinks go through the same resolver — an unresolved option errors (raised
+    // before the unknown-connector check), proving the sink path is wired.
     let err = db
-        .execute("CREATE SOURCE s (id BIGINT) WITH ('k' = '${LAMINAR_TEST_ABSENT_Z7Q}')")
+        .execute("CREATE SINK snk FROM s WITH ('connector' = 'noop', 'topic' = '${MISSING_X9Q}')")
         .await
         .unwrap_err();
     assert!(
         err.to_string().contains("Unresolved variable"),
-        "unexpected error: {err}"
+        "sink: {err}"
     );
 }
 

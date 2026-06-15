@@ -186,12 +186,8 @@ impl LaminarDB {
         )
     }
 
-    /// Start the streaming pipeline. Idempotent if already running.
-    ///
-    /// On failure the instance is reset to `Created` so the caller can retry.
-    /// A `Faulted` pipeline (compute thread crashed) is recoverable: this
-    /// rebuilds it from the surviving catalog, so an operator can drop the
-    /// offending object and restart without a process bounce.
+    /// Start the streaming pipeline. Idempotent if already running. On failure
+    /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
     /// # Errors
     ///
@@ -1709,8 +1705,7 @@ impl LaminarDB {
                             .or_else(|| panic.downcast_ref::<&str>().copied())
                             .unwrap_or("unknown");
                         tracing::error!(panic = msg, "laminar-compute thread panicked");
-                        // Record the reason before dropping done_tx → the watcher
-                        // (which observes the drop) sets Faulted with it in hand.
+                        // Record before dropping done_tx so the watcher sees it.
                         *fault_slot.lock() = Some(msg.to_string());
                         if let Some(ref m) = fault_metrics {
                             m.pipeline_faults_total.inc();
@@ -1743,12 +1738,10 @@ impl LaminarDB {
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_err() {
                     tracing::error!("laminar-compute thread exited unexpectedly");
-                    // The panic branch records the reason before dropping done_tx.
                     watcher_fault
                         .lock()
                         .get_or_insert_with(|| "compute thread exited unexpectedly".to_string());
-                    // Faulted (not Stopped) so the pipeline is recoverable: an
-                    // operator can drop the offending object and restart.
+                    // Faulted, not Stopped — recoverable via a later start().
                     DbState::Faulted.store(&watcher_state);
                     watcher_shutdown.notify_one();
                 }
