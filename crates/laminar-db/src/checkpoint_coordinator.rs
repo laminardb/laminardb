@@ -892,7 +892,10 @@ impl CheckpointCoordinator {
                     self.rotation_epoch_floor
                 ));
             }
-            match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
+            match backend
+                .epoch_complete(epoch, &self.gate_vnode_set, &[])
+                .await
+            {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(e @ StateBackendError::SplitBrainCommit { .. }) => {
@@ -3749,12 +3752,34 @@ mod tests {
             self.inner.read_partial(vnode, epoch).await
         }
 
+        async fn write_commit_descriptor(
+            &self,
+            epoch: u64,
+            key: &str,
+            assignment_version: u64,
+            bytes: bytes::Bytes,
+        ) -> Result<(), laminar_core::state::StateBackendError> {
+            self.inner
+                .write_commit_descriptor(epoch, key, assignment_version, bytes)
+                .await
+        }
+
+        async fn read_commit_descriptors(
+            &self,
+            epoch: u64,
+        ) -> Result<Vec<(String, bytes::Bytes)>, laminar_core::state::StateBackendError> {
+            self.inner.read_commit_descriptors(epoch).await
+        }
+
         async fn epoch_complete(
             &self,
             epoch: u64,
             vnodes: &[u32],
+            required_descriptors: &[String],
         ) -> Result<bool, laminar_core::state::StateBackendError> {
-            self.inner.epoch_complete(epoch, vnodes).await
+            self.inner
+                .epoch_complete(epoch, vnodes, required_descriptors)
+                .await
         }
 
         async fn prune_before(

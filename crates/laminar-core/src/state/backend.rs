@@ -108,13 +108,34 @@ pub trait StateBackend: Send + Sync + 'static {
         epoch: u64,
     ) -> Result<Option<Bytes>, StateBackendError>;
 
-    /// Durability barrier: returns true iff every `vnode` in the set
-    /// has a partial persisted for `epoch`.
+    /// Persist a coordinated-commit descriptor for `epoch` under `key`.
     ///
-    /// The checkpoint coordinator calls this after sinks precommit
-    /// and before they commit. Sinks do not commit until this returns
-    /// `Ok(true)`.
-    async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError>;
+    /// `key` is opaque and unique within the epoch (the coordinator uses
+    /// `node={id}/sink={name}`). Same fence and idempotence as `write_partial`.
+    async fn write_commit_descriptor(
+        &self,
+        epoch: u64,
+        key: &str,
+        assignment_version: u64,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError>;
+
+    /// Every coordinated-commit descriptor written for `epoch`, as `(key, bytes)`.
+    async fn read_commit_descriptors(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<(String, Bytes)>, StateBackendError>;
+
+    /// Durability barrier: true once every `vnode` partial and every
+    /// `required_descriptors` key for `epoch` is persisted, sealing the epoch.
+    /// Sinks do not commit until it returns `Ok(true)`. `required_descriptors`
+    /// is empty unless coordinated-commit sinks are present.
+    async fn epoch_complete(
+        &self,
+        epoch: u64,
+        vnodes: &[u32],
+        required_descriptors: &[String],
+    ) -> Result<bool, StateBackendError>;
 
     /// Garbage-collect every partial and commit marker whose epoch is
     /// strictly less than `before`. Called by the checkpoint

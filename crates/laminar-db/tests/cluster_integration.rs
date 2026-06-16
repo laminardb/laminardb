@@ -615,7 +615,7 @@ mod rebalance {
         }
         assert!(
             backend
-                .epoch_complete(SEED_EPOCH, &all_vnodes)
+                .epoch_complete(SEED_EPOCH, &all_vnodes, &[])
                 .await
                 .expect("seal seed epoch"),
             "seed epoch must seal once every vnode partial is present",

@@ -12,6 +12,8 @@ use super::backend::{StateBackend, StateBackendError};
 #[derive(Debug)]
 pub struct InProcessBackend {
     partials: RwLock<FxHashMap<(u32, u64), Bytes>>,
+    /// `epoch -> key -> descriptor`, the in-memory analogue of `epoch=N/commit/`.
+    descriptors: RwLock<FxHashMap<u64, FxHashMap<String, Bytes>>>,
     /// Highest epoch for which [`epoch_complete`](StateBackend::epoch_complete)
     /// observed every requested vnode present — the in-memory analogue of
     /// the object-store `_COMMIT` marker, surfaced by
@@ -26,6 +28,7 @@ impl InProcessBackend {
     pub fn new(vnode_capacity: u32) -> Self {
         Self {
             partials: RwLock::new(FxHashMap::default()),
+            descriptors: RwLock::new(FxHashMap::default()),
             committed_high: RwLock::new(None),
             vnode_capacity,
         }
@@ -75,12 +78,53 @@ impl StateBackend for InProcessBackend {
         Ok(self.partials.read().get(&(vnode, epoch)).cloned())
     }
 
-    async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError> {
+    async fn write_commit_descriptor(
+        &self,
+        epoch: u64,
+        key: &str,
+        _assignment_version: u64,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError> {
+        self.descriptors
+            .write()
+            .entry(epoch)
+            .or_default()
+            .insert(key.to_string(), bytes);
+        Ok(())
+    }
+
+    async fn read_commit_descriptors(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<(String, Bytes)>, StateBackendError> {
+        Ok(self
+            .descriptors
+            .read()
+            .get(&epoch)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default())
+    }
+
+    async fn epoch_complete(
+        &self,
+        epoch: u64,
+        vnodes: &[u32],
+        required_descriptors: &[String],
+    ) -> Result<bool, StateBackendError> {
         {
             let map = self.partials.read();
             for &v in vnodes {
                 self.check_vnode(v)?;
                 if !map.contains_key(&(v, epoch)) {
+                    return Ok(false);
+                }
+            }
+        }
+        {
+            let descs = self.descriptors.read();
+            let epoch_descs = descs.get(&epoch);
+            for key in required_descriptors {
+                if !epoch_descs.is_some_and(|m| m.contains_key(key)) {
                     return Ok(false);
                 }
             }
@@ -98,6 +142,7 @@ impl StateBackend for InProcessBackend {
         self.partials
             .write()
             .retain(|&(_, epoch), _| epoch >= before);
+        self.descriptors.write().retain(|&epoch, _| epoch >= before);
         Ok(())
     }
 
@@ -124,19 +169,19 @@ mod tests {
     async fn epoch_complete_requires_every_vnode() {
         let b = InProcessBackend::new(4);
         let vnodes = [0u32, 1, 2];
-        assert!(!b.epoch_complete(1, &vnodes).await.unwrap());
+        assert!(!b.epoch_complete(1, &vnodes, &[]).await.unwrap());
         b.write_partial(0, 1, 0, Bytes::from_static(b"a"))
             .await
             .unwrap();
         b.write_partial(1, 1, 0, Bytes::from_static(b"b"))
             .await
             .unwrap();
-        assert!(!b.epoch_complete(1, &vnodes).await.unwrap());
+        assert!(!b.epoch_complete(1, &vnodes, &[]).await.unwrap());
         b.write_partial(2, 1, 0, Bytes::from_static(b"c"))
             .await
             .unwrap();
-        assert!(b.epoch_complete(1, &vnodes).await.unwrap());
-        assert!(!b.epoch_complete(2, &vnodes).await.unwrap());
+        assert!(b.epoch_complete(1, &vnodes, &[]).await.unwrap());
+        assert!(!b.epoch_complete(2, &vnodes, &[]).await.unwrap());
     }
 
     #[tokio::test]
@@ -149,14 +194,14 @@ mod tests {
         b.write_partial(0, 2, 0, Bytes::from_static(b"a"))
             .await
             .unwrap();
-        assert!(!b.epoch_complete(2, &vnodes).await.unwrap());
+        assert!(!b.epoch_complete(2, &vnodes, &[]).await.unwrap());
         assert_eq!(b.latest_committed_epoch().await.unwrap(), None);
 
         // Complete epoch 2, then epoch 5 — the mark tracks the highest.
         b.write_partial(1, 2, 0, Bytes::from_static(b"b"))
             .await
             .unwrap();
-        assert!(b.epoch_complete(2, &vnodes).await.unwrap());
+        assert!(b.epoch_complete(2, &vnodes, &[]).await.unwrap());
         assert_eq!(b.latest_committed_epoch().await.unwrap(), Some(2));
 
         for v in &vnodes {
@@ -164,7 +209,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(b.epoch_complete(5, &vnodes).await.unwrap());
+        assert!(b.epoch_complete(5, &vnodes, &[]).await.unwrap());
         assert_eq!(b.latest_committed_epoch().await.unwrap(), Some(5));
     }
 
