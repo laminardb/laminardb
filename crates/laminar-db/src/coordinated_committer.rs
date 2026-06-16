@@ -15,6 +15,17 @@ use laminar_core::state::StateBackend;
 use crate::error::DbError;
 use crate::sink_task::SinkTaskHandle;
 
+/// Commit-descriptor key for `(node, sink)` within an epoch, stored at
+/// `epoch=N/commit/{key}`. Single source of truth for the build + parse pair.
+pub(crate) fn descriptor_key(node_id: u64, sink: &str) -> String {
+    format!("node={node_id}/sink={sink}")
+}
+
+/// The sink name a [`descriptor_key`] belongs to, or `None` if malformed.
+pub(crate) fn descriptor_key_sink(key: &str) -> Option<&str> {
+    key.rsplit_once("/sink=").map(|(_, sink)| sink)
+}
+
 /// Drives aggregated commits for coordinated-commit sinks on the leader.
 pub(crate) struct CoordinatedCommitter {
     backend: Arc<dyn StateBackend>,
@@ -96,22 +107,26 @@ impl CoordinatedCommitter {
             self.seeded = true;
         }
 
-        let high = self
+        // One listing of sealed epochs (skips abandoned ones) serves every sink;
+        // each commits the suffix of that list above its own cursor.
+        let min_cursor = self.min_committed();
+        let all_sealed = self
             .backend
-            .latest_committed_epoch()
+            .sealed_epochs(min_cursor)
             .await
-            .map_err(|e| DbError::Checkpoint(format!("committer: read sealed epoch: {e}")))?
-            .unwrap_or(0);
+            .map_err(|e| DbError::Checkpoint(format!("committer: list sealed epochs: {e}")))?;
+        let high = all_sealed.last().copied().unwrap_or(min_cursor);
 
         let mut first_err: Option<DbError> = None;
         for (name, handle) in &self.sinks {
             let cursor = self.committed_through.get(name).copied().unwrap_or(0);
-            if cursor >= high {
+            let sealed: Vec<u64> = all_sealed.iter().copied().filter(|&e| e > cursor).collect();
+            let Some(&target) = sealed.last() else {
                 continue;
-            }
-            match self.commit_range(handle, name, cursor, high).await {
+            };
+            match self.commit_sealed(handle, name, &sealed, target).await {
                 Ok(()) => {
-                    self.committed_through.insert(name.clone(), high);
+                    self.committed_through.insert(name.clone(), target);
                 }
                 Err(e) => {
                     first_err.get_or_insert(e); // leave the cursor; retry next pass
@@ -121,12 +136,7 @@ impl CoordinatedCommitter {
 
         // Publish the prune floor (lowest uncommitted epoch) + lag metric, and
         // warn if the committer is falling behind so storage isn't growing blind.
-        let min_committed = self
-            .sinks
-            .iter()
-            .map(|(name, _)| self.committed_through.get(name).copied().unwrap_or(0))
-            .min()
-            .unwrap_or(0);
+        let min_committed = self.min_committed();
         self.floor.store(min_committed + 1, Ordering::Release);
         let lag = high.saturating_sub(min_committed);
         if let Some(m) = &self.metrics {
@@ -145,40 +155,42 @@ impl CoordinatedCommitter {
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Commit all sealed epochs in `(cursor, high]` for one sink as a single
-    /// transaction (one snapshot), skipping abandoned (unsealed) epochs.
-    async fn commit_range(
+    /// Lowest committed epoch across sinks (0 if any sink has committed nothing).
+    fn min_committed(&self) -> u64 {
+        self.sinks
+            .iter()
+            .map(|(name, _)| self.committed_through.get(name).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Commit the `sealed` epochs' descriptors for one sink as a single
+    /// transaction (one snapshot), keyed by `target` (the highest of them).
+    async fn commit_sealed(
         &self,
         handle: &SinkTaskHandle,
         name: &str,
-        cursor: u64,
-        high: u64,
+        sealed: &[u64],
+        target: u64,
     ) -> Result<(), DbError> {
-        let suffix = format!("/sink={name}");
         let mut batch: Vec<Vec<u8>> = Vec::new();
-        for epoch in (cursor + 1)..=high {
-            if !self.backend.is_epoch_sealed(epoch).await.map_err(|e| {
-                DbError::Checkpoint(format!("committer: seal check epoch {epoch}: {e}"))
-            })? {
-                continue; // abandoned epoch — its data reprocesses later
-            }
+        for &epoch in sealed {
             let descriptors = self.backend.read_commit_descriptors(epoch).await.map_err(|e| {
                 DbError::Checkpoint(format!("committer: read descriptors epoch {epoch}: {e}"))
             })?;
             batch.extend(
                 descriptors
                     .into_iter()
-                    .filter(|(k, _)| k.ends_with(&suffix))
+                    .filter(|(k, _)| descriptor_key_sink(k) == Some(name))
                     .map(|(_, v)| v.to_vec()),
             );
         }
         if batch.is_empty() {
             return Ok(());
         }
-        handle
-            .commit_aggregated(high, batch)
-            .await
-            .map_err(|e| DbError::Checkpoint(format!("committer: commit through epoch {high}: {e}")))
+        handle.commit_aggregated(target, batch).await.map_err(|e| {
+            DbError::Checkpoint(format!("committer: commit through epoch {target}: {e}"))
+        })
     }
 }
 

@@ -92,6 +92,12 @@ pub struct CheckpointConfig {
     /// warning fires — the committer is falling behind and descriptors/data are
     /// accumulating in object storage (prune is held to avoid losing them).
     pub max_uncommitted_epochs: u64,
+    /// When true, exceeding `max_uncommitted_epochs` fails the checkpoint
+    /// (back-pressuring the pipeline) instead of only warning — bounds storage
+    /// growth at the cost of halting progress until the committer catches up.
+    pub uncommitted_epochs_backpressure: bool,
+    /// How often the decoupled committer task polls for newly sealed epochs.
+    pub coordinated_committer_poll: Duration,
 }
 
 impl Default for CheckpointConfig {
@@ -113,6 +119,8 @@ impl Default for CheckpointConfig {
             max_in_flight_epochs: 4,
             max_staged_bytes: 512 * 1024 * 1024,
             max_uncommitted_epochs: 1024,
+            uncommitted_epochs_backpressure: false,
+            coordinated_committer_poll: Duration::from_secs(1),
         }
     }
 }
@@ -599,6 +607,11 @@ impl CheckpointCoordinator {
         Some(committer)
     }
 
+    /// Poll interval for the decoupled committer task.
+    pub(crate) fn committer_poll_interval(&self) -> Duration {
+        self.config.coordinated_committer_poll
+    }
+
     /// Begin the initial epoch on all exactly-once sinks.
     ///
     /// Must be called once after all sinks are registered and before any writes. Subsequent
@@ -817,11 +830,6 @@ impl CheckpointCoordinator {
         0
     }
 
-    /// Commit-descriptor object key for `(node, sink)` within an epoch.
-    fn descriptor_key(node_id: u64, sink: &str) -> String {
-        format!("node={node_id}/sink={sink}")
-    }
-
     /// Commit-descriptor keys this node produced this epoch — the gate requires
     /// exactly these. Other nodes' descriptors are covered transitively: each
     /// node writes its descriptors before its vnode partials, so the partial
@@ -840,7 +848,7 @@ impl CheckpointCoordinator {
         let node = self.self_node_id();
         self.epoch_descriptor_keys = descriptors
             .keys()
-            .map(|sink| Self::descriptor_key(node, sink))
+            .map(|sink| crate::coordinated_committer::descriptor_key(node, sink))
             .collect();
         if descriptors.is_empty() {
             return Ok(());
@@ -868,7 +876,7 @@ impl CheckpointCoordinator {
             backend
                 .write_commit_descriptor(
                     epoch,
-                    &Self::descriptor_key(node, sink),
+                    &crate::coordinated_committer::descriptor_key(node, sink),
                     self.assignment_version,
                     bytes::Bytes::from(descriptor.clone()),
                 )
@@ -2038,6 +2046,32 @@ impl CheckpointCoordinator {
         }
         #[cfg(not(feature = "cluster"))]
         let _ = quorum;
+
+        // Hard backpressure: refuse a new checkpoint while the designated
+        // committer is too far behind, so descriptors/data can't grow unbounded.
+        if self.config.uncommitted_epochs_backpressure
+            && self.sinks.iter().any(|s| s.coordinated_commit)
+        {
+            let committed = self
+                .coordinated_commit_floor
+                .load(std::sync::atomic::Ordering::Acquire)
+                .saturating_sub(1);
+            let uncommitted = epoch.saturating_sub(committed);
+            if uncommitted > self.config.max_uncommitted_epochs {
+                return Ok(self
+                    .fail_epoch(
+                        checkpoint_id,
+                        epoch,
+                        start,
+                        format!(
+                            "[LDB-6031] coordinated committer {uncommitted} epochs behind \
+                             (cap {}) — back-pressuring checkpoints",
+                            self.config.max_uncommitted_epochs
+                        ),
+                    )
+                    .await);
+            }
+        }
 
         self.phase = CheckpointPhase::PreCommitting;
         match self.pre_commit_sinks(epoch).await {
@@ -3944,11 +3978,11 @@ mod tests {
                 .await
         }
 
-        async fn is_epoch_sealed(
+        async fn sealed_epochs(
             &self,
-            epoch: u64,
-        ) -> Result<bool, laminar_core::state::StateBackendError> {
-            self.inner.is_epoch_sealed(epoch).await
+            after: u64,
+        ) -> Result<Vec<u64>, laminar_core::state::StateBackendError> {
+            self.inner.sealed_epochs(after).await
         }
 
         async fn prune_before(

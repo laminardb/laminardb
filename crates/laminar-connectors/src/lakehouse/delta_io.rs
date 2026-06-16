@@ -326,14 +326,6 @@ pub async fn get_last_committed_epoch(table: &DeltaTable, writer_id: &str) -> u6
     }
 }
 
-/// One writer's `Add` actions, serialized for the designated committer.
-#[cfg(feature = "delta-lake")]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DeltaCommitDescriptor {
-    version: u32,
-    adds: Vec<deltalake::kernel::Add>,
-}
-
 /// Serialize a writer's flushed `Add` actions into a commit descriptor.
 ///
 /// # Errors
@@ -342,30 +334,21 @@ struct DeltaCommitDescriptor {
 pub fn encode_commit_descriptor(
     adds: Vec<deltalake::kernel::Add>,
 ) -> Result<Vec<u8>, ConnectorError> {
-    serde_json::to_vec(&DeltaCommitDescriptor { version: 1, adds })
-        .map_err(|e| ConnectorError::WriteError(format!("encode delta descriptor: {e}")))
+    super::commit_descriptor::encode(adds)
 }
 
 /// Decode and flatten every writer's descriptor into one set of `Add` actions.
 ///
 /// # Errors
-/// Returns `ConnectorError::TransactionError` on a version mismatch or malformed
-/// descriptor.
+/// Returns `ConnectorError::TransactionError` on a malformed/incompatible descriptor.
 #[cfg(feature = "delta-lake")]
 pub fn decode_commit_descriptors(
     descriptors: &[Vec<u8>],
 ) -> Result<Vec<deltalake::kernel::Add>, ConnectorError> {
     let mut out = Vec::new();
     for bytes in descriptors {
-        let d: DeltaCommitDescriptor = serde_json::from_slice(bytes)
-            .map_err(|e| ConnectorError::TransactionError(format!("decode delta descriptor: {e}")))?;
-        if d.version != 1 {
-            return Err(ConnectorError::TransactionError(format!(
-                "unsupported delta commit descriptor version {}",
-                d.version
-            )));
-        }
-        out.extend(d.adds);
+        let adds: Vec<deltalake::kernel::Add> = super::commit_descriptor::decode(bytes)?;
+        out.extend(adds);
     }
     Ok(out)
 }

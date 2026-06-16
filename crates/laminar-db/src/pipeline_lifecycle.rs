@@ -938,7 +938,7 @@ impl LaminarDB {
             table_sources.push((name.clone(), source, mode));
         }
 
-        let coordinated_committer = {
+        let (coordinated_committer, committer_poll) = {
             let mut guard = self.coordinator.lock().await;
             match *guard {
                 Some(ref mut coord) => {
@@ -950,19 +950,20 @@ impl LaminarDB {
                             handle.coordinated_commit(),
                         );
                     }
-                    coord.coordinated_committer()
+                    (coord.coordinated_committer(), coord.committer_poll_interval())
                 }
-                None => None,
+                None => (None, std::time::Duration::from_secs(1)),
             }
         };
 
         // Decoupled designated committer: a poll loop off the barrier path that
         // commits sealed epochs for coordinated-commit sinks. Spawned only when
-        // such sinks exist; stops on terminal pipeline state.
+        // such sinks exist; stops on terminal pipeline state. The handle is held
+        // so shutdown can abort it (its work is idempotent).
         if let Some(mut committer) = coordinated_committer {
             let state = Arc::clone(&self.state);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(committer_poll);
                 loop {
                     tick.tick().await;
                     if matches!(DbState::load(&state), DbState::Stopped | DbState::ShuttingDown) {
@@ -973,6 +974,7 @@ impl LaminarDB {
                     }
                 }
             });
+            *self.committer_handle.lock() = Some(handle);
         }
 
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
@@ -1810,6 +1812,9 @@ impl LaminarDB {
         *self.force_ckpt_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
+        if let Some(h) = self.committer_handle.lock().take() {
+            h.abort();
+        }
 
         let handle = self.runtime_handle.lock().take();
         if let Some(handle) = handle {
@@ -1845,6 +1850,9 @@ impl LaminarDB {
         *self.force_ckpt_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
+        if let Some(h) = self.committer_handle.lock().take() {
+            h.abort();
+        }
 
         let handle = self.runtime_handle.lock().take();
         if let Some(handle) = handle {

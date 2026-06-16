@@ -137,11 +137,11 @@ pub trait StateBackend: Send + Sync + 'static {
         required_descriptors: &[String],
     ) -> Result<bool, StateBackendError>;
 
-    /// Whether `epoch` is durably sealed (its commit marker exists). The
-    /// designated committer uses this to skip abandoned epochs that left
-    /// partial descriptors behind — their data is reprocessed into a later
-    /// epoch, so committing them would duplicate.
-    async fn is_epoch_sealed(&self, epoch: u64) -> Result<bool, StateBackendError>;
+    /// Sealed epochs strictly greater than `after`, ascending. The designated
+    /// committer uses this to commit exactly the sealed epochs in one pass and
+    /// skip abandoned ones (which left partial descriptors but no seal), in a
+    /// single listing rather than a probe per epoch.
+    async fn sealed_epochs(&self, after: u64) -> Result<Vec<u64>, StateBackendError>;
 
     /// Garbage-collect every partial and commit marker whose epoch is
     /// strictly less than `before`. Called by the checkpoint

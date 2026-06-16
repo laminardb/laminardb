@@ -169,14 +169,6 @@ pub fn current_snapshot_id(table: &Table) -> Option<i64> {
 /// Table property holding the highest epoch the designated committer sealed.
 const COORDINATED_EPOCH_PROP: &str = "laminardb.commit.epoch";
 
-/// One writer's data files, serialized for the designated committer.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommitDescriptor {
-    version: u32,
-    /// Each entry is a `DataFile` serialized via `serialize_data_file_to_json`.
-    data_files: Vec<String>,
-}
-
 /// Serialize this writer's `data_files` into a commit descriptor for handoff to
 /// the designated committer. Uses `table`'s partition type and format version.
 ///
@@ -189,24 +181,19 @@ pub fn encode_commit_descriptor(
     let meta = table.metadata();
     let partition_type = meta.default_partition_type().clone();
     let format_version = meta.format_version();
-    let data_files = data_files
+    let json: Vec<String> = data_files
         .into_iter()
         .map(|df| iceberg::spec::serialize_data_file_to_json(df, &partition_type, format_version))
-        .collect::<Result<Vec<String>, _>>()
+        .collect::<Result<_, _>>()
         .map_err(|e| ConnectorError::WriteError(format!("serialize data file: {e}")))?;
-    serde_json::to_vec(&CommitDescriptor {
-        version: 1,
-        data_files,
-    })
-    .map_err(|e| ConnectorError::WriteError(format!("encode commit descriptor: {e}")))
+    super::commit_descriptor::encode(json)
 }
 
 /// Decode and flatten every writer's commit descriptor into one set of data
 /// files, ready for a single `fast_append`.
 ///
 /// # Errors
-/// Returns `ConnectorError::TransactionError` on a version mismatch or a
-/// malformed/incompatible descriptor.
+/// Returns `ConnectorError::TransactionError` on a malformed/incompatible descriptor.
 pub fn decode_commit_descriptors(
     table: &Table,
     descriptors: &[Vec<u8>],
@@ -218,18 +205,11 @@ pub fn decode_commit_descriptors(
 
     let mut out = Vec::new();
     for bytes in descriptors {
-        let descriptor: CommitDescriptor = serde_json::from_slice(bytes)
-            .map_err(|e| ConnectorError::TransactionError(format!("decode descriptor: {e}")))?;
-        if descriptor.version != 1 {
-            return Err(ConnectorError::TransactionError(format!(
-                "unsupported commit descriptor version {}",
-                descriptor.version
-            )));
-        }
-        for json in &descriptor.data_files {
+        let json: Vec<String> = super::commit_descriptor::decode(bytes)?;
+        for entry in &json {
             out.push(
                 iceberg::spec::deserialize_data_file_from_json(
-                    json,
+                    entry,
                     spec_id,
                     &partition_type,
                     &schema,

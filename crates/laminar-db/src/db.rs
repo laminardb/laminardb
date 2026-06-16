@@ -106,6 +106,8 @@ pub struct LaminarDB {
     /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
     pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Decoupled coordinated-commit committer task; aborted on shutdown.
+    pub(crate) committer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
@@ -276,6 +278,7 @@ impl LaminarDB {
     /// Same as [`Self::open_with_config_and_vars`] but also installs
     /// the given physical-optimizer rules on the `DataFusion` session.
     #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::too_many_lines)] // flat field-init of a large struct
     pub(crate) fn open_with_config_and_vars_and_rules(
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
@@ -359,6 +362,7 @@ impl LaminarDB {
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             runtime_handle: parking_lot::Mutex::new(None),
+            committer_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             engine_metrics: parking_lot::Mutex::new(None),
             prometheus_registry: parking_lot::Mutex::new(None),

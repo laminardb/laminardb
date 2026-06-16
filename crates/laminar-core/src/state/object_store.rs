@@ -289,12 +289,24 @@ impl StateBackend for ObjectStoreBackend {
         }
     }
 
-    async fn is_epoch_sealed(&self, epoch: u64) -> Result<bool, StateBackendError> {
-        match self.store.head(&Self::commit_path(epoch)).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(StateBackendError::Io(e.to_string())),
+    async fn sealed_epochs(&self, after: u64) -> Result<Vec<u64>, StateBackendError> {
+        use tokio_stream::StreamExt;
+
+        let mut entries = self.store.list(None);
+        let mut out = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let loc = entry.map_err(|e| StateBackendError::Io(e.to_string()))?.location;
+            if !loc.as_ref().ends_with("/_COMMIT") {
+                continue;
+            }
+            if let Some(epoch) = Self::epoch_of_first_segment(loc.as_ref()) {
+                if epoch > after {
+                    out.push(epoch);
+                }
+            }
         }
+        out.sort_unstable();
+        Ok(out)
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
