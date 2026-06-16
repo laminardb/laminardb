@@ -36,6 +36,9 @@ pub(crate) enum DbState {
     Running = 2,
     ShuttingDown = 3,
     Stopped = 4,
+    /// Compute thread crashed (operator panic). Recoverable, unlike `Stopped`:
+    /// `start()` rebuilds from the catalog. Reason in `LaminarDB::last_fault`.
+    Faulted = 5,
 }
 
 impl DbState {
@@ -46,6 +49,7 @@ impl DbState {
             2 => Self::Running,
             3 => Self::ShuttingDown,
             4 => Self::Stopped,
+            5 => Self::Faulted,
             _ => return None,
         })
     }
@@ -98,6 +102,9 @@ pub struct LaminarDB {
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
+    /// Panic message when the compute thread exits unexpectedly (`Faulted`);
+    /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
+    pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     pub(crate) engine_metrics:
@@ -350,6 +357,7 @@ impl LaminarDB {
                 crate::table_store::TableStore::new(),
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
+            last_fault: Arc::new(parking_lot::Mutex::new(None)),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             engine_metrics: parking_lot::Mutex::new(None),
@@ -1100,13 +1108,7 @@ impl LaminarDB {
             return Err(DbError::Shutdown);
         }
 
-        let resolved = if self.config_vars.is_empty() {
-            sql.to_string()
-        } else {
-            sql_utils::resolve_config_vars(sql, &self.config_vars, true)?
-        };
-
-        let stmts = sql_utils::split_statements(&resolved);
+        let stmts = sql_utils::split_statements(sql);
         if stmts.is_empty() {
             return Err(DbError::InvalidOperation("Empty SQL statement".into()));
         }

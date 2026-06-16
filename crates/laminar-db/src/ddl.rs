@@ -13,6 +13,13 @@ use crate::db::{parse_duration_str, LaminarDB};
 use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 
+/// Which connector registry `prepare_connector` validates against.
+#[derive(Clone, Copy)]
+enum ConnectorKind {
+    Source,
+    Sink,
+}
+
 /// Reject object names in the reserved `laminar` namespace, which is owned by
 /// the system catalog (`laminar.models`, `laminar.ai_calls`).
 fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
@@ -26,15 +33,65 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
 }
 
 impl LaminarDB {
+    /// Resolve `${VAR}` in connector + format options (config vars, then env) and
+    /// verify the type is registered + format known — up front, before any
+    /// catalog mutation. `None` when no connector is declared.
+    fn prepare_connector(
+        &self,
+        connector_type: Option<&String>,
+        connector_options: &HashMap<String, String>,
+        format: Option<&laminar_sql::parser::FormatSpec>,
+        with_options: &HashMap<String, String>,
+        kind: ConnectorKind,
+    ) -> Result<Option<ResolvedConnector>, DbError> {
+        if connector_type.is_none() && !has_connector_key(with_options) {
+            return Ok(None);
+        }
+        let mut resolved =
+            resolve_connector_info(connector_type, connector_options, format, with_options);
+        let lookup = |name: &str| {
+            self.config_vars
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        };
+        for value in resolved
+            .connector_options
+            .values_mut()
+            .chain(resolved.format_options.values_mut())
+        {
+            *value = crate::sql_utils::substitute_vars(value, lookup)?;
+        }
+        if let Some(ref ct) = resolved.connector_type {
+            let normalized = normalize_connector_type(ct);
+            let registered = match kind {
+                ConnectorKind::Source => self.connector_registry.source_info(&normalized).is_some(),
+                ConnectorKind::Sink => self.connector_registry.sink_info(&normalized).is_some(),
+            };
+            if !registered {
+                let (what, available) = match kind {
+                    ConnectorKind::Source => ("source", self.connector_registry.list_sources()),
+                    ConnectorKind::Sink => ("sink", self.connector_registry.list_sinks()),
+                };
+                return Err(DbError::Connector(format!(
+                    "Unknown {what} connector type '{ct}'. Available: {available:?}"
+                )));
+            }
+            validate_format(resolved.format.as_ref())?;
+        }
+        Ok(Some(resolved))
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_create_source(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
-        // Connectors are instantiated in start() — reject mid-run DDL.
+        // Connectors are instantiated in start() — reject mid-run DDL. Match the
+        // `connector` key case-insensitively, as `resolve_connector_info` does.
         let has_connector =
-            create.connector_type.is_some() || create.with_options.contains_key("connector");
-        if has_connector && self.is_pipeline_running() {
+            create.connector_type.is_some() || has_connector_key(&create.with_options);
+        if has_connector && self.connector_ddl_rejected() {
             let name = &create.name;
             return Err(DbError::Pipeline(format!(
                 "Cannot create source '{name}' with connector while pipeline is running. \
@@ -51,13 +108,17 @@ impl LaminarDB {
             }));
         }
 
+        // Validate before mutating catalog/planner — no half-created source on error.
+        let resolved = self.prepare_connector(
+            create.connector_type.as_ref(),
+            &create.connector_options,
+            create.format.as_ref(),
+            &create.with_options,
+            ConnectorKind::Source,
+        )?;
+
         let source_def = if create.columns.is_empty() && has_connector {
-            let resolved = resolve_connector_info(
-                create.connector_type.as_ref(),
-                &create.connector_options,
-                create.format.as_ref(),
-                &create.with_options,
-            );
+            let resolved = resolved.as_ref().expect("has_connector ⇒ Some");
             let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
                 DbError::Config(format!(
                     "source '{source_name}': no columns declared and no connector type resolved"
@@ -65,18 +126,11 @@ impl LaminarDB {
             })?;
             let normalized = normalize_connector_type(connector_type);
 
-            // Fail on unknown connector before discovery so a typo isn't reported as a schema failure.
-            if self.connector_registry.source_info(&normalized).is_none() {
-                return Err(DbError::Config(format!(
-                    "source '{source_name}': unknown connector type '{normalized}'"
-                )));
-            }
-
-            let mut props = resolved.connector_options;
-            if let Some(fmt) = resolved.format {
+            let mut props = resolved.connector_options.clone();
+            if let Some(fmt) = resolved.format.clone() {
                 props.insert("format".into(), fmt);
             }
-            props.extend(resolved.format_options);
+            props.extend(resolved.format_options.clone());
 
             let discovered = match self
                 .connector_registry
@@ -197,32 +251,17 @@ impl LaminarDB {
             }
         }
 
-        let resolved = resolve_connector_info(
-            create.connector_type.as_ref(),
-            &create.connector_options,
-            create.format.as_ref(),
-            &create.with_options,
-        );
-
-        if let Some(ref ct) = resolved.connector_type {
-            let normalized = normalize_connector_type(ct);
-            if self.connector_registry.source_info(&normalized).is_none() {
-                return Err(DbError::Connector(format!(
-                    "Unknown source connector type '{ct}'. Available: {:?}",
-                    self.connector_registry.list_sources()
-                )));
+        if let Some(resolved) = resolved {
+            if let Some(ct) = resolved.connector_type {
+                let mut mgr = self.connector_manager.lock();
+                mgr.register_source(crate::connector_manager::SourceRegistration {
+                    name: name.clone(),
+                    connector_type: Some(ct),
+                    connector_options: resolved.connector_options,
+                    format: resolved.format,
+                    format_options: resolved.format_options,
+                });
             }
-
-            validate_format(resolved.format.as_ref())?;
-
-            let mut mgr = self.connector_manager.lock();
-            mgr.register_source(crate::connector_manager::SourceRegistration {
-                name: name.clone(),
-                connector_type: Some(ct.clone()),
-                connector_options: resolved.connector_options,
-                format: resolved.format,
-                format_options: resolved.format_options,
-            });
         }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -236,8 +275,8 @@ impl LaminarDB {
         create: &laminar_sql::parser::CreateSinkStatement,
     ) -> Result<ExecuteResult, DbError> {
         let has_connector =
-            create.connector_type.is_some() || create.with_options.contains_key("connector");
-        if has_connector && self.is_pipeline_running() {
+            create.connector_type.is_some() || has_connector_key(&create.with_options);
+        if has_connector && self.connector_ddl_rejected() {
             let name = &create.name;
             return Err(DbError::Pipeline(format!(
                 "Cannot create sink '{name}' with connector while pipeline is running. \
@@ -250,6 +289,15 @@ impl LaminarDB {
             laminar_sql::parser::SinkFrom::Table(t) => t.to_string(),
             laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
         };
+
+        // Validate before mutating catalog/planner — no half-created sink on error.
+        let resolved = self.prepare_connector(
+            create.connector_type.as_ref(),
+            &create.connector_options,
+            create.format.as_ref(),
+            &create.with_options,
+            ConnectorKind::Sink,
+        )?;
 
         if create.or_replace {
             self.catalog.drop_sink(&name);
@@ -268,34 +316,19 @@ impl LaminarDB {
             }
         }
 
-        let resolved = resolve_connector_info(
-            create.connector_type.as_ref(),
-            &create.connector_options,
-            create.format.as_ref(),
-            &create.with_options,
-        );
-
-        if let Some(ref ct) = resolved.connector_type {
-            let normalized = normalize_connector_type(ct);
-            if self.connector_registry.sink_info(&normalized).is_none() {
-                return Err(DbError::Connector(format!(
-                    "Unknown sink connector type '{ct}'. Available: {:?}",
-                    self.connector_registry.list_sinks()
-                )));
+        if let Some(resolved) = resolved {
+            if let Some(ct) = resolved.connector_type {
+                let mut mgr = self.connector_manager.lock();
+                mgr.register_sink(crate::connector_manager::SinkRegistration {
+                    name: name.clone(),
+                    input: input.clone(),
+                    connector_type: Some(ct),
+                    connector_options: resolved.connector_options,
+                    format: resolved.format,
+                    format_options: resolved.format_options,
+                    filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
+                });
             }
-
-            validate_format(resolved.format.as_ref())?;
-
-            let mut mgr = self.connector_manager.lock();
-            mgr.register_sink(crate::connector_manager::SinkRegistration {
-                name: name.clone(),
-                input: input.clone(),
-                connector_type: Some(ct.clone()),
-                connector_options: resolved.connector_options,
-                format: resolved.format,
-                format_options: resolved.format_options,
-                filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
-            });
         }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -517,7 +550,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        if self.is_pipeline_running() {
+        if self.connector_ddl_rejected() {
             return Err(DbError::Pipeline(format!(
                 "Cannot drop source '{name_str}' while pipeline is running. \
                  Stop the pipeline first."
@@ -626,7 +659,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        if self.is_pipeline_running() {
+        if self.connector_ddl_rejected() {
             return Err(DbError::Pipeline(format!(
                 "Cannot drop sink '{name_str}' while pipeline is running. \
                  Stop the pipeline first."
@@ -1233,6 +1266,14 @@ pub(crate) struct ResolvedConnector {
 }
 
 /// Merge the `FROM <TYPE> (...)` and `WITH ('connector' = ...)` syntax into one result.
+/// Whether a `WITH (...)` clause names a connector, matched case-insensitively
+/// to stay consistent with `resolve_connector_info`.
+fn has_connector_key(with_options: &HashMap<String, String>) -> bool {
+    with_options
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("connector"))
+}
+
 pub(crate) fn resolve_connector_info(
     connector_type: Option<&String>,
     connector_options: &HashMap<String, String>,

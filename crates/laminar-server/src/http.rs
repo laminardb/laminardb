@@ -429,6 +429,8 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
         )
             .into_response()
     } else {
+        // Generic on the unauthenticated probe — the fault reason (which may echo
+        // SQL/connector config) is exposed only on the authed status endpoint.
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("pipeline is {pipeline_state}, not Running"),
@@ -922,11 +924,12 @@ async fn start_pipeline(
 
 async fn pipeline_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pipeline_state = state.db.pipeline_state();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "pipeline_state": pipeline_state })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({ "pipeline_state": pipeline_state });
+    // The panic is async (after the DDL/start call returned), so surface it here.
+    if let Some(reason) = state.db.last_fault() {
+        body["last_error"] = serde_json::Value::String(reason);
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------

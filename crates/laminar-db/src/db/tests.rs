@@ -3741,6 +3741,84 @@ async fn test_connectorless_source_does_not_break_pipeline() {
     );
 }
 
+#[tokio::test]
+async fn connector_options_resolve_vars() {
+    // `${VAR}` resolves in connector option values (config vars, then env) for
+    // both sources and sinks — and only there, not elsewhere in the statement.
+    let db = LaminarDB::builder()
+        .config_var("TOPIC", "events")
+        .build()
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE SOURCE s (id BIGINT) WITH ('connector' = 'generator', 'topic' = '${TOPIC}')",
+    )
+    .await
+    .unwrap();
+    {
+        let mgr = db.connector_manager.lock();
+        let opts = &mgr.sources().get("s").unwrap().connector_options;
+        assert_eq!(opts.get("topic").map(String::as_str), Some("events"));
+    }
+    // Sinks go through the same resolver — an unresolved option errors (raised
+    // before the unknown-connector check), proving the sink path is wired.
+    let err = db
+        .execute("CREATE SINK snk FROM s WITH ('connector' = 'noop', 'topic' = '${MISSING_X9Q}')")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Unresolved variable"),
+        "sink: {err}"
+    );
+}
+
+#[tokio::test]
+async fn faulted_pipeline_recovers_and_resumes() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE trades (id BIGINT, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute("CREATE STREAM out AS SELECT id FROM trades")
+        .await
+        .unwrap();
+
+    // Simulate a compute-thread crash: recoverable state, recorded reason, and
+    // the shutdown permit the watcher's `notify_one()` leaves with no waiter.
+    DbState::Faulted.store(&db.state);
+    *db.last_fault.lock() = Some("operator boom".to_string());
+    db.shutdown_signal.notify_one();
+    assert_eq!(db.pipeline_state(), "Faulted");
+
+    // start() drains the stale permit, rebuilds from the catalog, and clears it.
+    db.start().await.unwrap();
+    assert_eq!(db.pipeline_state(), "Running");
+    assert!(db.last_fault().is_none());
+
+    // The recovered coordinator must be alive — without draining the permit it
+    // would see shutdown immediately and ingest nothing.
+    let handle = db.source_untyped("trades").unwrap();
+    let schema = handle.schema().clone();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                1_000_000, 2_000_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    handle.push_arrow(batch).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        db.metrics().total_events_ingested > 0,
+        "recovered pipeline should ingest"
+    );
+}
+
 /// Poll an MV until it has at least `min_rows` rows, or timeout.
 async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
     // 90s, not 2s: CI runners are CPU-starved (this MV emits in ~0.1s locally but

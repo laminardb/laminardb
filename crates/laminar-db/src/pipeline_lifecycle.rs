@@ -176,16 +176,18 @@ impl LaminarDB {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn is_pipeline_running(&self) -> bool {
+    /// Connector add/remove DDL can't take effect while serving — connectors are
+    /// built only at `start()`. `Starting` is allowed so catalog-manifest replay
+    /// (which runs before `start_inner` builds connectors) is picked up.
+    pub(crate) fn connector_ddl_rejected(&self) -> bool {
         matches!(
             DbState::load(&self.state),
-            DbState::Running | DbState::Starting | DbState::ShuttingDown
+            DbState::Running | DbState::ShuttingDown
         )
     }
 
-    /// Start the streaming pipeline. Idempotent if already running.
-    ///
-    /// On failure the instance is reset to `Created` so the caller can retry.
+    /// Start the streaming pipeline. Idempotent if already running. On failure
+    /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
     /// # Errors
     ///
@@ -203,10 +205,15 @@ impl LaminarDB {
                     "cannot start pipeline: shutdown/stop in progress".into(),
                 ));
             }
-            DbState::Created => {}
+            // Faulted is recoverable — fall through and rebuild. Created is the
+            // fresh-start path.
+            DbState::Created | DbState::Faulted => {}
         }
 
         DbState::Starting.store(&self.state);
+        // Clear on entry, not after start_inner — otherwise a panic during this
+        // startup (watcher → Faulted + reason) would be immediately overwritten.
+        *self.last_fault.lock() = None;
 
         {
             let mut guard = self.engine_metrics.lock();
@@ -220,9 +227,19 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         self.restore_catalog_from_manifest().await;
 
+        // Drain a shutdown permit a prior fault's `notify_one()` left with no
+        // waiter, so the new coordinator's `notified()` doesn't fire at once.
+        tokio::select! {
+            biased;
+            () = self.shutdown_signal.notified() => {}
+            () = std::future::ready(()) => {}
+        }
+
         match self.start_inner().await {
+            // CAS, not store: don't clobber a Faulted set by the watcher if the
+            // compute thread already panicked during startup.
             Ok(()) => {
-                DbState::Running.store(&self.state);
+                let _ = DbState::compare_exchange(DbState::Starting, DbState::Running, &self.state);
                 Ok(())
             }
             Err(e) => {
@@ -1668,6 +1685,10 @@ impl LaminarDB {
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
+            // Captured by the compute thread so an operator panic is recorded
+            // (surfaced via pipeline status) rather than only logged.
+            let fault_slot = Arc::clone(&self.last_fault);
+            let fault_metrics = self.engine_metrics.lock().clone();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -1696,7 +1717,11 @@ impl LaminarDB {
                             .or_else(|| panic.downcast_ref::<&str>().copied())
                             .unwrap_or("unknown");
                         tracing::error!(panic = msg, "laminar-compute thread panicked");
-                        // done_tx dropped → done_rx returns Err, logged by the watcher
+                        // Record before dropping done_tx so the watcher sees it.
+                        *fault_slot.lock() = Some(msg.to_string());
+                        if let Some(ref m) = fault_metrics {
+                            m.pipeline_faults_total.inc();
+                        }
                         return;
                     }
                     done_tx.send(());
@@ -1721,10 +1746,15 @@ impl LaminarDB {
 
             let watcher_state = Arc::clone(&self.state);
             let watcher_shutdown = Arc::clone(&self.shutdown_signal);
+            let watcher_fault = Arc::clone(&self.last_fault);
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_err() {
                     tracing::error!("laminar-compute thread exited unexpectedly");
-                    DbState::Stopped.store(&watcher_state);
+                    watcher_fault
+                        .lock()
+                        .get_or_insert_with(|| "compute thread exited unexpectedly".to_string());
+                    // Faulted, not Stopped — recoverable via a later start().
+                    DbState::Faulted.store(&watcher_state);
                     watcher_shutdown.notify_one();
                 }
             });

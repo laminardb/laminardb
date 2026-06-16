@@ -1,8 +1,6 @@
 //! SQL parsing utilities: statement splitting and config variable substitution.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::collections::HashMap;
-
 use sqlparser::dialect::GenericDialect;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -82,52 +80,52 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     statements
 }
 
-/// Resolve `${VAR_NAME}` placeholders in `sql` from `vars`.
+/// Substitute `${VAR}` / `${VAR:-default}` placeholders via `lookup`; an unset
+/// name with no default is an error. (`$1`/`$$` don't match `${`.)
 ///
 /// # Errors
 ///
-/// Returns `DbError::InvalidOperation` for an unknown variable when `strict` is true.
-/// When `strict` is false, unresolved placeholders are left in place.
-pub fn resolve_config_vars(
+/// Returns `DbError::InvalidOperation` for an unresolved `${VAR}`.
+pub fn substitute_vars(
     sql: &str,
-    vars: &HashMap<String, String>,
-    strict: bool,
+    lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<String, DbError> {
-    let mut result = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-            let start = i;
-            i += 2;
-            let var_start = i;
-            while i < len && bytes[i] != b'}' {
-                i += 1;
-            }
-            if i < len {
-                let var_name = &sql[var_start..i];
-                i += 1;
-                if let Some(value) = vars.get(var_name) {
-                    result.push_str(value);
-                } else if strict {
-                    return Err(DbError::InvalidOperation(format!(
-                        "Unresolved config variable: ${{{var_name}}}"
-                    )));
-                } else {
-                    result.push_str(&sql[start..i]);
-                }
-            } else {
-                result.push_str(&sql[start..]);
-            }
-        } else {
-            result.push(sql[i..].chars().next().unwrap());
-            i += sql[i..].chars().next().unwrap().len_utf8();
-        }
+    if !sql.contains("${") {
+        return Ok(sql.to_string());
     }
 
-    Ok(result)
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            let start = i;
+            i += 2;
+            let inner_start = i;
+            while i < bytes.len() && bytes[i] != b'}' {
+                i += 1;
+            }
+            if i == bytes.len() {
+                out.push_str(&sql[start..]); // unterminated — leave verbatim
+                break;
+            }
+            let (name, default) = sql[inner_start..i]
+                .split_once(":-")
+                .map_or((&sql[inner_start..i], None), |(n, d)| (n, Some(d)));
+            i += 1; // consume '}'
+            let value = lookup(name)
+                .or_else(|| default.map(str::to_string))
+                .ok_or_else(|| {
+                    DbError::InvalidOperation(format!("Unresolved variable: ${{{name}}}"))
+                })?;
+            out.push_str(&value);
+        } else {
+            let ch = sql[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Ok(out)
 }
 
 /// Extract a string representation from a SQL expression.
@@ -408,52 +406,25 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_substitution() {
-        let mut vars = HashMap::new();
-        vars.insert("KAFKA_BROKERS".to_string(), "localhost:9092".to_string());
-        let result =
-            resolve_config_vars("'bootstrap.servers' = '${KAFKA_BROKERS}'", &vars, true).unwrap();
-        assert_eq!(result, "'bootstrap.servers' = 'localhost:9092'");
+    fn substitute_resolves_named_and_default() {
+        let out = substitute_vars(
+            "brokers='${KAFKA_BROKERS}' group='${GROUP:-default-grp}'",
+            |n| (n == "KAFKA_BROKERS").then(|| "localhost:9092".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out, "brokers='localhost:9092' group='default-grp'");
     }
 
     #[test]
-    fn test_multiple_vars() {
-        let mut vars = HashMap::new();
-        vars.insert("HOST".to_string(), "localhost".to_string());
-        vars.insert("PORT".to_string(), "9092".to_string());
-        let result = resolve_config_vars("${HOST}:${PORT}", &vars, true).unwrap();
-        assert_eq!(result, "localhost:9092");
+    fn substitute_unresolved_without_default_is_error() {
+        let err = substitute_vars("${MISSING}", |_| None).unwrap_err();
+        assert!(err.to_string().contains("Unresolved variable"));
     }
 
     #[test]
-    fn test_missing_var_strict() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("${MISSING}", &vars, true);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unresolved config variable"));
-    }
-
-    #[test]
-    fn test_missing_var_permissive() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("${MISSING}", &vars, false).unwrap();
-        assert_eq!(result, "${MISSING}");
-    }
-
-    #[test]
-    fn test_no_vars_in_sql() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("SELECT 1", &vars, true).unwrap();
-        assert_eq!(result, "SELECT 1");
-    }
-
-    #[test]
-    fn test_unclosed_var() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("${UNCLOSED", &vars, false).unwrap();
-        assert_eq!(result, "${UNCLOSED");
+    fn substitute_ignores_non_placeholder_dollars() {
+        // `$1` params and `$$` quoting must pass through untouched.
+        let sql = "SELECT * FROM t WHERE id = $1 AND tag = $$x$$";
+        assert_eq!(substitute_vars(sql, |_| None).unwrap(), sql);
     }
 }

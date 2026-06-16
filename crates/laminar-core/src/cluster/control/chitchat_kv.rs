@@ -1,5 +1,6 @@
 //! Chitchat-backed [`ClusterKv`]. Reads filter by `live_nodes()` so
 //! suspected peers don't count toward quorum.
+#![allow(clippy::disallowed_types)] // cold control-plane path
 
 use std::sync::Arc;
 
@@ -57,18 +58,27 @@ impl ClusterKv for ChitchatKv {
     async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
         let target = encode_node_id(who);
         let guard = self.chitchat.lock().await;
+
+        // Read the key from the node's newest generation — an older generation
+        // must not mask a key the newest generation dropped.
+        let mut best: Option<(u64, Option<String>)> = None;
         for (cc_id, state) in guard.node_states() {
-            if cc_id.node_id == target {
-                return state.get(key).map(str::to_string);
+            if cc_id.node_id == target
+                && best.as_ref().is_none_or(|&(g, _)| cc_id.generation_id > g)
+            {
+                best = Some((cc_id.generation_id, state.get(key).map(str::to_string)));
             }
         }
-        None
+        best.and_then(|(_, val)| val)
     }
 
     async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
         let guard = self.chitchat.lock().await;
         let live: Vec<&chitchat::ChitchatId> = guard.live_nodes().collect();
-        let mut out = Vec::new();
+        // Newest generation per node wins, even if it lacks the key — an older
+        // generation must not resurrect a value the newest one dropped.
+        let mut best: std::collections::HashMap<NodeId, (u64, Option<String>)> =
+            std::collections::HashMap::new();
         for (cc_id, state) in guard.node_states() {
             if !live.contains(&cc_id) {
                 continue;
@@ -76,17 +86,28 @@ impl ClusterKv for ChitchatKv {
             let Some(node_id) = decode_chitchat_id(cc_id) else {
                 continue;
             };
-            if let Some(value) = state.get(key) {
-                out.push((node_id, value.to_string()));
+            if best
+                .get(&node_id)
+                .is_none_or(|&(g, _)| cc_id.generation_id > g)
+            {
+                best.insert(
+                    node_id,
+                    (cc_id.generation_id, state.get(key).map(str::to_string)),
+                );
             }
         }
-        out
+        best.into_iter()
+            .filter_map(|(id, (_, val))| val.map(|v| (id, v)))
+            .collect()
     }
 
     async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
         let guard = self.chitchat.lock().await;
         let live: Vec<&chitchat::ChitchatId> = guard.live_nodes().collect();
-        let mut out = Vec::new();
+        let mut best_gen: std::collections::HashMap<NodeId, u64> = std::collections::HashMap::new();
+        let mut best_states: std::collections::HashMap<NodeId, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+
         for (cc_id, state) in guard.node_states() {
             if !live.contains(&cc_id) {
                 continue;
@@ -94,10 +115,23 @@ impl ClusterKv for ChitchatKv {
             let Some(node_id) = decode_chitchat_id(cc_id) else {
                 continue;
             };
-            for (key, val) in state.key_values() {
-                if key.starts_with(prefix) {
-                    out.push((node_id, key.to_string(), val.to_string()));
+            let current_best_gen = *best_gen.get(&node_id).unwrap_or(&0);
+            if cc_id.generation_id >= current_best_gen {
+                best_gen.insert(node_id, cc_id.generation_id);
+                let mut node_kvs = Vec::new();
+                for (key, val) in state.key_values() {
+                    if key.starts_with(prefix) {
+                        node_kvs.push((key.to_string(), val.to_string()));
+                    }
                 }
+                best_states.insert(node_id, node_kvs);
+            }
+        }
+
+        let mut out = Vec::new();
+        for (node_id, kvs) in best_states {
+            for (k, v) in kvs {
+                out.push((node_id, k, v));
             }
         }
         out

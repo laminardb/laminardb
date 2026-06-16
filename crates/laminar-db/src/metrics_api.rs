@@ -42,7 +42,15 @@ impl LaminarDB {
             DbState::Running => "Running",
             DbState::ShuttingDown => "ShuttingDown",
             DbState::Stopped => "Stopped",
+            DbState::Faulted => "Faulted",
         }
+    }
+
+    /// The panic message from the last compute-thread crash, if any. Populated
+    /// when state is `Faulted`; cleared on a clean start.
+    #[must_use]
+    pub fn last_fault(&self) -> Option<String> {
+        self.last_fault.lock().clone()
     }
 
     /// Get a pipeline-wide metrics snapshot.
@@ -191,6 +199,7 @@ impl LaminarDB {
             DbState::Running => crate::metrics::PipelineState::Running,
             DbState::ShuttingDown => crate::metrics::PipelineState::ShuttingDown,
             DbState::Stopped => crate::metrics::PipelineState::Stopped,
+            DbState::Faulted => crate::metrics::PipelineState::Faulted,
         }
     }
 
