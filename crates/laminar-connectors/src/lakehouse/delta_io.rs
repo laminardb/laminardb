@@ -326,6 +326,89 @@ pub async fn get_last_committed_epoch(table: &DeltaTable, writer_id: &str) -> u6
     }
 }
 
+/// One writer's `Add` actions, serialized for the designated committer.
+#[cfg(feature = "delta-lake")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DeltaCommitDescriptor {
+    version: u32,
+    adds: Vec<deltalake::kernel::Add>,
+}
+
+/// Serialize a writer's flushed `Add` actions into a commit descriptor.
+///
+/// # Errors
+/// Returns `ConnectorError::WriteError` if serialization fails.
+#[cfg(feature = "delta-lake")]
+pub fn encode_commit_descriptor(
+    adds: Vec<deltalake::kernel::Add>,
+) -> Result<Vec<u8>, ConnectorError> {
+    serde_json::to_vec(&DeltaCommitDescriptor { version: 1, adds })
+        .map_err(|e| ConnectorError::WriteError(format!("encode delta descriptor: {e}")))
+}
+
+/// Decode and flatten every writer's descriptor into one set of `Add` actions.
+///
+/// # Errors
+/// Returns `ConnectorError::TransactionError` on a version mismatch or malformed
+/// descriptor.
+#[cfg(feature = "delta-lake")]
+pub fn decode_commit_descriptors(
+    descriptors: &[Vec<u8>],
+) -> Result<Vec<deltalake::kernel::Add>, ConnectorError> {
+    let mut out = Vec::new();
+    for bytes in descriptors {
+        let d: DeltaCommitDescriptor = serde_json::from_slice(bytes)
+            .map_err(|e| ConnectorError::TransactionError(format!("decode delta descriptor: {e}")))?;
+        if d.version != 1 {
+            return Err(ConnectorError::TransactionError(format!(
+                "unsupported delta commit descriptor version {}",
+                d.version
+            )));
+        }
+        out.extend(d.adds);
+    }
+    Ok(out)
+}
+
+/// Append `adds` from all writers in one transaction, stamped with the
+/// committer's application transaction (`committer_id`, `epoch`) for idempotency.
+///
+/// # Errors
+/// Returns `ConnectorError::TransactionError` on commit failure.
+#[cfg(feature = "delta-lake")]
+pub async fn commit_adds_coordinated(
+    table: &DeltaTable,
+    adds: Vec<deltalake::kernel::Add>,
+    committer_id: &str,
+    epoch: u64,
+) -> Result<i64, ConnectorError> {
+    use deltalake::kernel::transaction::CommitBuilder;
+    use deltalake::kernel::Action;
+    use deltalake::protocol::DeltaOperation;
+
+    let snapshot = table
+        .snapshot()
+        .map_err(|e| ConnectorError::TransactionError(format!("snapshot: {e}")))?;
+    let partition_cols = snapshot.metadata().partition_columns().clone();
+    let partition_by = (!partition_cols.is_empty()).then_some(partition_cols);
+    let operation = DeltaOperation::Write {
+        mode: SaveMode::Append,
+        partition_by,
+        predicate: None,
+    };
+
+    let actions: Vec<Action> = adds.into_iter().map(Action::Add).collect();
+    #[allow(clippy::cast_possible_wrap)]
+    let props = CommitProperties::default()
+        .with_application_transaction(Transaction::new(committer_id, epoch as i64));
+    let finalized = CommitBuilder::from(props)
+        .with_actions(actions)
+        .build(Some(snapshot), table.log_store(), operation)
+        .await
+        .map_err(|e| ConnectorError::TransactionError(format!("coordinated commit: {e}")))?;
+    Ok(finalized.version())
+}
+
 /// Returns the table's partition columns, or an empty list if the snapshot is
 /// unavailable. Best-effort: used for clustering diagnostics, never for
 /// correctness, so a missing snapshot is not an error.

@@ -620,6 +620,37 @@ impl DeltaLakeSink {
 
     /// Writes all staged data to Delta Lake as a single atomic transaction.
     ///
+    /// Append + exactly-once decomposes into distributed write + one commit.
+    fn is_coordinated(&self) -> bool {
+        self.config.write_mode == DeltaWriteMode::Append
+            && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+    }
+
+    /// Write staged batches to Parquet (no commit) and serialize the resulting
+    /// `Add` actions as the designated committer's descriptor.
+    #[cfg(feature = "delta-lake")]
+    async fn write_staged_to_descriptor(&self) -> Result<Vec<u8>, ConnectorError> {
+        use deltalake::writer::{DeltaWriter, RecordBatchWriter};
+
+        let table = self.table.as_ref().ok_or_else(|| ConnectorError::InvalidState {
+            expected: "open".into(),
+            actual: "delta table not loaded".into(),
+        })?;
+        let mut writer = RecordBatchWriter::for_table(table)
+            .map_err(|e| ConnectorError::WriteError(format!("delta writer: {e}")))?;
+        for batch in &self.staged_batches {
+            writer
+                .write(batch.clone())
+                .await
+                .map_err(|e| ConnectorError::WriteError(format!("delta write: {e}")))?;
+        }
+        let adds = writer
+            .flush()
+            .await
+            .map_err(|e| ConnectorError::WriteError(format!("delta flush: {e}")))?;
+        super::delta_io::encode_commit_descriptor(adds)
+    }
+
     /// Retries on optimistic concurrency conflicts with exponential backoff.
     /// On non-conflict errors or exhausted retries, propagates the error.
     #[cfg(feature = "delta-lake")]
@@ -1295,6 +1326,21 @@ impl SinkConnector for DeltaLakeSink {
             self.buffer_start_time = None;
         }
 
+        // Coordinated (append) mode: write Parquet now and hand the Add actions
+        // to the designated committer; the catalog commit happens in
+        // commit_aggregated. Upsert/at-least-once keep the commit_epoch path.
+        #[cfg(feature = "delta-lake")]
+        if self.is_coordinated() {
+            if self.staged_batches.is_empty() {
+                return Ok(None);
+            }
+            let descriptor = self.write_staged_to_descriptor().await?;
+            self.staged_batches.clear();
+            self.staged_rows = 0;
+            self.staged_bytes = 0;
+            return Ok(Some(descriptor));
+        }
+
         debug!(epoch, "Delta Lake: pre-committed (batches staged)");
         Ok(None)
     }
@@ -1307,10 +1353,12 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        // Write staged data to Delta as a single atomic transaction.
+        // Write staged data to Delta as a single atomic transaction. Coordinated
+        // (append) sinks commit via the designated committer (commit_aggregated),
+        // not here.
         #[cfg(feature = "delta-lake")]
         {
-            if !self.staged_batches.is_empty() {
+            if !self.is_coordinated() && !self.staged_batches.is_empty() {
                 self.flush_staged_to_delta().await?;
             }
         }
@@ -1349,6 +1397,11 @@ impl SinkConnector for DeltaLakeSink {
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             caps = caps.with_exactly_once().with_two_phase_commit();
+        }
+        // Append is the only mode that decomposes into distributed write +
+        // single commit; upsert (MERGE) keeps the per-writer path.
+        if self.is_coordinated() {
+            caps = caps.with_coordinated_commit();
         }
         if self.config.write_mode == DeltaWriteMode::Upsert {
             caps = caps.with_upsert().with_changelog();
@@ -1412,10 +1465,12 @@ impl SinkConnector for DeltaLakeSink {
         // Commit any remaining data before closing.
         // For at-least-once, use flush() which handles both orphaned
         // staged data and buffered data. For exactly-once, use 2PC.
+        // Coordinated sinks are committed by the designated committer, not on
+        // close; any un-checkpointed buffer is dropped and reprocessed on restart.
         #[cfg(feature = "delta-lake")]
         if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce {
             self.flush().await?;
-        } else if !self.buffer.is_empty() {
+        } else if !self.is_coordinated() && !self.buffer.is_empty() {
             self.pre_commit(self.current_epoch).await?;
             self.commit_epoch(self.current_epoch).await?;
         }
@@ -1451,6 +1506,46 @@ impl SinkConnector for DeltaLakeSink {
             "Delta Lake sink connector closed"
         );
 
+        Ok(())
+    }
+
+    #[cfg(feature = "delta-lake")]
+    fn as_coordinated_committer(&self) -> Option<&dyn crate::connector::CoordinatedCommitter> {
+        self.is_coordinated().then_some(self as &dyn crate::connector::CoordinatedCommitter)
+    }
+}
+
+/// Single app-transaction id the designated committer uses for idempotency; it
+/// is scoped to the table's own log, so a constant is sufficient.
+#[cfg(feature = "delta-lake")]
+const COORDINATED_COMMITTER_ID: &str = "laminardb.coordinated";
+
+#[cfg(feature = "delta-lake")]
+#[async_trait]
+impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
+    async fn commit_aggregated(
+        &self,
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+    ) -> Result<(), ConnectorError> {
+        let table = super::delta_io::open_or_create_table(
+            &self.resolved_table_path,
+            self.resolved_storage_options.clone(),
+            None,
+        )
+        .await?;
+        // Idempotent: skip if this epoch is already sealed for the committer.
+        if super::delta_io::get_last_committed_epoch(&table, COORDINATED_COMMITTER_ID).await >= epoch
+        {
+            return Ok(());
+        }
+        let adds = super::delta_io::decode_commit_descriptors(&descriptors)?;
+        if adds.is_empty() {
+            return Ok(());
+        }
+        super::delta_io::commit_adds_coordinated(&table, adds, COORDINATED_COMMITTER_ID, epoch)
+            .await?;
+        info!(epoch, writers = descriptors.len(), "delta coordinated commit");
         Ok(())
     }
 }
