@@ -525,6 +525,23 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
         info!(epoch, writers = descriptors.len(), "iceberg coordinated commit");
         Ok(())
     }
+
+    async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open".into(),
+                actual: "catalog not initialized".into(),
+            })?;
+        let table = super::iceberg_io::load_table(
+            catalog.as_ref(),
+            &self.config.catalog.namespace,
+            &self.config.catalog.table_name,
+        )
+        .await?;
+        Ok(super::iceberg_io::coordinated_committed_epoch(&table))
+    }
 }
 
 #[cfg(test)]

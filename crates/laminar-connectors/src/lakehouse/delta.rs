@@ -1548,6 +1548,17 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
         info!(epoch, writers = descriptors.len(), "delta coordinated commit");
         Ok(())
     }
+
+    async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+        let table = super::delta_io::open_or_create_table(
+            &self.resolved_table_path,
+            self.resolved_storage_options.clone(),
+            None,
+        )
+        .await?;
+        let epoch = super::delta_io::get_last_committed_epoch(&table, COORDINATED_COMMITTER_ID).await;
+        Ok((epoch > 0).then_some(epoch))
+    }
 }
 
 /// Safety-net: if the sink is dropped mid-lifecycle (panic, config error,

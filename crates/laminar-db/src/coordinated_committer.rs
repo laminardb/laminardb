@@ -22,6 +22,11 @@ pub(crate) struct CoordinatedCommitter {
     committed_through: FxHashMap<String, u64>,
     /// Lowest uncommitted epoch, published for the coordinator's prune clamp.
     floor: Arc<AtomicU64>,
+    /// Cursors seeded from each sink's external commit state on the first pass.
+    seeded: bool,
+    /// Lag (sealed − committed) past which a loud warning fires.
+    max_uncommitted_epochs: u64,
+    metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     #[cfg(feature = "cluster")]
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
 }
@@ -37,9 +42,25 @@ impl CoordinatedCommitter {
             sinks,
             committed_through: FxHashMap::default(),
             floor,
+            seeded: false,
+            max_uncommitted_epochs: u64::MAX,
+            metrics: None,
             #[cfg(feature = "cluster")]
             controller: None,
         }
+    }
+
+    pub(crate) fn with_metrics(
+        mut self,
+        metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub(crate) fn with_max_uncommitted_epochs(mut self, cap: u64) -> Self {
+        self.max_uncommitted_epochs = cap;
+        self
     }
 
     /// Restrict committing to the cluster leader (the single designated committer).
@@ -62,6 +83,17 @@ impl CoordinatedCommitter {
             return Ok(());
         }
 
+        // Resume each cursor from the sink's external commit state once, so a
+        // restart doesn't rescan from epoch 0.
+        if !self.seeded {
+            for (name, handle) in &self.sinks {
+                if let Ok(Some(epoch)) = handle.committed_through().await {
+                    self.committed_through.insert(name.clone(), epoch);
+                }
+            }
+            self.seeded = true;
+        }
+
         let high = self
             .backend
             .latest_committed_epoch()
@@ -71,27 +103,22 @@ impl CoordinatedCommitter {
 
         let mut first_err: Option<DbError> = None;
         for (name, handle) in &self.sinks {
-            let suffix = format!("/sink={name}");
-            let mut cursor = self.committed_through.get(name).copied().unwrap_or(0);
-            while cursor < high {
-                let epoch = cursor + 1;
-                // Abandoned epochs leave partial descriptors but no seal; their
-                // data reprocesses into a later epoch, so skip them.
-                match self.commit_epoch(handle, epoch, &suffix).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        first_err.get_or_insert(e);
-                        break;
-                    }
+            let cursor = self.committed_through.get(name).copied().unwrap_or(0);
+            if cursor >= high {
+                continue;
+            }
+            match self.commit_range(handle, name, cursor, high).await {
+                Ok(()) => {
+                    self.committed_through.insert(name.clone(), high);
                 }
-                cursor = epoch;
-                self.committed_through.insert(name.clone(), cursor);
+                Err(e) => {
+                    first_err.get_or_insert(e); // leave the cursor; retry next pass
+                }
             }
         }
 
-        // Publish the prune floor: the lowest epoch still uncommitted by any
-        // sink (committed_through + 1), so the coordinator won't GC descriptors
-        // the committer still needs.
+        // Publish the prune floor (lowest uncommitted epoch) + lag metric, and
+        // warn if the committer is falling behind so storage isn't growing blind.
         let min_committed = self
             .sinks
             .iter()
@@ -99,44 +126,57 @@ impl CoordinatedCommitter {
             .min()
             .unwrap_or(0);
         self.floor.store(min_committed + 1, Ordering::Release);
+        let lag = high.saturating_sub(min_committed);
+        if let Some(m) = &self.metrics {
+            #[allow(clippy::cast_possible_wrap)]
+            m.coordinated_committer_lag_epochs.set(lag as i64);
+        }
+        if lag > self.max_uncommitted_epochs {
+            tracing::warn!(
+                lag,
+                cap = self.max_uncommitted_epochs,
+                "[LDB-6030] coordinated committer is falling behind — descriptors and \
+                 data files are accumulating in object storage"
+            );
+        }
 
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Commit one sealed epoch's descriptors for a sink. Unsealed epochs are a
-    /// no-op (skipped). Errors leave the caller's cursor unadvanced.
-    async fn commit_epoch(
+    /// Commit all sealed epochs in `(cursor, high]` for one sink as a single
+    /// transaction (one snapshot), skipping abandoned (unsealed) epochs.
+    async fn commit_range(
         &self,
         handle: &SinkTaskHandle,
-        epoch: u64,
-        sink_suffix: &str,
+        name: &str,
+        cursor: u64,
+        high: u64,
     ) -> Result<(), DbError> {
-        if !self
-            .backend
-            .is_epoch_sealed(epoch)
-            .await
-            .map_err(|e| DbError::Checkpoint(format!("committer: seal check epoch {epoch}: {e}")))?
-        {
-            return Ok(());
-        }
-        let descriptors: Vec<Vec<u8>> = self
-            .backend
-            .read_commit_descriptors(epoch)
-            .await
-            .map_err(|e| {
+        let suffix = format!("/sink={name}");
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        for epoch in (cursor + 1)..=high {
+            if !self.backend.is_epoch_sealed(epoch).await.map_err(|e| {
+                DbError::Checkpoint(format!("committer: seal check epoch {epoch}: {e}"))
+            })? {
+                continue; // abandoned epoch — its data reprocesses later
+            }
+            let descriptors = self.backend.read_commit_descriptors(epoch).await.map_err(|e| {
                 DbError::Checkpoint(format!("committer: read descriptors epoch {epoch}: {e}"))
-            })?
-            .into_iter()
-            .filter(|(k, _)| k.ends_with(sink_suffix))
-            .map(|(_, v)| v.to_vec())
-            .collect();
-        if descriptors.is_empty() {
+            })?;
+            batch.extend(
+                descriptors
+                    .into_iter()
+                    .filter(|(k, _)| k.ends_with(&suffix))
+                    .map(|(_, v)| v.to_vec()),
+            );
+        }
+        if batch.is_empty() {
             return Ok(());
         }
         handle
-            .commit_aggregated(epoch, descriptors)
+            .commit_aggregated(high, batch)
             .await
-            .map_err(|e| DbError::Checkpoint(format!("committer: commit epoch {epoch}: {e}")))
+            .map_err(|e| DbError::Checkpoint(format!("committer: commit through epoch {high}: {e}")))
     }
 }
 
@@ -164,6 +204,7 @@ mod tests {
     struct RecordingSink {
         schema: SchemaRef,
         recorded: Recorded,
+        committed: AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -202,7 +243,13 @@ mod tests {
             descriptors: Vec<Vec<u8>>,
         ) -> Result<(), ConnectorError> {
             self.recorded.lock().push((epoch, descriptors));
+            self.committed.fetch_max(epoch, Ordering::Release);
             Ok(())
+        }
+
+        async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+            let c = self.committed.load(Ordering::Acquire);
+            Ok((c > 0).then_some(c))
         }
     }
 
@@ -214,7 +261,11 @@ mod tests {
         SinkTaskHandle::spawn(SinkTaskConfig {
             name: "ice".into(),
             sink_id: Arc::from("ice"),
-            connector: Box::new(RecordingSink { schema, recorded }),
+            connector: Box::new(RecordingSink {
+                schema,
+                recorded,
+                committed: AtomicU64::new(0),
+            }),
             exactly_once: true,
             coordinated_commit: true,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -234,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commits_each_sealed_epoch_and_advances_cursor() {
+    async fn batches_sealed_epochs_into_one_commit() {
         let backend = Arc::new(InProcessBackend::new(2));
         seal(&backend, 1, b"e1").await;
         seal(&backend, 2, b"e2").await;
@@ -249,15 +300,16 @@ mod tests {
 
         committer.commit_ready().await.unwrap();
 
-        let got = recorded.lock().clone();
+        // Both sealed epochs commit as ONE aggregated commit keyed by the high
+        // epoch — one snapshot, not one per epoch.
         assert_eq!(
-            got,
-            vec![(1, vec![b"e1".to_vec()]), (2, vec![b"e2".to_vec()])]
+            recorded.lock().clone(),
+            vec![(2, vec![b"e1".to_vec(), b"e2".to_vec()])]
         );
 
         // A second pass with no new sealed epochs is a no-op (cursor advanced).
         committer.commit_ready().await.unwrap();
-        assert_eq!(recorded.lock().len(), 2);
+        assert_eq!(recorded.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -281,10 +333,44 @@ mod tests {
 
         committer.commit_ready().await.unwrap();
 
-        // Epoch 2's orphan descriptor must NOT be committed.
+        // Epochs 1 and 3 batch into one commit keyed by 3; epoch 2's orphan
+        // descriptor (never sealed) must NOT be committed.
         assert_eq!(
             recorded.lock().clone(),
-            vec![(1, vec![b"e1".to_vec()]), (3, vec![b"e3".to_vec()])]
+            vec![(3, vec![b"e1".to_vec(), b"e3".to_vec()])]
+        );
+    }
+
+    /// On restart/failover a fresh committer seeds its cursor from the sink's
+    /// external commit state and must not re-commit already-committed epochs.
+    #[tokio::test]
+    async fn restart_resumes_from_committed_through() {
+        let backend = Arc::new(InProcessBackend::new(2));
+        seal(&backend, 1, b"e1").await;
+        seal(&backend, 2, b"e2").await;
+
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink(Arc::clone(&recorded));
+
+        let mut first = CoordinatedCommitter::new(
+            Arc::clone(&backend) as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle.clone())],
+            Arc::new(AtomicU64::new(0)),
+        );
+        first.commit_ready().await.unwrap();
+        assert_eq!(recorded.lock().len(), 1);
+
+        // Fresh committer (restart) over the same sink — seeds from committed_through.
+        let mut restarted = CoordinatedCommitter::new(
+            Arc::clone(&backend) as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            Arc::new(AtomicU64::new(0)),
+        );
+        restarted.commit_ready().await.unwrap();
+        assert_eq!(
+            recorded.lock().len(),
+            1,
+            "restart must not re-commit already-committed epochs"
         );
     }
 }

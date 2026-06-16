@@ -84,6 +84,10 @@ pub(crate) enum SinkCommand {
         descriptors: Vec<Vec<u8>>,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
+    /// Highest epoch already committed externally, for committer cursor resume.
+    CommittedThrough {
+        ack: oneshot::TxOneshot<Result<Option<u64>, ConnectorError>>,
+    },
     /// `force = false` keeps a healthy sink's pending transactional output —
     /// sources don't rewind on a live abort so those rows must not be discarded.
     RollbackEpoch {
@@ -247,6 +251,18 @@ impl SinkTaskHandle {
         ack_rx
             .await
             .map_err(|_| self.ack_dropped_err("commit-aggregated"))?
+    }
+
+    /// Highest epoch already committed externally (committer cursor resume).
+    pub async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::oneshot();
+        self.tx
+            .send(SinkCommand::CommittedThrough { ack: ack_tx })
+            .await
+            .map_err(|_| self.closed_err())?;
+        ack_rx
+            .await
+            .map_err(|_| self.ack_dropped_err("committed-through"))?
     }
 
     /// 2PC phase 2: finalize the transaction.
@@ -425,6 +441,13 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                                 expected: "coordinated committer".into(),
                                 actual: format!("sink '{}' is not coordinated", inner.name),
                             }),
+                        };
+                        ack.send(result);
+                    }
+                    SinkCommand::CommittedThrough { ack } => {
+                        let result = match inner.sink.as_coordinated_committer() {
+                            Some(committer) => committer.committed_through().await,
+                            None => Ok(None),
                         };
                         ack.send(result);
                     }

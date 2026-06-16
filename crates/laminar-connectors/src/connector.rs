@@ -538,6 +538,13 @@ pub trait CoordinatedCommitter: Send + Sync {
         epoch: u64,
         descriptors: Vec<Vec<u8>>,
     ) -> Result<(), ConnectorError>;
+
+    /// Highest epoch already committed to the external system, if any. Lets the
+    /// committer resume from the right cursor on restart instead of rescanning
+    /// from epoch 0. Default `None` (no resume hint).
+    async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

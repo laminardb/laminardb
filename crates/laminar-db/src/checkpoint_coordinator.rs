@@ -88,6 +88,10 @@ pub struct CheckpointConfig {
     pub max_in_flight_epochs: u64,
     /// Cap on in-flight captured-state bytes. At the cap, barrier admission pauses.
     pub max_staged_bytes: u64,
+    /// Sealed-but-uncommitted epochs (designated-committer lag) past which a loud
+    /// warning fires — the committer is falling behind and descriptors/data are
+    /// accumulating in object storage (prune is held to avoid losing them).
+    pub max_uncommitted_epochs: u64,
 }
 
 impl Default for CheckpointConfig {
@@ -108,6 +112,7 @@ impl Default for CheckpointConfig {
             restorable_gate_timeout: Duration::from_secs(10),
             max_in_flight_epochs: 4,
             max_staged_bytes: 512 * 1024 * 1024,
+            max_uncommitted_epochs: 1024,
         }
     }
 }
@@ -586,7 +591,9 @@ impl CheckpointCoordinator {
             backend,
             sinks,
             Arc::clone(&self.coordinated_commit_floor),
-        );
+        )
+        .with_metrics(self.prom.clone())
+        .with_max_uncommitted_epochs(self.config.max_uncommitted_epochs);
         #[cfg(feature = "cluster")]
         let committer = committer.with_cluster_controller(self.cluster_controller.clone());
         Some(committer)
