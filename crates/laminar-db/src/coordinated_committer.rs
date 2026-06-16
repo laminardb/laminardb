@@ -77,9 +77,11 @@ impl CoordinatedCommitter {
     /// fails stops at its cursor while others proceed; the first error is returned.
     pub(crate) async fn commit_ready(&mut self) -> Result<(), DbError> {
         // Only the designated committer (the leader) commits, so writers never
-        // race on the shared catalog.
+        // race on the shared catalog. Drop the seed so a regained leadership
+        // re-reads the catalog cursor instead of resuming from a stale one.
         #[cfg(feature = "cluster")]
         if self.controller.as_ref().is_some_and(|c| !c.is_leader()) {
+            self.seeded = false;
             return Ok(());
         }
 
