@@ -50,6 +50,7 @@ pub(crate) struct SinkTaskConfig {
     pub sink_id: Arc<str>,
     pub connector: Box<dyn SinkConnector>,
     pub exactly_once: bool,
+    pub coordinated_commit: bool,
     pub channel_capacity: usize,
     pub flush_interval: Duration,
     pub write_timeout: Duration,
@@ -98,6 +99,7 @@ pub(crate) struct SinkTaskHandle {
     sink_id: Arc<str>,
     tx: SinkCommandTx,
     exactly_once: bool,
+    coordinated_commit: bool,
     // `close()` extracts the handle under the lock then awaits outside it — lock never spans `.await`.
     #[allow(dead_code)]
     task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
@@ -120,6 +122,7 @@ impl SinkTaskHandle {
             sink_id,
             connector,
             exactly_once,
+            coordinated_commit,
             channel_capacity,
             flush_interval,
             write_timeout,
@@ -144,6 +147,7 @@ impl SinkTaskHandle {
             sink_id,
             tx,
             exactly_once,
+            coordinated_commit,
             task: Arc::new(parking_lot::Mutex::new(Some(handle))),
             event_tx,
         }
@@ -267,6 +271,10 @@ impl SinkTaskHandle {
 
     pub fn exactly_once(&self) -> bool {
         self.exactly_once
+    }
+
+    pub fn coordinated_commit(&self) -> bool {
+        self.coordinated_commit
     }
 }
 
@@ -516,6 +524,7 @@ mod tests {
             sink_id: Arc::from(name),
             connector,
             exactly_once: false,
+            coordinated_commit: false,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout,

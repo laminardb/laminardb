@@ -256,6 +256,7 @@ pub(crate) struct RegisteredSink {
     pub name: String,
     pub handle: crate::sink_task::SinkTaskHandle,
     pub exactly_once: bool,
+    pub coordinated_commit: bool,
 }
 
 /// Orchestrates the checkpoint lifecycle across sources, sinks, and operator state.
@@ -294,6 +295,11 @@ pub struct CheckpointCoordinator {
     // Empty in single-instance mode (the partial is a durability marker only).
     #[allow(clippy::disallowed_types)] // matches the graph snapshot shape
     pending_vnode_states: StagedVnodeStates,
+    // Per-sink commit descriptors from `pre_commit` for the in-flight checkpoint,
+    // persisted to the state backend in `write_vnode_partials`. Only coordinated
+    // sinks contribute; empty otherwise.
+    #[allow(clippy::disallowed_types)]
+    pending_sink_descriptors: std::collections::HashMap<String, Vec<u8>>,
     // Bases for reference partials. Bytes are refcounted; demoted slices hold a cold marker.
     #[allow(clippy::disallowed_types)]
     last_vnode_uploads:
@@ -366,6 +372,7 @@ impl CheckpointCoordinator {
             gate_vnode_set: Vec::new(),
             rotation_epoch_floor: 0,
             pending_vnode_states: std::collections::HashMap::new(),
+            pending_sink_descriptors: std::collections::HashMap::new(),
             last_vnode_uploads: std::collections::HashMap::new(),
             #[cfg(feature = "state-tier")]
             state_tier: None,
@@ -539,11 +546,13 @@ impl CheckpointCoordinator {
         name: impl Into<String>,
         handle: crate::sink_task::SinkTaskHandle,
         exactly_once: bool,
+        coordinated_commit: bool,
     ) {
         self.sinks.push(RegisteredSink {
             name: name.into(),
             handle,
             exactly_once,
+            coordinated_commit,
         });
         self.cached_sorted_sink_names = None;
     }
@@ -626,7 +635,11 @@ impl CheckpointCoordinator {
     }
 
     /// Pre-commit all exactly-once sinks (phase 1), bounded by `pre_commit_timeout`.
-    async fn pre_commit_sinks(&self, epoch: u64) -> Result<(), DbError> {
+    /// Returns the per-sink commit descriptors from coordinated-commit sinks.
+    async fn pre_commit_sinks(
+        &self,
+        epoch: u64,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, DbError> {
         let timeout_dur = self.config.pre_commit_timeout;
         let start = std::time::Instant::now();
 
@@ -647,19 +660,22 @@ impl CheckpointCoordinator {
         result
     }
 
-    /// Inner pre-commit loop (no timeout). Fires all exactly-once sinks concurrently.
-    async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
+    /// Inner pre-commit loop (no timeout). Fires all exactly-once sinks concurrently
+    /// and collects commit descriptors from coordinated-commit sinks.
+    async fn pre_commit_sinks_inner(
+        &self,
+        epoch: u64,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, DbError> {
         let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
             let handle = sink.handle.clone();
             let name = sink.name.clone();
+            let coordinated = sink.coordinated_commit;
             async move {
-                let result = handle.pre_commit(epoch).await;
-                match result {
-                    // The commit descriptor is consumed by the coordinated-commit
-                    // path (wired in a later commit); per-writer sinks return None.
-                    Ok(_descriptor) => {
+                match handle.pre_commit(epoch).await {
+                    Ok(descriptor) => {
                         debug!(sink = %name, epoch, "sink pre-committed");
-                        Ok(())
+                        // Only coordinated sinks contribute a descriptor for the committer.
+                        Ok(descriptor.filter(|_| coordinated).map(|d| (name, d)))
                     }
                     Err(e) => Err(DbError::Checkpoint(format!(
                         "sink '{name}' pre-commit failed: {e}"
@@ -667,7 +683,8 @@ impl CheckpointCoordinator {
                 }
             }
         });
-        futures::future::try_join_all(futures).await.map(|_| ())
+        let collected = futures::future::try_join_all(futures).await?;
+        Ok(collected.into_iter().flatten().collect())
     }
 
     /// Commit each exactly-once sink in its own task, bounded by `commit_timeout`.
@@ -748,6 +765,60 @@ impl CheckpointCoordinator {
         }
     }
 
+    /// This coordinator's node id, used to namespace commit descriptors.
+    fn self_node_id(&self) -> u64 {
+        #[cfg(feature = "cluster")]
+        if let Some(cc) = self.cluster_controller.as_ref() {
+            return cc.instance_id().0;
+        }
+        0
+    }
+
+    /// Commit-descriptor object key for `(node, sink)` within an epoch.
+    fn descriptor_key(node_id: u64, sink: &str) -> String {
+        format!("node={node_id}/sink={sink}")
+    }
+
+    /// Commit-descriptor keys the gate must observe before sealing this node's
+    /// epoch. Other nodes' descriptors are covered transitively: each node
+    /// writes its descriptors before its vnode partials, so the partial gate
+    /// implies them.
+    fn self_descriptor_keys(&self) -> Vec<String> {
+        let node = self.self_node_id();
+        self.sinks
+            .iter()
+            .filter(|s| s.coordinated_commit)
+            .map(|s| Self::descriptor_key(node, &s.name))
+            .collect()
+    }
+
+    /// Persist this epoch's coordinated-commit descriptors to the state backend.
+    async fn persist_sink_descriptors(
+        &self,
+        backend: &Arc<dyn StateBackend>,
+        epoch: u64,
+        descriptors: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Result<(), DbError> {
+        let node = self.self_node_id();
+        for (sink, descriptor) in descriptors {
+            backend
+                .write_commit_descriptor(
+                    epoch,
+                    &Self::descriptor_key(node, sink),
+                    self.assignment_version,
+                    bytes::Bytes::from(descriptor.clone()),
+                )
+                .await
+                .map_err(|e| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6024] commit descriptor write failed \
+                         (sink={sink}, epoch={epoch}): {e}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Write each owned vnode's `partial.bin` to seal the durability gate.
     ///
     /// Unchanged vnodes emit a reference partial; changed vnodes do a full upload. References
@@ -759,9 +830,23 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
     ) -> Result<(), DbError> {
+        // Take the staged descriptors first (clears them for the next epoch).
+        let descriptors = std::mem::take(&mut self.pending_sink_descriptors);
         let Some(ref backend) = self.state_backend else {
+            // A coordinated-commit sink without durable descriptor storage would
+            // lose its committables — fail the epoch rather than drop them.
+            if !descriptors.is_empty() {
+                return Err(DbError::Checkpoint(
+                    "coordinated-commit sink produced descriptors but no state \
+                     backend is configured to persist them".into(),
+                ));
+            }
             return Ok(());
         };
+        // Persist commit descriptors before partials so the partial gate
+        // transitively implies their durability across all nodes.
+        self.persist_sink_descriptors(backend, epoch, &descriptors)
+            .await?;
         if self.vnode_set.is_empty() {
             return Ok(());
         }
@@ -879,7 +964,9 @@ impl CheckpointCoordinator {
         let Some(ref backend) = self.state_backend else {
             return Ok(());
         };
-        if self.gate_vnode_set.is_empty() {
+        // Commit descriptors join the same `_COMMIT` seal as vnode partials.
+        let required_descriptors = self.self_descriptor_keys();
+        if self.gate_vnode_set.is_empty() && required_descriptors.is_empty() {
             return Ok(());
         }
 
@@ -895,7 +982,7 @@ impl CheckpointCoordinator {
                 ));
             }
             match backend
-                .epoch_complete(epoch, &self.gate_vnode_set, &[])
+                .epoch_complete(epoch, &self.gate_vnode_set, &required_descriptors)
                 .await
             {
                 Ok(true) => return Ok(()),
@@ -968,6 +1055,7 @@ impl CheckpointCoordinator {
         }
         self.begin_next_epoch_bounded().await;
         self.pending_vnode_states.clear();
+        self.pending_sink_descriptors.clear();
         CheckpointResult {
             success: false,
             checkpoint_id,
@@ -1787,9 +1875,12 @@ impl CheckpointCoordinator {
         } = request;
 
         self.phase = CheckpointPhase::PreCommitting;
-        if let Err(e) = self.pre_commit_sinks(epoch).await {
-            self.pending_vnode_states.clear();
-            return Err(e);
+        match self.pre_commit_sinks(epoch).await {
+            Ok(descriptors) => self.pending_sink_descriptors = descriptors,
+            Err(e) => {
+                self.pending_vnode_states.clear();
+                return Err(e);
+            }
         }
 
         let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
@@ -1891,16 +1982,19 @@ impl CheckpointCoordinator {
         let _ = quorum;
 
         self.phase = CheckpointPhase::PreCommitting;
-        if let Err(e) = self.pre_commit_sinks(epoch).await {
-            error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
-            return Ok(self
-                .fail_epoch(
-                    checkpoint_id,
-                    epoch,
-                    start,
-                    format!("pre-commit failed: {e}"),
-                )
-                .await);
+        match self.pre_commit_sinks(epoch).await {
+            Ok(descriptors) => self.pending_sink_descriptors = descriptors,
+            Err(e) => {
+                error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
+                return Ok(self
+                    .fail_epoch(
+                        checkpoint_id,
+                        epoch,
+                        start,
+                        format!("pre-commit failed: {e}"),
+                    )
+                    .await);
+            }
         }
 
         let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
@@ -4139,12 +4233,13 @@ mod tests {
             sink_id: Arc::from("failing-sink"),
             connector: Box::new(sink),
             exactly_once: true,
+            coordinated_commit: false,
             channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
             flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_secs(5),
             event_tx,
         });
-        coord.register_sink("failing-sink", handle, true);
+        coord.register_sink("failing-sink", handle, true, false);
 
         coord.begin_initial_epoch().await.unwrap();
 
@@ -4254,12 +4349,13 @@ mod tests {
             sink_id: Arc::from("stuck-sink"),
             connector: Box::new(sink),
             exactly_once: true,
+            coordinated_commit: false,
             channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
             flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_secs(5),
             event_tx,
         });
-        coord.register_sink("stuck-sink", handle.clone(), true);
+        coord.register_sink("stuck-sink", handle.clone(), true, false);
         coord.begin_initial_epoch().await.unwrap();
 
         // Poison the epoch with a failing write — only a poisoned sink
@@ -4289,6 +4385,102 @@ mod tests {
                 .is_some_and(|e| e.contains("pre-commit failed")),
             "checkpoint result should reflect pre-commit failure: got {:?}",
             result.error
+        );
+    }
+
+    /// A sink that declares `coordinated_commit` and returns a descriptor.
+    struct CoordinatedMockSink {
+        schema: arrow::datatypes::SchemaRef,
+        descriptor: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl laminar_connectors::connector::SinkConnector for CoordinatedMockSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &arrow::array::RecordBatch,
+        ) -> Result<
+            laminar_connectors::connector::WriteResult,
+            laminar_connectors::error::ConnectorError,
+        > {
+            Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+        }
+
+        async fn pre_commit(
+            &mut self,
+            _epoch: u64,
+        ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
+            Ok(Some(self.descriptor.clone()))
+        }
+
+        async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+            laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
+                .with_exactly_once()
+                .with_two_phase_commit()
+                .with_coordinated_commit()
+        }
+    }
+
+    /// A coordinated sink's `pre_commit` descriptor is persisted to the state
+    /// backend and required by the durability gate before the epoch seals.
+    #[tokio::test]
+    async fn coordinated_sink_descriptor_persisted_and_gated() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use laminar_core::state::{InProcessBackend, StateBackend};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+        let backend = Arc::new(InProcessBackend::new(2));
+        coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "ice".into(),
+            sink_id: Arc::from("ice"),
+            connector: Box::new(CoordinatedMockSink {
+                schema,
+                descriptor: b"datafiles".to_vec(),
+            }),
+            exactly_once: true,
+            coordinated_commit: true,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+            write_timeout: Duration::from_secs(5),
+            event_tx,
+        });
+        coord.register_sink("ice", handle, true, true);
+        coord.begin_initial_epoch().await.unwrap();
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "checkpoint failed: {:?}", result.error);
+
+        let descs = backend.read_commit_descriptors(result.epoch).await.unwrap();
+        assert_eq!(descs, vec![("node=0/sink=ice".to_string(), b"datafiles".to_vec().into())]);
+        assert_eq!(
+            backend.latest_committed_epoch().await.unwrap(),
+            Some(result.epoch),
+            "epoch must seal once the descriptor is durable"
         );
     }
 }

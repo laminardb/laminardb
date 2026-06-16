@@ -905,6 +905,7 @@ impl LaminarDB {
                     sink_id,
                     connector: sink,
                     exactly_once: caps.exactly_once,
+                    coordinated_commit: caps.coordinated_commit,
                     channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
                     flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
                     write_timeout,
@@ -941,8 +942,12 @@ impl LaminarDB {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 for (name, handle, _, _, _) in &sinks {
-                    let exactly_once = handle.exactly_once();
-                    coord.register_sink(name.clone(), handle.clone(), exactly_once);
+                    coord.register_sink(
+                        name.clone(),
+                        handle.clone(),
+                        handle.exactly_once(),
+                        handle.coordinated_commit(),
+                    );
                 }
             }
         }
