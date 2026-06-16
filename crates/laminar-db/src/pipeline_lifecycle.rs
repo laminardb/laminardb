@@ -950,7 +950,10 @@ impl LaminarDB {
                             handle.coordinated_commit(),
                         );
                     }
-                    (coord.coordinated_committer(), coord.committer_poll_interval())
+                    (
+                        coord.coordinated_committer(),
+                        coord.committer_poll_interval(),
+                    )
                 }
                 None => (None, std::time::Duration::from_secs(1)),
             }
@@ -966,7 +969,10 @@ impl LaminarDB {
                 let mut tick = tokio::time::interval(committer_poll);
                 loop {
                     tick.tick().await;
-                    if matches!(DbState::load(&state), DbState::Stopped | DbState::ShuttingDown) {
+                    if matches!(
+                        DbState::load(&state),
+                        DbState::Stopped | DbState::ShuttingDown
+                    ) {
                         break;
                     }
                     if let Err(e) = committer.commit_ready().await {

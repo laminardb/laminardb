@@ -171,9 +171,13 @@ impl CoordinatedCommitter {
     ) -> Result<(), DbError> {
         let mut batch: Vec<Vec<u8>> = Vec::new();
         for &epoch in sealed {
-            let descriptors = self.backend.read_commit_descriptors(epoch).await.map_err(|e| {
-                DbError::Checkpoint(format!("committer: read descriptors epoch {epoch}: {e}"))
-            })?;
+            let descriptors = self
+                .backend
+                .read_commit_descriptors(epoch)
+                .await
+                .map_err(|e| {
+                    DbError::Checkpoint(format!("committer: read descriptors epoch {epoch}: {e}"))
+                })?;
             batch.extend(
                 descriptors
                     .into_iter()
@@ -225,7 +229,10 @@ mod tests {
         ) -> Result<(), ConnectorError> {
             Ok(())
         }
-        async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
             Ok(WriteResult::new(0, 0))
         }
         fn schema(&self) -> SchemaRef {
@@ -287,7 +294,12 @@ mod tests {
 
     async fn seal(backend: &InProcessBackend, epoch: u64, descriptor: &[u8]) {
         backend
-            .write_commit_descriptor(epoch, "node=0/sink=ice", 0, Bytes::copy_from_slice(descriptor))
+            .write_commit_descriptor(
+                epoch,
+                "node=0/sink=ice",
+                0,
+                Bytes::copy_from_slice(descriptor),
+            )
             .await
             .unwrap();
         let key = ["node=0/sink=ice".to_string()];

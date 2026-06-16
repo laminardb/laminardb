@@ -1209,14 +1209,14 @@ mod minio {
         let node2 = ObjectStoreBackend::new(Arc::clone(&store), "2".to_string(), 4);
 
         let full = [0u32, 1, 2, 3];
-        let required = [
-            "node=1/sink=s".to_string(),
-            "node=2/sink=s".to_string(),
-        ];
+        let required = ["node=1/sink=s".to_string(), "node=2/sink=s".to_string()];
 
         // Node 1 writes its vnode slice and its commit descriptor.
         for v in [0u32, 1] {
-            node1.write_partial(v, 1, 0, Bytes::from_static(b"a")).await.unwrap();
+            node1
+                .write_partial(v, 1, 0, Bytes::from_static(b"a"))
+                .await
+                .unwrap();
         }
         node1
             .write_commit_descriptor(1, "node=1/sink=s", 0, Bytes::from_static(b"d1"))
@@ -1228,7 +1228,10 @@ mod minio {
 
         // Node 2 writes its slice and descriptor to the same bucket.
         for v in [2u32, 3] {
-            node2.write_partial(v, 1, 0, Bytes::from_static(b"b")).await.unwrap();
+            node2
+                .write_partial(v, 1, 0, Bytes::from_static(b"b"))
+                .await
+                .unwrap();
         }
         node2
             .write_commit_descriptor(1, "node=2/sink=s", 0, Bytes::from_static(b"d2"))

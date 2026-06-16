@@ -23,10 +23,18 @@ fn schema() -> SchemaRef {
 }
 
 fn batch(ids: std::ops::Range<i64>) -> RecordBatch {
-    RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ids.collect::<Vec<_>>()))]).unwrap()
+    RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(Int64Array::from(ids.collect::<Vec<_>>()))],
+    )
+    .unwrap()
 }
 
-async fn open_writer(path: &str, writer_id: &str, storage: &HashMap<String, String>) -> DeltaLakeSink {
+async fn open_writer(
+    path: &str,
+    writer_id: &str,
+    storage: &HashMap<String, String>,
+) -> DeltaLakeSink {
     let mut cfg = DeltaLakeSinkConfig::new(path);
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce; // append is the default mode
     cfg.writer_id = writer_id.to_string();
@@ -40,7 +48,9 @@ async fn open_writer(path: &str, writer_id: &str, storage: &HashMap<String, Stri
 
 async fn count_rows(path: &str, storage: HashMap<String, String>) -> usize {
     let ctx = datafusion::prelude::SessionContext::new();
-    register_delta_table(&ctx, "t", path, storage).await.unwrap();
+    register_delta_table(&ctx, "t", path, storage)
+        .await
+        .unwrap();
     ctx.sql("SELECT id FROM t")
         .await
         .unwrap()
@@ -69,7 +79,10 @@ async fn designated_committer_one_commit_from_many_writers() {
         .start()
         .await
         .expect("start MinIO container");
-    let port = container.get_host_port_ipv4(9000.tcp()).await.expect("MinIO host port");
+    let port = container
+        .get_host_port_ipv4(9000.tcp())
+        .await
+        .expect("MinIO host port");
 
     let mut storage = HashMap::new();
     for (k, v) in [
@@ -81,21 +94,31 @@ async fn designated_committer_one_commit_from_many_writers() {
     ] {
         storage.insert(k.to_string(), v.to_string());
     }
-    storage.insert("aws_endpoint".to_string(), format!("http://127.0.0.1:{port}"));
+    storage.insert(
+        "aws_endpoint".to_string(),
+        format!("http://127.0.0.1:{port}"),
+    );
 
     let path = "s3://warehouse/events";
 
     // Pre-create the empty table so each writer's RecordBatchWriter has a schema.
-    laminar_connectors::lakehouse::delta_io::open_or_create_table(path, storage.clone(), Some(&schema()))
-        .await
-        .expect("create delta table");
+    laminar_connectors::lakehouse::delta_io::open_or_create_table(
+        path,
+        storage.clone(),
+        Some(&schema()),
+    )
+    .await
+    .expect("create delta table");
 
     // Three writers, each writing distinct rows; collect their descriptors.
     let mut descriptors = Vec::new();
     for w in 0..3i64 {
         let mut writer = open_writer(path, &format!("w{w}"), &storage).await;
         writer.begin_epoch(1).await.unwrap();
-        writer.write_batch(&batch(w * 10..w * 10 + 10)).await.unwrap();
+        writer
+            .write_batch(&batch(w * 10..w * 10 + 10))
+            .await
+            .unwrap();
         let descriptor = writer
             .pre_commit(1)
             .await
@@ -107,7 +130,10 @@ async fn designated_committer_one_commit_from_many_writers() {
 
     // One designated commit for all writers' files.
     let committer = open_writer(path, "committer", &storage).await;
-    committer.commit_aggregated(1, descriptors.clone()).await.unwrap();
+    committer
+        .commit_aggregated(1, descriptors.clone())
+        .await
+        .unwrap();
     assert_eq!(count_rows(path, storage.clone()).await, 30);
 
     // Re-commit the same epoch — idempotent, no duplicate rows.

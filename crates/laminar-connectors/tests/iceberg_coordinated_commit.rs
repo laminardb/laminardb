@@ -45,7 +45,9 @@ async fn open_sink(table: &str, writer_id: &str) -> IcebergSink {
     let connector_config = config(table, writer_id);
     let sink_config = IcebergSinkConfig::from_config(&connector_config).unwrap();
     let mut sink = IcebergSink::new(sink_config, None);
-    sink.open(&connector_config).await.expect("open iceberg sink");
+    sink.open(&connector_config)
+        .await
+        .expect("open iceberg sink");
     sink
 }
 
@@ -53,9 +55,13 @@ async fn open_sink(table: &str, writer_id: &str) -> IcebergSink {
 async fn inspect(table: &str) -> (usize, usize) {
     let cfg = IcebergSinkConfig::from_config(&config(table, "inspector")).unwrap();
     let catalog = iceberg_io::build_catalog(&cfg.catalog).await.unwrap();
-    let t = iceberg_io::load_table(catalog.as_ref(), &cfg.catalog.namespace, &cfg.catalog.table_name)
-        .await
-        .unwrap();
+    let t = iceberg_io::load_table(
+        catalog.as_ref(),
+        &cfg.catalog.namespace,
+        &cfg.catalog.table_name,
+    )
+    .await
+    .unwrap();
     let snapshots = t.metadata().snapshots().count();
     let rows: usize = iceberg_io::scan_table(&t, None, &[])
         .await
@@ -81,8 +87,7 @@ async fn designated_committer_one_snapshot_from_many_writers() {
         let mut writer = open_sink(&table, &format!("w{w}")).await;
         writer.begin_epoch(1).await.unwrap();
         let ids: Vec<i64> = (w * 10..w * 10 + 10).collect();
-        let batch =
-            RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ids))]).unwrap();
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ids))]).unwrap();
         writer.write_batch(&batch).await.unwrap();
         let descriptor = writer
             .pre_commit(1)
@@ -95,7 +100,10 @@ async fn designated_committer_one_snapshot_from_many_writers() {
 
     // One designated commit for all writers' files.
     let mut committer = open_sink(&table, "committer").await;
-    committer.commit_aggregated(1, descriptors.clone()).await.unwrap();
+    committer
+        .commit_aggregated(1, descriptors.clone())
+        .await
+        .unwrap();
 
     let (snapshots, rows) = inspect(&table).await;
     assert_eq!(snapshots, 1, "all writers must land in a single snapshot");

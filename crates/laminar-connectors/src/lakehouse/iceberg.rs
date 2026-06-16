@@ -427,10 +427,13 @@ impl SinkConnector for IcebergSink {
             if data_files.is_empty() {
                 return Ok(None);
             }
-            let table = self.table.as_ref().ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open".into(),
-                actual: "table not loaded".into(),
-            })?;
+            let table = self
+                .table
+                .as_ref()
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "open".into(),
+                    actual: "table not loaded".into(),
+                })?;
             return Ok(Some(super::iceberg_io::encode_commit_descriptor(
                 table, data_files,
             )?));
@@ -467,9 +470,7 @@ impl SinkConnector for IcebergSink {
     }
 
     #[cfg(feature = "iceberg")]
-    fn as_coordinated_committer(
-        &self,
-    ) -> Option<&dyn crate::connector::CoordinatedCommitter> {
+    fn as_coordinated_committer(&self) -> Option<&dyn crate::connector::CoordinatedCommitter> {
         Some(self)
     }
 
@@ -522,7 +523,11 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
             epoch,
         )
         .await?;
-        info!(epoch, writers = descriptors.len(), "iceberg coordinated commit");
+        info!(
+            epoch,
+            writers = descriptors.len(),
+            "iceberg coordinated commit"
+        );
         Ok(())
     }
 
