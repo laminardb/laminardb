@@ -5,6 +5,7 @@
 //! drives one external commit per sink. Sequential and ascending per sink; a
 //! failed commit leaves the cursor so the next pass retries.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -19,23 +20,48 @@ pub(crate) struct CoordinatedCommitter {
     backend: Arc<dyn StateBackend>,
     sinks: Vec<(String, SinkTaskHandle)>,
     committed_through: FxHashMap<String, u64>,
+    /// Lowest uncommitted epoch, published for the coordinator's prune clamp.
+    floor: Arc<AtomicU64>,
+    #[cfg(feature = "cluster")]
+    controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
 }
 
 impl CoordinatedCommitter {
     pub(crate) fn new(
         backend: Arc<dyn StateBackend>,
         sinks: Vec<(String, SinkTaskHandle)>,
+        floor: Arc<AtomicU64>,
     ) -> Self {
         Self {
             backend,
             sinks,
             committed_through: FxHashMap::default(),
+            floor,
+            #[cfg(feature = "cluster")]
+            controller: None,
         }
+    }
+
+    /// Restrict committing to the cluster leader (the single designated committer).
+    #[cfg(feature = "cluster")]
+    pub(crate) fn with_cluster_controller(
+        mut self,
+        controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    ) -> Self {
+        self.controller = controller;
+        self
     }
 
     /// Commit every sealed-but-uncommitted epoch. Per-sink isolated: a sink that
     /// fails stops at its cursor while others proceed; the first error is returned.
     pub(crate) async fn commit_ready(&mut self) -> Result<(), DbError> {
+        // Only the designated committer (the leader) commits, so writers never
+        // race on the shared catalog.
+        #[cfg(feature = "cluster")]
+        if self.controller.as_ref().is_some_and(|c| !c.is_leader()) {
+            return Ok(());
+        }
+
         let high = self
             .backend
             .latest_committed_epoch()
@@ -62,6 +88,18 @@ impl CoordinatedCommitter {
                 self.committed_through.insert(name.clone(), cursor);
             }
         }
+
+        // Publish the prune floor: the lowest epoch still uncommitted by any
+        // sink (committed_through + 1), so the coordinator won't GC descriptors
+        // the committer still needs.
+        let min_committed = self
+            .sinks
+            .iter()
+            .map(|(name, _)| self.committed_through.get(name).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        self.floor.store(min_committed + 1, Ordering::Release);
+
         first_err.map_or(Ok(()), Err)
     }
 
@@ -206,6 +244,7 @@ mod tests {
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
             vec![("ice".into(), handle)],
+            Arc::new(AtomicU64::new(0)),
         );
 
         committer.commit_ready().await.unwrap();
@@ -237,6 +276,7 @@ mod tests {
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
             vec![("ice".into(), handle)],
+            Arc::new(AtomicU64::new(0)),
         );
 
         committer.commit_ready().await.unwrap();

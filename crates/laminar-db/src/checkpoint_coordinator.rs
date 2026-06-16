@@ -300,6 +300,14 @@ pub struct CheckpointCoordinator {
     // sinks contribute; empty otherwise.
     #[allow(clippy::disallowed_types)]
     pending_sink_descriptors: std::collections::HashMap<String, Vec<u8>>,
+    // Descriptor keys actually written this epoch — the gate requires exactly
+    // these (not all coordinated sinks), so an idle sink doesn't stall the seal.
+    epoch_descriptor_keys: Vec<String>,
+    // Lowest epoch the designated committer has NOT yet externally committed;
+    // prune must not delete descriptors at or above it. Shared with the
+    // committer task, which advances it. Starts at 0 (prune nothing until the
+    // committer confirms) when coordinated sinks exist.
+    coordinated_commit_floor: Arc<std::sync::atomic::AtomicU64>,
     // Bases for reference partials. Bytes are refcounted; demoted slices hold a cold marker.
     #[allow(clippy::disallowed_types)]
     last_vnode_uploads:
@@ -373,6 +381,8 @@ impl CheckpointCoordinator {
             rotation_epoch_floor: 0,
             pending_vnode_states: std::collections::HashMap::new(),
             pending_sink_descriptors: std::collections::HashMap::new(),
+            epoch_descriptor_keys: Vec::new(),
+            coordinated_commit_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_vnode_uploads: std::collections::HashMap::new(),
             #[cfg(feature = "state-tier")]
             state_tier: None,
@@ -572,9 +582,14 @@ impl CheckpointCoordinator {
         if sinks.is_empty() {
             return None;
         }
-        Some(crate::coordinated_committer::CoordinatedCommitter::new(
-            backend, sinks,
-        ))
+        let committer = crate::coordinated_committer::CoordinatedCommitter::new(
+            backend,
+            sinks,
+            Arc::clone(&self.coordinated_commit_floor),
+        );
+        #[cfg(feature = "cluster")]
+        let committer = committer.with_cluster_controller(self.cluster_controller.clone());
+        Some(committer)
     }
 
     /// Begin the initial epoch on all exactly-once sinks.
@@ -800,17 +815,12 @@ impl CheckpointCoordinator {
         format!("node={node_id}/sink={sink}")
     }
 
-    /// Commit-descriptor keys the gate must observe before sealing this node's
-    /// epoch. Other nodes' descriptors are covered transitively: each node
-    /// writes its descriptors before its vnode partials, so the partial gate
-    /// implies them.
+    /// Commit-descriptor keys this node produced this epoch — the gate requires
+    /// exactly these. Other nodes' descriptors are covered transitively: each
+    /// node writes its descriptors before its vnode partials, so the partial
+    /// gate implies them.
     fn self_descriptor_keys(&self) -> Vec<String> {
-        let node = self.self_node_id();
-        self.sinks
-            .iter()
-            .filter(|s| s.coordinated_commit)
-            .map(|s| Self::descriptor_key(node, &s.name))
-            .collect()
+        self.epoch_descriptor_keys.clone()
     }
 
     /// Take the staged commit descriptors and persist them to the state backend.
@@ -818,6 +828,13 @@ impl CheckpointCoordinator {
     /// is configured (rather than silently dropping committables).
     async fn take_and_persist_descriptors(&mut self, epoch: u64) -> Result<(), DbError> {
         let descriptors = std::mem::take(&mut self.pending_sink_descriptors);
+        // The gate requires exactly the descriptors produced this epoch — an
+        // idle sink contributes none and must not stall the seal.
+        let node = self.self_node_id();
+        self.epoch_descriptor_keys = descriptors
+            .keys()
+            .map(|sink| Self::descriptor_key(node, sink))
+            .collect();
         if descriptors.is_empty() {
             return Ok(());
         }
@@ -1085,6 +1102,7 @@ impl CheckpointCoordinator {
         self.begin_next_epoch_bounded().await;
         self.pending_vnode_states.clear();
         self.pending_sink_descriptors.clear();
+        self.epoch_descriptor_keys.clear();
         CheckpointResult {
             success: false,
             checkpoint_id,
@@ -2231,7 +2249,15 @@ impl CheckpointCoordinator {
 
         // Prune old partials/markers outside the retention window.
         if let Some(ref backend) = self.state_backend {
-            let horizon = epoch.saturating_sub(self.config.max_retained as u64);
+            let mut horizon = epoch.saturating_sub(self.config.max_retained as u64);
+            // Never prune descriptors the designated committer hasn't committed
+            // yet — hold the horizon at the commit floor for coordinated sinks.
+            if self.sinks.iter().any(|s| s.coordinated_commit) {
+                horizon = horizon.min(
+                    self.coordinated_commit_floor
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+            }
             if horizon > 0 {
                 if let Err(e) = backend.prune_before(horizon).await {
                     warn!(
@@ -4457,7 +4483,12 @@ mod tests {
             &mut self,
             _epoch: u64,
         ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
-            Ok(Some(self.descriptor.clone()))
+            // An empty descriptor models an idle epoch (no data produced).
+            if self.descriptor.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(self.descriptor.clone()))
+            }
         }
 
         async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
@@ -4474,6 +4505,49 @@ mod tests {
                 .with_two_phase_commit()
                 .with_coordinated_commit()
         }
+    }
+
+    /// An idle coordinated sink (no descriptor this epoch) must not stall the
+    /// gate — regression for the empty-epoch hang.
+    #[tokio::test]
+    async fn coordinated_sink_idle_epoch_still_seals() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use laminar_core::state::{InProcessBackend, StateBackend};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+        coord.set_state_backend(Arc::new(InProcessBackend::new(2)) as Arc<dyn StateBackend>);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let (event_tx, _rx) = laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
+            crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
+        );
+        let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "ice".into(),
+            sink_id: Arc::from("ice"),
+            connector: Box::new(CoordinatedMockSink {
+                schema,
+                descriptor: Vec::new(), // idle: pre_commit returns None
+            }),
+            exactly_once: true,
+            coordinated_commit: true,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+            write_timeout: Duration::from_secs(5),
+            event_tx,
+        });
+        coord.register_sink("ice", handle, true, true);
+        coord.begin_initial_epoch().await.unwrap();
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "idle coordinated epoch must seal, not hang: {:?}",
+            result.error
+        );
     }
 
     /// A coordinated sink's `pre_commit` descriptor is persisted to the state
