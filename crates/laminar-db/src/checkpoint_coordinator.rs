@@ -1442,7 +1442,11 @@ impl CheckpointCoordinator {
     fn initial_sink_commit_statuses(&self) -> HashMap<String, SinkCommitStatus> {
         self.sinks
             .iter()
-            .filter(|s| s.exactly_once)
+            // Coordinated sinks commit asynchronously via the designated committer
+            // (guarded by catalog idempotency), so they are never manifest-tracked
+            // — otherwise their Pending status would make recovery skip every
+            // checkpoint on nodes that don't run the per-sink commit.
+            .filter(|s| s.exactly_once && !s.coordinated_commit)
             .map(|s| (s.name.clone(), SinkCommitStatus::Pending))
             .collect()
     }
