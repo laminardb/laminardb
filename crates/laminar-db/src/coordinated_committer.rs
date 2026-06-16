@@ -1,9 +1,5 @@
-//! Decoupled designated committer for `coordinated_commit` sinks.
-//!
-//! Runs off the checkpoint barrier path: a pass reads each writer's commit
-//! descriptor for every sealed-but-uncommitted epoch from the state backend and
-//! drives one external commit per sink. Sequential and ascending per sink; a
-//! failed commit leaves the cursor so the next pass retries.
+//! Decoupled designated committer: off the barrier path, the leader reads each
+//! writer's descriptor for sealed epochs and runs one external commit per sink.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
