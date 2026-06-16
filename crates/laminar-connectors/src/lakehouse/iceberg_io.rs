@@ -166,22 +166,105 @@ pub fn current_snapshot_id(table: &Table) -> Option<i64> {
     table.metadata().current_snapshot().map(|s| s.snapshot_id())
 }
 
-/// Commits data files to an Iceberg table via a fast-append transaction.
-///
-/// When `epoch_metadata` is provided, also stores `writer_id` and `epoch`
-/// in table properties for exactly-once recovery. Both the data append
-/// and property update are committed atomically in a single transaction.
-///
-/// Returns the updated table with the new snapshot.
+/// Table property holding the highest epoch the designated committer sealed.
+const COORDINATED_EPOCH_PROP: &str = "laminardb.commit.epoch";
+
+/// One writer's data files, serialized for the designated committer.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CommitDescriptor {
+    version: u32,
+    /// Each entry is a `DataFile` serialized via `serialize_data_file_to_json`.
+    data_files: Vec<String>,
+}
+
+/// Serialize this writer's `data_files` into a commit descriptor for handoff to
+/// the designated committer. Uses `table`'s partition type and format version.
 ///
 /// # Errors
+/// Returns `ConnectorError::WriteError` if a data file cannot be serialized.
+pub fn encode_commit_descriptor(
+    table: &Table,
+    data_files: Vec<iceberg::spec::DataFile>,
+) -> Result<Vec<u8>, ConnectorError> {
+    let meta = table.metadata();
+    let partition_type = meta.default_partition_type().clone();
+    let format_version = meta.format_version();
+    let data_files = data_files
+        .into_iter()
+        .map(|df| iceberg::spec::serialize_data_file_to_json(df, &partition_type, format_version))
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| ConnectorError::WriteError(format!("serialize data file: {e}")))?;
+    serde_json::to_vec(&CommitDescriptor {
+        version: 1,
+        data_files,
+    })
+    .map_err(|e| ConnectorError::WriteError(format!("encode commit descriptor: {e}")))
+}
+
+/// Decode and flatten every writer's commit descriptor into one set of data
+/// files, ready for a single `fast_append`.
 ///
+/// # Errors
+/// Returns `ConnectorError::TransactionError` on a version mismatch or a
+/// malformed/incompatible descriptor.
+pub fn decode_commit_descriptors(
+    table: &Table,
+    descriptors: &[Vec<u8>],
+) -> Result<Vec<iceberg::spec::DataFile>, ConnectorError> {
+    let meta = table.metadata();
+    let partition_type = meta.default_partition_type().clone();
+    let spec_id = meta.default_partition_spec_id();
+    let schema = meta.current_schema().as_ref().clone();
+
+    let mut out = Vec::new();
+    for bytes in descriptors {
+        let descriptor: CommitDescriptor = serde_json::from_slice(bytes)
+            .map_err(|e| ConnectorError::TransactionError(format!("decode descriptor: {e}")))?;
+        if descriptor.version != 1 {
+            return Err(ConnectorError::TransactionError(format!(
+                "unsupported commit descriptor version {}",
+                descriptor.version
+            )));
+        }
+        for json in &descriptor.data_files {
+            out.push(
+                iceberg::spec::deserialize_data_file_from_json(
+                    json,
+                    spec_id,
+                    &partition_type,
+                    &schema,
+                )
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!("deserialize data file: {e}"))
+                })?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Highest epoch the designated committer has sealed, per table properties.
+#[must_use]
+pub fn coordinated_committed_epoch(table: &Table) -> Option<u64> {
+    table
+        .metadata()
+        .properties()
+        .get(COORDINATED_EPOCH_PROP)?
+        .parse()
+        .ok()
+}
+
+/// Append `data_files` and stamp the coordinated-commit epoch in one atomic
+/// transaction. The epoch property is the idempotency guard: a re-run after
+/// leader failover is skipped by the caller once the table reflects `epoch`.
+///
+/// # Errors
 /// Returns `ConnectorError::TransactionError` on commit failure.
-pub async fn commit_data_files(
+pub async fn commit_data_files_coordinated(
     table: &Table,
     catalog: &dyn Catalog,
     data_files: Vec<iceberg::spec::DataFile>,
-    epoch_metadata: Option<(&str, u64)>,
+    epoch: u64,
 ) -> Result<Table, ConnectorError> {
     let tx = Transaction::new(table);
     let tx: Transaction = tx
@@ -189,32 +272,16 @@ pub async fn commit_data_files(
         .add_data_files(data_files)
         .apply(tx)
         .map_err(|e| ConnectorError::TransactionError(format!("apply fast_append: {e}")))?;
-
-    // Chain epoch metadata into the same atomic transaction.
-    let tx = if let Some((writer_id, epoch)) = epoch_metadata {
-        let key = format!("laminardb.writer.{writer_id}.last_epoch");
-        tx.update_table_properties()
-            .set(key, epoch.to_string())
-            .apply(tx)
-            .map_err(|e| {
-                ConnectorError::TransactionError(format!("apply update_table_properties: {e}"))
-            })?
-    } else {
-        tx
-    };
-
+    let tx = tx
+        .update_table_properties()
+        .set(COORDINATED_EPOCH_PROP.to_string(), epoch.to_string())
+        .apply(tx)
+        .map_err(|e| {
+            ConnectorError::TransactionError(format!("apply update_table_properties: {e}"))
+        })?;
     tx.commit(catalog)
         .await
         .map_err(|e| ConnectorError::TransactionError(format!("commit: {e}")))
-}
-
-/// Reads the last committed epoch for a writer from Iceberg table properties.
-///
-/// Returns `None` if the writer has never committed to this table.
-#[must_use]
-pub fn get_last_committed_epoch(table: &Table, writer_id: &str) -> Option<u64> {
-    let key = format!("laminardb.writer.{writer_id}.last_epoch");
-    table.metadata().properties().get(&key)?.parse().ok()
 }
 
 /// Creates an Iceberg table (and namespace) if it does not already exist.
