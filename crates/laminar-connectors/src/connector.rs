@@ -217,6 +217,12 @@ pub struct SinkConnectorCapabilities {
     /// the connector back.
     pub preserves_pending_on_abandon: bool,
 
+    /// Whether the sink commits to a single shared log/catalog where concurrent
+    /// writers conflict. When set, the runtime collects each writer's
+    /// `pre_commit` descriptor and runs one commit on the leader via
+    /// [`CoordinatedCommitter`] instead of `commit_epoch` per node.
+    pub coordinated_commit: bool,
+
     /// Default per-call `write_batch` I/O timeout. Users can override via
     /// the `sink.write.timeout.ms` connector property.
     pub suggested_write_timeout: std::time::Duration,
@@ -236,6 +242,7 @@ impl SinkConnectorCapabilities {
             schema_evolution: false,
             partitioned: false,
             preserves_pending_on_abandon: false,
+            coordinated_commit: false,
             suggested_write_timeout,
         }
     }
@@ -288,6 +295,12 @@ impl SinkConnectorCapabilities {
     #[must_use]
     pub fn with_partitioned(mut self) -> Self {
         self.partitioned = true;
+        self
+    }
+    /// Declare a single shared commit target requiring a designated committer.
+    #[must_use]
+    pub fn with_coordinated_commit(mut self) -> Self {
+        self.coordinated_commit = true;
         self
     }
 }
@@ -462,10 +475,14 @@ pub trait SinkConnector: Send {
 
     /// Phase 1 of 2PC: flush + prepare, do NOT finalize the txn. The
     /// runtime persists the manifest between `pre_commit` and
-    /// `commit_epoch`; on failure it calls `rollback_epoch`. Default
-    /// delegates to `flush()`.
-    async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        self.flush().await
+    /// `commit_epoch`; on failure it calls `rollback_epoch`.
+    ///
+    /// Returns an opaque commit descriptor for `coordinated_commit` sinks (the
+    /// committables the designated committer will aggregate), else `None`.
+    /// Default delegates to `flush()` and returns `None`.
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
+        self.flush().await?;
+        Ok(None)
     }
 
     /// Phase 2 of 2PC: finalize the txn. Called after the manifest is
@@ -500,6 +517,27 @@ pub trait SinkConnector: Send {
     fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
         None
     }
+
+    /// Leader-side committer for `coordinated_commit` sinks; `None` otherwise.
+    fn as_coordinated_committer(&self) -> Option<&dyn CoordinatedCommitter> {
+        None
+    }
+}
+
+/// Leader-side commit for sinks that declare `coordinated_commit`.
+///
+/// The designated committer aggregates every writer's `pre_commit` descriptor
+/// for an epoch into one external commit. Must be idempotent: re-running with
+/// the same inputs after a leader failover is a no-op once the target already
+/// reflects the epoch.
+#[async_trait]
+pub trait CoordinatedCommitter: Send + Sync {
+    /// Commit `descriptors` (one per writer) for `epoch` as a single operation.
+    async fn commit_aggregated(
+        &self,
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+    ) -> Result<(), ConnectorError>;
 }
 
 #[cfg(test)]

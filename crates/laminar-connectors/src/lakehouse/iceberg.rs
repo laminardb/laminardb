@@ -456,16 +456,16 @@ impl SinkConnector for IcebergSink {
         Ok(())
     }
 
-    async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         if self.epoch_skipped {
-            return Ok(());
+            return Ok(None);
         }
 
         std::mem::swap(&mut self.staged_batches, &mut self.buffer);
         self.staged_rows = self.buffered_rows;
         self.clear_buffer();
 
-        Ok(())
+        Ok(None)
     }
 
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {

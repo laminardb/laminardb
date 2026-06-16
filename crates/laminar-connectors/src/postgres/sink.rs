@@ -821,7 +821,7 @@ impl SinkConnector for PostgresSink {
         Ok(())
     }
 
-    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         if epoch != self.current_epoch {
             return Err(ConnectorError::TransactionError(format!(
                 "epoch mismatch in pre_commit: expected {}, got {epoch}",
@@ -830,7 +830,7 @@ impl SinkConnector for PostgresSink {
         }
 
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let client = self
@@ -845,7 +845,7 @@ impl SinkConnector for PostgresSink {
                 info!(epoch, "epoch already committed in PostgreSQL, skipping");
                 self.buffer.clear();
                 self.buffered_rows = 0;
-                return Ok(());
+                return Ok(None);
             }
 
             // Co-transactional: data + epoch marker in one PG transaction.
@@ -888,7 +888,7 @@ impl SinkConnector for PostgresSink {
         self.last_flush = Instant::now();
 
         debug!(epoch, "PostgreSQL sink pre-committed");
-        Ok(())
+        Ok(None)
     }
 
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {

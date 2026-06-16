@@ -273,7 +273,7 @@ impl SinkConnector for FileSink {
         Ok(())
     }
 
-    async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         let is_bulk = self
             .config
             .as_ref()
@@ -347,7 +347,8 @@ impl SinkConnector for FileSink {
             Ok::<(), ConnectorError>(())
         })
         .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        Ok(None)
     }
 
     async fn commit_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {

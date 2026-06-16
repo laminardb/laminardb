@@ -241,12 +241,13 @@ impl SinkConnector for NatsSink {
         drain_acks(&mut self.pending_acks, &self.metrics, timeout).await
     }
 
-    async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         let timeout = self
             .config
             .as_ref()
             .map_or(Duration::from_secs(30), |c| c.ack_timeout);
-        drain_acks(&mut self.pending_acks, &self.metrics, timeout).await
+        drain_acks(&mut self.pending_acks, &self.metrics, timeout).await?;
+        Ok(None)
     }
 
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {

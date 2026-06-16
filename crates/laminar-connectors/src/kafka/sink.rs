@@ -757,7 +757,7 @@ impl SinkConnector for KafkaSink {
         Ok(())
     }
 
-    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         // Monotonic, not strict equality: the coordinator abandons
         // failed epochs (ids are never reused), so the epoch sealing
         // the currently open transaction may skip past the one
@@ -784,7 +784,7 @@ impl SinkConnector for KafkaSink {
         }
 
         debug!(epoch, "pre-committed epoch (flushed)");
-        Ok(())
+        Ok(None)
     }
 
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {

@@ -1275,12 +1275,12 @@ impl SinkConnector for DeltaLakeSink {
         Ok(())
     }
 
-    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         // Skip if already committed (exactly-once idempotency).
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
             && epoch <= self.last_committed_epoch
         {
-            return Ok(());
+            return Ok(None);
         }
 
         // Stage buffered data for commit. The actual Delta write happens in
@@ -1296,7 +1296,7 @@ impl SinkConnector for DeltaLakeSink {
         }
 
         debug!(epoch, "Delta Lake: pre-committed (batches staged)");
-        Ok(())
+        Ok(None)
     }
 
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {

@@ -655,7 +655,9 @@ impl CheckpointCoordinator {
             async move {
                 let result = handle.pre_commit(epoch).await;
                 match result {
-                    Ok(()) => {
+                    // The commit descriptor is consumed by the coordinated-commit
+                    // path (wired in a later commit); per-writer sinks return None.
+                    Ok(_descriptor) => {
                         debug!(sink = %name, epoch, "sink pre-committed");
                         Ok(())
                     }
@@ -4080,7 +4082,7 @@ mod tests {
         async fn pre_commit(
             &mut self,
             epoch: u64,
-        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
             Err(laminar_connectors::error::ConnectorError::TransactionError(
                 format!("synthetic pre_commit failure at epoch {epoch}"),
             ))
@@ -4198,7 +4200,7 @@ mod tests {
         async fn pre_commit(
             &mut self,
             _epoch: u64,
-        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
             Err(laminar_connectors::error::ConnectorError::TransactionError(
                 "synthetic pre_commit failure".into(),
             ))

@@ -70,7 +70,7 @@ pub(crate) enum SinkCommand {
     },
     PreCommit {
         epoch: u64,
-        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<Option<Vec<u8>>, ConnectorError>>,
     },
     CommitEpoch {
         epoch: u64,
@@ -205,8 +205,9 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("flush"))?
     }
 
-    /// 2PC phase 1: flush and prepare.
-    pub async fn pre_commit(&self, epoch: u64) -> Result<(), ConnectorError> {
+    /// 2PC phase 1: flush and prepare. Returns the connector's commit
+    /// descriptor for `coordinated_commit` sinks, else `None`.
+    pub async fn pre_commit(&self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::PreCommit { epoch, ack: ack_tx })
