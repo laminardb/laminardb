@@ -1,6 +1,8 @@
 //! [`InProcessBackend`] — non-durable [`StateBackend`] backed by an
 //! in-memory hashmap. Used for tests and embedded single-process runs.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -14,11 +16,9 @@ pub struct InProcessBackend {
     partials: RwLock<FxHashMap<(u32, u64), Bytes>>,
     /// `epoch -> key -> descriptor`, the in-memory analogue of `epoch=N/commit/`.
     descriptors: RwLock<FxHashMap<u64, FxHashMap<String, Bytes>>>,
-    /// Highest epoch for which [`epoch_complete`](StateBackend::epoch_complete)
-    /// observed every requested vnode present — the in-memory analogue of
-    /// the object-store `_COMMIT` marker, surfaced by
-    /// [`latest_committed_epoch`](StateBackend::latest_committed_epoch).
-    committed_high: RwLock<Option<u64>>,
+    /// Epochs sealed by [`epoch_complete`](StateBackend::epoch_complete) — the
+    /// in-memory analogue of the object-store `_COMMIT` markers.
+    sealed: RwLock<BTreeSet<u64>>,
     vnode_capacity: u32,
 }
 
@@ -29,7 +29,7 @@ impl InProcessBackend {
         Self {
             partials: RwLock::new(FxHashMap::default()),
             descriptors: RwLock::new(FxHashMap::default()),
-            committed_high: RwLock::new(None),
+            sealed: RwLock::new(BTreeSet::new()),
             vnode_capacity,
         }
     }
@@ -129,11 +129,13 @@ impl StateBackend for InProcessBackend {
                 }
             }
         }
-        // Every vnode is durable: this epoch is sealed. Record it as the
-        // committed high-water mark so rehydration can find it later.
-        let mut hi = self.committed_high.write();
-        *hi = Some(hi.map_or(epoch, |h| h.max(epoch)));
+        // Every vnode is durable: this epoch is sealed.
+        self.sealed.write().insert(epoch);
         Ok(true)
+    }
+
+    async fn is_epoch_sealed(&self, epoch: u64) -> Result<bool, StateBackendError> {
+        Ok(self.sealed.read().contains(&epoch))
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
@@ -143,11 +145,12 @@ impl StateBackend for InProcessBackend {
             .write()
             .retain(|&(_, epoch), _| epoch >= before);
         self.descriptors.write().retain(|&epoch, _| epoch >= before);
+        self.sealed.write().retain(|&epoch| epoch >= before);
         Ok(())
     }
 
     async fn latest_committed_epoch(&self) -> Result<Option<u64>, StateBackendError> {
-        Ok(*self.committed_high.read())
+        Ok(self.sealed.read().iter().next_back().copied())
     }
 }
 

@@ -938,18 +938,41 @@ impl LaminarDB {
             table_sources.push((name.clone(), source, mode));
         }
 
-        {
+        let coordinated_committer = {
             let mut guard = self.coordinator.lock().await;
-            if let Some(ref mut coord) = *guard {
-                for (name, handle, _, _, _) in &sinks {
-                    coord.register_sink(
-                        name.clone(),
-                        handle.clone(),
-                        handle.exactly_once(),
-                        handle.coordinated_commit(),
-                    );
+            match *guard {
+                Some(ref mut coord) => {
+                    for (name, handle, _, _, _) in &sinks {
+                        coord.register_sink(
+                            name.clone(),
+                            handle.clone(),
+                            handle.exactly_once(),
+                            handle.coordinated_commit(),
+                        );
+                    }
+                    coord.coordinated_committer()
                 }
+                None => None,
             }
+        };
+
+        // Decoupled designated committer: a poll loop off the barrier path that
+        // commits sealed epochs for coordinated-commit sinks. Spawned only when
+        // such sinks exist; stops on terminal pipeline state.
+        if let Some(mut committer) = coordinated_committer {
+            let state = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    if matches!(DbState::load(&state), DbState::Stopped | DbState::ShuttingDown) {
+                        break;
+                    }
+                    if let Err(e) = committer.commit_ready().await {
+                        tracing::warn!(error = %e, "coordinated committer pass failed; will retry");
+                    }
+                }
+            });
         }
 
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.

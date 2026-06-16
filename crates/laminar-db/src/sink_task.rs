@@ -77,6 +77,13 @@ pub(crate) enum SinkCommand {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
+    /// Designated-committer path: aggregate every writer's descriptor for the
+    /// epoch into one external commit (coordinated-commit sinks only).
+    CommitAggregated {
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
+    },
     /// `force = false` keeps a healthy sink's pending transactional output —
     /// sources don't rewind on a live abort so those rows must not be discarded.
     RollbackEpoch {
@@ -220,6 +227,26 @@ impl SinkTaskHandle {
         ack_rx
             .await
             .map_err(|_| self.ack_dropped_err("pre-commit"))?
+    }
+
+    /// Designated-committer commit of aggregated descriptors for `epoch`.
+    pub async fn commit_aggregated(
+        &self,
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+    ) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::oneshot();
+        self.tx
+            .send(SinkCommand::CommitAggregated {
+                epoch,
+                descriptors,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| self.closed_err())?;
+        ack_rx
+            .await
+            .map_err(|_| self.ack_dropped_err("commit-aggregated"))?
     }
 
     /// 2PC phase 2: finalize the transaction.
@@ -384,6 +411,20 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                             ))
                         } else {
                             inner.sink.commit_epoch(epoch).await
+                        };
+                        ack.send(result);
+                    }
+                    SinkCommand::CommitAggregated {
+                        epoch,
+                        descriptors,
+                        ack,
+                    } => {
+                        let result = match inner.sink.as_coordinated_committer() {
+                            Some(committer) => committer.commit_aggregated(epoch, descriptors).await,
+                            None => Err(ConnectorError::InvalidState {
+                                expected: "coordinated committer".into(),
+                                actual: format!("sink '{}' is not coordinated", inner.name),
+                            }),
                         };
                         ack.send(result);
                     }

@@ -289,6 +289,14 @@ impl StateBackend for ObjectStoreBackend {
         }
     }
 
+    async fn is_epoch_sealed(&self, epoch: u64) -> Result<bool, StateBackendError> {
+        match self.store.head(&Self::commit_path(epoch)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(StateBackendError::Io(e.to_string())),
+        }
+    }
+
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         use futures::stream::{self, StreamExt};
 

@@ -39,6 +39,7 @@ mod changelog_filter;
 pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
+mod coordinated_committer;
 mod core_window_state;
 mod db;
 /// Prometheus metrics for the streaming engine.

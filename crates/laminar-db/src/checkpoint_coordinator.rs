@@ -557,6 +557,26 @@ impl CheckpointCoordinator {
         self.cached_sorted_sink_names = None;
     }
 
+    /// Build the decoupled committer for coordinated-commit sinks, or `None`
+    /// when there are none (or no state backend to read descriptors from).
+    pub(crate) fn coordinated_committer(
+        &self,
+    ) -> Option<crate::coordinated_committer::CoordinatedCommitter> {
+        let backend = self.state_backend.clone()?;
+        let sinks: Vec<(String, crate::sink_task::SinkTaskHandle)> = self
+            .sinks
+            .iter()
+            .filter(|s| s.coordinated_commit)
+            .map(|s| (s.name.clone(), s.handle.clone()))
+            .collect();
+        if sinks.is_empty() {
+            return None;
+        }
+        Some(crate::coordinated_committer::CoordinatedCommitter::new(
+            backend, sinks,
+        ))
+    }
+
     /// Begin the initial epoch on all exactly-once sinks.
     ///
     /// Must be called once after all sinks are registered and before any writes. Subsequent
@@ -698,7 +718,8 @@ impl CheckpointCoordinator {
         let tasks: Vec<_> = self
             .sinks
             .iter()
-            .filter(|s| s.exactly_once)
+            // Coordinated sinks commit via the decoupled committer, not here.
+            .filter(|s| s.exactly_once && !s.coordinated_commit)
             .map(|sink| {
                 let handle = sink.handle.clone();
                 let name = sink.name.clone();
@@ -792,6 +813,25 @@ impl CheckpointCoordinator {
             .collect()
     }
 
+    /// Take the staged commit descriptors and persist them to the state backend.
+    /// Fails the epoch if a coordinated sink produced descriptors but no backend
+    /// is configured (rather than silently dropping committables).
+    async fn take_and_persist_descriptors(&mut self, epoch: u64) -> Result<(), DbError> {
+        let descriptors = std::mem::take(&mut self.pending_sink_descriptors);
+        if descriptors.is_empty() {
+            return Ok(());
+        }
+        let Some(ref backend) = self.state_backend else {
+            return Err(DbError::Checkpoint(
+                "coordinated-commit sink produced descriptors but no state \
+                 backend is configured to persist them"
+                    .into(),
+            ));
+        };
+        self.persist_sink_descriptors(backend, epoch, &descriptors)
+            .await
+    }
+
     /// Persist this epoch's coordinated-commit descriptors to the state backend.
     async fn persist_sink_descriptors(
         &self,
@@ -830,23 +870,12 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
     ) -> Result<(), DbError> {
-        // Take the staged descriptors first (clears them for the next epoch).
-        let descriptors = std::mem::take(&mut self.pending_sink_descriptors);
-        let Some(ref backend) = self.state_backend else {
-            // A coordinated-commit sink without durable descriptor storage would
-            // lose its committables — fail the epoch rather than drop them.
-            if !descriptors.is_empty() {
-                return Err(DbError::Checkpoint(
-                    "coordinated-commit sink produced descriptors but no state \
-                     backend is configured to persist them".into(),
-                ));
-            }
-            return Ok(());
-        };
         // Persist commit descriptors before partials so the partial gate
         // transitively implies their durability across all nodes.
-        self.persist_sink_descriptors(backend, epoch, &descriptors)
-            .await?;
+        self.take_and_persist_descriptors(epoch).await?;
+        let Some(ref backend) = self.state_backend else {
+            return Ok(());
+        };
         if self.vnode_set.is_empty() {
             return Ok(());
         }
@@ -3876,6 +3905,13 @@ mod tests {
             self.inner
                 .epoch_complete(epoch, vnodes, required_descriptors)
                 .await
+        }
+
+        async fn is_epoch_sealed(
+            &self,
+            epoch: u64,
+        ) -> Result<bool, laminar_core::state::StateBackendError> {
+            self.inner.is_epoch_sealed(epoch).await
         }
 
         async fn prune_before(
