@@ -2084,3 +2084,119 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
         "epoch must seal once the descriptor is durable"
     );
 }
+
+/// Full-wiring e2e: a real Iceberg sink registered as coordinated. A checkpoint
+/// persists the descriptor and seals the epoch; the designated committer then
+/// commits to the real Iceberg catalog, exactly once. Requires Docker
+/// (tests/docker/iceberg-compose.yml).
+#[cfg(feature = "iceberg")]
+#[tokio::test]
+#[ignore = "requires Docker: tests/docker/iceberg-compose.yml"]
+async fn coordinated_iceberg_commits_through_committer() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_connectors::config::{encode_arrow_schema_ipc, ConnectorConfig};
+    use laminar_connectors::connector::SinkConnector;
+    use laminar_connectors::lakehouse::iceberg::IcebergSink;
+    use laminar_connectors::lakehouse::iceberg_config::IcebergSinkConfig;
+    use laminar_connectors::lakehouse::iceberg_io;
+    use laminar_core::state::{InProcessBackend, StateBackend};
+    use std::sync::Arc;
+
+    if std::net::TcpStream::connect("127.0.0.1:8181").is_err() {
+        eprintln!("skipping: Iceberg REST not reachable on 127.0.0.1:8181");
+        return;
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let table = format!("e2e_{unique}");
+
+    let mut cc = ConnectorConfig::new("iceberg");
+    cc.set("catalog.uri", "http://localhost:8181");
+    cc.set("warehouse", "s3://warehouse/wh");
+    cc.set("storage.type", "s3");
+    cc.set("namespace", "laminar_test");
+    cc.set("table.name", table.as_str());
+    cc.set("auto.create", "true");
+    cc.set("writer.id", "w0");
+    cc.set("catalog.property.s3.endpoint", "http://localhost:9000");
+    cc.set("catalog.property.s3.access-key-id", "minioadmin");
+    cc.set("catalog.property.s3.secret-access-key", "minioadmin");
+    cc.set("catalog.property.s3.region", "us-east-1");
+    cc.set("catalog.property.s3.path-style-access", "true");
+    cc.set("_arrow_schema", encode_arrow_schema_ipc(&schema));
+
+    let mut sink = IcebergSink::new(IcebergSinkConfig::from_config(&cc).unwrap(), None);
+    sink.open(&cc).await.expect("open iceberg sink");
+
+    let (event_tx, _rx) = laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
+        crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
+    );
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "ice".into(),
+        sink_id: Arc::from("ice"),
+        connector: Box::new(sink),
+        exactly_once: true,
+        coordinated_commit: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(60),
+        event_tx,
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(2));
+    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord.register_sink("ice", handle.clone(), true, true);
+    coord.begin_initial_epoch().await.unwrap();
+
+    let batch = arrow::array::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+    )
+    .unwrap();
+    handle.write_batch(batch).await.unwrap();
+    handle.sync().await.unwrap();
+
+    // Checkpoint: pre_commit writes Parquet + descriptor, the gate seals the epoch.
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(result.success, "checkpoint failed: {:?}", result.error);
+
+    // The designated committer commits the sealed epoch to the real catalog.
+    let mut committer = coord.coordinated_committer().expect("coordinated committer");
+    committer.commit_ready().await.unwrap();
+
+    let catalog = iceberg_io::build_catalog(&IcebergSinkConfig::from_config(&cc).unwrap().catalog)
+        .await
+        .unwrap();
+    let loaded = iceberg_io::load_table(catalog.as_ref(), "laminar_test", &table)
+        .await
+        .unwrap();
+    assert_eq!(loaded.metadata().snapshots().count(), 1, "one snapshot");
+    let rows: usize = iceberg_io::scan_table(&loaded, None, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 3);
+
+    // Re-running the committer is idempotent — no new snapshot.
+    committer.commit_ready().await.unwrap();
+    let loaded = iceberg_io::load_table(catalog.as_ref(), "laminar_test", &table)
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded.metadata().snapshots().count(),
+        1,
+        "re-commit must not add a snapshot"
+    );
+}
