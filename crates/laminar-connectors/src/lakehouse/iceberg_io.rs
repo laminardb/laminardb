@@ -281,16 +281,21 @@ pub async fn ensure_table_exists(
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
     // Ensure the namespace exists before probing the table: a HEAD on a table in
-    // a missing namespace returns 400 (not 404) on some REST catalogs.
+    // a missing namespace returns 400 (not 404) on some REST catalogs. Creation
+    // tolerates a concurrent creator (N coordinated writers may auto-create the
+    // same namespace at once) by re-checking existence on failure.
     if !catalog
         .namespace_exists(&ns)
         .await
         .map_err(|e| ConnectorError::ReadError(format!("namespace_exists: {e}")))?
     {
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .map_err(|e| ConnectorError::WriteError(format!("create namespace: {e}")))?;
+        if let Err(e) = catalog.create_namespace(&ns, HashMap::new()).await {
+            if !catalog.namespace_exists(&ns).await.unwrap_or(false) {
+                return Err(ConnectorError::WriteError(format!(
+                    "create namespace: {e}"
+                )));
+            }
+        }
     }
 
     if catalog
@@ -313,10 +318,16 @@ pub async fn ensure_table_exists(
         .schema(iceberg_schema)
         .build();
 
-    catalog
-        .create_table(&ns, creation)
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("create table: {e}")))?;
+    // Same race tolerance for the table itself.
+    if let Err(e) = catalog.create_table(&ns, creation).await {
+        if !catalog
+            .table_exists(&ident)
+            .await
+            .map_err(|e| ConnectorError::ReadError(format!("table_exists: {e}")))?
+        {
+            return Err(ConnectorError::WriteError(format!("create table: {e}")));
+        }
+    }
 
     Ok(())
 }
