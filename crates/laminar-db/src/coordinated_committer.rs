@@ -22,14 +22,6 @@ pub(crate) fn descriptor_key_sink(key: &str) -> Option<&str> {
     key.rsplit_once("/sink=").map(|(_, sink)| sink)
 }
 
-#[cfg(feature = "cluster")]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
-}
-
 /// Drives aggregated commits for coordinated-commit sinks on the leader.
 pub(crate) struct CoordinatedCommitter {
     backend: Arc<dyn StateBackend>,
@@ -126,12 +118,7 @@ impl CoordinatedCommitter {
             (self.lease_watch.as_ref(), self.controller.as_ref())
         {
             let me = controller.instance_id();
-            let granted = laminar_core::cluster::control::lease_grants_leadership(
-                &watch.borrow(),
-                me,
-                now_millis(),
-            );
-            if !granted {
+            if !laminar_core::cluster::control::lease_currently_grants(&watch.borrow(), me) {
                 self.seeded = false;
                 return Ok(());
             }

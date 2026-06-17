@@ -320,11 +320,7 @@ pub async fn ensure_table_exists(
 
     // Same race tolerance for the table itself.
     if let Err(e) = catalog.create_table(&ns, creation).await {
-        if !catalog
-            .table_exists(&ident)
-            .await
-            .map_err(|e| ConnectorError::ReadError(format!("table_exists: {e}")))?
-        {
+        if !catalog.table_exists(&ident).await.unwrap_or(false) {
             return Err(ConnectorError::WriteError(format!("create table: {e}")));
         }
     }

@@ -237,6 +237,13 @@ pub fn lease_grants_leadership(lease: &Option<LeaderLease>, me: NodeId, now_ms: 
     matches!(lease, Some(l) if l.owner == me && !l.is_expired(now_ms))
 }
 
+/// [`lease_grants_leadership`] evaluated against the current wall clock.
+#[cfg(feature = "cluster")]
+#[must_use]
+pub fn lease_currently_grants(lease: &Option<LeaderLease>, me: NodeId) -> bool {
+    lease_grants_leadership(lease, me, now_millis())
+}
+
 /// Periodically renews the leader lease and publishes the latest record
 /// on a watch channel so other tasks can gate on the fencing token.
 pub struct LeaderLeaseManager {
