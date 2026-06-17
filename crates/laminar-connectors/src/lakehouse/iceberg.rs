@@ -243,46 +243,54 @@ impl IcebergSink {
             .build();
         let writer_builder = ParquetWriterBuilder::new(props, schema);
 
-        let mut all_data_files = Vec::new();
-
-        for (idx, batch) in self.staged_batches.iter().enumerate() {
+        // Stream every staged batch into ONE Parquet file (one S3 upload) per
+        // epoch. The source hands the sink many small batches (e.g. 1k-row Kafka
+        // polls); a file-per-batch loop would pay a full S3 multipart lifecycle
+        // for each, serializing the pipeline behind that I/O.
+        let mut writer = None;
+        for batch in &self.staged_batches {
             if batch.num_rows() == 0 {
                 continue;
             }
 
-            // Reproject the batch onto the Iceberg-derived Arrow schema so
-            // that every field carries PARQUET:field_id metadata. Without
-            // this the writer cannot correlate Arrow fields with Iceberg
-            // field IDs and fails with "Field id N not found in struct array".
+            // Reproject onto the Iceberg-derived Arrow schema so every field
+            // carries PARQUET:field_id metadata; without it the writer can't
+            // map Arrow fields to Iceberg field IDs ("Field id N not found").
             let aligned = self.align_batch_to_iceberg_schema(batch)?;
 
-            let file_path = format!(
-                "{location}/data/{}-{}-{}-{idx}.parquet",
-                self.config.writer_id,
-                self.current_epoch,
-                uuid::Uuid::new_v4(),
-            );
-
-            let output_file = file_io
-                .new_output(&file_path)
-                .map_err(|e| ConnectorError::WriteError(format!("create output: {e}")))?;
-
-            let mut writer = writer_builder
-                .clone()
-                .build(output_file)
-                .await
-                .map_err(|e| ConnectorError::WriteError(format!("build parquet writer: {e}")))?;
+            // Open lazily on the first non-empty batch so an all-empty epoch
+            // leaves no zero-row file behind.
+            if writer.is_none() {
+                let file_path = format!(
+                    "{location}/data/{}-{}-{}.parquet",
+                    self.config.writer_id,
+                    self.current_epoch,
+                    uuid::Uuid::new_v4(),
+                );
+                let output_file = file_io
+                    .new_output(&file_path)
+                    .map_err(|e| ConnectorError::WriteError(format!("create output: {e}")))?;
+                writer = Some(
+                    writer_builder.clone().build(output_file).await.map_err(|e| {
+                        ConnectorError::WriteError(format!("build parquet writer: {e}"))
+                    })?,
+                );
+            }
 
             writer
+                .as_mut()
+                .expect("writer opened above")
                 .write(&aligned)
                 .await
                 .map_err(|e| ConnectorError::WriteError(format!("parquet write: {e}")))?;
+        }
 
+        let mut all_data_files = Vec::new();
+        if let Some(writer) = writer {
             let data_file_builders = writer
                 .close()
                 .await
                 .map_err(|e| ConnectorError::WriteError(format!("close parquet writer: {e}")))?;
-
             for dfb in data_file_builders {
                 let data_file = dfb
                     .build()

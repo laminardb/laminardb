@@ -2160,6 +2160,31 @@ async fn iceberg_state(
     (snapshots, rows)
 }
 
+/// Data files added by the table's latest snapshot (from its summary).
+#[cfg(feature = "iceberg")]
+async fn iceberg_added_data_files(
+    cc: &laminar_connectors::config::ConnectorConfig,
+    table: &str,
+) -> usize {
+    use laminar_connectors::lakehouse::iceberg_config::IcebergSinkConfig;
+    use laminar_connectors::lakehouse::iceberg_io;
+    let catalog = iceberg_io::build_catalog(&IcebergSinkConfig::from_config(cc).unwrap().catalog)
+        .await
+        .unwrap();
+    let loaded = iceberg_io::load_table(catalog.as_ref(), "laminar_test", table)
+        .await
+        .unwrap();
+    loaded
+        .metadata()
+        .current_snapshot()
+        .expect("a snapshot")
+        .summary()
+        .additional_properties
+        .get("added-data-files")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "iceberg")]
 fn unique_table(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
@@ -2199,12 +2224,16 @@ async fn coordinated_iceberg_commits_through_committer() {
     coord.register_sink("ice", handle.clone(), true, true);
     coord.begin_initial_epoch().await.unwrap();
 
-    let batch = arrow::array::RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
-    )
-    .unwrap();
-    handle.write_batch(batch).await.unwrap();
+    // Three separate batches in one epoch — they must coalesce into ONE Parquet
+    // file (one S3 upload), not one file per batch.
+    for chunk in [[1i64, 2, 3], [4, 5, 6], [7, 8, 9]] {
+        let batch = arrow::array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(chunk.to_vec()))],
+        )
+        .unwrap();
+        handle.write_batch(batch).await.unwrap();
+    }
     handle.sync().await.unwrap();
 
     // Checkpoint: pre_commit writes Parquet + descriptor, the gate seals the epoch.
@@ -2217,7 +2246,12 @@ async fn coordinated_iceberg_commits_through_committer() {
     // The designated committer commits the sealed epoch to the real catalog.
     let mut committer = coord.coordinated_committer().expect("coordinated committer");
     committer.commit_ready().await.unwrap();
-    assert_eq!(iceberg_state(&cc, &table).await, (1, 3), "one snapshot, 3 rows");
+    assert_eq!(iceberg_state(&cc, &table).await, (1, 9), "one snapshot, 9 rows");
+    assert_eq!(
+        iceberg_added_data_files(&cc, &table).await,
+        1,
+        "all staged batches must land in a single data file"
+    );
 
     // Re-running the committer is idempotent — no new snapshot.
     committer.commit_ready().await.unwrap();
