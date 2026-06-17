@@ -838,6 +838,8 @@ impl CheckpointCoordinator {
     }
 
     /// This coordinator's node id, used to namespace commit descriptors.
+    /// Always 0 without the cluster feature (single-instance leader-of-one).
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn self_node_id(&self) -> u64 {
         #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.as_ref() {
