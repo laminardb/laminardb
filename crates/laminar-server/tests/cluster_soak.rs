@@ -12,6 +12,11 @@
 //!   reuse),
 //! - the restarted node rejoins and resumes committing.
 //!
+//! KNOWN GAP: the post-kill progress assertion currently wedges (durability gate +
+//! shuffle alignment wait on the dead node's vnodes) — see
+//! `docs/plans/cluster-leader-kill-failover-hardening.md`. Until that lands, expect
+//! a `progress after kill` timeout on the first kill.
+//!
 //! Ignored by default — it spawns processes and runs for minutes:
 //!
 //! ```text
