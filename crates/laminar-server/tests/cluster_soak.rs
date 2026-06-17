@@ -195,6 +195,10 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         storage.push_str("allow_http = \"true\"\n");
     }
 
+    // Discovery strategy: gossip (chitchat phi-accrual failure detection) by
+    // default; `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
+    let discovery = std::env::var("LAMINAR_SOAK_DISCOVERY").unwrap_or_else(|_| "gossip".into());
+
     let mut toml = format!(
         r#"
 node_id = "n{id}"
@@ -205,7 +209,7 @@ mode = "cluster"
 bind = "127.0.0.1:{http}"
 {server_extra}
 [discovery]
-strategy = "static"
+strategy = "{discovery}"
 seeds = [{seeds}]
 gossip_port = {gossip}
 advertise_host = "127.0.0.1"
