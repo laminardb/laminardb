@@ -22,6 +22,14 @@ pub(crate) fn descriptor_key_sink(key: &str) -> Option<&str> {
     key.rsplit_once("/sink=").map(|(_, sink)| sink)
 }
 
+#[cfg(feature = "cluster")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 /// Drives aggregated commits for coordinated-commit sinks on the leader.
 pub(crate) struct CoordinatedCommitter {
     backend: Arc<dyn StateBackend>,
@@ -36,6 +44,11 @@ pub(crate) struct CoordinatedCommitter {
     metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     #[cfg(feature = "cluster")]
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Fencing watch: commit only while we durably hold the leader lease, so a
+    /// stale gossip-leader (e.g. partitioned) whose lease expired cannot commit.
+    #[cfg(feature = "cluster")]
+    lease_watch:
+        Option<tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::LeaderLease>>>,
 }
 
 impl CoordinatedCommitter {
@@ -54,6 +67,8 @@ impl CoordinatedCommitter {
             metrics: None,
             #[cfg(feature = "cluster")]
             controller: None,
+            #[cfg(feature = "cluster")]
+            lease_watch: None,
         }
     }
 
@@ -80,6 +95,18 @@ impl CoordinatedCommitter {
         self
     }
 
+    /// Fence commits behind the durable leader lease (split-brain hardening).
+    #[cfg(feature = "cluster")]
+    pub(crate) fn with_lease_watch(
+        mut self,
+        watch: Option<
+            tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::LeaderLease>>,
+        >,
+    ) -> Self {
+        self.lease_watch = watch;
+        self
+    }
+
     /// Commit every sealed-but-uncommitted epoch. Per-sink isolated: a sink that
     /// fails stops at its cursor while others proceed; the first error is returned.
     pub(crate) async fn commit_ready(&mut self) -> Result<(), DbError> {
@@ -90,6 +117,24 @@ impl CoordinatedCommitter {
         if self.controller.as_ref().is_some_and(|c| !c.is_leader()) {
             self.seeded = false;
             return Ok(());
+        }
+
+        // Fence on the durable lease: even a gossip-leader must hold an
+        // unexpired lease to commit, so a partitioned stale leader stands down.
+        #[cfg(feature = "cluster")]
+        if let (Some(watch), Some(controller)) =
+            (self.lease_watch.as_ref(), self.controller.as_ref())
+        {
+            let me = controller.instance_id();
+            let granted = laminar_core::cluster::control::lease_grants_leadership(
+                &watch.borrow(),
+                me,
+                now_millis(),
+            );
+            if !granted {
+                self.seeded = false;
+                return Ok(());
+            }
         }
 
         // Resume each cursor from the sink's external commit state once, so a
@@ -360,6 +405,66 @@ mod tests {
         assert_eq!(
             recorded.lock().clone(),
             vec![(3, vec![b"e1".to_vec(), b"e3".to_vec()])]
+        );
+    }
+
+    /// The committer must not commit unless it durably holds the leader lease,
+    /// and must resume committing the moment the lease is acquired (failover).
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn lease_fence_gates_commit_on_held_lease() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv, LeaderLease};
+        use laminar_core::cluster::discovery::NodeId;
+        use tokio::sync::watch;
+
+        let backend = Arc::new(InProcessBackend::new(2));
+        seal(&backend, 1, b"e1").await;
+
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink(Arc::clone(&recorded));
+
+        let me = NodeId(1);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(me));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(me, kv, None, members_rx));
+
+        // Fenced out: a live lease held by another node.
+        let other = LeaderLease {
+            seq: 1,
+            token: 1,
+            owner: NodeId(2),
+            expires_at_ms: i64::MAX,
+        };
+        let (lease_tx, lease_rx) = watch::channel(Some(other));
+
+        let mut committer = CoordinatedCommitter::new(
+            Arc::clone(&backend) as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_cluster_controller(Some(controller))
+        .with_lease_watch(Some(lease_rx));
+
+        committer.commit_ready().await.unwrap();
+        assert!(
+            recorded.lock().is_empty(),
+            "must not commit while another node holds the lease"
+        );
+
+        // Failover: we acquire the lease → the next pass commits.
+        lease_tx
+            .send(Some(LeaderLease {
+                seq: 2,
+                token: 2,
+                owner: me,
+                expires_at_ms: i64::MAX,
+            }))
+            .unwrap();
+        committer.commit_ready().await.unwrap();
+        assert_eq!(
+            recorded.lock().len(),
+            1,
+            "must commit once the lease is held"
         );
     }
 

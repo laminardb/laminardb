@@ -330,6 +330,9 @@ pub struct CheckpointCoordinator {
     state_tier: Option<crate::state_tier::TierTx>,
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    #[cfg(feature = "cluster")]
+    leader_lease_watch:
+        Option<tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::LeaderLease>>>,
     // Invalidated on `register_sink`; rebuilt on the next checkpoint.
     cached_sorted_sink_names: Option<Vec<String>>,
 }
@@ -401,6 +404,8 @@ impl CheckpointCoordinator {
             state_tier: None,
             #[cfg(feature = "cluster")]
             cluster_controller: None,
+            #[cfg(feature = "cluster")]
+            leader_lease_watch: None,
             cached_sorted_sink_names: None,
         })
     }
@@ -412,6 +417,15 @@ impl CheckpointCoordinator {
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
         self.cluster_controller = Some(controller);
+    }
+
+    /// Fence the designated committer on the durable leader lease.
+    #[cfg(feature = "cluster")]
+    pub fn set_leader_lease_watch(
+        &mut self,
+        watch: tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::LeaderLease>>,
+    ) {
+        self.leader_lease_watch = Some(watch);
     }
 
     /// Wire a state backend to enable per-vnode markers and the durability gate.
@@ -603,7 +617,9 @@ impl CheckpointCoordinator {
         .with_metrics(self.prom.clone())
         .with_max_uncommitted_epochs(self.config.max_uncommitted_epochs);
         #[cfg(feature = "cluster")]
-        let committer = committer.with_cluster_controller(self.cluster_controller.clone());
+        let committer = committer
+            .with_cluster_controller(self.cluster_controller.clone())
+            .with_lease_watch(self.leader_lease_watch.clone());
         Some(committer)
     }
 
