@@ -128,11 +128,6 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
-    /// Fences the designated committer; `None` until a control store is wired.
-    #[cfg(feature = "cluster")]
-    pub(crate) leader_lease_watch: parking_lot::Mutex<
-        Option<tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::LeaderLease>>>,
-    >,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
@@ -381,8 +376,6 @@ impl LaminarDB {
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster")]
-            leader_lease_watch: parking_lot::Mutex::new(None),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
@@ -688,16 +681,6 @@ impl LaminarDB {
         self.spawn_subscription_router(&controller);
         *self.cluster_controller.lock() = Some(controller);
         self.update_sql_cluster_context();
-    }
-
-    /// Wire the leader-lease watch so the designated committer is lease-fenced.
-    /// Must be called before `start()` (the committer task spawns there).
-    #[cfg(feature = "cluster")]
-    pub fn set_leader_lease_watch(
-        &self,
-        watch: tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::LeaderLease>>,
-    ) {
-        *self.leader_lease_watch.lock() = Some(watch);
     }
 
     /// Refresh the gossip interest cache and drain remote `__sub::` batches.

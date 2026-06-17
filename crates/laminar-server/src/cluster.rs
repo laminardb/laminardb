@@ -616,13 +616,14 @@ pub async fn start_cluster(
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(e.to_string()))?;
 
-    // Fenced leader lease. Standalone split-brain hardening: a stale leader whose
-    // lease expired loses the CAS to the next acquirer and stops renewing, while
-    // the new owner advances the monotonic fencing token. The watch must be wired
-    // before `start()` so the designated committer spawns lease-fenced.
+    // Fenced leader lease. Wiring the watch into the controller makes
+    // `is_leader()` lease-aware, so every leader-gated path (checkpoint, 2PC,
+    // rebalance, committer) inherits fencing: a stale candidate whose lease
+    // expired stops being the leader. Renewal is gated on `is_gossip_leader` so
+    // the lease owner converges to the gossip candidate. Wired before `start()`.
     let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
-        match control_store.clone() {
-            Some(lease_os) => {
+        match (control_store.clone(), cluster_controller.as_ref()) {
+            (Some(lease_os), Some(controller)) => {
                 use laminar_core::cluster::control::{
                     LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
                 };
@@ -630,17 +631,18 @@ pub async fn start_cluster(
                 let ttl_ms = lease_cfg.ttl.as_millis() as i64;
                 let lease_store = Arc::new(LeaderLeaseStore::new(lease_os, ttl_ms));
                 let manager = LeaderLeaseManager::new(lease_store, node_id, lease_cfg);
-                db.set_leader_lease_watch(manager.lease_watch());
+                controller.set_leader_lease_watch(manager.lease_watch());
                 let token = tokio_util::sync::CancellationToken::new();
-                // Detached renewal loop; returns once `token` is cancelled on shutdown.
-                let _lease_handle = manager.spawn(token.clone());
+                let candidate = Arc::clone(controller);
+                let _lease_handle =
+                    manager.spawn(token.clone(), move || candidate.is_gossip_leader());
                 info!(
                     "Leader lease manager started (ttl={}s)",
                     lease_cfg.ttl.as_secs()
                 );
                 Some(token)
             }
-            None => None,
+            _ => None,
         };
 
     db.start()

@@ -340,10 +340,6 @@ impl LaminarDB {
             if let Some(controller) = self.cluster_controller.lock().clone() {
                 coord.set_cluster_controller(controller);
             }
-            #[cfg(feature = "cluster")]
-            if let Some(watch) = self.leader_lease_watch.lock().clone() {
-                coord.set_leader_lease_watch(watch);
-            }
 
             if let (Some(backend), Some(registry)) = (
                 self.state_backend.lock().clone(),

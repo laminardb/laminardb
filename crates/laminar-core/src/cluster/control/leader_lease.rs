@@ -281,16 +281,19 @@ impl LeaderLeaseManager {
         self.tx.subscribe()
     }
 
-    /// Spawn the renewal loop. Every `renew_interval` it `try_acquire`s
-    /// and publishes the resulting lease — `Acquired` when we own it,
-    /// otherwise the `Held` record so followers learn the current
-    /// fencing token. Errors are logged and retried next tick. Stops
-    /// when `shutdown` is cancelled.
+    /// Spawn the renewal loop. Every `renew_interval`, when `should_acquire`
+    /// holds, it `try_acquire`s and publishes the resulting lease — `Acquired`
+    /// when we own it, otherwise the `Held` record so followers learn the
+    /// current fencing token. `should_acquire` gates contention to the
+    /// leadership candidate so the lease owner converges to it; a node that is
+    /// no longer the candidate stops renewing and its lease lapses by TTL.
+    /// Errors are logged and retried next tick. Stops when `shutdown` is cancelled.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn spawn(
         self,
         shutdown: tokio_util::sync::CancellationToken,
+        should_acquire: impl Fn() -> bool + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(self.config.renew_interval);
@@ -300,6 +303,9 @@ impl LeaderLeaseManager {
                     biased;
                     () = shutdown.cancelled() => return,
                     _ = ticker.tick() => {}
+                }
+                if !should_acquire() {
+                    continue;
                 }
                 match self.store.try_acquire(self.me, now_millis()).await {
                     Ok(LeaseOutcome::Acquired(lease) | LeaseOutcome::Held(lease)) => {

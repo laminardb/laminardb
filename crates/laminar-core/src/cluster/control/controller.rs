@@ -51,6 +51,11 @@ pub struct ClusterController {
     /// Pooled channels to peers for cross-node `RemoteScan`.
     #[cfg(feature = "cluster")]
     query_client_pool: super::query::QueryClientPool,
+    /// When wired, leadership is lease-fenced: [`Self::is_leader`] also requires
+    /// holding the durable lease. Set once at startup; absent in embedded /
+    /// static-discovery deployments, where leadership stays gossip-only.
+    #[cfg(feature = "cluster")]
+    leader_lease: std::sync::OnceLock<watch::Receiver<Option<super::LeaderLease>>>,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -88,6 +93,8 @@ impl ClusterController {
             query_handler: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "cluster")]
             query_client_pool: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
+            #[cfg(feature = "cluster")]
+            leader_lease: std::sync::OnceLock::new(),
         }
     }
 
@@ -168,10 +175,40 @@ impl ClusterController {
         leader_of(&ids)
     }
 
-    /// True if this instance is currently the leader.
+    /// True if this node is the gossip-elected candidate (lowest active id),
+    /// ignoring the lease. The lease manager acquires only while this holds, so
+    /// the lease owner converges to the gossip candidate (otherwise the gossip
+    /// leader and lease owner could differ and neither would be [`Self::is_leader`]).
+    #[must_use]
+    pub fn is_gossip_leader(&self) -> bool {
+        self.current_leader() == Some(self.instance_id)
+    }
+
+    /// True if this node may act as leader. All leader-gated work goes through
+    /// here, so fencing is inherited everywhere. When a leader lease is wired
+    /// (cluster deployments with a control store) it additionally requires
+    /// durably holding an unexpired lease, fencing out a stale candidate; with
+    /// no lease wired it is gossip-only (embedded / static discovery).
     #[must_use]
     pub fn is_leader(&self) -> bool {
-        self.current_leader() == Some(self.instance_id)
+        if !self.is_gossip_leader() {
+            return false;
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(lease) = self.leader_lease.get() {
+            return super::lease_currently_grants(&lease.borrow(), self.instance_id);
+        }
+        true
+    }
+
+    /// Wire the leader-lease watch so leadership is lease-fenced. Set once at
+    /// startup; later calls are ignored.
+    #[cfg(feature = "cluster")]
+    pub fn set_leader_lease_watch(
+        &self,
+        lease: watch::Receiver<Option<super::LeaderLease>>,
+    ) {
+        let _ = self.leader_lease.set(lease);
     }
 
     /// Mark this node's active status.
@@ -489,6 +526,37 @@ mod tests {
     fn solo_instance_is_leader() {
         let c = ctl(42, vec![]);
         assert!(c.is_leader());
+    }
+
+    /// When a lease is wired, the gossip candidate is leader only while it holds
+    /// an unexpired lease; every other leader-gated path inherits this fencing.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn is_leader_requires_held_lease_when_wired() {
+        use crate::cluster::control::LeaderLease;
+        let lease = |owner, expires_at_ms| LeaderLease {
+            seq: 1,
+            token: 1,
+            owner: NodeId(owner),
+            expires_at_ms,
+        };
+
+        let c = ctl(1, vec![info(5)]); // lowest id → gossip candidate
+        assert!(c.is_leader(), "gossip-only leadership when no lease wired");
+
+        let (tx, rx) = watch::channel(None);
+        c.set_leader_lease_watch(rx);
+        assert!(!c.is_leader(), "fenced out until a lease is held");
+
+        tx.send(Some(lease(2, i64::MAX))).unwrap();
+        assert!(!c.is_leader(), "another node holds the lease");
+
+        tx.send(Some(lease(1, i64::MAX))).unwrap();
+        assert!(c.is_leader(), "we hold an unexpired lease");
+
+        assert!(c.is_gossip_leader());
+        tx.send(Some(lease(1, 0))).unwrap();
+        assert!(!c.is_leader(), "our lease expired");
     }
 
     #[test]
