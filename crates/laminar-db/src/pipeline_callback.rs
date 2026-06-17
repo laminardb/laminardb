@@ -935,6 +935,12 @@ impl ConnectorPipelineCallback {
         if !cc.is_leader() {
             return Ok(None);
         }
+        // A reclaiming leader recovers to its last committed epoch, which can lag the
+        // cluster's in-flight epoch; allocating below it would re-announce ids caught-up
+        // followers skip, deadlocking alignment. Start above the cluster-wide max.
+        if let Some((max_epoch, max_cid)) = cc.max_announced_epoch().await {
+            allocator.advance_to(max_epoch.saturating_add(1), max_cid.saturating_add(1));
+        }
         let (epoch, checkpoint_id) = allocator.allocate();
         if let Err(e) = cc
             .announce_barrier(&BarrierAnnouncement {

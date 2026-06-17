@@ -16,6 +16,29 @@ use tokio::sync::watch;
 
 pub use crate::state::NodeId;
 
+/// Publish the membership watch only on a real change. Unconditional `send` each
+/// discovery tick starves consumers that debounce on `changed()` for a quiet period
+/// (the rebalance controller, so a dead node's vnodes are never shed).
+pub(crate) fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_list: Vec<NodeInfo>) {
+    peer_list.sort_by_key(|n| n.id.0); // peer map order is arbitrary; equality must not depend on it
+    tx.send_if_modified(|cur| {
+        // Ignore `last_heartbeat_ms` — it ticks every refresh and would notify forever.
+        fn same_member(a: &NodeInfo, b: &NodeInfo) -> bool {
+            let mut a = a.clone();
+            a.last_heartbeat_ms = b.last_heartbeat_ms;
+            a == *b
+        }
+        let same = cur.len() == peer_list.len()
+            && cur.iter().zip(&peer_list).all(|(a, b)| same_member(a, b));
+        if same {
+            false
+        } else {
+            *cur = peer_list;
+            true
+        }
+    });
+}
+
 /// Current lifecycle state of a node.
 #[derive(
     Debug,

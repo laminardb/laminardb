@@ -1872,29 +1872,26 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
         use laminar_core::cluster::control::Phase;
-        use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
+        use laminar_core::shuffle::ShuffleMessage;
+        use rustc_hash::FxHashSet;
 
-        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        // Safety cap only — the membership self-heal below normally finishes alignment
+        // well before this by dropping any peer that leaves membership mid-align.
+        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
         };
-        // Fan-out = nodes we ship to. Wait set = live producers that ship to us
-        // (only if we own a vnode; a drained node still ships but receives nothing).
-        let output_peers: Vec<u64> = laminar_core::state::peer_owners(&cfg.registry, cfg.self_id)
+        // Fan-out and wait set both come from the same `live` membership so they stay
+        // mutually consistent across nodes (a vnode-ownership fan-out could target a
+        // stale/dead owner a live peer is still waiting on). Barriers are cheap.
+        let peers: Vec<u64> = live
             .iter()
-            .map(|n| n.0)
+            .copied()
+            .filter(|&id| id != cfg.self_id.0)
             .collect();
-        let input_peers: Vec<u64> =
-            if laminar_core::state::owned_vnodes(&cfg.registry, cfg.self_id).is_empty() {
-                Vec::new()
-            } else {
-                live.iter()
-                    .copied()
-                    .filter(|&id| id != cfg.self_id.0)
-                    .collect()
-            };
-        if output_peers.is_empty() && input_peers.is_empty() {
+        if peers.is_empty() {
             return Ok(());
         }
 
@@ -1904,55 +1901,32 @@ impl OperatorGraph {
         }
 
         let barrier = CheckpointBarrier::new(checkpoint_id, 0);
-        if !output_peers.is_empty() {
-            cfg.sender
-                .fan_out_barrier(&output_peers, barrier)
-                .await
-                .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
-        }
-        if input_peers.is_empty() {
-            return Ok(());
-        }
+        cfg.sender
+            .fan_out_barrier(&peers, barrier)
+            .await
+            .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
 
-        tracing::info!(
-            checkpoint_id,
-            self_id = cfg.self_id.0,
-            output_peers = ?output_peers,
-            input_peers = ?input_peers,
-            "align_shuffle_barriers: starting alignment"
-        );
+        // Self-healing wait set: done when every peer's barrier is seen OR the peer has
+        // left membership (re-checked each tick) — a peer that dies can't wedge the epoch.
+        let mut remaining: FxHashSet<u64> = peers.iter().copied().collect();
+        tracing::debug!(checkpoint_id, self_id = cfg.self_id.0, peers = ?peers, "shuffle align: start");
 
-        let tracker = BarrierTracker::new(input_peers.len() + 1);
-        let peer_port: FxHashMap<u64, usize> = input_peers
-            .iter()
-            .enumerate()
-            .map(|(i, &p)| (p, i + 1))
-            .collect();
-        tracker.observe(0, barrier); // our own input
-
-        // Observe any barriers that arrived before we entered alignment (stashed by the drain).
+        // Barriers stashed before we began aligning. A later-checkpoint barrier (a faster
+        // peer that moved on) is re-stashed, not dropped, so we still see it at that epoch.
         for (from, b) in cfg.receiver.drain_staged_barriers() {
             if b.checkpoint_id == checkpoint_id {
-                if let Some(&port) = peer_port.get(&from) {
-                    tracing::info!(
-                        checkpoint_id,
-                        from_peer = from,
-                        "align_shuffle_barriers: observed pre-staged peer barrier"
-                    );
-                    if tracker.observe(port, b).is_some() {
-                        tracing::info!(
-                            checkpoint_id,
-                            "align_shuffle_barriers: all peers aligned (pre-staged)"
-                        );
-                        return Ok(()); // all peers already aligned
-                    }
-                }
+                remaining.remove(&from);
+            } else if b.checkpoint_id > checkpoint_id {
+                cfg.receiver.stash_barrier(from, b);
             }
+        }
+        if remaining.is_empty() {
+            return Ok(());
         }
 
         let alignment_timeout = tokio::time::sleep(ALIGN_TIMEOUT);
         tokio::pin!(alignment_timeout);
-        let mut check_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut check_interval = tokio::time::interval(RECHECK);
         loop {
             tokio::select! {
                 res = cfg.receiver.recv() => {
@@ -1962,20 +1936,13 @@ impl OperatorGraph {
                                 "shuffle receiver closed during barrier alignment".into(),
                             ));
                         }
-                        Some((from, ShuffleMessage::Barrier(b))) if b.checkpoint_id == checkpoint_id => {
-                            tracing::info!(
-                                checkpoint_id,
-                                from_peer = from,
-                                "align_shuffle_barriers: received peer barrier"
-                            );
-                            if let Some(&port) = peer_port.get(&from) {
-                                if tracker.observe(port, b).is_some() {
-                                    tracing::info!(
-                                        checkpoint_id,
-                                        "align_shuffle_barriers: all peers aligned successfully"
-                                    );
+                        Some((from, ShuffleMessage::Barrier(b))) => {
+                            if b.checkpoint_id == checkpoint_id {
+                                if remaining.remove(&from) && remaining.is_empty() {
                                     break;
                                 }
+                            } else if b.checkpoint_id > checkpoint_id {
+                                cfg.receiver.stash_barrier(from, b); // for a later epoch; keep it
                             }
                         }
                         Some((_, ShuffleMessage::VnodeData(stage, _vnode, batch))) => {
@@ -1986,6 +1953,14 @@ impl OperatorGraph {
                 }
                 _ = check_interval.tick() => {
                     if let Some(ctrl) = controller {
+                        // Stop waiting on peers that left membership (a dead peer never
+                        // sends its barrier); Active-but-slow peers stay in the wait set.
+                        let live_now: FxHashSet<u64> =
+                            ctrl.live_instances().iter().map(|n| n.0).collect();
+                        remaining.retain(|p| live_now.contains(p));
+                        if remaining.is_empty() {
+                            break;
+                        }
                         if let Ok(Some(ann)) = ctrl.observe_barrier().await {
                             if ann.checkpoint_id == checkpoint_id && ann.phase == Phase::Abort {
                                 return Err(DbError::Pipeline(format!(
@@ -2005,11 +1980,13 @@ impl OperatorGraph {
                 }
                 () = &mut alignment_timeout => {
                     return Err(DbError::Pipeline(format!(
-                        "shuffle barrier alignment timed out for checkpoint {checkpoint_id}"
+                        "shuffle barrier alignment timed out for checkpoint {checkpoint_id} \
+                         (waiting on {remaining:?})"
                     )));
                 }
             }
         }
+        tracing::debug!(checkpoint_id, "shuffle align: complete");
         Ok(())
     }
 

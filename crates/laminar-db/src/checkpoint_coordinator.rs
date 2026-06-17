@@ -183,9 +183,9 @@ impl EpochAllocator {
         )
     }
 
-    /// Monotonically advance. An aborted epoch leaves artifacts (Pending manifest, partials);
-    /// recovery from an older committed epoch must not re-allocate those ids.
-    fn advance_to(&self, epoch: u64, next_checkpoint_id: u64) {
+    /// Monotonically advance so recovery, and a leader reclaiming the role after rejoin,
+    /// never re-allocate ids at or below the cluster's in-flight epoch.
+    pub(crate) fn advance_to(&self, epoch: u64, next_checkpoint_id: u64) {
         use std::sync::atomic::Ordering;
         self.epoch.fetch_max(epoch, Ordering::AcqRel);
         self.next_checkpoint_id

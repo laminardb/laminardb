@@ -364,6 +364,12 @@ impl ClusterController {
         self.barrier.announce(ann).await
     }
 
+    /// Highest `(epoch, checkpoint_id)` announced anywhere in the cluster — used by a
+    /// node reclaiming leadership to advance its allocator past the in-flight epoch.
+    pub async fn max_announced_epoch(&self) -> Option<(u64, u64)> {
+        self.barrier.max_announced().await
+    }
+
     /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
     /// As a side effect, an `Aligned` or `Commit` announcement with a

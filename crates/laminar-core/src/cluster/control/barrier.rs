@@ -860,6 +860,19 @@ impl BarrierCoordinator {
         })
     }
 
+    /// Highest `(epoch, checkpoint_id)` any node has announced, across the gossiped
+    /// per-node announcement keys — a reclaiming leader advances past it on rejoin.
+    #[must_use]
+    pub async fn max_announced(&self) -> Option<(u64, u64)> {
+        self.kv
+            .scan(ANNOUNCEMENT_KEY)
+            .await
+            .into_iter()
+            .filter_map(|(_, json)| serde_json::from_str::<BarrierAnnouncement>(&json).ok())
+            .map(|a| (a.epoch, a.checkpoint_id))
+            .max()
+    }
+
     /// Follower-side ack.
     ///
     /// # Errors
