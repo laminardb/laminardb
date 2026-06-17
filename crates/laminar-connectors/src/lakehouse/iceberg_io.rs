@@ -280,6 +280,19 @@ pub async fn ensure_table_exists(
 
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
+    // Ensure the namespace exists before probing the table: a HEAD on a table in
+    // a missing namespace returns 400 (not 404) on some REST catalogs.
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("namespace_exists: {e}")))?
+    {
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .map_err(|e| ConnectorError::WriteError(format!("create namespace: {e}")))?;
+    }
+
     if catalog
         .table_exists(&ident)
         .await
@@ -294,17 +307,6 @@ pub async fn ensure_table_exists(
         .map_err(|e| {
             ConnectorError::SchemaMismatch(format!("arrow→iceberg schema conversion: {e}"))
         })?;
-
-    if !catalog
-        .namespace_exists(&ns)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("namespace_exists: {e}")))?
-    {
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .map_err(|e| ConnectorError::WriteError(format!("create namespace: {e}")))?;
-    }
 
     let creation = iceberg::TableCreation::builder()
         .name(table_name.to_string())
