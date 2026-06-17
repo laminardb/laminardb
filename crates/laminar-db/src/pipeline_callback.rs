@@ -506,8 +506,13 @@ impl ConnectorPipelineCallback {
     }
 
     /// Capture operator state and commit a checkpoint for a `db.checkpoint()` request.
+    ///
+    /// `source_offsets` are the coordinator's current committed offsets; a forced
+    /// checkpoint has no source barrier, so without them the manifest advances the
+    /// recovery point with no offsets and a recovered source replays from the start.
     async fn force_capture_and_checkpoint(
         &mut self,
+        source_offsets: &FxHashMap<String, SourceCheckpoint>,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         self.sync_sinks_and_drain_events().await;
 
@@ -522,7 +527,7 @@ impl ConnectorPipelineCallback {
             .capture_and_serialize_operator_state()
             .await
             .map_err(DbError::Checkpoint)?;
-        let request = self.build_checkpoint_request(operator_states, &FxHashMap::default());
+        let request = self.build_checkpoint_request(operator_states, source_offsets);
 
         let vnode_states = self.capture_vnode_states();
         let mut guard = self.coordinator.lock().await;
@@ -1526,7 +1531,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         for reply_tx in force_reqs {
-            let result = self.force_capture_and_checkpoint().await;
+            let result = self.force_capture_and_checkpoint(&source_offsets).await;
             // Ignore receiver-dropped: caller gave up on `db.checkpoint()`.
             reply_tx.send(result);
         }

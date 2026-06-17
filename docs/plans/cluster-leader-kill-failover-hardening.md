@@ -39,6 +39,15 @@ plumbing — independent of the coordinated-sink-commit / lease work that surfac
    debounce never settled and a dead node's vnodes were never shed (the gate then
    wedged). Fix: share `publish_if_changed` (already used by static) on the gossip path.
 
+6. **Exactly-once violated on leader recovery (Kafka-diff soak).** The rebalance
+   pre-rotation drain checkpoint runs through `db.checkpoint()` →
+   `force_capture_and_checkpoint`, which built its request with *empty* source offsets.
+   That checkpoint commits sinks and becomes a recovery point with no source offset, so
+   a leader that recovers from it replays its source from the start and re-emits
+   already-committed records (a killed leader produced 2684 duplicates). Fix: the forced
+   checkpoint now captures the coordinator's current `committed_offsets` (consistent with
+   the operator/sink state it snapshots), so recovery resumes at the right offset.
+
 ## Validation
 
 ```
@@ -50,8 +59,11 @@ cargo test -p laminar-server --features cluster --test cluster_soak \
 
 clippy clean; alignment + aligned-resume unit tests pass; `cluster_integration` 15/15
 (2 MinIO-infra failures unrelated). Soak (`SECONDS=300 INTERVAL_MS=100`) green on both
-**static** and **gossip** across all kill rounds. Exactly-once *under rejoin* via the
-Kafka-diff soak path is not separately covered — a follow-up.
+**static** and **gossip** across all kill rounds. Exactly-once under rejoin is now
+covered by the Kafka-diff soak (`LAMINAR_SOAK_KAFKA_BROKERS=...` rps=200): 6 kill rounds
+(leader killed twice), all three per-node topics dense with zero duplicates/gaps under
+`read_committed`. Reset the soak Redpanda (down/up, not restart) first — a broker
+degraded by hours of kill-9 debris stalls sink commits and wedges the leader reclaim.
 
 ## Risk
 
