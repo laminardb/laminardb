@@ -510,13 +510,19 @@ impl KafkaSource {
                     }
                 }
 
+                // While paused, recv() yields nothing, so a long timeout would
+                // gate the resume re-check at the top of the loop behind it.
+                // Poll briefly when paused so resume fires promptly; block
+                // longer when running so an idle topic doesn't spin.
+                let recv_timeout = if is_paused {
+                    std::time::Duration::from_millis(10)
+                } else {
+                    std::time::Duration::from_millis(200)
+                };
                 let msg_result = tokio::select! {
                     biased;
                     _ = reader_shutdown.changed() => break,
-                    msg = tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        consumer.recv(),
-                    ) => match msg {
+                    msg = tokio::time::timeout(recv_timeout, consumer.recv()) => match msg {
                         Ok(result) => result,
                         Err(_timeout) => continue,
                     },
