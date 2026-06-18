@@ -58,7 +58,8 @@ mod tests {
         let future = br#"{"version":999,"payload":{"unknown":"shape"}}"#;
         let err = decode::<Vec<u32>>(future).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported commit descriptor version 999"),
+            err.to_string()
+                .contains("unsupported commit descriptor version 999"),
             "got: {err}"
         );
     }

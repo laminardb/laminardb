@@ -1,4 +1,3 @@
-
 use super::super::delta_config::DeltaCatalogType;
 use super::*;
 use arrow_array::{Float64Array, Int64Array, StringArray};

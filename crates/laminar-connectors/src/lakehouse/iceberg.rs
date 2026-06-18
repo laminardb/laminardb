@@ -271,9 +271,13 @@ impl IcebergSink {
                     .new_output(&file_path)
                     .map_err(|e| ConnectorError::WriteError(format!("create output: {e}")))?;
                 writer = Some(
-                    writer_builder.clone().build(output_file).await.map_err(|e| {
-                        ConnectorError::WriteError(format!("build parquet writer: {e}"))
-                    })?,
+                    writer_builder
+                        .clone()
+                        .build(output_file)
+                        .await
+                        .map_err(|e| {
+                            ConnectorError::WriteError(format!("build parquet writer: {e}"))
+                        })?,
                 );
             }
 

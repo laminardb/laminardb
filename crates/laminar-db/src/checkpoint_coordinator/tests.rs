@@ -1,4 +1,3 @@
-
 use super::*;
 use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
@@ -2244,9 +2243,15 @@ async fn coordinated_iceberg_commits_through_committer() {
     assert!(result.success, "checkpoint failed: {:?}", result.error);
 
     // The designated committer commits the sealed epoch to the real catalog.
-    let mut committer = coord.coordinated_committer().expect("coordinated committer");
+    let mut committer = coord
+        .coordinated_committer()
+        .expect("coordinated committer");
     committer.commit_ready().await.unwrap();
-    assert_eq!(iceberg_state(&cc, &table).await, (1, 9), "one snapshot, 9 rows");
+    assert_eq!(
+        iceberg_state(&cc, &table).await,
+        (1, 9),
+        "one snapshot, 9 rows"
+    );
     assert_eq!(
         iceberg_added_data_files(&cc, &table).await,
         1,

@@ -205,7 +205,9 @@ impl StateBackend for ObjectStoreBackend {
         let mut entries = self.store.list(Some(&OsPath::from(prefix_str.clone())));
         let mut out = Vec::new();
         while let Some(entry) = entries.next().await {
-            let loc = entry.map_err(|e| StateBackendError::Io(e.to_string()))?.location;
+            let loc = entry
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .location;
             let key = loc
                 .as_ref()
                 .strip_prefix(&prefix_str)
@@ -295,7 +297,9 @@ impl StateBackend for ObjectStoreBackend {
         let mut entries = self.store.list(None);
         let mut out = Vec::new();
         while let Some(entry) = entries.next().await {
-            let loc = entry.map_err(|e| StateBackendError::Io(e.to_string()))?.location;
+            let loc = entry
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .location;
             if !loc.as_ref().ends_with("/_COMMIT") {
                 continue;
             }

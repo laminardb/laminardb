@@ -135,7 +135,13 @@ impl StateBackend for InProcessBackend {
     }
 
     async fn sealed_epochs(&self, after: u64) -> Result<Vec<u64>, StateBackendError> {
-        Ok(self.sealed.read().iter().filter(|&&e| e > after).copied().collect())
+        Ok(self
+            .sealed
+            .read()
+            .iter()
+            .filter(|&&e| e > after)
+            .copied()
+            .collect())
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {

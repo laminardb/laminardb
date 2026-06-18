@@ -204,10 +204,7 @@ impl ClusterController {
     /// Wire the leader-lease watch so leadership is lease-fenced. Set once at
     /// startup; later calls are ignored.
     #[cfg(feature = "cluster")]
-    pub fn set_leader_lease_watch(
-        &self,
-        lease: watch::Receiver<Option<super::LeaderLease>>,
-    ) {
+    pub fn set_leader_lease_watch(&self, lease: watch::Receiver<Option<super::LeaderLease>>) {
         let _ = self.leader_lease.set(lease);
     }
 

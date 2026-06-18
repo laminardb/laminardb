@@ -91,7 +91,10 @@ async fn distributed_embedded_static_two_instances_shared_store() {
     assert!(node_a.epoch_complete(1, &[0, 1, 2, 3], &[]).await.unwrap());
 
     // node_b loses — it must not keep driving the commit phase.
-    let err = node_b.epoch_complete(1, &[0, 1, 2, 3], &[]).await.unwrap_err();
+    let err = node_b
+        .epoch_complete(1, &[0, 1, 2, 3], &[])
+        .await
+        .unwrap_err();
     match err {
         StateBackendError::SplitBrainCommit { committer, self_id } => {
             assert_eq!(committer, "node-a");

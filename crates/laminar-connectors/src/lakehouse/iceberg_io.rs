@@ -291,9 +291,7 @@ pub async fn ensure_table_exists(
     {
         if let Err(e) = catalog.create_namespace(&ns, HashMap::new()).await {
             if !catalog.namespace_exists(&ns).await.unwrap_or(false) {
-                return Err(ConnectorError::WriteError(format!(
-                    "create namespace: {e}"
-                )));
+                return Err(ConnectorError::WriteError(format!("create namespace: {e}")));
             }
         }
     }
