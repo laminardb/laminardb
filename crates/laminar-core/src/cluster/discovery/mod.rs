@@ -24,9 +24,23 @@ pub(crate) fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_lis
     tx.send_if_modified(|cur| {
         // Ignore `last_heartbeat_ms` — it ticks every refresh and would notify forever.
         fn same_member(a: &NodeInfo, b: &NodeInfo) -> bool {
-            let mut a = a.clone();
-            a.last_heartbeat_ms = b.last_heartbeat_ms;
-            a == *b
+            // Destructure so a new NodeInfo field forces an update here; compare
+            // all fields except last_heartbeat_ms (it ticks every refresh).
+            let NodeInfo {
+                id,
+                name,
+                rpc_address,
+                raft_address,
+                state,
+                metadata,
+                last_heartbeat_ms: _,
+            } = a;
+            id == &b.id
+                && name == &b.name
+                && rpc_address == &b.rpc_address
+                && raft_address == &b.raft_address
+                && state == &b.state
+                && metadata == &b.metadata
         }
         let same = cur.len() == peer_list.len()
             && cur.iter().zip(&peer_list).all(|(a, b)| same_member(a, b));

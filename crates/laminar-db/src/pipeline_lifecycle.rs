@@ -329,6 +329,10 @@ impl LaminarDB {
                 max_staged_bytes: cp_config
                     .max_staged_bytes
                     .unwrap_or(defaults.max_staged_bytes),
+                max_uncommitted_epochs: cp_config
+                    .max_uncommitted_epochs
+                    .unwrap_or(defaults.max_uncommitted_epochs),
+                uncommitted_epochs_backpressure: cp_config.uncommitted_epochs_backpressure,
                 ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;

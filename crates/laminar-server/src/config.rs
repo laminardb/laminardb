@@ -454,6 +454,15 @@ pub struct CheckpointSection {
     /// upload; admission pauses at the cap. Default 512 MiB.
     #[serde(default)]
     pub max_staged_bytes: Option<u64>,
+    /// Coordinated-committer lag (sealed-but-uncommitted epochs) past which the
+    /// committer warns; the hard cap when `uncommitted_epochs_backpressure` is
+    /// on. Default 1024.
+    #[serde(default)]
+    pub max_uncommitted_epochs: Option<u64>,
+    /// Fail checkpoints once the coordinated committer lag exceeds
+    /// `max_uncommitted_epochs`, bounding object-storage growth. Default false.
+    #[serde(default)]
+    pub uncommitted_epochs_backpressure: bool,
 }
 
 impl Default for CheckpointSection {
@@ -465,6 +474,8 @@ impl Default for CheckpointSection {
             storage: std::collections::HashMap::new(),
             max_in_flight_epochs: None,
             max_staged_bytes: None,
+            max_uncommitted_epochs: None,
+            uncommitted_epochs_backpressure: false,
         }
     }
 }

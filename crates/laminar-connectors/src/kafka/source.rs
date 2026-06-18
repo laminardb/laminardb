@@ -738,6 +738,10 @@ impl SourceConnector for KafkaSource {
         // `subscribe()`. Manual assign bypasses the broker rebalance callbacks,
         // so partitions are positioned here directly (checkpointed offset, else
         // the startup default). The reader loop re-binds on assignment rotation.
+        //
+        // Reset stale metadata so a re-`open()` that falls back to subscribe
+        // doesn't leave `checkpoint()` filtering by a prior run's vnode ownership.
+        self.vnode_topic_meta.clear();
         let vnode = self
             .vnode_assignment
             .as_ref()

@@ -21,6 +21,13 @@ pub struct StreamCheckpointConfig {
     /// Cap on captured-state bytes held by in-flight epochs; admission
     /// pauses at the cap. `None` = default (512 MiB).
     pub max_staged_bytes: Option<u64>,
+    /// Coordinated-committer lag (sealed-but-uncommitted epochs) past which the
+    /// committer warns, and — with `uncommitted_epochs_backpressure` — the hard
+    /// cap. `None` = default (1024).
+    pub max_uncommitted_epochs: Option<u64>,
+    /// Fail checkpoints once committer lag exceeds `max_uncommitted_epochs`,
+    /// bounding object-storage growth at the cost of pausing progress. Default off.
+    pub uncommitted_epochs_backpressure: bool,
 }
 
 /// Errors from checkpoint operations.
