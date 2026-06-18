@@ -1451,6 +1451,25 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Engine-controlled vnode assignment uses manual `assign()`, which fires
+        // no rebalance callbacks — so `rebalance_state` stays empty and can't
+        // drive the filter. Filter by the partitions this node owns instead;
+        // otherwise every checkpoint would record zero offsets and recovery
+        // would replay each partition from `auto.offset.reset`.
+        if let Some((registry, self_id)) = &self.vnode_assignment {
+            if !self.vnode_topic_meta.is_empty() {
+                let owned: std::collections::HashSet<(String, i32)> = self
+                    .vnode_topic_meta
+                    .iter()
+                    .flat_map(|(topic, count)| {
+                        crate::partition_assignment::owned_partitions(*count, registry, *self_id)
+                            .into_iter()
+                            .map(move |p| (topic.to_string(), p))
+                    })
+                    .collect();
+                return self.offsets.to_checkpoint_filtered(&owned);
+            }
+        }
         let assigned = lock_or_recover(&self.rebalance_state)
             .assigned_partitions()
             .clone();
@@ -1647,6 +1666,36 @@ mod tests {
         let cp = source.checkpoint();
         assert_eq!(cp.get_offset("events-0"), Some("100"));
         assert_eq!(cp.get_offset("events-1"), Some("200"));
+    }
+
+    #[test]
+    fn test_checkpoint_vnode_assigned_uses_owned_partitions() {
+        // Vnode mode uses manual assign(), which fires no rebalance callbacks,
+        // so rebalance_state stays empty. checkpoint() must filter by owned
+        // partitions instead — otherwise a cluster Kafka source records zero
+        // offsets and replays from the start on recovery.
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.offsets.update("events", 0, 100);
+        source.offsets.update("events", 1, 200);
+        source.offsets.update("events", 2, 300);
+        source.offsets.update("events", 3, 400);
+
+        // 4 vnodes; node 0 owns vnodes 0 and 2, node 1 owns 1 and 3.
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::new(4));
+        let node0 = laminar_core::state::NodeId(0);
+        let node1 = laminar_core::state::NodeId(1);
+        registry.set_assignment(vec![node0, node1, node0, node1].into());
+
+        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.vnode_topic_meta = vec![(Arc::from("events"), 4)];
+
+        // rebalance_state is empty (no callbacks under manual assign): the old
+        // code returned an empty checkpoint here.
+        let cp = source.checkpoint();
+        assert_eq!(cp.get_offset("events-0"), Some("100")); // vnode 0 → node0
+        assert_eq!(cp.get_offset("events-1"), None); // vnode 1 → node1
+        assert_eq!(cp.get_offset("events-2"), Some("300")); // vnode 2 → node0
+        assert_eq!(cp.get_offset("events-3"), None); // vnode 3 → node1
     }
 
     #[test]
