@@ -821,8 +821,7 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// This coordinator's node id, used to namespace commit descriptors.
-    /// Always 0 without the cluster feature (single-instance leader-of-one).
+    /// This coordinator's node id for namespacing commit descriptors (0 without the cluster feature).
     #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn self_node_id(&self) -> u64 {
         #[cfg(feature = "cluster")]
@@ -840,9 +839,8 @@ impl CheckpointCoordinator {
         self.epoch_descriptor_keys.clone()
     }
 
-    /// Take the staged commit descriptors and persist them to the state backend.
     /// Fails the epoch if a coordinated sink produced descriptors but no backend
-    /// is configured (rather than silently dropping committables).
+    /// is configured, rather than silently dropping committables.
     async fn take_and_persist_descriptors(&mut self, epoch: u64) -> Result<(), DbError> {
         let descriptors = std::mem::take(&mut self.pending_sink_descriptors);
         // The gate requires exactly the descriptors produced this epoch — an
