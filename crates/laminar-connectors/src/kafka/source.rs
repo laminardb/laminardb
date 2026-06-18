@@ -1,9 +1,5 @@
-//! Kafka source connector implementation.
-//!
-//! [`KafkaSource`] implements the [`SourceConnector`] trait, consuming
-//! from Kafka topics via rdkafka's `StreamConsumer`, deserializing
-//! messages using pluggable formats, and producing Arrow `RecordBatch`
-//! data through the connector SDK.
+//! Kafka source connector: consumes topics via rdkafka's `StreamConsumer`,
+//! deserializes with pluggable formats, and yields Arrow `RecordBatch`es.
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -58,8 +54,7 @@ struct KafkaPayload {
     partition: i32,
     offset: i64,
     timestamp_ms: Option<i64>,
-    /// Kafka message headers serialized as JSON string ("{key: value, ...}").
-    /// Only populated when `include_headers` is enabled.
+    /// Message headers as a JSON string; populated only when `include_headers` is set.
     headers_json: Option<String>,
 }
 
@@ -90,14 +85,9 @@ pub struct KafkaSource {
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance counter bridging `LaminarConsumerContext` → `KafkaSourceMetrics`.
     rebalance_counter: Arc<AtomicU64>,
-    /// Monotonic counter bumped on each partition revoke event.
-    ///
-    /// Shared with `LaminarConsumerContext` for lock-free revoke detection
-    /// from `poll_batch()`. The source compares `last_seen_revoke_gen`
-    /// against this value each poll cycle and only locks `rebalance_state`
-    /// when a change is detected to purge revoked partition offsets.
+    /// Bumped on each partition revoke; `poll_batch` compares it lock-free to
+    /// detect a revoke and purge the lost partitions' offsets.
     revoke_generation: Arc<AtomicU64>,
-    /// Last observed value of `revoke_generation`, cached per poll cycle.
     last_seen_revoke_gen: u64,
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     data_ready: Arc<Notify>,
@@ -110,35 +100,28 @@ pub struct KafkaSource {
     /// Latest TPL the commit task should flush (last-writer-wins).
     commit_tx: Option<watch::Sender<Option<TopicPartitionList>>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
-    /// Receiver for high watermark data from the background reader task.
-    /// Each entry is `(topic, partition, high_watermark)` for lag computation.
+    /// `(topic, partition, high_watermark)` from the reader task, for lag computation.
     #[allow(clippy::type_complexity)]
     high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
-    /// Shared flag: `true` when the reader task has paused Kafka partitions
-    /// due to downstream backpressure. Used to re-pause newly assigned
-    /// partitions during rebalance.
+    /// Set while the reader has paused partitions for backpressure; re-pauses
+    /// newly assigned partitions on rebalance.
     reader_paused: Arc<AtomicBool>,
-    /// Offset snapshot shared with the rebalance callback for seek-on-assign.
-    /// Updated once per `poll_batch()` cycle (not per message).
+    /// Offset snapshot for the rebalance callback's seek-on-assign, refreshed
+    /// once per `poll_batch()` cycle.
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
 
-    /// Cluster vnode assignment, set in cluster mode via
-    /// [`set_vnode_assignment`](SourceConnector::set_vnode_assignment). When
-    /// present, `open()` uses engine-controlled manual `assign()` of the
+    /// Cluster vnode assignment: when set, `open()` manually `assign()`s the
     /// partitions this node owns (`partition % vnode_count`) instead of
-    /// consumer-group `subscribe()`, and the reader re-binds when the
-    /// assignment version rotates. `None` → legacy broker-driven subscribe.
+    /// `subscribe()`, and the reader re-binds on version rotation.
     vnode_assignment: Option<(
         Arc<laminar_core::state::VnodeRegistry>,
         laminar_core::state::NodeId,
     )>,
-    /// `(topic, partition_count)` captured at `open()` when vnode-assigned, so
-    /// the reader can recompute owned partitions on assignment rotation without
-    /// re-fetching metadata (partition counts are stable).
+    /// `(topic, partition_count)` from `open()`, so the reader can recompute
+    /// owned partitions on rotation without re-fetching metadata.
     vnode_topic_meta: Vec<(Arc<str>, i32)>,
 
-    /// Last Avro writer schema from the schema registry, used to diff
-    /// successive versions for evolution detection.
+    /// Previous Avro writer schema, diffed against the next for evolution detection.
     last_avro_schema: Option<SchemaRef>,
 
     // Reusable poll_batch buffers — cleared each cycle, capacity retained.
@@ -309,14 +292,8 @@ impl KafkaSource {
         self.config.event_time_column.as_deref()
     }
 
-    /// Spawns background tasks on first `poll_batch()` call.
-    ///
-    /// Three tasks handle separate concerns:
-    /// - **Reader**: consumes messages, manages backpressure, detects revokes
-    /// - **Commit**: services on-checkpoint broker offset commits
-    /// - **HWM**: periodic high watermark queries for lag monitoring
-    ///
-    /// Deferred to allow `restore()` to access the consumer directly after `open()`.
+    /// Spawns the background reader, commit, and HWM tasks on the first
+    /// `poll_batch()`. Deferred so `restore()` can seek the consumer first.
     #[allow(clippy::too_many_lines)]
     fn ensure_reader_started(&mut self) {
         if self.reader_handle.is_some() || self.consumer.is_none() {
