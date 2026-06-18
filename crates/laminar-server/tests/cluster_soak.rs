@@ -12,11 +12,6 @@
 //!   reuse),
 //! - the restarted node rejoins and resumes committing.
 //!
-//! KNOWN GAP: the post-kill progress assertion currently wedges (durability gate +
-//! shuffle alignment wait on the dead node's vnodes) — see
-//! `docs/plans/cluster-leader-kill-failover-hardening.md`. Until that lands, expect
-//! a `progress after kill` timeout on the first kill.
-//!
 //! Ignored by default — it spawns processes and runs for minutes:
 //!
 //! ```text
@@ -203,6 +198,10 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     // Discovery strategy: gossip (chitchat phi-accrual failure detection) by
     // default; `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
     let discovery = std::env::var("LAMINAR_SOAK_DISCOVERY").unwrap_or_else(|_| "gossip".into());
+    assert!(
+        matches!(discovery.as_str(), "gossip" | "static"),
+        "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
+    );
 
     let mut toml = format!(
         r#"

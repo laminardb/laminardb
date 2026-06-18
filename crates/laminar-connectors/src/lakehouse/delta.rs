@@ -291,13 +291,22 @@ impl DeltaLakeSink {
             }
         }
 
-        // Resolve last committed epoch for exactly-once recovery.
+        // Resolve last committed epoch for exactly-once recovery. In coordinated
+        // mode nothing is ever committed under writer_id (only the designated
+        // committer commits, under COORDINATED_COMMITTER_ID), so we must read the
+        // committer's txn id or recovery always sees 0 and re-stages sealed epochs
+        // into orphan Parquet.
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            let recovery_id = if self.is_coordinated() {
+                COORDINATED_COMMITTER_ID
+            } else {
+                self.config.writer_id.as_str()
+            };
             self.last_committed_epoch =
-                delta_io::get_last_committed_epoch(&table, &self.config.writer_id).await;
+                delta_io::get_last_committed_epoch(&table, recovery_id).await;
             if self.last_committed_epoch > 0 {
                 info!(
-                    writer_id = %self.config.writer_id,
+                    recovery_id,
                     last_committed_epoch = self.last_committed_epoch,
                     "recovered last committed epoch from Delta Lake txn metadata"
                 );
@@ -641,6 +650,12 @@ impl DeltaLakeSink {
             })?;
         let mut writer = RecordBatchWriter::for_table(table)
             .map_err(|e| ConnectorError::WriteError(format!("delta writer: {e}")))?;
+        // Mirror the non-coordinated path: honor configured Parquet properties
+        // (compression, row-group size, bloom filters) instead of the writer's
+        // hard-coded Snappy default.
+        if let Some(props) = self.cached_writer_properties.clone() {
+            writer = writer.with_writer_properties(props);
+        }
         for batch in &self.staged_batches {
             writer
                 .write(batch.clone())
@@ -1337,7 +1352,17 @@ impl SinkConnector for DeltaLakeSink {
             if self.staged_batches.is_empty() {
                 return Ok(None);
             }
-            let descriptor = self.write_staged_to_descriptor().await?;
+            // Same timeout the commit path uses: a stale object-store connection
+            // must not hang the sink task forever (Azure LB drops idle conns).
+            let write_timeout = self.config.write_timeout;
+            let descriptor = tokio::time::timeout(write_timeout, self.write_staged_to_descriptor())
+                .await
+                .map_err(|_| {
+                    ConnectorError::WriteError(format!(
+                        "Delta write timed out after {}s",
+                        write_timeout.as_secs()
+                    ))
+                })??;
             self.staged_batches.clear();
             self.staged_rows = 0;
             self.staged_bytes = 0;

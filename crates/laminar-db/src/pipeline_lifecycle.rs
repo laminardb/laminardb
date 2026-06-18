@@ -940,22 +940,31 @@ impl LaminarDB {
 
         let (coordinated_committer, committer_poll) = {
             let mut guard = self.coordinator.lock().await;
-            match *guard {
-                Some(ref mut coord) => {
-                    for (name, handle, _, _, _) in &sinks {
-                        coord.register_sink(
-                            name.clone(),
-                            handle.clone(),
-                            handle.exactly_once(),
-                            handle.coordinated_commit(),
-                        );
-                    }
-                    (
-                        coord.coordinated_committer(),
-                        coord.committer_poll_interval(),
-                    )
+            if let Some(coord) = guard.as_mut() {
+                for (name, handle, _, _, _) in &sinks {
+                    coord.register_sink(
+                        name.clone(),
+                        handle.clone(),
+                        handle.exactly_once(),
+                        handle.coordinated_commit(),
+                    );
                 }
-                None => (None, std::time::Duration::from_secs(1)),
+                (
+                    coord.coordinated_committer(),
+                    coord.committer_poll_interval(),
+                )
+            } else {
+                // No coordinator (checkpointing disabled) means no designated
+                // committer; a coordinated sink would seal epochs that never
+                // get externally committed → silent data loss. Fail fast.
+                if sinks.iter().any(|(_, h, _, _, _)| h.coordinated_commit()) {
+                    return Err(DbError::Config(
+                        "a sink declares coordinated_commit but checkpointing is \
+                         disabled; coordinated commit requires a checkpoint coordinator"
+                            .into(),
+                    ));
+                }
+                (None, std::time::Duration::from_secs(1))
             }
         };
 
@@ -971,7 +980,10 @@ impl LaminarDB {
                     tick.tick().await;
                     if matches!(
                         DbState::load(&state),
-                        DbState::Stopped | DbState::ShuttingDown
+                        DbState::Stopped
+                            | DbState::ShuttingDown
+                            | DbState::Faulted
+                            | DbState::Created
                     ) {
                         break;
                     }
@@ -980,7 +992,13 @@ impl LaminarDB {
                     }
                 }
             });
-            *self.committer_handle.lock() = Some(handle);
+            // Abort any prior committer (e.g. on a Faulted→start() restart) so a
+            // stale loop can't run concurrently with the new one.
+            let mut guard = self.committer_handle.lock();
+            if let Some(prev) = guard.take() {
+                prev.abort();
+            }
+            *guard = Some(handle);
         }
 
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.

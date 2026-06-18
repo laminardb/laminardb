@@ -169,8 +169,20 @@ pub fn current_snapshot_id(table: &Table) -> Option<i64> {
 /// Table property holding the highest epoch the designated committer sealed.
 const COORDINATED_EPOCH_PROP: &str = "laminardb.commit.epoch";
 
+/// Self-describing Iceberg commit payload: carries the spec/schema/format the
+/// files were serialized against so the committer decodes by the encoder's
+/// metadata, not the (possibly evolved) table-default at commit time.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IcebergCommitPayload {
+    spec_id: i32,
+    schema_id: i32,
+    format_version: iceberg::spec::FormatVersion,
+    files: Vec<String>,
+}
+
 /// Serialize this writer's `data_files` into a commit descriptor for handoff to
-/// the designated committer. Uses `table`'s partition type and format version.
+/// the designated committer. Embeds the spec/schema/format ids so the committer
+/// can decode even if the table's defaults evolve before `commit_aggregated`.
 ///
 /// # Errors
 /// Returns `ConnectorError::WriteError` if a data file cannot be serialized.
@@ -179,40 +191,58 @@ pub fn encode_commit_descriptor(
     data_files: Vec<iceberg::spec::DataFile>,
 ) -> Result<Vec<u8>, ConnectorError> {
     let meta = table.metadata();
-    let partition_type = meta.default_partition_type().clone();
+    let spec_id = meta.default_partition_spec_id();
+    let schema_id = meta.current_schema_id();
     let format_version = meta.format_version();
-    let json: Vec<String> = data_files
+    let partition_type = meta.default_partition_type().clone();
+    let files: Vec<String> = data_files
         .into_iter()
         .map(|df| iceberg::spec::serialize_data_file_to_json(df, &partition_type, format_version))
         .collect::<Result<_, _>>()
         .map_err(|e| ConnectorError::WriteError(format!("serialize data file: {e}")))?;
-    super::commit_descriptor::encode(json)
+    super::commit_descriptor::encode(IcebergCommitPayload {
+        spec_id,
+        schema_id,
+        format_version,
+        files,
+    })
 }
 
 /// Decode and flatten every writer's commit descriptor into one set of data
-/// files, ready for a single `fast_append`.
+/// files, ready for a single `fast_append`. Each payload is resolved against the
+/// spec/schema it was encoded with; the table must still retain those ids.
 ///
 /// # Errors
-/// Returns `ConnectorError::TransactionError` on a malformed/incompatible descriptor.
+/// Returns `ConnectorError::TransactionError` on a malformed/incompatible
+/// descriptor, or if the table no longer retains the encoded spec/schema id.
 pub fn decode_commit_descriptors(
     table: &Table,
     descriptors: &[Vec<u8>],
 ) -> Result<Vec<iceberg::spec::DataFile>, ConnectorError> {
     let meta = table.metadata();
-    let partition_type = meta.default_partition_type().clone();
-    let spec_id = meta.default_partition_spec_id();
-    let schema = meta.current_schema().as_ref().clone();
 
     let mut out = Vec::new();
     for bytes in descriptors {
-        let json: Vec<String> = super::commit_descriptor::decode(bytes)?;
-        for entry in &json {
+        let payload: IcebergCommitPayload = super::commit_descriptor::decode(bytes)?;
+        let schema = meta.schema_by_id(payload.schema_id).ok_or_else(|| {
+            ConnectorError::TransactionError(format!("unknown schema id {}", payload.schema_id))
+        })?;
+        let spec = meta.partition_spec_by_id(payload.spec_id).ok_or_else(|| {
+            ConnectorError::TransactionError(format!(
+                "unknown partition spec id {}",
+                payload.spec_id
+            ))
+        })?;
+        let partition_type = spec
+            .partition_type(schema)
+            .map_err(|e| ConnectorError::TransactionError(format!("partition type: {e}")))?;
+        for entry in &payload.files {
             out.push(
                 iceberg::spec::deserialize_data_file_from_json(
                     entry,
-                    spec_id,
+                    payload.spec_id,
                     &partition_type,
-                    &schema,
+                    schema,
                 )
                 .map_err(|e| {
                     ConnectorError::TransactionError(format!("deserialize data file: {e}"))
@@ -379,8 +409,7 @@ mod tests {
         assert!(err.contains("LDB-5101"), "got: {err}");
     }
 
-    #[test]
-    fn test_current_snapshot_id_empty_table() {
+    fn empty_fixture_table() -> Table {
         let schema = iceberg::spec::Schema::builder()
             .with_fields(vec![])
             .build()
@@ -397,7 +426,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let table = Table::builder()
+        Table::builder()
             .metadata(metadata.metadata)
             .identifier(TableIdent::new(
                 iceberg::NamespaceIdent::new("test".to_string()),
@@ -405,8 +434,51 @@ mod tests {
             ))
             .file_io(iceberg::io::FileIO::new_with_memory())
             .build()
-            .unwrap();
+            .unwrap()
+    }
 
-        assert!(current_snapshot_id(&table).is_none());
+    fn sample_data_file() -> iceberg::spec::DataFile {
+        iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::Data)
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .file_path("data/file1.parquet".to_string())
+            .file_size_in_bytes(1024)
+            .record_count(10)
+            .partition_spec_id(0)
+            .partition(iceberg::spec::Struct::empty())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_current_snapshot_id_empty_table() {
+        assert!(current_snapshot_id(&empty_fixture_table()).is_none());
+    }
+
+    #[test]
+    fn test_commit_descriptor_roundtrip() {
+        let table = empty_fixture_table();
+        let bytes = encode_commit_descriptor(&table, vec![sample_data_file()]).unwrap();
+        let files = decode_commit_descriptors(&table, &[bytes]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path(), "data/file1.parquet");
+    }
+
+    #[test]
+    fn test_decode_rejects_unknown_embedded_ids() {
+        // A descriptor encoded against spec/schema ids the table no longer
+        // retains must error, not silently decode against the table default.
+        let table = empty_fixture_table();
+        let payload = IcebergCommitPayload {
+            spec_id: 99,
+            schema_id: 99,
+            format_version: table.metadata().format_version(),
+            files: vec![],
+        };
+        let bytes = super::super::commit_descriptor::encode(payload).unwrap();
+        let err = decode_commit_descriptors(&table, &[bytes])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown schema id 99"), "got: {err}");
     }
 }

@@ -298,9 +298,14 @@ impl SinkConnectorCapabilities {
         self
     }
     /// Declare a single shared commit target requiring a designated committer.
+    ///
+    /// Implies `exactly_once`: the descriptor path (`pre_commit` → aggregated
+    /// commit) only runs for exactly-once sinks, so coordinated commit is inert
+    /// without it.
     #[must_use]
     pub fn with_coordinated_commit(mut self) -> Self {
         self.coordinated_commit = true;
+        self.exactly_once = true;
         self
     }
 }
@@ -480,7 +485,18 @@ pub trait SinkConnector: Send {
     /// Returns an opaque commit descriptor for `coordinated_commit` sinks (the
     /// committables the designated committer will aggregate), else `None`.
     /// Default delegates to `flush()` and returns `None`.
+    ///
+    /// # Errors
+    /// Returns `ConfigurationError` if the sink declares `coordinated_commit`
+    /// yet relies on this default — such a sink would seal epochs with no
+    /// external commit. (`Ok(None)` is still valid for a coordinated sink that
+    /// overrides this and has nothing staged for the epoch.)
     async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
+        if self.capabilities().coordinated_commit {
+            return Err(ConnectorError::ConfigurationError(
+                "sink declares coordinated_commit but does not override pre_commit".into(),
+            ));
+        }
         self.flush().await?;
         Ok(None)
     }
@@ -532,7 +548,9 @@ pub trait SinkConnector: Send {
 /// reflects the epoch.
 #[async_trait]
 pub trait CoordinatedCommitter: Send + Sync {
-    /// Commit `descriptors` (one per writer) for `epoch` as a single operation.
+    /// Commit `descriptors` as a single operation. `epoch` is the commit-THROUGH
+    /// target: the runtime may batch descriptors drawn from several sealed epochs
+    /// into one call, so a given descriptor need not belong to `epoch` itself.
     async fn commit_aggregated(
         &self,
         epoch: u64,
@@ -611,5 +629,59 @@ mod tests {
             caps.suggested_write_timeout,
             std::time::Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn with_coordinated_commit_implies_exactly_once() {
+        let caps = SinkConnectorCapabilities::new(std::time::Duration::from_secs(5))
+            .with_coordinated_commit();
+        assert!(caps.coordinated_commit);
+        assert!(caps.exactly_once);
+    }
+
+    struct DefaultPreCommitSink {
+        coordinated: bool,
+    }
+
+    #[async_trait]
+    impl SinkConnector for DefaultPreCommitSink {
+        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(0, 0))
+        }
+        fn schema(&self) -> SchemaRef {
+            test_schema()
+        }
+        fn capabilities(&self) -> SinkConnectorCapabilities {
+            let caps = SinkConnectorCapabilities::new(std::time::Duration::from_secs(5));
+            if self.coordinated {
+                caps.with_coordinated_commit()
+            } else {
+                caps
+            }
+        }
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_pre_commit_rejects_coordinated_sink() {
+        let mut sink = DefaultPreCommitSink { coordinated: true };
+        assert!(matches!(
+            sink.pre_commit(1).await,
+            Err(ConnectorError::ConfigurationError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_pre_commit_ok_for_non_coordinated_sink() {
+        let mut sink = DefaultPreCommitSink { coordinated: false };
+        assert!(matches!(sink.pre_commit(1).await, Ok(None)));
     }
 }

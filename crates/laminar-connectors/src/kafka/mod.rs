@@ -229,7 +229,7 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "backpressure.low.watermark",
             "Channel fill ratio to resume",
-            "0.5",
+            "0.25",
         ),
         // Error handling
         ConfigKeySpec::optional(

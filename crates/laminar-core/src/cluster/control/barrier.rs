@@ -734,6 +734,12 @@ impl BarrierCoordinator {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
                 let local_id = self.local_node_id().await;
+                // Record the decision in KV before delivery, so a reclaiming
+                // leader's `max_announced()` and a recovering peer's KV fallback
+                // still see this epoch even if a peer RPC below fails and returns
+                // early (the RPC receiver does not persist the announcement).
+                let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
+                self.kv.write(ANNOUNCEMENT_KEY, json).await;
                 if ann.phase == Phase::Prepare {
                     // Prepare gRPC calls are initiated by wait_for_quorum.
                     // Redundant calls here cause duplicate prepare executions and timeouts on followers.

@@ -12,11 +12,20 @@ fn test_schema() -> SchemaRef {
 }
 
 fn test_config() -> DeltaLakeSinkConfig {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Unique per call so a leftover dir from a prior run can't make a later run
+    // hit an existing path (the hardcoded "8f3a" suffix caused flakes).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let uniq = format!(
+        "{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     #[cfg(unix)]
-    let path = "/tmp/delta_test_nonexistent_8f3a";
+    let path = format!("/tmp/delta_test_nonexistent_{uniq}");
     #[cfg(windows)]
-    let path = "C:\\delta_test_nonexistent_8f3a";
-    DeltaLakeSinkConfig::new(path)
+    let path = format!("C:\\delta_test_nonexistent_{uniq}");
+    DeltaLakeSinkConfig::new(&path)
 }
 
 fn upsert_config() -> DeltaLakeSinkConfig {
@@ -157,10 +166,7 @@ fn test_no_deferred_init_without_catalog_storage_location() {
     config.catalog_storage_location = None;
     let sink = DeltaLakeSink::new(config, None);
 
-    let should_defer = matches!(sink.config.catalog_type, DeltaCatalogType::Unity { .. })
-        && sink.config.catalog_storage_location.is_some()
-        && sink.schema.is_none();
-    assert!(!should_defer);
+    assert!(!sink.needs_deferred_delta_init);
 }
 
 #[test]
@@ -169,10 +175,7 @@ fn test_no_deferred_init_with_schema() {
     let config = unity_config();
     let sink = DeltaLakeSink::with_schema(config, test_schema());
 
-    let should_defer = matches!(sink.config.catalog_type, DeltaCatalogType::Unity { .. })
-        && sink.config.catalog_storage_location.is_some()
-        && sink.schema.is_none();
-    assert!(!should_defer);
+    assert!(!sink.needs_deferred_delta_init);
 }
 
 // ── Batch size estimation ──
@@ -639,7 +642,7 @@ fn test_debug_output() {
     let sink = DeltaLakeSink::new(test_config(), None);
     let debug = format!("{sink:?}");
     assert!(debug.contains("DeltaLakeSink"));
-    assert!(debug.contains("delta_test_nonexistent_8f3a"));
+    assert!(debug.contains("delta_test_nonexistent_"));
 }
 
 // ── End-to-end upsert collapse (aggregating-MV changelog → Delta table) ──
@@ -905,4 +908,164 @@ async fn upsert_replay_of_committed_epoch_is_idempotent() {
     );
 
     sink_b.close().await.unwrap();
+}
+
+// ── Coordinated-commit (designated-committer) regressions ──
+
+#[cfg(feature = "delta-lake")]
+fn coordinated_config(path: &str) -> DeltaLakeSinkConfig {
+    let mut cfg = DeltaLakeSinkConfig::new(path);
+    cfg.write_mode = DeltaWriteMode::Append;
+    cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    cfg.writer_id = "writer-A".to_string();
+    cfg
+}
+
+/// `is_coordinated()` drives the recovery-id selection; it must be true only
+/// for append + exactly-once (the path where the committer, not the writer,
+/// owns the Delta txn id).
+#[test]
+fn coordinated_only_for_append_exactly_once() {
+    let mut cfg = test_config();
+    cfg.write_mode = DeltaWriteMode::Append;
+    cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    assert!(DeltaLakeSink::new(cfg, None).is_coordinated());
+
+    let mut cfg = test_config();
+    cfg.write_mode = DeltaWriteMode::Append;
+    cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
+    assert!(!DeltaLakeSink::new(cfg, None).is_coordinated());
+
+    let mut cfg = test_config();
+    cfg.write_mode = DeltaWriteMode::Upsert;
+    cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    assert!(!DeltaLakeSink::new(cfg, None).is_coordinated());
+}
+
+/// Finding A: a coordinated sink recovering against an already-committed table
+/// must read the committer's txn id, not the (never-committed) `writer_id`. Before
+/// the fix recovery always saw 0 and re-staged sealed epochs into orphan files.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_recovery_reads_committer_epoch() {
+    use crate::connector::CoordinatedCommitter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_recover");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    // Writer stages epoch 1 and 2; the designated committer seals them under
+    // COORDINATED_COMMITTER_ID (nothing is ever committed under "writer-A").
+    let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    writer
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+
+    for epoch in 1..=2u64 {
+        writer.begin_epoch(epoch).await.unwrap();
+        writer.write_batch(&test_batch(3)).await.unwrap();
+        let descriptor = writer
+            .pre_commit(epoch)
+            .await
+            .unwrap()
+            .expect("coordinated pre_commit returns a descriptor");
+        writer.commit_epoch(epoch).await.unwrap();
+        writer
+            .commit_aggregated(epoch, vec![descriptor])
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    // A fresh writer (same writer_id) recovers from the table. The committer
+    // never used "writer-A", so reading writer_id would yield 0.
+    let mut recovered = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    recovered
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.last_committed_epoch(),
+        2,
+        "coordinated recovery must read the committer's sealed epoch"
+    );
+
+    // Replaying a sealed epoch must be a no-op: pre_commit returns no descriptor.
+    recovered.begin_epoch(2).await.unwrap();
+    recovered.write_batch(&test_batch(3)).await.unwrap();
+    assert!(
+        recovered.pre_commit(2).await.unwrap().is_none(),
+        "sealed epoch must not re-stage Parquet"
+    );
+    recovered.close().await.unwrap();
+}
+
+/// Finding B: the coordinated descriptor write must honor configured Parquet
+/// properties (cached at open), not the writer's hard-coded Snappy default.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_open_caches_configured_writer_properties() {
+    use deltalake::parquet::basic::Compression;
+    use deltalake::parquet::schema::types::ColumnPath;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_props");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    let mut cfg = coordinated_config(&path);
+    cfg.parquet.compression = "gzip".to_string();
+    cfg.parquet.compression_level = 6;
+
+    let mut sink = DeltaLakeSink::with_schema(cfg, test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+
+    let props = sink
+        .cached_writer_properties
+        .as_ref()
+        .expect("open() caches writer properties");
+    assert!(
+        matches!(
+            props.compression(&ColumnPath::from(Vec::<String>::new())),
+            Compression::GZIP(_)
+        ),
+        "descriptor writer must apply configured (non-default) compression"
+    );
+    sink.close().await.unwrap();
+}
+
+/// Finding C: the coordinated staging write is wrapped in the same write
+/// timeout the commit path uses, so a wedged object store can't hang the sink
+/// task forever. A near-zero timeout forces the wrapper to fire.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_pre_commit_honors_write_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_timeout");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    let mut cfg = coordinated_config(&path);
+    cfg.write_timeout = Duration::from_nanos(1);
+
+    let mut sink = DeltaLakeSink::with_schema(cfg, test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+
+    sink.begin_epoch(1).await.unwrap();
+    sink.write_batch(&test_batch(3)).await.unwrap();
+    let err = sink
+        .pre_commit(1)
+        .await
+        .expect_err("a 1ns write timeout must trip the wrapper");
+    assert!(
+        err.to_string().contains("timed out"),
+        "expected a timeout error, got: {err}"
+    );
+    sink.close().await.unwrap();
 }

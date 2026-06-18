@@ -50,7 +50,7 @@ plumbing — independent of the coordinated-sink-commit / lease work that surfac
 
 ## Validation
 
-```
+```bash
 cargo test -p laminar-server --features cluster --test cluster_soak \
   three_node_kill9_soak -- --ignored --nocapture
 # env: OpenSSL vars + RUST_MIN_STACK=67108864; LAMINAR_SOAK_SECONDS,
