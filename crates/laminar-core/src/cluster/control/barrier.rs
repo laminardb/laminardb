@@ -797,8 +797,6 @@ impl BarrierCoordinator {
                     }
                 }
 
-                let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
-                self.kv.write(ANNOUNCEMENT_KEY, json).await;
                 return Ok(());
             }
         }

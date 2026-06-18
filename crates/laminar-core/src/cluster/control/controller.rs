@@ -177,18 +177,15 @@ impl ClusterController {
 
     /// True if this node is the gossip-elected candidate (lowest active id),
     /// ignoring the lease. The lease manager acquires only while this holds, so
-    /// the lease owner converges to the gossip candidate (otherwise the gossip
-    /// leader and lease owner could differ and neither would be [`Self::is_leader`]).
+    /// the lease owner converges to the gossip candidate.
     #[must_use]
     pub fn is_gossip_leader(&self) -> bool {
         self.current_leader() == Some(self.instance_id)
     }
 
-    /// True if this node may act as leader. All leader-gated work goes through
-    /// here, so fencing is inherited everywhere. When a leader lease is wired
-    /// (cluster deployments with a control store) it additionally requires
-    /// durably holding an unexpired lease, fencing out a stale candidate; with
-    /// no lease wired it is gossip-only (embedded / static discovery).
+    /// True if this node may act as leader — the single gate all leader-gated
+    /// work inherits. When a leader lease is wired it also requires holding an
+    /// unexpired lease (fences out a stale candidate); otherwise gossip-only.
     #[must_use]
     pub fn is_leader(&self) -> bool {
         if !self.is_gossip_leader() {

@@ -281,13 +281,10 @@ impl LeaderLeaseManager {
         self.tx.subscribe()
     }
 
-    /// Spawn the renewal loop. Every `renew_interval`, when `should_acquire`
-    /// holds, it `try_acquire`s and publishes the resulting lease — `Acquired`
-    /// when we own it, otherwise the `Held` record so followers learn the
-    /// current fencing token. `should_acquire` gates contention to the
-    /// leadership candidate so the lease owner converges to it; a node that is
-    /// no longer the candidate stops renewing and its lease lapses by TTL.
-    /// Errors are logged and retried next tick. Stops when `shutdown` is cancelled.
+    /// Spawn the renewal loop: every `renew_interval`, when `should_acquire`
+    /// holds, `try_acquire` and publish the lease (so followers learn the
+    /// fencing token). A node that stops being the candidate lets its lease
+    /// lapse by TTL. Stops when `shutdown` is cancelled.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn spawn(

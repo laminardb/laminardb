@@ -1,13 +1,7 @@
-//! Apache Iceberg sink connector implementation.
-//!
-//! [`IcebergSink`] implements [`SinkConnector`], writing Arrow `RecordBatch`
-//! data to Iceberg tables with exactly-once semantics tied to checkpoint
-//! epochs via Iceberg's atomic transaction commits.
-//!
-//! `pre_commit()` moves the buffer into `staged_batches`.
-//! `commit_epoch()` writes Parquet data files and commits via Iceberg
-//! `Transaction::fast_append()`. `rollback_epoch()` discards staged data
-//! without side effects.
+//! Apache Iceberg sink connector: buffers Arrow `RecordBatch`es per checkpoint
+//! epoch and commits them atomically (exactly-once). With `coordinated_commit`,
+//! `pre_commit` writes Parquet and returns a descriptor for the designated
+//! committer; otherwise `commit_epoch` does a `fast_append`.
 
 use std::time::Duration;
 
@@ -30,30 +24,18 @@ use super::iceberg_config::IcebergSinkConfig;
 /// an Iceberg table atomically when the epoch commits. Each epoch produces
 /// at most one Iceberg transaction.
 pub struct IcebergSink {
-    /// Sink configuration — reparsed from `ConnectorConfig` in `open()`.
     config: IcebergSinkConfig,
-    /// Arrow schema for input batches.
     schema: Option<SchemaRef>,
-    /// Connector lifecycle state.
     state: ConnectorState,
-    /// Current epoch being written.
     current_epoch: u64,
-    /// Last successfully committed epoch.
     last_committed_epoch: u64,
-    /// `RecordBatch` buffer for the current epoch.
     buffer: Vec<RecordBatch>,
-    /// Total rows buffered in current epoch.
     buffered_rows: usize,
-    /// Staged batches ready for commit (populated by `pre_commit()`).
     staged_batches: Vec<RecordBatch>,
-    /// Rows staged for commit.
     staged_rows: usize,
-    /// Whether the current epoch was skipped (already committed).
     epoch_skipped: bool,
-    /// Cached catalog connection (initialized in `open()`).
     #[cfg(feature = "iceberg")]
     catalog: Option<std::sync::Arc<dyn iceberg::Catalog>>,
-    /// Cached table handle (updated after each commit).
     #[cfg(feature = "iceberg")]
     table: Option<iceberg::table::Table>,
     /// Arrow schema derived from the Iceberg table schema (carries
@@ -96,15 +78,8 @@ impl IcebergSink {
         self.staged_rows = 0;
     }
 
-    /// Reprojects a pipeline `RecordBatch` onto the Iceberg-derived Arrow
-    /// schema so that every field carries `PARQUET:field_id` metadata.
-    ///
-    /// Fast path: when the batch schema fields match the Iceberg schema
-    /// field-for-field (same names, types, count), just swap the schema
-    /// wrapper — columns are already in the right order.
-    ///
-    /// Slow path: match columns by name, cast where types differ (safe
-    /// widening validated in `open()`), fill nullable extras with nulls.
+    /// Reproject a batch onto the Iceberg-derived Arrow schema so every field
+    /// carries the `PARQUET:field_id` metadata the Iceberg writer requires.
     #[cfg(feature = "iceberg")]
     fn align_batch_to_iceberg_schema(
         &self,

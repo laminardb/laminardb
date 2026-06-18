@@ -93,13 +93,11 @@ impl CoordinatedCommitter {
             return Ok(());
         }
 
-        // Resume each cursor from the sink's external commit state once, so a
-        // restart doesn't rescan from epoch 0.
+        // Seed each cursor from the sink's external commit state once (so a
+        // restart doesn't rescan from 0), all-or-nothing: a failed read stays
+        // unseeded and retries next pass rather than committing from a stale
+        // cursor left by a prior leadership term.
         if !self.seeded {
-            // Seed every cursor atomically: a failed read leaves the committer
-            // unseeded so the next pass retries, rather than committing from a
-            // stale cursor left over from a prior leadership term (which could
-            // skip or re-emit epochs). A clean read rebuilds the whole map.
             let mut seeded = FxHashMap::default();
             for (name, handle) in &self.sinks {
                 match handle.committed_through().await {

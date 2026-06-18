@@ -316,10 +316,8 @@ pub struct CheckpointCoordinator {
     // Descriptor keys actually written this epoch — the gate requires exactly
     // these (not all coordinated sinks), so an idle sink doesn't stall the seal.
     epoch_descriptor_keys: Vec<String>,
-    // Lowest epoch the designated committer has NOT yet externally committed;
-    // prune must not delete descriptors at or above it. Shared with the
-    // committer task, which advances it. Starts at 0 (prune nothing until the
-    // committer confirms) when coordinated sinks exist.
+    // Lowest uncommitted epoch; prune must not cross it. Advanced by the
+    // committer task (leader only); starts at 0.
     coordinated_commit_floor: Arc<std::sync::atomic::AtomicU64>,
     // Bases for reference partials. Bytes are refcounted; demoted slices hold a cold marker.
     #[allow(clippy::disallowed_types)]
@@ -2288,29 +2286,33 @@ impl CheckpointCoordinator {
             m.checkpoint_size_bytes.set(checkpoint_bytes as i64);
         }
 
-        // Prune old partials/markers outside the retention window.
-        if let Some(ref backend) = self.state_backend {
-            let mut horizon = epoch.saturating_sub(self.config.max_retained as u64);
-            // Never prune descriptors the designated committer hasn't committed
-            // yet — hold the horizon at the commit floor for coordinated sinks.
-            if self.sinks.iter().any(|s| s.coordinated_commit) {
-                horizon = horizon.min(
-                    self.coordinated_commit_floor
-                        .load(std::sync::atomic::Ordering::Acquire),
-                );
-            }
-            if horizon > 0 {
-                if let Err(e) = backend.prune_before(horizon).await {
-                    warn!(
-                        epoch,
-                        horizon,
-                        error = %e,
-                        "[LDB-6026] state backend prune failed; old partials will linger"
+        // Prune old partials/markers outside the retention window. Leader-gated:
+        // the state backend is shared in cluster mode, so the leader (which
+        // advances the committer floor) owns GC; a follower's floor stays 0.
+        if is_decision_leader {
+            if let Some(ref backend) = self.state_backend {
+                let mut horizon = epoch.saturating_sub(self.config.max_retained as u64);
+                // Never prune descriptors the designated committer hasn't committed
+                // yet — hold the horizon at the commit floor for coordinated sinks.
+                if self.sinks.iter().any(|s| s.coordinated_commit) {
+                    horizon = horizon.min(
+                        self.coordinated_commit_floor
+                            .load(std::sync::atomic::Ordering::Acquire),
                     );
                 }
-                if let Some(ref ds) = self.decision_store {
-                    if let Err(e) = ds.prune_before(horizon).await {
-                        warn!(epoch, horizon, error = %e, "decision prune failed");
+                if horizon > 0 {
+                    if let Err(e) = backend.prune_before(horizon).await {
+                        warn!(
+                            epoch,
+                            horizon,
+                            error = %e,
+                            "[LDB-6026] state backend prune failed; old partials will linger"
+                        );
+                    }
+                    if let Some(ref ds) = self.decision_store {
+                        if let Err(e) = ds.prune_before(horizon).await {
+                            warn!(epoch, horizon, error = %e, "decision prune failed");
+                        }
                     }
                 }
             }

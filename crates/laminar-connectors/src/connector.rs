@@ -488,9 +488,7 @@ pub trait SinkConnector: Send {
     ///
     /// # Errors
     /// Returns `ConfigurationError` if the sink declares `coordinated_commit`
-    /// yet relies on this default — such a sink would seal epochs with no
-    /// external commit. (`Ok(None)` is still valid for a coordinated sink that
-    /// overrides this and has nothing staged for the epoch.)
+    /// yet relies on this default — it would seal epochs with no external commit.
     async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         if self.capabilities().coordinated_commit {
             return Err(ConnectorError::ConfigurationError(
