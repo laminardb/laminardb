@@ -1,9 +1,9 @@
 //! [`ObjectStoreBackend`] — durable partial-state storage backed by any
 //! `object_store` implementation (S3, GCS, Azure, `LocalFileSystem`).
 //!
-//! `epoch_complete(epoch, vnodes)` performs a CAS-commit: if every
-//! vnode's `partial.bin` is present, `put(_COMMIT, Create)` seals the
-//! epoch. The `_COMMIT` marker is the durability boundary the
+//! `epoch_complete` performs a CAS-commit: if every vnode's `partial.bin`
+//! and every required commit descriptor is present, `put(_COMMIT, Create)`
+//! seals the epoch. The `_COMMIT` marker is the durability boundary the
 //! checkpoint coordinator consults before releasing sinks.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -111,6 +111,10 @@ impl ObjectStoreBackend {
         OsPath::from(format!("epoch={epoch}/_COMMIT"))
     }
 
+    fn descriptor_path(epoch: u64, key: &str) -> OsPath {
+        OsPath::from(format!("epoch={epoch}/commit/{key}"))
+    }
+
     /// Parse `N` from a location whose first path segment is `epoch=N`.
     /// `None` for any sibling object that doesn't follow the layout.
     /// `str::split` always yields at least one segment.
@@ -170,7 +174,64 @@ impl StateBackend for ObjectStoreBackend {
         }
     }
 
-    async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError> {
+    async fn write_commit_descriptor(
+        &self,
+        epoch: u64,
+        key: &str,
+        assignment_version: u64,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError> {
+        let authoritative = self.authoritative_version.load(Ordering::Acquire);
+        if authoritative > 0 && assignment_version < authoritative {
+            return Err(StateBackendError::StaleVersion {
+                caller: assignment_version,
+                authoritative,
+            });
+        }
+        self.store
+            .put(&Self::descriptor_path(epoch, key), PutPayload::from(bytes))
+            .await
+            .map_err(|e| StateBackendError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_commit_descriptors(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<(String, Bytes)>, StateBackendError> {
+        use tokio_stream::StreamExt;
+
+        let prefix_str = format!("epoch={epoch}/commit/");
+        let mut entries = self.store.list(Some(&OsPath::from(prefix_str.clone())));
+        let mut out = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let loc = entry
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .location;
+            let key = loc
+                .as_ref()
+                .strip_prefix(&prefix_str)
+                .unwrap_or(loc.as_ref())
+                .to_string();
+            let bytes = self
+                .store
+                .get(&loc)
+                .await
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .bytes()
+                .await
+                .map_err(|e| StateBackendError::Io(e.to_string()))?;
+            out.push((key, bytes));
+        }
+        Ok(out)
+    }
+
+    async fn epoch_complete(
+        &self,
+        epoch: u64,
+        vnodes: &[u32],
+        required_descriptors: &[String],
+    ) -> Result<bool, StateBackendError> {
         use rustc_hash::FxHashSet;
         use tokio_stream::StreamExt;
 
@@ -205,6 +266,12 @@ impl StateBackend for ObjectStoreBackend {
                 return Ok(false);
             }
         }
+        // Commit descriptors live under `epoch=N/commit/` — already in this listing.
+        for key in required_descriptors {
+            if !found_paths.contains(&Self::descriptor_path(epoch, key)) {
+                return Ok(false);
+            }
+        }
 
         // CAS the commit marker; payload is the committer's id for audit.
         let payload = PutPayload::from(self.committer_bytes.clone());
@@ -222,6 +289,28 @@ impl StateBackend for ObjectStoreBackend {
             }
             Err(e) => Err(StateBackendError::Io(e.to_string())),
         }
+    }
+
+    async fn sealed_epochs(&self, after: u64) -> Result<Vec<u64>, StateBackendError> {
+        use tokio_stream::StreamExt;
+
+        let mut entries = self.store.list(None);
+        let mut out = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let loc = entry
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .location;
+            if !loc.as_ref().ends_with("/_COMMIT") {
+                continue;
+            }
+            if let Some(epoch) = Self::epoch_of_first_segment(loc.as_ref()) {
+                if epoch > after {
+                    out.push(epoch);
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
@@ -391,16 +480,41 @@ mod tests {
         let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
         let vnodes = [0u32, 1, 2];
 
-        assert!(!backend.epoch_complete(1, &vnodes).await.unwrap());
+        assert!(!backend.epoch_complete(1, &vnodes, &[]).await.unwrap());
         for v in &vnodes {
             backend
                 .write_partial(*v, 1, 0, Bytes::from_static(b"y"))
                 .await
                 .unwrap();
         }
-        assert!(backend.epoch_complete(1, &vnodes).await.unwrap());
+        assert!(backend.epoch_complete(1, &vnodes, &[]).await.unwrap());
         // Idempotent — same committer id in the audit body.
-        assert!(backend.epoch_complete(1, &vnodes).await.unwrap());
+        assert!(backend.epoch_complete(1, &vnodes, &[]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn epoch_complete_requires_commit_descriptors() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+        let vnodes = [0u32];
+        let key = "node=node-0/sink=ice";
+        let need = [key.to_string()];
+
+        backend
+            .write_partial(0, 1, 0, Bytes::from_static(b"s"))
+            .await
+            .unwrap();
+        // Partial present but the descriptor is missing → epoch not sealed.
+        assert!(!backend.epoch_complete(1, &vnodes, &need).await.unwrap());
+
+        backend
+            .write_commit_descriptor(1, key, 0, Bytes::from_static(b"df"))
+            .await
+            .unwrap();
+        assert!(backend.epoch_complete(1, &vnodes, &need).await.unwrap());
+
+        let descs = backend.read_commit_descriptors(1).await.unwrap();
+        assert_eq!(descs, vec![(key.to_string(), Bytes::from_static(b"df"))]);
     }
 
     /// Split-brain commit protection. Previously the CAS-create's
@@ -425,11 +539,11 @@ mod tests {
         }
 
         // Winner CAS-creates the commit marker first.
-        assert!(winner.epoch_complete(7, &vnodes).await.unwrap());
+        assert!(winner.epoch_complete(7, &vnodes, &[]).await.unwrap());
 
         // Loser finds the marker already there (HEAD fast-path) and
         // must NOT agree it committed — that's the split-brain case.
-        let err = loser.epoch_complete(7, &vnodes).await.unwrap_err();
+        let err = loser.epoch_complete(7, &vnodes, &[]).await.unwrap_err();
         match err {
             StateBackendError::SplitBrainCommit { committer, self_id } => {
                 assert_eq!(committer, "winner");
@@ -439,7 +553,7 @@ mod tests {
         }
 
         // And the winner's repeated call is still idempotent Ok(true).
-        assert!(winner.epoch_complete(7, &vnodes).await.unwrap());
+        assert!(winner.epoch_complete(7, &vnodes, &[]).await.unwrap());
     }
 
     /// Same contract on the CAS-loser path: if the marker doesn't exist
@@ -469,7 +583,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = loser.epoch_complete(3, &vnodes).await.unwrap_err();
+        let err = loser.epoch_complete(3, &vnodes, &[]).await.unwrap_err();
         assert!(matches!(
             err,
             StateBackendError::SplitBrainCommit { ref committer, .. }
@@ -565,7 +679,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            assert!(backend.epoch_complete(epoch, &vnodes).await.unwrap());
+            assert!(backend.epoch_complete(epoch, &vnodes, &[]).await.unwrap());
         }
 
         // Epoch 5 has partials but no commit marker — must be ignored.

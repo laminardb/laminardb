@@ -616,6 +616,35 @@ pub async fn start_cluster(
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(e.to_string()))?;
 
+    // Fenced leader lease. Wiring the watch into the controller makes
+    // `is_leader()` lease-aware, so every leader-gated path (checkpoint, 2PC,
+    // rebalance, committer) inherits fencing: a stale candidate whose lease
+    // expired stops being the leader. Renewal is gated on `is_gossip_leader` so
+    // the lease owner converges to the gossip candidate. Wired before `start()`.
+    let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
+        match (control_store.clone(), cluster_controller.as_ref()) {
+            (Some(lease_os), Some(controller)) => {
+                use laminar_core::cluster::control::{
+                    LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
+                };
+                let lease_cfg = LeaderLeaseConfig::default();
+                let ttl_ms = lease_cfg.ttl.as_millis() as i64;
+                let lease_store = Arc::new(LeaderLeaseStore::new(lease_os, ttl_ms));
+                let manager = LeaderLeaseManager::new(lease_store, node_id, lease_cfg);
+                controller.set_leader_lease_watch(manager.lease_watch());
+                let token = tokio_util::sync::CancellationToken::new();
+                let candidate = Arc::clone(controller);
+                let _lease_handle =
+                    manager.spawn(token.clone(), move || candidate.is_gossip_leader());
+                info!(
+                    "Leader lease manager started (ttl={}s)",
+                    lease_cfg.ttl.as_secs()
+                );
+                Some(token)
+            }
+            _ => None,
+        };
+
     db.start()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
@@ -651,34 +680,6 @@ pub async fn start_cluster(
         ));
         info!("Rebalance control plane started");
     }
-
-    // Fenced leader lease. Standalone split-brain hardening: a stale
-    // leader whose lease has expired loses the CAS to the next acquirer
-    // and stops renewing, while the new owner advances the monotonic
-    // fencing token. Runs whenever a shared control-plane store is
-    // available. The renewal loop is cancelled on shutdown via the token.
-    let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
-        match control_store.clone() {
-            Some(lease_os) => {
-                use laminar_core::cluster::control::{
-                    LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
-                };
-                let lease_cfg = LeaderLeaseConfig::default();
-                let ttl_ms = lease_cfg.ttl.as_millis() as i64;
-                let lease_store = Arc::new(LeaderLeaseStore::new(lease_os, ttl_ms));
-                let manager = LeaderLeaseManager::new(lease_store, node_id, lease_cfg);
-                let token = tokio_util::sync::CancellationToken::new();
-                // Detached renewal loop; it returns once `token` is cancelled
-                // during graceful shutdown.
-                let _lease_handle = manager.spawn(token.clone());
-                info!(
-                    "Leader lease manager started (ttl={}s)",
-                    lease_cfg.ttl.as_secs()
-                );
-                Some(token)
-            }
-            None => None,
-        };
 
     // Back the `/api/v1/cluster/*` endpoints. controller/snapshot_store may be
     // None under static discovery; the membership feed is always present.

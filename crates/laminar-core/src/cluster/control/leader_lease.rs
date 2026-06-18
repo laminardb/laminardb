@@ -237,6 +237,13 @@ pub fn lease_grants_leadership(lease: &Option<LeaderLease>, me: NodeId, now_ms: 
     matches!(lease, Some(l) if l.owner == me && !l.is_expired(now_ms))
 }
 
+/// [`lease_grants_leadership`] evaluated against the current wall clock.
+#[cfg(feature = "cluster")]
+#[must_use]
+pub fn lease_currently_grants(lease: &Option<LeaderLease>, me: NodeId) -> bool {
+    lease_grants_leadership(lease, me, now_millis())
+}
+
 /// Periodically renews the leader lease and publishes the latest record
 /// on a watch channel so other tasks can gate on the fencing token.
 pub struct LeaderLeaseManager {
@@ -274,16 +281,16 @@ impl LeaderLeaseManager {
         self.tx.subscribe()
     }
 
-    /// Spawn the renewal loop. Every `renew_interval` it `try_acquire`s
-    /// and publishes the resulting lease — `Acquired` when we own it,
-    /// otherwise the `Held` record so followers learn the current
-    /// fencing token. Errors are logged and retried next tick. Stops
-    /// when `shutdown` is cancelled.
+    /// Spawn the renewal loop: every `renew_interval`, when `should_acquire`
+    /// holds, `try_acquire` and publish the lease (so followers learn the
+    /// fencing token). A node that stops being the candidate lets its lease
+    /// lapse by TTL. Stops when `shutdown` is cancelled.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn spawn(
         self,
         shutdown: tokio_util::sync::CancellationToken,
+        should_acquire: impl Fn() -> bool + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(self.config.renew_interval);
@@ -293,6 +300,9 @@ impl LeaderLeaseManager {
                     biased;
                     () = shutdown.cancelled() => return,
                     _ = ticker.tick() => {}
+                }
+                if !should_acquire() {
+                    continue;
                 }
                 match self.store.try_acquire(self.me, now_millis()).await {
                     Ok(LeaseOutcome::Acquired(lease) | LeaseOutcome::Held(lease)) => {

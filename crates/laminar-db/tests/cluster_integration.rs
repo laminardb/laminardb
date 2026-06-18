@@ -615,7 +615,7 @@ mod rebalance {
         }
         assert!(
             backend
-                .epoch_complete(SEED_EPOCH, &all_vnodes)
+                .epoch_complete(SEED_EPOCH, &all_vnodes, &[])
                 .await
                 .expect("seal seed epoch"),
             "seed epoch must seal once every vnode partial is present",
@@ -1183,5 +1183,73 @@ mod minio {
         );
 
         cluster.shutdown().await;
+    }
+
+    /// Coordinated-commit descriptors written by two nodes to shared MinIO seal
+    /// the leader's gate only when both are present, and the leader reads both
+    /// back for the designated committer to aggregate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_node_coordinated_descriptors_aggregate_on_leader() {
+        use bytes::Bytes;
+        use laminar_core::state::StateBackend as _;
+
+        if minio_endpoint().is_none() {
+            eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
+            return;
+        }
+        let bucket = format!(
+            "laminar-coord-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let store = minio_store(&bucket).await;
+        let node1 = ObjectStoreBackend::new(Arc::clone(&store), "1".to_string(), 4);
+        let node2 = ObjectStoreBackend::new(Arc::clone(&store), "2".to_string(), 4);
+
+        let full = [0u32, 1, 2, 3];
+        let required = ["node=1/sink=s".to_string(), "node=2/sink=s".to_string()];
+
+        // Node 1 writes its vnode slice and its commit descriptor.
+        for v in [0u32, 1] {
+            node1
+                .write_partial(v, 1, 0, Bytes::from_static(b"a"))
+                .await
+                .unwrap();
+        }
+        node1
+            .write_commit_descriptor(1, "node=1/sink=s", 0, Bytes::from_static(b"d1"))
+            .await
+            .unwrap();
+
+        // Leader cannot seal yet — node 2's partials and descriptor are missing.
+        assert!(!node1.epoch_complete(1, &full, &required).await.unwrap());
+
+        // Node 2 writes its slice and descriptor to the same bucket.
+        for v in [2u32, 3] {
+            node2
+                .write_partial(v, 1, 0, Bytes::from_static(b"b"))
+                .await
+                .unwrap();
+        }
+        node2
+            .write_commit_descriptor(1, "node=2/sink=s", 0, Bytes::from_static(b"d2"))
+            .await
+            .unwrap();
+
+        // Now the leader seals: all partials and both descriptors are durable.
+        assert!(node1.epoch_complete(1, &full, &required).await.unwrap());
+
+        // The leader reads both nodes' descriptors for the committer to aggregate.
+        let mut descriptors = node1.read_commit_descriptors(1).await.unwrap();
+        descriptors.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            descriptors,
+            vec![
+                ("node=1/sink=s".to_string(), Bytes::from_static(b"d1")),
+                ("node=2/sink=s".to_string(), Bytes::from_static(b"d2")),
+            ]
+        );
     }
 }

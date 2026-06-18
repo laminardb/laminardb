@@ -1,13 +1,7 @@
-//! Apache Iceberg sink connector implementation.
-//!
-//! [`IcebergSink`] implements [`SinkConnector`], writing Arrow `RecordBatch`
-//! data to Iceberg tables with exactly-once semantics tied to checkpoint
-//! epochs via Iceberg's atomic transaction commits.
-//!
-//! `pre_commit()` moves the buffer into `staged_batches`.
-//! `commit_epoch()` writes Parquet data files and commits via Iceberg
-//! `Transaction::fast_append()`. `rollback_epoch()` discards staged data
-//! without side effects.
+//! Apache Iceberg sink connector: buffers Arrow `RecordBatch`es per checkpoint
+//! epoch and commits them atomically (exactly-once). With `coordinated_commit`,
+//! `pre_commit` writes Parquet and returns a descriptor for the designated
+//! committer; otherwise `commit_epoch` does a `fast_append`.
 
 use std::time::Duration;
 
@@ -30,30 +24,18 @@ use super::iceberg_config::IcebergSinkConfig;
 /// an Iceberg table atomically when the epoch commits. Each epoch produces
 /// at most one Iceberg transaction.
 pub struct IcebergSink {
-    /// Sink configuration — reparsed from `ConnectorConfig` in `open()`.
     config: IcebergSinkConfig,
-    /// Arrow schema for input batches.
     schema: Option<SchemaRef>,
-    /// Connector lifecycle state.
     state: ConnectorState,
-    /// Current epoch being written.
     current_epoch: u64,
-    /// Last successfully committed epoch.
     last_committed_epoch: u64,
-    /// `RecordBatch` buffer for the current epoch.
     buffer: Vec<RecordBatch>,
-    /// Total rows buffered in current epoch.
     buffered_rows: usize,
-    /// Staged batches ready for commit (populated by `pre_commit()`).
     staged_batches: Vec<RecordBatch>,
-    /// Rows staged for commit.
     staged_rows: usize,
-    /// Whether the current epoch was skipped (already committed).
     epoch_skipped: bool,
-    /// Cached catalog connection (initialized in `open()`).
     #[cfg(feature = "iceberg")]
     catalog: Option<std::sync::Arc<dyn iceberg::Catalog>>,
-    /// Cached table handle (updated after each commit).
     #[cfg(feature = "iceberg")]
     table: Option<iceberg::table::Table>,
     /// Arrow schema derived from the Iceberg table schema (carries
@@ -96,15 +78,8 @@ impl IcebergSink {
         self.staged_rows = 0;
     }
 
-    /// Reprojects a pipeline `RecordBatch` onto the Iceberg-derived Arrow
-    /// schema so that every field carries `PARQUET:field_id` metadata.
-    ///
-    /// Fast path: when the batch schema fields match the Iceberg schema
-    /// field-for-field (same names, types, count), just swap the schema
-    /// wrapper — columns are already in the right order.
-    ///
-    /// Slow path: match columns by name, cast where types differ (safe
-    /// widening validated in `open()`), fill nullable extras with nulls.
+    /// Reproject a batch onto the Iceberg-derived Arrow schema so every field
+    /// carries the `PARQUET:field_id` metadata the Iceberg writer requires.
     #[cfg(feature = "iceberg")]
     fn align_batch_to_iceberg_schema(
         &self,
@@ -217,16 +192,13 @@ impl IcebergSink {
 
     /// Writes staged batches to Iceberg as data files and commits.
     #[cfg(feature = "iceberg")]
-    async fn commit_to_iceberg(&mut self) -> Result<(), ConnectorError> {
+    /// Write staged batches to Parquet data files (no catalog commit). The
+    /// designated committer aggregates the returned files across writers.
+    async fn write_staged_data_files(
+        &self,
+    ) -> Result<Vec<iceberg::spec::DataFile>, ConnectorError> {
         use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
 
-        let catalog = self
-            .catalog
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open".into(),
-                actual: "catalog not initialized".into(),
-            })?;
         let table = self
             .table
             .as_ref()
@@ -246,46 +218,58 @@ impl IcebergSink {
             .build();
         let writer_builder = ParquetWriterBuilder::new(props, schema);
 
-        let mut all_data_files = Vec::new();
-
-        for (idx, batch) in self.staged_batches.iter().enumerate() {
+        // Stream every staged batch into ONE Parquet file (one S3 upload) per
+        // epoch. The source hands the sink many small batches (e.g. 1k-row Kafka
+        // polls); a file-per-batch loop would pay a full S3 multipart lifecycle
+        // for each, serializing the pipeline behind that I/O.
+        let mut writer = None;
+        for batch in &self.staged_batches {
             if batch.num_rows() == 0 {
                 continue;
             }
 
-            // Reproject the batch onto the Iceberg-derived Arrow schema so
-            // that every field carries PARQUET:field_id metadata. Without
-            // this the writer cannot correlate Arrow fields with Iceberg
-            // field IDs and fails with "Field id N not found in struct array".
+            // Reproject onto the Iceberg-derived Arrow schema so every field
+            // carries PARQUET:field_id metadata; without it the writer can't
+            // map Arrow fields to Iceberg field IDs ("Field id N not found").
             let aligned = self.align_batch_to_iceberg_schema(batch)?;
 
-            let file_path = format!(
-                "{location}/data/{}-{}-{}-{idx}.parquet",
-                self.config.writer_id,
-                self.current_epoch,
-                uuid::Uuid::new_v4(),
-            );
-
-            let output_file = file_io
-                .new_output(&file_path)
-                .map_err(|e| ConnectorError::WriteError(format!("create output: {e}")))?;
-
-            let mut writer = writer_builder
-                .clone()
-                .build(output_file)
-                .await
-                .map_err(|e| ConnectorError::WriteError(format!("build parquet writer: {e}")))?;
+            // Open lazily on the first non-empty batch so an all-empty epoch
+            // leaves no zero-row file behind.
+            if writer.is_none() {
+                let file_path = format!(
+                    "{location}/data/{}-{}-{}.parquet",
+                    self.config.writer_id,
+                    self.current_epoch,
+                    uuid::Uuid::new_v4(),
+                );
+                let output_file = file_io
+                    .new_output(&file_path)
+                    .map_err(|e| ConnectorError::WriteError(format!("create output: {e}")))?;
+                writer = Some(
+                    writer_builder
+                        .clone()
+                        .build(output_file)
+                        .await
+                        .map_err(|e| {
+                            ConnectorError::WriteError(format!("build parquet writer: {e}"))
+                        })?,
+                );
+            }
 
             writer
+                .as_mut()
+                .expect("writer opened above")
                 .write(&aligned)
                 .await
                 .map_err(|e| ConnectorError::WriteError(format!("parquet write: {e}")))?;
+        }
 
+        let mut all_data_files = Vec::new();
+        if let Some(writer) = writer {
             let data_file_builders = writer
                 .close()
                 .await
                 .map_err(|e| ConnectorError::WriteError(format!("close parquet writer: {e}")))?;
-
             for dfb in data_file_builders {
                 let data_file = dfb
                     .build()
@@ -294,54 +278,7 @@ impl IcebergSink {
             }
         }
 
-        if all_data_files.is_empty() {
-            debug!(epoch = self.current_epoch, "no data files to commit");
-            return Ok(());
-        }
-
-        let updated_table = super::iceberg_io::commit_data_files(
-            table,
-            catalog.as_ref(),
-            all_data_files,
-            Some((&self.config.writer_id, self.current_epoch)),
-        )
-        .await?;
-
-        // The Iceberg commit is durable at this point. Update table handle
-        // unconditionally so the next commit sees the new snapshot.
-        self.table = Some(updated_table);
-
-        // Best-effort schema refresh — keep the cached Arrow schema in sync
-        // with the table for the next epoch. A failure here must NOT prevent
-        // epoch advancement: if commit_to_iceberg() returned Err after the
-        // durable commit, commit_epoch() would skip last_committed_epoch
-        // update, and the next retry would duplicate the append.
-        let table = self.table.as_ref().expect("just set above");
-        let new_iceberg_schema = table.current_schema_ref();
-        match iceberg::arrow::schema_to_arrow_schema(&new_iceberg_schema) {
-            Ok(arrow_schema) => {
-                self.iceberg_arrow_schema = Some(std::sync::Arc::new(arrow_schema));
-            }
-            Err(e) => {
-                // Invalidate the cache so the next align_batch_to_iceberg_schema()
-                // fails with InvalidState rather than silently writing with stale
-                // field IDs that no longer match table.current_schema_ref().
-                self.iceberg_arrow_schema = None;
-                warn!(
-                    epoch = self.current_epoch,
-                    error = %e,
-                    "failed to refresh Iceberg Arrow schema; cache invalidated"
-                );
-            }
-        }
-
-        info!(
-            epoch = self.current_epoch,
-            rows = self.staged_rows,
-            "iceberg commit succeeded"
-        );
-
-        Ok(())
+        Ok(all_data_files)
     }
 }
 
@@ -384,12 +321,10 @@ impl SinkConnector for IcebergSink {
                 self.schema = Some(table_schema.clone());
             }
 
-            // Recover last committed epoch from table properties.
-            if let Some(epoch) =
-                super::iceberg_io::get_last_committed_epoch(&table, &self.config.writer_id)
-            {
+            // Recover the last epoch the designated committer sealed.
+            if let Some(epoch) = super::iceberg_io::coordinated_committed_epoch(&table) {
                 self.last_committed_epoch = epoch;
-                info!(writer_id = %self.config.writer_id, epoch, "recovered last committed epoch");
+                info!(epoch, "recovered last coordinated-committed epoch");
             }
 
             // Validate pipeline schema against table schema, then use the
@@ -456,29 +391,50 @@ impl SinkConnector for IcebergSink {
         Ok(())
     }
 
-    async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         if self.epoch_skipped {
-            return Ok(());
+            return Ok(None);
         }
 
         std::mem::swap(&mut self.staged_batches, &mut self.buffer);
         self.staged_rows = self.buffered_rows;
         self.clear_buffer();
 
-        Ok(())
+        if self.staged_rows == 0 {
+            return Ok(None);
+        }
+
+        // Coordinated commit: write Parquet now and hand the data files to the
+        // designated committer as a descriptor. The catalog commit happens once,
+        // on the committer, in commit_aggregated.
+        #[cfg(feature = "iceberg")]
+        {
+            let data_files = self.write_staged_data_files().await?;
+            self.clear_staged();
+            if data_files.is_empty() {
+                return Ok(None);
+            }
+            let table = self
+                .table
+                .as_ref()
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "open".into(),
+                    actual: "table not loaded".into(),
+                })?;
+            return Ok(Some(super::iceberg_io::encode_commit_descriptor(
+                table, data_files,
+            )?));
+        }
+        #[cfg(not(feature = "iceberg"))]
+        {
+            self.clear_staged();
+            Ok(None)
+        }
     }
 
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        if self.epoch_skipped || self.staged_rows == 0 {
-            self.clear_staged();
-            return Ok(());
-        }
-
-        #[cfg(feature = "iceberg")]
-        {
-            self.commit_to_iceberg().await?;
-        }
-
+        // Coordinated commit: data files were written in pre_commit and the
+        // catalog commit is done by the designated committer (commit_aggregated).
         self.last_committed_epoch = epoch;
         self.clear_staged();
         Ok(())
@@ -497,6 +453,12 @@ impl SinkConnector for IcebergSink {
         SinkConnectorCapabilities::new(Duration::from_secs(300))
             .with_exactly_once()
             .with_two_phase_commit()
+            .with_coordinated_commit()
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn as_coordinated_committer(&self) -> Option<&dyn crate::connector::CoordinatedCommitter> {
+        Some(self)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -508,6 +470,69 @@ impl SinkConnector for IcebergSink {
         }
         self.state = ConnectorState::Closed;
         Ok(())
+    }
+}
+
+#[cfg(feature = "iceberg")]
+#[async_trait]
+impl crate::connector::CoordinatedCommitter for IcebergSink {
+    async fn commit_aggregated(
+        &self,
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+    ) -> Result<(), ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open".into(),
+                actual: "catalog not initialized".into(),
+            })?;
+        // Reload for current metadata (schema, partition spec, epoch guard).
+        let table = super::iceberg_io::load_table(
+            catalog.as_ref(),
+            &self.config.catalog.namespace,
+            &self.config.catalog.table_name,
+        )
+        .await?;
+        // Idempotent: skip if this epoch is already sealed in the table.
+        if super::iceberg_io::coordinated_committed_epoch(&table).is_some_and(|c| epoch <= c) {
+            return Ok(());
+        }
+        let data_files = super::iceberg_io::decode_commit_descriptors(&table, &descriptors)?;
+        if data_files.is_empty() {
+            return Ok(());
+        }
+        super::iceberg_io::commit_data_files_coordinated(
+            &table,
+            catalog.as_ref(),
+            data_files,
+            epoch,
+        )
+        .await?;
+        info!(
+            epoch,
+            writers = descriptors.len(),
+            "iceberg coordinated commit"
+        );
+        Ok(())
+    }
+
+    async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open".into(),
+                actual: "catalog not initialized".into(),
+            })?;
+        let table = super::iceberg_io::load_table(
+            catalog.as_ref(),
+            &self.config.catalog.namespace,
+            &self.config.catalog.table_name,
+        )
+        .await?;
+        Ok(super::iceberg_io::coordinated_committed_epoch(&table))
     }
 }
 
@@ -561,29 +586,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pre_commit_stages_buffer() {
+    async fn test_rollback_clears_buffer() {
         let mut sink = IcebergSink::new(test_config(), None);
         sink.begin_epoch(1).await.unwrap();
         sink.write_batch(&test_batch(100)).await.unwrap();
-
-        sink.pre_commit(1).await.unwrap();
-        assert_eq!(sink.staged_rows, 100);
-        assert_eq!(sink.staged_batches.len(), 1);
-        assert!(sink.buffer.is_empty());
-        assert_eq!(sink.buffered_rows, 0);
-    }
-
-    #[tokio::test]
-    async fn test_rollback_clears_staged() {
-        let mut sink = IcebergSink::new(test_config(), None);
-        sink.begin_epoch(1).await.unwrap();
-        sink.write_batch(&test_batch(100)).await.unwrap();
-        sink.pre_commit(1).await.unwrap();
 
         sink.rollback_epoch(1).await.unwrap();
-        assert!(sink.staged_batches.is_empty());
-        assert_eq!(sink.staged_rows, 0);
         assert!(sink.buffer.is_empty());
+        assert_eq!(sink.buffered_rows, 0);
+        assert!(sink.staged_batches.is_empty());
     }
 
     #[tokio::test]
@@ -612,6 +623,7 @@ mod tests {
         let caps = sink.capabilities();
         assert!(caps.exactly_once);
         assert!(caps.two_phase_commit);
+        assert!(caps.coordinated_commit);
         assert!(!caps.partitioned);
         assert!(!caps.upsert);
     }

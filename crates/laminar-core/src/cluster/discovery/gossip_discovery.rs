@@ -411,7 +411,7 @@ impl GossipDiscovery {
                         let peer_list: Vec<NodeInfo> =
                             new_peers.values().cloned().collect();
                         *peers.write() = new_peers;
-                        let _ = membership_tx.send(peer_list);
+                        super::publish_if_changed(&membership_tx, peer_list);
                     }
                 }
             }

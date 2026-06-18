@@ -111,6 +111,9 @@ pub struct EngineMetrics {
     /// Vnode partials written as references to an unchanged base
     /// instead of re-uploading state.
     pub checkpoint_unchanged_vnodes: IntCounter,
+    /// Sealed-but-not-yet-externally-committed epochs for coordinated sinks
+    /// (designated-committer lag). Rising = the committer can't keep up.
+    pub coordinated_committer_lag_epochs: IntGauge,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// Sink commit round-trip (2PC phase 2).
@@ -382,6 +385,11 @@ impl EngineMetrics {
                     "Restorable-gate poll wait per epoch (vnode-partial presence)",
                 )
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 15).unwrap()),
+            )
+            .unwrap()),
+            coordinated_committer_lag_epochs: reg!(IntGauge::new(
+                "coordinated_committer_lag_epochs",
+                "Sealed epochs not yet externally committed by the designated committer",
             )
             .unwrap()),
             checkpoint_unchanged_vnodes: reg!(IntCounter::new(

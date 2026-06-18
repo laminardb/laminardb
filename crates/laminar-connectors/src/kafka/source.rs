@@ -1,9 +1,5 @@
-//! Kafka source connector implementation.
-//!
-//! [`KafkaSource`] implements the [`SourceConnector`] trait, consuming
-//! from Kafka topics via rdkafka's `StreamConsumer`, deserializing
-//! messages using pluggable formats, and producing Arrow `RecordBatch`
-//! data through the connector SDK.
+//! Kafka source connector: consumes topics via rdkafka's `StreamConsumer`,
+//! deserializes with pluggable formats, and yields Arrow `RecordBatch`es.
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -58,8 +54,7 @@ struct KafkaPayload {
     partition: i32,
     offset: i64,
     timestamp_ms: Option<i64>,
-    /// Kafka message headers serialized as JSON string ("{key: value, ...}").
-    /// Only populated when `include_headers` is enabled.
+    /// Message headers as a JSON string; populated only when `include_headers` is set.
     headers_json: Option<String>,
 }
 
@@ -90,14 +85,9 @@ pub struct KafkaSource {
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance counter bridging `LaminarConsumerContext` → `KafkaSourceMetrics`.
     rebalance_counter: Arc<AtomicU64>,
-    /// Monotonic counter bumped on each partition revoke event.
-    ///
-    /// Shared with `LaminarConsumerContext` for lock-free revoke detection
-    /// from `poll_batch()`. The source compares `last_seen_revoke_gen`
-    /// against this value each poll cycle and only locks `rebalance_state`
-    /// when a change is detected to purge revoked partition offsets.
+    /// Bumped on each partition revoke; `poll_batch` compares it lock-free to
+    /// detect a revoke and purge the lost partitions' offsets.
     revoke_generation: Arc<AtomicU64>,
-    /// Last observed value of `revoke_generation`, cached per poll cycle.
     last_seen_revoke_gen: u64,
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     data_ready: Arc<Notify>,
@@ -110,35 +100,28 @@ pub struct KafkaSource {
     /// Latest TPL the commit task should flush (last-writer-wins).
     commit_tx: Option<watch::Sender<Option<TopicPartitionList>>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
-    /// Receiver for high watermark data from the background reader task.
-    /// Each entry is `(topic, partition, high_watermark)` for lag computation.
+    /// `(topic, partition, high_watermark)` from the reader task, for lag computation.
     #[allow(clippy::type_complexity)]
     high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
-    /// Shared flag: `true` when the reader task has paused Kafka partitions
-    /// due to downstream backpressure. Used to re-pause newly assigned
-    /// partitions during rebalance.
+    /// Set while the reader has paused partitions for backpressure; re-pauses
+    /// newly assigned partitions on rebalance.
     reader_paused: Arc<AtomicBool>,
-    /// Offset snapshot shared with the rebalance callback for seek-on-assign.
-    /// Updated once per `poll_batch()` cycle (not per message).
+    /// Offset snapshot for the rebalance callback's seek-on-assign, refreshed
+    /// once per `poll_batch()` cycle.
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
 
-    /// Cluster vnode assignment, set in cluster mode via
-    /// [`set_vnode_assignment`](SourceConnector::set_vnode_assignment). When
-    /// present, `open()` uses engine-controlled manual `assign()` of the
+    /// Cluster vnode assignment: when set, `open()` manually `assign()`s the
     /// partitions this node owns (`partition % vnode_count`) instead of
-    /// consumer-group `subscribe()`, and the reader re-binds when the
-    /// assignment version rotates. `None` → legacy broker-driven subscribe.
+    /// `subscribe()`, and the reader re-binds on version rotation.
     vnode_assignment: Option<(
         Arc<laminar_core::state::VnodeRegistry>,
         laminar_core::state::NodeId,
     )>,
-    /// `(topic, partition_count)` captured at `open()` when vnode-assigned, so
-    /// the reader can recompute owned partitions on assignment rotation without
-    /// re-fetching metadata (partition counts are stable).
+    /// `(topic, partition_count)` from `open()`, so the reader can recompute
+    /// owned partitions on rotation without re-fetching metadata.
     vnode_topic_meta: Vec<(Arc<str>, i32)>,
 
-    /// Last Avro writer schema from the schema registry, used to diff
-    /// successive versions for evolution detection.
+    /// Previous Avro writer schema, diffed against the next for evolution detection.
     last_avro_schema: Option<SchemaRef>,
 
     // Reusable poll_batch buffers — cleared each cycle, capacity retained.
@@ -309,14 +292,8 @@ impl KafkaSource {
         self.config.event_time_column.as_deref()
     }
 
-    /// Spawns background tasks on first `poll_batch()` call.
-    ///
-    /// Three tasks handle separate concerns:
-    /// - **Reader**: consumes messages, manages backpressure, detects revokes
-    /// - **Commit**: services on-checkpoint broker offset commits
-    /// - **HWM**: periodic high watermark queries for lag monitoring
-    ///
-    /// Deferred to allow `restore()` to access the consumer directly after `open()`.
+    /// Spawns the background reader, commit, and HWM tasks on the first
+    /// `poll_batch()`. Deferred so `restore()` can seek the consumer first.
     #[allow(clippy::too_many_lines)]
     fn ensure_reader_started(&mut self) {
         if self.reader_handle.is_some() || self.consumer.is_none() {
@@ -510,13 +487,19 @@ impl KafkaSource {
                     }
                 }
 
+                // While paused, recv() yields nothing, so a long timeout would
+                // gate the resume re-check at the top of the loop behind it.
+                // Poll briefly when paused so resume fires promptly; block
+                // longer when running so an idle topic doesn't spin.
+                let recv_timeout = if is_paused {
+                    std::time::Duration::from_millis(10)
+                } else {
+                    std::time::Duration::from_millis(200)
+                };
                 let msg_result = tokio::select! {
                     biased;
                     _ = reader_shutdown.changed() => break,
-                    msg = tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        consumer.recv(),
-                    ) => match msg {
+                    msg = tokio::time::timeout(recv_timeout, consumer.recv()) => match msg {
                         Ok(result) => result,
                         Err(_timeout) => continue,
                     },
@@ -755,6 +738,10 @@ impl SourceConnector for KafkaSource {
         // `subscribe()`. Manual assign bypasses the broker rebalance callbacks,
         // so partitions are positioned here directly (checkpointed offset, else
         // the startup default). The reader loop re-binds on assignment rotation.
+        //
+        // Reset stale metadata so a re-`open()` that falls back to subscribe
+        // doesn't leave `checkpoint()` filtering by a prior run's vnode ownership.
+        self.vnode_topic_meta.clear();
         let vnode = self
             .vnode_assignment
             .as_ref()
@@ -1445,6 +1432,25 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Engine-controlled vnode assignment uses manual `assign()`, which fires
+        // no rebalance callbacks — so `rebalance_state` stays empty and can't
+        // drive the filter. Filter by the partitions this node owns instead;
+        // otherwise every checkpoint would record zero offsets and recovery
+        // would replay each partition from `auto.offset.reset`.
+        if let Some((registry, self_id)) = &self.vnode_assignment {
+            if !self.vnode_topic_meta.is_empty() {
+                let owned: std::collections::HashSet<(String, i32)> = self
+                    .vnode_topic_meta
+                    .iter()
+                    .flat_map(|(topic, count)| {
+                        crate::partition_assignment::owned_partitions(*count, registry, *self_id)
+                            .into_iter()
+                            .map(move |p| (topic.to_string(), p))
+                    })
+                    .collect();
+                return self.offsets.to_checkpoint_filtered(&owned);
+            }
+        }
         let assigned = lock_or_recover(&self.rebalance_state)
             .assigned_partitions()
             .clone();
@@ -1641,6 +1647,36 @@ mod tests {
         let cp = source.checkpoint();
         assert_eq!(cp.get_offset("events-0"), Some("100"));
         assert_eq!(cp.get_offset("events-1"), Some("200"));
+    }
+
+    #[test]
+    fn test_checkpoint_vnode_assigned_uses_owned_partitions() {
+        // Vnode mode uses manual assign(), which fires no rebalance callbacks,
+        // so rebalance_state stays empty. checkpoint() must filter by owned
+        // partitions instead — otherwise a cluster Kafka source records zero
+        // offsets and replays from the start on recovery.
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.offsets.update("events", 0, 100);
+        source.offsets.update("events", 1, 200);
+        source.offsets.update("events", 2, 300);
+        source.offsets.update("events", 3, 400);
+
+        // 4 vnodes; node 0 owns vnodes 0 and 2, node 1 owns 1 and 3.
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::new(4));
+        let node0 = laminar_core::state::NodeId(0);
+        let node1 = laminar_core::state::NodeId(1);
+        registry.set_assignment(vec![node0, node1, node0, node1].into());
+
+        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.vnode_topic_meta = vec![(Arc::from("events"), 4)];
+
+        // rebalance_state is empty (no callbacks under manual assign): the old
+        // code returned an empty checkpoint here.
+        let cp = source.checkpoint();
+        assert_eq!(cp.get_offset("events-0"), Some("100")); // vnode 0 → node0
+        assert_eq!(cp.get_offset("events-1"), None); // vnode 1 → node1
+        assert_eq!(cp.get_offset("events-2"), Some("300")); // vnode 2 → node0
+        assert_eq!(cp.get_offset("events-3"), None); // vnode 3 → node1
     }
 
     #[test]

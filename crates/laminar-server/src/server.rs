@@ -292,6 +292,8 @@ pub(crate) fn apply_checkpoint_config(
         alignment_timeout_ms: None,
         max_in_flight_epochs: checkpoint.max_in_flight_epochs,
         max_staged_bytes: checkpoint.max_staged_bytes,
+        max_uncommitted_epochs: checkpoint.max_uncommitted_epochs,
+        uncommitted_epochs_backpressure: checkpoint.uncommitted_epochs_backpressure,
     };
     builder = builder.checkpoint(cfg);
 

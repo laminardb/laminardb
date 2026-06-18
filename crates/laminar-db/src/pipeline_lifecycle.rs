@@ -329,6 +329,10 @@ impl LaminarDB {
                 max_staged_bytes: cp_config
                     .max_staged_bytes
                     .unwrap_or(defaults.max_staged_bytes),
+                max_uncommitted_epochs: cp_config
+                    .max_uncommitted_epochs
+                    .unwrap_or(defaults.max_uncommitted_epochs),
+                uncommitted_epochs_backpressure: cp_config.uncommitted_epochs_backpressure,
                 ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
@@ -905,6 +909,7 @@ impl LaminarDB {
                     sink_id,
                     connector: sink,
                     exactly_once: caps.exactly_once,
+                    coordinated_commit: caps.coordinated_commit,
                     channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
                     flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
                     write_timeout,
@@ -937,14 +942,67 @@ impl LaminarDB {
             table_sources.push((name.clone(), source, mode));
         }
 
-        {
+        let (coordinated_committer, committer_poll) = {
             let mut guard = self.coordinator.lock().await;
-            if let Some(ref mut coord) = *guard {
+            if let Some(coord) = guard.as_mut() {
                 for (name, handle, _, _, _) in &sinks {
-                    let exactly_once = handle.exactly_once();
-                    coord.register_sink(name.clone(), handle.clone(), exactly_once);
+                    coord.register_sink(
+                        name.clone(),
+                        handle.clone(),
+                        handle.exactly_once(),
+                        handle.coordinated_commit(),
+                    );
                 }
+                (
+                    coord.coordinated_committer(),
+                    coord.committer_poll_interval(),
+                )
+            } else {
+                // No coordinator (checkpointing disabled) means no designated
+                // committer; a coordinated sink would seal epochs that never
+                // get externally committed → silent data loss. Fail fast.
+                if sinks.iter().any(|(_, h, _, _, _)| h.coordinated_commit()) {
+                    return Err(DbError::Config(
+                        "a sink declares coordinated_commit but checkpointing is \
+                         disabled; coordinated commit requires a checkpoint coordinator"
+                            .into(),
+                    ));
+                }
+                (None, std::time::Duration::from_secs(1))
             }
+        };
+
+        // Decoupled designated committer: a poll loop off the barrier path that
+        // commits sealed epochs for coordinated-commit sinks. Spawned only when
+        // such sinks exist; stops on terminal pipeline state. The handle is held
+        // so shutdown can abort it (its work is idempotent).
+        if let Some(mut committer) = coordinated_committer {
+            let state = Arc::clone(&self.state);
+            let handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(committer_poll);
+                loop {
+                    tick.tick().await;
+                    if matches!(
+                        DbState::load(&state),
+                        DbState::Stopped
+                            | DbState::ShuttingDown
+                            | DbState::Faulted
+                            | DbState::Created
+                    ) {
+                        break;
+                    }
+                    if let Err(e) = committer.commit_ready().await {
+                        tracing::warn!(error = %e, "coordinated committer pass failed; will retry");
+                    }
+                }
+            });
+            // Abort any prior committer (e.g. on a Faulted→start() restart) so a
+            // stale loop can't run concurrently with the new one.
+            let mut guard = self.committer_handle.lock();
+            if let Some(prev) = guard.take() {
+                prev.abort();
+            }
+            *guard = Some(handle);
         }
 
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
@@ -1782,6 +1840,9 @@ impl LaminarDB {
         *self.force_ckpt_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
+        if let Some(h) = self.committer_handle.lock().take() {
+            h.abort();
+        }
 
         let handle = self.runtime_handle.lock().take();
         if let Some(handle) = handle {
@@ -1817,6 +1878,9 @@ impl LaminarDB {
         *self.force_ckpt_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
+        if let Some(h) = self.committer_handle.lock().take() {
+            h.abort();
+        }
 
         let handle = self.runtime_handle.lock().take();
         if let Some(handle) = handle {

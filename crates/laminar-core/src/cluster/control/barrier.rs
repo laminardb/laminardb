@@ -734,13 +734,36 @@ impl BarrierCoordinator {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
                 let local_id = self.local_node_id().await;
+                // Record the decision in KV before delivery, so a reclaiming
+                // leader's `max_announced()` and a recovering peer's KV fallback
+                // still see this epoch even if a peer RPC below fails and returns
+                // early (the RPC receiver does not persist the announcement).
+                let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
+                self.kv.write(ANNOUNCEMENT_KEY, json).await;
                 if ann.phase == Phase::Prepare {
                     // Prepare gRPC calls are initiated by wait_for_quorum.
                     // Redundant calls here cause duplicate prepare executions and timeouts on followers.
                 } else {
+                    // A node's barrier address lingers in the KV after it dies,
+                    // so announce to peers still Active in membership — a Commit
+                    // RPC to a departed peer returns Err and wedges every epoch.
+                    // The KV-fallback write below still lets a recovering peer
+                    // observe the announcement.
+                    let live: Option<FxHashSet<NodeId>> =
+                        self.leader_election.lock().clone().map(|(_, members_rx)| {
+                            members_rx
+                                .borrow()
+                                .iter()
+                                .filter(|m| matches!(m.state, NodeState::Active))
+                                .map(|m| m.id)
+                                .collect()
+                        });
                     let mut expected = Vec::new();
                     for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
                         if addr == state.advertise_addr {
+                            continue;
+                        }
+                        if live.as_ref().is_some_and(|live| !live.contains(&node_id)) {
                             continue;
                         }
                         expected.push(node_id);
@@ -774,8 +797,6 @@ impl BarrierCoordinator {
                     }
                 }
 
-                let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
-                self.kv.write(ANNOUNCEMENT_KEY, json).await;
                 return Ok(());
             }
         }
@@ -841,6 +862,19 @@ impl BarrierCoordinator {
             (Some(g), None) => Some(g),
             (None, k) => k,
         })
+    }
+
+    /// Highest `(epoch, checkpoint_id)` any node has announced, across the gossiped
+    /// per-node announcement keys — a reclaiming leader advances past it on rejoin.
+    #[must_use]
+    pub async fn max_announced(&self) -> Option<(u64, u64)> {
+        self.kv
+            .scan(ANNOUNCEMENT_KEY)
+            .await
+            .into_iter()
+            .filter_map(|(_, json)| serde_json::from_str::<BarrierAnnouncement>(&json).ok())
+            .map(|a| (a.epoch, a.checkpoint_id))
+            .max()
     }
 
     /// Follower-side ack.

@@ -593,7 +593,7 @@ pub struct KafkaSourceConfig {
 
     // -- Backpressure --
     /// Capacity of the bounded channel between the background Kafka reader
-    /// task and `poll_batch()` (default: 1024). Must be >= `max_poll_records`.
+    /// task and `poll_batch()` (default: 8192). Must be >= `max_poll_records`.
     pub reader_channel_capacity: usize,
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,
@@ -679,9 +679,9 @@ impl Default for KafkaSourceConfig {
             max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
             broker_commit_on_checkpoint: true,
-            reader_channel_capacity: 1024,
+            reader_channel_capacity: 8192,
             backpressure_high_watermark: 0.8,
-            backpressure_low_watermark: 0.5,
+            backpressure_low_watermark: 0.25,
             max_deser_error_rate: 0.5,
             kafka_properties: HashMap::new(),
         }
@@ -902,7 +902,7 @@ impl KafkaSourceConfig {
 
         let reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
-            .unwrap_or(1024);
+            .unwrap_or(8192);
 
         let backpressure_high_watermark = config
             .get_parsed::<f64>("backpressure.high.watermark")?
@@ -910,7 +910,7 @@ impl KafkaSourceConfig {
 
         let backpressure_low_watermark = config
             .get_parsed::<f64>("backpressure.low.watermark")?
-            .unwrap_or(0.5);
+            .unwrap_or(0.25);
 
         let max_deser_error_rate = config
             .get_parsed::<f64>("max.deser.error.rate")?
@@ -1326,7 +1326,9 @@ mod tests {
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
         assert!(cfg.broker_commit_on_checkpoint);
-        assert_eq!(cfg.reader_channel_capacity, 1024);
+        assert_eq!(cfg.reader_channel_capacity, 8192);
+        assert_eq!(cfg.backpressure_high_watermark, 0.8);
+        assert_eq!(cfg.backpressure_low_watermark, 0.25);
     }
 
     #[test]

@@ -50,6 +50,7 @@ pub(crate) struct SinkTaskConfig {
     pub sink_id: Arc<str>,
     pub connector: Box<dyn SinkConnector>,
     pub exactly_once: bool,
+    pub coordinated_commit: bool,
     pub channel_capacity: usize,
     pub flush_interval: Duration,
     pub write_timeout: Duration,
@@ -70,11 +71,22 @@ pub(crate) enum SinkCommand {
     },
     PreCommit {
         epoch: u64,
-        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<Option<Vec<u8>>, ConnectorError>>,
     },
     CommitEpoch {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
+    },
+    /// Designated-committer path: aggregate every writer's descriptor for the
+    /// epoch into one external commit (coordinated-commit sinks only).
+    CommitAggregated {
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
+    },
+    /// Highest epoch already committed externally, for committer cursor resume.
+    CommittedThrough {
+        ack: oneshot::TxOneshot<Result<Option<u64>, ConnectorError>>,
     },
     /// `force = false` keeps a healthy sink's pending transactional output —
     /// sources don't rewind on a live abort so those rows must not be discarded.
@@ -98,6 +110,7 @@ pub(crate) struct SinkTaskHandle {
     sink_id: Arc<str>,
     tx: SinkCommandTx,
     exactly_once: bool,
+    coordinated_commit: bool,
     // `close()` extracts the handle under the lock then awaits outside it — lock never spans `.await`.
     #[allow(dead_code)]
     task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
@@ -120,6 +133,7 @@ impl SinkTaskHandle {
             sink_id,
             connector,
             exactly_once,
+            coordinated_commit,
             channel_capacity,
             flush_interval,
             write_timeout,
@@ -144,6 +158,7 @@ impl SinkTaskHandle {
             sink_id,
             tx,
             exactly_once,
+            coordinated_commit,
             task: Arc::new(parking_lot::Mutex::new(Some(handle))),
             event_tx,
         }
@@ -205,8 +220,9 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("flush"))?
     }
 
-    /// 2PC phase 1: flush and prepare.
-    pub async fn pre_commit(&self, epoch: u64) -> Result<(), ConnectorError> {
+    /// 2PC phase 1: flush and prepare. Returns the connector's commit
+    /// descriptor for `coordinated_commit` sinks, else `None`.
+    pub async fn pre_commit(&self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::PreCommit { epoch, ack: ack_tx })
@@ -215,6 +231,38 @@ impl SinkTaskHandle {
         ack_rx
             .await
             .map_err(|_| self.ack_dropped_err("pre-commit"))?
+    }
+
+    /// Designated-committer commit of aggregated descriptors for `epoch`.
+    pub async fn commit_aggregated(
+        &self,
+        epoch: u64,
+        descriptors: Vec<Vec<u8>>,
+    ) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::oneshot();
+        self.tx
+            .send(SinkCommand::CommitAggregated {
+                epoch,
+                descriptors,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| self.closed_err())?;
+        ack_rx
+            .await
+            .map_err(|_| self.ack_dropped_err("commit-aggregated"))?
+    }
+
+    /// Highest epoch already committed externally (committer cursor resume).
+    pub async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::oneshot();
+        self.tx
+            .send(SinkCommand::CommittedThrough { ack: ack_tx })
+            .await
+            .map_err(|_| self.closed_err())?;
+        ack_rx
+            .await
+            .map_err(|_| self.ack_dropped_err("committed-through"))?
     }
 
     /// 2PC phase 2: finalize the transaction.
@@ -266,6 +314,10 @@ impl SinkTaskHandle {
 
     pub fn exactly_once(&self) -> bool {
         self.exactly_once
+    }
+
+    pub fn coordinated_commit(&self) -> bool {
+        self.coordinated_commit
     }
 }
 
@@ -375,6 +427,27 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                             ))
                         } else {
                             inner.sink.commit_epoch(epoch).await
+                        };
+                        ack.send(result);
+                    }
+                    SinkCommand::CommitAggregated {
+                        epoch,
+                        descriptors,
+                        ack,
+                    } => {
+                        let result = match inner.sink.as_coordinated_committer() {
+                            Some(committer) => committer.commit_aggregated(epoch, descriptors).await,
+                            None => Err(ConnectorError::InvalidState {
+                                expected: "coordinated committer".into(),
+                                actual: format!("sink '{}' is not coordinated", inner.name),
+                            }),
+                        };
+                        ack.send(result);
+                    }
+                    SinkCommand::CommittedThrough { ack } => {
+                        let result = match inner.sink.as_coordinated_committer() {
+                            Some(committer) => committer.committed_through().await,
+                            None => Ok(None),
                         };
                         ack.send(result);
                     }
@@ -515,6 +588,7 @@ mod tests {
             sink_id: Arc::from(name),
             connector,
             exactly_once: false,
+            coordinated_commit: false,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout,

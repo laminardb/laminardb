@@ -85,13 +85,16 @@ async fn distributed_embedded_static_two_instances_shared_store() {
     );
 
     // node_a wins the CAS — it committed the epoch.
-    assert!(node_a.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap());
+    assert!(node_a.epoch_complete(1, &[0, 1, 2, 3], &[]).await.unwrap());
     // node_a calling again is idempotent (same committer id in the
     // audit body), so it still gets Ok(true).
-    assert!(node_a.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap());
+    assert!(node_a.epoch_complete(1, &[0, 1, 2, 3], &[]).await.unwrap());
 
     // node_b loses — it must not keep driving the commit phase.
-    let err = node_b.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap_err();
+    let err = node_b
+        .epoch_complete(1, &[0, 1, 2, 3], &[])
+        .await
+        .unwrap_err();
     match err {
         StateBackendError::SplitBrainCommit { committer, self_id } => {
             assert_eq!(committer, "node-a");
@@ -104,5 +107,5 @@ async fn distributed_embedded_static_two_instances_shared_store() {
         .write_partial(0, 2, 0, Bytes::from_static(b"A0@2"))
         .await
         .unwrap();
-    assert!(!node_a.epoch_complete(2, &[0, 1, 2, 3]).await.unwrap());
+    assert!(!node_a.epoch_complete(2, &[0, 1, 2, 3], &[]).await.unwrap());
 }

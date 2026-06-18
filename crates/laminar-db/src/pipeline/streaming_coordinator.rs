@@ -692,18 +692,7 @@ impl StreamingCoordinator {
         // ack reaches the broker (Kafka group offsets, etc.).
         let checkpoint_enabled = self.config.checkpoint_interval.is_some();
         if checkpoint_enabled {
-            let source_offsets: FxHashMap<String, SourceCheckpoint> = self
-                .committed_offsets
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, cp)| {
-                    cp.as_ref().and_then(|c| {
-                        self.source_names
-                            .get(idx)
-                            .map(|name| (name.to_string(), c.clone()))
-                    })
-                })
-                .collect();
+            let source_offsets = self.current_source_offsets();
             if let Some(epoch) = callback
                 .maybe_checkpoint(true, source_offsets.clone())
                 .await
@@ -789,6 +778,24 @@ impl StreamingCoordinator {
                 barriers.push((source_idx, barrier, checkpoint));
             }
         }
+    }
+
+    /// Current per-source committed offsets, keyed by source name. These reflect the
+    /// last successfully processed cycle, so they match the operator/sink state a
+    /// forced (non-barrier) checkpoint captures — without them such a checkpoint would
+    /// advance the recovery point with no source offset and replay from the start.
+    fn current_source_offsets(&self) -> FxHashMap<String, SourceCheckpoint> {
+        self.committed_offsets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cp)| {
+                cp.as_ref().and_then(|c| {
+                    self.source_names
+                        .get(idx)
+                        .map(|name| (name.to_string(), c.clone()))
+                })
+            })
+            .collect()
     }
 
     /// Merge staged offsets into `committed_offsets` after a successful cycle.
@@ -885,8 +892,10 @@ impl StreamingCoordinator {
 
         // Give the callback a chance to run follower polling. On non-leaders this routes
         // to `maybe_follower_checkpoint` so gossip PREPARE announcements are picked up
-        // even with no data-path events.
-        let offsets = FxHashMap::default();
+        // even with no data-path events. The offsets also feed any drained
+        // `db.checkpoint()` request (e.g. the rebalance pre-rotation drain) so a forced
+        // checkpoint records source offsets instead of advancing the recovery point blind.
+        let offsets = self.current_source_offsets();
         if let Some(epoch) = callback.maybe_checkpoint(false, offsets).await {
             self.broadcast_epoch_committed(epoch, &FxHashMap::default());
         }

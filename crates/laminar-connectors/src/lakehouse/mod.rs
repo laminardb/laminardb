@@ -1,5 +1,9 @@
 //! Lakehouse connectors (Delta Lake, Apache Iceberg).
 
+// Shared versioned envelope for coordinated-commit descriptors.
+#[cfg(any(feature = "iceberg", feature = "delta-lake"))]
+mod commit_descriptor;
+
 // Delta Lake modules
 pub mod delta;
 pub mod delta_config;

@@ -1162,7 +1162,7 @@ mod rehydration_tests {
                 .await
                 .unwrap();
         }
-        assert!(backend.epoch_complete(epoch, vnodes).await.unwrap());
+        assert!(backend.epoch_complete(epoch, vnodes, &[]).await.unwrap());
     }
 
     #[tokio::test]
@@ -1208,7 +1208,7 @@ mod rehydration_tests {
             .write_partial(0, 5, 0, Bytes::from(full.encode().unwrap()))
             .await
             .unwrap();
-        assert!(backend.epoch_complete(5, &[0]).await.unwrap());
+        assert!(backend.epoch_complete(5, &[0], &[]).await.unwrap());
 
         let reference = crate::vnode_partial::VnodePartial {
             checkpoint_id: 2,
@@ -1219,7 +1219,7 @@ mod rehydration_tests {
             .write_partial(0, 6, 0, Bytes::from(reference.encode().unwrap()))
             .await
             .unwrap();
-        assert!(backend.epoch_complete(6, &[0]).await.unwrap());
+        assert!(backend.epoch_complete(6, &[0], &[]).await.unwrap());
 
         let report = VnodeRehydrator::new(&backend).rehydrate(&[0]).await;
         assert_eq!(report.epoch, Some(6));

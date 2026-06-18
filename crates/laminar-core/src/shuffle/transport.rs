@@ -577,6 +577,12 @@ mod grpc {
             std::mem::take(&mut self.holdover.staged_barriers.lock())
         }
 
+        /// Re-stash a peer barrier pulled while aligning a *different* checkpoint, so a
+        /// lagging node still sees it when it reaches that checkpoint.
+        pub fn stash_barrier(&self, from: ShufflePeerId, barrier: CheckpointBarrier) {
+            self.holdover.staged_barriers.lock().push((from, barrier));
+        }
+
         /// Empty the per-stage holdover, returning every buffered `(stage, batch)`.
         #[must_use]
         pub fn drain_all_staged(&self) -> Vec<(String, RecordBatch)> {

@@ -22,6 +22,8 @@ pub use catalog_manifest::{
     CatalogManifest, CatalogManifestEntry, CatalogManifestError, CatalogManifestStore,
 };
 pub use leader::leader_of;
+#[cfg(feature = "cluster")]
+pub use leader_lease::lease_currently_grants;
 pub use leader_lease::{
     lease_grants_leadership, LeaderLease, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
     LeaseError, LeaseOutcome,
