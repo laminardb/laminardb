@@ -128,6 +128,12 @@ impl PendingBarrier {
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Cap on a source task's post-shutdown flush so a hot source can't stall shutdown.
+const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Cap on awaiting a source task at shutdown before aborting it.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Throttled (~once/10s) WARN while barrier admission is paused at the
 /// staged-state cap — this check runs every coordinator tick, so an
 /// unthrottled warn would spam under a sustained upload backlog.
@@ -331,16 +337,25 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Drain before close() so buffered data isn't lost.
-                while let Ok(Some(batch)) = connector.poll_batch(max_poll).await {
-                    let cp = connector.checkpoint();
-                    let msg = SourceMsg::Batch {
-                        source_idx: idx,
-                        batch: batch.records,
-                        checkpoint: cp,
-                    };
-                    if task_tx.send(msg).await.is_err() {
-                        break;
+                // Bounded best-effort flush before close(). The `while` deadline (not the
+                // inner timeout) bounds an always-ready poll — timeout() polls the future
+                // first. Non-blocking send; unflushed rows resume from the committed offset.
+                let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
+                while Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(remaining, connector.poll_batch(max_poll)).await {
+                        Ok(Ok(Some(batch))) => {
+                            let cp = connector.checkpoint();
+                            let msg = SourceMsg::Batch {
+                                source_idx: idx,
+                                batch: batch.records,
+                                checkpoint: cp,
+                            };
+                            if task_tx.try_send(msg).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
                     }
                 }
 
@@ -707,14 +722,22 @@ impl StreamingCoordinator {
         for handle in std::mem::take(&mut self.source_handles) {
             let SourceHandle {
                 name,
-                shutdown: _,
-                join,
-                barrier_injector: _,
+                mut join,
                 epoch_committed_tx,
+                ..
             } = handle;
             drop(epoch_committed_tx);
-            if let Err(e) = join.await {
-                tracing::warn!(source = %name, error = ?e, "source task panicked");
+            // Abort a source task that didn't exit in time so run() can return.
+            match tokio::time::timeout(SHUTDOWN_JOIN_TIMEOUT, &mut join).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(source = %name, error = ?e, "source task panicked"),
+                Err(_) => {
+                    tracing::warn!(
+                        source = %name,
+                        "source task did not exit within shutdown budget; aborting"
+                    );
+                    join.abort();
+                }
             }
         }
     }
@@ -1103,6 +1126,77 @@ mod tests {
 
         // The callback was consumed by run(), so we can't inspect it directly.
         // But the test proves: no panics, no deadlocks, clean shutdown.
+    }
+
+    /// A wedged source task must not stall shutdown: `run()` still returns.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_aborts_wedged_source_task() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        // No timer: under paused time only the join timeout can unblock run().
+        let wedged = tokio::spawn(std::future::pending::<()>());
+        let (epoch_tx, _epoch_rx) = tokio::sync::watch::channel(None);
+        let handle = SourceHandle {
+            name: Arc::from("wedged"),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            join: wedged,
+            barrier_injector: CheckpointBarrierInjector::new(),
+            epoch_committed_tx: epoch_tx,
+        };
+
+        let coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: None,
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: Duration::from_secs(30),
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                max_input_buf_batches: 256,
+                max_input_buf_bytes: None,
+                backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
+            },
+            rx,
+            source_handles: vec![handle],
+            source_names: vec![Arc::from("wedged")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
+            control_rx,
+            checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
+        };
+
+        shutdown.notify_one();
+
+        // Outer bound gives a timer so a regression fails cleanly, not hangs.
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            coordinator.run(MockCallback::new()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "coordinator.run() must return after shutdown even with a wedged source task"
+        );
     }
 
     /// Test that a final checkpoint is triggered on shutdown when checkpointing

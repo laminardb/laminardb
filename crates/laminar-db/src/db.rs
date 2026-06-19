@@ -105,6 +105,9 @@ pub struct LaminarDB {
     /// Panic message when the compute thread exits unexpectedly (`Faulted`);
     /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
     pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
+    /// keeps it from racing a normal stop/shutdown, which finalize themselves.
+    pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Decoupled coordinated-commit committer task; aborted on shutdown.
     pub(crate) committer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -361,6 +364,7 @@ impl LaminarDB {
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
+            stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
             committer_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),

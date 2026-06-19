@@ -214,6 +214,9 @@ impl LaminarDB {
         // Clear on entry, not after start_inner — otherwise a panic during this
         // startup (watcher → Faulted + reason) would be immediately overwritten.
         *self.last_fault.lock() = None;
+        // Drop any stale flag from a prior run so this run's watcher doesn't finalize spuriously.
+        self.stop_timed_out
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         {
             let mut guard = self.engine_metrics.lock();
@@ -1805,8 +1808,19 @@ impl LaminarDB {
             let watcher_state = Arc::clone(&self.state);
             let watcher_shutdown = Arc::clone(&self.shutdown_signal);
             let watcher_fault = Arc::clone(&self.last_fault);
+            let watcher_stop_timed_out = Arc::clone(&self.stop_timed_out);
             let handle = tokio::spawn(async move {
-                if done_rx.await.is_err() {
+                if done_rx.await.is_ok() {
+                    // Only finalize for a timed-out stop. A normal stop/shutdown caller is
+                    // still awaiting this handle and sets the terminal state itself.
+                    if watcher_stop_timed_out.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = DbState::compare_exchange(
+                            DbState::ShuttingDown,
+                            DbState::Created,
+                            &watcher_state,
+                        );
+                    }
+                } else {
                     tracing::error!("laminar-compute thread exited unexpectedly");
                     watcher_fault
                         .lock()
@@ -1876,6 +1890,9 @@ impl LaminarDB {
         }
 
         *self.force_ckpt_tx.lock() = None;
+        // Clear up front so DDL during/after shutdown registers for the next start()
+        // instead of hot-adding into the dying coordinator's channel.
+        *self.control_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
         if let Some(h) = self.committer_handle.lock().take() {
@@ -1883,20 +1900,30 @@ impl LaminarDB {
         }
 
         let handle = self.runtime_handle.lock().take();
-        if let Some(handle) = handle {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
+        if let Some(mut handle) = handle {
+            // Set before awaiting: the watcher can wake on another thread the instant the
+            // coordinator exits, so it must already see the flag if we time out.
+            self.stop_timed_out
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
                 Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
                 Err(_) => {
-                    tracing::error!("Pipeline stop timed out after 10s; coordinator still running");
+                    // Still draining; the watcher finalizes ShuttingDown→Created when the
+                    // coordinator exits. Re-store its handle; start() refuses meanwhile.
+                    tracing::warn!(
+                        "Pipeline stop still draining after 10s; will finalize when the coordinator exits"
+                    );
+                    *self.runtime_handle.lock() = Some(handle);
                     return Err(DbError::InvalidOperation(
-                        "pipeline stop timed out; coordinator did not exit".into(),
+                        "pipeline stop is taking longer than expected; coordinator still \
+                         draining, retry shortly"
+                            .into(),
                     ));
                 }
             }
         }
 
-        *self.control_tx.lock() = None;
         DbState::Created.store(&self.state);
         Ok(())
     }
