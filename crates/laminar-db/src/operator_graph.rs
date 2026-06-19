@@ -1533,7 +1533,6 @@ impl OperatorGraph {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute_single_operator(
         &mut self,
         node_id: usize,
@@ -1570,23 +1569,7 @@ impl OperatorGraph {
             )
             .await;
 
-        // Source nodes have output_watermarks pre-seeded in execute_cycle; don't overwrite.
-        if !self.source_node_ids.contains(&node_id) {
-            let mut wm = watermarks
-                .iter()
-                .copied()
-                .min()
-                .unwrap_or(current_watermark);
-            if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
-                wm = wm.min(hold);
-            }
-            self.output_watermarks[node_id] = wm;
-            if let Some(ref prom) = self.prom {
-                prom.stream_watermark_ms
-                    .with_label_values(&[&self.nodes[node_id].name])
-                    .set(wm);
-            }
-        }
+        self.propagate_operator_watermark(node_id, &watermarks, current_watermark);
 
         let batches = match output_result {
             Ok(b) => {
@@ -1626,23 +1609,7 @@ impl OperatorGraph {
             }
         };
 
-        if let Some(limit) = self.max_state_bytes {
-            let size = self.nodes[node_id].operator.estimated_state_bytes();
-            if size >= limit {
-                return Err(DbError::Pipeline(format!(
-                    "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
-                    self.nodes[node_id].name
-                )));
-            }
-            if size >= limit * 4 / 5 {
-                tracing::warn!(
-                    query = %self.nodes[node_id].name,
-                    size_bytes = size,
-                    limit_bytes = limit,
-                    "state size at 80% of limit"
-                );
-            }
-        }
+        self.enforce_state_limit(node_id)?;
 
         let batches = if let Some(oc) = self.order_configs.get(&node_id) {
             match oc {
@@ -1654,46 +1621,105 @@ impl OperatorGraph {
             batches
         };
 
-        if !batches.is_empty() {
-            let node_name = Arc::clone(&self.nodes[node_id].name);
-            let has_routes = !self.nodes[node_id].output_routes.is_empty();
-            let is_output = self.output_map.values().any(|&id| id == node_id);
-
-            if has_routes {
-                let name_ref = node_name.as_ref();
-                if !self.live_handles.contains_key(name_ref) {
-                    let schema = batches[0].schema();
-                    self.ensure_live_provider(name_ref, &schema);
-                }
-                if let Some(handle) = self.live_handles.get(name_ref) {
-                    handle.swap(batches.clone());
-                }
-            }
-
-            if is_output {
-                results.insert(node_name, batches.clone());
-            }
-
-            let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-            let route_count = self.nodes[node_id].output_routes.len();
-            if route_count == 1 {
-                let (target, port) = self.nodes[node_id].output_routes[0];
-                self.push_to_port(target, port, batches, bytes);
-            } else if route_count > 1 {
-                // Clone batches N-1 times; the last route takes ownership.
-                for i in 0..route_count - 1 {
-                    let (target, port) = self.nodes[node_id].output_routes[i];
-                    self.push_to_port(target, port, batches.clone(), bytes);
-                }
-                let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
-                self.push_to_port(target, port, batches, bytes);
-            }
-        }
+        self.route_output(node_id, batches, results);
 
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Update a node's output watermark to the min of its input watermarks (and any
+    /// operator hold). Source nodes are pre-seeded in `execute_cycle` and skipped.
+    fn propagate_operator_watermark(
+        &mut self,
+        node_id: usize,
+        watermarks: &[i64],
+        current_watermark: i64,
+    ) {
+        if self.source_node_ids.contains(&node_id) {
+            return;
+        }
+        let mut wm = watermarks
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(current_watermark);
+        if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
+            wm = wm.min(hold);
+        }
+        self.output_watermarks[node_id] = wm;
+        if let Some(ref prom) = self.prom {
+            prom.stream_watermark_ms
+                .with_label_values(&[&self.nodes[node_id].name])
+                .set(wm);
+        }
+    }
+
+    fn enforce_state_limit(&self, node_id: usize) -> Result<(), DbError> {
+        let Some(limit) = self.max_state_bytes else {
+            return Ok(());
+        };
+        let size = self.nodes[node_id].operator.estimated_state_bytes();
+        if size >= limit {
+            return Err(DbError::Pipeline(format!(
+                "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
+                self.nodes[node_id].name
+            )));
+        }
+        if size >= limit * 4 / 5 {
+            tracing::warn!(
+                query = %self.nodes[node_id].name,
+                size_bytes = size,
+                limit_bytes = limit,
+                "state size at 80% of limit"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fan a node's output to its live provider, the results map, and downstream ports.
+    fn route_output(
+        &mut self,
+        node_id: usize,
+        batches: Vec<RecordBatch>,
+        results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) {
+        if batches.is_empty() {
+            return;
+        }
+        let node_name = Arc::clone(&self.nodes[node_id].name);
+        let has_routes = !self.nodes[node_id].output_routes.is_empty();
+        let is_output = self.output_map.values().any(|&id| id == node_id);
+
+        if has_routes {
+            let name_ref = node_name.as_ref();
+            if !self.live_handles.contains_key(name_ref) {
+                let schema = batches[0].schema();
+                self.ensure_live_provider(name_ref, &schema);
+            }
+            if let Some(handle) = self.live_handles.get(name_ref) {
+                handle.swap(batches.clone());
+            }
+        }
+
+        if is_output {
+            results.insert(node_name, batches.clone());
+        }
+
+        let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        let route_count = self.nodes[node_id].output_routes.len();
+        if route_count == 1 {
+            let (target, port) = self.nodes[node_id].output_routes[0];
+            self.push_to_port(target, port, batches, bytes);
+        } else if route_count > 1 {
+            // Clone batches N-1 times; the last route takes ownership.
+            for i in 0..route_count - 1 {
+                let (target, port) = self.nodes[node_id].output_routes[i];
+                self.push_to_port(target, port, batches.clone(), bytes);
+            }
+            let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
+            self.push_to_port(target, port, batches, bytes);
+        }
+    }
+
     pub async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -1708,23 +1734,7 @@ impl OperatorGraph {
         }
 
         self.register_source_tables(source_batches);
-
-        for &(ref name, node_id) in &self.source_list {
-            if let Some(batches) = source_batches.get(name) {
-                if !batches.is_empty() {
-                    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-                    self.input_bufs[node_id][0].extend(batches.iter().cloned());
-                    self.input_buf_bytes[node_id][0] += bytes;
-                }
-            }
-            let wm = source_watermarks
-                .and_then(|m| m.get(name).copied())
-                .unwrap_or(current_watermark);
-            self.output_watermarks[node_id] = wm;
-            if let Some(ref prom) = self.prom {
-                prom.stream_watermark_ms.with_label_values(&[name]).set(wm);
-            }
-        }
+        self.prime_sources(source_batches, current_watermark, source_watermarks);
 
         let mut results = FxHashMap::default();
         let cycle_start = std::time::Instant::now();
@@ -1759,41 +1769,12 @@ impl OperatorGraph {
                         "per-query budget exceeded — deferring remaining operators"
                     );
 
-                    // Run one deferred operator (round-robin) to prevent tail starvation.
-                    let deferred_count = topo_len - i;
-                    let start = self.deferred_scan_offset % deferred_count;
-                    for offset in 0..deferred_count {
-                        let j = i + (start + offset) % deferred_count;
-                        let deferred_id = self.topo_order[j];
-                        if self.nodes[deferred_id].removed {
-                            continue;
-                        }
-                        let has_input = self.input_bufs[deferred_id]
-                            .iter()
-                            .any(|port| !port.is_empty());
-                        if !has_input {
-                            continue;
-                        }
-                        match self.gate_decision(deferred_id) {
-                            GateDecision::Skip => continue,
-                            GateDecision::Fail => {
-                                self.finish_cycle();
-                                return Err(DbError::BackpressureFail(format!(
-                                    "input buffer at capacity downstream of '{}'",
-                                    self.nodes[deferred_id].name
-                                )));
-                            }
-                            GateDecision::Run => {}
-                        }
-                        if let Err(e) = self
-                            .execute_single_operator(deferred_id, current_watermark, &mut results)
-                            .await
-                        {
-                            self.finish_cycle();
-                            return Err(e);
-                        }
-                        self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
-                        break;
+                    if let Err(e) = self
+                        .run_one_deferred_operator(i, topo_len, current_watermark, &mut results)
+                        .await
+                    {
+                        self.finish_cycle();
+                        return Err(e);
                     }
 
                     break;
@@ -1814,22 +1795,92 @@ impl OperatorGraph {
         #[cfg(debug_assertions)]
         self.debug_assert_byte_sums();
 
-        self.stats_tick = self.stats_tick.wrapping_add(1);
-        if self.stats_tick.is_multiple_of(STATS_SAMPLE_INTERVAL) {
-            if let Some(ref prom) = self.prom {
-                for (id, ports) in self.input_buf_bytes.iter().enumerate() {
-                    if self.nodes[id].removed {
-                        continue;
-                    }
-                    let total: usize = ports.iter().sum();
-                    prom.input_buf_bytes
-                        .with_label_values(&[&self.nodes[id].name])
-                        .set(i64::try_from(total).unwrap_or(i64::MAX));
-                }
-            }
-        }
+        self.sample_buffer_stats();
 
         Ok(results)
+    }
+
+    fn prime_sources(
+        &mut self,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        current_watermark: i64,
+        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+    ) {
+        for &(ref name, node_id) in &self.source_list {
+            if let Some(batches) = source_batches.get(name) {
+                if !batches.is_empty() {
+                    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                    self.input_bufs[node_id][0].extend(batches.iter().cloned());
+                    self.input_buf_bytes[node_id][0] += bytes;
+                }
+            }
+            let wm = source_watermarks
+                .and_then(|m| m.get(name).copied())
+                .unwrap_or(current_watermark);
+            self.output_watermarks[node_id] = wm;
+            if let Some(ref prom) = self.prom {
+                prom.stream_watermark_ms.with_label_values(&[name]).set(wm);
+            }
+        }
+    }
+
+    /// Run one deferred operator (round-robin) so a per-cycle budget overrun can't
+    /// starve the tail of the topo order.
+    async fn run_one_deferred_operator(
+        &mut self,
+        i: usize,
+        topo_len: usize,
+        current_watermark: i64,
+        results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<(), DbError> {
+        let deferred_count = topo_len - i;
+        let start = self.deferred_scan_offset % deferred_count;
+        for offset in 0..deferred_count {
+            let j = i + (start + offset) % deferred_count;
+            let deferred_id = self.topo_order[j];
+            if self.nodes[deferred_id].removed {
+                continue;
+            }
+            let has_input = self.input_bufs[deferred_id]
+                .iter()
+                .any(|port| !port.is_empty());
+            if !has_input {
+                continue;
+            }
+            match self.gate_decision(deferred_id) {
+                GateDecision::Skip => continue,
+                GateDecision::Fail => {
+                    return Err(DbError::BackpressureFail(format!(
+                        "input buffer at capacity downstream of '{}'",
+                        self.nodes[deferred_id].name
+                    )));
+                }
+                GateDecision::Run => {}
+            }
+            self.execute_single_operator(deferred_id, current_watermark, results)
+                .await?;
+            self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
+            break;
+        }
+        Ok(())
+    }
+
+    fn sample_buffer_stats(&mut self) {
+        self.stats_tick = self.stats_tick.wrapping_add(1);
+        if !self.stats_tick.is_multiple_of(STATS_SAMPLE_INTERVAL) {
+            return;
+        }
+        if let Some(ref prom) = self.prom {
+            for (id, ports) in self.input_buf_bytes.iter().enumerate() {
+                if self.nodes[id].removed {
+                    continue;
+                }
+                let total: usize = ports.iter().sum();
+                prom.input_buf_bytes
+                    .with_label_values(&[&self.nodes[id].name])
+                    .set(i64::try_from(total).unwrap_or(i64::MAX));
+            }
+        }
     }
 
     // Unknown stage (no live operator for it) is silently dropped.

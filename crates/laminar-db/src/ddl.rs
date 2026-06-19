@@ -32,6 +32,137 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Parsed `WITH (...)` clause of a `CREATE TABLE`.
+#[derive(Default)]
+struct CreateTableWith {
+    connector_type: Option<String>,
+    connector_options: HashMap<String, String>,
+    format: Option<String>,
+    format_options: HashMap<String, String>,
+    refresh_mode: Option<laminar_connectors::reference::RefreshMode>,
+    cache_mode: Option<crate::table_cache_mode::TableCacheMode>,
+    cache_max_entries: Option<usize>,
+    cache_max_bytes: Option<usize>,
+    cache_ttl: Option<std::time::Duration>,
+    storage: Option<String>,
+}
+
+fn build_table_fields(create: &sqlparser::ast::CreateTable) -> Result<Vec<Field>, DbError> {
+    create
+        .columns
+        .iter()
+        .map(|col| {
+            let data_type = streaming_ddl::sql_type_to_arrow(&col.data_type).map_err(|e| {
+                DbError::InvalidOperation(format!(
+                    "unsupported column type for '{}': {e}",
+                    col.name
+                ))
+            })?;
+            let nullable = !col
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
+            Ok(Field::new(col.name.value.clone(), data_type, nullable))
+        })
+        .collect()
+}
+
+fn extract_primary_key(create: &sqlparser::ast::CreateTable) -> Option<String> {
+    for col in &create.columns {
+        for opt in &col.options {
+            if matches!(
+                opt.option,
+                sqlparser::ast::ColumnOption::Unique {
+                    is_primary: true,
+                    ..
+                }
+            ) {
+                return Some(col.name.value.clone());
+            }
+        }
+    }
+    for constraint in &create.constraints {
+        if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
+            if let Some(first) = columns.first() {
+                return Some(match &first.column.expr {
+                    sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
+                    other => other.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn parse_create_table_with(
+    with_options: &[sqlparser::ast::SqlOption],
+) -> Result<CreateTableWith, DbError> {
+    let mut out = CreateTableWith {
+        connector_options: HashMap::with_capacity(8),
+        format_options: HashMap::with_capacity(4),
+        ..Default::default()
+    };
+    for opt in with_options {
+        let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
+            continue;
+        };
+        let k = key.to_string().to_lowercase();
+        let val = value.to_string().trim_matches('\'').to_string();
+        match k.as_str() {
+            "connector" => out.connector_type = Some(val),
+            "format" => out.format = Some(val),
+            "refresh" => {
+                out.refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
+            }
+            "cache_mode" | "cache.mode" => {
+                out.cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
+            }
+            "cache_max_entries" | "cache.max_entries" => {
+                out.cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
+                    DbError::InvalidOperation(format!(
+                        "Invalid cache_max_entries '{val}': expected positive integer"
+                    ))
+                })?);
+            }
+            "cache_max_bytes" | "cache.max_bytes" | "cache.memory" => {
+                let bytes = val.parse::<usize>().map_err(|_| {
+                    DbError::InvalidOperation(format!(
+                        "Invalid cache_max_bytes '{val}': expected positive integer"
+                    ))
+                })?;
+                if bytes == 0 {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Invalid cache_max_bytes '{val}': expected positive integer"
+                    )));
+                }
+                out.cache_max_bytes = Some(bytes);
+            }
+            "cache_ttl" | "cache.ttl" => {
+                let secs = val.parse::<u64>().map_err(|_| {
+                    DbError::InvalidOperation(format!(
+                        "Invalid cache_ttl '{val}': expected positive integer seconds"
+                    ))
+                })?;
+                if secs == 0 {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Invalid cache_ttl '{val}': expected positive integer seconds"
+                    )));
+                }
+                out.cache_ttl = Some(std::time::Duration::from_secs(secs));
+            }
+            "storage" => out.storage = Some(val),
+            kk if kk.starts_with("format.") => {
+                out.format_options
+                    .insert(kk.strip_prefix("format.").unwrap().to_string(), val);
+            }
+            _ => {
+                out.connector_options.insert(k, val);
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl LaminarDB {
     /// Resolve `${VAR}` in connector + format options (config vars, then env) and
     /// verify the type is registered + format known — up front, before any
@@ -82,7 +213,6 @@ impl LaminarDB {
         Ok(Some(resolved))
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_create_source(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
@@ -117,59 +247,126 @@ impl LaminarDB {
             ConnectorKind::Source,
         )?;
 
-        let source_def = if create.columns.is_empty() && has_connector {
-            let resolved = resolved.as_ref().expect("has_connector ⇒ Some");
-            let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
-                DbError::Config(format!(
-                    "source '{source_name}': no columns declared and no connector type resolved"
-                ))
-            })?;
-            let normalized = normalize_connector_type(connector_type);
+        let source_def = self
+            .build_source_definition(create, resolved.as_ref(), has_connector, &source_name)
+            .await?;
 
-            let mut props = resolved.connector_options.clone();
-            if let Some(fmt) = resolved.format.clone() {
-                props.insert("format".into(), fmt);
+        let entry = self.register_source_entry(create, &source_def)?;
+        let name = &source_def.name;
+
+        if let Some(ref entry) = entry {
+            if create.or_replace {
+                let _ = self.ctx.deregister_table(name);
             }
-            props.extend(resolved.format_options.clone());
+            let num_partitions = self.ctx.state().config().target_partitions();
+            let provider = crate::table_provider::SourceSnapshotProvider::new(
+                Arc::clone(entry),
+                num_partitions,
+            );
+            if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
+                tracing::warn!(table = %name, error = %e, "failed to register source table in DataFusion");
+            }
+        }
 
-            let discovered = match self
-                .connector_registry
-                .default_source_schema(&normalized, &props)
-                .await
-            {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    return Err(DbError::Config(format!(
-                        "source '{source_name}': no columns declared and connector \
-                         '{normalized}' could not auto-discover a schema (declare \
-                         columns explicitly or check that the format supports \
-                         schema discovery)"
-                    )));
-                }
-                Err(e) => {
-                    return Err(DbError::Config(format!(
-                        "source '{source_name}': schema auto-discovery failed: {e}"
-                    )));
-                }
-            };
+        self.mv_registry.lock().register_base_table(name);
 
-            let columns: Vec<ColumnDefinition> = discovered
-                .fields()
-                .iter()
-                .map(|f| ColumnDefinition {
-                    name: f.name().clone(),
-                    data_type: f.data_type().clone(),
-                    nullable: f.is_nullable(),
-                })
-                .collect();
+        {
+            let mut planner = self.planner.lock();
+            let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
+            if let Err(e) = planner.plan(&stmt) {
+                tracing::warn!(source = %name, error = %e, "failed to register source in planner");
+            }
+        }
 
-            streaming_ddl::translate_create_source_with_columns(create.clone(), columns)
-                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?
-        } else {
-            streaming_ddl::translate_create_source(create.clone())
-                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?
+        if let Some(resolved) = resolved {
+            if let Some(ct) = resolved.connector_type {
+                let mut mgr = self.connector_manager.lock();
+                mgr.register_source(crate::connector_manager::SourceRegistration {
+                    name: name.clone(),
+                    connector_type: Some(ct),
+                    connector_options: resolved.connector_options,
+                    format: resolved.format,
+                    format_options: resolved.format_options,
+                });
+            }
+        }
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "CREATE SOURCE".to_string(),
+            object_name: name.clone(),
+        }))
+    }
+
+    /// Translate a `CREATE SOURCE` to a `SourceDefinition`, auto-discovering the
+    /// schema from the connector when no columns are declared.
+    async fn build_source_definition(
+        &self,
+        create: &laminar_sql::parser::CreateSourceStatement,
+        resolved: Option<&ResolvedConnector>,
+        has_connector: bool,
+        source_name: &str,
+    ) -> Result<streaming_ddl::SourceDefinition, DbError> {
+        if !(create.columns.is_empty() && has_connector) {
+            return streaming_ddl::translate_create_source(create.clone())
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)));
+        }
+
+        let resolved = resolved.expect("has_connector ⇒ Some");
+        let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
+            DbError::Config(format!(
+                "source '{source_name}': no columns declared and no connector type resolved"
+            ))
+        })?;
+        let normalized = normalize_connector_type(connector_type);
+
+        let mut props = resolved.connector_options.clone();
+        if let Some(fmt) = resolved.format.clone() {
+            props.insert("format".into(), fmt);
+        }
+        props.extend(resolved.format_options.clone());
+
+        let discovered = match self
+            .connector_registry
+            .default_source_schema(&normalized, &props)
+            .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Err(DbError::Config(format!(
+                    "source '{source_name}': no columns declared and connector \
+                     '{normalized}' could not auto-discover a schema (declare \
+                     columns explicitly or check that the format supports \
+                     schema discovery)"
+                )));
+            }
+            Err(e) => {
+                return Err(DbError::Config(format!(
+                    "source '{source_name}': schema auto-discovery failed: {e}"
+                )));
+            }
         };
 
+        let columns: Vec<ColumnDefinition> = discovered
+            .fields()
+            .iter()
+            .map(|f| ColumnDefinition {
+                name: f.name().clone(),
+                data_type: f.data_type().clone(),
+                nullable: f.is_nullable(),
+            })
+            .collect();
+
+        streaming_ddl::translate_create_source_with_columns(create.clone(), columns)
+            .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))
+    }
+
+    /// Register a source in the catalog per the `OR REPLACE` / `IF NOT EXISTS`
+    /// semantics, returning the entry (`None` when an existing one was kept).
+    fn register_source_entry(
+        &self,
+        create: &laminar_sql::parser::CreateSourceStatement,
+        source_def: &streaming_ddl::SourceDefinition,
+    ) -> Result<Option<Arc<crate::catalog::SourceEntry>>, DbError> {
         let name = &source_def.name;
         let schema = source_def.schema.clone();
         let watermark_col = source_def.watermark.as_ref().map(|w| w.column.clone());
@@ -227,47 +424,7 @@ impl LaminarDB {
             }
         }
 
-        if let Some(ref entry) = entry {
-            if create.or_replace {
-                let _ = self.ctx.deregister_table(name);
-            }
-            let num_partitions = self.ctx.state().config().target_partitions();
-            let provider = crate::table_provider::SourceSnapshotProvider::new(
-                Arc::clone(entry),
-                num_partitions,
-            );
-            if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
-                tracing::warn!(table = %name, error = %e, "failed to register source table in DataFusion");
-            }
-        }
-
-        self.mv_registry.lock().register_base_table(name);
-
-        {
-            let mut planner = self.planner.lock();
-            let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
-            if let Err(e) = planner.plan(&stmt) {
-                tracing::warn!(source = %name, error = %e, "failed to register source in planner");
-            }
-        }
-
-        if let Some(resolved) = resolved {
-            if let Some(ct) = resolved.connector_type {
-                let mut mgr = self.connector_manager.lock();
-                mgr.register_source(crate::connector_manager::SourceRegistration {
-                    name: name.clone(),
-                    connector_type: Some(ct),
-                    connector_options: resolved.connector_options,
-                    format: resolved.format,
-                    format_options: resolved.format_options,
-                });
-            }
-        }
-
-        Ok(ExecuteResult::Ddl(DdlInfo {
-            statement_type: "CREATE SOURCE".to_string(),
-            object_name: name.clone(),
-        }))
+        Ok(entry)
     }
 
     pub(crate) fn handle_create_sink(
@@ -337,7 +494,6 @@ impl LaminarDB {
         }))
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn handle_create_table(
         &self,
         create: &sqlparser::ast::CreateTable,
@@ -345,144 +501,23 @@ impl LaminarDB {
         let name = create.name.to_string();
         reject_reserved_namespace(&name)?;
 
-        let fields: Vec<arrow::datatypes::Field> = create
-            .columns
-            .iter()
-            .map(|col| {
-                let data_type = streaming_ddl::sql_type_to_arrow(&col.data_type).map_err(|e| {
-                    DbError::InvalidOperation(format!(
-                        "unsupported column type for '{}': {e}",
-                        col.name
-                    ))
-                })?;
-                let nullable = !col
-                    .options
-                    .iter()
-                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
-                Ok(arrow::datatypes::Field::new(
-                    col.name.value.clone(),
-                    data_type,
-                    nullable,
-                ))
-            })
-            .collect::<Result<Vec<_>, DbError>>()?;
-
-        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-
-        let mut primary_key: Option<String> = None;
-
-        for col in &create.columns {
-            for opt in &col.options {
-                if matches!(
-                    opt.option,
-                    sqlparser::ast::ColumnOption::Unique {
-                        is_primary: true,
-                        ..
-                    }
-                ) {
-                    primary_key = Some(col.name.value.clone());
-                    break;
-                }
-            }
-            if primary_key.is_some() {
-                break;
-            }
-        }
-
-        if primary_key.is_none() {
-            for constraint in &create.constraints {
-                if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
-                    if let Some(first) = columns.first() {
-                        primary_key = match &first.column.expr {
-                            sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-                            other => Some(other.to_string()),
-                        };
-                    }
-                }
-            }
-        }
-
-        let mut connector_type: Option<String> = None;
-        let mut connector_options: HashMap<String, String> = HashMap::with_capacity(8);
-        let mut format: Option<String> = None;
-        let mut format_options: HashMap<String, String> = HashMap::with_capacity(4);
-        let mut refresh_mode: Option<laminar_connectors::reference::RefreshMode> = None;
-        let mut cache_mode: Option<crate::table_cache_mode::TableCacheMode> = None;
-        let mut cache_max_entries: Option<usize> = None;
-        let mut cache_max_bytes: Option<usize> = None;
-        let mut cache_ttl: Option<std::time::Duration> = None;
-        let mut storage: Option<String> = None;
+        let schema = Arc::new(Schema::new(build_table_fields(create)?));
+        let primary_key = extract_primary_key(create);
 
         let with_options = match &create.table_options {
             sqlparser::ast::CreateTableOptions::With(opts) => opts.as_slice(),
             _ => &[],
         };
+        let opts = parse_create_table_with(with_options)?;
 
-        for opt in with_options {
-            if let sqlparser::ast::SqlOption::KeyValue { key, value } = opt {
-                let k = key.to_string().to_lowercase();
-                let val = value.to_string().trim_matches('\'').to_string();
-                match k.as_str() {
-                    "connector" => connector_type = Some(val),
-                    "format" => format = Some(val),
-                    "refresh" => {
-                        refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
-                    }
-                    "cache_mode" | "cache.mode" => {
-                        cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
-                    }
-                    "cache_max_entries" | "cache.max_entries" => {
-                        cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
-                            DbError::InvalidOperation(format!(
-                                "Invalid cache_max_entries '{val}': expected positive integer"
-                            ))
-                        })?);
-                    }
-                    "cache_max_bytes" | "cache.max_bytes" | "cache.memory" => {
-                        let bytes = val.parse::<usize>().map_err(|_| {
-                            DbError::InvalidOperation(format!(
-                                "Invalid cache_max_bytes '{val}': expected positive integer"
-                            ))
-                        })?;
-                        if bytes == 0 {
-                            return Err(DbError::InvalidOperation(format!(
-                                "Invalid cache_max_bytes '{val}': expected positive integer"
-                            )));
-                        }
-                        cache_max_bytes = Some(bytes);
-                    }
-                    "cache_ttl" | "cache.ttl" => {
-                        let secs = val.parse::<u64>().map_err(|_| {
-                            DbError::InvalidOperation(format!(
-                                "Invalid cache_ttl '{val}': expected positive integer seconds"
-                            ))
-                        })?;
-                        if secs == 0 {
-                            return Err(DbError::InvalidOperation(format!(
-                                "Invalid cache_ttl '{val}': expected positive integer seconds"
-                            )));
-                        }
-                        cache_ttl = Some(std::time::Duration::from_secs(secs));
-                    }
-                    "storage" => storage = Some(val),
-                    kk if kk.starts_with("format.") => {
-                        format_options.insert(kk.strip_prefix("format.").unwrap().to_string(), val);
-                    }
-                    _ => {
-                        connector_options.insert(k, val);
-                    }
-                }
-            }
-        }
-
-        let resolved_cache_mode = match (&cache_mode, cache_max_entries) {
+        let resolved_cache_mode = match (&opts.cache_mode, opts.cache_max_entries) {
             (Some(crate::table_cache_mode::TableCacheMode::Partial { .. }), Some(max)) => {
                 Some(crate::table_cache_mode::TableCacheMode::Partial { max_entries: max })
             }
-            _ => cache_mode.clone(),
+            _ => opts.cache_mode.clone(),
         };
 
-        let is_persistent = storage.as_deref() == Some("persistent");
+        let is_persistent = opts.storage.as_deref() == Some("persistent");
 
         if let Some(ref pk) = primary_key {
             let cache = resolved_cache_mode
@@ -502,9 +537,9 @@ impl LaminarDB {
             }
         }
 
-        if connector_type.is_some() || !connector_options.is_empty() {
+        if opts.connector_type.is_some() || !opts.connector_options.is_empty() {
             if let Some(ref pk) = primary_key {
-                if let Some(ref ct) = connector_type {
+                if let Some(ref ct) = opts.connector_type {
                     let mut ts = self.table_store.write();
                     ts.set_connector(&name, ct);
                 }
@@ -513,13 +548,13 @@ impl LaminarDB {
                 mgr.register_table(crate::connector_manager::TableRegistration {
                     name: name.clone(),
                     primary_key: pk.clone(),
-                    connector_type: connector_type.clone(),
-                    connector_options,
-                    format,
-                    format_options,
-                    refresh: refresh_mode,
-                    cache_max_bytes,
-                    cache_ttl,
+                    connector_type: opts.connector_type.clone(),
+                    connector_options: opts.connector_options,
+                    format: opts.format,
+                    format_options: opts.format_options,
+                    refresh: opts.refresh_mode,
+                    cache_max_bytes: opts.cache_max_bytes,
+                    cache_ttl: opts.cache_ttl,
                 });
             }
         }
