@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_expr::LogicalPlan;
 
+use super::AggFuncSpec;
 use crate::error::DbError;
 
 pub(crate) struct AggregateInfo {
@@ -19,6 +20,210 @@ pub(crate) struct AggregateInfo {
     pub(crate) having_predicate: Option<datafusion_expr::Expr>,
     pub(crate) input_df_schema: Arc<DFSchema>,
     pub(crate) where_predicate: Option<datafusion_expr::Expr>,
+}
+
+/// Supplied by the caller so the builder needn't name `DFSchema`/`ExecutionProps`.
+pub(crate) type ExprCompiler<'a> =
+    dyn Fn(&datafusion_expr::Expr) -> Option<Arc<dyn PhysicalExpr>> + 'a;
+
+/// Builds a query's pre-aggregate projection; shared by the plain, windowed, and
+/// EOWC aggregate-state builders.
+pub(crate) struct PreAggBuilder<'a> {
+    input_schema: &'a Schema,
+    pub(crate) compile_ok: bool,
+    pub(crate) next_col_idx: usize,
+    pub(crate) compiled_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    pub(crate) proj_fields: Vec<Field>,
+    pub(crate) pre_agg_select_items: Vec<String>,
+    pub(crate) agg_specs: Vec<AggFuncSpec>,
+}
+
+impl<'a> PreAggBuilder<'a> {
+    pub(crate) fn new(input_schema: &'a Schema, num_group_cols: usize, compile_ok: bool) -> Self {
+        Self {
+            input_schema,
+            compile_ok,
+            next_col_idx: num_group_cols,
+            compiled_exprs: Vec::new(),
+            proj_fields: Vec::new(),
+            pre_agg_select_items: Vec::new(),
+            agg_specs: Vec::new(),
+        }
+    }
+
+    /// `from_phys` takes the column type from the compiled expr; no-op once
+    /// compilation has failed.
+    pub(crate) fn push_compiled_column(
+        &mut self,
+        name: &str,
+        expr: &datafusion_expr::Expr,
+        fallback: DataType,
+        from_phys: bool,
+        compile: &ExprCompiler<'_>,
+    ) {
+        if !self.compile_ok {
+            return;
+        }
+        match compile(expr) {
+            Some(phys) => {
+                let dt = if from_phys {
+                    phys.data_type(self.input_schema).unwrap_or(fallback)
+                } else {
+                    fallback
+                };
+                self.proj_fields.push(Field::new(name, dt, true));
+                self.compiled_exprs.push(phys);
+            }
+            None => self.compile_ok = false,
+        }
+    }
+
+    pub(crate) fn push_group_expr(
+        &mut self,
+        i: usize,
+        group_expr: &datafusion_expr::Expr,
+        compile: &ExprCompiler<'_>,
+    ) {
+        let name = if let datafusion_expr::Expr::Column(col) = group_expr {
+            self.pre_agg_select_items.push(format!("\"{}\"", col.name));
+            col.name.clone()
+        } else {
+            let group_sql = expr_to_sql(group_expr);
+            self.pre_agg_select_items
+                .push(format!("{group_sql} AS \"__group_{i}\""));
+            format!("__group_{i}")
+        };
+        self.push_compiled_column(&name, group_expr, DataType::Utf8, true, compile);
+    }
+
+    /// `false` if `expr` is not an aggregate function (caller bails to the
+    /// interpreted path).
+    pub(crate) fn push_aggregate(
+        &mut self,
+        expr: &datafusion_expr::Expr,
+        output_name: String,
+        agg_field: &Field,
+        compile: &ExprCompiler<'_>,
+    ) -> bool {
+        let datafusion_expr::Expr::AggregateFunction(agg_func) = expr else {
+            return false;
+        };
+        let udf = Arc::clone(&agg_func.func);
+        let is_distinct = agg_func.params.distinct;
+
+        let mut input_col_indices = Vec::new();
+        let mut input_types = Vec::new();
+
+        if agg_func.params.args.is_empty() {
+            let col_idx = self.next_col_idx;
+            self.next_col_idx += 1;
+            self.pre_agg_select_items
+                .push(format!("TRUE AS \"__agg_input_{col_idx}\""));
+            input_col_indices.push(col_idx);
+            input_types.push(DataType::Boolean);
+            self.push_compiled_column(
+                &format!("__agg_input_{col_idx}"),
+                &datafusion_expr::lit(true),
+                DataType::Boolean,
+                false,
+                compile,
+            );
+        } else {
+            for arg_expr in &agg_func.params.args {
+                let col_idx = self.next_col_idx;
+                self.next_col_idx += 1;
+                let expr_sql = expr_to_sql(arg_expr);
+                let dt = resolve_expr_type(arg_expr, self.input_schema, agg_field.data_type());
+
+                // FILTER: wrap with CASE WHEN so filtered rows become NULL.
+                if let Some(filter_expr) = &agg_func.params.filter {
+                    let filter_sql = expr_to_sql(filter_expr);
+                    self.pre_agg_select_items.push(format!(
+                        "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
+                    ));
+                    let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                        expr: None,
+                        when_then_expr: vec![(
+                            Box::new(filter_expr.as_ref().clone()),
+                            Box::new(arg_expr.clone()),
+                        )],
+                        else_expr: Some(Box::new(datafusion_expr::lit(ScalarValue::Null))),
+                    });
+                    self.push_compiled_column(
+                        &format!("__agg_input_{col_idx}"),
+                        &case_expr,
+                        dt.clone(),
+                        false,
+                        compile,
+                    );
+                } else {
+                    self.pre_agg_select_items
+                        .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
+                    self.push_compiled_column(
+                        &format!("__agg_input_{col_idx}"),
+                        arg_expr,
+                        dt.clone(),
+                        false,
+                        compile,
+                    );
+                }
+
+                input_col_indices.push(col_idx);
+                input_types.push(dt);
+            }
+        }
+
+        let filter_col_index = agg_func
+            .params
+            .filter
+            .as_ref()
+            .map(|filter_expr| self.push_filter_column(filter_expr, compile));
+
+        let return_type = udf
+            .return_type(&input_types)
+            .unwrap_or_else(|_| agg_field.data_type().clone());
+
+        self.agg_specs.push(AggFuncSpec {
+            udf,
+            input_types,
+            input_col_indices,
+            output_name,
+            return_type,
+            distinct: is_distinct,
+            is_count_star: agg_func.params.args.is_empty(),
+            filter_col_index,
+        });
+        true
+    }
+
+    fn push_filter_column(
+        &mut self,
+        filter_expr: &datafusion_expr::Expr,
+        compile: &ExprCompiler<'_>,
+    ) -> usize {
+        let col_idx = self.next_col_idx;
+        self.next_col_idx += 1;
+        let filter_sql = expr_to_sql(filter_expr);
+        self.pre_agg_select_items.push(format!(
+            "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
+        ));
+        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+            expr: None,
+            when_then_expr: vec![(
+                Box::new(filter_expr.clone()),
+                Box::new(datafusion_expr::lit(true)),
+            )],
+            else_expr: Some(Box::new(datafusion_expr::lit(false))),
+        });
+        self.push_compiled_column(
+            &format!("__agg_filter_{col_idx}"),
+            &case_expr,
+            DataType::Boolean,
+            false,
+            compile,
+        );
+        col_idx
+    }
 }
 
 pub(crate) fn find_aggregate(plan: &LogicalPlan) -> Option<AggregateInfo> {

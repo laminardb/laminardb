@@ -22,8 +22,8 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, resolve_expr_type,
-    AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, AggFuncSpec,
+    CompiledProjection, GroupCheckpoint, PreAggBuilder, WindowCheckpoint,
 };
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
@@ -260,9 +260,6 @@ impl CoreWindowState {
         let state_ref = ctx.state();
         let compile_props = state_ref.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
-        let mut compiled_exprs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-        let mut proj_fields: Vec<Field> = Vec::new();
-        let mut compile_ok = compile_source.is_some();
 
         // A Projection above the Aggregate makes the top schema differ.
         let has_projection = {
@@ -330,36 +327,15 @@ impl CoreWindowState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        let mut agg_specs = Vec::new();
-        let mut pre_agg_select_items: Vec<String> = Vec::new();
+        let compile = |e: &datafusion_expr::Expr| {
+            create_physical_expr(e, input_df_schema, compile_props).ok()
+        };
+        let mut builder =
+            PreAggBuilder::new(&input_schema, num_group_cols, compile_source.is_some());
 
         for (i, group_expr) in group_exprs.iter().enumerate() {
-            if let datafusion_expr::Expr::Column(col) = group_expr {
-                pre_agg_select_items.push(format!("\"{}\"", col.name));
-            } else {
-                let group_sql = expr_to_sql(group_expr);
-                pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
-            }
-
-            if compile_ok {
-                match create_physical_expr(group_expr, input_df_schema, compile_props) {
-                    Ok(phys) => {
-                        let dt = phys
-                            .data_type(input_df_schema.as_arrow())
-                            .unwrap_or(DataType::Utf8);
-                        let name = match group_expr {
-                            datafusion_expr::Expr::Column(col) => col.name.clone(),
-                            _ => format!("__group_{i}"),
-                        };
-                        proj_fields.push(Field::new(name, dt, true));
-                        compiled_exprs.push(phys);
-                    }
-                    Err(_) => compile_ok = false,
-                }
-            }
+            builder.push_group_expr(i, group_expr, &compile);
         }
-
-        let mut next_col_idx = num_group_cols;
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
             let agg_schema_idx = num_group_cols + i;
@@ -371,167 +347,17 @@ impl CoreWindowState {
             } else {
                 agg_field.name().clone()
             };
-
-            if let datafusion_expr::Expr::AggregateFunction(agg_func) = expr {
-                let udf = Arc::clone(&agg_func.func);
-                let is_distinct = agg_func.params.distinct;
-
-                let mut input_col_indices = Vec::new();
-                let mut input_types = Vec::new();
-
-                if agg_func.params.args.is_empty() {
-                    let col_idx = next_col_idx;
-                    next_col_idx += 1;
-                    pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
-                    input_col_indices.push(col_idx);
-                    input_types.push(DataType::Boolean);
-
-                    if compile_ok {
-                        match create_physical_expr(
-                            &datafusion_expr::lit(true),
-                            input_df_schema,
-                            compile_props,
-                        ) {
-                            Ok(phys) => {
-                                proj_fields.push(Field::new(
-                                    format!("__agg_input_{col_idx}"),
-                                    DataType::Boolean,
-                                    true,
-                                ));
-                                compiled_exprs.push(phys);
-                            }
-                            Err(_) => compile_ok = false,
-                        }
-                    }
-                } else {
-                    for arg_expr in &agg_func.params.args {
-                        let col_idx = next_col_idx;
-                        next_col_idx += 1;
-                        let expr_sql = expr_to_sql(arg_expr);
-
-                        if let Some(filter_expr) = &agg_func.params.filter {
-                            let filter_sql = expr_to_sql(filter_expr);
-                            pre_agg_select_items.push(format!(
-                                "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
-                            ));
-
-                            if compile_ok {
-                                let case_expr =
-                                    datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                                        expr: None,
-                                        when_then_expr: vec![(
-                                            Box::new(filter_expr.as_ref().clone()),
-                                            Box::new(arg_expr.clone()),
-                                        )],
-                                        else_expr: Some(Box::new(datafusion_expr::lit(
-                                            ScalarValue::Null,
-                                        ))),
-                                    });
-                                match create_physical_expr(
-                                    &case_expr,
-                                    input_df_schema,
-                                    compile_props,
-                                ) {
-                                    Ok(phys) => {
-                                        let dt = resolve_expr_type(
-                                            arg_expr,
-                                            &input_schema,
-                                            agg_field.data_type(),
-                                        );
-                                        proj_fields.push(Field::new(
-                                            format!("__agg_input_{col_idx}"),
-                                            dt,
-                                            true,
-                                        ));
-                                        compiled_exprs.push(phys);
-                                    }
-                                    Err(_) => compile_ok = false,
-                                }
-                            }
-                        } else {
-                            pre_agg_select_items
-                                .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
-
-                            if compile_ok {
-                                match create_physical_expr(arg_expr, input_df_schema, compile_props)
-                                {
-                                    Ok(phys) => {
-                                        let dt = resolve_expr_type(
-                                            arg_expr,
-                                            &input_schema,
-                                            agg_field.data_type(),
-                                        );
-                                        proj_fields.push(Field::new(
-                                            format!("__agg_input_{col_idx}"),
-                                            dt,
-                                            true,
-                                        ));
-                                        compiled_exprs.push(phys);
-                                    }
-                                    Err(_) => compile_ok = false,
-                                }
-                            }
-                        }
-
-                        input_col_indices.push(col_idx);
-                        let dt = resolve_expr_type(arg_expr, &input_schema, agg_field.data_type());
-                        input_types.push(dt);
-                    }
-                }
-
-                let filter_col_index = if let Some(filter_expr) = &agg_func.params.filter {
-                    let col_idx = next_col_idx;
-                    next_col_idx += 1;
-                    let filter_sql = expr_to_sql(filter_expr);
-                    pre_agg_select_items.push(format!(
-                        "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
-                    ));
-
-                    if compile_ok {
-                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                            expr: None,
-                            when_then_expr: vec![(
-                                Box::new(filter_expr.as_ref().clone()),
-                                Box::new(datafusion_expr::lit(true)),
-                            )],
-                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
-                        });
-                        match create_physical_expr(&case_expr, input_df_schema, compile_props) {
-                            Ok(phys) => {
-                                proj_fields.push(Field::new(
-                                    format!("__agg_filter_{col_idx}"),
-                                    DataType::Boolean,
-                                    true,
-                                ));
-                                compiled_exprs.push(phys);
-                            }
-                            Err(_) => compile_ok = false,
-                        }
-                    }
-
-                    Some(col_idx)
-                } else {
-                    None
-                };
-
-                let return_type = udf
-                    .return_type(&input_types)
-                    .unwrap_or_else(|_| agg_field.data_type().clone());
-
-                agg_specs.push(AggFuncSpec {
-                    udf,
-                    input_types,
-                    input_col_indices,
-                    output_name,
-                    return_type,
-                    distinct: is_distinct,
-                    is_count_star: agg_func.params.args.is_empty(),
-                    filter_col_index,
-                });
-            } else {
+            if !builder.push_aggregate(expr, output_name, agg_field, &compile) {
                 return Ok(None);
             }
         }
+
+        let mut compile_ok = builder.compile_ok;
+        let next_col_idx = builder.next_col_idx;
+        let mut pre_agg_select_items = builder.pre_agg_select_items;
+        let agg_specs = builder.agg_specs;
+        let mut compiled_exprs = builder.compiled_exprs;
+        let mut proj_fields = builder.proj_fields;
 
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
@@ -713,7 +539,6 @@ impl CoreWindowState {
     /// Update per-window accumulators with a new pre-aggregation batch.
     ///
     /// Session windows use per-row processing because merge depends on insertion order.
-    #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -725,83 +550,92 @@ impl CoreWindowState {
             return self.update_batch_session(batch, &ts_array);
         }
 
-        let rows = if self.num_group_cols > 0 {
-            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-                .map(|i| Arc::clone(batch.column(i)))
-                .collect();
-            let rows = self
-                .row_converter
-                .convert_columns(&group_cols)
-                .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-            Some(rows)
+        if self.num_group_cols == 0 {
+            self.update_batch_nogroup(batch, &ts_array)
         } else {
-            None
-        };
+            self.update_batch_grouped(batch, &ts_array)
+        }
+    }
 
-        let has_groups = self.num_group_cols > 0;
-        if !has_groups {
-            let empty_key = crate::aggregate_state::global_aggregate_key();
-            let mut grouped = std::mem::take(&mut self.scratch_nogroup);
-            grouped.clear();
-            for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
-                if ts_ms == NULL_TIMESTAMP {
-                    continue;
+    fn update_batch_nogroup(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let empty_key = crate::aggregate_state::global_aggregate_key();
+        let mut grouped = std::mem::take(&mut self.scratch_nogroup);
+        grouped.clear();
+        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = row_idx as u32;
+            match &self.assigner {
+                CoreWindowAssigner::Tumbling(a) => {
+                    let ws = a.assign(ts_ms).start;
+                    if self.is_window_closed(ws) {
+                        self.record_late_drop(1);
+                        continue;
+                    }
+                    grouped.entry(ws).or_default().push(idx);
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = row_idx as u32;
-                match &self.assigner {
-                    CoreWindowAssigner::Tumbling(a) => {
-                        let ws = a.assign(ts_ms).start;
-                        if self.is_window_closed(ws) {
+                CoreWindowAssigner::Hopping(a) => {
+                    for wid in a.assign_windows(ts_ms) {
+                        if self.is_window_closed(wid.start) {
                             self.record_late_drop(1);
                             continue;
                         }
-                        grouped.entry(ws).or_default().push(idx);
+                        grouped.entry(wid.start).or_default().push(idx);
                     }
-                    CoreWindowAssigner::Hopping(a) => {
-                        for wid in a.assign_windows(ts_ms) {
-                            if self.is_window_closed(wid.start) {
-                                self.record_late_drop(1);
-                                continue;
-                            }
-                            grouped.entry(wid.start).or_default().push(idx);
-                        }
-                    }
-                    CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
                 }
+                CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
             }
-            for (window_start, indices) in &grouped {
-                let needs_insert = {
-                    let wg = self.windows.entry(*window_start).or_default();
-                    !wg.contains_key(&empty_key)
-                };
-                if needs_insert {
-                    let accs = self.create_fresh_accumulators()?;
-                    self.windows
-                        .entry(*window_start)
-                        .or_default()
-                        .insert(empty_key.clone(), accs);
-                }
-                let Some(accs) = self
-                    .windows
-                    .get_mut(window_start)
-                    .and_then(|g| g.get_mut(&empty_key))
-                else {
-                    continue;
-                };
-                crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs,
-                    batch,
-                    indices,
-                    &self.agg_specs,
-                    None,
-                )?;
-            }
-            self.scratch_nogroup = grouped;
-            return Ok(());
         }
+        for (window_start, indices) in &grouped {
+            let needs_insert = {
+                let wg = self.windows.entry(*window_start).or_default();
+                !wg.contains_key(&empty_key)
+            };
+            if needs_insert {
+                let accs = self.create_fresh_accumulators()?;
+                self.windows
+                    .entry(*window_start)
+                    .or_default()
+                    .insert(empty_key.clone(), accs);
+            }
+            let Some(accs) = self
+                .windows
+                .get_mut(window_start)
+                .and_then(|g| g.get_mut(&empty_key))
+            else {
+                continue;
+            };
+            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                accs,
+                batch,
+                indices,
+                &self.agg_specs,
+                None,
+            )?;
+        }
+        self.scratch_nogroup = grouped;
+        Ok(())
+    }
 
-        let rows_ref = rows.as_ref().expect("rows set when has_groups");
+    fn update_batch_grouped(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
+
         let mut grouped = std::mem::take(&mut self.scratch_grouped);
         let mut group_keys = std::mem::take(&mut self.scratch_group_keys);
         grouped.clear();
@@ -811,7 +645,7 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
+            let (gid, _) = group_keys.insert_full(rows.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
@@ -938,7 +772,6 @@ impl CoreWindowState {
     }
 
     /// Update accumulators for a session window, merging overlapping sessions.
-    #[allow(clippy::too_many_lines)]
     fn update_session_window(
         &mut self,
         ts_ms: i64,
@@ -1013,58 +846,77 @@ impl CoreWindowState {
                 }
             }
             _ => {
-                let group = self
-                    .session_groups
-                    .get_mut(key)
-                    .expect("invariant: key present (overlapping derived from same group)");
-                let mut merged_start = new_start;
-                let mut merged_end = new_end;
-                let mut survivor_accs: Option<Vec<Box<dyn datafusion_expr::Accumulator>>> = None;
-
-                for &sess_key in &overlapping {
-                    let sess = group
-                        .sessions
-                        .remove(&sess_key)
-                        .expect("invariant: overlapping keys are unique BTreeMap entries");
-                    merged_start = merged_start.min(sess.start);
-                    merged_end = merged_end.max(sess.end);
-
-                    if let Some(ref mut surv) = survivor_accs {
-                        for (i, mut acc) in sess.accs.into_iter().enumerate() {
-                            let state = acc.state().map_err(|e| {
-                                DbError::Pipeline(format!("session merge state: {e}"))
-                            })?;
-                            let arrays: Vec<ArrayRef> = state
-                                .iter()
-                                .map(|sv| {
-                                    sv.to_array().map_err(|e| {
-                                        DbError::Pipeline(format!("session merge array: {e}"))
-                                    })
-                                })
-                                .collect::<Result<_, _>>()?;
-                            surv[i]
-                                .merge_batch(&arrays)
-                                .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
-                        }
-                    } else {
-                        survivor_accs = Some(sess.accs);
-                    }
-                }
-
-                let mut accs = survivor_accs
-                    .expect("invariant: overlapping non-empty, survivor set on first iter");
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
-                group.sessions.insert(
-                    merged_start,
-                    SessionAccState {
-                        start: merged_start,
-                        end: merged_end,
-                        accs,
-                    },
-                );
+                self.merge_overlapping_sessions(
+                    key,
+                    &overlapping,
+                    new_start,
+                    new_end,
+                    batch,
+                    index_array,
+                )?;
             }
         }
 
+        Ok(())
+    }
+
+    fn merge_overlapping_sessions(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+        overlapping: &[i64],
+        new_start: i64,
+        new_end: i64,
+        batch: &RecordBatch,
+        index_array: &arrow::array::UInt32Array,
+    ) -> Result<(), DbError> {
+        // Stage the merge into a fresh survivor before mutating the group: fold in
+        // every overlapping session's state (a non-destructive read) plus the new
+        // row, and only remove + insert once all fallible steps succeed — so a
+        // mid-merge failure leaves the existing sessions intact.
+        let mut accs = self.create_fresh_accumulators()?;
+
+        let group = self
+            .session_groups
+            .get_mut(key)
+            .expect("invariant: key present (overlapping derived from same group)");
+        let mut merged_start = new_start;
+        let mut merged_end = new_end;
+        for &sess_key in overlapping {
+            let sess = group
+                .sessions
+                .get_mut(&sess_key)
+                .expect("invariant: overlapping keys are unique BTreeMap entries");
+            merged_start = merged_start.min(sess.start);
+            merged_end = merged_end.max(sess.end);
+            for (i, acc) in sess.accs.iter_mut().enumerate() {
+                let state = acc
+                    .state()
+                    .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
+                let arrays: Vec<ArrayRef> = state
+                    .iter()
+                    .map(|sv| {
+                        sv.to_array()
+                            .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
+                    })
+                    .collect::<Result<_, _>>()?;
+                accs[i]
+                    .merge_batch(&arrays)
+                    .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
+            }
+        }
+        Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
+
+        for &sess_key in overlapping {
+            group.sessions.remove(&sess_key);
+        }
+        group.sessions.insert(
+            merged_start,
+            SessionAccState {
+                start: merged_start,
+                end: merged_end,
+                accs,
+            },
+        );
         Ok(())
     }
 

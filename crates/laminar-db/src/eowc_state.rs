@@ -10,14 +10,13 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
-use datafusion_common::ScalarValue;
 
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, resolve_expr_type,
-    AggFuncSpec, CompiledProjection, EowcStateCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, AggFuncSpec,
+    CompiledProjection, EowcStateCheckpoint, PreAggBuilder,
 };
 use crate::error::DbError;
 
@@ -159,9 +158,6 @@ impl IncrementalEowcState {
         let state = ctx.state();
         let props = state.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
-        let mut compiled_exprs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-        let mut proj_fields: Vec<Field> = Vec::new();
-        let mut compile_ok = compile_source.is_some();
 
         // Bail if there's a post-aggregate projection (e.g. SUM(a)/SUM(b)); fall through
         // to raw-batch EOWC. Check types too — count match alone can hide remaps.
@@ -185,36 +181,14 @@ impl IncrementalEowcState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        let mut agg_specs = Vec::new();
-        let mut pre_agg_select_items: Vec<String> = Vec::new();
+        let compile =
+            |e: &datafusion_expr::Expr| create_physical_expr(e, input_df_schema, props).ok();
+        let mut builder =
+            PreAggBuilder::new(&input_schema, num_group_cols, compile_source.is_some());
 
         for (i, group_expr) in group_exprs.iter().enumerate() {
-            if let datafusion_expr::Expr::Column(col) = group_expr {
-                pre_agg_select_items.push(format!("\"{}\"", col.name));
-            } else {
-                let group_sql = expr_to_sql(group_expr);
-                pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
-            }
-
-            if compile_ok {
-                match create_physical_expr(group_expr, input_df_schema, props) {
-                    Ok(phys) => {
-                        let dt = phys
-                            .data_type(input_df_schema.as_arrow())
-                            .unwrap_or(DataType::Utf8);
-                        let name = match group_expr {
-                            datafusion_expr::Expr::Column(col) => col.name.clone(),
-                            _ => format!("__group_{i}"),
-                        };
-                        proj_fields.push(Field::new(name, dt, true));
-                        compiled_exprs.push(phys);
-                    }
-                    Err(_) => compile_ok = false,
-                }
-            }
+            builder.push_group_expr(i, group_expr, &compile);
         }
-
-        let mut next_col_idx = num_group_cols;
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
             let agg_schema_idx = num_group_cols + i;
@@ -224,162 +198,17 @@ impl IncrementalEowcState {
             } else {
                 agg_field.name().clone()
             };
-
-            if let datafusion_expr::Expr::AggregateFunction(agg_func) = expr {
-                let udf = Arc::clone(&agg_func.func);
-                let is_distinct = agg_func.params.distinct;
-
-                let mut input_col_indices = Vec::new();
-                let mut input_types = Vec::new();
-
-                if agg_func.params.args.is_empty() {
-                    let col_idx = next_col_idx;
-                    next_col_idx += 1;
-                    pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
-                    input_col_indices.push(col_idx);
-                    input_types.push(DataType::Boolean);
-
-                    if compile_ok {
-                        match create_physical_expr(
-                            &datafusion_expr::lit(true),
-                            input_df_schema,
-                            props,
-                        ) {
-                            Ok(phys) => {
-                                proj_fields.push(Field::new(
-                                    format!("__agg_input_{col_idx}"),
-                                    DataType::Boolean,
-                                    true,
-                                ));
-                                compiled_exprs.push(phys);
-                            }
-                            Err(_) => compile_ok = false,
-                        }
-                    }
-                } else {
-                    for arg_expr in &agg_func.params.args {
-                        let col_idx = next_col_idx;
-                        next_col_idx += 1;
-                        let expr_sql = expr_to_sql(arg_expr);
-
-                        if let Some(filter_expr) = &agg_func.params.filter {
-                            let filter_sql = expr_to_sql(filter_expr);
-                            pre_agg_select_items.push(format!(
-                                "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
-                            ));
-
-                            if compile_ok {
-                                let case_expr =
-                                    datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                                        expr: None,
-                                        when_then_expr: vec![(
-                                            Box::new(filter_expr.as_ref().clone()),
-                                            Box::new(arg_expr.clone()),
-                                        )],
-                                        else_expr: Some(Box::new(datafusion_expr::lit(
-                                            ScalarValue::Null,
-                                        ))),
-                                    });
-                                match create_physical_expr(&case_expr, input_df_schema, props) {
-                                    Ok(phys) => {
-                                        let dt = resolve_expr_type(
-                                            arg_expr,
-                                            &input_schema,
-                                            agg_field.data_type(),
-                                        );
-                                        proj_fields.push(Field::new(
-                                            format!("__agg_input_{col_idx}"),
-                                            dt,
-                                            true,
-                                        ));
-                                        compiled_exprs.push(phys);
-                                    }
-                                    Err(_) => compile_ok = false,
-                                }
-                            }
-                        } else {
-                            pre_agg_select_items
-                                .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
-
-                            if compile_ok {
-                                match create_physical_expr(arg_expr, input_df_schema, props) {
-                                    Ok(phys) => {
-                                        let dt = resolve_expr_type(
-                                            arg_expr,
-                                            &input_schema,
-                                            agg_field.data_type(),
-                                        );
-                                        proj_fields.push(Field::new(
-                                            format!("__agg_input_{col_idx}"),
-                                            dt,
-                                            true,
-                                        ));
-                                        compiled_exprs.push(phys);
-                                    }
-                                    Err(_) => compile_ok = false,
-                                }
-                            }
-                        }
-
-                        input_col_indices.push(col_idx);
-                        let dt = resolve_expr_type(arg_expr, &input_schema, agg_field.data_type());
-                        input_types.push(dt);
-                    }
-                }
-
-                let filter_col_index = if let Some(filter_expr) = &agg_func.params.filter {
-                    let col_idx = next_col_idx;
-                    next_col_idx += 1;
-                    let filter_sql = expr_to_sql(filter_expr);
-                    pre_agg_select_items.push(format!(
-                            "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
-                        ));
-
-                    if compile_ok {
-                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                            expr: None,
-                            when_then_expr: vec![(
-                                Box::new(filter_expr.as_ref().clone()),
-                                Box::new(datafusion_expr::lit(true)),
-                            )],
-                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
-                        });
-                        match create_physical_expr(&case_expr, input_df_schema, props) {
-                            Ok(phys) => {
-                                proj_fields.push(Field::new(
-                                    format!("__agg_filter_{col_idx}"),
-                                    DataType::Boolean,
-                                    true,
-                                ));
-                                compiled_exprs.push(phys);
-                            }
-                            Err(_) => compile_ok = false,
-                        }
-                    }
-
-                    Some(col_idx)
-                } else {
-                    None
-                };
-
-                let return_type = udf
-                    .return_type(&input_types)
-                    .unwrap_or_else(|_| agg_field.data_type().clone());
-
-                agg_specs.push(AggFuncSpec {
-                    udf,
-                    input_types,
-                    input_col_indices,
-                    output_name,
-                    return_type,
-                    distinct: is_distinct,
-                    is_count_star: agg_func.params.args.is_empty(),
-                    filter_col_index,
-                });
-            } else {
+            if !builder.push_aggregate(expr, output_name, agg_field, &compile) {
                 return Ok(None);
             }
         }
+
+        let mut compile_ok = builder.compile_ok;
+        let next_col_idx = builder.next_col_idx;
+        let mut pre_agg_select_items = builder.pre_agg_select_items;
+        let agg_specs = builder.agg_specs;
+        let mut compiled_exprs = builder.compiled_exprs;
+        let mut proj_fields = builder.proj_fields;
 
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!(
@@ -525,81 +354,89 @@ impl IncrementalEowcState {
     }
 
     /// Update per-window accumulators with a new pre-aggregation batch.
-    #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
-        let has_groups = self.num_group_cols > 0;
 
-        let rows = if has_groups {
-            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-                .map(|i| Arc::clone(batch.column(i)))
-                .collect();
-            let rows = self
-                .row_converter
-                .convert_columns(&group_cols)
-                .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-            Some(rows)
+        if self.num_group_cols == 0 {
+            self.update_batch_nogroup(batch, &ts_array)
         } else {
-            None
-        };
-
-        if !has_groups {
-            let empty_key = crate::aggregate_state::global_aggregate_key();
-            let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
-            for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
-                if ts_ms == NULL_TIMESTAMP {
-                    continue;
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = row_idx as u32;
-                for ws in assign_windows(ts_ms, &self.window_type) {
-                    if self.is_window_closed(ws) {
-                        self.record_late_drop(1);
-                        continue;
-                    }
-                    grouped.entry(ws).or_default().push(idx);
-                }
-            }
-            for (window_start, indices) in &grouped {
-                let needs_insert = {
-                    let wg = self.windows.entry(*window_start).or_default();
-                    !wg.contains_key(&empty_key)
-                };
-                if needs_insert {
-                    let mut accs = Vec::with_capacity(self.agg_specs.len());
-                    for spec in &self.agg_specs {
-                        accs.push(spec.create_accumulator()?);
-                    }
-                    self.windows
-                        .entry(*window_start)
-                        .or_default()
-                        .insert(empty_key.clone(), accs);
-                }
-                let Some(accs) = self
-                    .windows
-                    .get_mut(window_start)
-                    .and_then(|g| g.get_mut(&empty_key))
-                else {
-                    continue;
-                };
-                crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs,
-                    batch,
-                    indices,
-                    &self.agg_specs,
-                    None,
-                )?;
-            }
-            return Ok(());
+            self.update_batch_grouped(batch, &ts_array)
         }
+    }
+
+    fn update_batch_nogroup(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let empty_key = crate::aggregate_state::global_aggregate_key();
+        let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
+        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = row_idx as u32;
+            for ws in assign_windows(ts_ms, &self.window_type) {
+                if self.is_window_closed(ws) {
+                    self.record_late_drop(1);
+                    continue;
+                }
+                grouped.entry(ws).or_default().push(idx);
+            }
+        }
+        for (window_start, indices) in &grouped {
+            let needs_insert = {
+                let wg = self.windows.entry(*window_start).or_default();
+                !wg.contains_key(&empty_key)
+            };
+            if needs_insert {
+                let mut accs = Vec::with_capacity(self.agg_specs.len());
+                for spec in &self.agg_specs {
+                    accs.push(spec.create_accumulator()?);
+                }
+                self.windows
+                    .entry(*window_start)
+                    .or_default()
+                    .insert(empty_key.clone(), accs);
+            }
+            let Some(accs) = self
+                .windows
+                .get_mut(window_start)
+                .and_then(|g| g.get_mut(&empty_key))
+            else {
+                continue;
+            };
+            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                accs,
+                batch,
+                indices,
+                &self.agg_specs,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn update_batch_grouped(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
         // Dedup group keys per batch; bucket by (window, group_id) to avoid cloning OwnedRow
         // for each overlapping window (hopping).
-        let rows_ref = rows.as_ref().expect("rows set when has_groups");
         let mut group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState> =
             indexmap::IndexSet::default();
         let mut grouped: AHashMap<(i64, u32), Vec<u32>> = AHashMap::new();
@@ -608,7 +445,7 @@ impl IncrementalEowcState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
+            let (gid, _) = group_keys.insert_full(rows.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             for ws in assign_windows(ts_ms, &self.window_type) {

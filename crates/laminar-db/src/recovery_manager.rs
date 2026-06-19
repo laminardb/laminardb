@@ -459,7 +459,6 @@ impl<'a> RecoveryManager<'a> {
     }
 
     /// Inner restore logic shared by the fast path and the fallback loop.
-    #[allow(clippy::too_many_lines)]
     async fn restore_from(
         &self,
         mut manifest: CheckpointManifest,
@@ -490,59 +489,7 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
-        // Warn about topology changes since the checkpoint.
-        if !manifest.source_names.is_empty() {
-            let mut current_sources: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
-            current_sources.sort_unstable();
-            let checkpoint_sources: Vec<&str> =
-                manifest.source_names.iter().map(String::as_str).collect();
-            let added: Vec<&&str> = current_sources
-                .iter()
-                .filter(|n| !checkpoint_sources.contains(n))
-                .collect();
-            let removed: Vec<&&str> = checkpoint_sources
-                .iter()
-                .filter(|n| !current_sources.contains(n))
-                .collect();
-            if !added.is_empty() {
-                warn!(
-                    sources = ?added,
-                    "new sources added since checkpoint — no saved offsets"
-                );
-            }
-            if !removed.is_empty() {
-                warn!(
-                    sources = ?removed,
-                    "sources removed since checkpoint — orphaned offsets"
-                );
-            }
-        }
-        if !manifest.sink_names.is_empty() {
-            let mut current_sinks: Vec<&str> = sinks.iter().map(|s| s.name.as_str()).collect();
-            current_sinks.sort_unstable();
-            let checkpoint_sinks: Vec<&str> =
-                manifest.sink_names.iter().map(String::as_str).collect();
-            let added: Vec<&&str> = current_sinks
-                .iter()
-                .filter(|n| !checkpoint_sinks.contains(n))
-                .collect();
-            let removed: Vec<&&str> = checkpoint_sinks
-                .iter()
-                .filter(|n| !current_sinks.contains(n))
-                .collect();
-            if !added.is_empty() {
-                warn!(
-                    sinks = ?added,
-                    "new sinks added since checkpoint — no saved epoch"
-                );
-            }
-            if !removed.is_empty() {
-                warn!(
-                    sinks = ?removed,
-                    "sinks removed since checkpoint — orphaned epochs"
-                );
-            }
-        }
+        Self::warn_topology_changes(&manifest, sources, sinks);
 
         info!(
             checkpoint_id = manifest.checkpoint_id,
@@ -569,46 +516,7 @@ impl<'a> RecoveryManager<'a> {
             );
         }
 
-        for source in sources {
-            if !source.supports_replay {
-                info!(
-                    source = %source.name,
-                    "skipping restore for non-replayable source (at-most-once)"
-                );
-                continue;
-            }
-            if let Some(cp) = manifest.source_offsets.get(&source.name) {
-                let source_cp = connector_to_source_checkpoint(cp);
-                let mut last_err = None;
-                for attempt in 0..3u32 {
-                    let mut connector = source.connector.lock().await;
-                    match connector.restore(&source_cp).await {
-                        Ok(()) => {
-                            last_err = None;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                source = %source.name, attempt,
-                                error = %e, "source restore failed, retrying"
-                            );
-                            last_err = Some(e);
-                            drop(connector);
-                            if attempt < 2 {
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            }
-                        }
-                    }
-                }
-                if let Some(e) = last_err {
-                    let msg = format!("source restore failed after 3 attempts: {e}");
-                    result.source_errors.insert(source.name.clone(), msg);
-                } else {
-                    result.sources_restored += 1;
-                    debug!(source = %source.name, epoch = cp.epoch, "source restored");
-                }
-            }
-        }
+        Self::restore_replayable_sources(sources, &manifest, &mut result).await;
 
         for table_source in table_sources {
             if let Some(cp) = manifest.table_offsets.get(&table_source.name) {
@@ -629,41 +537,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Roll back exactly-once sinks that did not commit. Committed sinks are left alone.
-        for sink in sinks {
-            if sink.exactly_once {
-                let already_committed = manifest
-                    .sink_commit_statuses
-                    .get(&sink.name)
-                    .is_some_and(|s| matches!(s, SinkCommitStatus::Committed));
-
-                if already_committed {
-                    debug!(
-                        sink = %sink.name,
-                        epoch = manifest.epoch,
-                        "sink already committed, skipping rollback"
-                    );
-                    continue;
-                }
-
-                match sink.handle.rollback_epoch(manifest.epoch).await {
-                    Ok(()) => {
-                        result.sinks_rolled_back += 1;
-                        debug!(sink = %sink.name, epoch = manifest.epoch, "sink rolled back");
-                    }
-                    Err(e) => {
-                        result
-                            .sink_errors
-                            .insert(sink.name.clone(), format!("rollback failed: {e}"));
-                        warn!(
-                            sink = %sink.name,
-                            epoch = manifest.epoch,
-                            error = %e,
-                            "[LDB-6016] sink rollback failed during recovery"
-                        );
-                    }
-                }
-            }
-        }
+        Self::rollback_uncommitted_sinks(sinks, &manifest, &mut result).await;
 
         info!(
             checkpoint_id = manifest.checkpoint_id,
@@ -676,6 +550,142 @@ impl<'a> RecoveryManager<'a> {
         );
 
         result
+    }
+
+    fn warn_topology_changes(
+        manifest: &CheckpointManifest,
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+    ) {
+        if !manifest.source_names.is_empty() {
+            let mut current_sources: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
+            current_sources.sort_unstable();
+            let checkpoint_sources: Vec<&str> =
+                manifest.source_names.iter().map(String::as_str).collect();
+            let added: Vec<&&str> = current_sources
+                .iter()
+                .filter(|n| !checkpoint_sources.contains(n))
+                .collect();
+            let removed: Vec<&&str> = checkpoint_sources
+                .iter()
+                .filter(|n| !current_sources.contains(n))
+                .collect();
+            if !added.is_empty() {
+                warn!(sources = ?added, "new sources added since checkpoint — no saved offsets");
+            }
+            if !removed.is_empty() {
+                warn!(sources = ?removed, "sources removed since checkpoint — orphaned offsets");
+            }
+        }
+        if !manifest.sink_names.is_empty() {
+            let mut current_sinks: Vec<&str> = sinks.iter().map(|s| s.name.as_str()).collect();
+            current_sinks.sort_unstable();
+            let checkpoint_sinks: Vec<&str> =
+                manifest.sink_names.iter().map(String::as_str).collect();
+            let added: Vec<&&str> = current_sinks
+                .iter()
+                .filter(|n| !checkpoint_sinks.contains(n))
+                .collect();
+            let removed: Vec<&&str> = checkpoint_sinks
+                .iter()
+                .filter(|n| !current_sinks.contains(n))
+                .collect();
+            if !added.is_empty() {
+                warn!(sinks = ?added, "new sinks added since checkpoint — no saved epoch");
+            }
+            if !removed.is_empty() {
+                warn!(sinks = ?removed, "sinks removed since checkpoint — orphaned epochs");
+            }
+        }
+    }
+
+    async fn restore_replayable_sources(
+        sources: &[RegisteredSource],
+        manifest: &CheckpointManifest,
+        result: &mut RecoveredState,
+    ) {
+        for source in sources {
+            if !source.supports_replay {
+                info!(
+                    source = %source.name,
+                    "skipping restore for non-replayable source (at-most-once)"
+                );
+                continue;
+            }
+            let Some(cp) = manifest.source_offsets.get(&source.name) else {
+                continue;
+            };
+            let source_cp = connector_to_source_checkpoint(cp);
+            let mut last_err = None;
+            for attempt in 0..3u32 {
+                let mut connector = source.connector.lock().await;
+                match connector.restore(&source_cp).await {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            source = %source.name, attempt,
+                            error = %e, "source restore failed, retrying"
+                        );
+                        last_err = Some(e);
+                        drop(connector);
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                let msg = format!("source restore failed after 3 attempts: {e}");
+                result.source_errors.insert(source.name.clone(), msg);
+            } else {
+                result.sources_restored += 1;
+                debug!(source = %source.name, epoch = cp.epoch, "source restored");
+            }
+        }
+    }
+
+    async fn rollback_uncommitted_sinks(
+        sinks: &[RegisteredSink],
+        manifest: &CheckpointManifest,
+        result: &mut RecoveredState,
+    ) {
+        for sink in sinks {
+            if !sink.exactly_once {
+                continue;
+            }
+            let already_committed = manifest
+                .sink_commit_statuses
+                .get(&sink.name)
+                .is_some_and(|s| matches!(s, SinkCommitStatus::Committed));
+            if already_committed {
+                debug!(
+                    sink = %sink.name,
+                    epoch = manifest.epoch,
+                    "sink already committed, skipping rollback"
+                );
+                continue;
+            }
+            match sink.handle.rollback_epoch(manifest.epoch).await {
+                Ok(()) => {
+                    result.sinks_rolled_back += 1;
+                    debug!(sink = %sink.name, epoch = manifest.epoch, "sink rolled back");
+                }
+                Err(e) => {
+                    result
+                        .sink_errors
+                        .insert(sink.name.clone(), format!("rollback failed: {e}"));
+                    warn!(
+                        sink = %sink.name,
+                        epoch = manifest.epoch,
+                        error = %e,
+                        "[LDB-6016] sink rollback failed during recovery"
+                    );
+                }
+            }
+        }
     }
 
     /// Returns `true` if the checkpoint fails integrity validation.
