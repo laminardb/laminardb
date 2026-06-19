@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
 use crate::aggregate_state::{apply_compiled_having, EowcStateCheckpoint};
@@ -78,11 +79,10 @@ impl RawSqlCache {
 
     async fn apply(
         &self,
-        ctx: &SessionContext,
         op_name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        self.0.apply(ctx, op_name, batches).await
+        self.0.apply(op_name, batches).await
     }
 }
 
@@ -177,6 +177,7 @@ pub(crate) struct EowcQueryOperator {
     emit_clause: Option<EmitClause>,
     window_config: Option<WindowOperatorConfig>,
     ctx: SessionContext,
+    task_ctx: Arc<TaskContext>,
     state: EowcInnerState,
     pending_restore: Option<EowcCheckpointEnvelope>,
     prom: Option<Arc<EngineMetrics>>,
@@ -191,12 +192,14 @@ impl EowcQueryOperator {
         ctx: SessionContext,
         prom: Option<Arc<EngineMetrics>>,
     ) -> Self {
+        let task_ctx = ctx.task_ctx();
         Self {
             op_name: Arc::from(name),
             sql: Arc::from(sql),
             emit_clause,
             window_config,
             ctx,
+            task_ctx,
             state: EowcInnerState::Uninit,
             pending_restore: None,
             prom,
@@ -358,6 +361,7 @@ impl EowcQueryOperator {
         watermark: i64,
         op_name: &str,
         ctx: &SessionContext,
+        task_ctx: &Arc<TaskContext>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let now_filtered = cw.apply_dynamic_now_filter(ctx, inputs, watermark)?;
         let inputs: &[RecordBatch] = now_filtered.as_deref().unwrap_or(inputs);
@@ -372,7 +376,7 @@ impl EowcQueryOperator {
                         "EOWC compiled pre-agg failed, falling back to cached plan"
                     );
                     if let Some(physical) = cw.cached_pre_agg_physical() {
-                        super::execute_cached_physical(ctx, op_name, physical).await?
+                        super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
@@ -381,7 +385,7 @@ impl EowcQueryOperator {
                 }
             }
         } else if let Some(physical) = cw.cached_pre_agg_physical() {
-            super::execute_cached_physical(ctx, op_name, physical).await?
+            super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] EOWC query '{op_name}': no compiled projection or cached plan"
@@ -412,6 +416,7 @@ impl EowcQueryOperator {
         watermark: i64,
         op_name: &str,
         ctx: &SessionContext,
+        task_ctx: &Arc<TaskContext>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let pre_agg_batches = if let Some(proj) = eowc.compiled_projection() {
             match try_evaluate_compiled(proj, inputs) {
@@ -423,7 +428,7 @@ impl EowcQueryOperator {
                         "EOWC-agg compiled pre-agg failed, falling back to cached plan"
                     );
                     if let Some(physical) = eowc.cached_pre_agg_physical() {
-                        super::execute_cached_physical(ctx, op_name, physical).await?
+                        super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
@@ -432,7 +437,7 @@ impl EowcQueryOperator {
                 }
             }
         } else if let Some(physical) = eowc.cached_pre_agg_physical() {
-            super::execute_cached_physical(ctx, op_name, physical).await?
+            super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] EOWC query '{op_name}': no compiled projection or cached plan"
@@ -529,7 +534,7 @@ impl EowcQueryOperator {
         sql_cache
             .as_ref()
             .expect("just initialized")
-            .apply(ctx, op_name, query_batches)
+            .apply(op_name, query_batches)
             .await
     }
 }
@@ -555,12 +560,26 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             ))),
             EowcInnerState::CoreWindow(ref mut cw) => {
-                Self::process_core_window(cw, &input_batches, watermark, &self.op_name, &self.ctx)
-                    .await
+                Self::process_core_window(
+                    cw,
+                    &input_batches,
+                    watermark,
+                    &self.op_name,
+                    &self.ctx,
+                    &self.task_ctx,
+                )
+                .await
             }
             EowcInnerState::EowcAgg(ref mut eowc) => {
-                Self::process_eowc_agg(eowc, &input_batches, watermark, &self.op_name, &self.ctx)
-                    .await
+                Self::process_eowc_agg(
+                    eowc,
+                    &input_batches,
+                    watermark,
+                    &self.op_name,
+                    &self.ctx,
+                    &self.task_ctx,
+                )
+                .await
             }
             EowcInnerState::Raw {
                 ref mut accumulated,
@@ -709,7 +728,7 @@ async fn apply_having_via_sql(
     cache
         .as_ref()
         .expect("just initialized")
-        .apply(ctx, query_name, batches.to_vec())
+        .apply(query_name, batches.to_vec())
         .await
 }
 

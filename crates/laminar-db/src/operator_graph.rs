@@ -242,7 +242,7 @@ impl GraphOperator for SqlFilterOperator {
         self.cache
             .as_ref()
             .unwrap()
-            .apply(&self.ctx, "pre-filter", batches)
+            .apply("pre-filter", batches)
             .await
     }
 
