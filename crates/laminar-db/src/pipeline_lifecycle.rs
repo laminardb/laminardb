@@ -1884,6 +1884,9 @@ impl LaminarDB {
         }
 
         *self.force_ckpt_tx.lock() = None;
+        // Clear up front so DDL during/after shutdown registers for the next start()
+        // instead of hot-adding into the dying coordinator's channel.
+        *self.control_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
         if let Some(h) = self.committer_handle.lock().take() {
@@ -1896,9 +1899,8 @@ impl LaminarDB {
                 Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
                 Err(_) => {
-                    // Still draining. Re-store the watcher; it finalizes
-                    // ShuttingDown→Created once the thread exits. start() refuses
-                    // meanwhile, so nothing double-spawns over the draining coordinator.
+                    // Still draining. Re-store the watcher; it finalizes ShuttingDown→Created
+                    // once the thread exits. start() refuses meanwhile, so nothing double-spawns.
                     tracing::warn!(
                         "Pipeline stop still draining after 10s; will finalize when the coordinator exits"
                     );
@@ -1912,7 +1914,6 @@ impl LaminarDB {
             }
         }
 
-        *self.control_tx.lock() = None;
         DbState::Created.store(&self.state);
         Ok(())
     }

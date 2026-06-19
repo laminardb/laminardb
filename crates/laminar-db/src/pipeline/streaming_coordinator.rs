@@ -337,23 +337,25 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Best-effort flush before close(): time-boxed poll, non-blocking send.
-                // Unflushed rows resume from the committed offset on restart.
+                // Bounded best-effort flush before close(). The `while` deadline (not the
+                // inner timeout) bounds an always-ready poll — timeout() polls the future
+                // first. Non-blocking send; unflushed rows resume from the committed offset.
                 let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
-                while let Ok(Ok(Some(batch))) = tokio::time::timeout(
-                    deadline.saturating_duration_since(Instant::now()),
-                    connector.poll_batch(max_poll),
-                )
-                .await
-                {
-                    let cp = connector.checkpoint();
-                    let msg = SourceMsg::Batch {
-                        source_idx: idx,
-                        batch: batch.records,
-                        checkpoint: cp,
-                    };
-                    if task_tx.try_send(msg).is_err() {
-                        break;
+                while Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(remaining, connector.poll_batch(max_poll)).await {
+                        Ok(Ok(Some(batch))) => {
+                            let cp = connector.checkpoint();
+                            let msg = SourceMsg::Batch {
+                                source_idx: idx,
+                                batch: batch.records,
+                                checkpoint: cp,
+                            };
+                            if task_tx.try_send(msg).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
                     }
                 }
 
