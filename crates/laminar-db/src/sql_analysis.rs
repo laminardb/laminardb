@@ -2450,7 +2450,6 @@ fn rewrite_temporal_expr(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn build_stream_join_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
@@ -2466,70 +2465,25 @@ fn build_stream_join_projection_sql(
     let has_residual = select.from.len() == 1 && select.from[0].joins.len() > 1;
     let tmp_qual: Option<&str> = has_residual.then_some("__interval_tmp");
 
-    // Count natural names so colliding projections (p.type, a.type) get {qual}_{col} aliases.
-    let mut natural_counts: FxHashMap<String, usize> = FxHashMap::default();
-    if has_residual {
-        for item in &select.projection {
-            if let SelectItem::UnnamedExpr(expr) = item {
-                let n = match expr {
-                    Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
-                    Expr::Identifier(ident) => Some(ident.value.clone()),
-                    _ => None,
-                };
-                if let Some(n) = n {
-                    *natural_counts.entry(n).or_insert(0) += 1;
-                }
-            }
-        }
-    }
+    let natural_counts = if has_residual {
+        count_natural_projection_names(select)
+    } else {
+        FxHashMap::default()
+    };
 
     let items: Vec<String> = select
         .projection
         .iter()
-        .map(|item| match item {
-            SelectItem::UnnamedExpr(expr) => {
-                let rewritten =
-                    rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
-                if has_residual {
-                    let (qual, natural) = match expr {
-                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                            (Some(parts[0].value.clone()), Some(parts[1].value.clone()))
-                        }
-                        Expr::Identifier(ident) => (None, Some(ident.value.clone())),
-                        _ => (None, None),
-                    };
-                    if let Some(n) = natural {
-                        let collides = natural_counts.get(&n).copied().unwrap_or(0) > 1;
-                        if collides {
-                            if let Some(q) = qual {
-                                return format!("{rewritten} AS {q}_{n}");
-                            }
-                        }
-                        if rewritten != n {
-                            return format!("{rewritten} AS {n}");
-                        }
-                    }
-                }
-                rewritten
-            }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                let rewritten =
-                    rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
-                format!("{rewritten} AS {alias}")
-            }
-            SelectItem::Wildcard(_) => "*".to_string(),
-            SelectItem::QualifiedWildcard(name, _) => {
-                let table = name.to_string();
-                if table == config.left_table
-                    || left_alias.is_some_and(|a| a == table)
-                    || table == config.right_table
-                    || right_alias.is_some_and(|a| a == table)
-                {
-                    "*".to_string()
-                } else {
-                    format!("{table}.*")
-                }
-            }
+        .map(|item| {
+            render_join_projection_item(
+                item,
+                left_alias,
+                right_alias,
+                config,
+                tmp_qual,
+                has_residual,
+                &natural_counts,
+            )
         })
         .collect();
 
@@ -2545,22 +2499,7 @@ fn build_stream_join_projection_sql(
         String::new()
     };
 
-    // IntervalJoin is symmetric but BETWEEN is directional; add right_ts >= left_ts
-    // to enforce the lower bound (the upper is already covered by the tolerance).
-    let directional_filter =
-        if !config.left_time_column.is_empty() && !config.right_time_column.is_empty() {
-            let left_ref = match tmp_qual {
-                Some(q) => format!("{q}.{}", config.left_time_column),
-                None => config.left_time_column.clone(),
-            };
-            let right_ref = match tmp_qual {
-                Some(q) => format!("{q}.{}_{}", config.right_time_column, config.right_table),
-                None => format!("{}_{}", config.right_time_column, config.right_table),
-            };
-            format!("{right_ref} >= {left_ref}")
-        } else {
-            String::new()
-        };
+    let directional_filter = join_directional_filter(config, tmp_qual);
 
     let combined_where = match (where_clause.is_empty(), directional_filter.is_empty()) {
         (true, true) => String::new(),
@@ -2573,6 +2512,97 @@ fn build_stream_join_projection_sql(
         "SELECT {} FROM __interval_tmp{residual}{combined_where}",
         items.join(", ")
     )
+}
+
+// Count natural names so colliding projections (p.type, a.type) get {qual}_{col} aliases.
+fn count_natural_projection_names(select: &sqlparser::ast::Select) -> FxHashMap<String, usize> {
+    let mut counts: FxHashMap<String, usize> = FxHashMap::default();
+    for item in &select.projection {
+        if let SelectItem::UnnamedExpr(expr) = item {
+            let n = match expr {
+                Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+                Expr::Identifier(ident) => Some(ident.value.clone()),
+                _ => None,
+            };
+            if let Some(n) = n {
+                *counts.entry(n).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+fn render_join_projection_item(
+    item: &SelectItem,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &StreamJoinConfig,
+    tmp_qual: Option<&str>,
+    has_residual: bool,
+    natural_counts: &FxHashMap<String, usize>,
+) -> String {
+    match item {
+        SelectItem::UnnamedExpr(expr) => {
+            let rewritten =
+                rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
+            if has_residual {
+                let (qual, natural) = match expr {
+                    Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                        (Some(parts[0].value.clone()), Some(parts[1].value.clone()))
+                    }
+                    Expr::Identifier(ident) => (None, Some(ident.value.clone())),
+                    _ => (None, None),
+                };
+                if let Some(n) = natural {
+                    let collides = natural_counts.get(&n).copied().unwrap_or(0) > 1;
+                    if collides {
+                        if let Some(q) = qual {
+                            return format!("{rewritten} AS {q}_{n}");
+                        }
+                    }
+                    if rewritten != n {
+                        return format!("{rewritten} AS {n}");
+                    }
+                }
+            }
+            rewritten
+        }
+        SelectItem::ExprWithAlias { expr, alias } => {
+            let rewritten =
+                rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
+            format!("{rewritten} AS {alias}")
+        }
+        SelectItem::Wildcard(_) => "*".to_string(),
+        SelectItem::QualifiedWildcard(name, _) => {
+            let table = name.to_string();
+            if table == config.left_table
+                || left_alias.is_some_and(|a| a == table)
+                || table == config.right_table
+                || right_alias.is_some_and(|a| a == table)
+            {
+                "*".to_string()
+            } else {
+                format!("{table}.*")
+            }
+        }
+    }
+}
+
+// IntervalJoin is symmetric but BETWEEN is directional; add right_ts >= left_ts
+// to enforce the lower bound (the upper is already covered by the tolerance).
+fn join_directional_filter(config: &StreamJoinConfig, tmp_qual: Option<&str>) -> String {
+    if config.left_time_column.is_empty() || config.right_time_column.is_empty() {
+        return String::new();
+    }
+    let left_ref = match tmp_qual {
+        Some(q) => format!("{q}.{}", config.left_time_column),
+        None => config.left_time_column.clone(),
+    };
+    let right_ref = match tmp_qual {
+        Some(q) => format!("{q}.{}_{}", config.right_time_column, config.right_table),
+        None => format!("{}_{}", config.right_time_column, config.right_table),
+    };
+    format!("{right_ref} >= {left_ref}")
 }
 
 // Unsupported shapes (CROSS, USING, etc.) pass through sqlparser's Display unchanged.
