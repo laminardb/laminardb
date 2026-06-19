@@ -972,7 +972,6 @@ impl LaminarDB {
     }
 
     /// Register a materialized view and wire it into the running pipeline.
-    #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_create_materialized_view(
         &self,
@@ -987,54 +986,16 @@ impl LaminarDB {
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
 
-        {
-            let registry = self.mv_registry.lock();
-            if registry.get(&name_str).is_some() {
-                if if_not_exists {
-                    return Ok(ExecuteResult::Ddl(DdlInfo {
-                        statement_type: "CREATE MATERIALIZED VIEW".to_string(),
-                        object_name: name_str,
-                    }));
-                }
-                if !or_replace {
-                    return Err(DbError::MaterializedView(format!(
-                        "Materialized view '{name_str}' already exists"
-                    )));
-                }
-            }
+        if self.mv_exists_guard(&name_str, if_not_exists, or_replace)? {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "CREATE MATERIALIZED VIEW".to_string(),
+                object_name: name_str,
+            }));
         }
 
         let query_sql = query_sql.to_string();
-
-        // Planning is cheaper than execution; fall back for ASOF and other joins DataFusion can't lower.
-        let schema =
-            match crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await {
-                Some(s) => s,
-                None => match self.handle_query(&query_sql).await? {
-                    ExecuteResult::Query(qh) => qh.schema().clone(),
-                    _ => Arc::new(Schema::new(vec![Field::new(
-                        "result",
-                        DataType::Utf8,
-                        true,
-                    )])),
-                },
-            };
-
-        let table_refs = crate::sql_analysis::extract_table_references(&query_sql);
-        let catalog_sources = self.catalog.list_sources();
-        let mut sources: Vec<String> = catalog_sources
-            .into_iter()
-            .filter(|s| table_refs.contains(s.as_str()))
-            .collect();
-
-        {
-            let registry = self.mv_registry.lock();
-            for view in registry.views() {
-                if view.name != name_str && table_refs.contains(view.name.as_str()) {
-                    sources.push(view.name.clone());
-                }
-            }
-        }
+        let schema = self.resolve_mv_schema(&query_sql).await?;
+        let sources = self.collect_mv_sources(&query_sql, &name_str);
 
         {
             let mv =
@@ -1086,53 +1047,8 @@ impl LaminarDB {
             });
         }
 
-        {
-            use crate::mv_store::MvStorageMode;
-
-            // Non-windowed aggs emit all groups every cycle (replace-all); windowed aggs emit
-            // only closing windows (append) so previous windows aren't overwritten.
-            let has_aggregate = self.ctx.sql(&query_sql).await.ok().is_some_and(|df| {
-                crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
-            });
-            let mode = if has_aggregate && plan_window.is_none() {
-                MvStorageMode::Aggregate
-            } else {
-                MvStorageMode::append_default()
-            };
-
-            self.mv_store
-                .write()
-                .create_mv(&name_str, schema.clone(), mode);
-
-            let mv_provider = crate::table_provider::MvTableProvider::new(
-                name_str.clone(),
-                schema.clone(),
-                self.mv_store.clone(),
-            );
-
-            // In cluster mode each node owns a vnode slice; wrap to union peers on read.
-            #[cfg(feature = "cluster")]
-            let provider: Arc<dyn datafusion::datasource::TableProvider> =
-                if let Some(controller) = self.cluster_controller.lock().clone() {
-                    Arc::new(
-                        laminar_sql::datafusion::distributed_scan::DistributedTableProvider::new(
-                            name_str.clone(),
-                            schema,
-                            Arc::new(mv_provider),
-                            controller,
-                        ),
-                    )
-                } else {
-                    Arc::new(mv_provider)
-                };
-            #[cfg(not(feature = "cluster"))]
-            let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(mv_provider);
-
-            let _ = self.ctx.deregister_table(&name_str);
-            self.ctx.register_table(&name_str, provider).map_err(|e| {
-                DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
-            })?;
-        }
+        self.register_mv_provider(&name_str, schema, &query_sql, plan_window.is_some())
+            .await?;
 
         // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
         if let Some(ref tx) = *self.control_tx.lock() {
@@ -1159,6 +1075,119 @@ impl LaminarDB {
             statement_type: "CREATE MATERIALIZED VIEW".to_string(),
             object_name: name_str,
         }))
+    }
+
+    /// Returns `true` when an existing MV means the caller should no-op
+    /// (`IF NOT EXISTS`). Errors when it exists without `OR REPLACE`.
+    fn mv_exists_guard(
+        &self,
+        name_str: &str,
+        if_not_exists: bool,
+        or_replace: bool,
+    ) -> Result<bool, DbError> {
+        let registry = self.mv_registry.lock();
+        if registry.get(name_str).is_some() {
+            if if_not_exists {
+                return Ok(true);
+            }
+            if !or_replace {
+                return Err(DbError::MaterializedView(format!(
+                    "Materialized view '{name_str}' already exists"
+                )));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolve the MV output schema by planning the query, falling back to
+    /// execution for shapes `DataFusion` can't lower (ASOF and other joins).
+    async fn resolve_mv_schema(&self, query_sql: &str) -> Result<Arc<Schema>, DbError> {
+        if let Some(s) = crate::pipeline_lifecycle::plan_output_schema(&self.ctx, query_sql).await {
+            return Ok(s);
+        }
+        Ok(match self.handle_query(query_sql).await? {
+            ExecuteResult::Query(qh) => qh.schema().clone(),
+            _ => Arc::new(Schema::new(vec![Field::new(
+                "result",
+                DataType::Utf8,
+                true,
+            )])),
+        })
+    }
+
+    /// Collect the base sources and upstream MVs this view reads from.
+    fn collect_mv_sources(&self, query_sql: &str, name_str: &str) -> Vec<String> {
+        let table_refs = crate::sql_analysis::extract_table_references(query_sql);
+        let mut sources: Vec<String> = self
+            .catalog
+            .list_sources()
+            .into_iter()
+            .filter(|s| table_refs.contains(s.as_str()))
+            .collect();
+        let registry = self.mv_registry.lock();
+        for view in registry.views() {
+            if view.name != name_str && table_refs.contains(view.name.as_str()) {
+                sources.push(view.name.clone());
+            }
+        }
+        sources
+    }
+
+    /// Create MV storage and register its `DataFusion` table provider. In cluster
+    /// mode the provider is wrapped to union peer vnode slices on read.
+    async fn register_mv_provider(
+        &self,
+        name_str: &str,
+        schema: Arc<Schema>,
+        query_sql: &str,
+        has_window: bool,
+    ) -> Result<(), DbError> {
+        use crate::mv_store::MvStorageMode;
+
+        // Non-windowed aggs emit all groups every cycle (replace-all); windowed aggs emit
+        // only closing windows (append) so previous windows aren't overwritten.
+        let has_aggregate =
+            self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
+                crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
+            });
+        let mode = if has_aggregate && !has_window {
+            MvStorageMode::Aggregate
+        } else {
+            MvStorageMode::append_default()
+        };
+
+        self.mv_store
+            .write()
+            .create_mv(name_str, schema.clone(), mode);
+
+        let mv_provider = crate::table_provider::MvTableProvider::new(
+            name_str.to_string(),
+            schema.clone(),
+            self.mv_store.clone(),
+        );
+
+        #[cfg(feature = "cluster")]
+        let provider: Arc<dyn datafusion::datasource::TableProvider> =
+            if let Some(controller) = self.cluster_controller.lock().clone() {
+                Arc::new(
+                    laminar_sql::datafusion::distributed_scan::DistributedTableProvider::new(
+                        name_str.to_string(),
+                        schema,
+                        Arc::new(mv_provider),
+                        controller,
+                    ),
+                )
+            } else {
+                Arc::new(mv_provider)
+            };
+        #[cfg(not(feature = "cluster"))]
+        let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(mv_provider);
+
+        let _ = self.ctx.deregister_table(name_str);
+        self.ctx.register_table(name_str, provider).map_err(|e| {
+            DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
+        })?;
+        Ok(())
     }
 
     /// Handle DROP MATERIALIZED VIEW statement.
