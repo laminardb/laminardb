@@ -22,8 +22,8 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, resolve_expr_type,
-    AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, AggFuncSpec,
+    CompiledProjection, GroupCheckpoint, PreAggBuilder, WindowCheckpoint,
 };
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
@@ -260,9 +260,6 @@ impl CoreWindowState {
         let state_ref = ctx.state();
         let compile_props = state_ref.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
-        let mut compiled_exprs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-        let mut proj_fields: Vec<Field> = Vec::new();
-        let mut compile_ok = compile_source.is_some();
 
         // A Projection above the Aggregate makes the top schema differ.
         let has_projection = {
@@ -330,36 +327,15 @@ impl CoreWindowState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        let mut agg_specs = Vec::new();
-        let mut pre_agg_select_items: Vec<String> = Vec::new();
+        let compile = |e: &datafusion_expr::Expr| {
+            create_physical_expr(e, input_df_schema, compile_props).ok()
+        };
+        let mut builder =
+            PreAggBuilder::new(&input_schema, num_group_cols, compile_source.is_some());
 
         for (i, group_expr) in group_exprs.iter().enumerate() {
-            if let datafusion_expr::Expr::Column(col) = group_expr {
-                pre_agg_select_items.push(format!("\"{}\"", col.name));
-            } else {
-                let group_sql = expr_to_sql(group_expr);
-                pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
-            }
-
-            if compile_ok {
-                match create_physical_expr(group_expr, input_df_schema, compile_props) {
-                    Ok(phys) => {
-                        let dt = phys
-                            .data_type(input_df_schema.as_arrow())
-                            .unwrap_or(DataType::Utf8);
-                        let name = match group_expr {
-                            datafusion_expr::Expr::Column(col) => col.name.clone(),
-                            _ => format!("__group_{i}"),
-                        };
-                        proj_fields.push(Field::new(name, dt, true));
-                        compiled_exprs.push(phys);
-                    }
-                    Err(_) => compile_ok = false,
-                }
-            }
+            builder.push_group_expr(i, group_expr, &compile);
         }
-
-        let mut next_col_idx = num_group_cols;
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
             let agg_schema_idx = num_group_cols + i;
@@ -371,167 +347,17 @@ impl CoreWindowState {
             } else {
                 agg_field.name().clone()
             };
-
-            if let datafusion_expr::Expr::AggregateFunction(agg_func) = expr {
-                let udf = Arc::clone(&agg_func.func);
-                let is_distinct = agg_func.params.distinct;
-
-                let mut input_col_indices = Vec::new();
-                let mut input_types = Vec::new();
-
-                if agg_func.params.args.is_empty() {
-                    let col_idx = next_col_idx;
-                    next_col_idx += 1;
-                    pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
-                    input_col_indices.push(col_idx);
-                    input_types.push(DataType::Boolean);
-
-                    if compile_ok {
-                        match create_physical_expr(
-                            &datafusion_expr::lit(true),
-                            input_df_schema,
-                            compile_props,
-                        ) {
-                            Ok(phys) => {
-                                proj_fields.push(Field::new(
-                                    format!("__agg_input_{col_idx}"),
-                                    DataType::Boolean,
-                                    true,
-                                ));
-                                compiled_exprs.push(phys);
-                            }
-                            Err(_) => compile_ok = false,
-                        }
-                    }
-                } else {
-                    for arg_expr in &agg_func.params.args {
-                        let col_idx = next_col_idx;
-                        next_col_idx += 1;
-                        let expr_sql = expr_to_sql(arg_expr);
-
-                        if let Some(filter_expr) = &agg_func.params.filter {
-                            let filter_sql = expr_to_sql(filter_expr);
-                            pre_agg_select_items.push(format!(
-                                "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
-                            ));
-
-                            if compile_ok {
-                                let case_expr =
-                                    datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                                        expr: None,
-                                        when_then_expr: vec![(
-                                            Box::new(filter_expr.as_ref().clone()),
-                                            Box::new(arg_expr.clone()),
-                                        )],
-                                        else_expr: Some(Box::new(datafusion_expr::lit(
-                                            ScalarValue::Null,
-                                        ))),
-                                    });
-                                match create_physical_expr(
-                                    &case_expr,
-                                    input_df_schema,
-                                    compile_props,
-                                ) {
-                                    Ok(phys) => {
-                                        let dt = resolve_expr_type(
-                                            arg_expr,
-                                            &input_schema,
-                                            agg_field.data_type(),
-                                        );
-                                        proj_fields.push(Field::new(
-                                            format!("__agg_input_{col_idx}"),
-                                            dt,
-                                            true,
-                                        ));
-                                        compiled_exprs.push(phys);
-                                    }
-                                    Err(_) => compile_ok = false,
-                                }
-                            }
-                        } else {
-                            pre_agg_select_items
-                                .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
-
-                            if compile_ok {
-                                match create_physical_expr(arg_expr, input_df_schema, compile_props)
-                                {
-                                    Ok(phys) => {
-                                        let dt = resolve_expr_type(
-                                            arg_expr,
-                                            &input_schema,
-                                            agg_field.data_type(),
-                                        );
-                                        proj_fields.push(Field::new(
-                                            format!("__agg_input_{col_idx}"),
-                                            dt,
-                                            true,
-                                        ));
-                                        compiled_exprs.push(phys);
-                                    }
-                                    Err(_) => compile_ok = false,
-                                }
-                            }
-                        }
-
-                        input_col_indices.push(col_idx);
-                        let dt = resolve_expr_type(arg_expr, &input_schema, agg_field.data_type());
-                        input_types.push(dt);
-                    }
-                }
-
-                let filter_col_index = if let Some(filter_expr) = &agg_func.params.filter {
-                    let col_idx = next_col_idx;
-                    next_col_idx += 1;
-                    let filter_sql = expr_to_sql(filter_expr);
-                    pre_agg_select_items.push(format!(
-                        "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
-                    ));
-
-                    if compile_ok {
-                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                            expr: None,
-                            when_then_expr: vec![(
-                                Box::new(filter_expr.as_ref().clone()),
-                                Box::new(datafusion_expr::lit(true)),
-                            )],
-                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
-                        });
-                        match create_physical_expr(&case_expr, input_df_schema, compile_props) {
-                            Ok(phys) => {
-                                proj_fields.push(Field::new(
-                                    format!("__agg_filter_{col_idx}"),
-                                    DataType::Boolean,
-                                    true,
-                                ));
-                                compiled_exprs.push(phys);
-                            }
-                            Err(_) => compile_ok = false,
-                        }
-                    }
-
-                    Some(col_idx)
-                } else {
-                    None
-                };
-
-                let return_type = udf
-                    .return_type(&input_types)
-                    .unwrap_or_else(|_| agg_field.data_type().clone());
-
-                agg_specs.push(AggFuncSpec {
-                    udf,
-                    input_types,
-                    input_col_indices,
-                    output_name,
-                    return_type,
-                    distinct: is_distinct,
-                    is_count_star: agg_func.params.args.is_empty(),
-                    filter_col_index,
-                });
-            } else {
+            if !builder.push_aggregate(expr, output_name, agg_field, &compile) {
                 return Ok(None);
             }
         }
+
+        let mut compile_ok = builder.compile_ok;
+        let next_col_idx = builder.next_col_idx;
+        let mut pre_agg_select_items = builder.pre_agg_select_items;
+        let agg_specs = builder.agg_specs;
+        let mut compiled_exprs = builder.compiled_exprs;
+        let mut proj_fields = builder.proj_fields;
 
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
