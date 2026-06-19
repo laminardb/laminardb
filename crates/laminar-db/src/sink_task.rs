@@ -377,7 +377,7 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
     }
 }
 
-/// Dispatch a single sink command. Returns `true` when the task should stop.
+/// Returns `true` when the task should stop.
 async fn handle_sink_command(
     inner: &mut SinkTaskInner,
     cmd: SinkCommand,

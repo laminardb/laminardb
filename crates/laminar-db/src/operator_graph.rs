@@ -1626,8 +1626,7 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Update a node's output watermark to the min of its input watermarks (and any
-    /// operator hold). Source nodes are pre-seeded in `execute_cycle` and skipped.
+    /// Source nodes are pre-seeded in `execute_cycle`, so skip them here.
     fn propagate_operator_watermark(
         &mut self,
         node_id: usize,
@@ -1675,7 +1674,6 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Fan a node's output to its live provider, the results map, and downstream ports.
     fn route_output(
         &mut self,
         node_id: usize,
@@ -1824,8 +1822,7 @@ impl OperatorGraph {
         }
     }
 
-    /// Run one deferred operator (round-robin) so a per-cycle budget overrun can't
-    /// starve the tail of the topo order.
+    /// Round-robin one deferred operator so a budget overrun can't starve the tail.
     async fn run_one_deferred_operator(
         &mut self,
         i: usize,

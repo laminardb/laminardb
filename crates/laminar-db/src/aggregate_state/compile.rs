@@ -22,16 +22,12 @@ pub(crate) struct AggregateInfo {
     pub(crate) where_predicate: Option<datafusion_expr::Expr>,
 }
 
-/// A function that compiles a logical expr to a physical one, or `None` on
-/// failure. Constructed by the caller capturing the input schema + props so the
-/// builder needn't name `DFSchema`/`ExecutionProps`.
+/// Supplied by the caller so the builder needn't name `DFSchema`/`ExecutionProps`.
 pub(crate) type ExprCompiler<'a> =
     dyn Fn(&datafusion_expr::Expr) -> Option<Arc<dyn PhysicalExpr>> + 'a;
 
-/// Accumulates a query's pre-aggregate projection — the `SELECT` items, the
-/// optional compiled physical projection (skipped once compilation fails), and
-/// one [`AggFuncSpec`] per aggregate — while walking GROUP BY / aggregate exprs.
-/// Shared by the plain, windowed, and EOWC aggregate-state builders.
+/// Builds a query's pre-aggregate projection; shared by the plain, windowed, and
+/// EOWC aggregate-state builders.
 pub(crate) struct PreAggBuilder<'a> {
     input_schema: &'a Schema,
     pub(crate) compile_ok: bool,
@@ -55,9 +51,8 @@ impl<'a> PreAggBuilder<'a> {
         }
     }
 
-    /// Compile `expr` and add it as projected column `name`. When `from_phys`,
-    /// the column type is the compiled expr's type (falling back to `fallback`),
-    /// otherwise `fallback` is used directly. No-op once compilation has failed.
+    /// `from_phys` takes the column type from the compiled expr; no-op once
+    /// compilation has failed.
     pub(crate) fn push_compiled_column(
         &mut self,
         name: &str,
@@ -83,7 +78,6 @@ impl<'a> PreAggBuilder<'a> {
         }
     }
 
-    /// Add a GROUP BY column to the pre-agg projection.
     pub(crate) fn push_group_expr(
         &mut self,
         i: usize,
@@ -102,9 +96,8 @@ impl<'a> PreAggBuilder<'a> {
         self.push_compiled_column(&name, group_expr, DataType::Utf8, true, compile);
     }
 
-    /// Add an aggregate's input column(s), optional FILTER column, and its
-    /// [`AggFuncSpec`]. Returns `false` if `expr` is not an aggregate function
-    /// (the caller should bail to the interpreted path).
+    /// `false` if `expr` is not an aggregate function (caller bails to the
+    /// interpreted path).
     pub(crate) fn push_aggregate(
         &mut self,
         expr: &datafusion_expr::Expr,
@@ -203,8 +196,6 @@ impl<'a> PreAggBuilder<'a> {
         true
     }
 
-    /// Add the `__agg_filter_*` column for an aggregate's `FILTER (WHERE ...)`
-    /// clause and return its pre-agg column index.
     fn push_filter_column(
         &mut self,
         filter_expr: &datafusion_expr::Expr,

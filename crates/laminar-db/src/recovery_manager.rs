@@ -552,7 +552,6 @@ impl<'a> RecoveryManager<'a> {
         result
     }
 
-    /// Warn about sources/sinks added or removed since the checkpoint was taken.
     fn warn_topology_changes(
         manifest: &CheckpointManifest,
         sources: &[RegisteredSource],
@@ -600,8 +599,6 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
-    /// Restore replayable sources from their saved offsets, retrying transient
-    /// failures up to three times. Records per-source failures in `result`.
     async fn restore_replayable_sources(
         sources: &[RegisteredSource],
         manifest: &CheckpointManifest,
@@ -650,7 +647,6 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
-    /// Roll back exactly-once sinks that did not commit; committed sinks are left alone.
     async fn rollback_uncommitted_sinks(
         sinks: &[RegisteredSink],
         manifest: &CheckpointManifest,
