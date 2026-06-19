@@ -1806,7 +1806,15 @@ impl LaminarDB {
             let watcher_shutdown = Arc::clone(&self.shutdown_signal);
             let watcher_fault = Arc::clone(&self.last_fault);
             let handle = tokio::spawn(async move {
-                if done_rx.await.is_err() {
+                if done_rx.await.is_ok() {
+                    // Finalize a stop that out-waited its caller (ShuttingDown→Created);
+                    // a no-op if stop_pipeline already did.
+                    let _ = DbState::compare_exchange(
+                        DbState::ShuttingDown,
+                        DbState::Created,
+                        &watcher_state,
+                    );
+                } else {
                     tracing::error!("laminar-compute thread exited unexpectedly");
                     watcher_fault
                         .lock()
@@ -1883,14 +1891,22 @@ impl LaminarDB {
         }
 
         let handle = self.runtime_handle.lock().take();
-        if let Some(handle) = handle {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
+        if let Some(mut handle) = handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
                 Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
                 Err(_) => {
-                    tracing::error!("Pipeline stop timed out after 10s; coordinator still running");
+                    // Still draining. Re-store the watcher; it finalizes
+                    // ShuttingDown→Created once the thread exits. start() refuses
+                    // meanwhile, so nothing double-spawns over the draining coordinator.
+                    tracing::warn!(
+                        "Pipeline stop still draining after 10s; will finalize when the coordinator exits"
+                    );
+                    *self.runtime_handle.lock() = Some(handle);
                     return Err(DbError::InvalidOperation(
-                        "pipeline stop timed out; coordinator did not exit".into(),
+                        "pipeline stop is taking longer than expected; coordinator still \
+                         draining, retry shortly"
+                            .into(),
                     ));
                 }
             }
