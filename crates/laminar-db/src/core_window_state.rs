@@ -860,7 +860,6 @@ impl CoreWindowState {
         Ok(())
     }
 
-    /// Merge several overlapping sessions into one, folding their accumulators.
     fn merge_overlapping_sessions(
         &mut self,
         key: &arrow::row::OwnedRow,
@@ -870,46 +869,46 @@ impl CoreWindowState {
         batch: &RecordBatch,
         index_array: &arrow::array::UInt32Array,
     ) -> Result<(), DbError> {
+        // Stage the merge into a fresh survivor before mutating the group: fold in
+        // every overlapping session's state (a non-destructive read) plus the new
+        // row, and only remove + insert once all fallible steps succeed — so a
+        // mid-merge failure leaves the existing sessions intact.
+        let mut accs = self.create_fresh_accumulators()?;
+
         let group = self
             .session_groups
             .get_mut(key)
             .expect("invariant: key present (overlapping derived from same group)");
         let mut merged_start = new_start;
         let mut merged_end = new_end;
-        let mut survivor_accs: Option<Vec<Box<dyn datafusion_expr::Accumulator>>> = None;
-
         for &sess_key in overlapping {
             let sess = group
                 .sessions
-                .remove(&sess_key)
+                .get_mut(&sess_key)
                 .expect("invariant: overlapping keys are unique BTreeMap entries");
             merged_start = merged_start.min(sess.start);
             merged_end = merged_end.max(sess.end);
-
-            if let Some(ref mut surv) = survivor_accs {
-                for (i, mut acc) in sess.accs.into_iter().enumerate() {
-                    let state = acc
-                        .state()
-                        .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
-                    let arrays: Vec<ArrayRef> = state
-                        .iter()
-                        .map(|sv| {
-                            sv.to_array()
-                                .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    surv[i]
-                        .merge_batch(&arrays)
-                        .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
-                }
-            } else {
-                survivor_accs = Some(sess.accs);
+            for (i, acc) in sess.accs.iter_mut().enumerate() {
+                let state = acc
+                    .state()
+                    .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
+                let arrays: Vec<ArrayRef> = state
+                    .iter()
+                    .map(|sv| {
+                        sv.to_array()
+                            .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
+                    })
+                    .collect::<Result<_, _>>()?;
+                accs[i]
+                    .merge_batch(&arrays)
+                    .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
             }
         }
-
-        let mut accs =
-            survivor_accs.expect("invariant: overlapping non-empty, survivor set on first iter");
         Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
+
+        for &sess_key in overlapping {
+            group.sessions.remove(&sess_key);
+        }
         group.sessions.insert(
             merged_start,
             SessionAccState {

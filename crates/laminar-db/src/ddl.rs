@@ -118,11 +118,17 @@ fn parse_create_table_with(
                 out.cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
             }
             "cache_max_entries" | "cache.max_entries" => {
-                out.cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
+                let entries = val.parse::<usize>().map_err(|_| {
                     DbError::InvalidOperation(format!(
                         "Invalid cache_max_entries '{val}': expected positive integer"
                     ))
-                })?);
+                })?;
+                if entries == 0 {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Invalid cache_max_entries '{val}': expected positive integer"
+                    )));
+                }
+                out.cache_max_entries = Some(entries);
             }
             "cache_max_bytes" | "cache.max_bytes" | "cache.memory" => {
                 let bytes = val.parse::<usize>().map_err(|_| {
@@ -297,8 +303,7 @@ impl LaminarDB {
         }))
     }
 
-    /// Translate a `CREATE SOURCE` to a `SourceDefinition`, auto-discovering the
-    /// schema from the connector when no columns are declared.
+    /// Auto-discovers the schema from the connector when no columns are declared.
     async fn build_source_definition(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
@@ -360,8 +365,7 @@ impl LaminarDB {
             .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))
     }
 
-    /// Register a source in the catalog per the `OR REPLACE` / `IF NOT EXISTS`
-    /// semantics, returning the entry (`None` when an existing one was kept).
+    /// `None` when an existing source was kept (`IF NOT EXISTS`).
     fn register_source_entry(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
@@ -1077,8 +1081,7 @@ impl LaminarDB {
         }))
     }
 
-    /// Returns `true` when an existing MV means the caller should no-op
-    /// (`IF NOT EXISTS`). Errors when it exists without `OR REPLACE`.
+    /// `true` ⇒ an existing MV should make the caller no-op (`IF NOT EXISTS`).
     fn mv_exists_guard(
         &self,
         name_str: &str,
@@ -1099,8 +1102,7 @@ impl LaminarDB {
         Ok(false)
     }
 
-    /// Resolve the MV output schema by planning the query, falling back to
-    /// execution for shapes `DataFusion` can't lower (ASOF and other joins).
+    /// Falls back to executing the query for shapes `DataFusion` can't plan (e.g. ASOF).
     async fn resolve_mv_schema(&self, query_sql: &str) -> Result<Arc<Schema>, DbError> {
         if let Some(s) = crate::pipeline_lifecycle::plan_output_schema(&self.ctx, query_sql).await {
             return Ok(s);
@@ -1115,7 +1117,6 @@ impl LaminarDB {
         })
     }
 
-    /// Collect the base sources and upstream MVs this view reads from.
     fn collect_mv_sources(&self, query_sql: &str, name_str: &str) -> Vec<String> {
         let table_refs = crate::sql_analysis::extract_table_references(query_sql);
         let mut sources: Vec<String> = self
@@ -1133,8 +1134,7 @@ impl LaminarDB {
         sources
     }
 
-    /// Create MV storage and register its `DataFusion` table provider. In cluster
-    /// mode the provider is wrapped to union peer vnode slices on read.
+    /// Cluster mode wraps the provider to union peer vnode slices on read.
     async fn register_mv_provider(
         &self,
         name_str: &str,
