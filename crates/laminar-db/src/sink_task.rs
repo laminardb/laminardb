@@ -332,7 +332,6 @@ struct SinkTaskInner {
 }
 
 // `epoch_poisoned` causes `pre_commit`/`commit_epoch` to fail so the coordinator rolls back.
-#[allow(clippy::too_many_lines)]
 async fn run_sink_task(mut inner: SinkTaskInner) {
     let mut flush_timer = tokio::time::interval(inner.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -357,138 +356,16 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                     }
                     break;
                 };
-                match cmd {
-                    SinkCommand::WriteBatch { batch } => {
-                        let rows = batch.num_rows();
-                        match tokio::time::timeout(
-                            inner.write_timeout,
-                            inner.sink.write_batch(&batch),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => {
-                                epoch_poisoned.store(true, Ordering::Release);
-                                tracing::warn!(
-                                    sink = %inner.name, error = %e, rows,
-                                    "Sink write error — epoch poisoned"
-                                );
-                                let _ = inner.event_tx.try_push(SinkEvent::WriteError {
-                                    sink_id: Arc::clone(&inner.sink_id),
-                                    epoch: current_epoch,
-                                    rows,
-                                    error: e.to_string(),
-                                });
-                            }
-                            Err(_elapsed) => {
-                                epoch_poisoned.store(true, Ordering::Release);
-                                tracing::error!(
-                                    sink = %inner.name,
-                                    timeout_secs = inner.write_timeout.as_secs(),
-                                    rows,
-                                    "Sink write I/O timed out — epoch poisoned"
-                                );
-                                let _ = inner.event_tx.try_push(SinkEvent::WriteTimeout {
-                                    sink_id: Arc::clone(&inner.sink_id),
-                                    epoch: current_epoch,
-                                    rows,
-                                    timeout: inner.write_timeout,
-                                });
-                            }
-                        }
-                    }
-                    SinkCommand::BeginEpoch { epoch, ack } => {
-                        let result = inner.sink.begin_epoch(epoch).await;
-                        if result.is_ok() {
-                            current_epoch = epoch;
-                            epoch_poisoned.store(false, Ordering::Release);
-                        }
-                        ack.send(result);
-                    }
-                    #[cfg(test)]
-                    SinkCommand::Flush { ack } => {
-                        let result = inner.sink.flush().await;
-                        ack.send(result);
-                    }
-                    SinkCommand::PreCommit { epoch, ack } => {
-                        let result = if epoch_poisoned.load(Ordering::Acquire) {
-                            Err(ConnectorError::WriteError(
-                                "epoch poisoned by prior write failure".into(),
-                            ))
-                        } else {
-                            inner.sink.pre_commit(epoch).await
-                        };
-                        ack.send(result);
-                    }
-                    SinkCommand::CommitEpoch { epoch, ack } => {
-                        let result = if epoch_poisoned.load(Ordering::Acquire) {
-                            Err(ConnectorError::WriteError(
-                                "epoch poisoned by prior write failure".into(),
-                            ))
-                        } else {
-                            inner.sink.commit_epoch(epoch).await
-                        };
-                        ack.send(result);
-                    }
-                    SinkCommand::CommitAggregated {
-                        epoch,
-                        descriptors,
-                        ack,
-                    } => {
-                        let result = match inner.sink.as_coordinated_committer() {
-                            Some(committer) => committer.commit_aggregated(epoch, descriptors).await,
-                            None => Err(ConnectorError::InvalidState {
-                                expected: "coordinated committer".into(),
-                                actual: format!("sink '{}' is not coordinated", inner.name),
-                            }),
-                        };
-                        ack.send(result);
-                    }
-                    SinkCommand::CommittedThrough { ack } => {
-                        let result = match inner.sink.as_coordinated_committer() {
-                            Some(committer) => committer.committed_through().await,
-                            None => Ok(None),
-                        };
-                        ack.send(result);
-                    }
-                    SinkCommand::RollbackEpoch { epoch, force, ack } => {
-                        let result = if force
-                            || !preserves_pending_on_abandon
-                            || epoch_poisoned.load(Ordering::Acquire)
-                        {
-                            inner.sink.rollback_epoch(epoch).await
-                        } else {
-                            tracing::debug!(
-                                sink = %inner.name, epoch,
-                                "coordination rollback — keeping pending sink \
-                                 output for the next epoch's commit"
-                            );
-                            Ok(())
-                        };
-                        if let Err(ref e) = result {
-                            tracing::warn!(
-                                sink = %inner.name, epoch, error = %e,
-                                "[LDB-6004] Sink rollback failed"
-                            );
-                        }
-                        ack.send(result);
-                    }
-                    SinkCommand::Sync { ack } => {
-                        ack.send(());
-                    }
-                    #[cfg(test)]
-                    SinkCommand::Close => {
-                        if let Err(e) = inner.sink.flush().await {
-                            tracing::warn!(sink = %inner.name, error = %e,
-                                "Sink flush failed during close");
-                        }
-                        if let Err(e) = inner.sink.close().await {
-                            tracing::warn!(sink = %inner.name, error = %e,
-                                "Sink close failed");
-                        }
-                        tracing::debug!(sink = %inner.name, "Sink task closed");
-                        break;
-                    }
+                let stop = handle_sink_command(
+                    &mut inner,
+                    cmd,
+                    &mut current_epoch,
+                    &epoch_poisoned,
+                    preserves_pending_on_abandon,
+                )
+                .await;
+                if stop {
+                    break;
                 }
             }
             _ = flush_timer.tick() => {
@@ -498,6 +375,170 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
             }
         }
     }
+}
+
+/// Dispatch a single sink command. Returns `true` when the task should stop.
+async fn handle_sink_command(
+    inner: &mut SinkTaskInner,
+    cmd: SinkCommand,
+    current_epoch: &mut u64,
+    epoch_poisoned: &AtomicBool,
+    preserves_pending_on_abandon: bool,
+) -> bool {
+    match cmd {
+        SinkCommand::WriteBatch { batch } => {
+            handle_write_batch(inner, batch, *current_epoch, epoch_poisoned).await;
+        }
+        SinkCommand::BeginEpoch { epoch, ack } => {
+            let result = inner.sink.begin_epoch(epoch).await;
+            if result.is_ok() {
+                *current_epoch = epoch;
+                epoch_poisoned.store(false, Ordering::Release);
+            }
+            ack.send(result);
+        }
+        #[cfg(test)]
+        SinkCommand::Flush { ack } => {
+            let result = inner.sink.flush().await;
+            ack.send(result);
+        }
+        SinkCommand::PreCommit { epoch, ack } => {
+            let result = if epoch_poisoned.load(Ordering::Acquire) {
+                Err(ConnectorError::WriteError(
+                    "epoch poisoned by prior write failure".into(),
+                ))
+            } else {
+                inner.sink.pre_commit(epoch).await
+            };
+            ack.send(result);
+        }
+        SinkCommand::CommitEpoch { epoch, ack } => {
+            let result = if epoch_poisoned.load(Ordering::Acquire) {
+                Err(ConnectorError::WriteError(
+                    "epoch poisoned by prior write failure".into(),
+                ))
+            } else {
+                inner.sink.commit_epoch(epoch).await
+            };
+            ack.send(result);
+        }
+        SinkCommand::CommitAggregated {
+            epoch,
+            descriptors,
+            ack,
+        } => {
+            let result = match inner.sink.as_coordinated_committer() {
+                Some(committer) => committer.commit_aggregated(epoch, descriptors).await,
+                None => Err(ConnectorError::InvalidState {
+                    expected: "coordinated committer".into(),
+                    actual: format!("sink '{}' is not coordinated", inner.name),
+                }),
+            };
+            ack.send(result);
+        }
+        SinkCommand::CommittedThrough { ack } => {
+            let result = match inner.sink.as_coordinated_committer() {
+                Some(committer) => committer.committed_through().await,
+                None => Ok(None),
+            };
+            ack.send(result);
+        }
+        SinkCommand::RollbackEpoch { epoch, force, ack } => {
+            let result = handle_rollback_epoch(
+                inner,
+                epoch,
+                force,
+                preserves_pending_on_abandon,
+                epoch_poisoned,
+            )
+            .await;
+            ack.send(result);
+        }
+        SinkCommand::Sync { ack } => {
+            ack.send(());
+        }
+        #[cfg(test)]
+        SinkCommand::Close => {
+            if let Err(e) = inner.sink.flush().await {
+                tracing::warn!(sink = %inner.name, error = %e,
+                    "Sink flush failed during close");
+            }
+            if let Err(e) = inner.sink.close().await {
+                tracing::warn!(sink = %inner.name, error = %e,
+                    "Sink close failed");
+            }
+            tracing::debug!(sink = %inner.name, "Sink task closed");
+            return true;
+        }
+    }
+    false
+}
+
+/// Write a batch under the configured timeout; poisons the epoch on error.
+async fn handle_write_batch(
+    inner: &mut SinkTaskInner,
+    batch: RecordBatch,
+    current_epoch: u64,
+    epoch_poisoned: &AtomicBool,
+) {
+    let rows = batch.num_rows();
+    match tokio::time::timeout(inner.write_timeout, inner.sink.write_batch(&batch)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            epoch_poisoned.store(true, Ordering::Release);
+            tracing::warn!(
+                sink = %inner.name, error = %e, rows,
+                "Sink write error — epoch poisoned"
+            );
+            let _ = inner.event_tx.try_push(SinkEvent::WriteError {
+                sink_id: Arc::clone(&inner.sink_id),
+                epoch: current_epoch,
+                rows,
+                error: e.to_string(),
+            });
+        }
+        Err(_elapsed) => {
+            epoch_poisoned.store(true, Ordering::Release);
+            tracing::error!(
+                sink = %inner.name,
+                timeout_secs = inner.write_timeout.as_secs(),
+                rows,
+                "Sink write I/O timed out — epoch poisoned"
+            );
+            let _ = inner.event_tx.try_push(SinkEvent::WriteTimeout {
+                sink_id: Arc::clone(&inner.sink_id),
+                epoch: current_epoch,
+                rows,
+                timeout: inner.write_timeout,
+            });
+        }
+    }
+}
+
+/// Roll back (or intentionally keep) a coordinated epoch's pending output.
+async fn handle_rollback_epoch(
+    inner: &mut SinkTaskInner,
+    epoch: u64,
+    force: bool,
+    preserves_pending_on_abandon: bool,
+    epoch_poisoned: &AtomicBool,
+) -> Result<(), ConnectorError> {
+    if !(force || !preserves_pending_on_abandon || epoch_poisoned.load(Ordering::Acquire)) {
+        tracing::debug!(
+            sink = %inner.name, epoch,
+            "coordination rollback — keeping pending sink \
+             output for the next epoch's commit"
+        );
+        return Ok(());
+    }
+    let result = inner.sink.rollback_epoch(epoch).await;
+    if let Err(ref e) = result {
+        tracing::warn!(
+            sink = %inner.name, epoch, error = %e,
+            "[LDB-6004] Sink rollback failed"
+        );
+    }
+    result
 }
 
 #[cfg(test)]
