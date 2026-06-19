@@ -525,81 +525,89 @@ impl IncrementalEowcState {
     }
 
     /// Update per-window accumulators with a new pre-aggregation batch.
-    #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
-        let has_groups = self.num_group_cols > 0;
 
-        let rows = if has_groups {
-            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-                .map(|i| Arc::clone(batch.column(i)))
-                .collect();
-            let rows = self
-                .row_converter
-                .convert_columns(&group_cols)
-                .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-            Some(rows)
+        if self.num_group_cols == 0 {
+            self.update_batch_nogroup(batch, &ts_array)
         } else {
-            None
-        };
-
-        if !has_groups {
-            let empty_key = crate::aggregate_state::global_aggregate_key();
-            let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
-            for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
-                if ts_ms == NULL_TIMESTAMP {
-                    continue;
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = row_idx as u32;
-                for ws in assign_windows(ts_ms, &self.window_type) {
-                    if self.is_window_closed(ws) {
-                        self.record_late_drop(1);
-                        continue;
-                    }
-                    grouped.entry(ws).or_default().push(idx);
-                }
-            }
-            for (window_start, indices) in &grouped {
-                let needs_insert = {
-                    let wg = self.windows.entry(*window_start).or_default();
-                    !wg.contains_key(&empty_key)
-                };
-                if needs_insert {
-                    let mut accs = Vec::with_capacity(self.agg_specs.len());
-                    for spec in &self.agg_specs {
-                        accs.push(spec.create_accumulator()?);
-                    }
-                    self.windows
-                        .entry(*window_start)
-                        .or_default()
-                        .insert(empty_key.clone(), accs);
-                }
-                let Some(accs) = self
-                    .windows
-                    .get_mut(window_start)
-                    .and_then(|g| g.get_mut(&empty_key))
-                else {
-                    continue;
-                };
-                crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs,
-                    batch,
-                    indices,
-                    &self.agg_specs,
-                    None,
-                )?;
-            }
-            return Ok(());
+            self.update_batch_grouped(batch, &ts_array)
         }
+    }
+
+    fn update_batch_nogroup(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let empty_key = crate::aggregate_state::global_aggregate_key();
+        let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
+        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = row_idx as u32;
+            for ws in assign_windows(ts_ms, &self.window_type) {
+                if self.is_window_closed(ws) {
+                    self.record_late_drop(1);
+                    continue;
+                }
+                grouped.entry(ws).or_default().push(idx);
+            }
+        }
+        for (window_start, indices) in &grouped {
+            let needs_insert = {
+                let wg = self.windows.entry(*window_start).or_default();
+                !wg.contains_key(&empty_key)
+            };
+            if needs_insert {
+                let mut accs = Vec::with_capacity(self.agg_specs.len());
+                for spec in &self.agg_specs {
+                    accs.push(spec.create_accumulator()?);
+                }
+                self.windows
+                    .entry(*window_start)
+                    .or_default()
+                    .insert(empty_key.clone(), accs);
+            }
+            let Some(accs) = self
+                .windows
+                .get_mut(window_start)
+                .and_then(|g| g.get_mut(&empty_key))
+            else {
+                continue;
+            };
+            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                accs,
+                batch,
+                indices,
+                &self.agg_specs,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn update_batch_grouped(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
         // Dedup group keys per batch; bucket by (window, group_id) to avoid cloning OwnedRow
         // for each overlapping window (hopping).
-        let rows_ref = rows.as_ref().expect("rows set when has_groups");
         let mut group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState> =
             indexmap::IndexSet::default();
         let mut grouped: AHashMap<(i64, u32), Vec<u32>> = AHashMap::new();
@@ -608,7 +616,7 @@ impl IncrementalEowcState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
+            let (gid, _) = group_keys.insert_full(rows.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             for ws in assign_windows(ts_ms, &self.window_type) {

@@ -713,7 +713,6 @@ impl CoreWindowState {
     /// Update per-window accumulators with a new pre-aggregation batch.
     ///
     /// Session windows use per-row processing because merge depends on insertion order.
-    #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -725,83 +724,92 @@ impl CoreWindowState {
             return self.update_batch_session(batch, &ts_array);
         }
 
-        let rows = if self.num_group_cols > 0 {
-            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-                .map(|i| Arc::clone(batch.column(i)))
-                .collect();
-            let rows = self
-                .row_converter
-                .convert_columns(&group_cols)
-                .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-            Some(rows)
+        if self.num_group_cols == 0 {
+            self.update_batch_nogroup(batch, &ts_array)
         } else {
-            None
-        };
+            self.update_batch_grouped(batch, &ts_array)
+        }
+    }
 
-        let has_groups = self.num_group_cols > 0;
-        if !has_groups {
-            let empty_key = crate::aggregate_state::global_aggregate_key();
-            let mut grouped = std::mem::take(&mut self.scratch_nogroup);
-            grouped.clear();
-            for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
-                if ts_ms == NULL_TIMESTAMP {
-                    continue;
+    fn update_batch_nogroup(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let empty_key = crate::aggregate_state::global_aggregate_key();
+        let mut grouped = std::mem::take(&mut self.scratch_nogroup);
+        grouped.clear();
+        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = row_idx as u32;
+            match &self.assigner {
+                CoreWindowAssigner::Tumbling(a) => {
+                    let ws = a.assign(ts_ms).start;
+                    if self.is_window_closed(ws) {
+                        self.record_late_drop(1);
+                        continue;
+                    }
+                    grouped.entry(ws).or_default().push(idx);
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = row_idx as u32;
-                match &self.assigner {
-                    CoreWindowAssigner::Tumbling(a) => {
-                        let ws = a.assign(ts_ms).start;
-                        if self.is_window_closed(ws) {
+                CoreWindowAssigner::Hopping(a) => {
+                    for wid in a.assign_windows(ts_ms) {
+                        if self.is_window_closed(wid.start) {
                             self.record_late_drop(1);
                             continue;
                         }
-                        grouped.entry(ws).or_default().push(idx);
+                        grouped.entry(wid.start).or_default().push(idx);
                     }
-                    CoreWindowAssigner::Hopping(a) => {
-                        for wid in a.assign_windows(ts_ms) {
-                            if self.is_window_closed(wid.start) {
-                                self.record_late_drop(1);
-                                continue;
-                            }
-                            grouped.entry(wid.start).or_default().push(idx);
-                        }
-                    }
-                    CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
                 }
+                CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
             }
-            for (window_start, indices) in &grouped {
-                let needs_insert = {
-                    let wg = self.windows.entry(*window_start).or_default();
-                    !wg.contains_key(&empty_key)
-                };
-                if needs_insert {
-                    let accs = self.create_fresh_accumulators()?;
-                    self.windows
-                        .entry(*window_start)
-                        .or_default()
-                        .insert(empty_key.clone(), accs);
-                }
-                let Some(accs) = self
-                    .windows
-                    .get_mut(window_start)
-                    .and_then(|g| g.get_mut(&empty_key))
-                else {
-                    continue;
-                };
-                crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs,
-                    batch,
-                    indices,
-                    &self.agg_specs,
-                    None,
-                )?;
-            }
-            self.scratch_nogroup = grouped;
-            return Ok(());
         }
+        for (window_start, indices) in &grouped {
+            let needs_insert = {
+                let wg = self.windows.entry(*window_start).or_default();
+                !wg.contains_key(&empty_key)
+            };
+            if needs_insert {
+                let accs = self.create_fresh_accumulators()?;
+                self.windows
+                    .entry(*window_start)
+                    .or_default()
+                    .insert(empty_key.clone(), accs);
+            }
+            let Some(accs) = self
+                .windows
+                .get_mut(window_start)
+                .and_then(|g| g.get_mut(&empty_key))
+            else {
+                continue;
+            };
+            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                accs,
+                batch,
+                indices,
+                &self.agg_specs,
+                None,
+            )?;
+        }
+        self.scratch_nogroup = grouped;
+        Ok(())
+    }
 
-        let rows_ref = rows.as_ref().expect("rows set when has_groups");
+    fn update_batch_grouped(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
+
         let mut grouped = std::mem::take(&mut self.scratch_grouped);
         let mut group_keys = std::mem::take(&mut self.scratch_group_keys);
         grouped.clear();
@@ -811,7 +819,7 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
+            let (gid, _) = group_keys.insert_full(rows.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
@@ -938,7 +946,6 @@ impl CoreWindowState {
     }
 
     /// Update accumulators for a session window, merging overlapping sessions.
-    #[allow(clippy::too_many_lines)]
     fn update_session_window(
         &mut self,
         ts_ms: i64,
@@ -1013,58 +1020,78 @@ impl CoreWindowState {
                 }
             }
             _ => {
-                let group = self
-                    .session_groups
-                    .get_mut(key)
-                    .expect("invariant: key present (overlapping derived from same group)");
-                let mut merged_start = new_start;
-                let mut merged_end = new_end;
-                let mut survivor_accs: Option<Vec<Box<dyn datafusion_expr::Accumulator>>> = None;
-
-                for &sess_key in &overlapping {
-                    let sess = group
-                        .sessions
-                        .remove(&sess_key)
-                        .expect("invariant: overlapping keys are unique BTreeMap entries");
-                    merged_start = merged_start.min(sess.start);
-                    merged_end = merged_end.max(sess.end);
-
-                    if let Some(ref mut surv) = survivor_accs {
-                        for (i, mut acc) in sess.accs.into_iter().enumerate() {
-                            let state = acc.state().map_err(|e| {
-                                DbError::Pipeline(format!("session merge state: {e}"))
-                            })?;
-                            let arrays: Vec<ArrayRef> = state
-                                .iter()
-                                .map(|sv| {
-                                    sv.to_array().map_err(|e| {
-                                        DbError::Pipeline(format!("session merge array: {e}"))
-                                    })
-                                })
-                                .collect::<Result<_, _>>()?;
-                            surv[i]
-                                .merge_batch(&arrays)
-                                .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
-                        }
-                    } else {
-                        survivor_accs = Some(sess.accs);
-                    }
-                }
-
-                let mut accs = survivor_accs
-                    .expect("invariant: overlapping non-empty, survivor set on first iter");
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
-                group.sessions.insert(
-                    merged_start,
-                    SessionAccState {
-                        start: merged_start,
-                        end: merged_end,
-                        accs,
-                    },
-                );
+                self.merge_overlapping_sessions(
+                    key,
+                    &overlapping,
+                    new_start,
+                    new_end,
+                    batch,
+                    index_array,
+                )?;
             }
         }
 
+        Ok(())
+    }
+
+    /// Merge several overlapping sessions into one, folding their accumulators.
+    fn merge_overlapping_sessions(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+        overlapping: &[i64],
+        new_start: i64,
+        new_end: i64,
+        batch: &RecordBatch,
+        index_array: &arrow::array::UInt32Array,
+    ) -> Result<(), DbError> {
+        let group = self
+            .session_groups
+            .get_mut(key)
+            .expect("invariant: key present (overlapping derived from same group)");
+        let mut merged_start = new_start;
+        let mut merged_end = new_end;
+        let mut survivor_accs: Option<Vec<Box<dyn datafusion_expr::Accumulator>>> = None;
+
+        for &sess_key in overlapping {
+            let sess = group
+                .sessions
+                .remove(&sess_key)
+                .expect("invariant: overlapping keys are unique BTreeMap entries");
+            merged_start = merged_start.min(sess.start);
+            merged_end = merged_end.max(sess.end);
+
+            if let Some(ref mut surv) = survivor_accs {
+                for (i, mut acc) in sess.accs.into_iter().enumerate() {
+                    let state = acc
+                        .state()
+                        .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
+                    let arrays: Vec<ArrayRef> = state
+                        .iter()
+                        .map(|sv| {
+                            sv.to_array()
+                                .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    surv[i]
+                        .merge_batch(&arrays)
+                        .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
+                }
+            } else {
+                survivor_accs = Some(sess.accs);
+            }
+        }
+
+        let mut accs =
+            survivor_accs.expect("invariant: overlapping non-empty, survivor set on first iter");
+        Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
+        group.sessions.insert(
+            merged_start,
+            SessionAccState {
+                start: merged_start,
+                end: merged_end,
+                accs,
+            },
+        );
         Ok(())
     }
 
