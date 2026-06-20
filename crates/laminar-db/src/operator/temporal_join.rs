@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
 use laminar_sql::datafusion::lookup_join::LookupJoinType;
@@ -21,6 +22,7 @@ pub(crate) struct TemporalJoinOperator {
     op_name: Arc<str>,
     config: TemporalJoinTranslatorConfig,
     ctx: SessionContext,
+    task_ctx: Arc<TaskContext>,
     lookup_registry: Option<Arc<LookupTableRegistry>>,
     last_temporal_row_count: usize,
     projection: ProjectingJoinState,
@@ -38,6 +40,7 @@ impl TemporalJoinOperator {
             op_name: Arc::from(name),
             config,
             ctx: ctx.clone(),
+            task_ctx: ctx.task_ctx(),
             lookup_registry,
             last_temporal_row_count: 0,
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__temporal_tmp"),
@@ -166,9 +169,8 @@ impl TemporalJoinOperator {
             ))
         })?;
 
-        let task_ctx = self.ctx.state().task_ctx();
         let stream = exec
-            .execute(0, task_ctx)
+            .execute(0, self.task_ctx.clone())
             .map_err(|e| DbError::Pipeline(format!("temporal join [{}]: {e}", self.op_name)))?;
 
         let batches: Vec<RecordBatch> = stream

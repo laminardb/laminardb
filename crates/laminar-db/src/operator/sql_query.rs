@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
@@ -176,6 +177,7 @@ pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,
     ctx: SessionContext,
+    task_ctx: Arc<TaskContext>,
     state: QueryState,
     prom: Option<Arc<EngineMetrics>>,
     pending_restore: Option<AggStateCheckpoint>,
@@ -210,10 +212,12 @@ impl SqlQueryOperator {
         emit_changelog: bool,
         idle_ttl_ms: Option<u64>,
     ) -> Self {
+        let task_ctx = ctx.task_ctx();
         Self {
             op_name: Arc::from(name),
             sql: sql.to_string(),
             ctx,
+            task_ctx,
             state: QueryState::Uninit,
             prom,
             pending_restore: None,
@@ -404,8 +408,7 @@ impl SqlQueryOperator {
                 "internal: execute_cached_plan called on non-CachedPlan state".into(),
             ));
         };
-        let task_ctx = self.ctx.task_ctx();
-        datafusion::physical_plan::collect(plan.clone(), task_ctx)
+        datafusion::physical_plan::collect(plan.clone(), self.task_ctx.clone())
             .await
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
     }
@@ -431,7 +434,12 @@ impl SqlQueryOperator {
                         "Compiled pre-agg projection failed, falling back to cached plan"
                     );
                     if let Some(physical) = agg_state.cached_pre_agg_physical() {
-                        super::execute_cached_physical(&self.ctx, &self.op_name, physical).await?
+                        super::execute_cached_physical(
+                            self.task_ctx.clone(),
+                            &self.op_name,
+                            physical,
+                        )
+                        .await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] query '{}': compiled pre-agg failed and no cached plan: {e}",
@@ -441,7 +449,7 @@ impl SqlQueryOperator {
                 }
             }
         } else if let Some(physical) = agg_state.cached_pre_agg_physical() {
-            super::execute_cached_physical(&self.ctx, &self.op_name, physical).await?
+            super::execute_cached_physical(self.task_ctx.clone(), &self.op_name, physical).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] query '{}': no compiled projection or cached plan",
@@ -662,7 +670,7 @@ impl SqlQueryOperator {
         self.having_cache
             .as_ref()
             .expect("just initialized")
-            .apply(&self.ctx, &self.op_name, batches.to_vec())
+            .apply(&self.op_name, batches.to_vec())
             .await
     }
 }
@@ -829,7 +837,7 @@ impl GraphOperator for SqlQueryOperator {
                 }
             },
             QueryState::CachedPhysical(ref physical) => {
-                super::execute_cached_physical(&self.ctx, &self.op_name, physical).await
+                super::execute_cached_physical(self.task_ctx.clone(), &self.op_name, physical).await
             }
         }
     }
