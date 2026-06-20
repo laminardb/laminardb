@@ -4,18 +4,19 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
 use crate::error::DbError;
 use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
 
 /// Re-execute a cached physical plan without re-planning; source leaves are swapped per cycle.
+/// Takes a cached `task_ctx` — `SessionContext::task_ctx()` clones the function registries.
 pub(crate) async fn execute_cached_physical(
-    ctx: &SessionContext,
+    task_ctx: Arc<TaskContext>,
     op_name: &str,
     physical: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 ) -> Result<Vec<RecordBatch>, DbError> {
-    let task_ctx = ctx.task_ctx();
     datafusion::physical_plan::collect(Arc::clone(physical), task_ctx)
         .await
         .map_err(|e| DbError::query_pipeline(op_name, &e))
@@ -25,6 +26,7 @@ pub(crate) async fn execute_cached_physical(
 pub(crate) struct LiveSqlCache {
     handle: laminar_sql::datafusion::LiveSourceHandle,
     physical: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
 }
 
 impl LiveSqlCache {
@@ -52,17 +54,21 @@ impl LiveSqlCache {
             .create_physical_plan(&logical)
             .await
             .map_err(|e| DbError::Pipeline(format!("{what} physical: {e}")))?;
-        Ok(Self { handle, physical })
+        let task_ctx = ctx.task_ctx();
+        Ok(Self {
+            handle,
+            physical,
+            task_ctx,
+        })
     }
 
     pub(crate) async fn apply(
         &self,
-        ctx: &SessionContext,
         op_name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         self.handle.swap(batches);
-        execute_cached_physical(ctx, op_name, &self.physical).await
+        execute_cached_physical(self.task_ctx.clone(), op_name, &self.physical).await
     }
 }
 
@@ -90,11 +96,10 @@ impl HavingSqlCache {
 
     pub(crate) async fn apply(
         &self,
-        ctx: &SessionContext,
         op_name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        self.0.apply(ctx, op_name, batches).await
+        self.0.apply(op_name, batches).await
     }
 }
 
@@ -245,6 +250,6 @@ pub(crate) async fn apply_post_projection(
         .sql_cache
         .as_ref()
         .expect("sql_cache built above")
-        .apply(ctx, op_name, batches)
+        .apply(op_name, batches)
         .await
 }
