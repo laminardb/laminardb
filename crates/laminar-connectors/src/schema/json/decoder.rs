@@ -342,14 +342,32 @@ impl FormatDecoder for JsonDecoder {
         self.schema.clone()
     }
 
-    #[allow(clippy::too_many_lines)]
     fn decode_batch(&self, records: &[RawRecord]) -> SchemaResult<RecordBatch> {
-        if records.is_empty() {
+        let values: Vec<&[u8]> = records.iter().map(|r| r.value.as_slice()).collect();
+        self.decode_slices(&values)
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn format_name(&self) -> &str {
+        "json"
+    }
+}
+
+impl JsonDecoder {
+    /// Decode borrowed JSON payload slices into a `RecordBatch` — avoids the owned
+    /// copy a `RawRecord` requires. Used by the streaming deserializer.
+    ///
+    /// # Errors
+    /// Returns `SchemaError::DecodeError` if a payload is not valid JSON or the
+    /// decoded values cannot be assembled into the output schema.
+    #[allow(clippy::too_many_lines)]
+    pub fn decode_slices(&self, values: &[&[u8]]) -> SchemaResult<RecordBatch> {
+        if values.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
         let num_fields = self.schema.fields().len();
-        let capacity = records.len();
+        let capacity = values.len();
 
         // Initialise one builder per schema column.
         let mut builders = create_builders(&self.schema, capacity);
@@ -374,8 +392,8 @@ impl FormatDecoder for JsonDecoder {
         // Reusable populated-tracking buffer — avoids heap alloc per record.
         let mut populated = vec![false; num_fields];
 
-        for record in records {
-            let value: serde_json::Value = serde_json::from_slice(&record.value)
+        for &bytes in values {
+            let value: serde_json::Value = serde_json::from_slice(bytes)
                 .map_err(|e| SchemaError::DecodeError(format!("JSON parse error: {e}")))?;
 
             // Navigate json.path → default target (borrowed, ZERO alloc).
@@ -579,13 +597,6 @@ impl FormatDecoder for JsonDecoder {
             .map_err(|e| SchemaError::DecodeError(format!("RecordBatch construction: {e}")))
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn format_name(&self) -> &str {
-        "json"
-    }
-}
-
-impl JsonDecoder {
     /// O(n) field lookup. For schemas with many fields, consider switching
     /// to a `HashMap`; for typical schemas (<50 fields) linear scan is faster.
     fn field_index(&self, name: &str) -> Option<usize> {
