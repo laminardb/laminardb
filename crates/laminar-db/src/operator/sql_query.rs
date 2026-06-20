@@ -1092,8 +1092,7 @@ impl GraphOperator for SqlQueryOperator {
                 // Fold into the pending restore; vnodes are disjoint so concatenating groups is safe.
                 match self.pending_restore {
                     Some(ref mut existing) if existing.fingerprint == cp.fingerprint => {
-                        existing.groups.extend(cp.groups);
-                        existing.last_emitted.extend(cp.last_emitted);
+                        existing.append_disjoint(cp)?;
                     }
                     Some(_) => tracing::warn!(
                         query = %self.op_name, vnode,
@@ -1396,7 +1395,10 @@ mod promotion_tests {
         let decoded: AggOpCheckpoint =
             rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&manifest.data).unwrap();
         assert!(
-            decoded.agg.as_ref().is_some_and(|a| a.groups.is_empty()),
+            decoded
+                .agg
+                .as_ref()
+                .is_some_and(|a| a.last_updated_ms.is_empty()),
             "all vnodes demoted → manifest carries no groups"
         );
         let mut cold_listed: Vec<u32> = decoded.cold_vnodes.clone();

@@ -164,21 +164,22 @@ impl AggFuncSpec {
     }
 }
 
-/// Snapshot an accumulator's state for a checkpoint and rebuild it in place.
+/// Snapshot an accumulator's state for a checkpoint and rebuild it in place,
+/// returning the raw `Vec<ScalarValue>` (no IPC framing — the columnar agg path
+/// batches across groups instead).
 ///
-/// `Accumulator::state()` may drain internal state (e.g. DISTINCT hash sets);
-/// we rebuild the accumulator from the snapshot so it keeps running correctly.
-/// `retractable` must match how the accumulator was created.
-pub(crate) fn snapshot_and_rebuild(
+/// `Accumulator::state()` may drain internal state (e.g. DISTINCT hash sets); we
+/// rebuild the accumulator from the snapshot so it keeps running correctly. The
+/// rebuild happens before returning, so a later encode failure can never leave
+/// the accumulator empty. `retractable` must match how the accumulator was created.
+pub(crate) fn snapshot_state_scalars(
     acc: &mut Box<dyn datafusion_expr::Accumulator>,
     spec: &AggFuncSpec,
     retractable: bool,
-) -> Result<Vec<u8>, DbError> {
+) -> Result<Vec<ScalarValue>, DbError> {
     let state = acc
         .state()
         .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-    // Rebuild before serializing: a scalars_to_ipc failure must not leave
-    // the accumulator empty for the next cycle.
     let arrays: Vec<ArrayRef> = state
         .iter()
         .map(|sv| {
@@ -195,19 +196,248 @@ pub(crate) fn snapshot_and_rebuild(
         .merge_batch(&arrays)
         .map_err(|e| DbError::Pipeline(format!("accumulator rebuild: {e}")))?;
     *acc = rebuilt;
-    let ipc = scalars_to_ipc(&state)?;
-    Ok(ipc)
+    Ok(state)
+}
+
+/// IPC-bytes variant of [`snapshot_state_scalars`], kept for EOWC's per-group
+/// [`GroupCheckpoint`] shape.
+pub(crate) fn snapshot_and_rebuild(
+    acc: &mut Box<dyn datafusion_expr::Accumulator>,
+    spec: &AggFuncSpec,
+    retractable: bool,
+) -> Result<Vec<u8>, DbError> {
+    let state = snapshot_state_scalars(acc, spec, retractable)?;
+    scalars_to_ipc(&state)
+}
+
+/// Build an IPC stream from arrays as the columns of a single batch; empty input
+/// (no columns) → empty `Vec`.
+fn arrays_to_ipc(arrays: &[ArrayRef]) -> Result<Vec<u8>, DbError> {
+    if arrays.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fields: Vec<Arc<Field>> = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, a)| Arc::new(Field::new(format!("c{i}"), a.data_type().clone(), true)))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, arrays.to_vec())
+        .map_err(|e| DbError::Pipeline(format!("columnar batch build: {e}")))?;
+    laminar_core::serialization::serialize_batch_stream(&batch)
+        .map_err(|e| DbError::Pipeline(format!("columnar IPC encode: {e}")))
+}
+
+/// Columnar encode result: `(keys IPC, per-accumulator state IPC, last_updated_ms)`.
+type ColumnarEncoding = (Vec<u8>, Vec<Vec<u8>>, Vec<i64>);
+
+/// Encode groups columnar: keys in one IPC batch, each accumulator's state across
+/// all groups in one IPC batch. Row `j` of every batch refers to `entries[j]`.
+fn encode_groups_columnar(
+    row_converter: &arrow::row::RowConverter,
+    num_group_cols: usize,
+    agg_specs: &[AggFuncSpec],
+    retractable: bool,
+    entries: &mut [(arrow::row::OwnedRow, &mut GroupEntry)],
+) -> Result<ColumnarEncoding, DbError> {
+    if entries.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let n = entries.len();
+
+    let keys_ipc = if num_group_cols == 0 {
+        Vec::new()
+    } else {
+        let key_arrays = row_converter
+            .convert_rows(entries.iter().map(|(k, _)| k.row()))
+            .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?;
+        arrays_to_ipc(&key_arrays)?
+    };
+
+    // Per accumulator, per group: collect state scalars (also rebuilds the acc).
+    let num_accs = agg_specs.len();
+    let mut acc_rows: Vec<Vec<Vec<ScalarValue>>> =
+        (0..num_accs).map(|_| Vec::with_capacity(n)).collect();
+    let mut last_updated_ms = Vec::with_capacity(n);
+    for (_, entry) in entries.iter_mut() {
+        last_updated_ms.push(entry.last_updated_ms);
+        for (i, acc) in entry.accs.iter_mut().enumerate() {
+            acc_rows[i].push(snapshot_state_scalars(acc, &agg_specs[i], retractable)?);
+        }
+    }
+
+    let mut acc_state_ipc = Vec::with_capacity(num_accs);
+    for rows in acc_rows {
+        let arity = rows.first().map_or(0, Vec::len);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arity);
+        for c in 0..arity {
+            let col = ScalarValue::iter_to_array(rows.iter().map(|s| s[c].clone()))
+                .map_err(|e| DbError::Pipeline(format!("acc state column build: {e}")))?;
+            columns.push(col);
+        }
+        acc_state_ipc.push(arrays_to_ipc(&columns)?);
+    }
+
+    Ok((keys_ipc, acc_state_ipc, last_updated_ms))
+}
+
+struct DecodedGroup {
+    row_key: arrow::row::OwnedRow,
+    accs: Vec<Box<dyn datafusion_expr::Accumulator>>,
+    last_updated_ms: i64,
+}
+
+/// Per-group decoded state: `(key, last_updated_ms, per-accumulator state arrays)`.
+type DecodedGroupState = (arrow::row::OwnedRow, i64, Vec<Vec<ArrayRef>>);
+
+/// Decode a columnar checkpoint to per-group state arrays. Keys round-trip through
+/// the row converter's own column types, so no per-type coercion is needed.
+fn decode_columnar_state_arrays(
+    row_converter: &arrow::row::RowConverter,
+    keys_ipc: &[u8],
+    acc_state_ipc: &[Vec<u8>],
+    last_updated_ms: &[i64],
+) -> Result<Vec<DecodedGroupState>, DbError> {
+    let n = last_updated_ms.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let key_rows = if keys_ipc.is_empty() {
+        None
+    } else {
+        let batch = laminar_core::serialization::deserialize_batch_stream(keys_ipc)
+            .map_err(|e| DbError::Pipeline(format!("keys IPC decode: {e}")))?;
+        Some(
+            row_converter
+                .convert_columns(batch.columns())
+                .map_err(|e| DbError::Pipeline(format!("keys row convert: {e}")))?,
+        )
+    };
+    let acc_batches: Vec<Option<RecordBatch>> = acc_state_ipc
+        .iter()
+        .map(|bytes| {
+            if bytes.is_empty() {
+                Ok(None)
+            } else {
+                laminar_core::serialization::deserialize_batch_stream(bytes)
+                    .map(Some)
+                    .map_err(|e| DbError::Pipeline(format!("acc state IPC decode: {e}")))
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut out = Vec::with_capacity(n);
+    for (j, &updated_ms) in last_updated_ms.iter().enumerate() {
+        let row_key = match &key_rows {
+            Some(rows) => rows.row(j).owned(),
+            None => global_aggregate_key(),
+        };
+        let mut state_arrays: Vec<Vec<ArrayRef>> = Vec::with_capacity(acc_batches.len());
+        for batch in &acc_batches {
+            let arrays = match batch {
+                Some(b) => (0..b.num_columns())
+                    .map(|c| {
+                        let sv = ScalarValue::try_from_array(b.column(c), j)
+                            .map_err(|e| DbError::Pipeline(format!("acc state scalar: {e}")))?;
+                        sv.to_array()
+                            .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            };
+            state_arrays.push(arrays);
+        }
+        out.push((row_key, updated_ms, state_arrays));
+    }
+    Ok(out)
+}
+
+/// Build fresh accumulators, merging each decoded state-array set into its own.
+fn build_accumulators_from_state(
+    agg_specs: &[AggFuncSpec],
+    retractable: bool,
+    state_arrays: &[Vec<ArrayRef>],
+) -> Result<Vec<Box<dyn datafusion_expr::Accumulator>>, DbError> {
+    let mut accs = Vec::with_capacity(agg_specs.len());
+    for (i, spec) in agg_specs.iter().enumerate() {
+        let mut acc = if retractable {
+            spec.create_retractable_accumulator()?
+        } else {
+            spec.create_accumulator()?
+        };
+        if let Some(arrays) = state_arrays.get(i) {
+            if !arrays.is_empty() {
+                acc.merge_batch(arrays)
+                    .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
+            }
+        }
+        accs.push(acc);
+    }
+    Ok(accs)
+}
+
+/// Inverse of [`encode_groups_columnar`]: rebuild one [`DecodedGroup`] per row.
+fn decode_groups_columnar(
+    row_converter: &arrow::row::RowConverter,
+    agg_specs: &[AggFuncSpec],
+    retractable: bool,
+    keys_ipc: &[u8],
+    acc_state_ipc: &[Vec<u8>],
+    last_updated_ms: &[i64],
+) -> Result<Vec<DecodedGroup>, DbError> {
+    decode_columnar_state_arrays(row_converter, keys_ipc, acc_state_ipc, last_updated_ms)?
+        .into_iter()
+        .map(|(row_key, last_updated_ms, state_arrays)| {
+            Ok(DecodedGroup {
+                row_key,
+                accs: build_accumulators_from_state(agg_specs, retractable, &state_arrays)?,
+                last_updated_ms,
+            })
+        })
+        .collect()
+}
+
+/// Row-concatenate two IPC stream batches sharing a schema; an empty side passes
+/// the other through unchanged.
+#[cfg(feature = "cluster")]
+fn concat_columnar_ipc(a: &[u8], b: &[u8]) -> Result<Vec<u8>, DbError> {
+    if a.is_empty() {
+        return Ok(b.to_vec());
+    }
+    if b.is_empty() {
+        return Ok(a.to_vec());
+    }
+    let ba = laminar_core::serialization::deserialize_batch_stream(a)
+        .map_err(|e| DbError::Pipeline(format!("columnar concat decode: {e}")))?;
+    let bb = laminar_core::serialization::deserialize_batch_stream(b)
+        .map_err(|e| DbError::Pipeline(format!("columnar concat decode: {e}")))?;
+    let merged = arrow::compute::concat_batches(&ba.schema(), [&ba, &bb])
+        .map_err(|e| DbError::Pipeline(format!("columnar concat: {e}")))?;
+    laminar_core::serialization::serialize_batch_stream(&merged)
+        .map_err(|e| DbError::Pipeline(format!("columnar concat encode: {e}")))
 }
 
 #[cfg(feature = "cluster")]
-fn scalars_to_arrays(scalars: &[ScalarValue]) -> Result<Vec<ArrayRef>, DbError> {
-    scalars
-        .iter()
-        .map(|sv| {
-            sv.to_array()
-                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
-        })
-        .collect()
+impl AggStateCheckpoint {
+    /// Append another checkpoint's groups, assuming disjoint keys (per-vnode
+    /// slices of one query): row-concatenate the columnar batches and stamps.
+    pub(crate) fn append_disjoint(&mut self, other: AggStateCheckpoint) -> Result<(), DbError> {
+        self.keys_ipc = concat_columnar_ipc(&self.keys_ipc, &other.keys_ipc)?;
+        if self.acc_state_ipc.is_empty() {
+            self.acc_state_ipc = other.acc_state_ipc;
+        } else {
+            for (dst, src) in self
+                .acc_state_ipc
+                .iter_mut()
+                .zip(other.acc_state_ipc.iter())
+            {
+                *dst = concat_columnar_ipc(dst, src)?;
+            }
+        }
+        self.last_updated_ms.extend(other.last_updated_ms);
+        self.last_emitted.extend(other.last_emitted);
+        Ok(())
+    }
 }
 
 /// Minimum interval between full O(groups) size re-walks.
@@ -1053,39 +1283,47 @@ impl IncrementalAggState {
 
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
-        let mut groups = Vec::with_capacity(self.groups.len());
-        for (row_key, entry) in &mut self.groups {
-            let sv_key =
-                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-            let key_ipc = scalars_to_ipc(&sv_key)?;
-            let retractable = self.weight_col_idx.is_some();
-            let mut acc_states = Vec::with_capacity(entry.accs.len());
-            for (i, acc) in entry.accs.iter_mut().enumerate() {
-                acc_states.push(snapshot_and_rebuild(acc, &self.agg_specs[i], retractable)?);
-            }
-            groups.push(GroupCheckpoint {
-                key: key_ipc,
-                acc_states,
-                last_updated_ms: entry.last_updated_ms,
-            });
-        }
-        let mut last_emitted_cp = Vec::new();
-        if self.emit_changelog {
-            for (row_key, vals) in &self.last_emitted {
-                let sv_key =
-                    row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-                last_emitted_cp.push(EmittedCheckpoint {
-                    key: scalars_to_ipc(&sv_key)?,
-                    values: scalars_to_ipc(vals)?,
-                });
-            }
-        }
+        let retractable = self.weight_col_idx.is_some();
+        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
+            .groups
+            .iter_mut()
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+        let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
+            &self.row_converter,
+            self.num_group_cols,
+            &self.agg_specs,
+            retractable,
+            &mut entries,
+        )?;
+
+        let last_emitted = self.checkpoint_last_emitted()?;
 
         Ok(AggStateCheckpoint {
             fingerprint,
-            groups,
-            last_emitted: last_emitted_cp,
+            keys_ipc,
+            acc_state_ipc,
+            last_updated_ms,
+            last_emitted,
         })
+    }
+
+    /// Encode the changelog `last_emitted` map per-entry (still keyed individually;
+    /// columnarizing it is out of scope). Empty unless `emit_changelog`.
+    fn checkpoint_last_emitted(&self) -> Result<Vec<EmittedCheckpoint>, DbError> {
+        if !self.emit_changelog {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(self.last_emitted.len());
+        for (row_key, vals) in &self.last_emitted {
+            let sv_key =
+                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+            out.push(EmittedCheckpoint {
+                key: scalars_to_ipc(&sv_key)?,
+                values: scalars_to_ipc(vals)?,
+            });
+        }
+        Ok(out)
     }
 
     pub(crate) fn restore_groups(
@@ -1101,50 +1339,29 @@ impl IncrementalAggState {
         }
         // Build locally then swap so a mid-list decode error can't leave
         // last_emitted partially populated.
+        let retractable = self.weight_col_idx.is_some();
+        let decoded = decode_groups_columnar(
+            &self.row_converter,
+            &self.agg_specs,
+            retractable,
+            &checkpoint.keys_ipc,
+            &checkpoint.acc_state_ipc,
+            &checkpoint.last_updated_ms,
+        )?;
+        let restored = decoded.len();
         let mut new_groups: AHashMap<arrow::row::OwnedRow, GroupEntry> =
-            AHashMap::with_capacity(checkpoint.groups.len());
-        for gc in &checkpoint.groups {
-            let sv_key = ipc_to_scalars(&gc.key)?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-
-            let mut accs = Vec::with_capacity(self.agg_specs.len());
-            for (i, spec) in self.agg_specs.iter().enumerate() {
-                let mut acc = if self.weight_col_idx.is_some() {
-                    spec.create_retractable_accumulator()?
-                } else {
-                    spec.create_accumulator()?
-                };
-                if i < gc.acc_states.len() {
-                    let state_scalars = ipc_to_scalars(&gc.acc_states[i])?;
-                    let arrays: Vec<ArrayRef> = state_scalars
-                        .iter()
-                        .map(|sv| {
-                            sv.to_array()
-                                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    acc.merge_batch(&arrays)
-                        .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
-                }
-                accs.push(acc);
-            }
+            AHashMap::with_capacity(restored);
+        for g in decoded {
             new_groups.insert(
-                row_key,
+                g.row_key,
                 GroupEntry {
-                    accs,
-                    last_updated_ms: gc.last_updated_ms,
+                    accs: g.accs,
+                    last_updated_ms: g.last_updated_ms,
                 },
             );
         }
 
-        let mut new_last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>> =
-            AHashMap::with_capacity(checkpoint.last_emitted.len());
-        for ec in &checkpoint.last_emitted {
-            let sv_key = ipc_to_scalars(&ec.key)?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-            let vals = ipc_to_scalars(&ec.values)?;
-            new_last_emitted.insert(row_key, vals);
-        }
+        let new_last_emitted = self.decode_last_emitted(&checkpoint.last_emitted)?;
 
         self.groups = new_groups;
         self.last_emitted = new_last_emitted;
@@ -1159,7 +1376,23 @@ impl IncrementalAggState {
             self.cold_vnodes.clear();
             self.dirty_all = true;
         }
-        Ok(checkpoint.groups.len())
+        Ok(restored)
+    }
+
+    /// Decode the per-entry changelog `last_emitted` checkpoint into the live map.
+    fn decode_last_emitted(
+        &self,
+        entries: &[EmittedCheckpoint],
+    ) -> Result<AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>, DbError> {
+        let mut out: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>> =
+            AHashMap::with_capacity(entries.len());
+        for ec in entries {
+            let sv_key = ipc_to_scalars(&ec.key)?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
+            let vals = ipc_to_scalars(&ec.values)?;
+            out.insert(row_key, vals);
+        }
+        Ok(out)
     }
 
     /// Partition state into one [`AggStateCheckpoint`] per vnode using the same hash as the shuffle.
@@ -1186,32 +1419,39 @@ impl IncrementalAggState {
             }
         };
 
-        let mut buckets: std::collections::HashMap<u32, AggStateCheckpoint> =
-            std::collections::HashMap::new();
-        let mut new_bucket = || AggStateCheckpoint {
-            fingerprint,
-            groups: Vec::new(),
-            last_emitted: Vec::new(),
-        };
-
+        // Bucket the live groups by vnode first, then columnar-encode each subset.
+        let mut by_vnode: std::collections::HashMap<
+            u32,
+            Vec<(arrow::row::OwnedRow, &mut GroupEntry)>,
+        > = std::collections::HashMap::new();
         for (row_key, entry) in &mut self.groups {
             let vnode = vnode_of(row_key);
-            let sv_key =
-                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-            let key_ipc = scalars_to_ipc(&sv_key)?;
-            let mut acc_states = Vec::with_capacity(entry.accs.len());
-            for (i, acc) in entry.accs.iter_mut().enumerate() {
-                acc_states.push(snapshot_and_rebuild(acc, &self.agg_specs[i], retractable)?);
-            }
-            buckets
+            by_vnode
                 .entry(vnode)
-                .or_insert_with(&mut new_bucket)
-                .groups
-                .push(GroupCheckpoint {
-                    key: key_ipc,
-                    acc_states,
-                    last_updated_ms: entry.last_updated_ms,
-                });
+                .or_default()
+                .push((row_key.clone(), entry));
+        }
+
+        let mut buckets: std::collections::HashMap<u32, AggStateCheckpoint> =
+            std::collections::HashMap::with_capacity(by_vnode.len());
+        for (vnode, mut entries) in by_vnode {
+            let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
+                &self.row_converter,
+                self.num_group_cols,
+                &self.agg_specs,
+                retractable,
+                &mut entries,
+            )?;
+            buckets.insert(
+                vnode,
+                AggStateCheckpoint {
+                    fingerprint,
+                    keys_ipc,
+                    acc_state_ipc,
+                    last_updated_ms,
+                    last_emitted: Vec::new(),
+                },
+            );
         }
 
         if self.emit_changelog {
@@ -1221,7 +1461,13 @@ impl IncrementalAggState {
                     row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
                 buckets
                     .entry(vnode)
-                    .or_insert_with(&mut new_bucket)
+                    .or_insert_with(|| AggStateCheckpoint {
+                        fingerprint,
+                        keys_ipc: Vec::new(),
+                        acc_state_ipc: Vec::new(),
+                        last_updated_ms: Vec::new(),
+                        last_emitted: Vec::new(),
+                    })
                     .last_emitted
                     .push(EmittedCheckpoint {
                         key: scalars_to_ipc(&sv_key)?,
@@ -1258,11 +1504,17 @@ impl IncrementalAggState {
             )));
         }
 
-        for gc in &checkpoint.groups {
-            let sv_key = ipc_to_scalars(&gc.key)?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-            // merge_batch changes the group's value relative to last_emitted, so the
-            // changelog path must re-evaluate it (the diff still gates actual output).
+        let retractable = self.weight_col_idx.is_some();
+        let per_group = decode_columnar_state_arrays(
+            &self.row_converter,
+            &checkpoint.keys_ipc,
+            &checkpoint.acc_state_ipc,
+            &checkpoint.last_updated_ms,
+        )?;
+        let merged = per_group.len();
+        for (row_key, last_updated_ms, state_arrays) in per_group {
+            // merge_batch changes the group's value vs last_emitted, so the changelog
+            // path must re-evaluate it (the diff still gates actual output).
             if self.emit_changelog {
                 self.dirty_keys.insert(row_key.clone());
             }
@@ -1270,45 +1522,30 @@ impl IncrementalAggState {
                 std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let entry = occ.get_mut();
                     for (i, acc) in entry.accs.iter_mut().enumerate() {
-                        if let Some(state_bytes) = gc.acc_states.get(i) {
-                            let state_scalars = ipc_to_scalars(state_bytes)?;
-                            let arrays = scalars_to_arrays(&state_scalars)?;
-                            acc.merge_batch(&arrays).map_err(|e| {
-                                DbError::Pipeline(format!("accumulator merge: {e}"))
-                            })?;
+                        if let Some(arrays) = state_arrays.get(i) {
+                            if !arrays.is_empty() {
+                                acc.merge_batch(arrays).map_err(|e| {
+                                    DbError::Pipeline(format!("accumulator merge: {e}"))
+                                })?;
+                            }
                         }
                     }
-                    entry.last_updated_ms = entry.last_updated_ms.max(gc.last_updated_ms);
+                    entry.last_updated_ms = entry.last_updated_ms.max(last_updated_ms);
                 }
                 std::collections::hash_map::Entry::Vacant(vac) => {
-                    let mut accs = Vec::with_capacity(self.agg_specs.len());
-                    for (i, spec) in self.agg_specs.iter().enumerate() {
-                        let mut acc = if self.weight_col_idx.is_some() {
-                            spec.create_retractable_accumulator()?
-                        } else {
-                            spec.create_accumulator()?
-                        };
-                        if let Some(state_bytes) = gc.acc_states.get(i) {
-                            let state_scalars = ipc_to_scalars(state_bytes)?;
-                            let arrays = scalars_to_arrays(&state_scalars)?;
-                            acc.merge_batch(&arrays).map_err(|e| {
-                                DbError::Pipeline(format!("accumulator merge: {e}"))
-                            })?;
-                        }
-                        accs.push(acc);
-                    }
                     vac.insert(GroupEntry {
-                        accs,
-                        last_updated_ms: gc.last_updated_ms,
+                        accs: build_accumulators_from_state(
+                            &self.agg_specs,
+                            retractable,
+                            &state_arrays,
+                        )?,
+                        last_updated_ms,
                     });
                 }
             }
         }
 
-        for ec in &checkpoint.last_emitted {
-            let sv_key = ipc_to_scalars(&ec.key)?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-            let vals = ipc_to_scalars(&ec.values)?;
+        for (row_key, vals) in self.decode_last_emitted(&checkpoint.last_emitted)? {
             self.last_emitted.entry(row_key).or_insert(vals);
         }
 
@@ -1316,7 +1553,7 @@ impl IncrementalAggState {
         self.size_cache.invalidate();
         // No dirty_all: callers mark only the merged vnode dirty, so other
         // clean vnodes remain demotable.
-        Ok(checkpoint.groups.len())
+        Ok(merged)
     }
 }
 
@@ -2354,7 +2591,7 @@ mod tests {
 
         let buckets = state.checkpoint_groups_by_vnode(VNODES).unwrap();
         let (&v, slice) = buckets.iter().next().unwrap();
-        let demoted_groups = slice.groups.len();
+        let demoted_groups = slice.last_updated_ms.len();
         assert!(demoted_groups > 0);
         let groups_before = state.groups.len();
 
@@ -2762,7 +2999,7 @@ mod tests {
 
         // Checkpoint
         let cp = state.checkpoint_groups().unwrap();
-        assert_eq!(cp.groups.len(), 1);
+        assert_eq!(cp.last_updated_ms.len(), 1);
 
         // Create a fresh state and restore
         let (_, mut state2) =
@@ -2809,7 +3046,7 @@ mod tests {
         state.process_batch(&batch, i64::MIN).unwrap();
 
         let cp = state.checkpoint_groups().unwrap();
-        assert_eq!(cp.groups.len(), 3);
+        assert_eq!(cp.last_updated_ms.len(), 3);
 
         let (_, mut state2) =
             setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
@@ -2818,6 +3055,86 @@ mod tests {
 
         let result = state2.emit().unwrap();
         assert_eq!(result[0].num_rows(), 3);
+    }
+
+    /// Columnar checkpoint round-trip with a mix of accumulator shapes
+    /// (SUM, COUNT(*), MAX) across several groups: restored emit must equal
+    /// the original emit row-for-row.
+    #[tokio::test]
+    async fn test_agg_checkpoint_roundtrip_mixed_accumulators() {
+        let sql = "SELECT name, SUM(value) AS s, COUNT(*) AS c, MAX(value) AS m \
+                   FROM events GROUP BY name";
+        let (_, mut state) = setup_agg_state(sql).await;
+
+        // Pre-agg layout for [name] + SUM(value), COUNT(*), MAX(value):
+        // group col, then __agg_input_1 (SUM), __agg_input_2 (COUNT* dummy bool), __agg_input_3 (MAX).
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+            Field::new("__agg_input_2", DataType::Boolean, true),
+            Field::new("__agg_input_3", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a", "b", "a", "b", "c", "a",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    10.0, 20.0, 30.0, 40.0, 50.0, 5.0,
+                ])),
+                Arc::new(arrow::array::BooleanArray::from(vec![true; 6])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    10.0, 20.0, 30.0, 40.0, 50.0, 5.0,
+                ])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
+        let original = state.emit().unwrap();
+
+        let cp = state.checkpoint_groups().unwrap();
+        assert_eq!(cp.last_updated_ms.len(), 3);
+
+        let (_, mut state2) = setup_agg_state(sql).await;
+        assert_eq!(state2.restore_groups(&cp).unwrap(), 3);
+        let restored = state2.emit().unwrap();
+
+        // Compare as (name -> (s, c, m)) maps so HashMap iteration order is irrelevant.
+        let collect = |batches: &[RecordBatch]| {
+            let mut out: std::collections::BTreeMap<String, (f64, i64, f64)> =
+                std::collections::BTreeMap::new();
+            for b in batches {
+                let names = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let s = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .unwrap();
+                let c = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                let m = b
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .unwrap();
+                for i in 0..b.num_rows() {
+                    out.insert(
+                        names.value(i).to_string(),
+                        (s.value(i), c.value(i), m.value(i)),
+                    );
+                }
+            }
+            out
+        };
+        assert_eq!(collect(&original), collect(&restored));
     }
 
     #[tokio::test]
@@ -3825,7 +4142,7 @@ mod tests {
                 Field::new("id", DataType::Int64, true),
                 Field::new("__agg_input_1", DataType::Float64, true),
             ]));
-            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
             let batch = RecordBatch::try_new(
                 pre,
                 vec![
@@ -3844,18 +4161,15 @@ mod tests {
             let cp = state.checkpoint_groups().unwrap();
             let elapsed = t0.elapsed();
 
-            let bytes: usize = cp
-                .groups
-                .iter()
-                .map(|g| g.key.len() + g.acc_states.iter().map(Vec::len).sum::<usize>())
-                .sum();
+            let bytes: usize =
+                cp.keys_ipc.len() + cp.acc_state_ipc.iter().map(Vec::len).sum::<usize>();
             #[allow(clippy::cast_precision_loss)]
             let ns_per_group = elapsed.as_nanos() as f64 / n as f64;
             println!(
                 "checkpoint_groups: {n:>9} groups -> {elapsed:>11.2?}  ({ns_per_group:6.0} ns/group)  ~{} KiB",
                 bytes / 1024
             );
-            assert_eq!(cp.groups.len(), n);
+            assert_eq!(cp.last_updated_ms.len(), n);
         }
     }
 }
@@ -3963,10 +4277,10 @@ mod vnode_partition_tests {
         let full = a.checkpoint_groups().unwrap();
 
         // Every group lands in exactly one vnode slice — union == the whole.
-        let partitioned: usize = by_vnode.values().map(|cp| cp.groups.len()).sum();
+        let partitioned: usize = by_vnode.values().map(|cp| cp.last_updated_ms.len()).sum();
         assert_eq!(
             partitioned,
-            full.groups.len(),
+            full.last_updated_ms.len(),
             "per-vnode slices must cover every group exactly once",
         );
 

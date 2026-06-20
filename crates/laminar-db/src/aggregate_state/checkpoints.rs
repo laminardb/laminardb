@@ -1,7 +1,7 @@
 //! Serializable checkpoint shapes for aggregate, join, and window state.
 //!
-//! Scalar fields (`key`, `acc_states`, `values`) hold Arrow IPC one-row batches
-//! from `scalars_to_ipc`. Join buffer fields hold full multi-row IPC batches.
+//! `AggStateCheckpoint` is columnar; `GroupCheckpoint` (window/EOWC) and
+//! `EmittedCheckpoint` hold one-row IPC tuples; join buffers hold multi-row batches.
 
 use std::hash::{Hash, Hasher};
 
@@ -21,12 +21,17 @@ fn default_last_updated() -> i64 {
     i64::MIN
 }
 
+/// Columnar running-aggregate state: all keys in one IPC batch, each accumulator's
+/// state across all groups in one IPC batch. Row `j` of `keys_ipc`, every
+/// `acc_state_ipc[i]`, and `last_updated_ms[j]` refer to the same group.
 #[derive(
     Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
-    pub groups: Vec<GroupCheckpoint>,
+    pub keys_ipc: Vec<u8>,
+    pub acc_state_ipc: Vec<Vec<u8>>,
+    pub last_updated_ms: Vec<i64>,
     #[serde(default)]
     pub last_emitted: Vec<EmittedCheckpoint>,
 }
