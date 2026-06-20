@@ -3,28 +3,47 @@
 //! Implements [`RecordDeserializer`] / [`RecordSerializer`] by delegating
 //! to [`JsonDecoder`] and [`JsonEncoder`].
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use parking_lot::Mutex;
 use serde_json::Value;
 
 use super::{Format, RecordDeserializer, RecordSerializer};
 use crate::error::SerdeError;
 use crate::schema::json::decoder::JsonDecoder;
 use crate::schema::json::encoder::JsonEncoder;
-use crate::schema::traits::{FormatDecoder, FormatEncoder};
-use crate::schema::types::RawRecord;
+use crate::schema::traits::FormatEncoder;
 
-/// JSON record deserializer. Delegates to [`JsonDecoder`].
+/// JSON record deserializer. Delegates to a cached [`JsonDecoder`].
 #[derive(Debug, Clone)]
 pub struct JsonDeserializer {
-    _private: (),
+    #[allow(clippy::type_complexity)]
+    decoder: Arc<Mutex<Option<(SchemaRef, Arc<JsonDecoder>)>>>,
 }
 
 impl JsonDeserializer {
     /// Creates a new JSON deserializer.
     #[must_use]
     pub fn new() -> Self {
-        Self { _private: () }
+        Self {
+            decoder: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Returns a cached [`JsonDecoder`] for `schema`, rebuilding it only when
+    /// the cached schema differs.
+    fn decoder_for(&self, schema: &SchemaRef) -> Arc<JsonDecoder> {
+        let mut cache = self.decoder.lock();
+        if let Some((cached_schema, cached)) = cache.as_ref() {
+            if Arc::ptr_eq(cached_schema, schema) || cached_schema == schema {
+                return cached.clone();
+            }
+        }
+        let decoder = Arc::new(JsonDecoder::new(schema.clone()));
+        *cache = Some((schema.clone(), decoder.clone()));
+        decoder
     }
 
     /// Deserializes a pre-parsed JSON [`Value`] into a [`RecordBatch`].
@@ -53,10 +72,8 @@ impl Default for JsonDeserializer {
 
 impl RecordDeserializer for JsonDeserializer {
     fn deserialize(&self, data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, SerdeError> {
-        let decoder = JsonDecoder::new(schema.clone());
-        let record = RawRecord::new(data.to_vec());
-        decoder
-            .decode_one(&record)
+        let d = self.decoder_for(schema);
+        d.decode_slices(&[data])
             .map_err(|e| SerdeError::Json(e.to_string()))
     }
 
@@ -68,11 +85,8 @@ impl RecordDeserializer for JsonDeserializer {
         if records.is_empty() {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }
-        let decoder = JsonDecoder::new(schema.clone());
-        let raw_records: Vec<RawRecord> =
-            records.iter().map(|r| RawRecord::new(r.to_vec())).collect();
-        decoder
-            .decode_batch(&raw_records)
+        let d = self.decoder_for(schema);
+        d.decode_slices(records)
             .map_err(|e| SerdeError::Json(e.to_string()))
     }
 
