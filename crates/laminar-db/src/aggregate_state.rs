@@ -3784,6 +3784,80 @@ mod tests {
         let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
         assert_eq!(round_trip(&sv), sv);
     }
+
+    /// Profiling (not a correctness test): measures the on-task whole-node
+    /// `checkpoint_groups` capture cost vs group count — the cost an incremental
+    /// (dirty-only) capture would shrink (Track A1). Reports total time, ns/group,
+    /// and serialized size, so the incremental win for a given dirty ratio is
+    /// `ns/group * dirty_count`. `#[ignore]`d; run in release:
+    /// `cargo test -p laminar-db --release profile_checkpoint_capture -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "profiling; run with --release --ignored --nocapture"]
+    async fn profile_checkpoint_capture_cost() {
+        for &n in &[10_000usize, 100_000, 1_000_000] {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Float64, false),
+            ]));
+            let dummy = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(vec![0i64])),
+                    Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+                ],
+            )
+            .unwrap();
+            let mem =
+                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                    .unwrap();
+            ctx.register_table("events", Arc::new(mem)).unwrap();
+            let mut state = IncrementalAggState::try_from_sql(
+                &ctx,
+                "SELECT id, SUM(value) AS total FROM events GROUP BY id",
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let pre = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]));
+            #[allow(clippy::cast_precision_loss)]
+            let batch = RecordBatch::try_new(
+                pre,
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(
+                        (0..n as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(arrow::array::Float64Array::from(
+                        (0..n).map(|i| i as f64).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, 0).unwrap();
+
+            let t0 = std::time::Instant::now();
+            let cp = state.checkpoint_groups().unwrap();
+            let elapsed = t0.elapsed();
+
+            let bytes: usize = cp
+                .groups
+                .iter()
+                .map(|g| g.key.len() + g.acc_states.iter().map(Vec::len).sum::<usize>())
+                .sum();
+            #[allow(clippy::cast_precision_loss)]
+            let ns_per_group = elapsed.as_nanos() as f64 / n as f64;
+            println!(
+                "checkpoint_groups: {n:>9} groups -> {elapsed:>11.2?}  ({ns_per_group:6.0} ns/group)  ~{} KiB",
+                bytes / 1024
+            );
+            assert_eq!(cp.groups.len(), n);
+        }
+    }
 }
 
 /// Per-vnode checkpoint partitioning + merge-apply (the cross-node vnode
