@@ -264,6 +264,8 @@ pub(crate) struct OperatorGraph {
     source_list: Vec<(Arc<str>, usize)>,
     source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
+    // Reverse of `output_map` (node id → is an output); rebuilt in `compute_topo_order`.
+    output_node_ids: FxHashSet<usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
     input_buf_bytes: Vec<Vec<usize>>,
     input_sources: Vec<Vec<usize>>,
@@ -318,6 +320,7 @@ impl OperatorGraph {
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
+            output_node_ids: FxHashSet::default(),
             input_bufs: Vec::new(),
             input_buf_bytes: Vec::new(),
             input_sources: Vec::new(),
@@ -443,8 +446,7 @@ impl OperatorGraph {
 
     pub fn has_pending_input(&self) -> bool {
         self.input_bufs.iter().enumerate().any(|(id, ports)| {
-            ports.iter().any(|port| !port.is_empty())
-                && !self.source_map.values().any(|&src| src == id)
+            ports.iter().any(|port| !port.is_empty()) && !self.source_node_ids.contains(&id)
         })
     }
 
@@ -1508,6 +1510,10 @@ impl OperatorGraph {
         self.source_list
             .extend(self.source_map.iter().map(|(k, v)| (Arc::clone(k), *v)));
 
+        self.output_node_ids.clear();
+        self.output_node_ids
+            .extend(self.output_map.values().copied());
+
         self.topo_dirty = false;
     }
 
@@ -1685,7 +1691,7 @@ impl OperatorGraph {
         }
         let node_name = Arc::clone(&self.nodes[node_id].name);
         let has_routes = !self.nodes[node_id].output_routes.is_empty();
-        let is_output = self.output_map.values().any(|&id| id == node_id);
+        let is_output = self.output_node_ids.contains(&node_id);
 
         if has_routes {
             let name_ref = node_name.as_ref();
