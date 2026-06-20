@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::execution::TaskContext;
+use datafusion::execution::{SessionState, TaskContext};
 use datafusion::prelude::SessionContext;
 
 use laminar_sql::datafusion::lookup_join::LookupJoinType;
@@ -21,7 +21,9 @@ use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 pub(crate) struct TemporalJoinOperator {
     op_name: Arc<str>,
     config: TemporalJoinTranslatorConfig,
-    ctx: SessionContext,
+    // Session state is fixed after setup; cache it so the per-cycle MemTable scan
+    // doesn't clone it (and the whole SessionState) every cycle.
+    cached_state: SessionState,
     task_ctx: Arc<TaskContext>,
     lookup_registry: Option<Arc<LookupTableRegistry>>,
     last_temporal_row_count: usize,
@@ -39,7 +41,7 @@ impl TemporalJoinOperator {
         Self {
             op_name: Arc::from(name),
             config,
-            ctx: ctx.clone(),
+            cached_state: ctx.state(),
             task_ctx: ctx.task_ctx(),
             lookup_registry,
             last_temporal_row_count: 0,
@@ -146,7 +148,7 @@ impl TemporalJoinOperator {
         })?;
 
         let input = mem_table
-            .scan(&self.ctx.state(), None, &[], None)
+            .scan(&self.cached_state, None, &[], None)
             .await
             .map_err(|e| {
                 DbError::Pipeline(format!("temporal join [{}]: scan: {e}", self.op_name))
