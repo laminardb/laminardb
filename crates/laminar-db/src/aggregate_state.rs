@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use rustc_hash::FxHashMap;
 
 use arrow::array::ArrayRef;
@@ -260,6 +260,10 @@ pub(crate) struct IncrementalAggState {
     max_groups: usize,
     emit_changelog: bool,
     last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    // Group keys touched since the last emit. The changelog path re-evaluates only
+    // these instead of scanning every group. Transient (cleared each emit),
+    // populated only when emit_changelog, so not checkpointed.
+    dirty_keys: AHashSet<arrow::row::OwnedRow>,
     pub(crate) idle_ttl_ms: Option<u64>,
     weight_col_idx: Option<usize>,
     // None = no per-vnode capture yet; dirty tracking is off.
@@ -559,6 +563,7 @@ impl IncrementalAggState {
             max_groups: 1_000_000,
             emit_changelog,
             last_emitted: AHashMap::new(),
+            dirty_keys: AHashSet::new(),
             idle_ttl_ms: None,
             weight_col_idx,
             #[cfg(feature = "state-tier")]
@@ -710,6 +715,9 @@ impl IncrementalAggState {
                 self.weight_col_idx,
             )?;
             entry.last_updated_ms = watermark_ms;
+            if self.emit_changelog {
+                self.dirty_keys.insert(row_ref.owned());
+            }
         }
         self.state_gen = self.state_gen.wrapping_add(1);
 
@@ -750,13 +758,17 @@ impl IncrementalAggState {
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
         self.state_gen = self.state_gen.wrapping_add(1);
-        Self::update_group_accumulators(
+        let res = Self::update_group_accumulators(
             &mut entry.accs,
             batch,
             &all_indices,
             &self.agg_specs,
             self.weight_col_idx,
-        )
+        );
+        if self.emit_changelog {
+            self.dirty_keys.insert(empty_key);
+        }
+        res
     }
 
     /// Update accumulators for a group: one `take()` per column per accumulator, no per-row allocation.
@@ -900,7 +912,15 @@ impl IncrementalAggState {
         let mut insert_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut insert_vals: Vec<Vec<ScalarValue>> = Vec::new();
 
-        for (key, entry) in &mut self.groups {
+        // Only touched groups can differ from `last_emitted`. Take the set so the loop
+        // can borrow `groups`/`last_emitted`; restore it cleared to reuse the allocation.
+        let mut dirty = std::mem::take(&mut self.dirty_keys);
+        for key in &dirty {
+            // A dirty key absent from `groups` was removed by `evict_idle`, which
+            // already emitted its retraction; skip it.
+            let Some(entry) = self.groups.get_mut(key) else {
+                continue;
+            };
             let current: Vec<ScalarValue> = entry
                 .accs
                 .iter_mut()
@@ -937,18 +957,18 @@ impl IncrementalAggState {
                 self.last_emitted.insert(key.clone(), current);
             }
         }
+        dirty.clear();
+        self.dirty_keys = dirty;
 
-        let deleted: Vec<arrow::row::OwnedRow> = self
-            .last_emitted
-            .keys()
-            .filter(|k| !self.groups.contains_key(*k))
-            .cloned()
-            .collect();
-        for key in &deleted {
-            let old = self.last_emitted.remove(key).unwrap();
-            retract_keys.push(key.clone());
-            retract_vals.push(old);
-        }
+        // Every remover (evict_idle, demote_vnode, restore/merge) drops the group from
+        // `last_emitted` too and evict_idle retracts, so no separate deletion pass is
+        // needed; the invariant below holds.
+        debug_assert!(
+            self.last_emitted
+                .keys()
+                .all(|k| self.groups.contains_key(k)),
+            "last_emitted must be a subset of groups"
+        );
 
         let total = retract_keys.len() + insert_keys.len();
         if total == 0 {
@@ -1128,6 +1148,9 @@ impl IncrementalAggState {
 
         self.groups = new_groups;
         self.last_emitted = new_last_emitted;
+        // Restored state is internally consistent (groups == last_emitted), so
+        // nothing is pending for the changelog path.
+        self.dirty_keys.clear();
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
         // All state is in memory; block demotion until the next capture re-baselines.
@@ -1238,6 +1261,11 @@ impl IncrementalAggState {
         for gc in &checkpoint.groups {
             let sv_key = ipc_to_scalars(&gc.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
+            // merge_batch changes the group's value relative to last_emitted, so the
+            // changelog path must re-evaluate it (the diff still gates actual output).
+            if self.emit_changelog {
+                self.dirty_keys.insert(row_key.clone());
+            }
             match self.groups.entry(row_key) {
                 std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let entry = occ.get_mut();
@@ -2491,6 +2519,67 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn merge_groups_reemits_changed_group_on_changelog() {
+        // Regression: merge_groups folds extra accumulator state into an existing
+        // group, changing its value relative to last_emitted. The changelog emit
+        // only visits dirty keys, so merge_groups must mark the merged group dirty
+        // or the change is silently dropped downstream.
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            pre_agg_schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, 1000).unwrap();
+        let r1 = state.emit().unwrap();
+        assert_eq!(r1.iter().map(RecordBatch::num_rows).sum::<usize>(), 1); // a: +10
+
+        // Fold a's own slice back in (the rebalance/promotion apply path): a -> 20.
+        let cp = state.checkpoint_groups().unwrap();
+        state.merge_groups(&cp).unwrap();
+
+        // a changed (10 -> 20) and must re-emit retract(old) + insert(new).
+        let r2 = state.emit().unwrap();
+        assert_eq!(
+            r2.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            2,
+            "merged group must re-emit retract+insert",
+        );
+    }
+
     #[tokio::test]
     async fn test_size_estimate_throttled_cache_and_invalidate() {
         let (_, mut state) =
@@ -2856,6 +2945,93 @@ mod tests {
         // Cycle 3: no new data, nothing changed → empty output.
         let r3 = state.emit().unwrap();
         assert!(r3.is_empty() || r3.iter().all(|b| b.num_rows() == 0));
+    }
+
+    #[tokio::test]
+    async fn changelog_restore_emits_no_duplicates_then_resumes() {
+        // After recovery, restored groups are already reflected downstream (last_emitted
+        // is restored in lockstep with groups), so the first post-restore emit must be
+        // empty — re-emitting would duplicate. A later change must still emit normally.
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("price", DataType::Int64, false),
+        ]));
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![seed]]).unwrap();
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+
+        let sql = "SELECT symbol, SUM(price) AS total FROM t GROUP BY symbol";
+        let mut state = IncrementalAggState::try_from_sql(&ctx, sql, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let pre_agg = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new("price", DataType::Int64, true),
+        ]));
+        let b1 = RecordBatch::try_new(
+            Arc::clone(&pre_agg),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow::array::Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b1, 1000).unwrap();
+        assert_eq!(
+            state
+                .emit()
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
+        ); // AAPL +1, GOOG +1
+
+        // Recover into a fresh state from the post-emit checkpoint.
+        let cp = state.checkpoint_groups().unwrap();
+        let mut restored = IncrementalAggState::try_from_sql(&ctx, sql, true)
+            .await
+            .unwrap()
+            .unwrap();
+        restored.restore_groups(&cp).unwrap();
+
+        // First emit after restore: nothing new → empty (no duplicate inserts).
+        let r0 = restored.emit().unwrap();
+        assert!(
+            r0.is_empty() || r0.iter().all(|b| b.num_rows() == 0),
+            "restored groups must not be re-emitted"
+        );
+
+        // A real change resumes normally: AAPL 100 -> 150 emits retract + insert.
+        let b2 = RecordBatch::try_new(
+            pre_agg,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+                Arc::new(arrow::array::Int64Array::from(vec![50])),
+            ],
+        )
+        .unwrap();
+        restored.process_batch(&b2, 2000).unwrap();
+        assert_eq!(
+            restored
+                .emit()
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2,
+            "post-restore change must emit retract+insert"
+        );
     }
 
     #[tokio::test]

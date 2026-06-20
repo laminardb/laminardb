@@ -57,6 +57,30 @@ fn synthetic_batch(rows: usize) -> RecordBatch {
     .unwrap()
 }
 
+/// Batch whose `id` ranges over `[0, num_groups)` (offset by `base`), so
+/// `GROUP BY id` yields exactly `num_groups` groups. Other columns are filler.
+fn keyed_batch(rows: usize, num_groups: usize, base: usize) -> RecordBatch {
+    let ids: Vec<i64> = (0..rows)
+        .map(|i| ((base + i) % num_groups) as i64)
+        .collect();
+    let regions: Vec<&str> = (0..rows).map(|_| "us-east").collect();
+    let prices: Vec<f64> = (0..rows).map(|i| 10.0 + (i as f64) * 0.1).collect();
+    let quantities: Vec<i64> = (0..rows).map(|i| (i % 100) as i64 + 1).collect();
+    let timestamps: Vec<i64> = (0..rows).map(|i| 1_000_000 + i as i64).collect();
+
+    RecordBatch::try_new(
+        bench_schema(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(regions)),
+            Arc::new(Float64Array::from(prices)),
+            Arc::new(Int64Array::from(quantities)),
+            Arc::new(Int64Array::from(timestamps)),
+        ],
+    )
+    .unwrap()
+}
+
 /// A trivial type implementing `FromBatch` for subscription polling.
 struct RowCount(#[allow(dead_code)] usize);
 
@@ -299,10 +323,71 @@ fn bench_query_chain(c: &mut Criterion) {
     group.finish();
 }
 
+/// Subscribe, push, then poll until one emit lands. Subscribe-before-push so the
+/// emit isn't missed; `poll` is non-blocking so no tokio context is needed (the
+/// pipeline runs on the runtime workers started by `db.start()`).
+fn push_and_wait(db: &LaminarDB, source: &laminar_db::UntypedSourceHandle, batch: RecordBatch) {
+    let mut sub = db.subscribe::<RowCount>("agg_hc").unwrap();
+    source.push_arrow(batch).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if sub.poll().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// High-cardinality `GROUP BY id`: warm the group table to `num_groups`, then push
+/// a 64-row batch per cycle and measure the emit. Pre-P0.1a the changelog emit
+/// re-scans every group; after, only touched ones. `running_state` (replace-all,
+/// unchanged by P0.1a) is the control; `emit_changes` is the delta path under test.
+fn bench_agg_high_cardinality(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("agg_high_cardinality");
+    let create_source = "CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)";
+
+    for &num_groups in &[1_000usize, 100_000] {
+        for (label, tail) in [("running_state", ""), ("emit_changes", " EMIT CHANGES")] {
+            let ddl = format!(
+                "CREATE STREAM agg_hc AS SELECT id, SUM(price) AS total FROM trades GROUP BY id{tail}"
+            );
+            group.bench_function(format!("{label}_{num_groups}_groups"), |b| {
+                b.iter_batched(
+                    || {
+                        let db = LaminarDB::open().unwrap();
+                        let source = rt.block_on(async {
+                            db.execute(create_source).await.unwrap();
+                            db.execute(&ddl).await.unwrap();
+                            db.start().await.unwrap();
+                            db.source_untyped("trades").unwrap()
+                        });
+                        // Warm: populate all num_groups groups.
+                        push_and_wait(&db, &source, keyed_batch(num_groups, num_groups, 0));
+                        (db, source, keyed_batch(64, num_groups, 0))
+                    },
+                    |(db, source, small)| {
+                        push_and_wait(&db, &source, small);
+                        std::hint::black_box(&db);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_plain_select,
     bench_agg_group_by,
+    bench_agg_high_cardinality,
     bench_sort_limit,
     bench_query_chain,
 );
