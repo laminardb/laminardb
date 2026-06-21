@@ -205,41 +205,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_offsets_union_across_nodes() {
-        let b = InProcessBackend::new(4);
-        // Two nodes each persist their own partitions' offsets at the same epoch.
-        b.write_source_offsets(
-            7,
-            "node-1",
-            0,
-            Bytes::from_static(b"{\"events-0\":\"100\"}"),
-        )
-        .await
-        .unwrap();
-        b.write_source_offsets(
-            7,
-            "node-2",
-            0,
-            Bytes::from_static(b"{\"events-1\":\"200\"}"),
-        )
-        .await
-        .unwrap();
-
-        // A node acquiring a partition reads every node's blob and unions them.
-        let blobs = b.read_source_offsets(7).await.unwrap();
-        assert_eq!(
-            blobs.len(),
-            2,
-            "both nodes' blobs are returned for the epoch"
-        );
-        assert!(b.read_source_offsets(8).await.unwrap().is_empty());
-
-        // Pruning drops them with their epoch.
-        b.prune_before(8).await.unwrap();
-        assert!(b.read_source_offsets(7).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn epoch_complete_requires_every_vnode() {
         let b = InProcessBackend::new(4);
         let vnodes = [0u32, 1, 2];

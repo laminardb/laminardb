@@ -31,11 +31,15 @@ pub struct RebalanceConfig {
     pub checkpoint_timeout: Duration,
     /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
-    /// Settle window after publishing the draining snapshot, before the
-    /// pre-rotation checkpoint: time for every node to observe the drain, pause
-    /// the revoking partitions, and let the pipeline drain buffered records so the
-    /// checkpoint is a clean cut. Only used under exactly-once (see
-    /// [`LaminarDB::requires_rotation_drain`]).
+    /// Bound on waiting for every live node to ack it adopted the draining
+    /// snapshot (paused its revoking partitions) before the pre-rotation
+    /// checkpoint. On timeout the rotation aborts and clears the drain. Must
+    /// exceed `watcher_poll` so nodes get a chance to observe the snapshot.
+    pub drain_ack_timeout: Duration,
+    /// Settle after the drain quorum acks, before the pre-rotation checkpoint:
+    /// covers the source reacting to the pause and the pipeline draining buffered
+    /// records so the checkpoint is a clean cut. Only used under exactly-once
+    /// (see [`LaminarDB::requires_rotation_drain`]).
     pub drain_settle: Duration,
     /// Locality tier the placement metrics group by (0 = coarsest).
     pub placement_isolation_tier: usize,
@@ -52,6 +56,7 @@ impl Default for RebalanceConfig {
             // rotation is what restores commit availability).
             checkpoint_timeout: Duration::from_secs(15),
             retry_delay: Duration::from_secs(2),
+            drain_ack_timeout: Duration::from_secs(10),
             drain_settle: Duration::from_secs(1),
             placement_isolation_tier: 0,
         }
@@ -68,6 +73,7 @@ impl RebalanceConfig {
             rebalance_debounce: Duration::from_millis(500),
             checkpoint_timeout: Duration::from_secs(30),
             retry_delay: Duration::from_millis(500),
+            drain_ack_timeout: Duration::from_secs(5),
             drain_settle: Duration::from_millis(300),
             placement_isolation_tier: 0,
         }
@@ -134,6 +140,10 @@ pub fn spawn_snapshot_watcher(
                     {
                         last_drained = snap.version;
                         db.adopt_draining_snapshot(&snap);
+                        // Ack so the leader knows we've paused before it checkpoints.
+                        if let Some(ref c) = controller {
+                            c.announce_drained_version(snap.version).await;
+                        }
                     }
                     Ok(Some(snap)) if !snap.draining && snap.version > local => {
                         debug!(local, remote = snap.version, "adopting newer assignment");
@@ -363,7 +373,20 @@ async fn try_rebalance(
             RotateOutcome::Rotated => {
                 db.adopt_draining_snapshot(&drain);
                 controller.announce_snapshot_version(drain.version).await;
-                // Let every node observe the drain, pause, and flush buffered records.
+                controller.announce_drained_version(drain.version).await;
+                // Wait for EVERY live node to ack it adopted the drain (paused its
+                // revoking partitions) before checkpointing — a fixed sleep would
+                // race the watcher poll interval and checkpoint un-paused nodes.
+                let acked =
+                    await_drain_quorum(controller, live, drain.version, config.drain_ack_timeout)
+                        .await;
+                if !acked {
+                    let abort = drain.next(current.vnodes.clone());
+                    let _ = commit_snapshot(db, store, controller, abort, drain.version).await;
+                    return Err("drain ack quorum not reached before timeout".into());
+                }
+                // Acked = paused; this short settle covers the source reacting and the
+                // pipeline flushing buffered records so the checkpoint is a clean cut.
                 tokio::time::sleep(config.drain_settle).await;
                 let ckpt = pre_rotation_checkpoint(db, config).await?;
                 if !ckpt {
@@ -417,6 +440,34 @@ async fn pre_rotation_checkpoint(
         })?
         .map_err(|e| e.to_string())?;
     Ok(ckpt.success)
+}
+
+/// Wait until every node in `live` has gossip-acked it adopted draining `version`
+/// (paused its revoking partitions). Returns false on timeout. Polls because the
+/// ack arrives via gossip after each node's watcher observes the draining snapshot.
+async fn await_drain_quorum(
+    controller: &Arc<ClusterController>,
+    live: &[NodeId],
+    version: u64,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let acked: std::collections::HashSet<NodeId> = controller
+                .read_drained_versions()
+                .await
+                .into_iter()
+                .filter(|(_, v)| *v >= version)
+                .map(|(n, _)| n)
+                .collect();
+            if live.iter().all(|n| acked.contains(n)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 /// CAS a committed (non-draining) snapshot, adopt it, announce, and prune. On a

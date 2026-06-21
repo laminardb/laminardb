@@ -335,6 +335,25 @@ impl ClusterController {
             .max()
     }
 
+    /// Announce that this node has adopted a draining snapshot version (paused its
+    /// revoking partitions) so the leader can wait for every node before taking the
+    /// pre-rotation checkpoint.
+    pub async fn announce_drained_version(&self, version: u64) {
+        self.kv
+            .write("control:drained-version", version.to_string())
+            .await;
+    }
+
+    /// Each peer's adopted draining-snapshot version from gossip KV.
+    pub async fn read_drained_versions(&self) -> Vec<(NodeId, u64)> {
+        self.kv
+            .scan("control:drained-version")
+            .await
+            .into_iter()
+            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|ver| (n, ver)))
+            .collect()
+    }
+
     /// Start the direct gRPC barrier sync server.
     ///
     /// # Errors
