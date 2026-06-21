@@ -428,13 +428,10 @@ impl KafkaSource {
                 std::collections::HashSet::new();
 
             loop {
-                // Engine-controlled re-assignment: when the vnode assignment
-                // rotates, rebind to the partitions this node now owns. Apply only
-                // the DELTA (incremental assign/unassign) — a full re-assign would
-                // re-seek partitions the node is keeping and re-fetch records already
-                // buffered ahead in the reader channel, re-emitting committed rows.
-                // Newly-acquired partitions seek to their handoff/checkpoint offset;
-                // kept partitions are left exactly where the consumer is.
+                // On rotation, apply only the DELTA (incremental assign/unassign): a
+                // full re-assign would re-seek kept partitions and re-fetch records
+                // already buffered ahead, re-emitting committed rows. Newly-acquired
+                // partitions seek to their handoff offset; kept ones are untouched.
                 if let Some((registry, self_id)) = &vnode_reassign {
                     let version = registry.assignment_version();
                     if version != last_assignment_version {
@@ -511,10 +508,8 @@ impl KafkaSource {
                 }
 
                 // Rotation drain: pause the partitions of vnodes about to be revoked
-                // from this node so the pre-rotation checkpoint is a clean cut (the
-                // previous owner stops consuming exactly at the sealed offset). On
-                // commit the partitions are dropped at the version rebind above; on
-                // abort the drain is cleared and they resume here.
+                // so the pre-rotation checkpoint is a clean cut. On commit they're
+                // dropped at the rebind above; on abort the drain clears and they resume.
                 if let Some((registry, self_id)) = &vnode_reassign {
                     let drain_gen = registry.draining_generation();
                     if drain_gen != last_drain_gen {
@@ -562,13 +557,10 @@ impl KafkaSource {
                     let _ = seen_tx.send(seen_partitions.iter().cloned().collect());
                 }
 
-                // A rebalance assigned new partitions; the callback paused them so
-                // they can't fetch from `auto.offset.reset` before we position them.
-                // Seek to the checkpointed offsets HERE — in the live poll loop where
-                // the assignment is fetch-ready (the in-callback seek fails with
-                // `Local: Erroneous state`) — then resume. This is what makes source
-                // offset recovery actually take effect; without it the consumer would
-                // resume from the reset position and skip or duplicate records.
+                // Newly-assigned partitions were paused by the callback. Seek to the
+                // checkpointed offsets HERE, in the poll loop where the assignment is
+                // fetch-ready (the in-callback seek fails `Local: Erroneous state`),
+                // then resume — otherwise recovery resumes from auto.offset.reset.
                 let cur_assign_gen = assign_generation.load(Ordering::Acquire);
                 if cur_assign_gen != last_assign_gen {
                     let assigned: Vec<(String, i32)> = lock_or_recover(&rebalance_state)
@@ -772,12 +764,9 @@ fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitio
     tpl
 }
 
-/// Build the manual-`assign()` partition list for a vnode-assigned Kafka source:
-/// the partitions this node owns (`partition % vnode_count`), each positioned at
-/// its checkpointed offset + 1 when known (resume after the last consumed record),
-/// else `default_offset`. Used for the initial `open()` assignment; rotation
-/// rebinds use `incremental_assign`/`incremental_unassign` so kept partitions are
-/// never re-seeked (see the reader loop).
+/// Partition list for the initial `open()` assignment of a vnode-assigned source:
+/// owned partitions (`partition % vnode_count`) at their checkpointed offset + 1,
+/// else `default_offset`. Rotations rebind incrementally in the reader loop.
 fn build_vnode_assignment_tpl(
     registry: &laminar_core::state::VnodeRegistry,
     self_id: laminar_core::state::NodeId,
@@ -791,10 +780,8 @@ fn build_vnode_assignment_tpl(
         for partition in crate::partition_assignment::owned_partitions(*count, registry, self_id) {
             let offset = match offsets
                 .get(topic.as_ref(), partition)
-                // No local offset → this partition was just handed to us in a vnode
-                // rotation; fall back to the previous owner's checkpointed position
-                // the engine staged, instead of auto.offset.reset (which replays the
-                // prefix and emits duplicates).
+                // No local offset → handed to us in a rotation; fall back to the
+                // previous owner's staged position, not auto.offset.reset.
                 .or_else(|| resume.get(topic.as_ref(), partition))
             {
                 Some(o) => rdkafka::Offset::Offset(o + 1),
@@ -948,9 +935,8 @@ impl SourceConnector for KafkaSource {
                     ));
                 }
                 let default_offset = startup_default_offset(&kafka_config.startup_mode);
-                // Initial assignment: a fresh start has no local offsets (→ default)
-                // and recovery already loaded committed offsets into `self.offsets`
-                // via restore(), so there are no rotation resume offsets to apply.
+                // restore() already loaded committed offsets into self.offsets, so
+                // there are no rotation resume offsets at open().
                 let no_resume = OffsetTracker::new();
                 let tpl = build_vnode_assignment_tpl(
                     &registry,
@@ -961,9 +947,8 @@ impl SourceConnector for KafkaSource {
                     default_offset,
                 );
                 let owned = tpl.count();
-                // Incremental from the empty initial assignment, so every later
-                // rotation rebind can also use incremental_assign/unassign (mixing a
-                // full assign() with incremental ops is rejected by librdkafka).
+                // Incremental from empty so rebinds can stay incremental — librdkafka
+                // rejects mixing a full assign() with incremental_assign/unassign.
                 consumer.incremental_assign(&tpl).map_err(|e| {
                     ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
                 })?;

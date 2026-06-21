@@ -31,15 +31,11 @@ pub struct RebalanceConfig {
     pub checkpoint_timeout: Duration,
     /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
-    /// Bound on waiting for every live node to ack it adopted the draining
-    /// snapshot (paused its revoking partitions) before the pre-rotation
-    /// checkpoint. On timeout the rotation aborts and clears the drain. Must
-    /// exceed `watcher_poll` so nodes get a chance to observe the snapshot.
+    /// Bound on waiting for all live nodes to ack the draining snapshot before the
+    /// pre-rotation checkpoint; on timeout the rotation aborts. Must exceed `watcher_poll`.
     pub drain_ack_timeout: Duration,
-    /// Settle after the drain quorum acks, before the pre-rotation checkpoint:
-    /// covers the source reacting to the pause and the pipeline draining buffered
-    /// records so the checkpoint is a clean cut. Only used under exactly-once
-    /// (see [`LaminarDB::requires_rotation_drain`]).
+    /// Settle after the drain acks so the source reacts and buffered records flush,
+    /// before the checkpoint cut. Exactly-once only.
     pub drain_settle: Duration,
     /// Locality tier the placement metrics group by (0 = coarsest).
     pub placement_isolation_tier: usize,
@@ -356,12 +352,9 @@ async fn try_rebalance(
         );
     }
 
-    // Barrier-aligned handoff (B2): under exactly-once, first publish a draining
-    // snapshot so every node pauses the partitions of vnodes it is about to lose,
-    // settle, then take the pre-rotation checkpoint as a clean cut — the old owner
-    // stops consuming exactly at the sealed offset, so no records are emitted past
-    // it. Skipped when shedding a dead node (it can't drain) or when the pipeline
-    // isn't exactly-once.
+    // Exactly-once handoff: publish a draining snapshot so every node pauses the
+    // partitions it's losing, settle, then checkpoint as a clean cut. Skipped when
+    // shedding a dead node (it can't drain) or when not exactly-once.
     if !shedding_dead && db.requires_rotation_drain() {
         let mut drain = current.next(new_vnodes.clone());
         drain.draining = true;
@@ -374,9 +367,8 @@ async fn try_rebalance(
                 db.adopt_draining_snapshot(&drain);
                 controller.announce_snapshot_version(drain.version).await;
                 controller.announce_drained_version(drain.version).await;
-                // Wait for EVERY live node to ack it adopted the drain (paused its
-                // revoking partitions) before checkpointing — a fixed sleep would
-                // race the watcher poll interval and checkpoint un-paused nodes.
+                // Wait for every live node to ack the pause before checkpointing —
+                // a fixed sleep would race the watcher poll and capture un-paused nodes.
                 let acked =
                     await_drain_quorum(controller, live, drain.version, config.drain_ack_timeout)
                         .await;
@@ -385,14 +377,11 @@ async fn try_rebalance(
                     let _ = commit_snapshot(db, store, controller, abort, drain.version).await;
                     return Err("drain ack quorum not reached before timeout".into());
                 }
-                // Acked = paused; this short settle covers the source reacting and the
-                // pipeline flushing buffered records so the checkpoint is a clean cut.
                 tokio::time::sleep(config.drain_settle).await;
                 let ckpt = pre_rotation_checkpoint(db, config).await?;
                 if !ckpt {
-                    // Checkpoint failed mid-drain: re-publish the CURRENT assignment
-                    // (no rotation) so nodes clear the drain and resume, then surface
-                    // the failure for retry. Availability over strictness on failure.
+                    // Re-publish the current assignment so nodes clear the drain and
+                    // resume, then surface the failure for retry.
                     let abort = drain.next(current.vnodes.clone());
                     let _ = commit_snapshot(db, store, controller, abort, drain.version).await;
                     return Err("pre-rotation checkpoint failed during drain".into());

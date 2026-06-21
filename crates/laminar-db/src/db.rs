@@ -108,9 +108,7 @@ pub struct LaminarDB {
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
-    /// Set at pipeline start when the pipeline has an exactly-once sink, so vnode
-    /// rotations run the pre-rotation source drain (B2). Read by
-    /// [`requires_rotation_drain`](Self::requires_rotation_drain).
+    /// Set at pipeline start when a sink is exactly-once; gates the rotation drain.
     pub(crate) rotation_drain_required: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Decoupled coordinated-commit committer task; aborted on shutdown.
@@ -596,12 +594,9 @@ impl LaminarDB {
         let mut guard = self.coordinator.lock().await;
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
 
-        // Before bumping the assignment version (which triggers the source's
-        // partition rebind), stage the cluster-wide source offsets (unioned from
-        // every node's blob in the shared state backend) so an acquiring source
-        // resumes newly-owned partitions from the previous owner's sealed position
-        // instead of auto.offset.reset (which duplicates). Only when this node is
-        // actually acquiring a vnode. Operator state is rehydrated separately below.
+        // Stage the cluster-wide sealed source offsets before the version bump so an
+        // acquiring source resumes newly-owned partitions from the previous owner's
+        // position, not auto.offset.reset. Only when this node acquires a vnode.
         let acquiring_any = {
             let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
             (0..vnode_count).any(|v| {
@@ -615,8 +610,7 @@ impl LaminarDB {
         }
 
         registry.set_assignment_and_version(new_assignment, snapshot.version);
-        // The rotation committed: drop any pre-rotation drain marks. Revoked
-        // partitions are gone from the new assignment; the source resumes the rest.
+        // Rotation committed — drop the drain marks (revoked partitions are gone).
         registry.clear_draining();
         let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         if let Some(backend) = self.state_backend.lock().clone() {
@@ -689,12 +683,10 @@ impl LaminarDB {
         adoption
     }
 
-    /// Adopt the DRAIN phase of a rotation: mark the vnodes this node is about to
-    /// lose (owned now, not owned in `snapshot`) as draining so the source pauses
-    /// their partitions for a clean pre-rotation checkpoint cut. Ownership is NOT
-    /// changed — the committed snapshot (`draining = false`) does that later via
-    /// [`adopt_assignment_snapshot`](Self::adopt_assignment_snapshot). Returns the
-    /// vnodes marked draining (for the leader to log / wait on).
+    /// Mark the vnodes this node is about to lose as draining (source pauses their
+    /// partitions for a clean checkpoint cut); does NOT change ownership. Returns
+    /// them so the leader can wait on the drain. The committed snapshot rotates
+    /// ownership later via [`adopt_assignment_snapshot`](Self::adopt_assignment_snapshot).
     #[cfg(feature = "cluster")]
     pub fn adopt_draining_snapshot(
         &self,
@@ -728,16 +720,9 @@ impl LaminarDB {
         revoking
     }
 
-    /// Whether vnode rotations should run the pre-rotation source drain (B2).
-    ///
-    /// True when the running pipeline has an exactly-once sink: there the old
-    /// owner must stop consuming a rotating partition at the checkpoint cut, or it
-    /// emits records past the sealed offset that a non-upsert sink can't dedup.
-    /// Set from the actual registered sinks at pipeline start (the server
-    /// configures delivery per sink, not via the DB-level `delivery_guarantee`).
-    /// At-least-once pipelines skip the drain and tolerate the bounded rotation
-    /// duplicate. (An all-upsert EO pipeline would absorb the dup too; skipping the
-    /// drain there is a future optimization — correctness doesn't depend on it.)
+    /// Whether vnode rotations run the pre-rotation source drain — true when a sink
+    /// is exactly-once, so the old owner stops at the checkpoint cut rather than
+    /// emitting past the sealed offset. At-least-once pipelines skip it.
     #[must_use]
     pub fn requires_rotation_drain(&self) -> bool {
         self.rotation_drain_required

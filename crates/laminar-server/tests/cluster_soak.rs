@@ -623,14 +623,14 @@ fn three_node_kill9_soak() {
 
 // ── Graceful-rotation soak (B2) ─────────────────────────────────────────────
 
-/// Node config for the graceful-rotation soak: a SHARED vnode-partitioned Kafka
-/// source over `input_topic`, a pass-through pipeline, and a per-node exactly-once
-/// Kafka sink. The exactly-once sink is what makes a vnode rotation run the B2
-/// pre-rotation drain. `seeds` covers all nodes (incl. the one added mid-run).
+/// Node config for the graceful-rotation soak: a shared vnode-partitioned Kafka
+/// source, a pass-through pipeline, and a per-node exactly-once Kafka sink (the
+/// exactly-once sink is what makes a rotation run the pre-rotation drain). Seeds
+/// `n_seeds` nodes — the joiner discovers the cluster via gossip on these seeds.
 fn write_graceful_config(
     dir: &Path,
     id: usize,
-    n_nodes: usize,
+    n_seeds: usize,
     interval_ms: u64,
     checkpoint_url: &str,
     brokers: &str,
@@ -644,7 +644,7 @@ fn write_graceful_config(
     );
     let http = BASE_PORT + id as u16;
     let gossip = BASE_PORT + 100 + id as u16;
-    let seeds: Vec<String> = (0..n_nodes)
+    let seeds: Vec<String> = (0..n_seeds)
         .map(|i| format!("\"127.0.0.1:{}\"", BASE_PORT + 100 + i as u16))
         .collect();
     let data_dir = dir.join(format!("node{id}-data"));
@@ -852,8 +852,7 @@ fn graceful_rotation_kafka_soak() {
     let total: i64 = env_u64("LAMINAR_SOAK_TOTAL", 12000) as i64;
     const INITIAL: usize = 3;
     const ALL: usize = 4; // a 4th node joins mid-run
-                          // Enough partitions that the added node reliably acquires some (64 vnodes,
-                          // 4 nodes → ~1/4 each; with 12 partitions the join almost surely moves one).
+                          // Enough partitions that the joining node reliably acquires some.
     const PARTS: i32 = 12;
 
     let input = format!("soak-grace-in-{}", std::process::id());
@@ -900,10 +899,8 @@ fn graceful_rotation_kafka_soak() {
     assert_progress(&nodes[..INITIAL], 0.0, Duration::from_secs(90), "startup");
     eprintln!("soak: 3 nodes up; producing {total} records");
 
-    // Produce on a background thread at a modest rate so records are STILL
-    // flowing after the rotation settles — otherwise the backlog is consumed
-    // before node 3 acquires its partitions and it never sees data. At ~400/s a
-    // 12k run spans ~30s, well past the join + settle.
+    // Modest rate so records are still flowing after the rotation settles —
+    // otherwise the backlog drains before node 3 acquires its partitions.
     let (pb, pt) = (brokers.clone(), input.clone());
     let producer = std::thread::spawn(move || produce_seq(&pb, &pt, total, 400));
 
@@ -927,10 +924,8 @@ fn graceful_rotation_kafka_soak() {
         s.len() >= total as usize
     });
 
-    // Every input was already observed committed (the wait above reads
-    // read_committed), so the sinks are idle with no open transactions. Read the
-    // diff against the live, settled cluster: killing first only races the diff
-    // consumer against the kill and can surface transient phantom reads.
+    // The wait above already saw every input committed, so read the diff against
+    // the live, settled cluster — killing first races the diff into phantom reads.
     std::thread::sleep(Duration::from_secs(5));
     let (mut seqs, per_topic) = collect_output_seqs(&brokers, ALL);
     let count = seqs.len();
