@@ -419,6 +419,13 @@ impl KafkaSource {
             let mut last_assignment_version = vnode_reassign
                 .as_ref()
                 .map_or(0, |(r, _)| r.assignment_version());
+            // Partitions paused for a pending rotation (their vnode is draining), so
+            // the pre-rotation checkpoint is a clean cut. Reconciled on drain-gen change.
+            let mut last_drain_gen = vnode_reassign
+                .as_ref()
+                .map_or(0, |(r, _)| r.draining_generation());
+            let mut drain_paused: std::collections::HashSet<(Arc<str>, i32)> =
+                std::collections::HashSet::new();
 
             loop {
                 // Engine-controlled re-assignment: when the vnode assignment
@@ -454,6 +461,51 @@ impl KafkaSource {
                                 "Kafka source partition re-assignment failed"
                             ),
                         }
+                        // The new assignment resets pause state and drops revoked
+                        // partitions; any drain pauses no longer apply.
+                        drain_paused.clear();
+                        last_drain_gen = registry.draining_generation();
+                    }
+                }
+
+                // Rotation drain: pause the partitions of vnodes about to be revoked
+                // from this node so the pre-rotation checkpoint is a clean cut (the
+                // previous owner stops consuming exactly at the sealed offset). On
+                // commit the partitions are dropped at the version rebind above; on
+                // abort the drain is cleared and they resume here.
+                if let Some((registry, self_id)) = &vnode_reassign {
+                    let drain_gen = registry.draining_generation();
+                    if drain_gen != last_drain_gen {
+                        last_drain_gen = drain_gen;
+                        let vnode_count = registry.vnode_count();
+                        let want: std::collections::HashSet<(Arc<str>, i32)> = vnode_topic_meta
+                            .iter()
+                            .flat_map(|(topic, count)| {
+                                let topic = Arc::clone(topic);
+                                crate::partition_assignment::owned_partitions(
+                                    *count, registry, *self_id,
+                                )
+                                .into_iter()
+                                .filter(|&p| {
+                                    u32::try_from(p)
+                                        .is_ok_and(|pid| registry.is_draining(pid % vnode_count))
+                                })
+                                .map(move |p| (Arc::clone(&topic), p))
+                            })
+                            .collect();
+                        let to_pause = tpl_of(want.difference(&drain_paused));
+                        if to_pause.count() > 0 {
+                            let _ = consumer.pause(&to_pause);
+                        }
+                        // Resume vnodes that stopped draining (rotation aborted), unless
+                        // backpressure is holding everything.
+                        if !is_paused {
+                            let to_resume = tpl_of(drain_paused.difference(&want));
+                            if to_resume.count() > 0 {
+                                let _ = consumer.resume(&to_resume);
+                            }
+                        }
+                        drain_paused = want;
                     }
                 }
 
@@ -518,6 +570,10 @@ impl KafkaSource {
                         if !is_paused {
                             if let Ok(assignment) = consumer.assignment() {
                                 let _ = consumer.resume(&assignment);
+                                // Keep rotation-drained partitions paused.
+                                if !drain_paused.is_empty() {
+                                    let _ = consumer.pause(&tpl_of(drain_paused.iter()));
+                                }
                             }
                         }
                         last_assign_gen = cur_assign_gen;
@@ -542,6 +598,10 @@ impl KafkaSource {
                     if let Ok(assignment) = consumer.assignment() {
                         if consumer.resume(&assignment).is_ok() {
                             is_paused = false;
+                            // Keep rotation-drained partitions paused.
+                            if !drain_paused.is_empty() {
+                                let _ = consumer.pause(&tpl_of(drain_paused.iter()));
+                            }
                             debug!("reader: resumed Kafka partitions (fill={fill:.2})");
                         }
                     }
@@ -664,6 +724,16 @@ impl KafkaSource {
 /// source: the partitions this node owns (`partition % vnode_count`), each
 /// positioned at its checkpointed offset + 1 when known (resume after the last
 /// consumed record), else `default_offset`.
+/// Build an offset-less `TopicPartitionList` from `(topic, partition)` refs, for
+/// `pause`/`resume` calls.
+fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitionList {
+    let mut tpl = TopicPartitionList::new();
+    for (topic, partition) in parts {
+        let _ = tpl.add_partition(topic.as_ref(), *partition);
+    }
+    tpl
+}
+
 fn build_vnode_assignment_tpl(
     registry: &laminar_core::state::VnodeRegistry,
     self_id: laminar_core::state::NodeId,

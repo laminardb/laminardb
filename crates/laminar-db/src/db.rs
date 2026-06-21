@@ -610,6 +610,9 @@ impl LaminarDB {
         }
 
         registry.set_assignment_and_version(new_assignment, snapshot.version);
+        // The rotation committed: drop any pre-rotation drain marks. Revoked
+        // partitions are gone from the new assignment; the source resumes the rest.
+        registry.clear_draining();
         let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
@@ -679,6 +682,60 @@ impl LaminarDB {
             "adopted assignment snapshot",
         );
         adoption
+    }
+
+    /// Adopt the DRAIN phase of a rotation: mark the vnodes this node is about to
+    /// lose (owned now, not owned in `snapshot`) as draining so the source pauses
+    /// their partitions for a clean pre-rotation checkpoint cut. Ownership is NOT
+    /// changed — the committed snapshot (`draining = false`) does that later via
+    /// [`adopt_assignment_snapshot`](Self::adopt_assignment_snapshot). Returns the
+    /// vnodes marked draining (for the leader to log / wait on).
+    #[cfg(feature = "cluster")]
+    pub fn adopt_draining_snapshot(
+        &self,
+        snapshot: &laminar_core::cluster::control::AssignmentSnapshot,
+    ) -> Vec<u32> {
+        let Some(registry) = self.vnode_registry.lock().clone() else {
+            return Vec::new();
+        };
+        let vnode_count = registry.vnode_count();
+        let self_id = self
+            .cluster_controller
+            .lock()
+            .as_ref()
+            .map_or(laminar_core::state::NodeId(0), |c| {
+                laminar_core::state::NodeId(c.instance_id().0)
+            });
+        let next = snapshot.to_vnode_vec(vnode_count);
+        let revoking: Vec<u32> = (0..vnode_count)
+            .filter(|&v| {
+                registry.owner(v) == self_id && next.get(v as usize).copied() != Some(self_id)
+            })
+            .collect();
+        if !revoking.is_empty() {
+            tracing::info!(
+                count = revoking.len(),
+                version = snapshot.version,
+                "pre-rotation drain: pausing source for revoking vnodes"
+            );
+            registry.mark_draining(&revoking);
+        }
+        revoking
+    }
+
+    /// Whether vnode rotations should run the pre-rotation source drain (B2).
+    ///
+    /// Only under exactly-once: there the old owner must stop consuming a rotating
+    /// partition at the checkpoint cut, or it emits records past the sealed offset
+    /// that a non-upsert sink can't dedup. At-least-once pipelines tolerate the
+    /// bounded rotation duplicate and skip the drain. (An all-upsert exactly-once
+    /// pipeline would absorb the dup too; skipping the drain there is a future
+    /// optimization — correctness doesn't depend on it.)
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn requires_rotation_drain(&self) -> bool {
+        self.config.delivery_guarantee
+            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
     }
 
     /// Staged vnode state from the most recent rebalance adoptions, keyed by vnode.
