@@ -1489,6 +1489,55 @@ mod tests {
         assert_eq!(op.decode_inline().unwrap(), b"data");
     }
 
+    /// B1 foundation gap (KNOWN-FAILING): in cluster mode every node writes its
+    /// OWN partial manifest — only the partitions it owns — to the shared store,
+    /// which has a single `latest.txt` pointer and no cross-node merge. So
+    /// `load_latest()` returns one node's offsets, not a global union, and a node
+    /// acquiring a partition can't reliably find the previous owner's committed
+    /// position (it resumes from `auto.offset.reset` → duplicates). This asserts
+    /// the DESIRED post-fix behavior (a globally-complete manifest) and therefore
+    /// fails today; remove `#[ignore]` when the leader-merged global manifest lands.
+    #[tokio::test]
+    #[ignore = "B1: documents the multi-node manifest-completeness gap; flip when leader-merged manifest lands"]
+    async fn manifest_handoff_is_globally_complete_across_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Node 0 checkpoints only the partition it owns (events-0)…
+        let mut n0 = make_manifest(1, 5);
+        n0.source_offsets.insert(
+            "kafka-src".into(),
+            ConnectorCheckpoint::with_offsets(
+                5,
+                HashMap::from([("events-0".into(), "100".into())]),
+            ),
+        );
+        store.save(&n0).await.unwrap();
+
+        // …node 1 checkpoints its own partition (events-1), a different id but the
+        // same shared `latest.txt`. Last writer wins.
+        let mut n1 = make_manifest(2, 5);
+        n1.source_offsets.insert(
+            "kafka-src".into(),
+            ConnectorCheckpoint::with_offsets(
+                5,
+                HashMap::from([("events-1".into(), "200".into())]),
+            ),
+        );
+        store.save(&n1).await.unwrap();
+
+        // A node acquiring events-0 on rotation reads the latest manifest for its
+        // offset. The handoff is only sound if the manifest is a global union.
+        let latest = store.load_latest().await.unwrap().unwrap();
+        let offsets = &latest.source_offsets.get("kafka-src").unwrap().offsets;
+        assert_eq!(
+            offsets.get("events-0"),
+            Some(&"100".to_string()),
+            "previous owner's offset must survive the handoff (global manifest)"
+        );
+        assert_eq!(offsets.get("events-1"), Some(&"200".to_string()));
+    }
+
     #[tokio::test]
     async fn test_empty_latest_txt() {
         let dir = tempfile::tempdir().unwrap();
