@@ -429,41 +429,83 @@ impl KafkaSource {
 
             loop {
                 // Engine-controlled re-assignment: when the vnode assignment
-                // rotates, rebind to the partitions this node now owns, seeking
-                // each to its tracked offset (manual assign gets no broker
-                // rebalance callback to do this for us).
+                // rotates, rebind to the partitions this node now owns. Apply only
+                // the DELTA (incremental assign/unassign) — a full re-assign would
+                // re-seek partitions the node is keeping and re-fetch records already
+                // buffered ahead in the reader channel, re-emitting committed rows.
+                // Newly-acquired partitions seek to their handoff/checkpoint offset;
+                // kept partitions are left exactly where the consumer is.
                 if let Some((registry, self_id)) = &vnode_reassign {
                     let version = registry.assignment_version();
                     if version != last_assignment_version {
                         last_assignment_version = version;
-                        let offsets = lock_or_recover(&reassign_snapshot).clone();
-                        // Previous owners' checkpointed offsets, staged by the engine
-                        // before the version bump; used only for partitions we have no
-                        // local offset for (those handed to us in this rotation).
-                        let resume = OffsetTracker::from_offset_map(&registry.resume_offsets());
-                        let tpl = build_vnode_assignment_tpl(
-                            registry,
-                            *self_id,
-                            &vnode_topic_meta,
-                            &offsets,
-                            &resume,
-                            reassign_default_offset,
-                        );
-                        match consumer.assign(&tpl) {
-                            Ok(()) => info!(
-                                version,
-                                owned_partitions = tpl.count(),
-                                "Kafka source re-assigned partitions after vnode rotation"
-                            ),
-                            Err(e) => warn!(
-                                version,
-                                error = %e,
-                                "Kafka source partition re-assignment failed"
-                            ),
+                        let current = consumer.assignment().unwrap_or_default();
+                        let current_set: std::collections::HashSet<(String, i32)> = current
+                            .elements()
+                            .iter()
+                            .map(|e| (e.topic().to_string(), e.partition()))
+                            .collect();
+
+                        let mut owned_set: std::collections::HashSet<(String, i32)> =
+                            std::collections::HashSet::new();
+                        for (topic, count) in &vnode_topic_meta {
+                            for p in crate::partition_assignment::owned_partitions(
+                                *count, registry, *self_id,
+                            ) {
+                                owned_set.insert((topic.to_string(), p));
+                            }
                         }
-                        // The new assignment resets pause state and drops revoked
-                        // partitions; any drain pauses no longer apply.
-                        drain_paused.clear();
+
+                        let mut to_remove = TopicPartitionList::new();
+                        for e in current.elements() {
+                            if !owned_set.contains(&(e.topic().to_string(), e.partition())) {
+                                let _ = to_remove.add_partition(e.topic(), e.partition());
+                            }
+                        }
+
+                        // Newly-acquired partitions resume from local offset, else the
+                        // previous owner's staged handoff offset, else the startup default.
+                        let offsets = lock_or_recover(&reassign_snapshot).clone();
+                        let resume = OffsetTracker::from_offset_map(&registry.resume_offsets());
+                        let mut to_add = TopicPartitionList::new();
+                        for (topic, count) in &vnode_topic_meta {
+                            for p in crate::partition_assignment::owned_partitions(
+                                *count, registry, *self_id,
+                            ) {
+                                if current_set.contains(&(topic.to_string(), p)) {
+                                    continue; // kept — leave untouched
+                                }
+                                let offset = match offsets
+                                    .get(topic.as_ref(), p)
+                                    .or_else(|| resume.get(topic.as_ref(), p))
+                                {
+                                    Some(o) => rdkafka::Offset::Offset(o + 1),
+                                    None => reassign_default_offset,
+                                };
+                                let _ = to_add.add_partition_offset(topic.as_ref(), p, offset);
+                            }
+                        }
+
+                        if to_remove.count() > 0 {
+                            if let Err(e) = consumer.incremental_unassign(&to_remove) {
+                                warn!(version, error = %e, "Kafka source unassign failed");
+                            }
+                        }
+                        if to_add.count() > 0 {
+                            if let Err(e) = consumer.incremental_assign(&to_add) {
+                                warn!(version, error = %e, "Kafka source assign failed");
+                            }
+                        }
+                        if to_remove.count() > 0 || to_add.count() > 0 {
+                            info!(
+                                version,
+                                acquired = to_add.count(),
+                                revoked = to_remove.count(),
+                                "Kafka source rebound partitions after vnode rotation"
+                            );
+                        }
+                        // Revoked partitions are gone; their drain pauses no longer apply.
+                        drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
                         last_drain_gen = registry.draining_generation();
                     }
                 }
@@ -720,10 +762,6 @@ impl KafkaSource {
     }
 }
 
-/// Build the manual-`assign()` partition list for a vnode-assigned Kafka
-/// source: the partitions this node owns (`partition % vnode_count`), each
-/// positioned at its checkpointed offset + 1 when known (resume after the last
-/// consumed record), else `default_offset`.
 /// Build an offset-less `TopicPartitionList` from `(topic, partition)` refs, for
 /// `pause`/`resume` calls.
 fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitionList {
@@ -734,6 +772,12 @@ fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitio
     tpl
 }
 
+/// Build the manual-`assign()` partition list for a vnode-assigned Kafka source:
+/// the partitions this node owns (`partition % vnode_count`), each positioned at
+/// its checkpointed offset + 1 when known (resume after the last consumed record),
+/// else `default_offset`. Used for the initial `open()` assignment; rotation
+/// rebinds use `incremental_assign`/`incremental_unassign` so kept partitions are
+/// never re-seeked (see the reader loop).
 fn build_vnode_assignment_tpl(
     registry: &laminar_core::state::VnodeRegistry,
     self_id: laminar_core::state::NodeId,
@@ -917,7 +961,10 @@ impl SourceConnector for KafkaSource {
                     default_offset,
                 );
                 let owned = tpl.count();
-                consumer.assign(&tpl).map_err(|e| {
+                // Incremental from the empty initial assignment, so every later
+                // rotation rebind can also use incremental_assign/unassign (mixing a
+                // full assign() with incremental ops is rejected by librdkafka).
+                consumer.incremental_assign(&tpl).map_err(|e| {
                     ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
                 })?;
                 self.vnode_topic_meta = topic_meta;
