@@ -82,6 +82,13 @@ impl VnodeLifecycleState {
     }
 }
 
+/// Opaque source-checkpoint offsets (connector-defined `"key" -> "value"`
+/// strings) staged for a rotation handoff. A private alias keeps the single
+/// `disallowed_types` exception (cold path, mirrors the checkpoint map shape) in
+/// one place rather than blanket-allowing this perf-sensitive module.
+#[allow(clippy::disallowed_types)]
+type ResumeOffsets = std::collections::HashMap<String, String>;
+
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
     vnode_count: u32,
@@ -93,12 +100,12 @@ pub struct VnodeRegistry {
     /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
     /// on boot, so adding it never touches a wire format.
     lifecycle: Arc<[AtomicU8]>,
-    /// Committed source resume offsets staged by the engine just before an
-    /// assignment-version bump, for partitions this node is acquiring in a
-    /// rotation. Keyed `(topic, partition) -> next-offset-to-fetch`. Drained by
-    /// the Kafka source on its next rebind so acquired partitions resume from the
-    /// previous owner's sealed checkpoint position instead of `auto.offset.reset`.
-    resume_hints: parking_lot::Mutex<std::collections::HashMap<(String, i32), i64>>,
+    /// Opaque source-checkpoint offsets (connector-defined key/value strings)
+    /// staged by the engine just before an assignment-version bump. A partitioned
+    /// source reads them on rebind to resume partitions it is acquiring from the
+    /// previous owner's sealed position instead of `auto.offset.reset`. The engine
+    /// stays connector-agnostic; the source interprets the keys.
+    resume_offsets: parking_lot::Mutex<Arc<ResumeOffsets>>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -131,7 +138,7 @@ impl VnodeRegistry {
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
-            resume_hints: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
     }
 
@@ -152,29 +159,27 @@ impl VnodeRegistry {
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
-            resume_hints: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
     }
 
-    /// Stage committed source resume offsets for partitions about to be acquired
-    /// in a rotation, keyed `(topic, partition) -> next-offset-to-fetch`. MUST be
-    /// called before [`set_assignment_and_version`](Self::set_assignment_and_version)
-    /// so the source observes them when it rebinds for the new version.
-    pub fn stage_resume_hints(&self, hints: std::collections::HashMap<(String, i32), i64>) {
-        if hints.is_empty() {
+    /// Stage opaque source-checkpoint offsets for the next rebind. MUST be called
+    /// before [`set_assignment_and_version`](Self::set_assignment_and_version) so
+    /// the source observes them. Replaces any prior staging; an empty map is
+    /// ignored so a transient load failure can't clobber a good snapshot.
+    pub fn stage_resume_offsets(&self, offsets: ResumeOffsets) {
+        if offsets.is_empty() {
             return;
         }
-        self.resume_hints.lock().extend(hints);
+        *self.resume_offsets.lock() = Arc::new(offsets);
     }
 
-    /// Drain the staged source resume offsets (see
-    /// [`stage_resume_hints`](Self::stage_resume_hints)). Returns and clears the
-    /// map; entries the caller does not use are dropped — they are only valid for
-    /// the rotation that staged them.
+    /// The staged source-checkpoint offsets (see
+    /// [`stage_resume_offsets`](Self::stage_resume_offsets)). Reads (does not
+    /// drain), so every source on this node sees the same snapshot on rebind.
     #[must_use]
-    pub fn take_resume_hints(&self) -> std::collections::HashMap<(String, i32), i64> {
-        let mut guard = self.resume_hints.lock();
-        std::mem::take(&mut *guard)
+    pub fn resume_offsets(&self) -> Arc<ResumeOffsets> {
+        Arc::clone(&self.resume_offsets.lock())
     }
 
     /// Number of vnodes.

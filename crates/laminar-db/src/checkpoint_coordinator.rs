@@ -610,58 +610,28 @@ impl CheckpointCoordinator {
         self.config.coordinated_committer_poll
     }
 
-    /// Committed Kafka source offsets for the partitions bound to `acquiring`
-    /// vnodes, read from the latest durable checkpoint manifest. Keyed
-    /// `(topic, partition) -> next-offset-to-fetch`.
+    /// All source-checkpoint offsets from the latest durable manifest, as one
+    /// opaque map of connector-defined key/value strings.
     ///
-    /// Used during a vnode rotation so a node that acquires a partition resumes
-    /// it from the previous owner's sealed position instead of replaying from
-    /// `auto.offset.reset` (which emits duplicates). Best-effort: returns empty
-    /// on any load error so the source falls back to its configured startup
-    /// offset.
+    /// Staged onto the vnode registry during a rotation so an acquiring source can
+    /// resume partitions from the previous owner's sealed position instead of
+    /// `auto.offset.reset`. The engine does not interpret the keys — the source
+    /// parses and filters to the partitions it owns. Best-effort: empty on any
+    /// load error so the source falls back to its configured startup offset.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn acquired_source_resume_hints(
-        &self,
-        acquiring: &[u32],
-        vnode_count: u32,
-    ) -> HashMap<(String, i32), i64> {
-        let mut hints = HashMap::new();
-        if acquiring.is_empty() || vnode_count == 0 {
-            return hints;
-        }
-        let manifest = match self.store.load_latest().await {
-            Ok(Some(m)) => m,
-            Ok(None) => return hints,
+    pub(crate) async fn latest_source_offsets(&self) -> HashMap<String, String> {
+        match self.store.load_latest().await {
+            Ok(Some(m)) => m
+                .source_offsets
+                .values()
+                .flat_map(|cp| cp.offsets.iter().map(|(k, v)| (k.clone(), v.clone())))
+                .collect(),
+            Ok(None) => HashMap::new(),
             Err(e) => {
                 warn!(error = %e, "source offset handoff: failed to load latest manifest");
-                return hints;
-            }
-        };
-        let acquiring: std::collections::HashSet<u32> = acquiring.iter().copied().collect();
-        for cp in manifest.source_offsets.values() {
-            for (key, val) in &cp.offsets {
-                // key format: "{topic}-{partition}" (topic names may contain '-').
-                let Some((topic, partition)) = key.rsplit_once('-') else {
-                    continue;
-                };
-                let (Ok(partition), Ok(offset)) =
-                    (partition.parse::<i32>(), val.parse::<i64>())
-                else {
-                    continue;
-                };
-                if partition < 0 {
-                    continue;
-                }
-                #[allow(clippy::cast_sign_loss)]
-                let vnode = (partition as u32) % vnode_count;
-                if acquiring.contains(&vnode) {
-                    // Manifest stores the last-consumed offset; the source seeks
-                    // the next record to fetch.
-                    hints.insert((topic.to_string(), partition), offset + 1);
-                }
+                HashMap::new()
             }
         }
-        hints
     }
 
     /// Begin the initial epoch on all exactly-once sinks.

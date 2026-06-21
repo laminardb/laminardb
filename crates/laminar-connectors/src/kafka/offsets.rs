@@ -109,40 +109,40 @@ impl OffsetTracker {
         cp
     }
 
-    /// Restores offset state from a [`SourceCheckpoint`].
-    ///
-    /// Parses keys in `"{topic}-{partition}"` format. Logs warnings for
-    /// unparseable entries rather than silently dropping them.
+    /// Restores offset state from a [`SourceCheckpoint`]. See
+    /// [`from_offset_map`](Self::from_offset_map) for the key format.
     #[must_use]
     pub fn from_checkpoint(cp: &SourceCheckpoint) -> Self {
+        Self::from_offset_map(cp.offsets())
+    }
+
+    /// Builds a tracker from a raw `"{topic}-{partition}" -> offset` map (the
+    /// connector-agnostic source-checkpoint representation). Topic names may
+    /// contain `-`, so the partition is split off the last `-`. Unparseable
+    /// entries are logged and skipped rather than silently dropped.
+    #[must_use]
+    pub fn from_offset_map(offsets: &HashMap<String, String>) -> Self {
         let mut tracker = Self::new();
-        for (key, value) in cp.offsets() {
-            match value.parse::<i64>() {
-                Ok(offset) => {
-                    if let Some(dash_pos) = key.rfind('-') {
-                        let topic = &key[..dash_pos];
-                        match key[dash_pos + 1..].parse::<i32>() {
-                            Ok(partition) => tracker.update_force(topic, partition, offset),
-                            Err(_) => {
-                                tracing::warn!(
-                                    key,
-                                    "skipping checkpoint entry with unparseable partition"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            key,
-                            "skipping checkpoint entry without topic-partition separator"
-                        );
-                    }
-                }
+        for (key, value) in offsets {
+            let Ok(offset) = value.parse::<i64>() else {
+                tracing::warn!(
+                    key,
+                    value,
+                    "skipping checkpoint entry with unparseable offset"
+                );
+                continue;
+            };
+            let Some(dash_pos) = key.rfind('-') else {
+                tracing::warn!(
+                    key,
+                    "skipping checkpoint entry without topic-partition separator"
+                );
+                continue;
+            };
+            match key[dash_pos + 1..].parse::<i32>() {
+                Ok(partition) => tracker.update_force(&key[..dash_pos], partition, offset),
                 Err(_) => {
-                    tracing::warn!(
-                        key,
-                        value,
-                        "skipping checkpoint entry with unparseable offset"
-                    );
+                    tracing::warn!(key, "skipping checkpoint entry with unparseable partition");
                 }
             }
         }
@@ -329,6 +329,38 @@ mod tests {
         assert_eq!(restored.get("events", 1), Some(200));
         assert_eq!(restored.get("orders", 0), Some(50));
         assert_eq!(restored.partition_count(), 3);
+    }
+
+    #[test]
+    fn from_offset_map_splits_partition_off_last_dash() {
+        // Topic names may contain '-': only the final segment is the partition.
+        let map = HashMap::from([
+            ("events-5".to_string(), "100".to_string()),
+            ("my-topic-2".to_string(), "7".to_string()),
+        ]);
+        let tracker = OffsetTracker::from_offset_map(&map);
+        assert_eq!(tracker.get("events", 5), Some(100));
+        assert_eq!(tracker.get("my-topic", 2), Some(7));
+        assert_eq!(tracker.partition_count(), 2);
+    }
+
+    #[test]
+    fn from_offset_map_skips_malformed_entries() {
+        let map = HashMap::from([
+            ("good-0".to_string(), "10".to_string()),
+            ("bad-partition-x".to_string(), "10".to_string()), // partition not an int
+            ("nodashseparator".to_string(), "10".to_string()), // no '-'
+            ("offset-0".to_string(), "notanumber".to_string()), // offset not an int
+        ]);
+        let tracker = OffsetTracker::from_offset_map(&map);
+        assert_eq!(tracker.get("good", 0), Some(10));
+        assert_eq!(tracker.partition_count(), 1);
+    }
+
+    #[test]
+    fn from_offset_map_empty_is_empty() {
+        let tracker = OffsetTracker::from_offset_map(&HashMap::new());
+        assert_eq!(tracker.partition_count(), 0);
     }
 
     #[test]

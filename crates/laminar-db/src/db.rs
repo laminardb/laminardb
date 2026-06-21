@@ -592,26 +592,20 @@ impl LaminarDB {
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
 
         // Before bumping the assignment version (which triggers the source's
-        // partition rebind), stage the committed Kafka source offsets for the
-        // partitions bound to vnodes this node is ACQUIRING. The source seeks
-        // those partitions to the previous owner's sealed checkpoint position
-        // instead of replaying from auto.offset.reset — preventing duplicate
-        // emission on rotation. Operator state is rehydrated separately below.
-        let acquiring: Vec<u32> = {
+        // partition rebind), stage the latest manifest's source offsets so an
+        // acquiring source can resume newly-owned partitions from the previous
+        // owner's sealed position instead of auto.offset.reset (which duplicates).
+        // Only when this node is actually acquiring a vnode — otherwise skip the
+        // object-store read. Operator state is rehydrated separately below.
+        let acquiring_any = {
             let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
-            (0..vnode_count)
-                .filter(|&v| {
-                    new_assignment.get(v as usize).copied() == Some(self_id)
-                        && !old_set.contains(&v)
-                })
-                .collect()
+            (0..vnode_count).any(|v| {
+                new_assignment.get(v as usize).copied() == Some(self_id) && !old_set.contains(&v)
+            })
         };
-        if !acquiring.is_empty() {
+        if acquiring_any {
             if let Some(coord) = guard.as_ref() {
-                let hints = coord
-                    .acquired_source_resume_hints(&acquiring, vnode_count)
-                    .await;
-                registry.stage_resume_hints(hints);
+                registry.stage_resume_offsets(coord.latest_source_offsets().await);
             }
         }
 
