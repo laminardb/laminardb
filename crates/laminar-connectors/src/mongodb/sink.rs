@@ -223,6 +223,43 @@ fn arrow_value_to_json(col: &dyn arrow_array::Array, row: usize) -> serde_json::
             let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
             serde_json::Value::String(arr.value(row).to_string())
         }
+        DataType::Timestamp(time_unit, _) => {
+            let timestamp_ms = match time_unit {
+                arrow_schema::TimeUnit::Second => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampSecondArray>()
+                        .unwrap();
+                    arr.value(row) * 1000
+                }
+                arrow_schema::TimeUnit::Millisecond => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                        .unwrap();
+                    arr.value(row)
+                }
+                arrow_schema::TimeUnit::Microsecond => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                        .unwrap();
+                    arr.value(row) / 1000
+                }
+                arrow_schema::TimeUnit::Nanosecond => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                        .unwrap();
+                    arr.value(row) / 1_000_000
+                }
+            };
+            serde_json::json!({
+                "$date": {
+                    "$numberLong": timestamp_ms.to_string()
+                }
+            })
+        }
         _ => {
             // Fallback: use Arrow's display format.
             let formatted = arrow_cast::display::ArrayFormatter::try_new(
@@ -275,9 +312,34 @@ fn json_from_float(col: &dyn arrow_array::Array, row: usize) -> serde_json::Valu
     }
 }
 
+/// Convert a JSON value to BSON, interpreting `MongoDB` Extended JSON (e.g. the
+/// `$date` emitted for timestamp columns). serde's structural `to_bson`/`to_document`
+/// would store `$date` as a literal sub-document, not a BSON date.
+#[cfg(feature = "mongodb-cdc")]
+fn json_to_bson(value: &serde_json::Value) -> Result<mongodb::bson::Bson, ConnectorError> {
+    mongodb::bson::Bson::try_from(value.clone())
+        .map_err(|e| ConnectorError::WriteError(format!("JSON to BSON: {e}")))
+}
+
+#[cfg(feature = "mongodb-cdc")]
+fn json_to_bson_document(
+    value: &serde_json::Value,
+) -> Result<mongodb::bson::Document, ConnectorError> {
+    match json_to_bson(value)? {
+        mongodb::bson::Bson::Document(doc) => Ok(doc),
+        other => Err(ConnectorError::WriteError(format!(
+            "expected a BSON document, got {:?}",
+            other.element_type()
+        ))),
+    }
+}
+
 #[async_trait]
 impl SinkConnector for MongoDbSink {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if !config.properties().is_empty() {
+            self.config = MongoDbSinkConfig::from_config(config)?;
+        }
         self.config.validate()?;
 
         #[cfg(feature = "mongodb-cdc")]
@@ -508,10 +570,7 @@ impl MongoDbSink {
             WriteMode::Insert => {
                 let bson_docs: Vec<Document> = docs
                     .iter()
-                    .map(|v| {
-                        mongodb::bson::to_document(v)
-                            .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))
-                    })
+                    .map(json_to_bson_document)
                     .collect::<Result<Vec<_>, _>>()?;
 
                 let opts = mongodb::options::InsertManyOptions::builder()
@@ -532,8 +591,7 @@ impl MongoDbSink {
 
             WriteMode::Upsert { ref key_fields } => {
                 for val in docs {
-                    let bson_doc = mongodb::bson::to_document(val)
-                        .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))?;
+                    let bson_doc = json_to_bson_document(val)?;
 
                     let mut filter = Document::new();
                     for key in key_fields {
@@ -567,8 +625,7 @@ impl MongoDbSink {
 
             WriteMode::Replace { upsert_on_missing } => {
                 for val in docs {
-                    let bson_doc = mongodb::bson::to_document(val)
-                        .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))?;
+                    let bson_doc = json_to_bson_document(val)?;
 
                     // Use _id as the filter for replacement.
                     let filter = match bson_doc.get("_id") {
@@ -606,8 +663,7 @@ impl MongoDbSink {
                     match op {
                         "I" => {
                             let full_doc = Self::parse_cdc_field(val, "_full_document")?;
-                            let bson_doc = mongodb::bson::to_document(full_doc.as_ref())
-                                .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))?;
+                            let bson_doc = json_to_bson_document(full_doc.as_ref())?;
                             collection.insert_one(bson_doc).await.map_err(|e| {
                                 ConnectorError::WriteError(format!("cdc insert: {e}"))
                             })?;
@@ -616,19 +672,14 @@ impl MongoDbSink {
                         "U" => {
                             let dk = Self::parse_cdc_field(val, "_document_key")?;
                             let ud = Self::parse_cdc_field(val, "_update_desc")?;
-                            let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("filter BSON: {e}"))
-                            })?;
+                            let filter = json_to_bson_document(dk.as_ref())?;
 
                             // Transform updateDescription into update operators.
                             // Raw format: { "updatedFields": {...}, "removedFields": [...] }
                             // Required:   { "$set": {...}, "$unset": {...} }
                             let mut update = mongodb::bson::Document::new();
                             if let Some(updated) = ud.get("updatedFields") {
-                                let bson = mongodb::bson::to_bson(updated).map_err(|e| {
-                                    ConnectorError::WriteError(format!("updatedFields BSON: {e}"))
-                                })?;
-                                update.insert("$set", bson);
+                                update.insert("$set", json_to_bson(updated)?);
                             }
                             if let Some(removed) =
                                 ud.get("removedFields").and_then(|v| v.as_array())
@@ -659,13 +710,8 @@ impl MongoDbSink {
                         "R" => {
                             let dk = Self::parse_cdc_field(val, "_document_key")?;
                             let full_doc = Self::parse_cdc_field(val, "_full_document")?;
-                            let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("filter BSON: {e}"))
-                            })?;
-                            let replacement = mongodb::bson::to_document(full_doc.as_ref())
-                                .map_err(|e| {
-                                    ConnectorError::WriteError(format!("replace BSON: {e}"))
-                                })?;
+                            let filter = json_to_bson_document(dk.as_ref())?;
+                            let replacement = json_to_bson_document(full_doc.as_ref())?;
                             let opts = mongodb::options::ReplaceOptions::builder()
                                 .upsert(Some(true))
                                 .build();
@@ -680,9 +726,7 @@ impl MongoDbSink {
                         }
                         "D" => {
                             let dk = Self::parse_cdc_field(val, "_document_key")?;
-                            let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("filter BSON: {e}"))
-                            })?;
+                            let filter = json_to_bson_document(dk.as_ref())?;
                             collection.delete_one(filter).await.map_err(|e| {
                                 ConnectorError::WriteError(format!("cdc delete: {e}"))
                             })?;
@@ -779,6 +823,19 @@ mod tests {
 
         assert_eq!(docs[0]["id"], 0);
         assert_eq!(docs[0]["name"], "user_0");
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn timestamp_column_becomes_bson_date() {
+        let arr = arrow_array::TimestampMillisecondArray::from(vec![1_700_000_000_000_i64]);
+        let json = arrow_value_to_json(&arr, 0);
+        match json_to_bson(&json).unwrap() {
+            mongodb::bson::Bson::DateTime(dt) => {
+                assert_eq!(dt.timestamp_millis(), 1_700_000_000_000);
+            }
+            other => panic!("expected BSON DateTime, got {other:?}"),
+        }
     }
 
     #[test]

@@ -307,22 +307,32 @@ fn decode_columnar_state_arrays(
     } else {
         let batch = laminar_core::serialization::deserialize_batch_stream(keys_ipc)
             .map_err(|e| DbError::Pipeline(format!("keys IPC decode: {e}")))?;
-        Some(
-            row_converter
-                .convert_columns(batch.columns())
-                .map_err(|e| DbError::Pipeline(format!("keys row convert: {e}")))?,
-        )
+        let rows = row_converter
+            .convert_columns(batch.columns())
+            .map_err(|e| DbError::Pipeline(format!("keys row convert: {e}")))?;
+        if rows.num_rows() != n {
+            return Err(DbError::Pipeline(format!(
+                "columnar checkpoint shape: {} key rows vs {n} groups",
+                rows.num_rows()
+            )));
+        }
+        Some(rows)
     };
     let acc_batches: Vec<Option<RecordBatch>> = acc_state_ipc
         .iter()
         .map(|bytes| {
             if bytes.is_empty() {
-                Ok(None)
-            } else {
-                laminar_core::serialization::deserialize_batch_stream(bytes)
-                    .map(Some)
-                    .map_err(|e| DbError::Pipeline(format!("acc state IPC decode: {e}")))
+                return Ok(None);
             }
+            let batch = laminar_core::serialization::deserialize_batch_stream(bytes)
+                .map_err(|e| DbError::Pipeline(format!("acc state IPC decode: {e}")))?;
+            if batch.num_rows() != n {
+                return Err(DbError::Pipeline(format!(
+                    "columnar checkpoint shape: acc batch {} rows vs {n} groups",
+                    batch.num_rows()
+                )));
+            }
+            Ok(Some(batch))
         })
         .collect::<Result<_, _>>()?;
 
@@ -374,6 +384,23 @@ fn build_accumulators_from_state(
         accs.push(acc);
     }
     Ok(accs)
+}
+
+/// Reject a checkpoint whose per-accumulator state-batch count doesn't match the
+/// query's aggregates — a truncated/corrupt slice the fingerprint can't catch.
+/// An empty checkpoint carries no acc batches by construction, so skip it.
+fn validate_columnar_acc_shape(
+    checkpoint: &AggStateCheckpoint,
+    agg_specs: &[AggFuncSpec],
+) -> Result<(), DbError> {
+    if !checkpoint.last_updated_ms.is_empty() && checkpoint.acc_state_ipc.len() != agg_specs.len() {
+        return Err(DbError::Pipeline(format!(
+            "columnar checkpoint shape: {} accumulator states vs {} aggregates",
+            checkpoint.acc_state_ipc.len(),
+            agg_specs.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Inverse of [`encode_groups_columnar`]: rebuild one [`DecodedGroup`] per row.
@@ -1337,6 +1364,7 @@ impl IncrementalAggState {
                 checkpoint.fingerprint, current_fp
             )));
         }
+        validate_columnar_acc_shape(checkpoint, &self.agg_specs)?;
         // Build locally then swap so a mid-list decode error can't leave
         // last_emitted partially populated.
         let retractable = self.weight_col_idx.is_some();
@@ -1503,6 +1531,7 @@ impl IncrementalAggState {
                 checkpoint.fingerprint,
             )));
         }
+        validate_columnar_acc_shape(checkpoint, &self.agg_specs)?;
 
         let retractable = self.weight_col_idx.is_some();
         let per_group = decode_columnar_state_arrays(
@@ -4161,8 +4190,9 @@ mod tests {
             let cp = state.checkpoint_groups().unwrap();
             let elapsed = t0.elapsed();
 
-            let bytes: usize =
-                cp.keys_ipc.len() + cp.acc_state_ipc.iter().map(Vec::len).sum::<usize>();
+            let bytes: usize = cp.keys_ipc.len()
+                + cp.acc_state_ipc.iter().map(Vec::len).sum::<usize>()
+                + cp.last_updated_ms.len() * 8;
             #[allow(clippy::cast_precision_loss)]
             let ns_per_group = elapsed.as_nanos() as f64 / n as f64;
             println!(

@@ -1394,12 +1394,13 @@ mod promotion_tests {
         let manifest = op.checkpoint().unwrap().expect("non-empty manifest");
         let decoded: AggOpCheckpoint =
             rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&manifest.data).unwrap();
+        let agg = decoded.agg.as_ref().expect("agg payload present");
         assert!(
-            decoded
-                .agg
-                .as_ref()
-                .is_some_and(|a| a.last_updated_ms.is_empty()),
-            "all vnodes demoted → manifest carries no groups"
+            agg.last_updated_ms.is_empty()
+                && agg.keys_ipc.is_empty()
+                && agg.acc_state_ipc.iter().all(Vec::is_empty)
+                && agg.last_emitted.is_empty(),
+            "all vnodes demoted → manifest carries no group-bearing payload"
         );
         let mut cold_listed: Vec<u32> = decoded.cold_vnodes.clone();
         cold_listed.sort_unstable();
