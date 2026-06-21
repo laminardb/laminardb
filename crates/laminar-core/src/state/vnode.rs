@@ -93,6 +93,12 @@ pub struct VnodeRegistry {
     /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
     /// on boot, so adding it never touches a wire format.
     lifecycle: Arc<[AtomicU8]>,
+    /// Committed source resume offsets staged by the engine just before an
+    /// assignment-version bump, for partitions this node is acquiring in a
+    /// rotation. Keyed `(topic, partition) -> next-offset-to-fetch`. Drained by
+    /// the Kafka source on its next rebind so acquired partitions resume from the
+    /// previous owner's sealed checkpoint position instead of `auto.offset.reset`.
+    resume_hints: parking_lot::Mutex<std::collections::HashMap<(String, i32), i64>>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -125,6 +131,7 @@ impl VnodeRegistry {
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
+            resume_hints: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -145,7 +152,29 @@ impl VnodeRegistry {
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
+            resume_hints: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Stage committed source resume offsets for partitions about to be acquired
+    /// in a rotation, keyed `(topic, partition) -> next-offset-to-fetch`. MUST be
+    /// called before [`set_assignment_and_version`](Self::set_assignment_and_version)
+    /// so the source observes them when it rebinds for the new version.
+    pub fn stage_resume_hints(&self, hints: std::collections::HashMap<(String, i32), i64>) {
+        if hints.is_empty() {
+            return;
+        }
+        self.resume_hints.lock().extend(hints);
+    }
+
+    /// Drain the staged source resume offsets (see
+    /// [`stage_resume_hints`](Self::stage_resume_hints)). Returns and clears the
+    /// map; entries the caller does not use are dropped — they are only valid for
+    /// the rotation that staged them.
+    #[must_use]
+    pub fn take_resume_hints(&self) -> std::collections::HashMap<(String, i32), i64> {
+        let mut guard = self.resume_hints.lock();
+        std::mem::take(&mut *guard)
     }
 
     /// Number of vnodes.

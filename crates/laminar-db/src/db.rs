@@ -590,6 +590,31 @@ impl LaminarDB {
         // Hold the coord mutex so registry + fence updates land between epochs.
         let mut guard = self.coordinator.lock().await;
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+
+        // Before bumping the assignment version (which triggers the source's
+        // partition rebind), stage the committed Kafka source offsets for the
+        // partitions bound to vnodes this node is ACQUIRING. The source seeks
+        // those partitions to the previous owner's sealed checkpoint position
+        // instead of replaying from auto.offset.reset — preventing duplicate
+        // emission on rotation. Operator state is rehydrated separately below.
+        let acquiring: Vec<u32> = {
+            let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
+            (0..vnode_count)
+                .filter(|&v| {
+                    new_assignment.get(v as usize).copied() == Some(self_id)
+                        && !old_set.contains(&v)
+                })
+                .collect()
+        };
+        if !acquiring.is_empty() {
+            if let Some(coord) = guard.as_ref() {
+                let hints = coord
+                    .acquired_source_resume_hints(&acquiring, vnode_count)
+                    .await;
+                registry.stage_resume_hints(hints);
+            }
+        }
+
         registry.set_assignment_and_version(new_assignment, snapshot.version);
         let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         if let Some(backend) = self.state_backend.lock().clone() {

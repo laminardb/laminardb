@@ -429,11 +429,16 @@ impl KafkaSource {
                     if version != last_assignment_version {
                         last_assignment_version = version;
                         let offsets = lock_or_recover(&reassign_snapshot).clone();
+                        // Committed resume offsets for partitions handed to us in
+                        // this rotation, staged by the engine from the checkpoint
+                        // manifest just before the version bump.
+                        let acquired = registry.take_resume_hints();
                         let tpl = build_vnode_assignment_tpl(
                             registry,
                             *self_id,
                             &vnode_topic_meta,
                             &offsets,
+                            &acquired,
                             reassign_default_offset,
                         );
                         match consumer.assign(&tpl) {
@@ -610,14 +615,24 @@ fn build_vnode_assignment_tpl(
     self_id: laminar_core::state::NodeId,
     topic_meta: &[(Arc<str>, i32)],
     offsets: &OffsetTracker,
+    acquired: &std::collections::HashMap<(String, i32), i64>,
     default_offset: rdkafka::Offset,
 ) -> TopicPartitionList {
     let mut tpl = TopicPartitionList::new();
     for (topic, count) in topic_meta {
         for partition in crate::partition_assignment::owned_partitions(*count, registry, self_id) {
             let offset = match offsets.get(topic.as_ref(), partition) {
+                // Locally tracked: resume after the last record we consumed.
                 Some(o) => rdkafka::Offset::Offset(o + 1),
-                None => default_offset,
+                // No local offset → this partition was just handed to us in a vnode
+                // rotation. Resume from the committed checkpoint offset the engine
+                // staged (already next-to-fetch) instead of `default_offset` /
+                // `auto.offset.reset`, which would replay the partition prefix and
+                // emit duplicates.
+                None => match acquired.get(&(topic.to_string(), partition)) {
+                    Some(&o) => rdkafka::Offset::Offset(o),
+                    None => default_offset,
+                },
             };
             if let Err(e) = tpl.add_partition_offset(topic.as_ref(), partition, offset) {
                 warn!(
@@ -768,11 +783,17 @@ impl SourceConnector for KafkaSource {
                     ));
                 }
                 let default_offset = startup_default_offset(&kafka_config.startup_mode);
+                // Initial assignment: a fresh start has no local offsets (→ default)
+                // and recovery already staged committed offsets into `self.offsets`
+                // via restore(), so no rotation-acquisition lookup is needed here.
+                let acquired_none: std::collections::HashMap<(String, i32), i64> =
+                    std::collections::HashMap::new();
                 let tpl = build_vnode_assignment_tpl(
                     &registry,
                     self_id,
                     &topic_meta,
                     &self.offsets,
+                    &acquired_none,
                     default_offset,
                 );
                 let owned = tpl.count();
