@@ -126,6 +126,32 @@ pub trait StateBackend: Send + Sync + 'static {
         epoch: u64,
     ) -> Result<Vec<(String, Bytes)>, StateBackendError>;
 
+    /// Persist this node's source-checkpoint offsets for `epoch` (opaque
+    /// connector key/value bytes), keyed by a per-node `node_key` so writers
+    /// don't collide. A node acquiring a partition on a later rotation unions
+    /// every node's blob (see [`read_source_offsets`](Self::read_source_offsets))
+    /// to resume from the committed cut instead of `auto.offset.reset`. Same
+    /// fence as `write_partial`. Default no-op: handoff degrades to the source's
+    /// configured startup offset.
+    async fn write_source_offsets(
+        &self,
+        epoch: u64,
+        node_key: &str,
+        assignment_version: u64,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError> {
+        let _ = (epoch, node_key, assignment_version, bytes);
+        Ok(())
+    }
+
+    /// Every node's source-offset blob for `epoch` (see
+    /// [`write_source_offsets`](Self::write_source_offsets)). The caller unions
+    /// them into the global offset map. Default empty.
+    async fn read_source_offsets(&self, epoch: u64) -> Result<Vec<Bytes>, StateBackendError> {
+        let _ = epoch;
+        Ok(Vec::new())
+    }
+
     /// Durability barrier: true once every `vnode` partial and every
     /// `required_descriptors` key for `epoch` is persisted, sealing the epoch.
     /// Sinks do not commit until it returns `Ok(true)`. `required_descriptors`

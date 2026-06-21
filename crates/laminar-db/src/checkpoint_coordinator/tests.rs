@@ -1003,6 +1003,48 @@ async fn gate_checks_full_registry_not_just_owned() {
     );
 }
 
+/// B1: each node persists its source offsets every checkpoint; once the epoch
+/// seals, a node acquiring a partition reads the union of every node's blob and
+/// recovers the committed offset instead of falling back to `auto.offset.reset`.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+#[allow(clippy::disallowed_types)]
+async fn source_offset_handoff_round_trip() {
+    use bytes::Bytes;
+    use laminar_core::state::{InProcessBackend, StateBackend};
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(4));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(1); // >0 so the handoff actually writes
+
+    let mut source_offsets = HashMap::new();
+    source_offsets.insert(
+        "kafka".to_string(),
+        ConnectorCheckpoint::with_offsets(
+            5,
+            HashMap::from([("events-0".to_string(), "100".to_string())]),
+        ),
+    );
+    coord
+        .persist_source_offset_handoff(5, &source_offsets)
+        .await
+        .unwrap();
+
+    // Seal epoch 5 so it becomes the latest committed epoch.
+    for v in 0u32..4 {
+        backend
+            .write_partial(v, 5, 1, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    assert!(backend.epoch_complete(5, &[0, 1, 2, 3], &[]).await.unwrap());
+
+    // A node acquiring events-0 on rotation recovers the committed offset.
+    let acquired = coord.acquired_source_offsets().await;
+    assert_eq!(acquired.get("events-0"), Some(&"100".to_string()));
+}
+
 /// Followers ack at capture and upload partials
 /// asynchronously, so the leader's restorable gate must *wait* for
 /// late partials rather than failing on the first check.

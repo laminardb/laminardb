@@ -610,28 +610,76 @@ impl CheckpointCoordinator {
         self.config.coordinated_committer_poll
     }
 
-    /// All source-checkpoint offsets from the latest durable manifest, as one
-    /// opaque map of connector-defined key/value strings.
-    ///
-    /// Staged onto the vnode registry during a rotation so an acquiring source can
-    /// resume partitions from the previous owner's sealed position instead of
-    /// `auto.offset.reset`. The engine does not interpret the keys — the source
-    /// parses and filters to the partitions it owns. Best-effort: empty on any
-    /// load error so the source falls back to its configured startup offset.
+    /// Persist this node's source offsets for `epoch` to the shared state backend,
+    /// keyed per node, so a node that acquires one of its partitions on a later
+    /// rotation can resume from the committed cut (see
+    /// [`acquired_source_offsets`](Self::acquired_source_offsets)) instead of
+    /// `auto.offset.reset`. Written pre-seal so a sealed epoch always carries it;
+    /// a write error fails the epoch. No-op outside a real cluster assignment
+    /// (version 0) or without a backend.
+    async fn persist_source_offset_handoff(
+        &self,
+        epoch: u64,
+        source_offsets: &HashMap<String, ConnectorCheckpoint>,
+    ) -> Result<(), DbError> {
+        if self.assignment_version == 0 {
+            return Ok(());
+        }
+        let Some(ref backend) = self.state_backend else {
+            return Ok(());
+        };
+        let flat: HashMap<String, String> = source_offsets
+            .values()
+            .flat_map(|cp| cp.offsets.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect();
+        if flat.is_empty() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&flat)
+            .map_err(|e| DbError::Checkpoint(format!("source-offset handoff encode: {e}")))?;
+        let node_key = format!("node-{}", self.self_node_id());
+        backend
+            .write_source_offsets(epoch, &node_key, self.assignment_version, bytes.into())
+            .await
+            .map_err(|e| DbError::Checkpoint(format!("source-offset handoff write: {e}")))?;
+        Ok(())
+    }
+
+    /// The global source-offset map for the latest sealed epoch, unioned from
+    /// every node's blob in the shared state backend (opaque connector key/value
+    /// strings). Staged onto the vnode registry during a rotation so an acquiring
+    /// source resumes its newly-owned partitions from the previous owner's sealed
+    /// position. The engine does not interpret the keys — the source filters to
+    /// the partitions it owns. Best-effort: empty on any error so the source
+    /// falls back to its configured startup offset.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn latest_source_offsets(&self) -> HashMap<String, String> {
-        match self.store.load_latest().await {
-            Ok(Some(m)) => m
-                .source_offsets
-                .values()
-                .flat_map(|cp| cp.offsets.iter().map(|(k, v)| (k.clone(), v.clone())))
-                .collect(),
-            Ok(None) => HashMap::new(),
+    pub(crate) async fn acquired_source_offsets(&self) -> HashMap<String, String> {
+        let mut merged = HashMap::new();
+        let Some(ref backend) = self.state_backend else {
+            return merged;
+        };
+        let epoch = match backend.latest_committed_epoch().await {
+            Ok(Some(e)) => e,
+            Ok(None) => return merged,
             Err(e) => {
-                warn!(error = %e, "source offset handoff: failed to load latest manifest");
-                HashMap::new()
+                warn!(error = %e, "source offset handoff: latest_committed_epoch failed");
+                return merged;
+            }
+        };
+        let blobs = match backend.read_source_offsets(epoch).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "source offset handoff: read_source_offsets failed");
+                return merged;
+            }
+        };
+        for blob in blobs {
+            match serde_json::from_slice::<HashMap<String, String>>(&blob) {
+                Ok(m) => merged.extend(m),
+                Err(e) => warn!(error = %e, "source offset handoff: skipping undecodable blob"),
             }
         }
+        merged
     }
 
     /// Begin the initial epoch on all exactly-once sinks.
@@ -1992,6 +2040,14 @@ impl CheckpointCoordinator {
             self.config.state_inline_threshold,
         );
 
+        if let Err(e) = self
+            .persist_source_offset_handoff(epoch, &manifest.source_offsets)
+            .await
+        {
+            self.pending_vnode_states.clear();
+            return Err(e);
+        }
+
         self.phase = CheckpointPhase::Persisting;
         if let Err(e) = self.save_manifest(Arc::new(manifest), state_data).await {
             self.pending_vnode_states.clear();
@@ -2190,6 +2246,21 @@ impl CheckpointCoordinator {
                     epoch,
                     start,
                     format!("vnode partial write failed: {e}"),
+                )
+                .await);
+        }
+
+        if let Err(e) = self
+            .persist_source_offset_handoff(epoch, &manifest.source_offsets)
+            .await
+        {
+            error!(checkpoint_id, epoch, error = %e, "source-offset handoff write failed");
+            return Ok(self
+                .fail_epoch(
+                    checkpoint_id,
+                    epoch,
+                    start,
+                    format!("source-offset handoff write failed: {e}"),
                 )
                 .await);
         }

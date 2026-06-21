@@ -592,11 +592,11 @@ impl LaminarDB {
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
 
         // Before bumping the assignment version (which triggers the source's
-        // partition rebind), stage the latest manifest's source offsets so an
-        // acquiring source can resume newly-owned partitions from the previous
-        // owner's sealed position instead of auto.offset.reset (which duplicates).
-        // Only when this node is actually acquiring a vnode — otherwise skip the
-        // object-store read. Operator state is rehydrated separately below.
+        // partition rebind), stage the cluster-wide source offsets (unioned from
+        // every node's blob in the shared state backend) so an acquiring source
+        // resumes newly-owned partitions from the previous owner's sealed position
+        // instead of auto.offset.reset (which duplicates). Only when this node is
+        // actually acquiring a vnode. Operator state is rehydrated separately below.
         let acquiring_any = {
             let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
             (0..vnode_count).any(|v| {
@@ -605,7 +605,7 @@ impl LaminarDB {
         };
         if acquiring_any {
             if let Some(coord) = guard.as_ref() {
-                registry.stage_resume_offsets(coord.latest_source_offsets().await);
+                registry.stage_resume_offsets(coord.acquired_source_offsets().await);
             }
         }
 

@@ -115,6 +115,10 @@ impl ObjectStoreBackend {
         OsPath::from(format!("epoch={epoch}/commit/{key}"))
     }
 
+    fn source_offsets_path(epoch: u64, node_key: &str) -> OsPath {
+        OsPath::from(format!("epoch={epoch}/srcoff/{node_key}"))
+    }
+
     /// Parse `N` from a location whose first path segment is `epoch=N`.
     /// `None` for any sibling object that doesn't follow the layout.
     /// `str::split` always yields at least one segment.
@@ -222,6 +226,53 @@ impl StateBackend for ObjectStoreBackend {
                 .await
                 .map_err(|e| StateBackendError::Io(e.to_string()))?;
             out.push((key, bytes));
+        }
+        Ok(out)
+    }
+
+    async fn write_source_offsets(
+        &self,
+        epoch: u64,
+        node_key: &str,
+        assignment_version: u64,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError> {
+        let authoritative = self.authoritative_version.load(Ordering::Acquire);
+        if authoritative > 0 && assignment_version < authoritative {
+            return Err(StateBackendError::StaleVersion {
+                caller: assignment_version,
+                authoritative,
+            });
+        }
+        self.store
+            .put(
+                &Self::source_offsets_path(epoch, node_key),
+                PutPayload::from(bytes),
+            )
+            .await
+            .map_err(|e| StateBackendError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_source_offsets(&self, epoch: u64) -> Result<Vec<Bytes>, StateBackendError> {
+        use tokio_stream::StreamExt;
+
+        let prefix = OsPath::from(format!("epoch={epoch}/srcoff/"));
+        let mut entries = self.store.list(Some(&prefix));
+        let mut out = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let loc = entry
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .location;
+            let bytes = self
+                .store
+                .get(&loc)
+                .await
+                .map_err(|e| StateBackendError::Io(e.to_string()))?
+                .bytes()
+                .await
+                .map_err(|e| StateBackendError::Io(e.to_string()))?;
+            out.push(bytes);
         }
         Ok(out)
     }
@@ -472,6 +523,39 @@ mod tests {
             .unwrap();
         let got = backend.read_partial(0, 1).await.unwrap().unwrap();
         assert_eq!(&got[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn source_offsets_union_and_prune() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        backend
+            .write_source_offsets(
+                7,
+                "node-1",
+                0,
+                Bytes::from_static(b"{\"events-0\":\"100\"}"),
+            )
+            .await
+            .unwrap();
+        backend
+            .write_source_offsets(
+                7,
+                "node-2",
+                0,
+                Bytes::from_static(b"{\"events-1\":\"200\"}"),
+            )
+            .await
+            .unwrap();
+
+        let blobs = backend.read_source_offsets(7).await.unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert!(backend.read_source_offsets(8).await.unwrap().is_empty());
+
+        // Lives under `epoch=7/srcoff/`, so the epoch-prefix prune reclaims it.
+        backend.prune_before(8).await.unwrap();
+        assert!(backend.read_source_offsets(7).await.unwrap().is_empty());
     }
 
     #[tokio::test]
