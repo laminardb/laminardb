@@ -1562,6 +1562,14 @@ impl LaminarDB {
                     );
                 }
             }
+
+            // Drive the B2 pre-rotation drain off the actual sinks: an exactly-once
+            // sink can't dedup a rotation duplicate, so a vnode rotation must pause
+            // the source at the checkpoint cut. (The DB-level `delivery_guarantee` is
+            // not set by the server, which configures delivery per sink.)
+            let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
+            self.rotation_drain_required
+                .store(has_eo_sink, std::sync::atomic::Ordering::Release);
         }
 
         let shutdown = self.shutdown_signal.clone();

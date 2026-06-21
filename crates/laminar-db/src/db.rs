@@ -108,6 +108,10 @@ pub struct LaminarDB {
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
+    /// Set at pipeline start when the pipeline has an exactly-once sink, so vnode
+    /// rotations run the pre-rotation source drain (B2). Read by
+    /// [`requires_rotation_drain`](Self::requires_rotation_drain).
+    pub(crate) rotation_drain_required: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Decoupled coordinated-commit committer task; aborted on shutdown.
     pub(crate) committer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -365,6 +369,7 @@ impl LaminarDB {
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
             committer_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
@@ -725,17 +730,18 @@ impl LaminarDB {
 
     /// Whether vnode rotations should run the pre-rotation source drain (B2).
     ///
-    /// Only under exactly-once: there the old owner must stop consuming a rotating
-    /// partition at the checkpoint cut, or it emits records past the sealed offset
-    /// that a non-upsert sink can't dedup. At-least-once pipelines tolerate the
-    /// bounded rotation duplicate and skip the drain. (An all-upsert exactly-once
-    /// pipeline would absorb the dup too; skipping the drain there is a future
-    /// optimization — correctness doesn't depend on it.)
-    #[cfg(feature = "cluster")]
+    /// True when the running pipeline has an exactly-once sink: there the old
+    /// owner must stop consuming a rotating partition at the checkpoint cut, or it
+    /// emits records past the sealed offset that a non-upsert sink can't dedup.
+    /// Set from the actual registered sinks at pipeline start (the server
+    /// configures delivery per sink, not via the DB-level `delivery_guarantee`).
+    /// At-least-once pipelines skip the drain and tolerate the bounded rotation
+    /// duplicate. (An all-upsert EO pipeline would absorb the dup too; skipping the
+    /// drain there is a future optimization — correctness doesn't depend on it.)
     #[must_use]
     pub fn requires_rotation_drain(&self) -> bool {
-        self.config.delivery_guarantee
-            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+        self.rotation_drain_required
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Staged vnode state from the most recent rebalance adoptions, keyed by vnode.
