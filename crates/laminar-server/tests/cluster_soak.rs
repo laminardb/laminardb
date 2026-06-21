@@ -620,3 +620,344 @@ fn three_node_kill9_soak() {
         verify_exactly_once_output(&brokers);
     }
 }
+
+// ── Graceful-rotation soak (B2) ─────────────────────────────────────────────
+
+/// Node config for the graceful-rotation soak: a SHARED vnode-partitioned Kafka
+/// source over `input_topic`, a pass-through pipeline, and a per-node exactly-once
+/// Kafka sink. The exactly-once sink is what makes a vnode rotation run the B2
+/// pre-rotation drain. `seeds` covers all nodes (incl. the one added mid-run).
+fn write_graceful_config(
+    dir: &Path,
+    id: usize,
+    n_nodes: usize,
+    interval_ms: u64,
+    checkpoint_url: &str,
+    brokers: &str,
+    input_topic: &str,
+) -> PathBuf {
+    let state_shared = dir.join("state");
+    std::fs::create_dir_all(&state_shared).unwrap();
+    let state_url = format!(
+        "file:///{}",
+        state_shared.display().to_string().replace('\\', "/")
+    );
+    let http = BASE_PORT + id as u16;
+    let gossip = BASE_PORT + 100 + id as u16;
+    let seeds: Vec<String> = (0..n_nodes)
+        .map(|i| format!("\"127.0.0.1:{}\"", BASE_PORT + 100 + i as u16))
+        .collect();
+    let data_dir = dir.join(format!("node{id}-data"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let toml = format!(
+        r#"
+node_id = "n{id}"
+storage_dir = "{data}"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:{http}"
+
+[discovery]
+strategy = "gossip"
+seeds = [{seeds}]
+gossip_port = {gossip}
+advertise_host = "127.0.0.1"
+
+[coordination]
+strategy = "raft"
+
+[state]
+backend = "object_store"
+url = "{state_url}"
+instance_id = "n{id}"
+vnode_capacity = 64
+
+[checkpoint]
+url = "{url}"
+interval = "{interval_ms}ms"
+max_retained = 5
+max_in_flight_epochs = 4
+
+[[source]]
+name = "kin"
+connector = "kafka"
+format = "json"
+[source.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{input_topic}"
+"group.id" = "soak-grace-n{id}"
+"startup.mode" = "earliest"
+[[source.schema]]
+name = "seq"
+type = "BIGINT"
+nullable = false
+
+[[pipeline]]
+name = "passthrough"
+sql = "SELECT seq FROM kin"
+
+[[sink]]
+name = "kout"
+pipeline = "passthrough"
+connector = "kafka"
+delivery = "exactly_once"
+[sink.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{topic}"
+format = "json"
+"delivery.guarantee" = "exactly-once"
+"#,
+        data = data_dir.display().to_string().replace('\\', "/"),
+        seeds = seeds.join(", "),
+        url = checkpoint_url,
+        topic = eo_topic(id),
+    );
+    let path = dir.join(format!("node{id}.toml"));
+    std::fs::write(&path, toml).unwrap();
+    path
+}
+
+/// Create `topic` with `partitions` partitions (blocking; the admin API is async).
+fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::client::DefaultClientContext;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let admin: AdminClient<DefaultClientContext> = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .create()
+            .expect("admin client");
+        let new = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
+        admin
+            .create_topics([&new], &AdminOptions::new())
+            .await
+            .expect("create_topics");
+    });
+}
+
+/// Produce `{"seq": n}` for `n in 0..count`, keyed by `seq` (spreads across
+/// partitions), paced near `rps` so the cluster is still consuming during the
+/// mid-run rotation. Blocks until all are produced and flushed.
+fn produce_seq(brokers: &str, topic: &str, count: i64, rps: u64) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+    let producer: BaseProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("producer");
+    let batch = (rps / 20).max(1) as i64; // ~20 bursts/sec
+    let mut n = 0i64;
+    while n < count {
+        for _ in 0..batch.min(count - n) {
+            let payload = format!(r#"{{"seq":{n}}}"#);
+            let key = n.to_string();
+            let mut rec = BaseRecord::to(topic).payload(&payload).key(&key);
+            loop {
+                match producer.send(rec) {
+                    Ok(()) => break,
+                    Err((
+                        rdkafka::error::KafkaError::MessageProduction(
+                            rdkafka::types::RDKafkaErrorCode::QueueFull,
+                        ),
+                        r,
+                    )) => {
+                        rec = r;
+                        producer.poll(Duration::from_millis(20));
+                    }
+                    Err((e, _)) => panic!("produce: {e}"),
+                }
+            }
+            n += 1;
+        }
+        producer.poll(Duration::from_millis(0));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    producer.flush(Duration::from_secs(60)).expect("flush");
+}
+
+/// All `seq` values across every node's output topic, with per-topic counts.
+fn collect_output_seqs(brokers: &str, n_nodes: usize) -> (Vec<i64>, Vec<usize>) {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+    let mut all = Vec::new();
+    let mut per_topic = vec![0usize; n_nodes];
+    for id in 0..n_nodes {
+        let topic = eo_topic(id);
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set(
+                "group.id",
+                format!("soak-grace-diff-{}", std::process::id()),
+            )
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("isolation.level", "read_committed")
+            .create()
+            .expect("diff consumer");
+        let Ok(md) = consumer.fetch_metadata(Some(&topic), Duration::from_secs(10)) else {
+            continue; // topic may not exist yet (node never owned a partition)
+        };
+        let parts: Vec<i32> = md
+            .topics()
+            .first()
+            .map(|t| {
+                t.partitions()
+                    .iter()
+                    .map(rdkafka::metadata::MetadataPartition::id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if parts.is_empty() {
+            continue;
+        }
+        let mut tpl = TopicPartitionList::new();
+        for p in parts {
+            tpl.add_partition_offset(&topic, p, Offset::Beginning)
+                .unwrap();
+        }
+        consumer.assign(&tpl).expect("assign");
+        let mut idle = 0u32;
+        while idle < 5 {
+            match consumer.poll(Duration::from_secs(2)) {
+                Some(Ok(msg)) => {
+                    idle = 0;
+                    let v: serde_json::Value =
+                        serde_json::from_slice(msg.payload().unwrap_or_default()).expect("json");
+                    all.push(v["seq"].as_i64().expect("seq"));
+                    per_topic[id] += 1;
+                }
+                Some(Err(e)) => panic!("{topic}: consume error: {e}"),
+                None => idle += 1,
+            }
+        }
+    }
+    (all, per_topic)
+}
+
+/// B2 end-to-end: a shared Kafka source is consumed across the cluster; adding a
+/// node mid-run triggers a GRACEFUL vnode rotation (the exactly-once sink makes it
+/// run the pre-rotation drain). The union of all output topics must then be a
+/// dense `0..=TOTAL-1` with no duplicates — proving the rotation handed off each
+/// partition at a clean cut.
+#[test]
+#[ignore = "spawns 4 real laminardb processes; needs LAMINAR_SOAK_KAFKA_BROKERS; run with --ignored"]
+fn graceful_rotation_kafka_soak() {
+    let brokers = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS")
+        .expect("graceful_rotation_kafka_soak requires LAMINAR_SOAK_KAFKA_BROKERS");
+    let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 200).max(100);
+    let total: i64 = env_u64("LAMINAR_SOAK_TOTAL", 12000) as i64;
+    const INITIAL: usize = 3;
+    const ALL: usize = 4; // a 4th node joins mid-run
+                          // Enough partitions that the added node reliably acquires some (64 vnodes,
+                          // 4 nodes → ~1/4 each; with 12 partitions the join almost surely moves one).
+    const PARTS: i32 = 12;
+
+    let input = format!("soak-grace-in-{}", std::process::id());
+    kafka_create_topic(&brokers, &input, PARTS);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cp = dir.path().join("checkpoints");
+    std::fs::create_dir_all(&cp).unwrap();
+    let url = format!("file:///{}", cp.display().to_string().replace('\\', "/"));
+    let log_dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-grace-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    eprintln!("soak: node logs in {}", log_dir.display());
+
+    let mut nodes: Vec<Node> = (0..ALL)
+        .map(|id| Node {
+            id,
+            config_path: write_graceful_config(
+                dir.path(),
+                id,
+                // Seed only the initial set so formation completes before node 3
+                // exists; node 3 joins the running cluster via gossip on these seeds.
+                INITIAL,
+                interval_ms,
+                &url,
+                &brokers,
+                &input,
+            ),
+            log_path: log_dir.join(format!("node{id}.log")),
+            child: None,
+            http_port: BASE_PORT + id as u16,
+        })
+        .collect();
+
+    for id in 0..INITIAL {
+        nodes[id].spawn();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    wait_for(
+        "initial nodes serving /metrics",
+        Duration::from_secs(60),
+        || nodes[..INITIAL].iter().all(|n| n.epoch().is_some()),
+    );
+    assert_progress(&nodes[..INITIAL], 0.0, Duration::from_secs(90), "startup");
+    eprintln!("soak: 3 nodes up; producing {total} records");
+
+    // Produce on a background thread at a modest rate so records are STILL
+    // flowing after the rotation settles — otherwise the backlog is consumed
+    // before node 3 acquires its partitions and it never sees data. At ~400/s a
+    // 12k run spans ~30s, well past the join + settle.
+    let (pb, pt) = (brokers.clone(), input.clone());
+    let producer = std::thread::spawn(move || produce_seq(&pb, &pt, total, 400));
+
+    std::thread::sleep(Duration::from_secs(3));
+    eprintln!("soak: adding node 3 → graceful rotation");
+    nodes[3].spawn();
+    wait_for("node 3 serving /metrics", Duration::from_secs(60), || {
+        nodes[3].epoch().is_some()
+    });
+    // Let the two-phase drain + reassignment settle; production continues meanwhile
+    // so node 3 consumes fresh records on its newly-acquired partitions.
+    std::thread::sleep(Duration::from_secs(15));
+
+    producer.join().expect("producer thread");
+    eprintln!("soak: produced all; waiting for the cluster to drain output");
+    wait_for("all records sunk", Duration::from_secs(180), || {
+        let (seqs, _) = collect_output_seqs(&brokers, ALL);
+        let mut s = seqs;
+        s.sort_unstable();
+        s.dedup();
+        s.len() >= total as usize
+    });
+
+    // Every input was already observed committed (the wait above reads
+    // read_committed), so the sinks are idle with no open transactions. Read the
+    // diff against the live, settled cluster: killing first only races the diff
+    // consumer against the kill and can surface transient phantom reads.
+    std::thread::sleep(Duration::from_secs(5));
+    let (mut seqs, per_topic) = collect_output_seqs(&brokers, ALL);
+    let count = seqs.len();
+    seqs.sort_unstable();
+    seqs.dedup();
+    let duplicates = count - seqs.len();
+    let max = seqs.last().copied().unwrap_or(-1);
+    let mut gaps = Vec::new();
+    let mut expected = 0i64;
+    for &s in &seqs {
+        if s != expected {
+            gaps.push((expected, s));
+            expected = s;
+        }
+        expected += 1;
+    }
+    eprintln!("soak: per-node output counts {per_topic:?}");
+    assert!(
+        per_topic[3] > 0,
+        "node 3 produced no output — the graceful rotation never moved partitions \
+         to it, so B2 was not exercised (per-topic {per_topic:?})",
+    );
+    assert!(
+        duplicates == 0 && gaps.is_empty() && max == total - 1,
+        "graceful-rotation exactly-once VIOLATED — {count} records, max seq {max} \
+         (want {}), {duplicates} duplicate(s), gap(s) {gaps:?}",
+        total - 1,
+    );
+    eprintln!("soak: graceful rotation exactly-once OK — union dense 0..={max}, 0 duplicates");
+}
