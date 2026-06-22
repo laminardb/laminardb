@@ -550,6 +550,16 @@ pub(crate) struct IncrementalAggState {
     // Groups for these vnodes were dropped; captures stage a cold marker.
     #[cfg(feature = "state-tier")]
     cold_vnodes: rustc_hash::FxHashSet<u32>,
+    // ── Delta-state tracking (Lever 2, Phase 1) ─────────────────────────────
+    // When delta capture is enabled, the keys mutated / removed since the last
+    // per-vnode capture, bucketed by vnode. Populated only while `delta_vnode_count`
+    // is set (off by default → zero cost). Consumed by the delta encode (Phase 2).
+    // `delta_enabled` is read only by the cluster per-vnode capture.
+    #[cfg(feature = "cluster")]
+    delta_enabled: bool,
+    delta_vnode_count: Option<u32>,
+    dirty_keys_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
+    removed_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
 }
 
 impl IncrementalAggState {
@@ -846,7 +856,32 @@ impl IncrementalAggState {
             dirty_all: false,
             #[cfg(feature = "state-tier")]
             cold_vnodes: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "cluster")]
+            delta_enabled: false,
+            delta_vnode_count: None,
+            dirty_keys_by_vnode: AHashMap::new(),
+            removed_by_vnode: AHashMap::new(),
         }))
+    }
+
+    /// Enable per-vnode delta tracking. Off by default; the first per-vnode capture
+    /// after this starts recording mutated/removed keys for the delta encode (Phase 2).
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn set_delta_enabled(&mut self, enabled: bool) {
+        self.delta_enabled = enabled;
+    }
+
+    /// Vnode for a group key (row bytes) under delta bucketing — mirrors the
+    /// capture/tier mapping.
+    fn delta_vnode_of(&self, key_bytes: &[u8], count: u32) -> u32 {
+        if self.num_group_cols == 0 {
+            0
+        } else {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (laminar_core::state::key_hash(key_bytes) % u64::from(count)) as u32
+            }
+        }
     }
 
     /// Evict idle groups and return retraction records. Requires both `emit_changelog` and `idle_ttl_ms`.
@@ -887,6 +922,16 @@ impl IncrementalAggState {
                     }
                 };
                 self.dirty_vnodes.insert(v);
+            }
+            if let Some(count) = self.delta_vnode_count {
+                let v = self.delta_vnode_of(key.as_ref(), count);
+                if let Some(s) = self.dirty_keys_by_vnode.get_mut(&v) {
+                    s.remove(key);
+                }
+                self.removed_by_vnode
+                    .entry(v)
+                    .or_default()
+                    .insert(key.clone());
             }
             if let Some(old) = self.last_emitted.remove(key) {
                 retract_keys.push(key.clone());
@@ -990,6 +1035,13 @@ impl IncrementalAggState {
             if self.emit_changelog {
                 self.dirty_keys.insert(row_ref.owned());
             }
+            if let Some(count) = self.delta_vnode_count {
+                let v = self.delta_vnode_of(row_ref.as_ref(), count);
+                self.dirty_keys_by_vnode
+                    .entry(v)
+                    .or_default()
+                    .insert(row_ref.owned());
+            }
         }
         self.state_gen = self.state_gen.wrapping_add(1);
 
@@ -1037,6 +1089,12 @@ impl IncrementalAggState {
             &self.agg_specs,
             self.weight_col_idx,
         );
+        if self.delta_vnode_count.is_some() {
+            self.dirty_keys_by_vnode
+                .entry(0)
+                .or_default()
+                .insert(global_aggregate_key());
+        }
         if self.emit_changelog {
             self.dirty_keys.insert(empty_key);
         }
@@ -1412,6 +1470,9 @@ impl IncrementalAggState {
         // Restored state is internally consistent (groups == last_emitted), so
         // nothing is pending for the changelog path.
         self.dirty_keys.clear();
+        // The restored state is the new baseline — no pending delta entries.
+        self.dirty_keys_by_vnode.clear();
+        self.removed_by_vnode.clear();
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
         // All state is in memory; block demotion until the next capture re-baselines.
@@ -1527,6 +1588,14 @@ impl IncrementalAggState {
             self.dirty_vnodes.clear();
             self.dirty_all = false;
         }
+        // Delta tracking restarts from this capture (Lever 2). Enabling here means
+        // the first delta-capable capture is the chain root (FULL), with subsequent
+        // mutations recorded into the per-vnode sets for the next checkpoint.
+        if self.delta_enabled {
+            self.delta_vnode_count = Some(vnode_count);
+            self.dirty_keys_by_vnode.clear();
+            self.removed_by_vnode.clear();
+        }
 
         Ok(buckets)
     }
@@ -1563,6 +1632,13 @@ impl IncrementalAggState {
             // path must re-evaluate it (the diff still gates actual output).
             if self.emit_changelog {
                 self.dirty_keys.insert(row_key.clone());
+            }
+            if let Some(count) = self.delta_vnode_count {
+                let v = self.delta_vnode_of(row_key.as_ref(), count);
+                self.dirty_keys_by_vnode
+                    .entry(v)
+                    .or_default()
+                    .insert(row_key.clone());
             }
             match self.groups.entry(row_key) {
                 std::collections::hash_map::Entry::Occupied(mut occ) => {
@@ -2860,6 +2936,44 @@ mod tests {
             r2.iter().map(RecordBatch::num_rows).sum::<usize>(),
             2,
             "merged group must re-emit retract+insert",
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn delta_tracking_records_dirty_keys_per_vnode_and_resets_on_capture() {
+        const VNODES: u32 = 4;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+        state.set_delta_enabled(true);
+
+        // First per-vnode capture establishes the delta baseline and starts a window.
+        state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        assert!(state.dirty_keys_by_vnode.is_empty());
+
+        let pre_agg = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            pre_agg,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, 1000).unwrap();
+
+        // Every mutated key is recorded, bucketed by vnode.
+        let tracked: usize = state.dirty_keys_by_vnode.values().map(|s| s.len()).sum();
+        assert_eq!(tracked, 3, "all mutated keys tracked in the delta window");
+
+        // The next capture resets the window.
+        state.checkpoint_groups_by_vnode(VNODES).unwrap();
+        assert!(
+            state.dirty_keys_by_vnode.is_empty(),
+            "capture resets the per-vnode dirty set",
         );
     }
 
