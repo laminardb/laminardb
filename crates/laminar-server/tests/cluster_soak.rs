@@ -142,8 +142,14 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     // A/B the durability-gate poll cadence: `LAMINAR_SOAK_GATE_POLL_MS` sets the
     // initial (and, unless `_MAX_MS` overrides, the cap). Unset = engine default.
     let gate_poll = std::env::var("LAMINAR_SOAK_GATE_POLL_MS").map_or(String::new(), |ms| {
-        let max = std::env::var("LAMINAR_SOAK_GATE_POLL_MAX_MS").unwrap_or_else(|_| ms.clone());
-        format!("restorable_gate_poll_initial_ms = {ms}\nrestorable_gate_poll_max_ms = {max}")
+        let initial: u64 = ms
+            .parse()
+            .expect("LAMINAR_SOAK_GATE_POLL_MS must be a u64 (ms)");
+        let max: u64 = std::env::var("LAMINAR_SOAK_GATE_POLL_MAX_MS").map_or(initial, |v| {
+            v.parse()
+                .expect("LAMINAR_SOAK_GATE_POLL_MAX_MS must be a u64 (ms)")
+        });
+        format!("restorable_gate_poll_initial_ms = {initial}\nrestorable_gate_poll_max_ms = {max}")
     });
     // Vnode partials go through the [state] backend, NOT [checkpoint] -
     // without a SHARED state store each node writes partials to its own

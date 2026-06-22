@@ -1099,9 +1099,13 @@ impl CheckpointCoordinator {
 
         // Each poll LISTs the epoch prefix; back off exponentially from the configured
         // initial to the cap. Gates serialize on the coordinator mutex so at most one
-        // loop runs at a time regardless of pipeline depth.
-        let initial_poll = self.config.restorable_gate_poll_initial;
-        let max_poll = self.config.restorable_gate_poll_max;
+        // loop runs at a time regardless of pipeline depth. Clamp to a 1ms floor and
+        // keep the cap >= initial so a 0ms config can't spin the loop under the mutex.
+        let initial_poll = self
+            .config
+            .restorable_gate_poll_initial
+            .max(Duration::from_millis(1));
+        let max_poll = self.config.restorable_gate_poll_max.max(initial_poll);
 
         let Some(ref backend) = self.state_backend else {
             return Ok(());

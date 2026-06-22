@@ -467,7 +467,17 @@ impl AggStateCheckpoint {
         self.keys_ipc = concat_columnar_ipc(&self.keys_ipc, &other.keys_ipc)?;
         if self.acc_state_ipc.is_empty() {
             self.acc_state_ipc = other.acc_state_ipc;
-        } else {
+        } else if !other.acc_state_ipc.is_empty() {
+            // Both are slices of one query, so the accumulator-column counts must
+            // match; a mismatch would row-misalign keys vs accs in a way the
+            // fingerprint can't catch. (An empty `other` contributes no rows.)
+            if self.acc_state_ipc.len() != other.acc_state_ipc.len() {
+                return Err(DbError::Pipeline(format!(
+                    "append_disjoint: accumulator column count mismatch ({} vs {})",
+                    self.acc_state_ipc.len(),
+                    other.acc_state_ipc.len()
+                )));
+            }
             for (dst, src) in self
                 .acc_state_ipc
                 .iter_mut()
@@ -1045,10 +1055,12 @@ impl IncrementalAggState {
             }
             if let Some(count) = self.delta_vnode_count {
                 let v = self.delta_vnode_of(row_ref.as_ref(), count);
-                self.dirty_keys_by_vnode
-                    .entry(v)
-                    .or_default()
-                    .insert(row_ref.owned());
+                let owned = row_ref.owned();
+                // Re-touching a key supersedes any pending tombstone for it.
+                if let Some(s) = self.removed_by_vnode.get_mut(&v) {
+                    s.remove(&owned);
+                }
+                self.dirty_keys_by_vnode.entry(v).or_default().insert(owned);
             }
         }
         self.state_gen = self.state_gen.wrapping_add(1);
@@ -1098,10 +1110,11 @@ impl IncrementalAggState {
             self.weight_col_idx,
         );
         if self.delta_vnode_count.is_some() {
-            self.dirty_keys_by_vnode
-                .entry(0)
-                .or_default()
-                .insert(global_aggregate_key());
+            let key = global_aggregate_key();
+            if let Some(s) = self.removed_by_vnode.get_mut(&0) {
+                s.remove(&key);
+            }
+            self.dirty_keys_by_vnode.entry(0).or_default().insert(key);
         }
         if self.emit_changelog {
             self.dirty_keys.insert(empty_key);
@@ -1739,6 +1752,9 @@ impl IncrementalAggState {
             }
             if let Some(count) = self.delta_vnode_count {
                 let v = self.delta_vnode_of(row_key.as_ref(), count);
+                if let Some(s) = self.removed_by_vnode.get_mut(&v) {
+                    s.remove(&row_key);
+                }
                 self.dirty_keys_by_vnode
                     .entry(v)
                     .or_default()
@@ -3153,12 +3169,18 @@ mod tests {
         // Producer state: seed a,b,c then take a FULL baseline (opens the delta window).
         let mut producer = changelog_agg(&ctx).await;
         producer.set_delta_enabled(true);
-        feed(&mut producer, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
+        feed(
+            &mut producer,
+            &[("a", 1.0), ("b", 2.0), ("c", 3.0), ("d", 4.0)],
+            1000,
+        );
         let base = producer.checkpoint_groups_by_vnode(V).unwrap();
 
-        // Change a (+10) and b (+20); let c go idle and evict it (a tombstone).
+        // Change a,b; let c,d go idle and evict both; then re-add d — its tombstone
+        // must clear so it is encoded as changed, not removed.
         feed(&mut producer, &[("a", 10.0), ("b", 20.0)], 5000);
         producer.evict_idle(5000).unwrap();
+        feed(&mut producer, &[("d", 7.0)], 6000);
         let delta = producer.encode_delta_for_vnode(0).unwrap();
 
         // Consumer: restore the FULL base, then apply the delta — must match the producer.
