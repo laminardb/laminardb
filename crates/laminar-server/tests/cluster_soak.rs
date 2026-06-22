@@ -139,6 +139,12 @@ fn eo_topic(id: usize) -> String {
 
 fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -> PathBuf {
     let depth = env_u64("LAMINAR_SOAK_DEPTH", 4);
+    // A/B the durability-gate poll cadence: `LAMINAR_SOAK_GATE_POLL_MS` sets the
+    // initial (and, unless `_MAX_MS` overrides, the cap). Unset = engine default.
+    let gate_poll = std::env::var("LAMINAR_SOAK_GATE_POLL_MS").map_or(String::new(), |ms| {
+        let max = std::env::var("LAMINAR_SOAK_GATE_POLL_MAX_MS").unwrap_or_else(|_| ms.clone());
+        format!("restorable_gate_poll_initial_ms = {ms}\nrestorable_gate_poll_max_ms = {max}")
+    });
     // Vnode partials go through the [state] backend, NOT [checkpoint] -
     // without a SHARED state store each node writes partials to its own
     // local default and the leader durability gate (which lists the
@@ -234,6 +240,7 @@ url = "{url}"
 interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = {depth}
+{gate_poll}
 
 [checkpoint.storage]
 {storage}
@@ -574,6 +581,25 @@ fn three_node_kill9_soak() {
     }
 
     eprintln!("soak: completed {round} rounds ({kills} kills), final epoch {floor}");
+
+    // Durability-gate poll wait vs whole checkpoint (leader-only metric; sum across
+    // nodes picks it up). avg = histogram sum/count.
+    {
+        let m = |n: &str| -> f64 { nodes.iter().filter_map(|x| x.metric(n)).sum() };
+        let gw_sum = m("laminardb_checkpoint_restorable_gate_wait_seconds_sum");
+        let gw_cnt = m("laminardb_checkpoint_restorable_gate_wait_seconds_count");
+        let cd_sum = m("laminardb_checkpoint_duration_seconds_sum");
+        let cd_cnt = m("laminardb_checkpoint_duration_seconds_count");
+        if gw_cnt > 0.0 {
+            eprintln!(
+                "soak: PROFILE gate-wait avg={:.0}ms over {} obs; checkpoint_duration avg={:.0}ms over {} obs",
+                gw_sum / gw_cnt * 1000.0,
+                gw_cnt as u64,
+                cd_sum / cd_cnt.max(1.0) * 1000.0,
+                cd_cnt as u64,
+            );
+        }
+    }
 
     // Tier validation: scrape while every node is still live (the Kafka
     // diff below kills them all). Demotions prove the budget→demote

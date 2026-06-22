@@ -84,6 +84,13 @@ pub struct CheckpointConfig {
     /// Followers upload asynchronously after the capture ack, so the durability gate polls
     /// rather than checking once. Expiry aborts the epoch.
     pub restorable_gate_timeout: Duration,
+    /// Durability-gate poll first interval. The gate re-checks object-store
+    /// presence on an exponential schedule from here to `restorable_gate_poll_max`.
+    /// Tighten both on a low-latency object store to cut the poll quantization;
+    /// the defaults (100ms/1s) suit a higher-latency store.
+    pub restorable_gate_poll_initial: Duration,
+    /// Durability-gate poll backoff cap (see `restorable_gate_poll_initial`).
+    pub restorable_gate_poll_max: Duration,
     /// Max pipelined epochs between `Aligned` and restorable. Exactly-once pipelines cap at 1.
     pub max_in_flight_epochs: u64,
     /// Cap on in-flight captured-state bytes. At the cap, barrier admission pauses.
@@ -116,6 +123,8 @@ impl Default for CheckpointConfig {
             quorum_timeout: Duration::from_secs(3),
             // Last-resort bound: fail-fasts catch dead participants in seconds.
             restorable_gate_timeout: Duration::from_secs(10),
+            restorable_gate_poll_initial: Duration::from_millis(100),
+            restorable_gate_poll_max: Duration::from_secs(1),
             max_in_flight_epochs: 4,
             max_staged_bytes: 512 * 1024 * 1024,
             max_uncommitted_epochs: 1024,
@@ -1088,10 +1097,11 @@ impl CheckpointCoordinator {
     ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
-        // Each poll LISTs the epoch prefix; back off exponentially. Gates serialize on the
-        // coordinator mutex so at most one loop runs at a time regardless of pipeline depth.
-        const INITIAL_POLL: Duration = Duration::from_millis(100);
-        const MAX_POLL: Duration = Duration::from_secs(1);
+        // Each poll LISTs the epoch prefix; back off exponentially from the configured
+        // initial to the cap. Gates serialize on the coordinator mutex so at most one
+        // loop runs at a time regardless of pipeline depth.
+        let initial_poll = self.config.restorable_gate_poll_initial;
+        let max_poll = self.config.restorable_gate_poll_max;
 
         let Some(ref backend) = self.state_backend else {
             return Ok(());
@@ -1103,7 +1113,7 @@ impl CheckpointCoordinator {
         }
 
         let deadline = Instant::now() + self.config.restorable_gate_timeout;
-        let mut interval = INITIAL_POLL;
+        let mut interval = initial_poll;
         let mut last_state = String::from("not all vnodes persisted");
         loop {
             if epoch < self.rotation_epoch_floor {
@@ -1155,7 +1165,7 @@ impl CheckpointCoordinator {
                 ));
             }
             tokio::time::sleep(interval).await;
-            interval = (interval * 2).min(MAX_POLL);
+            interval = (interval * 2).min(max_poll);
         }
     }
 

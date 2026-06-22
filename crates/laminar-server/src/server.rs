@@ -294,6 +294,8 @@ pub(crate) fn apply_checkpoint_config(
         max_staged_bytes: checkpoint.max_staged_bytes,
         max_uncommitted_epochs: checkpoint.max_uncommitted_epochs,
         uncommitted_epochs_backpressure: checkpoint.uncommitted_epochs_backpressure,
+        restorable_gate_poll_initial_ms: checkpoint.restorable_gate_poll_initial_ms,
+        restorable_gate_poll_max_ms: checkpoint.restorable_gate_poll_max_ms,
     };
     builder = builder.checkpoint(cfg);
 

@@ -336,6 +336,14 @@ impl LaminarDB {
                     .max_uncommitted_epochs
                     .unwrap_or(defaults.max_uncommitted_epochs),
                 uncommitted_epochs_backpressure: cp_config.uncommitted_epochs_backpressure,
+                restorable_gate_poll_initial: cp_config.restorable_gate_poll_initial_ms.map_or(
+                    defaults.restorable_gate_poll_initial,
+                    std::time::Duration::from_millis,
+                ),
+                restorable_gate_poll_max: cp_config.restorable_gate_poll_max_ms.map_or(
+                    defaults.restorable_gate_poll_max,
+                    std::time::Duration::from_millis,
+                ),
                 ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
