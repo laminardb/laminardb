@@ -470,6 +470,11 @@ pub struct CheckpointSection {
     /// Durability-gate poll backoff cap in ms (default 1000).
     #[serde(default)]
     pub restorable_gate_poll_max_ms: Option<u64>,
+    /// Enable incremental delta checkpoints (Lever 2, cluster-only) with this re-base chain bound.
+    /// Default off (full + reference partials). Clamped `< max_retained` so a chain base never ages
+    /// out of the prune window.
+    #[serde(default)]
+    pub delta_chain_max: Option<u32>,
 }
 
 impl Default for CheckpointSection {
@@ -485,6 +490,7 @@ impl Default for CheckpointSection {
             uncommitted_epochs_backpressure: false,
             restorable_gate_poll_initial_ms: None,
             restorable_gate_poll_max_ms: None,
+            delta_chain_max: None,
         }
     }
 }

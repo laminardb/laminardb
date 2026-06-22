@@ -137,6 +137,10 @@ fn staged_request_bytes(
             crate::checkpoint_coordinator::StagedSlice::Bytes(b) => b.len(),
             // Cold slices are on disk; they hold no RAM.
             crate::checkpoint_coordinator::StagedSlice::Cold => 0,
+            crate::checkpoint_coordinator::StagedSlice::Delta {
+                changed,
+                tombstones,
+            } => changed.len() + tombstones.len(),
         })
         .sum();
     (ops + vnodes) as u64

@@ -5,19 +5,36 @@
 
 use crate::error::DbError;
 
-/// Operator-state slices for one vnode at one epoch.
+/// One operator's incremental delta (Lever 2): the groups changed this epoch
+/// (columnar `AggStateCheckpoint` bytes) plus the keys removed (tombstone IPC).
+/// Both empty = a carry-forward (nothing changed since the parent).
+#[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) struct OpDelta {
+    pub changed: Vec<u8>,
+    pub tombstones_ipc: Vec<u8>,
+}
+
+/// Operator-state slices for one vnode at one epoch. One of three kinds:
 ///
-/// `base_epoch = Some(N)` means the state is byte-identical to the full partial at epoch N;
-/// `operators` is empty and the reader follows this one-hop reference. The writer re-emits a full
-/// partial before the base leaves the prune window.
+/// - FULL: `operators` non-empty, `base_epoch = None`, `deltas` empty.
+/// - REFERENCE (Lever 1): `operators`/`deltas` empty, `base_epoch = Some(N)` — byte-identical
+///   to the full partial at epoch N; the reader follows this one hop.
+/// - DELTA (Lever 2): `deltas` non-empty, `base_epoch = Some(parent)` — per-operator changes
+///   since `parent` (itself a FULL, REFERENCE, or DELTA); the reader walks parents back to a
+///   FULL collecting deltas, then replays FULL → deltas forward.
+///
+/// `base_epoch` doubles as the parent link. The writer re-bases (re-emits FULL) before the base
+/// leaves the prune window.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct VnodePartial {
     /// Sealed epoch, for audit.
     pub checkpoint_id: u64,
-    /// `(operator_name, vnode-slice bytes)`. Empty for references.
+    /// `(operator_name, vnode-slice bytes)`. Empty for references and deltas.
     pub operators: Vec<(String, Vec<u8>)>,
-    /// `Some(epoch)` = unchanged since that epoch's full partial.
+    /// `Some(epoch)` = parent link (reference base, or delta parent).
     pub base_epoch: Option<u64>,
+    /// `(operator_name, delta)`. Non-empty only for delta partials.
+    pub deltas: Vec<(String, OpDelta)>,
 }
 
 impl VnodePartial {
@@ -48,6 +65,7 @@ mod tests {
                 ("other".to_string(), vec![]),
             ],
             base_epoch: None,
+            deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
@@ -63,6 +81,7 @@ mod tests {
             checkpoint_id: 7,
             operators: Vec::new(),
             base_epoch: None,
+            deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
@@ -76,6 +95,7 @@ mod tests {
             checkpoint_id: 9,
             operators: Vec::new(),
             base_epoch: Some(4),
+            deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();

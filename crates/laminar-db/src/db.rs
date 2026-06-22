@@ -226,10 +226,10 @@ pub(crate) use laminar_core::time::parse_duration_str;
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone)]
 pub struct RehydratedVnode {
-    /// Committed epoch the partial was read from.
+    /// Committed epoch the chain head was read from.
     pub epoch: u64,
-    /// `partial.bin` bytes at `epoch`.
-    pub bytes: bytes::Bytes,
+    /// Recovery chain (oldest→newest decoded-as-bytes partials): a FULL base plus any delta partials.
+    pub chain: Vec<bytes::Bytes>,
 }
 
 /// Summary of a single [`LaminarDB::adopt_assignment_snapshot`] call.
@@ -682,8 +682,8 @@ impl LaminarDB {
             }
             if let Some(epoch) = report.epoch {
                 let mut staged = self.rehydrated_vnode_state.lock();
-                for (vnode, bytes) in report.restored {
-                    staged.insert(vnode, RehydratedVnode { epoch, bytes });
+                for (vnode, chain) in report.restored {
+                    staged.insert(vnode, RehydratedVnode { epoch, chain });
                 }
             }
         } else if !newly_acquired.is_empty() {

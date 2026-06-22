@@ -101,6 +101,17 @@ pub(crate) trait GraphOperator: Send {
         Ok(())
     }
 
+    /// Replay one operator's recovery chain for a vnode: a FULL base then ordered deltas.
+    #[cfg(feature = "cluster")]
+    fn apply_vnode_chain(
+        &mut self,
+        _vnode: u32,
+        _base: &[u8],
+        _deltas: &[(&[u8], &[u8])],
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
     /// Wire the cold-tier channel for vnode promotion. Only vnode-sharded
     /// aggregates use it; others ignore it.
     #[cfg(feature = "state-tier")]
@@ -296,6 +307,9 @@ pub(crate) struct OperatorGraph {
     build_errors: Vec<DbError>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
+    // `Some(chain_max)` enables incremental delta checkpoints on aggregate operators.
+    #[cfg(feature = "cluster")]
+    delta_chain_max: Option<u32>,
     // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
@@ -334,6 +348,8 @@ impl OperatorGraph {
             max_state_bytes: None,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            delta_chain_max: None,
             #[cfg(feature = "cluster")]
             vnode_count: None,
             #[cfg(feature = "cluster")]
@@ -474,6 +490,12 @@ impl OperatorGraph {
         self.cluster_shuffle = Some(config);
     }
 
+    /// Enable incremental delta checkpoints on aggregate operators with `chain_max` as the bound.
+    #[cfg(feature = "cluster")]
+    pub fn set_delta_chain_max(&mut self, chain_max: u32) {
+        self.delta_chain_max = Some(chain_max);
+    }
+
     /// Set the vnode count for the single-node tier path (no shuffle config).
     /// Must stay stable across restarts; demoted partials are keyed by vnode.
     #[cfg(feature = "state-tier")]
@@ -551,39 +573,60 @@ impl OperatorGraph {
         }
 
         for (vnode, rehydrated) in drained {
-            match crate::vnode_partial::VnodePartial::decode(&rehydrated.bytes) {
-                Ok(partial) => {
-                    for (op_name, bytes) in &partial.operators {
-                        if let Some(node) = self
-                            .nodes
-                            .iter_mut()
-                            .find(|n| !n.removed && &*n.name == op_name.as_str())
-                        {
-                            if let Err(e) = node.operator.apply_vnode_state(vnode, bytes) {
-                                tracing::warn!(
-                                    operator = %op_name, vnode, error = %e,
-                                    "failed to apply rehydrated vnode state"
-                                );
-                            }
-                        } else {
-                            tracing::debug!(
-                                operator = %op_name, vnode,
-                                "no live operator for rehydrated slice (topology drift)"
-                            );
-                        }
+            // Decode the recovery chain; an undecodable link is skipped (vnode resumes from current).
+            let chain: Vec<crate::vnode_partial::VnodePartial> = rehydrated
+                .chain
+                .iter()
+                .filter_map(|b| crate::vnode_partial::VnodePartial::decode(b).ok())
+                .collect();
+            // Every operator present anywhere in the chain (full or delta), resolved independently.
+            let mut op_names: Vec<String> = Vec::new();
+            for p in &chain {
+                for (n, _) in &p.operators {
+                    if !op_names.iter().any(|o| o == n) {
+                        op_names.push(n.clone());
                     }
-                    tracing::info!(
-                        vnode,
-                        epoch = rehydrated.epoch,
-                        operators = partial.operators.len(),
-                        "applied rehydrated vnode state"
+                }
+                for (n, _) in &p.deltas {
+                    if !op_names.iter().any(|o| o == n) {
+                        op_names.push(n.clone());
+                    }
+                }
+            }
+            let mut applied = 0usize;
+            for op_name in &op_names {
+                let Some((base, deltas)) =
+                    crate::recovery_manager::resolve_op_chain(&chain, op_name)
+                else {
+                    continue; // no FULL base for this operator in the chain → start fresh
+                };
+                if let Some(node) = self
+                    .nodes
+                    .iter_mut()
+                    .find(|n| !n.removed && &*n.name == op_name.as_str())
+                {
+                    if let Err(e) = node.operator.apply_vnode_chain(vnode, base, &deltas) {
+                        tracing::warn!(
+                            operator = %op_name, vnode, error = %e,
+                            "failed to apply rehydrated vnode chain"
+                        );
+                    } else {
+                        applied += 1;
+                    }
+                } else {
+                    tracing::debug!(
+                        operator = %op_name, vnode,
+                        "no live operator for rehydrated slice (topology drift)"
                     );
                 }
-                Err(e) => tracing::warn!(
-                    vnode, error = %e,
-                    "rehydrated partial decode failed — vnode resumes from current state"
-                ),
             }
+            tracing::info!(
+                vnode,
+                epoch = rehydrated.epoch,
+                operators = applied,
+                links = chain.len(),
+                "applied rehydrated vnode chain"
+            );
             registry.mark_active(&[vnode]);
         }
     }
@@ -1395,6 +1438,10 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
+            // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
+            if let Some(chain_max) = self.delta_chain_max {
+                op.enable_delta_checkpoints(chain_max);
+            }
         }
         #[cfg(feature = "state-tier")]
         if let Some(tier) = self.state_tier.clone() {
@@ -2154,21 +2201,22 @@ impl OperatorGraph {
         out
     }
 
-    /// Apply one operator's slice of a vnode partial (cold-vnode rehydration on restart).
-    /// Targets a single operator to avoid double-applying slices recovered from the manifest.
+    /// Replay one operator's recovery chain (FULL base + ordered deltas) for a vnode (cold-vnode
+    /// rehydration on restart). Targets a single operator to avoid double-applying manifest slices.
     #[cfg(feature = "state-tier")]
-    pub(crate) fn apply_vnode_slice(
+    pub(crate) fn apply_vnode_chain(
         &mut self,
         operator: &str,
         vnode: u32,
-        bytes: &[u8],
+        base: &[u8],
+        deltas: &[(&[u8], &[u8])],
     ) -> Result<(), DbError> {
         match self
             .nodes
             .iter_mut()
             .find(|n| !n.removed && &*n.name == operator)
         {
-            Some(node) => node.operator.apply_vnode_state(vnode, bytes),
+            Some(node) => node.operator.apply_vnode_chain(vnode, base, deltas),
             None => Ok(()),
         }
     }

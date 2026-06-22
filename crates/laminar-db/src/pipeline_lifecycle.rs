@@ -135,22 +135,25 @@ impl LaminarDB {
         let (mut applied, mut lost) = (0usize, 0usize);
         for (op_name, cold_vnodes) in cold_map {
             for &v in cold_vnodes {
-                let Some(partial_bytes) = rehy.restored.get(&v) else {
+                let Some(chain_bytes) = rehy.restored.get(&v) else {
                     tracing::error!(operator = %op_name, vnode = v, "demoted-vnode partial missing on restart");
                     lost += 1;
                     continue;
                 };
-                let partial = match crate::vnode_partial::VnodePartial::decode(partial_bytes) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(operator = %op_name, vnode = v, error = %e, "demoted-vnode partial decode failed");
-                        lost += 1;
-                        continue;
-                    }
-                };
-                // Absence from the partial means the operator had no groups in this vnode.
-                if let Some((_, slice)) = partial.operators.iter().find(|(n, _)| n == op_name) {
-                    match graph.apply_vnode_slice(op_name, v, slice) {
+                let chain: Vec<crate::vnode_partial::VnodePartial> = chain_bytes
+                    .iter()
+                    .filter_map(|b| crate::vnode_partial::VnodePartial::decode(b).ok())
+                    .collect();
+                if chain.len() != chain_bytes.len() {
+                    tracing::error!(operator = %op_name, vnode = v, "demoted-vnode chain link decode failed");
+                    lost += 1;
+                    continue;
+                }
+                // Absence of a FULL base means the operator had no groups in this vnode.
+                if let Some((base, deltas)) =
+                    crate::recovery_manager::resolve_op_chain(&chain, op_name)
+                {
+                    match graph.apply_vnode_chain(op_name, v, base, &deltas) {
                         Ok(()) => applied += 1,
                         Err(e) => {
                             tracing::error!(operator = %op_name, vnode = v, error = %e, "demoted-vnode apply failed");
@@ -534,6 +537,16 @@ impl LaminarDB {
                     self_id,
                 });
                 graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
+                // Incremental delta checkpoints (opt-in). Clamp the chain bound below the prune
+                // window so a chain base never ages out before the chain head.
+                if let Some(cp) = self.config.checkpoint.as_ref() {
+                    if let Some(chain_max) = cp.delta_chain_max {
+                        let retain =
+                            u32::try_from(cp.max_retained.unwrap_or(3)).unwrap_or(u32::MAX);
+                        let bounded = chain_max.min(retain.saturating_sub(1)).max(1);
+                        graph.set_delta_chain_max(bounded);
+                    }
+                }
             }
         }
 

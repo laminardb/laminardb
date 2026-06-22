@@ -26,6 +26,12 @@ pub(crate) enum StagedSlice {
     // No bytes; the coordinator emits a reference partial or fetches from the tier on a forced
     // full re-upload.
     Cold,
+    // An incremental delta (Lever 2): changed-group columnar bytes + tombstone IPC, chained to the
+    // previous epoch's partial for this vnode. Bypasses the byte-compare reference path.
+    Delta {
+        changed: bytes::Bytes,
+        tombstones: bytes::Bytes,
+    },
 }
 
 pub(crate) type StagedVnodeStates = HashMap<u32, HashMap<String, StagedSlice>>;
@@ -49,7 +55,8 @@ impl UploadedSlice {
         match (staged, self) {
             (StagedSlice::Cold, _) => true,
             (StagedSlice::Bytes(b), UploadedSlice::Bytes(prev)) => b == prev,
-            (StagedSlice::Bytes(_), UploadedSlice::Cold) => false,
+            // A delta never matches a prior full — it rides the delta-chain path, not the reference path.
+            (StagedSlice::Bytes(_), UploadedSlice::Cold) | (StagedSlice::Delta { .. }, _) => false,
         }
     }
 }
@@ -330,6 +337,9 @@ pub struct CheckpointCoordinator {
     #[allow(clippy::disallowed_types)]
     last_vnode_uploads:
         std::collections::HashMap<u32, (u64, std::collections::HashMap<String, UploadedSlice>)>,
+    // Epoch of the previous partial written per vnode — the parent link a delta partial chains to.
+    #[allow(clippy::disallowed_types)]
+    last_partial_epoch: std::collections::HashMap<u32, u64>,
     // Channel to fetch demoted slice bytes back from the tier on a forced full re-upload.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
@@ -402,6 +412,7 @@ impl CheckpointCoordinator {
             epoch_descriptor_keys: Vec::new(),
             coordinated_commit_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_vnode_uploads: std::collections::HashMap::new(),
+            last_partial_epoch: std::collections::HashMap::new(),
             #[cfg(feature = "state-tier")]
             state_tier: None,
             #[cfg(feature = "cluster")]
@@ -466,6 +477,9 @@ impl CheckpointCoordinator {
         self.rotation_epoch_floor = self.allocator.peek().0;
         // Drop bases for shed vnodes; the new owner builds its own from a full upload.
         self.last_vnode_uploads.retain(|v, _| vnodes.contains(v));
+        // Drop parent links for shed vnodes so a newly-acquired vnode has no stale parent — it must
+        // re-base FULL before any delta chains to it.
+        self.last_partial_epoch.retain(|v, _| vnodes.contains(v));
         self.vnode_set = vnodes;
     }
 
@@ -975,6 +989,7 @@ impl CheckpointCoordinator {
     /// are forced back to full before their base ages out of the prune window. All writes run
     /// concurrently. Bases are recorded only after every write in an epoch lands, so a partially
     /// failed epoch re-uploads full on the next attempt.
+    #[allow(clippy::too_many_lines)] // cohesive per-vnode classify→write→record; async self-borrow resists splitting
     async fn write_vnode_partials(
         &mut self,
         epoch: u64,
@@ -1001,60 +1016,121 @@ impl CheckpointCoordinator {
         let mut emptied: Vec<u32> = Vec::new();
         let mut reference_count: u64 = 0;
         let mut encoded: Vec<(u32, bytes::Bytes)> = Vec::with_capacity(self.vnode_set.len());
+        let mut written: Vec<u32> = Vec::with_capacity(self.vnode_set.len());
         for &v in &self.vnode_set {
             let ops = self.pending_vnode_states.get(&v);
-            let base = ops.filter(|ops| !ops.is_empty()).and_then(|ops| {
-                self.last_vnode_uploads
-                    .get(&v)
-                    .filter(|(base, last)| {
-                        epoch.saturating_sub(*base) < max_ref_age
-                            && last.len() == ops.len()
-                            && ops
-                                .iter()
-                                .all(|(n, s)| last.get(n).is_some_and(|prev| prev.matches(s)))
-                    })
-                    .map(|(base, _)| *base)
-            });
-            let partial = if let Some(base_epoch) = base {
-                reference_count += 1;
-                crate::vnode_partial::VnodePartial {
-                    checkpoint_id,
-                    operators: Vec::new(),
-                    base_epoch: Some(base_epoch),
-                }
-            } else {
-                let mut resolved: Vec<(String, Vec<u8>)> = Vec::new();
+            // A delta partial chains to the previous epoch this vnode was written.
+            let parent_epoch = self.last_partial_epoch.get(&v).copied();
+            let has_delta =
+                ops.is_some_and(|ops| ops.values().any(|s| matches!(s, StagedSlice::Delta { .. })));
+
+            let partial = if has_delta {
+                // DELTA partial: delta ops chain to the parent; any re-based (full) ops ride along
+                // in `operators` and reset their reference base. Per-operator chain resolution on
+                // recovery (each operator_name finds its own latest FULL + later deltas).
+                let Some(parent) = parent_epoch else {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6025] delta partial for vnode {v} has no parent epoch (epoch={epoch}); \
+                         a just-acquired vnode must re-base FULL first"
+                    )));
+                };
+                let mut operators: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut deltas: Vec<(String, crate::vnode_partial::OpDelta)> = Vec::new();
                 let mut recorded: std::collections::HashMap<String, UploadedSlice> =
                     std::collections::HashMap::new();
                 if let Some(ops) = ops {
                     for (name, slice) in ops {
-                        let bytes = match slice {
-                            StagedSlice::Bytes(b) => b.clone(),
-                            StagedSlice::Cold => self.fetch_cold_slice(name, v).await?,
-                        };
-                        resolved.push((name.clone(), bytes.to_vec()));
-                        // Cold slices contribute bytes to this upload but stay pinned in the tier.
-                        recorded.insert(
-                            name.clone(),
-                            match slice {
-                                StagedSlice::Bytes(b) => UploadedSlice::Bytes(b.clone()),
-                                StagedSlice::Cold => UploadedSlice::Cold,
-                            },
-                        );
+                        match slice {
+                            StagedSlice::Delta {
+                                changed,
+                                tombstones,
+                            } => deltas.push((
+                                name.clone(),
+                                crate::vnode_partial::OpDelta {
+                                    changed: changed.to_vec(),
+                                    tombstones_ipc: tombstones.to_vec(),
+                                },
+                            )),
+                            StagedSlice::Bytes(b) => {
+                                operators.push((name.clone(), b.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Bytes(b.clone()));
+                            }
+                            StagedSlice::Cold => {
+                                let bytes = self.fetch_cold_slice(name, v).await?;
+                                operators.push((name.clone(), bytes.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Cold);
+                            }
+                        }
                     }
                 }
-                if recorded.is_empty() {
-                    emptied.push(v);
-                } else {
+                if !recorded.is_empty() {
                     full_uploads.push((v, recorded));
                 }
                 crate::vnode_partial::VnodePartial {
                     checkpoint_id,
-                    operators: resolved,
-                    base_epoch: None,
+                    operators,
+                    base_epoch: Some(parent),
+                    deltas,
+                }
+            } else {
+                let base = ops.filter(|ops| !ops.is_empty()).and_then(|ops| {
+                    self.last_vnode_uploads
+                        .get(&v)
+                        .filter(|(base, last)| {
+                            epoch.saturating_sub(*base) < max_ref_age
+                                && last.len() == ops.len()
+                                && ops
+                                    .iter()
+                                    .all(|(n, s)| last.get(n).is_some_and(|prev| prev.matches(s)))
+                        })
+                        .map(|(base, _)| *base)
+                });
+                if let Some(base_epoch) = base {
+                    reference_count += 1;
+                    crate::vnode_partial::VnodePartial {
+                        checkpoint_id,
+                        operators: Vec::new(),
+                        base_epoch: Some(base_epoch),
+                        deltas: Vec::new(),
+                    }
+                } else {
+                    let mut resolved: Vec<(String, Vec<u8>)> = Vec::new();
+                    let mut recorded: std::collections::HashMap<String, UploadedSlice> =
+                        std::collections::HashMap::new();
+                    if let Some(ops) = ops {
+                        for (name, slice) in ops {
+                            let bytes = match slice {
+                                StagedSlice::Bytes(b) => b.clone(),
+                                StagedSlice::Cold => self.fetch_cold_slice(name, v).await?,
+                                StagedSlice::Delta { .. } => unreachable!("delta routed above"),
+                            };
+                            resolved.push((name.clone(), bytes.to_vec()));
+                            // Cold slices contribute bytes to this upload but stay pinned in the tier.
+                            recorded.insert(
+                                name.clone(),
+                                match slice {
+                                    StagedSlice::Bytes(b) => UploadedSlice::Bytes(b.clone()),
+                                    StagedSlice::Cold => UploadedSlice::Cold,
+                                    StagedSlice::Delta { .. } => unreachable!("delta routed above"),
+                                },
+                            );
+                        }
+                    }
+                    if recorded.is_empty() {
+                        emptied.push(v);
+                    } else {
+                        full_uploads.push((v, recorded));
+                    }
+                    crate::vnode_partial::VnodePartial {
+                        checkpoint_id,
+                        operators: resolved,
+                        base_epoch: None,
+                        deltas: Vec::new(),
+                    }
                 }
             };
             encoded.push((v, bytes::Bytes::from(partial.encode()?)));
+            written.push(v);
         }
 
         let writes = encoded.into_iter().map(|(v, payload)| {
@@ -1072,6 +1148,11 @@ impl CheckpointCoordinator {
         });
         futures::future::try_join_all(writes).await?;
 
+        // Record the parent link only after every write lands, so a partially failed epoch is not
+        // chained from on the next attempt.
+        for v in written {
+            self.last_partial_epoch.insert(v, epoch);
+        }
         for (v, ops) in full_uploads {
             self.last_vnode_uploads.insert(v, (epoch, ops));
         }

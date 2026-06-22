@@ -296,6 +296,7 @@ pub(crate) fn apply_checkpoint_config(
         uncommitted_epochs_backpressure: checkpoint.uncommitted_epochs_backpressure,
         restorable_gate_poll_initial_ms: checkpoint.restorable_gate_poll_initial_ms,
         restorable_gate_poll_max_ms: checkpoint.restorable_gate_poll_max_ms,
+        delta_chain_max: checkpoint.delta_chain_max,
     };
     builder = builder.checkpoint(cfg);
 

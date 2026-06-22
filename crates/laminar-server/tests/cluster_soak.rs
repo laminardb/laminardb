@@ -215,6 +215,16 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
 
+    // Incremental delta checkpoints (Lever 2): `LAMINAR_SOAK_DELTA_CHAIN_MAX=N` enables them and
+    // adds a non-changelog aggregate whose per-vnode state is delta-captured (a changelog agg would
+    // re-base FULL). The agg has no sink — it exists to exercise the delta write+chain-recovery path
+    // under kill -9; the exactly-once proof stays on the pass-through `soak_stream` sink.
+    let delta_chain_max = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").ok().map(|v| {
+        v.parse::<u32>()
+            .expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32")
+    });
+    let delta_line = delta_chain_max.map_or(String::new(), |n| format!("delta_chain_max = {n}"));
+
     let mut toml = format!(
         r#"
 node_id = "n{id}"
@@ -247,6 +257,7 @@ interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = {depth}
 {gate_poll}
+{delta_line}
 
 [checkpoint.storage]
 {storage}
@@ -266,6 +277,22 @@ sql = "SELECT seq, ts_ms, value FROM gen"
         seeds = seeds.join(", "),
         url = checkpoint_url,
     );
+
+    // Non-changelog agg (no EMIT CHANGES) over a bounded, slow-cycling key space: its per-vnode
+    // state accumulates and is captured as delta partials each checkpoint, so kill -9 + rebalance
+    // exercises the delta write + chain-recovery path. No sink — state is the thing under test.
+    // `LAMINAR_SOAK_AGG=1` adds it without delta, to isolate the shuffle path from the delta path.
+    if delta_chain_max.is_some() || std::env::var("LAMINAR_SOAK_AGG").is_ok() {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_delta_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups}"
+"#,
+        ));
+    }
 
     // Demotable per-vnode aggregate state for the cold tier: an EMIT
     // CHANGES agg over a SLOW-CYCLING bounded key space. Only changelog
@@ -682,6 +709,22 @@ fn write_graceful_config(
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
 
+    // Optional incremental delta checkpoints + a non-changelog agg to exercise the delta
+    // write/chain-recovery path across the graceful rotation (see `write_config`).
+    let (delta_line, delta_agg) = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").map_or_else(
+        |_| (String::new(), String::new()),
+        |v| {
+            let n: u32 = v.parse().expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32");
+            let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+            (
+                format!("delta_chain_max = {n}"),
+                format!(
+                    "\n[[pipeline]]\nname = \"soak_delta_agg\"\nsql = \"SELECT seq % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM kin GROUP BY seq % {groups}\"\n"
+                ),
+            )
+        },
+    );
+
     let toml = format!(
         r#"
 node_id = "n{id}"
@@ -711,6 +754,7 @@ url = "{url}"
 interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = 4
+{delta_line}
 
 [[source]]
 name = "kin"
@@ -729,7 +773,7 @@ nullable = false
 [[pipeline]]
 name = "passthrough"
 sql = "SELECT seq FROM kin"
-
+{delta_agg}
 [[sink]]
 name = "kout"
 pipeline = "passthrough"

@@ -76,8 +76,9 @@ pub struct VnodeRehydration {
     /// Committed epoch the partials were read from. `None` when the backend
     /// has no committed epoch — every vnode starts fresh.
     pub epoch: Option<u64>,
-    /// vnode → restored partial bytes at `epoch`.
-    pub restored: HashMap<u32, Bytes>,
+    /// vnode → recovery chain (decoded-as-bytes partials, oldest→newest): a FULL base followed by
+    /// any delta partials. A simple/reference vnode resolves to a single-element chain.
+    pub restored: HashMap<u32, Vec<Bytes>>,
     /// Vnodes with no durable partial at `epoch`; resume from empty state.
     pub missing: Vec<u32>,
     /// vnode → error for reads that failed.
@@ -147,46 +148,10 @@ impl<'a> VnodeRehydrator<'a> {
         report.epoch = Some(epoch);
 
         for &vnode in vnodes {
-            match self.backend.read_partial(vnode, epoch).await {
-                Ok(Some(bytes)) => {
-                    // An unchanged-vnode partial is a reference to its last full
-                    // upload — follow the single hop. An undecodable blob passes
-                    // through unchanged (the apply path skips it).
-                    let bytes = match crate::vnode_partial::VnodePartial::decode(&bytes) {
-                        Ok(p) => match p.base_epoch {
-                            Some(base) => match self.backend.read_partial(vnode, base).await {
-                                Ok(Some(base_bytes)) => base_bytes,
-                                Ok(None) => {
-                                    warn!(
-                                        vnode,
-                                        epoch,
-                                        base,
-                                        "[LDB-6052] reference partial's base is missing — \
-                                         vnode starts fresh"
-                                    );
-                                    report.missing.push(vnode);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        vnode, epoch, base, error = %e,
-                                        "[LDB-6051] rehydrate: base read failed — vnode starts fresh"
-                                    );
-                                    report.errors.insert(vnode, e.to_string());
-                                    continue;
-                                }
-                            },
-                            None => bytes,
-                        },
-                        Err(_) => bytes,
-                    };
-                    debug!(
-                        vnode,
-                        epoch,
-                        bytes = bytes.len(),
-                        "rehydrated vnode partial"
-                    );
-                    report.restored.insert(vnode, bytes);
+            match self.collect_chain(vnode, epoch).await {
+                Ok(Some(chain)) => {
+                    debug!(vnode, epoch, links = chain.len(), "rehydrated vnode chain");
+                    report.restored.insert(vnode, chain);
                 }
                 Ok(None) => {
                     debug!(
@@ -197,12 +162,10 @@ impl<'a> VnodeRehydrator<'a> {
                 }
                 Err(e) => {
                     warn!(
-                        vnode,
-                        epoch,
-                        error = %e,
-                        "[LDB-6051] rehydrate: read_partial failed — vnode starts fresh"
+                        vnode, epoch, error = %e,
+                        "[LDB-6051] rehydrate: chain read failed — vnode starts fresh"
                     );
-                    report.errors.insert(vnode, e.to_string());
+                    report.errors.insert(vnode, e);
                 }
             }
         }
@@ -216,6 +179,107 @@ impl<'a> VnodeRehydrator<'a> {
         );
         report
     }
+
+    /// Resolve a vnode's recovery chain at `epoch`: collapse leading Lever-1 reference hops, then
+    /// walk `base_epoch` back collecting delta partials until every delta operator at the head has
+    /// its FULL base (or the chain ends / a link is missing). Returns oldest→newest decoded bytes.
+    async fn collect_chain(&self, vnode: u32, epoch: u64) -> Result<Option<Vec<Bytes>>, String> {
+        use crate::vnode_partial::VnodePartial;
+        let Some(mut bytes) = self
+            .backend
+            .read_partial(vnode, epoch)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+
+        // Follow reference hops (no data, just a base pointer) to the real partial.
+        loop {
+            let Ok(p) = VnodePartial::decode(&bytes) else {
+                // Undecodable → pass through; the apply path skips it (prior behavior).
+                return Ok(Some(vec![bytes]));
+            };
+            if p.operators.is_empty() && p.deltas.is_empty() {
+                if let Some(base) = p.base_epoch {
+                    match self
+                        .backend
+                        .read_partial(vnode, base)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Some(b) => {
+                            bytes = b;
+                            continue;
+                        }
+                        None => return Ok(None), // reference base missing → start fresh
+                    }
+                }
+            }
+            break;
+        }
+
+        // `bytes` is a FULL or DELTA partial. Walk back until each delta operator has its FULL.
+        let head = VnodePartial::decode(&bytes).map_err(|e| e.to_string())?;
+        let mut need: std::collections::HashSet<String> = head
+            .deltas
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| !head.operators.iter().any(|(on, _)| on == n))
+            .collect();
+        let mut chain_rev: Vec<Bytes> = vec![bytes];
+        let mut cur = head;
+        while !need.is_empty() {
+            let Some(parent) = cur.base_epoch else { break };
+            let Some(pbytes) = self
+                .backend
+                .read_partial(vnode, parent)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                break; // missing link → unresolved operators start fresh (conservative)
+            };
+            let Ok(pp) = VnodePartial::decode(&pbytes) else {
+                break;
+            };
+            for (n, _) in &pp.operators {
+                need.remove(n);
+            }
+            chain_rev.push(pbytes);
+            cur = pp;
+        }
+        chain_rev.reverse();
+        Ok(Some(chain_rev))
+    }
+}
+
+/// One operator's resolved recovery chain: FULL base bytes + ordered `(changed, tombstones)` deltas.
+#[cfg(feature = "cluster")]
+pub(crate) type ResolvedOpChain<'a> = (&'a [u8], Vec<(&'a [u8], &'a [u8])>);
+
+/// From a vnode's recovery chain (oldest→newest decoded partials), resolve one operator's FULL base
+/// bytes + ordered delta payloads. Returns `None` when no FULL for `op` is present (start fresh).
+#[cfg(feature = "cluster")]
+#[must_use]
+pub(crate) fn resolve_op_chain<'a>(
+    chain: &'a [crate::vnode_partial::VnodePartial],
+    op: &str,
+) -> Option<ResolvedOpChain<'a>> {
+    let base_idx = chain
+        .iter()
+        .rposition(|p| p.operators.iter().any(|(n, _)| n == op))?;
+    let base = chain[base_idx]
+        .operators
+        .iter()
+        .find(|(n, _)| n == op)
+        .map(|(_, b)| b.as_slice())?;
+    let mut deltas: Vec<(&[u8], &[u8])> = Vec::new();
+    for p in &chain[base_idx + 1..] {
+        if let Some((_, d)) = p.deltas.iter().find(|(n, _)| n == op) {
+            deltas.push((d.changed.as_slice(), d.tombstones_ipc.as_slice()));
+        }
+    }
+    Some((base, deltas))
 }
 
 /// Loads the latest [`CheckpointManifest`] and restores sources, sinks, and
@@ -1184,8 +1248,8 @@ mod rehydration_tests {
 
         assert_eq!(report.epoch, Some(7));
         assert_eq!(report.restored_count(), 2);
-        assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"v7"[..]));
-        assert_eq!(report.restored.get(&1).map(|b| &b[..]), Some(&b"v7"[..]));
+        assert_eq!(report.restored.get(&0).map(|c| &c[0][..]), Some(&b"v7"[..]));
+        assert_eq!(report.restored.get(&1).map(|c| &c[0][..]), Some(&b"v7"[..]));
         // vnode 3 was never written — fresh start, no error.
         assert_eq!(report.missing, vec![3]);
         assert!(!report.has_errors());
@@ -1200,7 +1264,10 @@ mod rehydration_tests {
         let report = VnodeRehydrator::new(&backend).rehydrate(&[0, 1]).await;
 
         assert_eq!(report.epoch, Some(9), "must read the highest sealed epoch");
-        assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"new"[..]));
+        assert_eq!(
+            report.restored.get(&0).map(|c| &c[0][..]),
+            Some(&b"new"[..])
+        );
     }
 
     /// A reference partial resolves (one hop) to the
@@ -1213,6 +1280,7 @@ mod rehydration_tests {
             checkpoint_id: 1,
             operators: vec![("agg".into(), vec![1, 2, 3])],
             base_epoch: None,
+            deltas: Vec::new(),
         };
         backend
             .write_partial(0, 5, 0, Bytes::from(full.encode().unwrap()))
@@ -1224,6 +1292,7 @@ mod rehydration_tests {
             checkpoint_id: 2,
             operators: Vec::new(),
             base_epoch: Some(5),
+            deltas: Vec::new(),
         };
         backend
             .write_partial(0, 6, 0, Bytes::from(reference.encode().unwrap()))
@@ -1233,10 +1302,9 @@ mod rehydration_tests {
 
         let report = VnodeRehydrator::new(&backend).rehydrate(&[0]).await;
         assert_eq!(report.epoch, Some(6));
-        let restored = crate::vnode_partial::VnodePartial::decode(
-            report.restored.get(&0).expect("vnode restored"),
-        )
-        .unwrap();
+        let chain = report.restored.get(&0).expect("vnode restored");
+        assert_eq!(chain.len(), 1, "reference resolves to a single full base");
+        let restored = crate::vnode_partial::VnodePartial::decode(&chain[0]).unwrap();
         assert_eq!(
             restored.base_epoch, None,
             "the resolved partial must be the full base, not the reference",
@@ -1279,7 +1347,7 @@ mod rehydration_tests {
         assert_eq!(report.epoch, Some(5));
         assert_eq!(report.restored_count(), 2);
         assert_eq!(
-            report.restored.get(&1).map(|b| &b[..]),
+            report.restored.get(&1).map(|c| &c[0][..]),
             Some(&b"durable"[..])
         );
     }
