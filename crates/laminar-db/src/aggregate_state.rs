@@ -622,6 +622,14 @@ pub(crate) struct GroupEntry {
     pub(crate) last_updated_ms: i64,
 }
 
+/// A per-vnode state delta (Lever 2): the groups changed since the chain base
+/// (columnar, same shape as a `FULL` slice) plus the keys removed (tombstones).
+#[cfg(all(test, feature = "cluster"))]
+pub(crate) struct AggVnodeDelta {
+    pub(crate) changed: AggStateCheckpoint,
+    pub(crate) tombstones_ipc: Vec<u8>,
+}
+
 impl IncrementalAggState {
     /// Attempt to build an `IncrementalAggState` by introspecting the logical
     /// plan of the given SQL query. Returns `None` if the query does not
@@ -1598,6 +1606,102 @@ impl IncrementalAggState {
         }
 
         Ok(buckets)
+    }
+
+    /// Encode the per-vnode state DELTA (Lever 2 phase 2): the groups changed and
+    /// the keys removed for `vnode` since the last capture, from the phase-1 dirty
+    /// sets. Changed groups reuse the columnar FULL encoding over the subset;
+    /// removed keys are columnar-encoded as tombstones. Decoded + applied onto the
+    /// chain base by [`apply_delta`](Self::apply_delta). Phase-3 wires it into the
+    /// capture + recovery path; until then it is exercised only by tests.
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn encode_delta_for_vnode(&mut self, vnode: u32) -> Result<AggVnodeDelta, DbError> {
+        let fingerprint = self.query_fingerprint();
+        let retractable = self.weight_col_idx.is_some();
+
+        let changed = self
+            .dirty_keys_by_vnode
+            .get(&vnode)
+            .cloned()
+            .unwrap_or_default();
+        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
+            .groups
+            .iter_mut()
+            .filter(|(k, _)| changed.contains(*k))
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+        let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
+            &self.row_converter,
+            self.num_group_cols,
+            &self.agg_specs,
+            retractable,
+            &mut entries,
+        )?;
+
+        let removed: Vec<arrow::row::OwnedRow> = self
+            .removed_by_vnode
+            .get(&vnode)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let tombstones_ipc = if removed.is_empty() {
+            Vec::new()
+        } else {
+            let arrays = self
+                .row_converter
+                .convert_rows(removed.iter().map(arrow::row::OwnedRow::row))
+                .map_err(|e| DbError::Pipeline(format!("tombstone key build: {e}")))?;
+            arrays_to_ipc(&arrays)?
+        };
+
+        Ok(AggVnodeDelta {
+            changed: AggStateCheckpoint {
+                fingerprint,
+                keys_ipc,
+                acc_state_ipc,
+                last_updated_ms,
+                last_emitted: Vec::new(),
+            },
+            tombstones_ipc,
+        })
+    }
+
+    /// Apply a delta onto live state (Lever 2 phase 2): each changed group's
+    /// accumulators are REPLACED from the delta's post-update state (never additively
+    /// re-merged), and tombstoned keys are removed.
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn apply_delta(&mut self, delta: &AggVnodeDelta) -> Result<(), DbError> {
+        let retractable = self.weight_col_idx.is_some();
+        let per_group = decode_columnar_state_arrays(
+            &self.row_converter,
+            self.num_group_cols,
+            &delta.changed.keys_ipc,
+            &delta.changed.acc_state_ipc,
+            &delta.changed.last_updated_ms,
+        )?;
+        for (row_key, last_updated_ms, state_arrays) in per_group {
+            let accs = build_accumulators_from_state(&self.agg_specs, retractable, &state_arrays)?;
+            self.groups.insert(
+                row_key,
+                GroupEntry {
+                    accs,
+                    last_updated_ms,
+                },
+            );
+        }
+        if !delta.tombstones_ipc.is_empty() {
+            let batch =
+                laminar_core::serialization::deserialize_batch_stream(&delta.tombstones_ipc)
+                    .map_err(|e| DbError::Pipeline(format!("tombstone decode: {e}")))?;
+            let rows = self
+                .row_converter
+                .convert_columns(batch.columns())
+                .map_err(|e| DbError::Pipeline(format!("tombstone row convert: {e}")))?;
+            for i in 0..rows.num_rows() {
+                self.groups.remove(&rows.row(i).owned());
+            }
+        }
+        self.state_gen = self.state_gen.wrapping_add(1);
+        Ok(())
     }
 
     /// Fold a checkpoint's accumulator states into live state via `merge_batch`.
@@ -2974,6 +3078,98 @@ mod tests {
         assert!(
             state.dirty_keys_by_vnode.is_empty(),
             "capture resets the per-vnode dirty set",
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn delta_round_trip_reproduces_changed_and_removed_groups() {
+        use std::collections::BTreeMap;
+        // Single vnode → every key lands in vnode 0, so one delta carries all changes.
+        const V: u32 = 1;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        // Group key bytes -> accumulator value, for state equality.
+        fn group_vals(state: &mut IncrementalAggState) -> BTreeMap<Vec<u8>, String> {
+            state
+                .groups
+                .iter_mut()
+                .map(|(k, v)| {
+                    (
+                        k.as_ref().to_vec(),
+                        format!("{:?}", v.accs[0].evaluate().unwrap()),
+                    )
+                })
+                .collect()
+        }
+        async fn changelog_agg(ctx: &SessionContext) -> IncrementalAggState {
+            let mut s = IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            s.idle_ttl_ms = Some(1000);
+            s
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        // Producer state: seed a,b,c then take a FULL baseline (opens the delta window).
+        let mut producer = changelog_agg(&ctx).await;
+        producer.set_delta_enabled(true);
+        feed(&mut producer, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
+        let base = producer.checkpoint_groups_by_vnode(V).unwrap();
+
+        // Change a (+10) and b (+20); let c go idle and evict it (a tombstone).
+        feed(&mut producer, &[("a", 10.0), ("b", 20.0)], 5000);
+        producer.evict_idle(5000).unwrap();
+        let delta = producer.encode_delta_for_vnode(0).unwrap();
+
+        // Consumer: restore the FULL base, then apply the delta — must match the producer.
+        let mut consumer = changelog_agg(&ctx).await;
+        consumer.restore_groups(base.get(&0).unwrap()).unwrap();
+        consumer.apply_delta(&delta).unwrap();
+
+        assert_eq!(
+            group_vals(&mut consumer),
+            group_vals(&mut producer),
+            "base + delta must reproduce the producer's state (changed replaced, tombstoned removed)",
         );
     }
 
