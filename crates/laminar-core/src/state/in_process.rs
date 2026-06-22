@@ -16,6 +16,8 @@ pub struct InProcessBackend {
     partials: RwLock<FxHashMap<(u32, u64), Bytes>>,
     /// `epoch -> key -> descriptor`, the in-memory analogue of `epoch=N/commit/`.
     descriptors: RwLock<FxHashMap<u64, FxHashMap<String, Bytes>>>,
+    /// `epoch -> node_key -> source offsets`, the analogue of `epoch=N/srcoff/`.
+    source_offsets: RwLock<FxHashMap<u64, FxHashMap<String, Bytes>>>,
     /// Epochs sealed by [`epoch_complete`](StateBackend::epoch_complete) — the
     /// in-memory analogue of the object-store `_COMMIT` markers.
     sealed: RwLock<BTreeSet<u64>>,
@@ -29,6 +31,7 @@ impl InProcessBackend {
         Self {
             partials: RwLock::new(FxHashMap::default()),
             descriptors: RwLock::new(FxHashMap::default()),
+            source_offsets: RwLock::new(FxHashMap::default()),
             sealed: RwLock::new(BTreeSet::new()),
             vnode_capacity,
         }
@@ -105,6 +108,30 @@ impl StateBackend for InProcessBackend {
             .unwrap_or_default())
     }
 
+    async fn write_source_offsets(
+        &self,
+        epoch: u64,
+        node_key: &str,
+        _assignment_version: u64,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError> {
+        self.source_offsets
+            .write()
+            .entry(epoch)
+            .or_default()
+            .insert(node_key.to_string(), bytes);
+        Ok(())
+    }
+
+    async fn read_source_offsets(&self, epoch: u64) -> Result<Vec<Bytes>, StateBackendError> {
+        Ok(self
+            .source_offsets
+            .read()
+            .get(&epoch)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
     async fn epoch_complete(
         &self,
         epoch: u64,
@@ -151,6 +178,9 @@ impl StateBackend for InProcessBackend {
             .write()
             .retain(|&(_, epoch), _| epoch >= before);
         self.descriptors.write().retain(|&epoch, _| epoch >= before);
+        self.source_offsets
+            .write()
+            .retain(|&epoch, _| epoch >= before);
         self.sealed.write().retain(|&epoch| epoch >= before);
         Ok(())
     }

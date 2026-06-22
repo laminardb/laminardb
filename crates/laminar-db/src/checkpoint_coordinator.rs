@@ -84,6 +84,11 @@ pub struct CheckpointConfig {
     /// Followers upload asynchronously after the capture ack, so the durability gate polls
     /// rather than checking once. Expiry aborts the epoch.
     pub restorable_gate_timeout: Duration,
+    /// Durability-gate poll: first interval, backing off exponentially to the cap.
+    /// Tighten on a low-latency store to cut poll quantization.
+    pub restorable_gate_poll_initial: Duration,
+    /// Durability-gate poll backoff cap.
+    pub restorable_gate_poll_max: Duration,
     /// Max pipelined epochs between `Aligned` and restorable. Exactly-once pipelines cap at 1.
     pub max_in_flight_epochs: u64,
     /// Cap on in-flight captured-state bytes. At the cap, barrier admission pauses.
@@ -116,6 +121,8 @@ impl Default for CheckpointConfig {
             quorum_timeout: Duration::from_secs(3),
             // Last-resort bound: fail-fasts catch dead participants in seconds.
             restorable_gate_timeout: Duration::from_secs(10),
+            restorable_gate_poll_initial: Duration::from_millis(100),
+            restorable_gate_poll_max: Duration::from_secs(1),
             max_in_flight_epochs: 4,
             max_staged_bytes: 512 * 1024 * 1024,
             max_uncommitted_epochs: 1024,
@@ -610,6 +617,79 @@ impl CheckpointCoordinator {
         self.config.coordinated_committer_poll
     }
 
+    /// Persist this node's source offsets for `epoch` to the shared state backend,
+    /// keyed per node, so a node that acquires one of its partitions on a later
+    /// rotation can resume from the committed cut (see
+    /// [`acquired_source_offsets`](Self::acquired_source_offsets)) instead of
+    /// `auto.offset.reset`. Written pre-seal so a sealed epoch always carries it;
+    /// a write error fails the epoch. No-op outside a real cluster assignment
+    /// (version 0) or without a backend.
+    async fn persist_source_offset_handoff(
+        &self,
+        epoch: u64,
+        source_offsets: &HashMap<String, ConnectorCheckpoint>,
+    ) -> Result<(), DbError> {
+        if self.assignment_version == 0 {
+            return Ok(());
+        }
+        let Some(ref backend) = self.state_backend else {
+            return Ok(());
+        };
+        let flat: HashMap<String, String> = source_offsets
+            .values()
+            .flat_map(|cp| cp.offsets.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect();
+        if flat.is_empty() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&flat)
+            .map_err(|e| DbError::Checkpoint(format!("source-offset handoff encode: {e}")))?;
+        let node_key = format!("node-{}", self.self_node_id());
+        backend
+            .write_source_offsets(epoch, &node_key, self.assignment_version, bytes.into())
+            .await
+            .map_err(|e| DbError::Checkpoint(format!("source-offset handoff write: {e}")))?;
+        Ok(())
+    }
+
+    /// The global source-offset map for the latest sealed epoch, unioned from
+    /// every node's blob in the shared state backend (opaque connector key/value
+    /// strings). Staged onto the vnode registry during a rotation so an acquiring
+    /// source resumes its newly-owned partitions from the previous owner's sealed
+    /// position. The engine does not interpret the keys — the source filters to
+    /// the partitions it owns. An empty backend or no committed epoch yields an empty
+    /// map (nothing to hand off); a backend read FAILURE is propagated so the caller
+    /// defers the rotation rather than letting an exactly-once source silently fall
+    /// back to its startup offset and re-emit.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn acquired_source_offsets(&self) -> Result<HashMap<String, String>, DbError> {
+        let mut merged = HashMap::new();
+        let Some(ref backend) = self.state_backend else {
+            return Ok(merged);
+        };
+        let epoch = match backend.latest_committed_epoch().await {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(merged),
+            Err(e) => {
+                return Err(DbError::Checkpoint(format!(
+                    "source-offset handoff: latest_committed_epoch failed: {e}"
+                )))
+            }
+        };
+        let blobs = backend.read_source_offsets(epoch).await.map_err(|e| {
+            DbError::Checkpoint(format!(
+                "source-offset handoff: read_source_offsets failed: {e}"
+            ))
+        })?;
+        for blob in blobs {
+            match serde_json::from_slice::<HashMap<String, String>>(&blob) {
+                Ok(m) => merged.extend(m),
+                Err(e) => warn!(error = %e, "source offset handoff: skipping undecodable blob"),
+            }
+        }
+        Ok(merged)
+    }
+
     /// Begin the initial epoch on all exactly-once sinks.
     ///
     /// Must be called once after all sinks are registered and before any writes. Subsequent
@@ -1015,10 +1095,13 @@ impl CheckpointCoordinator {
     ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
-        // Each poll LISTs the epoch prefix; back off exponentially. Gates serialize on the
-        // coordinator mutex so at most one loop runs at a time regardless of pipeline depth.
-        const INITIAL_POLL: Duration = Duration::from_millis(100);
-        const MAX_POLL: Duration = Duration::from_secs(1);
+        // Back off exponentially from the configured initial to the cap. Clamp to a
+        // 1ms floor (cap >= initial) so a 0ms config can't spin the gate under the mutex.
+        let initial_poll = self
+            .config
+            .restorable_gate_poll_initial
+            .max(Duration::from_millis(1));
+        let max_poll = self.config.restorable_gate_poll_max.max(initial_poll);
 
         let Some(ref backend) = self.state_backend else {
             return Ok(());
@@ -1030,7 +1113,7 @@ impl CheckpointCoordinator {
         }
 
         let deadline = Instant::now() + self.config.restorable_gate_timeout;
-        let mut interval = INITIAL_POLL;
+        let mut interval = initial_poll;
         let mut last_state = String::from("not all vnodes persisted");
         loop {
             if epoch < self.rotation_epoch_floor {
@@ -1082,7 +1165,7 @@ impl CheckpointCoordinator {
                 ));
             }
             tokio::time::sleep(interval).await;
-            interval = (interval * 2).min(MAX_POLL);
+            interval = (interval * 2).min(max_poll);
         }
     }
 
@@ -1968,6 +2051,14 @@ impl CheckpointCoordinator {
             self.config.state_inline_threshold,
         );
 
+        if let Err(e) = self
+            .persist_source_offset_handoff(epoch, &manifest.source_offsets)
+            .await
+        {
+            self.pending_vnode_states.clear();
+            return Err(e);
+        }
+
         self.phase = CheckpointPhase::Persisting;
         if let Err(e) = self.save_manifest(Arc::new(manifest), state_data).await {
             self.pending_vnode_states.clear();
@@ -2166,6 +2257,21 @@ impl CheckpointCoordinator {
                     epoch,
                     start,
                     format!("vnode partial write failed: {e}"),
+                )
+                .await);
+        }
+
+        if let Err(e) = self
+            .persist_source_offset_handoff(epoch, &manifest.source_offsets)
+            .await
+        {
+            error!(checkpoint_id, epoch, error = %e, "source-offset handoff write failed");
+            return Ok(self
+                .fail_epoch(
+                    checkpoint_id,
+                    epoch,
+                    start,
+                    format!("source-offset handoff write failed: {e}"),
                 )
                 .await);
         }

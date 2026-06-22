@@ -432,9 +432,8 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         use crate::checkpoint::object_store_builder::ObjectStoreBuilderError;
 
         let c = StateBackendConfig::object_store("s3://bucket/path", "node-0");
-        let err = match c.build().await {
-            Ok(_) => panic!("s3 must not build without the aws feature"),
-            Err(e) => e,
+        let Err(err) = c.build().await else {
+            panic!("s3 must not build without the aws feature");
         };
         assert!(
             matches!(

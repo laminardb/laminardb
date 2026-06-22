@@ -336,6 +336,14 @@ impl LaminarDB {
                     .max_uncommitted_epochs
                     .unwrap_or(defaults.max_uncommitted_epochs),
                 uncommitted_epochs_backpressure: cp_config.uncommitted_epochs_backpressure,
+                restorable_gate_poll_initial: cp_config.restorable_gate_poll_initial_ms.map_or(
+                    defaults.restorable_gate_poll_initial,
+                    std::time::Duration::from_millis,
+                ),
+                restorable_gate_poll_max: cp_config.restorable_gate_poll_max_ms.map_or(
+                    defaults.restorable_gate_poll_max,
+                    std::time::Duration::from_millis,
+                ),
                 ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
@@ -1562,6 +1570,14 @@ impl LaminarDB {
                     );
                 }
             }
+
+            // Drive the B2 pre-rotation drain off the actual sinks: an exactly-once
+            // sink can't dedup a rotation duplicate, so a vnode rotation must pause
+            // the source at the checkpoint cut. (The DB-level `delivery_guarantee` is
+            // not set by the server, which configures delivery per sink.)
+            let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
+            self.rotation_drain_required
+                .store(has_eo_sink, std::sync::atomic::Ordering::Release);
         }
 
         let shutdown = self.shutdown_signal.clone();

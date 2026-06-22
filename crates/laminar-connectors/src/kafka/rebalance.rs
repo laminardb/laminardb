@@ -97,14 +97,9 @@ pub struct LaminarConsumerContext {
     /// this value using `Relaxed` ordering, and only locks the mutex when
     /// a change is detected.
     revoke_generation: Arc<AtomicU64>,
-    /// Shared flag indicating whether the reader task has paused Kafka
-    /// partitions for backpressure. On `Assign`, newly assigned partitions
-    /// must be re-paused if this flag is true.
-    reader_paused: Arc<AtomicBool>,
-    /// Snapshot of consumed offsets, updated once per `poll_batch()` cycle.
-    /// Read on Assign to seek newly assigned partitions to last-consumed
-    /// offset + 1, preventing duplicates after broker failures.
-    offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
+    /// Bumped on each Assign; the reader task seeks the newly-assigned partitions
+    /// from the poll loop (see the `KafkaSource` reader loop).
+    assign_generation: Arc<AtomicU64>,
     /// Counter bumped on every broker-confirmed commit. The on-checkpoint
     /// commit path issues `CommitMode::Sync`, so this is the authoritative
     /// success counter — `commit_callback` still fires for sync commits.
@@ -122,8 +117,7 @@ impl LaminarConsumerContext {
         rebalance_state: Arc<Mutex<RebalanceState>>,
         rebalance_metric: Arc<AtomicU64>,
         revoke_generation: Arc<AtomicU64>,
-        reader_paused: Arc<AtomicBool>,
-        offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
+        assign_generation: Arc<AtomicU64>,
         commits_counter: IntCounter,
         commit_failures_counter: IntCounter,
     ) -> Self {
@@ -133,8 +127,7 @@ impl LaminarConsumerContext {
             rebalance_state,
             rebalance_metric,
             revoke_generation,
-            reader_paused,
-            offset_snapshot,
+            assign_generation,
             commits_counter,
             commit_failures_counter,
         }
@@ -156,14 +149,6 @@ impl LaminarConsumerContext {
     fn lock_rebalance_state(&self) -> std::sync::MutexGuard<'_, RebalanceState> {
         self.rebalance_state.lock().unwrap_or_else(|poisoned| {
             warn!("rebalance_state mutex poisoned, recovering");
-            poisoned.into_inner()
-        })
-    }
-
-    /// Locks the offset snapshot, recovering from poison.
-    fn lock_offset_snapshot(&self) -> std::sync::MutexGuard<'_, super::offsets::OffsetTracker> {
-        self.offset_snapshot.lock().unwrap_or_else(|poisoned| {
-            warn!("offset_snapshot mutex poisoned, recovering");
             poisoned.into_inner()
         })
     }
@@ -257,58 +242,15 @@ impl ConsumerContext for LaminarConsumerContext {
         use rdkafka::consumer::Rebalance;
 
         if let Rebalance::Assign(tpl) = rebalance {
-            // Seek assigned partitions to tracked offsets so we don't fall
-            // back to broker-stored group offsets (which may be stale or
-            // reset to earliest after a broker failure).
-            //
-            // Uses seek_partitions() instead of assign() to avoid clobbering
-            // the partition set under cooperative rebalancing, where the tpl
-            // contains only NEWLY assigned partitions (not the full set).
-            let assigned: Vec<(String, i32)> = tpl
-                .elements()
-                .iter()
-                .map(|e| (e.topic().to_string(), e.partition()))
-                .collect();
-
-            let seek_tpl = self.lock_offset_snapshot().to_seek_tpl(&assigned);
-
-            if seek_tpl.count() > 0 {
-                // Non-zero timeout: Duration::ZERO returns "In Progress" for every partition.
-                match base_consumer.seek_partitions(seek_tpl, std::time::Duration::from_secs(10)) {
-                    Ok(result) => {
-                        let errors: Vec<_> = result
-                            .elements()
-                            .iter()
-                            .filter(|e| e.error().is_err())
-                            .map(|e| format!("{}[{}]: {:?}", e.topic(), e.partition(), e.error()))
-                            .collect();
-                        if errors.is_empty() {
-                            info!(
-                                partition_count = result.count(),
-                                "seeked assigned partitions to tracked offsets"
-                            );
-                        } else {
-                            warn!(?errors, "some partitions failed to seek to tracked offsets");
-                        }
-                    }
-                    Err(e) => warn!(
-                        error = %e,
-                        "failed to seek assigned partitions to tracked offsets"
-                    ),
-                }
+            // Pause the newly-assigned partitions so librdkafka can't fetch from
+            // the reset position before the reader loop seeks them to their
+            // checkpointed offsets; the reader resumes them after the seek. (Seeking
+            // here fails — the partitions aren't fetch-ready yet in the callback.)
+            if let Err(e) = base_consumer.pause(tpl) {
+                warn!(error = %e, "failed to pause newly assigned partitions for seek");
             }
-
-            // Re-pause newly assigned partitions if backpressure is active.
-            if self.reader_paused.load(Ordering::Acquire) {
-                if let Err(e) = base_consumer.pause(tpl) {
-                    warn!(error = %e, "failed to re-pause newly assigned partitions");
-                } else {
-                    info!(
-                        partition_count = tpl.count(),
-                        "re-paused newly assigned partitions (reader backpressure active)"
-                    );
-                }
-            }
+            // Signal the reader loop to seek + resume from the live poll loop.
+            self.assign_generation.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -386,8 +328,7 @@ mod tests {
         let state = Arc::new(Mutex::new(RebalanceState::new()));
         let metric = Arc::new(AtomicU64::new(0));
         let revoke_gen = Arc::new(AtomicU64::new(0));
-        let reader_paused = Arc::new(AtomicBool::new(false));
-        let offset_snapshot = Arc::new(Mutex::new(super::super::offsets::OffsetTracker::new()));
+        let assign_gen = Arc::new(AtomicU64::new(0));
         let commits = IntCounter::new("test_commits", "test").unwrap();
         let commit_failures = IntCounter::new("test_commit_failures", "test").unwrap();
         let ctx = LaminarConsumerContext::new(
@@ -395,8 +336,7 @@ mod tests {
             state,
             metric,
             revoke_gen,
-            reader_paused,
-            offset_snapshot,
+            assign_gen,
             commits,
             commit_failures,
         );

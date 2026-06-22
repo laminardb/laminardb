@@ -108,6 +108,8 @@ pub struct LaminarDB {
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
+    /// Set at pipeline start when a sink is exactly-once; gates the rotation drain.
+    pub(crate) rotation_drain_required: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Decoupled coordinated-commit committer task; aborted on shutdown.
     pub(crate) committer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -365,6 +367,7 @@ impl LaminarDB {
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
             committer_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
@@ -561,6 +564,7 @@ impl LaminarDB {
     /// Rehydration runs after the coordinator lock is released so a slow
     /// object-store read can't stall the checkpoint cadence.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // sequential rotation steps read better inline
     pub async fn adopt_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
@@ -589,8 +593,57 @@ impl LaminarDB {
 
         // Hold the coord mutex so registry + fence updates land between epochs.
         let mut guard = self.coordinator.lock().await;
+        // Re-check under the lock: a concurrent adopt may have advanced the version,
+        // which we must not regress.
+        if snapshot.version <= registry.assignment_version() {
+            return SnapshotAdoption {
+                adopted: false,
+                version: snapshot.version,
+                ..SnapshotAdoption::default()
+            };
+        }
+
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
+        // Compute from the new assignment before publishing it, so the Restoring marks
+        // below land before the ownership flip.
+        let newly_acquired: Vec<u32> = (0..vnode_count)
+            .filter(|&v| {
+                new_assignment.get(v as usize).copied() == Some(self_id) && !old_set.contains(&v)
+            })
+            .collect();
+
+        // Stage the sealed source offsets before the version bump (acquiring source
+        // resumes from the previous owner's cut). A handoff-read failure defers the
+        // rotation — exactly-once must not fall back to startup and re-emit.
+        if !newly_acquired.is_empty() {
+            if let Some(coord) = guard.as_ref() {
+                match coord.acquired_source_offsets().await {
+                    Ok(offsets) => registry.stage_resume_offsets(offsets),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e, version = snapshot.version,
+                            "source-offset handoff read failed; deferring rotation"
+                        );
+                        return SnapshotAdoption {
+                            adopted: false,
+                            version: snapshot.version,
+                            ..SnapshotAdoption::default()
+                        };
+                    }
+                }
+            }
+        }
+
+        // Mark Restoring before the ownership flip so emission stays suppressed as the
+        // shuffle starts routing rows here.
+        if !newly_acquired.is_empty() {
+            registry.mark_restoring(&newly_acquired);
+        }
+
         registry.set_assignment_and_version(new_assignment, snapshot.version);
+        // Rotation committed — drop the drain marks (revoked partitions are gone).
+        registry.clear_draining();
         let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
@@ -601,20 +654,6 @@ impl LaminarDB {
             coord.set_gate_vnode_set((0..vnode_count).collect());
         }
         drop(guard);
-
-        let old_set: std::collections::HashSet<u32> = old_owned.into_iter().collect();
-        let newly_acquired: Vec<u32> = new_owned
-            .into_iter()
-            .filter(|v| !old_set.contains(v))
-            .collect();
-
-        // Mark Restoring before the (slow) durable read so the operator suppresses
-        // emission from the moment the shuffle starts routing rows here. Vnodes
-        // with no durable state flip back to Active immediately; staged ones stay
-        // Restoring until the graph applies their state.
-        if !newly_acquired.is_empty() {
-            registry.mark_restoring(&newly_acquired);
-        }
 
         let mut adoption = SnapshotAdoption {
             adopted: true,
@@ -660,6 +699,56 @@ impl LaminarDB {
             "adopted assignment snapshot",
         );
         adoption
+    }
+
+    /// Mark the vnodes this node is about to lose as draining (source pauses their
+    /// partitions for a clean checkpoint cut); does NOT change ownership. Returns
+    /// them so the leader can wait on the drain. The committed snapshot rotates
+    /// ownership later via [`adopt_assignment_snapshot`](Self::adopt_assignment_snapshot).
+    #[cfg(feature = "cluster")]
+    pub fn adopt_draining_snapshot(
+        &self,
+        snapshot: &laminar_core::cluster::control::AssignmentSnapshot,
+    ) -> Vec<u32> {
+        let Some(registry) = self.vnode_registry.lock().clone() else {
+            return Vec::new();
+        };
+        let vnode_count = registry.vnode_count();
+        let self_id = self
+            .cluster_controller
+            .lock()
+            .as_ref()
+            .map_or(laminar_core::state::NodeId(0), |c| {
+                laminar_core::state::NodeId(c.instance_id().0)
+            });
+        let next = snapshot.to_vnode_vec(vnode_count);
+        let revoking: Vec<u32> = (0..vnode_count)
+            .filter(|&v| {
+                registry.owner(v) == self_id && next.get(v as usize).copied() != Some(self_id)
+            })
+            .collect();
+        // Reset first so only this snapshot's revoking set stays marked (a newer
+        // draining snapshot may skip the committed snapshot that would have cleared
+        // the previous marks).
+        registry.clear_draining();
+        if !revoking.is_empty() {
+            tracing::info!(
+                count = revoking.len(),
+                version = snapshot.version,
+                "pre-rotation drain: pausing source for revoking vnodes"
+            );
+            registry.mark_draining(&revoking);
+        }
+        revoking
+    }
+
+    /// Whether vnode rotations run the pre-rotation source drain — true when a sink
+    /// is exactly-once, so the old owner stops at the checkpoint cut rather than
+    /// emitting past the sealed offset. At-least-once pipelines skip it.
+    #[must_use]
+    pub fn requires_rotation_drain(&self) -> bool {
+        self.rotation_drain_required
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Staged vnode state from the most recent rebalance adoptions, keyed by vnode.

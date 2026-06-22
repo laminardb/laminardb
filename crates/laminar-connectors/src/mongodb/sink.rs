@@ -155,6 +155,27 @@ impl MongoDbSink {
         (docs, byte_estimate)
     }
 
+    /// Arrow batches → BSON documents directly (no `serde_json::Value` hop), for the
+    /// insert/upsert/replace paths. Returns `(docs, byte_estimate)`.
+    #[cfg(feature = "mongodb-cdc")]
+    fn batches_to_bson_docs(&self) -> (Vec<mongodb::bson::Document>, u64) {
+        let mut docs = Vec::with_capacity(self.buffered_rows);
+        let mut bytes: u64 = 0;
+        for batch in &self.buffer {
+            let schema = batch.schema();
+            for row in 0..batch.num_rows() {
+                let mut doc = mongodb::bson::Document::new();
+                for (col_idx, field) in schema.fields().iter().enumerate() {
+                    let value = arrow_value_to_bson(batch.column(col_idx), row);
+                    bytes += bson_size(&value) + field.name().len() as u64;
+                    doc.insert(field.name().clone(), value);
+                }
+                docs.push(doc);
+            }
+        }
+        (docs, bytes)
+    }
+
     /// Clears the internal buffer after a flush.
     fn clear_buffer(&mut self) {
         self.buffer.clear();
@@ -170,21 +191,30 @@ impl MongoDbSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        let (docs, byte_estimate) = self.batches_to_json_docs();
-        let doc_count = docs.len();
-
+        // CDC replay parses a JSON envelope (_op/_full_document/_update_desc), so it
+        // keeps the serde_json path; every other mode goes Arrow → BSON directly.
         #[cfg(feature = "mongodb-cdc")]
-        {
-            self.write_docs(&docs).await?;
-        }
+        let (doc_count, byte_estimate) = if matches!(self.config.write_mode, WriteMode::CdcReplay) {
+            let (docs, bytes) = self.batches_to_json_docs();
+            let n = docs.len();
+            self.write_cdc_docs(&docs).await?;
+            (n, bytes)
+        } else {
+            let (docs, bytes) = self.batches_to_bson_docs();
+            let n = docs.len();
+            self.write_bson_docs(docs).await?;
+            (n, bytes)
+        };
 
         #[cfg(not(feature = "mongodb-cdc"))]
-        {
+        let (doc_count, byte_estimate) = {
+            let (docs, bytes) = self.batches_to_json_docs();
             debug!(
-                count = doc_count,
+                count = docs.len(),
                 "flush (no-op without mongodb-cdc feature)"
             );
-        }
+            (docs.len(), bytes)
+        };
 
         self.metrics.record_flush(doc_count as u64, byte_estimate);
         self.clear_buffer();
@@ -223,6 +253,9 @@ fn arrow_value_to_json(col: &dyn arrow_array::Array, row: usize) -> serde_json::
             let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
             serde_json::Value::String(arr.value(row).to_string())
         }
+        DataType::Timestamp(..) => serde_json::json!({
+            "$date": { "$numberLong": timestamp_millis(col, row).to_string() }
+        }),
         _ => {
             // Fallback: use Arrow's display format.
             let formatted = arrow_cast::display::ArrayFormatter::try_new(
@@ -275,9 +308,149 @@ fn json_from_float(col: &dyn arrow_array::Array, row: usize) -> serde_json::Valu
     }
 }
 
+/// Milliseconds since epoch for a timestamp column cell, normalizing the unit.
+/// Sub-millisecond precision is truncated (BSON dates are millisecond-resolution).
+fn timestamp_millis(col: &dyn arrow_array::Array, row: usize) -> i64 {
+    use arrow_array::{
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    let DataType::Timestamp(unit, _) = col.data_type() else {
+        return 0;
+    };
+    let a = col.as_any();
+    match unit {
+        arrow_schema::TimeUnit::Second => {
+            a.downcast_ref::<TimestampSecondArray>().unwrap().value(row) * 1000
+        }
+        arrow_schema::TimeUnit::Millisecond => a
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap()
+            .value(row),
+        arrow_schema::TimeUnit::Microsecond => {
+            a.downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(row)
+                / 1000
+        }
+        arrow_schema::TimeUnit::Nanosecond => {
+            a.downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(row)
+                / 1_000_000
+        }
+    }
+}
+
+/// Convert one Arrow cell straight to BSON for the insert/upsert/replace paths,
+/// skipping the `serde_json::Value` intermediate (and the number string round-trip)
+/// that the CDC path still needs. Integers stay width-faithful; timestamps become
+/// BSON dates; anything without a native BSON scalar falls back to a display string.
+#[cfg(feature = "mongodb-cdc")]
+fn arrow_value_to_bson(col: &dyn arrow_array::Array, row: usize) -> mongodb::bson::Bson {
+    use arrow_array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        LargeStringArray, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use mongodb::bson::Bson;
+
+    if col.is_null(row) {
+        return Bson::Null;
+    }
+    let a = col.as_any();
+    let i32_of = |v: i32| Bson::Int32(v);
+    match col.data_type() {
+        DataType::Boolean => Bson::Boolean(a.downcast_ref::<BooleanArray>().unwrap().value(row)),
+        DataType::Int8 => i32_of(i32::from(a.downcast_ref::<Int8Array>().unwrap().value(row))),
+        DataType::Int16 => i32_of(i32::from(
+            a.downcast_ref::<Int16Array>().unwrap().value(row),
+        )),
+        DataType::Int32 => i32_of(a.downcast_ref::<Int32Array>().unwrap().value(row)),
+        DataType::Int64 => Bson::Int64(a.downcast_ref::<Int64Array>().unwrap().value(row)),
+        DataType::UInt8 => i32_of(i32::from(
+            a.downcast_ref::<UInt8Array>().unwrap().value(row),
+        )),
+        DataType::UInt16 => i32_of(i32::from(
+            a.downcast_ref::<UInt16Array>().unwrap().value(row),
+        )),
+        DataType::UInt32 => Bson::Int64(i64::from(
+            a.downcast_ref::<UInt32Array>().unwrap().value(row),
+        )),
+        DataType::UInt64 => {
+            let v = a.downcast_ref::<UInt64Array>().unwrap().value(row);
+            i64::try_from(v).map_or_else(|_| Bson::String(v.to_string()), Bson::Int64)
+        }
+        DataType::Float32 => Bson::Double(f64::from(
+            a.downcast_ref::<Float32Array>().unwrap().value(row),
+        )),
+        DataType::Float64 => Bson::Double(a.downcast_ref::<Float64Array>().unwrap().value(row)),
+        DataType::Utf8 => Bson::String(
+            a.downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::LargeUtf8 => Bson::String(
+            a.downcast_ref::<LargeStringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Timestamp(..) => Bson::DateTime(mongodb::bson::DateTime::from_millis(
+            timestamp_millis(col, row),
+        )),
+        _ => match arrow_cast::display::ArrayFormatter::try_new(
+            col,
+            &arrow_cast::display::FormatOptions::default(),
+        ) {
+            Ok(fmt) => Bson::String(fmt.value(row).to_string()),
+            Err(_) => Bson::Null,
+        },
+    }
+}
+
+/// Rough wire-size of a scalar BSON value, for the throughput metric (avoids a
+/// serialization pass just to count bytes).
+#[cfg(feature = "mongodb-cdc")]
+fn bson_size(v: &mongodb::bson::Bson) -> u64 {
+    use mongodb::bson::Bson;
+    match v {
+        Bson::String(s) => s.len() as u64 + 5,
+        Bson::Boolean(_) | Bson::Int32(_) => 5,
+        Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_) => 9,
+        Bson::Null => 1,
+        _ => 16,
+    }
+}
+
+/// Convert a JSON value to BSON, interpreting `MongoDB` Extended JSON (e.g. the
+/// `$date` emitted for timestamp columns). serde's structural `to_bson`/`to_document`
+/// would store `$date` as a literal sub-document, not a BSON date.
+#[cfg(feature = "mongodb-cdc")]
+fn json_to_bson(value: &serde_json::Value) -> Result<mongodb::bson::Bson, ConnectorError> {
+    mongodb::bson::Bson::try_from(value.clone())
+        .map_err(|e| ConnectorError::WriteError(format!("JSON to BSON: {e}")))
+}
+
+#[cfg(feature = "mongodb-cdc")]
+fn json_to_bson_document(
+    value: &serde_json::Value,
+) -> Result<mongodb::bson::Document, ConnectorError> {
+    match json_to_bson(value)? {
+        mongodb::bson::Bson::Document(doc) => Ok(doc),
+        other => Err(ConnectorError::WriteError(format!(
+            "expected a BSON document, got {:?}",
+            other.element_type()
+        ))),
+    }
+}
+
 #[async_trait]
 impl SinkConnector for MongoDbSink {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if !config.properties().is_empty() {
+            self.config = MongoDbSinkConfig::from_config(config)?;
+        }
         self.config.validate()?;
 
         #[cfg(feature = "mongodb-cdc")]
@@ -495,46 +668,38 @@ impl MongoDbSink {
     /// Writes JSON value documents to `MongoDB` using the configured write mode.
     ///
     /// Accepts `serde_json::Value` directly (no intermediate string round-trip).
-    #[allow(clippy::too_many_lines)]
-    async fn write_docs(&self, docs: &[serde_json::Value]) -> Result<(), ConnectorError> {
-        use mongodb::bson::{doc, Document};
+    /// Insert/upsert/replace from documents already in BSON (no JSON hop). CDC
+    /// replay goes through [`write_cdc_docs`](Self::write_cdc_docs) instead.
+    async fn write_bson_docs(
+        &self,
+        docs: Vec<mongodb::bson::Document>,
+    ) -> Result<(), ConnectorError> {
+        use mongodb::bson::{doc, Bson, Document};
 
         let collection = self
             .collection
             .as_ref()
             .ok_or_else(|| ConnectorError::Internal("collection not initialized".to_string()))?;
+        let count = docs.len() as u64;
 
         match &self.config.write_mode {
             WriteMode::Insert => {
-                let bson_docs: Vec<Document> = docs
-                    .iter()
-                    .map(|v| {
-                        mongodb::bson::to_document(v)
-                            .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
                 let opts = mongodb::options::InsertManyOptions::builder()
                     .ordered(Some(self.config.ordered))
                     .build();
-
                 collection
-                    .insert_many(bson_docs)
+                    .insert_many(docs)
                     .with_options(opts)
                     .await
                     .map_err(|e| {
                         self.metrics.record_error();
                         ConnectorError::WriteError(format!("insert_many: {e}"))
                     })?;
-
-                self.metrics.record_inserts(docs.len() as u64);
+                self.metrics.record_inserts(count);
             }
 
             WriteMode::Upsert { ref key_fields } => {
-                for val in docs {
-                    let bson_doc = mongodb::bson::to_document(val)
-                        .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))?;
-
+                for bson_doc in docs {
                     let mut filter = Document::new();
                     for key in key_fields {
                         if let Some(v) = bson_doc.get(key) {
@@ -547,11 +712,9 @@ impl MongoDbSink {
                              exist in the document"
                         )));
                     }
-
                     let opts = mongodb::options::ReplaceOptions::builder()
                         .upsert(Some(true))
                         .build();
-
                     collection
                         .replace_one(filter, bson_doc)
                         .with_options(opts)
@@ -561,20 +724,14 @@ impl MongoDbSink {
                             ConnectorError::WriteError(format!("upsert: {e}"))
                         })?;
                 }
-
-                self.metrics.record_upserts(docs.len() as u64);
+                self.metrics.record_upserts(count);
             }
 
             WriteMode::Replace { upsert_on_missing } => {
-                for val in docs {
-                    let bson_doc = mongodb::bson::to_document(val)
-                        .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))?;
-
-                    // Use _id as the filter for replacement.
+                let upsert = *upsert_on_missing;
+                for bson_doc in docs {
                     let filter = match bson_doc.get("_id") {
-                        Some(id) if *id != mongodb::bson::Bson::Null => {
-                            doc! { "_id": id.clone() }
-                        }
+                        Some(id) if *id != Bson::Null => doc! { "_id": id.clone() },
                         _ => {
                             return Err(ConnectorError::WriteError(
                                 "Replace mode requires a non-null _id field in document"
@@ -582,11 +739,9 @@ impl MongoDbSink {
                             ));
                         }
                     };
-
                     let opts = mongodb::options::ReplaceOptions::builder()
-                        .upsert(Some(*upsert_on_missing))
+                        .upsert(Some(upsert))
                         .build();
-
                     collection
                         .replace_one(filter, bson_doc)
                         .with_options(opts)
@@ -596,102 +751,103 @@ impl MongoDbSink {
                             ConnectorError::WriteError(format!("replace: {e}"))
                         })?;
                 }
+                // replace_one with upsert is an upsert; count it like Upsert mode.
+                self.metrics.record_upserts(count);
             }
 
             WriteMode::CdcReplay => {
-                // CDC replay processes each document based on its _op field.
-                for val in docs {
-                    let op = val.get("_op").and_then(|v| v.as_str()).unwrap_or("I");
+                return Err(ConnectorError::Internal(
+                    "CDC replay must go through write_cdc_docs".to_string(),
+                ));
+            }
+        }
 
-                    match op {
-                        "I" => {
-                            let full_doc = Self::parse_cdc_field(val, "_full_document")?;
-                            let bson_doc = mongodb::bson::to_document(full_doc.as_ref())
-                                .map_err(|e| ConnectorError::WriteError(format!("to BSON: {e}")))?;
-                            collection.insert_one(bson_doc).await.map_err(|e| {
-                                ConnectorError::WriteError(format!("cdc insert: {e}"))
-                            })?;
-                            self.metrics.record_inserts(1);
-                        }
-                        "U" => {
-                            let dk = Self::parse_cdc_field(val, "_document_key")?;
-                            let ud = Self::parse_cdc_field(val, "_update_desc")?;
-                            let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("filter BSON: {e}"))
-                            })?;
+        self.metrics.record_bulk_write();
+        Ok(())
+    }
 
-                            // Transform updateDescription into update operators.
-                            // Raw format: { "updatedFields": {...}, "removedFields": [...] }
-                            // Required:   { "$set": {...}, "$unset": {...} }
-                            let mut update = mongodb::bson::Document::new();
-                            if let Some(updated) = ud.get("updatedFields") {
-                                let bson = mongodb::bson::to_bson(updated).map_err(|e| {
-                                    ConnectorError::WriteError(format!("updatedFields BSON: {e}"))
-                                })?;
-                                update.insert("$set", bson);
-                            }
-                            if let Some(removed) =
-                                ud.get("removedFields").and_then(|v| v.as_array())
-                            {
-                                if !removed.is_empty() {
-                                    let unset_doc: mongodb::bson::Document = removed
-                                        .iter()
-                                        .filter_map(|f| f.as_str())
-                                        .map(|f| {
-                                            (
-                                                f.to_string(),
-                                                mongodb::bson::Bson::String(String::new()),
-                                            )
-                                        })
-                                        .collect();
-                                    update.insert("$unset", unset_doc);
-                                }
-                            }
-                            if update.is_empty() {
-                                continue;
-                            }
+    /// CDC replay: each doc is a changelog envelope (`_op`/`_full_document`/
+    /// `_document_key`/`_update_desc`) applied as the matching `MongoDB` op.
+    #[allow(clippy::too_many_lines)]
+    async fn write_cdc_docs(&self, docs: &[serde_json::Value]) -> Result<(), ConnectorError> {
+        let collection = self
+            .collection
+            .as_ref()
+            .ok_or_else(|| ConnectorError::Internal("collection not initialized".to_string()))?;
 
-                            collection.update_one(filter, update).await.map_err(|e| {
-                                ConnectorError::WriteError(format!("cdc update: {e}"))
-                            })?;
-                            self.metrics.record_upserts(1);
-                        }
-                        "R" => {
-                            let dk = Self::parse_cdc_field(val, "_document_key")?;
-                            let full_doc = Self::parse_cdc_field(val, "_full_document")?;
-                            let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("filter BSON: {e}"))
-                            })?;
-                            let replacement = mongodb::bson::to_document(full_doc.as_ref())
-                                .map_err(|e| {
-                                    ConnectorError::WriteError(format!("replace BSON: {e}"))
-                                })?;
-                            let opts = mongodb::options::ReplaceOptions::builder()
-                                .upsert(Some(true))
-                                .build();
-                            collection
-                                .replace_one(filter, replacement)
-                                .with_options(opts)
-                                .await
-                                .map_err(|e| {
-                                    ConnectorError::WriteError(format!("cdc replace: {e}"))
-                                })?;
-                            self.metrics.record_upserts(1);
-                        }
-                        "D" => {
-                            let dk = Self::parse_cdc_field(val, "_document_key")?;
-                            let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("filter BSON: {e}"))
-                            })?;
-                            collection.delete_one(filter).await.map_err(|e| {
-                                ConnectorError::WriteError(format!("cdc delete: {e}"))
-                            })?;
-                            self.metrics.record_deletes(1);
-                        }
-                        _ => {
-                            debug!(op = op, "lifecycle event — no write issued");
+        for val in docs {
+            let op = val.get("_op").and_then(|v| v.as_str()).unwrap_or("I");
+
+            match op {
+                "I" => {
+                    let full_doc = Self::parse_cdc_field(val, "_full_document")?;
+                    let bson_doc = json_to_bson_document(full_doc.as_ref())?;
+                    collection
+                        .insert_one(bson_doc)
+                        .await
+                        .map_err(|e| ConnectorError::WriteError(format!("cdc insert: {e}")))?;
+                    self.metrics.record_inserts(1);
+                }
+                "U" => {
+                    let dk = Self::parse_cdc_field(val, "_document_key")?;
+                    let ud = Self::parse_cdc_field(val, "_update_desc")?;
+                    let filter = json_to_bson_document(dk.as_ref())?;
+
+                    // Transform updateDescription into update operators.
+                    // Raw format: { "updatedFields": {...}, "removedFields": [...] }
+                    // Required:   { "$set": {...}, "$unset": {...} }
+                    let mut update = mongodb::bson::Document::new();
+                    if let Some(updated) = ud.get("updatedFields") {
+                        update.insert("$set", json_to_bson(updated)?);
+                    }
+                    if let Some(removed) = ud.get("removedFields").and_then(|v| v.as_array()) {
+                        if !removed.is_empty() {
+                            let unset_doc: mongodb::bson::Document = removed
+                                .iter()
+                                .filter_map(|f| f.as_str())
+                                .map(|f| {
+                                    (f.to_string(), mongodb::bson::Bson::String(String::new()))
+                                })
+                                .collect();
+                            update.insert("$unset", unset_doc);
                         }
                     }
+                    if update.is_empty() {
+                        continue;
+                    }
+
+                    collection
+                        .update_one(filter, update)
+                        .await
+                        .map_err(|e| ConnectorError::WriteError(format!("cdc update: {e}")))?;
+                    self.metrics.record_upserts(1);
+                }
+                "R" => {
+                    let dk = Self::parse_cdc_field(val, "_document_key")?;
+                    let full_doc = Self::parse_cdc_field(val, "_full_document")?;
+                    let filter = json_to_bson_document(dk.as_ref())?;
+                    let replacement = json_to_bson_document(full_doc.as_ref())?;
+                    let opts = mongodb::options::ReplaceOptions::builder()
+                        .upsert(Some(true))
+                        .build();
+                    collection
+                        .replace_one(filter, replacement)
+                        .with_options(opts)
+                        .await
+                        .map_err(|e| ConnectorError::WriteError(format!("cdc replace: {e}")))?;
+                    self.metrics.record_upserts(1);
+                }
+                "D" => {
+                    let dk = Self::parse_cdc_field(val, "_document_key")?;
+                    let filter = json_to_bson_document(dk.as_ref())?;
+                    collection
+                        .delete_one(filter)
+                        .await
+                        .map_err(|e| ConnectorError::WriteError(format!("cdc delete: {e}")))?;
+                    self.metrics.record_deletes(1);
+                }
+                _ => {
+                    debug!(op = op, "lifecycle event — no write issued");
                 }
             }
         }
@@ -779,6 +935,38 @@ mod tests {
 
         assert_eq!(docs[0]["id"], 0);
         assert_eq!(docs[0]["name"], "user_0");
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn timestamp_column_becomes_bson_date() {
+        let arr = arrow_array::TimestampMillisecondArray::from(vec![1_700_000_000_000_i64]);
+        let json = arrow_value_to_json(&arr, 0);
+        match json_to_bson(&json).unwrap() {
+            mongodb::bson::Bson::DateTime(dt) => {
+                assert_eq!(dt.timestamp_millis(), 1_700_000_000_000);
+            }
+            other => panic!("expected BSON DateTime, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn arrow_to_bson_maps_scalar_types() {
+        use mongodb::bson::Bson;
+        let ts = arrow_array::TimestampMillisecondArray::from(vec![Some(1_700_000_000_000), None]);
+        assert!(
+            matches!(arrow_value_to_bson(&ts, 0), Bson::DateTime(dt) if dt.timestamp_millis() == 1_700_000_000_000)
+        );
+        assert_eq!(arrow_value_to_bson(&ts, 1), Bson::Null);
+        assert_eq!(
+            arrow_value_to_bson(&Int64Array::from(vec![42]), 0),
+            Bson::Int64(42)
+        );
+        assert_eq!(
+            arrow_value_to_bson(&StringArray::from(vec!["x"]), 0),
+            Bson::String("x".to_string())
+        );
     }
 
     #[test]

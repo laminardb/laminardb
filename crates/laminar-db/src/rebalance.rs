@@ -31,6 +31,12 @@ pub struct RebalanceConfig {
     pub checkpoint_timeout: Duration,
     /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
+    /// Bound on waiting for all live nodes to ack the draining snapshot before the
+    /// pre-rotation checkpoint; on timeout the rotation aborts. Must exceed `watcher_poll`.
+    pub drain_ack_timeout: Duration,
+    /// Settle after the drain acks so the source reacts and buffered records flush,
+    /// before the checkpoint cut. Exactly-once only.
+    pub drain_settle: Duration,
     /// Locality tier the placement metrics group by (0 = coarsest).
     pub placement_isolation_tier: usize,
 }
@@ -46,6 +52,8 @@ impl Default for RebalanceConfig {
             // rotation is what restores commit availability).
             checkpoint_timeout: Duration::from_secs(15),
             retry_delay: Duration::from_secs(2),
+            drain_ack_timeout: Duration::from_secs(10),
+            drain_settle: Duration::from_secs(1),
             placement_isolation_tier: 0,
         }
     }
@@ -61,6 +69,8 @@ impl RebalanceConfig {
             rebalance_debounce: Duration::from_millis(500),
             checkpoint_timeout: Duration::from_secs(30),
             retry_delay: Duration::from_millis(500),
+            drain_ack_timeout: Duration::from_secs(5),
+            drain_settle: Duration::from_millis(300),
             placement_isolation_tier: 0,
         }
     }
@@ -95,6 +105,9 @@ pub fn spawn_snapshot_watcher(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await; // burn the immediate first tick
         let mut published_version = 0;
+        // Highest draining snapshot already adopted; a draining snapshot doesn't
+        // bump the registry version, so this prevents re-adopting it every tick.
+        let mut last_drained = 0u64;
         loop {
             tokio::select! {
                 biased;
@@ -114,7 +127,21 @@ pub fn spawn_snapshot_watcher(
 
             if remote_newer {
                 match store.load().await {
-                    Ok(Some(snap)) if snap.version > local => {
+                    // Drain phase: pause the partitions of vnodes we're about to
+                    // lose; ownership is unchanged so the registry version stays put.
+                    Ok(Some(snap))
+                        if snap.draining
+                            && snap.version > local
+                            && snap.version != last_drained =>
+                    {
+                        last_drained = snap.version;
+                        db.adopt_draining_snapshot(&snap);
+                        // Ack so the leader knows we've paused before it checkpoints.
+                        if let Some(ref c) = controller {
+                            c.announce_drained_version(snap.version).await;
+                        }
+                    }
+                    Ok(Some(snap)) if !snap.draining && snap.version > local => {
                         debug!(local, remote = snap.version, "adopting newer assignment");
                         let adoption = db.adopt_assignment_snapshot(snap).await;
                         log_adoption("watcher", &adoption);
@@ -323,26 +350,128 @@ async fn try_rebalance(
             "rotation sheds a dead node — skipping the pre-rotation drain \
              checkpoint (it cannot seal without the dead node's captures)"
         );
-    } else {
-        let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
+    }
+
+    // Exactly-once handoff: publish a draining snapshot so every node pauses the
+    // partitions it's losing, settle, then checkpoint as a clean cut. Skipped when
+    // shedding a dead node (it can't drain) or when not exactly-once.
+    if !shedding_dead && db.requires_rotation_drain() {
+        let mut drain = current.next(new_vnodes.clone());
+        drain.draining = true;
+        match store
+            .save_if_version(&drain, current.version)
             .await
-            .map_err(|_| {
-                format!(
-                    "pre-rotation checkpoint did not complete within {}s",
-                    config.checkpoint_timeout.as_secs()
-                )
-            })?
-            .map_err(|e| e.to_string())?;
-        if !ckpt.success {
-            return Err(ckpt
-                .error
-                .unwrap_or_else(|| "checkpoint returned success=false".into()));
+            .map_err(|e| e.to_string())?
+        {
+            RotateOutcome::Rotated => {
+                db.adopt_draining_snapshot(&drain);
+                controller.announce_snapshot_version(drain.version).await;
+                controller.announce_drained_version(drain.version).await;
+                // Wait for every live node to ack the pause before checkpointing —
+                // a fixed sleep would race the watcher poll and capture un-paused nodes.
+                let acked =
+                    await_drain_quorum(controller, live, drain.version, config.drain_ack_timeout)
+                        .await;
+                if !acked {
+                    let abort = drain.next(current.vnodes.clone());
+                    let _ = commit_snapshot(db, store, controller, abort, drain.version).await;
+                    return Err("drain ack quorum not reached before timeout".into());
+                }
+                tokio::time::sleep(config.drain_settle).await;
+                // Abort the drain on failure OR timeout (not just Ok(false)) — a bare
+                // `?` here would leave nodes stuck draining.
+                let checkpointed = pre_rotation_checkpoint(db, config).await;
+                if !matches!(checkpointed, Ok(true)) {
+                    let abort = drain.next(current.vnodes.clone());
+                    let _ = commit_snapshot(db, store, controller, abort, drain.version).await;
+                    return Err(checkpointed
+                        .err()
+                        .unwrap_or_else(|| "pre-rotation checkpoint failed during drain".into()));
+                }
+                let commit = drain.next(new_vnodes);
+                return commit_snapshot(db, store, controller, commit, drain.version).await;
+            }
+            RotateOutcome::Conflict(winner) => {
+                let v = winner.version;
+                adopt_any(db, winner).await;
+                controller.announce_snapshot_version(v).await;
+                return Ok(Some(v));
+            }
         }
     }
 
-    let proposal = current.next(new_vnodes);
+    // Single-phase path: dead-node shedding, or a non-exactly-once pipeline that
+    // tolerates the bounded rotation duplicate.
+    if !shedding_dead && !pre_rotation_checkpoint(db, config).await? {
+        return Err("pre-rotation checkpoint returned success=false".into());
+    }
+    commit_snapshot(
+        db,
+        store,
+        controller,
+        current.next(new_vnodes),
+        current.version,
+    )
+    .await
+}
+
+/// Run the pre-rotation checkpoint with the configured timeout. `Ok(true)` on a
+/// successful seal, `Ok(false)` if the checkpoint ran but did not succeed.
+async fn pre_rotation_checkpoint(
+    db: &Arc<LaminarDB>,
+    config: RebalanceConfig,
+) -> Result<bool, String> {
+    let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
+        .await
+        .map_err(|_| {
+            format!(
+                "pre-rotation checkpoint did not complete within {}s",
+                config.checkpoint_timeout.as_secs()
+            )
+        })?
+        .map_err(|e| e.to_string())?;
+    Ok(ckpt.success)
+}
+
+/// Wait until every node in `live` has gossip-acked it adopted draining `version`
+/// (paused its revoking partitions). Returns false on timeout. Polls because the
+/// ack arrives via gossip after each node's watcher observes the draining snapshot.
+async fn await_drain_quorum(
+    controller: &Arc<ClusterController>,
+    live: &[NodeId],
+    version: u64,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let acked: std::collections::HashSet<NodeId> = controller
+                .read_drained_versions()
+                .await
+                .into_iter()
+                .filter(|(_, v)| *v >= version)
+                .map(|(n, _)| n)
+                .collect();
+            if live.iter().all(|n| acked.contains(n)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// CAS a committed (non-draining) snapshot, adopt it, announce, and prune. On a
+/// CAS conflict adopt the winner instead and let the next cycle re-evaluate.
+async fn commit_snapshot(
+    db: &Arc<LaminarDB>,
+    store: &Arc<AssignmentSnapshotStore>,
+    controller: &Arc<ClusterController>,
+    proposal: AssignmentSnapshot,
+    prev_version: u64,
+) -> Result<Option<u64>, String> {
     match store
-        .save_if_version(&proposal, current.version)
+        .save_if_version(&proposal, prev_version)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -352,19 +481,27 @@ async fn try_rebalance(
             log_adoption("rebalance", &adoption);
             controller.announce_snapshot_version(v).await;
             // Retain [v-1, v] as slack for in-flight readers.
-            let prune = v.saturating_sub(1);
-            if let Err(e) = store.prune_before(prune).await {
+            if let Err(e) = store.prune_before(v.saturating_sub(1)).await {
                 warn!(error = %e, "snapshot prune failed");
             }
             Ok(Some(v))
         }
         RotateOutcome::Conflict(winner) => {
             let v = winner.version;
-            let adoption = db.adopt_assignment_snapshot(winner).await;
-            log_adoption("rebalance-conflict", &adoption);
+            adopt_any(db, winner).await;
             controller.announce_snapshot_version(v).await;
             Ok(Some(v))
         }
+    }
+}
+
+/// Adopt a snapshot whether it is a draining or a committed one.
+async fn adopt_any(db: &Arc<LaminarDB>, snap: AssignmentSnapshot) {
+    if snap.draining {
+        db.adopt_draining_snapshot(&snap);
+    } else {
+        let adoption = db.adopt_assignment_snapshot(snap).await;
+        log_adoption("rebalance-conflict", &adoption);
     }
 }
 

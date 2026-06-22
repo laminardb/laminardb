@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -82,6 +82,13 @@ impl VnodeLifecycleState {
     }
 }
 
+/// Opaque source-checkpoint offsets (connector-defined `"key" -> "value"`
+/// strings) staged for a rotation handoff. A private alias keeps the single
+/// `disallowed_types` exception (cold path, mirrors the checkpoint map shape) in
+/// one place rather than blanket-allowing this perf-sensitive module.
+#[allow(clippy::disallowed_types)]
+type ResumeOffsets = std::collections::HashMap<String, String>;
+
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
     vnode_count: u32,
@@ -93,6 +100,19 @@ pub struct VnodeRegistry {
     /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
     /// on boot, so adding it never touches a wire format.
     lifecycle: Arc<[AtomicU8]>,
+    /// Per-vnode "draining" flag, set on a vnode this node is about to lose in a
+    /// rotation so a partitioned source pauses that vnode's input until the cut.
+    /// Orthogonal to `lifecycle`: a draining vnode is still owned and still emits;
+    /// it only stops *consuming*. `draining_generation` lets the source detect a
+    /// change lock-free without an assignment-version bump.
+    draining: Arc<[AtomicBool]>,
+    draining_generation: AtomicU64,
+    /// Opaque source-checkpoint offsets (connector-defined key/value strings)
+    /// staged by the engine just before an assignment-version bump. A partitioned
+    /// source reads them on rebind to resume partitions it is acquiring from the
+    /// previous owner's sealed position instead of `auto.offset.reset`. The engine
+    /// stays connector-agnostic; the source interprets the keys.
+    resume_offsets: parking_lot::Mutex<Arc<ResumeOffsets>>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -125,6 +145,9 @@ impl VnodeRegistry {
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
+            draining: new_draining(vnode_count),
+            draining_generation: AtomicU64::new(0),
+            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
     }
 
@@ -145,7 +168,29 @@ impl VnodeRegistry {
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
+            draining: new_draining(vnode_count),
+            draining_generation: AtomicU64::new(0),
+            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
+    }
+
+    /// Stage opaque source-checkpoint offsets for the next rebind. MUST be called
+    /// before [`set_assignment_and_version`](Self::set_assignment_and_version) so
+    /// the source observes them. Replaces any prior staging; an empty map is
+    /// ignored so a transient load failure can't clobber a good snapshot.
+    pub fn stage_resume_offsets(&self, offsets: ResumeOffsets) {
+        if offsets.is_empty() {
+            return;
+        }
+        *self.resume_offsets.lock() = Arc::new(offsets);
+    }
+
+    /// The staged source-checkpoint offsets (see
+    /// [`stage_resume_offsets`](Self::stage_resume_offsets)). Reads (does not
+    /// drain), so every source on this node sees the same snapshot on rebind.
+    #[must_use]
+    pub fn resume_offsets(&self) -> Arc<ResumeOffsets> {
+        Arc::clone(&self.resume_offsets.lock())
     }
 
     /// Number of vnodes.
@@ -283,11 +328,55 @@ impl VnodeRegistry {
             })
             .collect()
     }
+
+    /// Mark `vnodes` as draining for a pending rotation so a partitioned source
+    /// pauses their input until the pre-rotation checkpoint cut. Out-of-range ids
+    /// are ignored. Bumps the draining generation so the source observes it.
+    pub fn mark_draining(&self, vnodes: &[u32]) {
+        for &v in vnodes {
+            if let Some(slot) = self.draining.get(v as usize) {
+                slot.store(true, Ordering::Release);
+            }
+        }
+        self.draining_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Clear every draining flag (rotation committed or aborted). Bumps the
+    /// generation so the source resumes any partitions it paused for the drain.
+    pub fn clear_draining(&self) {
+        for slot in self.draining.iter() {
+            slot.store(false, Ordering::Release);
+        }
+        self.draining_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether `vnode` is currently draining. Out-of-range ids report false.
+    #[must_use]
+    pub fn is_draining(&self, vnode: u32) -> bool {
+        self.draining
+            .get(vnode as usize)
+            .is_some_and(|s| s.load(Ordering::Acquire))
+    }
+
+    /// Monotonic counter bumped on each draining change; the source compares it
+    /// lock-free to detect drain/undrain without an assignment-version bump.
+    #[must_use]
+    pub fn draining_generation(&self) -> u64 {
+        self.draining_generation.load(Ordering::Acquire)
+    }
 }
 
 /// Build a fresh lifecycle array with every vnode [`Active`].
 fn new_lifecycle(vnode_count: u32) -> Arc<[AtomicU8]> {
     std::iter::repeat_with(|| AtomicU8::new(VnodeLifecycleState::ACTIVE))
+        .take(vnode_count as usize)
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Build a fresh draining array with every vnode not draining.
+fn new_draining(vnode_count: u32) -> Arc<[AtomicBool]> {
+    std::iter::repeat_with(|| AtomicBool::new(false))
         .take(vnode_count as usize)
         .collect::<Vec<_>>()
         .into()
@@ -618,6 +707,37 @@ mod tests {
         r.mark_restoring(&[2]);
         r.set_assignment(vec![NodeId(1), NodeId(1), NodeId(1), NodeId(1)].into());
         assert!(r.is_restoring(2));
+    }
+
+    #[test]
+    fn draining_marks_clear_and_bump_generation() {
+        let r = VnodeRegistry::new(4);
+        let g0 = r.draining_generation();
+        assert!(!r.is_draining(1));
+
+        r.mark_draining(&[1, 3]);
+        assert!(r.is_draining(1));
+        assert!(r.is_draining(3));
+        assert!(!r.is_draining(0));
+        assert!(r.draining_generation() > g0, "mark bumps the generation");
+
+        let g1 = r.draining_generation();
+        r.clear_draining();
+        assert!(!r.is_draining(1));
+        assert!(!r.is_draining(3));
+        assert!(r.draining_generation() > g1, "clear bumps the generation");
+    }
+
+    #[test]
+    fn draining_is_orthogonal_to_lifecycle_and_ignores_out_of_range() {
+        let r = VnodeRegistry::new(2);
+        // A draining vnode still emits (lifecycle stays Active) — only consumption pauses.
+        r.mark_draining(&[0]);
+        assert!(r.is_draining(0));
+        assert!(!r.is_restoring(0));
+        // Out-of-range ids are ignored, no panic.
+        r.mark_draining(&[5, 99]);
+        assert!(!r.is_draining(5));
     }
 
     // -- Topology-aware placement --------------------------------------------

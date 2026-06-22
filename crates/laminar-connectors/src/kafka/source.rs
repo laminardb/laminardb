@@ -88,6 +88,9 @@ pub struct KafkaSource {
     /// Bumped on each partition revoke; `poll_batch` compares it lock-free to
     /// detect a revoke and purge the lost partitions' offsets.
     revoke_generation: Arc<AtomicU64>,
+    /// Bumped on each partition assign; the reader loop seeks the newly-assigned
+    /// partitions on change (see the seek block in `ensure_reader_started`).
+    assign_generation: Arc<AtomicU64>,
     last_seen_revoke_gen: u64,
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     data_ready: Arc<Notify>,
@@ -103,9 +106,6 @@ pub struct KafkaSource {
     /// `(topic, partition, high_watermark)` from the reader task, for lag computation.
     #[allow(clippy::type_complexity)]
     high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
-    /// Set while the reader has paused partitions for backpressure; re-pauses
-    /// newly assigned partitions on rebalance.
-    reader_paused: Arc<AtomicBool>,
     /// Offset snapshot for the rebalance callback's seek-on-assign, refreshed
     /// once per `poll_batch()` cycle.
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
@@ -216,6 +216,7 @@ impl KafkaSource {
             rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
             rebalance_counter: Arc::new(AtomicU64::new(0)),
             revoke_generation: Arc::new(AtomicU64::new(0)),
+            assign_generation: Arc::new(AtomicU64::new(0)),
             last_seen_revoke_gen: 0,
             schema_registry,
             data_ready: Arc::new(Notify::new()),
@@ -228,7 +229,6 @@ impl KafkaSource {
             commit_tx: None,
             watermark_tracker,
             high_watermarks_rx: None,
-            reader_paused: Arc::new(AtomicBool::new(false)),
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
             vnode_assignment: None,
             vnode_topic_meta: Vec::new(),
@@ -312,8 +312,8 @@ impl KafkaSource {
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
         let reader_channel_capacity = self.config.reader_channel_capacity;
-        let reader_paused = Arc::clone(&self.reader_paused);
         let revoke_generation = Arc::clone(&self.revoke_generation);
+        let assign_generation = Arc::clone(&self.assign_generation);
         let rebalance_state = Arc::clone(&self.rebalance_state);
         let pause_threshold = self.config.backpressure_high_watermark;
         let resume_threshold = self.config.backpressure_low_watermark;
@@ -413,40 +413,153 @@ impl KafkaSource {
                 std::collections::HashSet::new();
             let mut is_paused = false;
             let mut last_revoke_gen: u64 = 0;
+            let mut last_assign_gen: u64 = 0;
             // Track the vnode assignment generation; open() already assigned at
             // the current version, so only a later rotation triggers a rebind.
             let mut last_assignment_version = vnode_reassign
                 .as_ref()
                 .map_or(0, |(r, _)| r.assignment_version());
+            // Partitions paused for a pending rotation (their vnode is draining), so
+            // the pre-rotation checkpoint is a clean cut. Reconciled on drain-gen change.
+            let mut last_drain_gen = vnode_reassign
+                .as_ref()
+                .map_or(0, |(r, _)| r.draining_generation());
+            let mut drain_paused: std::collections::HashSet<(Arc<str>, i32)> =
+                std::collections::HashSet::new();
 
             loop {
-                // Engine-controlled re-assignment: when the vnode assignment
-                // rotates, rebind to the partitions this node now owns, seeking
-                // each to its tracked offset (manual assign gets no broker
-                // rebalance callback to do this for us).
+                // On rotation, apply only the DELTA (incremental assign/unassign): a
+                // full re-assign would re-seek kept partitions and re-fetch records
+                // already buffered ahead, re-emitting committed rows. Newly-acquired
+                // partitions seek to their handoff offset; kept ones are untouched.
                 if let Some((registry, self_id)) = &vnode_reassign {
                     let version = registry.assignment_version();
                     if version != last_assignment_version {
-                        last_assignment_version = version;
+                        let current = consumer.assignment().unwrap_or_default();
+                        let current_set: std::collections::HashSet<(String, i32)> = current
+                            .elements()
+                            .iter()
+                            .map(|e| (e.topic().to_string(), e.partition()))
+                            .collect();
+
+                        let mut owned_set: std::collections::HashSet<(String, i32)> =
+                            std::collections::HashSet::new();
+                        for (topic, count) in &vnode_topic_meta {
+                            for p in crate::partition_assignment::owned_partitions(
+                                *count, registry, *self_id,
+                            ) {
+                                owned_set.insert((topic.to_string(), p));
+                            }
+                        }
+
+                        let mut to_remove = TopicPartitionList::new();
+                        for e in current.elements() {
+                            if !owned_set.contains(&(e.topic().to_string(), e.partition())) {
+                                let _ = to_remove.add_partition(e.topic(), e.partition());
+                            }
+                        }
+
+                        // Newly-acquired partitions resume from local offset, else the
+                        // previous owner's staged handoff offset, else the startup default.
                         let offsets = lock_or_recover(&reassign_snapshot).clone();
-                        let tpl = build_vnode_assignment_tpl(
-                            registry,
-                            *self_id,
-                            &vnode_topic_meta,
-                            &offsets,
-                            reassign_default_offset,
-                        );
-                        match consumer.assign(&tpl) {
-                            Ok(()) => info!(
-                                version,
-                                owned_partitions = tpl.count(),
-                                "Kafka source re-assigned partitions after vnode rotation"
-                            ),
-                            Err(e) => warn!(
-                                version,
-                                error = %e,
-                                "Kafka source partition re-assignment failed"
-                            ),
+                        let resume = OffsetTracker::from_offset_map(&registry.resume_offsets());
+                        let mut to_add = TopicPartitionList::new();
+                        for (topic, count) in &vnode_topic_meta {
+                            for p in crate::partition_assignment::owned_partitions(
+                                *count, registry, *self_id,
+                            ) {
+                                if current_set.contains(&(topic.to_string(), p)) {
+                                    continue; // kept — leave untouched
+                                }
+                                let offset = match offsets
+                                    .get(topic.as_ref(), p)
+                                    .or_else(|| resume.get(topic.as_ref(), p))
+                                {
+                                    Some(o) => rdkafka::Offset::Offset(o + 1),
+                                    None => reassign_default_offset,
+                                };
+                                let _ = to_add.add_partition_offset(topic.as_ref(), p, offset);
+                            }
+                        }
+
+                        let mut ok = true;
+                        if to_remove.count() > 0 {
+                            if let Err(e) = consumer.incremental_unassign(&to_remove) {
+                                warn!(version, error = %e, "Kafka source unassign failed");
+                                ok = false;
+                            }
+                        }
+                        if to_add.count() > 0 {
+                            if let Err(e) = consumer.incremental_assign(&to_add) {
+                                warn!(version, error = %e, "Kafka source assign failed");
+                                ok = false;
+                            }
+                        }
+                        // Record the version only on success, so a transient failure
+                        // retries instead of dropping the newly-owned partitions.
+                        if ok {
+                            if to_remove.count() > 0 || to_add.count() > 0 {
+                                info!(
+                                    version,
+                                    acquired = to_add.count(),
+                                    revoked = to_remove.count(),
+                                    "Kafka source rebound partitions after vnode rotation"
+                                );
+                            }
+                            // Revoked partitions are gone; their drain pauses no longer apply.
+                            drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
+                            last_drain_gen = registry.draining_generation();
+                            last_assignment_version = version;
+                        }
+                    }
+                }
+
+                // Rotation drain: pause the partitions of vnodes about to be revoked
+                // so the pre-rotation checkpoint is a clean cut. On commit they're
+                // dropped at the rebind above; on abort the drain clears and they resume.
+                if let Some((registry, self_id)) = &vnode_reassign {
+                    let drain_gen = registry.draining_generation();
+                    if drain_gen != last_drain_gen {
+                        let vnode_count = registry.vnode_count();
+                        let want: std::collections::HashSet<(Arc<str>, i32)> = vnode_topic_meta
+                            .iter()
+                            .flat_map(|(topic, count)| {
+                                let topic = Arc::clone(topic);
+                                crate::partition_assignment::owned_partitions(
+                                    *count, registry, *self_id,
+                                )
+                                .into_iter()
+                                .filter(|&p| {
+                                    u32::try_from(p)
+                                        .is_ok_and(|pid| registry.is_draining(pid % vnode_count))
+                                })
+                                .map(move |p| (Arc::clone(&topic), p))
+                            })
+                            .collect();
+                        let mut ok = true;
+                        let to_pause = tpl_of(want.difference(&drain_paused));
+                        if to_pause.count() > 0 {
+                            if let Err(e) = consumer.pause(&to_pause) {
+                                warn!(error = %e, "drain pause failed; will retry");
+                                ok = false;
+                            }
+                        }
+                        // Resume vnodes that stopped draining (rotation aborted), unless
+                        // backpressure is holding everything.
+                        if !is_paused {
+                            let to_resume = tpl_of(drain_paused.difference(&want));
+                            if to_resume.count() > 0 {
+                                if let Err(e) = consumer.resume(&to_resume) {
+                                    warn!(error = %e, "drain resume failed; will retry");
+                                    ok = false;
+                                }
+                            }
+                        }
+                        // Advance only on success, else a partition that failed to pause
+                        // keeps consuming past the cut.
+                        if ok {
+                            drain_paused = want;
+                            last_drain_gen = drain_gen;
                         }
                     }
                 }
@@ -462,6 +575,81 @@ impl KafkaSource {
                     let _ = seen_tx.send(seen_partitions.iter().cloned().collect());
                 }
 
+                // Newly-assigned partitions were paused by the callback. Seek to the
+                // checkpointed offsets HERE, in the poll loop where the assignment is
+                // fetch-ready (the in-callback seek fails `Local: Erroneous state`),
+                // then resume — otherwise recovery resumes from auto.offset.reset.
+                let cur_assign_gen = assign_generation.load(Ordering::Acquire);
+                if cur_assign_gen != last_assign_gen {
+                    let mut assigned: Vec<(String, i32)> = lock_or_recover(&rebalance_state)
+                        .assigned_partitions()
+                        .iter()
+                        .cloned()
+                        .collect();
+                    if assigned.is_empty() {
+                        // Vnode mode fires no rebalance callback, so use the live
+                        // assignment to seek the offsets restore() staged.
+                        if let Ok(a) = consumer.assignment() {
+                            assigned = a
+                                .elements()
+                                .iter()
+                                .map(|e| (e.topic().to_string(), e.partition()))
+                                .collect();
+                        }
+                    }
+                    let seek_tpl = lock_or_recover(&reassign_snapshot).to_seek_tpl(&assigned);
+                    let seek_ok = if seek_tpl.count() == 0 {
+                        true // fresh start: nothing checkpointed to seek to
+                    } else {
+                        match consumer.seek_partitions(seek_tpl, std::time::Duration::from_secs(5))
+                        {
+                            Ok(result) => {
+                                let failed = result
+                                    .elements()
+                                    .iter()
+                                    .filter(|e| e.error().is_err())
+                                    .count();
+                                if failed == 0 {
+                                    info!(
+                                        partition_count = result.count(),
+                                        "seeked assigned partitions to checkpointed offsets"
+                                    );
+                                    true
+                                } else {
+                                    // Not all fetch-ready yet — retry next loop.
+                                    debug!(failed, "assign-seek incomplete; will retry");
+                                    false
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "assign-seek failed; will retry");
+                                false
+                            }
+                        }
+                    };
+                    if seek_ok {
+                        // Positioned — undo the callback's pause unless backpressure
+                        // is currently holding partitions.
+                        let mut resumed_ok = true;
+                        if !is_paused {
+                            if let Ok(assignment) = consumer.assignment() {
+                                if let Err(e) = consumer.resume(&assignment) {
+                                    warn!(error = %e, "post-seek resume failed; will retry");
+                                    resumed_ok = false;
+                                } else if !drain_paused.is_empty() {
+                                    // Keep rotation-drained partitions paused.
+                                    let _ = consumer.pause(&tpl_of(drain_paused.iter()));
+                                }
+                            }
+                        }
+                        // Advance only when resumed, else the partitions stay paused
+                        // and never fetch.
+                        if resumed_ok {
+                            last_assign_gen = cur_assign_gen;
+                        }
+                    }
+                }
+
                 // Backpressure: pause/resume Kafka partitions based on channel fill.
                 #[allow(clippy::cast_precision_loss)]
                 let fill = if reader_channel_capacity > 0 {
@@ -473,7 +661,6 @@ impl KafkaSource {
                     if let Ok(assignment) = consumer.assignment() {
                         if consumer.pause(&assignment).is_ok() {
                             is_paused = true;
-                            reader_paused.store(true, Ordering::Release);
                             debug!("reader: paused Kafka partitions (fill={fill:.2})");
                         }
                     }
@@ -481,7 +668,12 @@ impl KafkaSource {
                     if let Ok(assignment) = consumer.assignment() {
                         if consumer.resume(&assignment).is_ok() {
                             is_paused = false;
-                            reader_paused.store(false, Ordering::Release);
+                            // Keep rotation-drained partitions paused.
+                            if !drain_paused.is_empty() {
+                                if let Err(e) = consumer.pause(&tpl_of(drain_paused.iter())) {
+                                    warn!(error = %e, "re-pause of drained partitions failed");
+                                }
+                            }
                             debug!("reader: resumed Kafka partitions (fill={fill:.2})");
                         }
                     }
@@ -557,7 +749,6 @@ impl KafkaSource {
                                         if let Ok(assignment) = consumer.assignment() {
                                             if consumer.pause(&assignment).is_ok() {
                                                 is_paused = true;
-                                                reader_paused.store(true, Ordering::Release);
                                                 debug!("reader: paused partitions (channel full)");
                                             }
                                         }
@@ -601,21 +792,36 @@ impl KafkaSource {
     }
 }
 
-/// Build the manual-`assign()` partition list for a vnode-assigned Kafka
-/// source: the partitions this node owns (`partition % vnode_count`), each
-/// positioned at its checkpointed offset + 1 when known (resume after the last
-/// consumed record), else `default_offset`.
+/// Build an offset-less `TopicPartitionList` from `(topic, partition)` refs, for
+/// `pause`/`resume` calls.
+fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitionList {
+    let mut tpl = TopicPartitionList::new();
+    for (topic, partition) in parts {
+        let _ = tpl.add_partition(topic.as_ref(), *partition);
+    }
+    tpl
+}
+
+/// Partition list for the initial `open()` assignment of a vnode-assigned source:
+/// owned partitions (`partition % vnode_count`) at their checkpointed offset + 1,
+/// else `default_offset`. Rotations rebind incrementally in the reader loop.
 fn build_vnode_assignment_tpl(
     registry: &laminar_core::state::VnodeRegistry,
     self_id: laminar_core::state::NodeId,
     topic_meta: &[(Arc<str>, i32)],
     offsets: &OffsetTracker,
+    resume: &OffsetTracker,
     default_offset: rdkafka::Offset,
 ) -> TopicPartitionList {
     let mut tpl = TopicPartitionList::new();
     for (topic, count) in topic_meta {
         for partition in crate::partition_assignment::owned_partitions(*count, registry, self_id) {
-            let offset = match offsets.get(topic.as_ref(), partition) {
+            let offset = match offsets
+                .get(topic.as_ref(), partition)
+                // No local offset → handed to us in a rotation; fall back to the
+                // previous owner's staged position, not auto.offset.reset.
+                .or_else(|| resume.get(topic.as_ref(), partition))
+            {
                 Some(o) => rdkafka::Offset::Offset(o + 1),
                 None => default_offset,
             };
@@ -719,8 +925,7 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.rebalance_state),
             Arc::clone(&self.rebalance_counter),
             Arc::clone(&self.revoke_generation),
-            Arc::clone(&self.reader_paused),
-            Arc::clone(&self.offset_snapshot),
+            Arc::clone(&self.assign_generation),
             // IntCounter::clone is an Arc bump; these are shared with the
             // metrics struct and bumped from librdkafka's background thread
             // inside `commit_callback`.
@@ -768,15 +973,21 @@ impl SourceConnector for KafkaSource {
                     ));
                 }
                 let default_offset = startup_default_offset(&kafka_config.startup_mode);
+                // restore() already loaded committed offsets into self.offsets, so
+                // there are no rotation resume offsets at open().
+                let no_resume = OffsetTracker::new();
                 let tpl = build_vnode_assignment_tpl(
                     &registry,
                     self_id,
                     &topic_meta,
                     &self.offsets,
+                    &no_resume,
                     default_offset,
                 );
                 let owned = tpl.count();
-                consumer.assign(&tpl).map_err(|e| {
+                // Incremental from empty so rebinds can stay incremental — librdkafka
+                // rejects mixing a full assign() with incremental_assign/unassign.
+                consumer.incremental_assign(&tpl).map_err(|e| {
                     ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
                 })?;
                 self.vnode_topic_meta = topic_meta;
@@ -1459,10 +1670,9 @@ impl SourceConnector for KafkaSource {
 
     /// Restores the consumer to checkpointed offsets.
     ///
-    /// Offsets are staged in `offset_snapshot`; the actual `seek_partitions`
-    /// runs in `post_rebalance` when the group coordinator hands us the
-    /// assignment. Calling `consumer.assign()` here would switch out of
-    /// `subscribe()` mode and produce `Local: Erroneous state`.
+    /// Only stages offsets into `offset_snapshot`; the reader loop performs the
+    /// actual `seek_partitions` once the assignment is fetch-ready (seeking here
+    /// or in the rebalance callback yields `Local: Erroneous state`).
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         info!(
             epoch = checkpoint.epoch(),
@@ -1475,6 +1685,9 @@ impl SourceConnector for KafkaSource {
             Ok(mut snapshot) => snapshot.clone_from(&self.offsets),
             Err(poisoned) => poisoned.into_inner().clone_from(&self.offsets),
         }
+        // Signal the seek block; vnode mode has no rebalance callback to apply the
+        // staged offsets, so without this recovery resumes from `startup.mode`.
+        self.assign_generation.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -1677,6 +1890,37 @@ mod tests {
         assert_eq!(cp.get_offset("events-1"), None); // vnode 1 → node1
         assert_eq!(cp.get_offset("events-2"), Some("300")); // vnode 2 → node0
         assert_eq!(cp.get_offset("events-3"), None); // vnode 3 → node1
+    }
+
+    #[test]
+    fn build_vnode_assignment_tpl_offset_precedence() {
+        // local offset > resume (manifest handoff) offset > startup default.
+        let node0 = laminar_core::state::NodeId(0);
+        let registry = laminar_core::state::VnodeRegistry::single_owner(4, node0);
+        let topic_meta = vec![(Arc::from("events"), 4)];
+
+        let mut local = OffsetTracker::new();
+        local.update_force("events", 0, 100); // p0: local only
+        local.update_force("events", 2, 200); // p2: local AND resume → local wins
+
+        let mut resume = OffsetTracker::new();
+        resume.update_force("events", 1, 50); // p1: resume only
+        resume.update_force("events", 2, 999); // p2: shadowed by local
+
+        let tpl = build_vnode_assignment_tpl(
+            &registry,
+            node0,
+            &topic_meta,
+            &local,
+            &resume,
+            rdkafka::Offset::Beginning,
+        );
+
+        let offset_of = |p: i32| tpl.find_partition("events", p).map(|e| e.offset());
+        assert_eq!(offset_of(0), Some(rdkafka::Offset::Offset(101))); // local + 1
+        assert_eq!(offset_of(1), Some(rdkafka::Offset::Offset(51))); // resume + 1
+        assert_eq!(offset_of(2), Some(rdkafka::Offset::Offset(201))); // local wins
+        assert_eq!(offset_of(3), Some(rdkafka::Offset::Beginning)); // default
     }
 
     #[test]

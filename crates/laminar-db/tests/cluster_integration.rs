@@ -486,6 +486,93 @@ mod rebalance {
         harness.shutdown().await;
     }
 
+    /// B2 barrier-aligned handoff: the draining phase marks a node's to-be-lost
+    /// vnodes draining (so its source pauses them for a clean checkpoint cut)
+    /// WITHOUT changing ownership; the committed phase then rotates and clears the
+    /// drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_watcher_handles_draining_phase() {
+        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness.start_all().await;
+
+        let store: Arc<AssignmentSnapshotStore> =
+            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
+        let seed = store.load().await.unwrap().unwrap();
+
+        let leader = NodeId(harness.nodes[harness.leader_idx()].instance_id.0);
+        let follower_idx = harness.follower_idxs()[0];
+        let lost = harness.nodes[follower_idx].owned_vnodes();
+        assert!(
+            !lost.is_empty(),
+            "test needs the follower to own vnodes to drain"
+        );
+
+        // Everything moves to the leader; the follower loses all its vnodes.
+        let mut vnodes = BTreeMap::new();
+        for v in 0..VNODE_COUNT {
+            vnodes.insert(v, leader);
+        }
+
+        // Phase 1: draining snapshot — the follower marks its lost vnodes draining
+        // but ownership (the registry version) does not change.
+        let pre_version = harness.nodes[follower_idx]
+            .vnode_registry
+            .assignment_version();
+        let mut drain = seed.next(vnodes.clone());
+        drain.draining = true;
+        assert!(matches!(
+            store.save_if_version(&drain, seed.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
+        wait_for(
+            || {
+                lost.iter()
+                    .all(|&v| harness.nodes[follower_idx].vnode_registry.is_draining(v))
+            },
+            "follower marks its lost vnodes draining",
+        )
+        .await;
+        assert_eq!(
+            harness.nodes[follower_idx]
+                .vnode_registry
+                .assignment_version(),
+            pre_version,
+            "drain phase must not change ownership",
+        );
+
+        // Phase 2: committed snapshot — ownership rotates and the drain clears.
+        let commit = drain.next(vnodes);
+        let expected = commit.version;
+        assert!(matches!(
+            store.save_if_version(&commit, drain.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
+        wait_for(
+            || {
+                harness
+                    .nodes
+                    .iter()
+                    .all(|n| n.vnode_registry.assignment_version() >= expected)
+            },
+            "every node adopts the committed snapshot",
+        )
+        .await;
+        for node in &harness.nodes {
+            for v in 0..VNODE_COUNT {
+                assert!(
+                    !node.vnode_registry.is_draining(v),
+                    "draining must clear on commit",
+                );
+            }
+        }
+        assert_eq!(
+            harness.nodes[harness.leader_idx()].owned_vnodes().len(),
+            VNODE_COUNT as usize,
+        );
+
+        harness.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_rotation_picks_single_winner() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;

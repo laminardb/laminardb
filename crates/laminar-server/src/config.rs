@@ -463,6 +463,13 @@ pub struct CheckpointSection {
     /// `max_uncommitted_epochs`, bounding object-storage growth. Default false.
     #[serde(default)]
     pub uncommitted_epochs_backpressure: bool,
+    /// Durability-gate poll first interval in ms (default 100). Tighten on a
+    /// low-latency object store to cut poll quantization.
+    #[serde(default)]
+    pub restorable_gate_poll_initial_ms: Option<u64>,
+    /// Durability-gate poll backoff cap in ms (default 1000).
+    #[serde(default)]
+    pub restorable_gate_poll_max_ms: Option<u64>,
 }
 
 impl Default for CheckpointSection {
@@ -476,6 +483,8 @@ impl Default for CheckpointSection {
             max_staged_bytes: None,
             max_uncommitted_epochs: None,
             uncommitted_epochs_backpressure: false,
+            restorable_gate_poll_initial_ms: None,
+            restorable_gate_poll_max_ms: None,
         }
     }
 }

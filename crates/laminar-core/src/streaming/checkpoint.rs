@@ -28,6 +28,10 @@ pub struct StreamCheckpointConfig {
     /// Fail checkpoints once committer lag exceeds `max_uncommitted_epochs`,
     /// bounding object-storage growth at the cost of pausing progress. Default off.
     pub uncommitted_epochs_backpressure: bool,
+    /// Durability-gate poll first interval (ms). `None` = engine default (100).
+    pub restorable_gate_poll_initial_ms: Option<u64>,
+    /// Durability-gate poll backoff cap (ms). `None` = engine default (1000).
+    pub restorable_gate_poll_max_ms: Option<u64>,
 }
 
 /// Errors from checkpoint operations.

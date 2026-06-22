@@ -36,6 +36,13 @@ pub struct AssignmentSnapshot {
     pub vnodes: BTreeMap<u32, NodeId>,
     /// Wall-clock timestamp of the last update, millis since epoch.
     pub updated_at_ms: i64,
+    /// Pre-rotation drain phase: when set, this snapshot carries the *intended*
+    /// next assignment but ownership has NOT changed yet. Nodes mark the vnodes
+    /// they are about to lose as draining (pausing those source partitions) so the
+    /// pre-rotation checkpoint is a clean cut; the leader then publishes the same
+    /// assignment with `draining = false` to commit the rotation.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 impl AssignmentSnapshot {
@@ -46,6 +53,7 @@ impl AssignmentSnapshot {
             version: 0,
             vnodes: BTreeMap::new(),
             updated_at_ms: 0,
+            draining: false,
         }
     }
 
@@ -60,6 +68,7 @@ impl AssignmentSnapshot {
             version: self.version + 1,
             vnodes,
             updated_at_ms: now_ms,
+            draining: false,
         }
     }
 
@@ -493,5 +502,27 @@ mod tests {
         let snap = AssignmentSnapshot::empty().next(map);
         let back = snap.to_vnode_vec(u32::try_from(assignment.len()).expect("test len fits u32"));
         assert_eq!(back, assignment);
+    }
+
+    #[test]
+    fn draining_defaults_false_and_survives_roundtrip() {
+        // `next` produces a committed (non-draining) snapshot.
+        let mut vnodes = BTreeMap::new();
+        vnodes.insert(0, NodeId(1));
+        let committed = AssignmentSnapshot::empty().next(vnodes);
+        assert!(!committed.draining);
+
+        // The draining flag round-trips through JSON.
+        let mut drain = committed.clone();
+        drain.draining = true;
+        let json = serde_json::to_vec(&drain).unwrap();
+        let back: AssignmentSnapshot = serde_json::from_slice(&json).unwrap();
+        assert!(back.draining);
+        assert_eq!(back.version, drain.version);
+
+        // An older snapshot JSON without the field deserializes as not draining.
+        let legacy = r#"{"version":3,"vnodes":{},"updated_at_ms":0}"#;
+        let parsed: AssignmentSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.draining);
     }
 }
