@@ -785,7 +785,7 @@ fn collect_output_seqs(brokers: &str, n_nodes: usize) -> (Vec<i64>, Vec<usize>) 
     use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
     let mut all = Vec::new();
     let mut per_topic = vec![0usize; n_nodes];
-    for id in 0..n_nodes {
+    for (id, topic_count) in per_topic.iter_mut().enumerate() {
         let topic = eo_topic(id);
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
@@ -828,7 +828,7 @@ fn collect_output_seqs(brokers: &str, n_nodes: usize) -> (Vec<i64>, Vec<usize>) 
                     let v: serde_json::Value =
                         serde_json::from_slice(msg.payload().unwrap_or_default()).expect("json");
                     all.push(v["seq"].as_i64().expect("seq"));
-                    per_topic[id] += 1;
+                    *topic_count += 1;
                 }
                 Some(Err(e)) => panic!("{topic}: consume error: {e}"),
                 None => idle += 1,
@@ -887,8 +887,8 @@ fn graceful_rotation_kafka_soak() {
         })
         .collect();
 
-    for id in 0..INITIAL {
-        nodes[id].spawn();
+    for node in nodes.iter_mut().take(INITIAL) {
+        node.spawn();
         std::thread::sleep(Duration::from_millis(500));
     }
     wait_for(

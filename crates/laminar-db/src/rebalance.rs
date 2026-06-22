@@ -378,13 +378,15 @@ async fn try_rebalance(
                     return Err("drain ack quorum not reached before timeout".into());
                 }
                 tokio::time::sleep(config.drain_settle).await;
-                let ckpt = pre_rotation_checkpoint(db, config).await?;
-                if !ckpt {
-                    // Re-publish the current assignment so nodes clear the drain and
-                    // resume, then surface the failure for retry.
+                // Abort the drain on failure OR timeout (not just Ok(false)) — a bare
+                // `?` here would leave nodes stuck draining.
+                let checkpointed = pre_rotation_checkpoint(db, config).await;
+                if !matches!(checkpointed, Ok(true)) {
                     let abort = drain.next(current.vnodes.clone());
                     let _ = commit_snapshot(db, store, controller, abort, drain.version).await;
-                    return Err("pre-rotation checkpoint failed during drain".into());
+                    return Err(checkpointed
+                        .err()
+                        .unwrap_or_else(|| "pre-rotation checkpoint failed during drain".into()));
                 }
                 let commit = drain.next(new_vnodes);
                 return commit_snapshot(db, store, controller, commit, drain.version).await;

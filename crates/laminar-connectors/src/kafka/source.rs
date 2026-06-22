@@ -435,7 +435,6 @@ impl KafkaSource {
                 if let Some((registry, self_id)) = &vnode_reassign {
                     let version = registry.assignment_version();
                     if version != last_assignment_version {
-                        last_assignment_version = version;
                         let current = consumer.assignment().unwrap_or_default();
                         let current_set: std::collections::HashSet<(String, i32)> = current
                             .elements()
@@ -483,27 +482,35 @@ impl KafkaSource {
                             }
                         }
 
+                        let mut ok = true;
                         if to_remove.count() > 0 {
                             if let Err(e) = consumer.incremental_unassign(&to_remove) {
                                 warn!(version, error = %e, "Kafka source unassign failed");
+                                ok = false;
                             }
                         }
                         if to_add.count() > 0 {
                             if let Err(e) = consumer.incremental_assign(&to_add) {
                                 warn!(version, error = %e, "Kafka source assign failed");
+                                ok = false;
                             }
                         }
-                        if to_remove.count() > 0 || to_add.count() > 0 {
-                            info!(
-                                version,
-                                acquired = to_add.count(),
-                                revoked = to_remove.count(),
-                                "Kafka source rebound partitions after vnode rotation"
-                            );
+                        // Record the version only on success, so a transient failure
+                        // retries instead of dropping the newly-owned partitions.
+                        if ok {
+                            if to_remove.count() > 0 || to_add.count() > 0 {
+                                info!(
+                                    version,
+                                    acquired = to_add.count(),
+                                    revoked = to_remove.count(),
+                                    "Kafka source rebound partitions after vnode rotation"
+                                );
+                            }
+                            // Revoked partitions are gone; their drain pauses no longer apply.
+                            drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
+                            last_drain_gen = registry.draining_generation();
+                            last_assignment_version = version;
                         }
-                        // Revoked partitions are gone; their drain pauses no longer apply.
-                        drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
-                        last_drain_gen = registry.draining_generation();
                     }
                 }
 
@@ -513,7 +520,6 @@ impl KafkaSource {
                 if let Some((registry, self_id)) = &vnode_reassign {
                     let drain_gen = registry.draining_generation();
                     if drain_gen != last_drain_gen {
-                        last_drain_gen = drain_gen;
                         let vnode_count = registry.vnode_count();
                         let want: std::collections::HashSet<(Arc<str>, i32)> = vnode_topic_meta
                             .iter()
@@ -530,19 +536,31 @@ impl KafkaSource {
                                 .map(move |p| (Arc::clone(&topic), p))
                             })
                             .collect();
+                        let mut ok = true;
                         let to_pause = tpl_of(want.difference(&drain_paused));
                         if to_pause.count() > 0 {
-                            let _ = consumer.pause(&to_pause);
+                            if let Err(e) = consumer.pause(&to_pause) {
+                                warn!(error = %e, "drain pause failed; will retry");
+                                ok = false;
+                            }
                         }
                         // Resume vnodes that stopped draining (rotation aborted), unless
                         // backpressure is holding everything.
                         if !is_paused {
                             let to_resume = tpl_of(drain_paused.difference(&want));
                             if to_resume.count() > 0 {
-                                let _ = consumer.resume(&to_resume);
+                                if let Err(e) = consumer.resume(&to_resume) {
+                                    warn!(error = %e, "drain resume failed; will retry");
+                                    ok = false;
+                                }
                             }
                         }
-                        drain_paused = want;
+                        // Advance only on success, else a partition that failed to pause
+                        // keeps consuming past the cut.
+                        if ok {
+                            drain_paused = want;
+                            last_drain_gen = drain_gen;
+                        }
                     }
                 }
 
@@ -563,11 +581,22 @@ impl KafkaSource {
                 // then resume — otherwise recovery resumes from auto.offset.reset.
                 let cur_assign_gen = assign_generation.load(Ordering::Acquire);
                 if cur_assign_gen != last_assign_gen {
-                    let assigned: Vec<(String, i32)> = lock_or_recover(&rebalance_state)
+                    let mut assigned: Vec<(String, i32)> = lock_or_recover(&rebalance_state)
                         .assigned_partitions()
                         .iter()
                         .cloned()
                         .collect();
+                    if assigned.is_empty() {
+                        // Vnode mode fires no rebalance callback, so use the live
+                        // assignment to seek the offsets restore() staged.
+                        if let Ok(a) = consumer.assignment() {
+                            assigned = a
+                                .elements()
+                                .iter()
+                                .map(|e| (e.topic().to_string(), e.partition()))
+                                .collect();
+                        }
+                    }
                     let seek_tpl = lock_or_recover(&reassign_snapshot).to_seek_tpl(&assigned);
                     let seek_ok = if seek_tpl.count() == 0 {
                         true // fresh start: nothing checkpointed to seek to
@@ -601,16 +630,23 @@ impl KafkaSource {
                     if seek_ok {
                         // Positioned — undo the callback's pause unless backpressure
                         // is currently holding partitions.
+                        let mut resumed_ok = true;
                         if !is_paused {
                             if let Ok(assignment) = consumer.assignment() {
-                                let _ = consumer.resume(&assignment);
-                                // Keep rotation-drained partitions paused.
-                                if !drain_paused.is_empty() {
+                                if let Err(e) = consumer.resume(&assignment) {
+                                    warn!(error = %e, "post-seek resume failed; will retry");
+                                    resumed_ok = false;
+                                } else if !drain_paused.is_empty() {
+                                    // Keep rotation-drained partitions paused.
                                     let _ = consumer.pause(&tpl_of(drain_paused.iter()));
                                 }
                             }
                         }
-                        last_assign_gen = cur_assign_gen;
+                        // Advance only when resumed, else the partitions stay paused
+                        // and never fetch.
+                        if resumed_ok {
+                            last_assign_gen = cur_assign_gen;
+                        }
                     }
                 }
 
@@ -634,7 +670,9 @@ impl KafkaSource {
                             is_paused = false;
                             // Keep rotation-drained partitions paused.
                             if !drain_paused.is_empty() {
-                                let _ = consumer.pause(&tpl_of(drain_paused.iter()));
+                                if let Err(e) = consumer.pause(&tpl_of(drain_paused.iter())) {
+                                    warn!(error = %e, "re-pause of drained partitions failed");
+                                }
                             }
                             debug!("reader: resumed Kafka partitions (fill={fill:.2})");
                         }
@@ -1647,6 +1685,9 @@ impl SourceConnector for KafkaSource {
             Ok(mut snapshot) => snapshot.clone_from(&self.offsets),
             Err(poisoned) => poisoned.into_inner().clone_from(&self.offsets),
         }
+        // Signal the seek block; vnode mode has no rebalance callback to apply the
+        // staged offsets, so without this recovery resumes from `startup.mode`.
+        self.assign_generation.fetch_add(1, Ordering::Release);
 
         Ok(())
     }

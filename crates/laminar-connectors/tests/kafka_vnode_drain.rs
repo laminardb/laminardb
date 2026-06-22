@@ -85,7 +85,7 @@ fn part_offset(source: &KafkaSource, topic: &str, partition: i32) -> i64 {
 async fn poll_for(source: &mut KafkaSource, dur: Duration) {
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
-        let _ = source.poll_batch(1000).await;
+        source.poll_batch(1000).await.expect("poll_batch");
         sleep(Duration::from_millis(50)).await;
     }
 }

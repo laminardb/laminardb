@@ -1041,7 +1041,7 @@ async fn source_offset_handoff_round_trip() {
     assert!(backend.epoch_complete(5, &[0, 1, 2, 3], &[]).await.unwrap());
 
     // A node acquiring events-0 on rotation recovers the committed offset.
-    let acquired = coord.acquired_source_offsets().await;
+    let acquired = coord.acquired_source_offsets().await.unwrap();
     assert_eq!(acquired.get("events-0"), Some(&"100".to_string()));
 }
 

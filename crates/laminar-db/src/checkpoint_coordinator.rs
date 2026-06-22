@@ -650,36 +650,37 @@ impl CheckpointCoordinator {
     /// strings). Staged onto the vnode registry during a rotation so an acquiring
     /// source resumes its newly-owned partitions from the previous owner's sealed
     /// position. The engine does not interpret the keys — the source filters to
-    /// the partitions it owns. Best-effort: empty on any error so the source
-    /// falls back to its configured startup offset.
+    /// the partitions it owns. An empty backend or no committed epoch yields an empty
+    /// map (nothing to hand off); a backend read FAILURE is propagated so the caller
+    /// defers the rotation rather than letting an exactly-once source silently fall
+    /// back to its startup offset and re-emit.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn acquired_source_offsets(&self) -> HashMap<String, String> {
+    pub(crate) async fn acquired_source_offsets(&self) -> Result<HashMap<String, String>, DbError> {
         let mut merged = HashMap::new();
         let Some(ref backend) = self.state_backend else {
-            return merged;
+            return Ok(merged);
         };
         let epoch = match backend.latest_committed_epoch().await {
             Ok(Some(e)) => e,
-            Ok(None) => return merged,
+            Ok(None) => return Ok(merged),
             Err(e) => {
-                warn!(error = %e, "source offset handoff: latest_committed_epoch failed");
-                return merged;
+                return Err(DbError::Checkpoint(format!(
+                    "source-offset handoff: latest_committed_epoch failed: {e}"
+                )))
             }
         };
-        let blobs = match backend.read_source_offsets(epoch).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "source offset handoff: read_source_offsets failed");
-                return merged;
-            }
-        };
+        let blobs = backend.read_source_offsets(epoch).await.map_err(|e| {
+            DbError::Checkpoint(format!(
+                "source-offset handoff: read_source_offsets failed: {e}"
+            ))
+        })?;
         for blob in blobs {
             match serde_json::from_slice::<HashMap<String, String>>(&blob) {
                 Ok(m) => merged.extend(m),
                 Err(e) => warn!(error = %e, "source offset handoff: skipping undecodable blob"),
             }
         }
-        merged
+        Ok(merged)
     }
 
     /// Begin the initial epoch on all exactly-once sinks.

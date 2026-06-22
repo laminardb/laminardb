@@ -751,6 +751,8 @@ impl MongoDbSink {
                             ConnectorError::WriteError(format!("replace: {e}"))
                         })?;
                 }
+                // replace_one with upsert is an upsert; count it like Upsert mode.
+                self.metrics.record_upserts(count);
             }
 
             WriteMode::CdcReplay => {

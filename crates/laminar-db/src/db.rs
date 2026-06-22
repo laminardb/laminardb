@@ -564,6 +564,7 @@ impl LaminarDB {
     /// Rehydration runs after the coordinator lock is released so a slow
     /// object-store read can't stall the checkpoint cadence.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // sequential rotation steps read better inline
     pub async fn adopt_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
@@ -592,21 +593,52 @@ impl LaminarDB {
 
         // Hold the coord mutex so registry + fence updates land between epochs.
         let mut guard = self.coordinator.lock().await;
-        let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        // Re-check under the lock: a concurrent adopt may have advanced the version,
+        // which we must not regress.
+        if snapshot.version <= registry.assignment_version() {
+            return SnapshotAdoption {
+                adopted: false,
+                version: snapshot.version,
+                ..SnapshotAdoption::default()
+            };
+        }
 
-        // Stage the cluster-wide sealed source offsets before the version bump so an
-        // acquiring source resumes newly-owned partitions from the previous owner's
-        // position, not auto.offset.reset. Only when this node acquires a vnode.
-        let acquiring_any = {
-            let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
-            (0..vnode_count).any(|v| {
+        let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
+        // Compute from the new assignment before publishing it, so the Restoring marks
+        // below land before the ownership flip.
+        let newly_acquired: Vec<u32> = (0..vnode_count)
+            .filter(|&v| {
                 new_assignment.get(v as usize).copied() == Some(self_id) && !old_set.contains(&v)
             })
-        };
-        if acquiring_any {
+            .collect();
+
+        // Stage the sealed source offsets before the version bump (acquiring source
+        // resumes from the previous owner's cut). A handoff-read failure defers the
+        // rotation — exactly-once must not fall back to startup and re-emit.
+        if !newly_acquired.is_empty() {
             if let Some(coord) = guard.as_ref() {
-                registry.stage_resume_offsets(coord.acquired_source_offsets().await);
+                match coord.acquired_source_offsets().await {
+                    Ok(offsets) => registry.stage_resume_offsets(offsets),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e, version = snapshot.version,
+                            "source-offset handoff read failed; deferring rotation"
+                        );
+                        return SnapshotAdoption {
+                            adopted: false,
+                            version: snapshot.version,
+                            ..SnapshotAdoption::default()
+                        };
+                    }
+                }
             }
+        }
+
+        // Mark Restoring before the ownership flip so emission stays suppressed as the
+        // shuffle starts routing rows here.
+        if !newly_acquired.is_empty() {
+            registry.mark_restoring(&newly_acquired);
         }
 
         registry.set_assignment_and_version(new_assignment, snapshot.version);
@@ -622,20 +654,6 @@ impl LaminarDB {
             coord.set_gate_vnode_set((0..vnode_count).collect());
         }
         drop(guard);
-
-        let old_set: std::collections::HashSet<u32> = old_owned.into_iter().collect();
-        let newly_acquired: Vec<u32> = new_owned
-            .into_iter()
-            .filter(|v| !old_set.contains(v))
-            .collect();
-
-        // Mark Restoring before the (slow) durable read so the operator suppresses
-        // emission from the moment the shuffle starts routing rows here. Vnodes
-        // with no durable state flip back to Active immediately; staged ones stay
-        // Restoring until the graph applies their state.
-        if !newly_acquired.is_empty() {
-            registry.mark_restoring(&newly_acquired);
-        }
 
         let mut adoption = SnapshotAdoption {
             adopted: true,
@@ -709,6 +727,10 @@ impl LaminarDB {
                 registry.owner(v) == self_id && next.get(v as usize).copied() != Some(self_id)
             })
             .collect();
+        // Reset first so only this snapshot's revoking set stays marked (a newer
+        // draining snapshot may skip the committed snapshot that would have cleared
+        // the previous marks).
+        registry.clear_draining();
         if !revoking.is_empty() {
             tracing::info!(
                 count = revoking.len(),

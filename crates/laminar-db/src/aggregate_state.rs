@@ -294,6 +294,7 @@ type DecodedGroupState = (arrow::row::OwnedRow, i64, Vec<Vec<ArrayRef>>);
 /// the row converter's own column types, so no per-type coercion is needed.
 fn decode_columnar_state_arrays(
     row_converter: &arrow::row::RowConverter,
+    num_group_cols: usize,
     keys_ipc: &[u8],
     acc_state_ipc: &[Vec<u8>],
     last_updated_ms: &[i64],
@@ -301,6 +302,13 @@ fn decode_columnar_state_arrays(
     let n = last_updated_ms.len();
     if n == 0 {
         return Ok(Vec::new());
+    }
+    // A grouped aggregate always encodes keys; empty key bytes with groups present
+    // means a truncated/corrupt checkpoint, not the global (no-GROUP-BY) key.
+    if num_group_cols > 0 && keys_ipc.is_empty() {
+        return Err(DbError::Pipeline(format!(
+            "columnar checkpoint shape: {n} groups but no key bytes"
+        )));
     }
     let key_rows = if keys_ipc.is_empty() {
         None
@@ -406,22 +414,29 @@ fn validate_columnar_acc_shape(
 /// Inverse of [`encode_groups_columnar`]: rebuild one [`DecodedGroup`] per row.
 fn decode_groups_columnar(
     row_converter: &arrow::row::RowConverter,
+    num_group_cols: usize,
     agg_specs: &[AggFuncSpec],
     retractable: bool,
     keys_ipc: &[u8],
     acc_state_ipc: &[Vec<u8>],
     last_updated_ms: &[i64],
 ) -> Result<Vec<DecodedGroup>, DbError> {
-    decode_columnar_state_arrays(row_converter, keys_ipc, acc_state_ipc, last_updated_ms)?
-        .into_iter()
-        .map(|(row_key, last_updated_ms, state_arrays)| {
-            Ok(DecodedGroup {
-                row_key,
-                accs: build_accumulators_from_state(agg_specs, retractable, &state_arrays)?,
-                last_updated_ms,
-            })
+    decode_columnar_state_arrays(
+        row_converter,
+        num_group_cols,
+        keys_ipc,
+        acc_state_ipc,
+        last_updated_ms,
+    )?
+    .into_iter()
+    .map(|(row_key, last_updated_ms, state_arrays)| {
+        Ok(DecodedGroup {
+            row_key,
+            accs: build_accumulators_from_state(agg_specs, retractable, &state_arrays)?,
+            last_updated_ms,
         })
-        .collect()
+    })
+    .collect()
 }
 
 /// Row-concatenate two IPC stream batches sharing a schema; an empty side passes
@@ -1370,6 +1385,7 @@ impl IncrementalAggState {
         let retractable = self.weight_col_idx.is_some();
         let decoded = decode_groups_columnar(
             &self.row_converter,
+            self.num_group_cols,
             &self.agg_specs,
             retractable,
             &checkpoint.keys_ipc,
@@ -1536,6 +1552,7 @@ impl IncrementalAggState {
         let retractable = self.weight_col_idx.is_some();
         let per_group = decode_columnar_state_arrays(
             &self.row_converter,
+            self.num_group_cols,
             &checkpoint.keys_ipc,
             &checkpoint.acc_state_ipc,
             &checkpoint.last_updated_ms,
