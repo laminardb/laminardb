@@ -464,8 +464,7 @@ pub struct CheckpointSection {
     #[serde(default)]
     pub uncommitted_epochs_backpressure: bool,
     /// Durability-gate poll first interval in ms (default 100). Tighten on a
-    /// low-latency object store to cut the poll quantization that dominates
-    /// sub-second checkpoint latency.
+    /// low-latency object store to cut poll quantization.
     #[serde(default)]
     pub restorable_gate_poll_initial_ms: Option<u64>,
     /// Durability-gate poll backoff cap in ms (default 1000).

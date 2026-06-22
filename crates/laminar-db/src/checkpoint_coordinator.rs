@@ -84,12 +84,10 @@ pub struct CheckpointConfig {
     /// Followers upload asynchronously after the capture ack, so the durability gate polls
     /// rather than checking once. Expiry aborts the epoch.
     pub restorable_gate_timeout: Duration,
-    /// Durability-gate poll first interval. The gate re-checks object-store
-    /// presence on an exponential schedule from here to `restorable_gate_poll_max`.
-    /// Tighten both on a low-latency object store to cut the poll quantization;
-    /// the defaults (100ms/1s) suit a higher-latency store.
+    /// Durability-gate poll: first interval, backing off exponentially to the cap.
+    /// Tighten on a low-latency store to cut poll quantization.
     pub restorable_gate_poll_initial: Duration,
-    /// Durability-gate poll backoff cap (see `restorable_gate_poll_initial`).
+    /// Durability-gate poll backoff cap.
     pub restorable_gate_poll_max: Duration,
     /// Max pipelined epochs between `Aligned` and restorable. Exactly-once pipelines cap at 1.
     pub max_in_flight_epochs: u64,
@@ -1097,10 +1095,8 @@ impl CheckpointCoordinator {
     ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
-        // Each poll LISTs the epoch prefix; back off exponentially from the configured
-        // initial to the cap. Gates serialize on the coordinator mutex so at most one
-        // loop runs at a time regardless of pipeline depth. Clamp to a 1ms floor and
-        // keep the cap >= initial so a 0ms config can't spin the loop under the mutex.
+        // Back off exponentially from the configured initial to the cap. Clamp to a
+        // 1ms floor (cap >= initial) so a 0ms config can't spin the gate under the mutex.
         let initial_poll = self
             .config
             .restorable_gate_poll_initial

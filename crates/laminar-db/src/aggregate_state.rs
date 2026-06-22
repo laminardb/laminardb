@@ -468,9 +468,8 @@ impl AggStateCheckpoint {
         if self.acc_state_ipc.is_empty() {
             self.acc_state_ipc = other.acc_state_ipc;
         } else if !other.acc_state_ipc.is_empty() {
-            // Both are slices of one query, so the accumulator-column counts must
-            // match; a mismatch would row-misalign keys vs accs in a way the
-            // fingerprint can't catch. (An empty `other` contributes no rows.)
+            // Slices of one query → equal accumulator-column counts; a mismatch would
+            // row-misalign keys vs accs (an empty `other` is a no-op).
             if self.acc_state_ipc.len() != other.acc_state_ipc.len() {
                 return Err(DbError::Pipeline(format!(
                     "append_disjoint: accumulator column count mismatch ({} vs {})",
@@ -560,11 +559,9 @@ pub(crate) struct IncrementalAggState {
     // Groups for these vnodes were dropped; captures stage a cold marker.
     #[cfg(feature = "state-tier")]
     cold_vnodes: rustc_hash::FxHashSet<u32>,
-    // ── Delta-state tracking (Lever 2, Phase 1) ─────────────────────────────
-    // When delta capture is enabled, the keys mutated / removed since the last
-    // per-vnode capture, bucketed by vnode. Populated only while `delta_vnode_count`
-    // is set (off by default → zero cost). Consumed by the delta encode (Phase 2).
-    // `delta_enabled` is read only by the cluster per-vnode capture.
+    // Delta-state tracking: keys mutated / removed since the last per-vnode capture,
+    // bucketed by vnode. Populated only while `delta_vnode_count` is set (off by
+    // default → zero cost).
     #[cfg(feature = "cluster")]
     delta_enabled: bool,
     delta_vnode_count: Option<u32>,
@@ -882,15 +879,12 @@ impl IncrementalAggState {
         }))
     }
 
-    /// Enable per-vnode delta tracking. Off by default; the first per-vnode capture
-    /// after this starts recording mutated/removed keys for the delta encode (Phase 2).
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn set_delta_enabled(&mut self, enabled: bool) {
         self.delta_enabled = enabled;
     }
 
-    /// Vnode for a group key (row bytes) under delta bucketing — mirrors the
-    /// capture/tier mapping.
+    /// Vnode for a group key under delta bucketing — same hash as the capture path.
     fn delta_vnode_of(&self, key_bytes: &[u8], count: u32) -> u32 {
         if self.num_group_cols == 0 {
             0
@@ -1609,9 +1603,8 @@ impl IncrementalAggState {
             self.dirty_vnodes.clear();
             self.dirty_all = false;
         }
-        // Delta tracking restarts from this capture (Lever 2). Enabling here means
-        // the first delta-capable capture is the chain root (FULL), with subsequent
-        // mutations recorded into the per-vnode sets for the next checkpoint.
+        // Delta tracking re-bases on this capture: the dirty sets reset, so the next
+        // checkpoint's delta is measured against the state staged here.
         if self.delta_enabled {
             self.delta_vnode_count = Some(vnode_count);
             self.dirty_keys_by_vnode.clear();
@@ -1621,12 +1614,8 @@ impl IncrementalAggState {
         Ok(buckets)
     }
 
-    /// Encode the per-vnode state DELTA (Lever 2 phase 2): the groups changed and
-    /// the keys removed for `vnode` since the last capture, from the phase-1 dirty
-    /// sets. Changed groups reuse the columnar FULL encoding over the subset;
-    /// removed keys are columnar-encoded as tombstones. Decoded + applied onto the
-    /// chain base by [`apply_delta`](Self::apply_delta). Phase-3 wires it into the
-    /// capture + recovery path; until then it is exercised only by tests.
+    /// Encode the state delta for `vnode` from the dirty sets: changed groups via the
+    /// columnar FULL encoding over the subset, removed keys as tombstones.
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn encode_delta_for_vnode(&mut self, vnode: u32) -> Result<AggVnodeDelta, DbError> {
         let fingerprint = self.query_fingerprint();
@@ -1678,9 +1667,8 @@ impl IncrementalAggState {
         })
     }
 
-    /// Apply a delta onto live state (Lever 2 phase 2): each changed group's
-    /// accumulators are REPLACED from the delta's post-update state (never additively
-    /// re-merged), and tombstoned keys are removed.
+    /// Apply a delta onto live state: changed groups replace per key (the delta
+    /// carries post-update state, never additively re-merged); tombstoned keys removed.
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn apply_delta(&mut self, delta: &AggVnodeDelta) -> Result<(), DbError> {
         let retractable = self.weight_col_idx.is_some();
@@ -3166,7 +3154,7 @@ mod tests {
             .unwrap();
         ctx.register_table("events", Arc::new(mem)).unwrap();
 
-        // Producer state: seed a,b,c then take a FULL baseline (opens the delta window).
+        // Producer: seed the keys, then take a FULL baseline (opens the delta window).
         let mut producer = changelog_agg(&ctx).await;
         producer.set_delta_enabled(true);
         feed(
