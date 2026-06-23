@@ -13,6 +13,45 @@ All file:line anchors verified against the tree at `92fdf9d8`.
 
 ---
 
+## Status — what landed in the follow-up pass
+
+- **Note 3 + Note 2 — DONE.** Note 2 (event-driven convergence gate) subsumes Note 3:
+  the leader's checkpoint-convergence verdict is computed off the hot path by the
+  snapshot watcher and published through a `watch` channel
+  (`ClusterController::publish_converged` / `converged_watch`); the checkpoint gate is
+  now a local borrow (`assignment_ready_for_checkpoint` → `converged_rx.borrow()`) with
+  no per-checkpoint gossip scan. De-conflation falls out for free — the gate no longer
+  bumps `last_checkpoint` on a convergence skip, so the first post-convergence checkpoint
+  fires immediately. The throttle field Note 3 proposed was never needed.
+
+- **1B — foundation DONE; full isolation deferred (corrected to L).** Recovery domains
+  (weakly-connected components *including* sources — independent queries are disjoint
+  sub-pipelines, so a global-epoch checkpoint is the union of per-domain consistent cuts)
+  are computed in `compute_topo_order` (`node_domain` / `domain_of` / `failure_domain_count`)
+  and wired into fatal-error blast-radius attribution. **Correction to the plan:** the
+  "exclude sources" model creates a shared-source offset inconsistency (option-b dups a
+  sibling's rows on replay); the *including-sources* model avoids it. Full fatal
+  cross-domain isolation (let healthy domains commit while a faulted domain recovers
+  alone) requires **in-flight per-domain recovery** — selective graph restore + per-source
+  re-seek — neither of which exists (recovery is whole-pipeline stop+start; sources consume
+  `restore_checkpoint` only at spawn). That is an **L**, not the **M** estimated here, and
+  is the remaining work for 1B.
+
+- **1A-cluster — foundation DONE; distributed driver deferred (soak-gated).** The
+  deterministic, unit-tested mechanisms landed: leader epoch selector
+  (`CheckpointDecisionStore::highest_committed`, exposed as `LaminarDB::cluster_recovery_target`),
+  per-node recover-to-target (`RecoveryManager::recover_to_epoch` →
+  `CheckpointCoordinator::recover_to_epoch`), and the node-side restart hook
+  (`LaminarDB::set_recover_target_epoch` + `recover_target_epoch` consumed in `start_inner`).
+  The remaining piece is the **distributed driver**: fault-report → leader decision →
+  recover-directive broadcast → every node `set_recover_target_epoch` + coordinated restart
+  → barrier-rearm fence (reusing the Note 2 convergence signal). It is implementable on
+  these primitives but **gated on multi-node kill-9 soak** (depth > 1 cross-node shuffle),
+  which the local environment cannot run reliably — so it is intentionally not yet wired
+  into a live path.
+
+---
+
 ## Note 3 — De-conflate the convergence-gate throttle. (XS, do first)
 
 ### Problem
