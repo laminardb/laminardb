@@ -280,6 +280,27 @@ impl LaminarDB {
         *self.supervisor_self.lock() = Arc::downgrade(self);
     }
 
+    /// Arm a coordinated-recovery target for the next [`Self::start`]: the node will
+    /// restore to `epoch` (the cluster-agreed cut) instead of its local latest. The
+    /// leader-driven global restart sets the same target on every node so the
+    /// distributed shuffle cut stays consistent. Cleared (taken) on start.
+    #[cfg(feature = "cluster")]
+    pub fn set_recover_target_epoch(&self, epoch: u64) {
+        *self.recover_target_epoch.lock() = Some(epoch);
+    }
+
+    /// The newest epoch committed cluster-wide (highest 2PC commit marker) — the
+    /// recovery target a leader proposes for a coordinated global restart. `None`
+    /// before any commit, or outside cluster mode.
+    #[cfg(feature = "cluster")]
+    pub async fn cluster_recovery_target(&self) -> Option<u64> {
+        let decisions = {
+            let guard = self.coordinator.lock().await;
+            guard.as_ref()?.decision_store_handle()?
+        };
+        decisions.highest_committed().await.ok().flatten()
+    }
+
     /// Start the streaming pipeline. Idempotent if already running. On failure
     /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
@@ -1134,7 +1155,20 @@ impl LaminarDB {
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                match coord.recover().await {
+                // Coordinated cluster restart: restore to the cluster-agreed epoch so
+                // every node lands on the same distributed cut; else the local latest.
+                // Take the override owned first — holding the guard across the await
+                // would make this future non-Send.
+                #[cfg(feature = "cluster")]
+                let recover_target = self.recover_target_epoch.lock().take();
+                #[cfg(feature = "cluster")]
+                let recovery = match recover_target {
+                    Some(target) => coord.recover_to_epoch(target).await,
+                    None => coord.recover().await,
+                };
+                #[cfg(not(feature = "cluster"))]
+                let recovery = coord.recover().await;
+                match recovery {
                     Ok(Some(recovered)) => {
                         recovered_source_wms = recovered
                             .manifest

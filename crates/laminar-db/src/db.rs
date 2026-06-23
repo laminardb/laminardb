@@ -137,6 +137,11 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
+    /// Coordinated-recovery target for the next start: when set, the node restores
+    /// to this cluster-agreed epoch instead of its local latest, so a leader-driven
+    /// global restart yields a consistent distributed cut. Taken in `start_inner`.
+    #[cfg(feature = "cluster")]
+    pub(crate) recover_target_epoch: parking_lot::Mutex<Option<u64>>,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
@@ -389,6 +394,8 @@ impl LaminarDB {
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            recover_target_epoch: parking_lot::Mutex::new(None),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
