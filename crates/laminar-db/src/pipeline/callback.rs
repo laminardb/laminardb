@@ -97,6 +97,16 @@ pub trait PipelineCallback: Send + 'static {
         true
     }
 
+    /// `true` when the cluster is converged enough for the leader to take a periodic
+    /// checkpoint (see the gate in `StreamingCoordinator::maybe_checkpoint`). Default
+    /// `true` (single-node). `fn -> impl Future` (not `async fn`) so `trait_variant`
+    /// keeps the default; `&mut self` keeps the future `Send` without `Self: Sync`.
+    fn assignment_ready_for_checkpoint(
+        &mut self,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 

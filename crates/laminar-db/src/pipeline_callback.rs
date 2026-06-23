@@ -198,6 +198,27 @@ impl FollowerTailState {
     }
 }
 
+/// `true` when every live node has reported a committed-assignment version and all
+/// agree. A node missing from `reported` hasn't republished since (re)joining, so it
+/// is treated as not-yet-converged; disagreement means a rebalance is still
+/// propagating (the leader has bumped, a follower lags). The leader's committed
+/// version is the max, so all-equal ⇒ every follower has caught up.
+#[cfg(feature = "cluster")]
+fn assignment_versions_converged(live: &[u64], reported: &rustc_hash::FxHashMap<u64, u64>) -> bool {
+    let mut seen: Option<u64> = None;
+    for id in live {
+        let Some(&v) = reported.get(id) else {
+            return false;
+        };
+        match seen {
+            None => seen = Some(v),
+            Some(s) if s != v => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -1472,6 +1493,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         true
     }
 
+    #[cfg(feature = "cluster")]
+    async fn assignment_ready_for_checkpoint(&mut self) -> bool {
+        let Some(cc) = self.cluster_controller.as_ref() else {
+            return true;
+        };
+        let live: Vec<u64> = cc.live_instances().iter().map(|n| n.0).collect();
+        if live.len() <= 1 {
+            return true; // solo owner — nothing to converge with.
+        }
+        let reported: rustc_hash::FxHashMap<u64, u64> = cc
+            .read_adopted_versions()
+            .await
+            .into_iter()
+            .map(|(n, v)| (n.0, v))
+            .collect();
+        assignment_versions_converged(&live, &reported)
+    }
+
     fn tick_idle_watermark(&mut self) {
         let Some(ref mut trk) = self.tracker else {
             return;
@@ -2254,6 +2293,39 @@ mod tests {
         // A higher epoch is always processed.
         assert!(!skip(Some(5), None, None, 6));
         assert!(!skip(Some(5), Some(5), Some(5), 6));
+    }
+
+    /// The leader's checkpoint-convergence gate: ready only when every live node
+    /// has reported the same committed-assignment version. A respawned node that
+    /// lags (or hasn't republished yet) holds the gate closed.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn assignment_versions_converged_matrix() {
+        let map = |pairs: &[(u64, u64)]| -> rustc_hash::FxHashMap<u64, u64> {
+            pairs.iter().copied().collect()
+        };
+        // All live nodes on the same version → converged.
+        assert!(assignment_versions_converged(
+            &[1, 2, 3],
+            &map(&[(1, 5), (2, 5), (3, 5)])
+        ));
+        // A follower lagging behind the leader's newer version → not converged.
+        assert!(!assignment_versions_converged(
+            &[1, 2, 3],
+            &map(&[(1, 6), (2, 6), (3, 5)])
+        ));
+        // A live node with no reported version yet (just rejoined) → not converged.
+        assert!(!assignment_versions_converged(
+            &[1, 2, 3],
+            &map(&[(1, 5), (2, 5)])
+        ));
+        // Stale entries for dead nodes don't matter — only live ids are checked.
+        assert!(assignment_versions_converged(
+            &[1, 2],
+            &map(&[(1, 7), (2, 7), (9, 3)])
+        ));
+        // Single live node is trivially converged.
+        assert!(assignment_versions_converged(&[1], &map(&[(1, 4)])));
     }
 
     /// Build a follower-side controller whose `current_leader()` is a

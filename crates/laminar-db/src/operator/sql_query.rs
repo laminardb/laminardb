@@ -742,10 +742,10 @@ async fn shuffle_pre_agg_batches(
         }
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
         for &v in &row_vn {
-            let owner = cfg.registry.owner(v);
-            if owner.is_unassigned() {
-                return Err(DbError::Pipeline(format!(
-                    "[{op_name}] row-shuffle: vnode {v} is unassigned — refusing to drop rows"
+            if cfg.registry.owner(v).is_unassigned() {
+                // Formation/rebalance transient — defer (recoverable), don't drop.
+                return Err(DbError::ShuffleNotReady(format!(
+                    "[{op_name}] row-shuffle: vnode {v} is unassigned"
                 )));
             }
         }
@@ -763,8 +763,9 @@ async fn shuffle_pre_agg_batches(
 
         for (owner, slice) in remote_slices {
             let msg = ShuffleMessage::VnodeData(op_name.to_string(), 0, slice);
+            // Unreachable peer during formation: `ShuffleNotReady` defers (recoverable).
             cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
-                DbError::Pipeline(format!(
+                DbError::ShuffleNotReady(format!(
                     "[{op_name}] row-shuffle send_to peer {}: {e}",
                     owner.0
                 ))

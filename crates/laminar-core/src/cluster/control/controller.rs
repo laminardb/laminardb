@@ -354,6 +354,24 @@ impl ClusterController {
             .collect()
     }
 
+    /// Publish the committed-assignment version this node has adopted (peer gossip
+    /// KV), for the leader's checkpoint-convergence gate in `StreamingCoordinator`.
+    pub async fn announce_adopted_version(&self, version: u64) {
+        self.kv
+            .write("control:adopted-version", version.to_string())
+            .await;
+    }
+
+    /// Each live peer's adopted committed-assignment version from gossip KV.
+    pub async fn read_adopted_versions(&self) -> Vec<(NodeId, u64)> {
+        self.kv
+            .scan("control:adopted-version")
+            .await
+            .into_iter()
+            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|ver| (n, ver)))
+            .collect()
+    }
+
     /// Start the direct gRPC barrier sync server.
     ///
     /// # Errors

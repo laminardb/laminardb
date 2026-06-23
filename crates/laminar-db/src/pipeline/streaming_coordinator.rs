@@ -923,12 +923,26 @@ impl StreamingCoordinator {
             self.broadcast_epoch_committed(epoch, &FxHashMap::default());
         }
 
-        let should_checkpoint = callback.is_leader()
-            && (self
+        let interval_due = callback.is_leader()
+            && self
                 .config
                 .checkpoint_interval
-                .is_some_and(|interval| self.last_checkpoint.elapsed() >= interval)
-                || self
+                .is_some_and(|interval| self.last_checkpoint.elapsed() >= interval);
+
+        // Hold the interval cadence while a rebalance is converging: a respawned node
+        // is gossip-live before it has adopted+rehydrated the current assignment, so a
+        // checkpoint started now would align-wait on its not-yet-flowing shuffle barrier
+        // and time out, cascading into epoch aborts. Advance the interval clock so the
+        // gossip read behind this gate runs at most once per interval, not every tick.
+        if interval_due && !callback.assignment_ready_for_checkpoint().await {
+            self.last_checkpoint = Instant::now();
+            return;
+        }
+
+        // Explicit connector checkpoint requests are honored regardless of convergence.
+        let should_checkpoint = interval_due
+            || (callback.is_leader()
+                && self
                     .checkpoint_request_flags
                     .iter()
                     .any(|f| f.swap(false, Ordering::AcqRel)));

@@ -1638,14 +1638,19 @@ impl OperatorGraph {
                 b
             }
             Err(e) => {
-                if accept && self.depends_on_stream.contains(&node_id) {
-                    // Upstream not ready; preserve input for retry next cycle.
+                // Defer (preserve input, keep the cycle alive) when the upstream
+                // isn't ready, OR when a cross-node shuffle target isn't reachable
+                // yet (cluster formation): aborting the whole cycle would also drop
+                // co-located streams (e.g. a pass-through exactly-once sink) whose
+                // source rows the generator has already advanced past — an EO gap.
+                if accept && (self.depends_on_stream.contains(&node_id) || e.is_shuffle_not_ready())
+                {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
-                        "Query deferred (upstream not ready); batches preserved for retry"
+                        "Query deferred (upstream/shuffle not ready); batches preserved for retry"
                     );
                     return Ok(());
                 }

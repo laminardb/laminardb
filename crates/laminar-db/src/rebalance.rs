@@ -154,6 +154,11 @@ pub fn spawn_snapshot_watcher(
             let version = registry.assignment_version();
             if version != published_version {
                 published_version = version;
+                // Publish the adopted version so the leader's checkpoint-convergence
+                // gate sees this node has caught up (see `announce_adopted_version`).
+                if let Some(ref c) = controller {
+                    c.announce_adopted_version(version).await;
+                }
                 if let (Some(c), Some(metrics)) = (controller.as_ref(), db.engine_metrics()) {
                     let nodes = c.assignable_with_locality();
                     publish_placement_metrics(
