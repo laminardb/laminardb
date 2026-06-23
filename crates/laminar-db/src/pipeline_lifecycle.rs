@@ -1821,6 +1821,12 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             cluster_controller: self.cluster_controller.lock().clone(),
             #[cfg(feature = "cluster")]
+            converged_rx: self
+                .cluster_controller
+                .lock()
+                .as_ref()
+                .map(|cc| cc.converged_watch()),
+            #[cfg(feature = "cluster")]
             follower_tail: Arc::default(),
             #[cfg(feature = "cluster")]
             barrier_injectors: Vec::new(),

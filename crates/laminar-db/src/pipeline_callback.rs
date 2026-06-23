@@ -204,7 +204,10 @@ impl FollowerTailState {
 /// propagating (the leader has bumped, a follower lags). The leader's committed
 /// version is the max, so all-equal ⇒ every follower has caught up.
 #[cfg(feature = "cluster")]
-fn assignment_versions_converged(live: &[u64], reported: &rustc_hash::FxHashMap<u64, u64>) -> bool {
+pub(crate) fn assignment_versions_converged(
+    live: &[u64],
+    reported: &rustc_hash::FxHashMap<u64, u64>,
+) -> bool {
     let mut seen: Option<u64> = None;
     for id in live {
         let Some(&v) = reported.get(id) else {
@@ -265,6 +268,10 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Cached convergence verdict for the periodic-checkpoint gate, published by the
+    /// snapshot watcher. `None` in single-node mode (gate defaults open).
+    #[cfg(feature = "cluster")]
+    pub(crate) converged_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// In-flight epoch + highest committed epoch for follower tail dedup.
     #[cfg(feature = "cluster")]
     pub(crate) follower_tail: Arc<FollowerTailState>,
@@ -1500,20 +1507,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     #[cfg(feature = "cluster")]
     async fn assignment_ready_for_checkpoint(&mut self) -> bool {
-        let Some(cc) = self.cluster_controller.as_ref() else {
-            return true;
-        };
-        let live: Vec<u64> = cc.live_instances().iter().map(|n| n.0).collect();
-        if live.len() <= 1 {
-            return true; // solo owner — nothing to converge with.
-        }
-        let reported: rustc_hash::FxHashMap<u64, u64> = cc
-            .read_adopted_versions()
-            .await
-            .into_iter()
-            .map(|(n, v)| (n.0, v))
-            .collect();
-        assignment_versions_converged(&live, &reported)
+        // Local borrow of the verdict the snapshot watcher computes off the hot path
+        // (see `rebalance::spawn_snapshot_watcher`); no gossip scan on the gate.
+        self.converged_rx.as_ref().is_none_or(|rx| *rx.borrow())
     }
 
     fn tick_idle_watermark(&mut self) {

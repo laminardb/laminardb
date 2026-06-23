@@ -22,6 +22,9 @@ pub struct ClusterController {
     barrier: BarrierCoordinator,
     snapshot: Option<Arc<AssignmentSnapshotStore>>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
+    /// Leader's checkpoint-convergence verdict, published off the hot path by the
+    /// snapshot watcher; the gate borrows it instead of a per-checkpoint gossip scan.
+    converged_for_checkpoint: watch::Sender<bool>,
     /// Latest cluster-wide minimum watermark published by the leader
     /// in a `Commit` announcement. `i64::MIN` means uninitialised
     /// (no Commit observed yet). Operators consult this instead of
@@ -84,6 +87,7 @@ impl ClusterController {
             kv,
             snapshot,
             members_rx,
+            converged_for_checkpoint: watch::channel(true).0,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
@@ -370,6 +374,19 @@ impl ClusterController {
             .into_iter()
             .filter_map(|(n, v)| v.parse::<u64>().ok().map(|ver| (n, ver)))
             .collect()
+    }
+
+    /// Publish the leader's checkpoint-convergence verdict. Called off the hot
+    /// path by the snapshot watcher; read locally by the periodic-checkpoint gate.
+    pub fn publish_converged(&self, converged: bool) {
+        self.converged_for_checkpoint.send_replace(converged);
+    }
+
+    /// Watch the leader's checkpoint-convergence verdict — a local borrow that
+    /// replaces the per-checkpoint `read_adopted_versions` gossip scan.
+    #[must_use]
+    pub fn converged_watch(&self) -> watch::Receiver<bool> {
+        self.converged_for_checkpoint.subscribe()
     }
 
     /// Start the direct gRPC barrier sync server.
