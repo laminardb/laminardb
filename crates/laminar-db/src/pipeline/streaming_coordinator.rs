@@ -18,7 +18,7 @@ use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::callback::{BarrierOutcome, PipelineCallback, SourceRegistration};
+use super::callback::{BarrierOutcome, CycleError, PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
 use crate::error::DbError;
 
@@ -57,6 +57,15 @@ struct SourceHandle {
 
 /// `(epoch, per-source fan-out)` sent back when a background checkpoint completes.
 type CheckpointCompletion = (u64, rustc_hash::FxHashMap<String, SourceCheckpoint>);
+
+/// Why [`StreamingCoordinator::run`] returned.
+#[derive(Debug)]
+pub enum ExitReason {
+    /// Shutdown signaled, or all source senders dropped — a clean stop.
+    Shutdown,
+    /// Fatal exactly-once cycle error; the caller recovers from the last checkpoint.
+    Fault(String),
+}
 
 /// Single-task pipeline coordinator — no core threads.
 pub struct StreamingCoordinator {
@@ -439,12 +448,12 @@ impl StreamingCoordinator {
         self
     }
 
-    /// Run the coordinator loop until shutdown is signaled.
+    /// Run the coordinator loop until shutdown or a fatal cycle fault.
     ///
     /// Cycle priority: (1) shutdown, (2) drain + SQL, (3) barrier alignment,
     /// (4) periodic checkpoint, (5) table polling, (6) barrier timeout.
     #[allow(clippy::too_many_lines)]
-    pub async fn run<C: PipelineCallback>(mut self, mut callback: C) {
+    pub async fn run<C: PipelineCallback>(mut self, mut callback: C) -> ExitReason {
         /// Maximum messages to drain per cycle before yielding for maintenance work.
         const MAX_DRAIN_PER_CYCLE: usize = 10_000;
 
@@ -457,6 +466,9 @@ impl StreamingCoordinator {
 
         let batch_window = self.config.batch_window;
         let mut barriers_buf: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
+        // Set by a fatal exactly-once error; gates the final checkpoint (committing the
+        // open epoch would seal offsets past the lost rows → recovery dups/gaps them).
+        let mut fault: Option<String> = None;
 
         loop {
             // Step: Wait for data, shutdown, or idle timeout.
@@ -565,7 +577,32 @@ impl StreamingCoordinator {
                     }
                     Err(e) => {
                         self.discard_pending_offsets();
-                        tracing::warn!(error = %e, "[LDB-3020] SQL cycle error");
+                        match e {
+                            // Shutdown already signaled; restarting would just re-trip it.
+                            CycleError::Halt(msg) => {
+                                tracing::warn!(reason = %msg, "[LDB-3022] cycle halted");
+                            }
+                            // Exactly-once: continuing would drop the drained rows (EO gap).
+                            CycleError::Fatal(msg)
+                                if self.config.delivery_guarantee
+                                    == DeliveryGuarantee::ExactlyOnce =>
+                            {
+                                tracing::error!(
+                                    error = %msg,
+                                    "[LDB-3021] fatal SQL cycle error; faulting for recovery"
+                                );
+                                fault = Some(msg);
+                                break;
+                            }
+                            // At-least-once: drop the bad cycle and continue.
+                            CycleError::Fatal(msg) => {
+                                callback.note_cycle_error();
+                                tracing::warn!(
+                                    error = %msg,
+                                    "[LDB-3020] SQL cycle error (at-least-once: continuing)"
+                                );
+                            }
+                        }
                     }
                 }
                 #[allow(clippy::cast_possible_truncation)]
@@ -632,88 +669,92 @@ impl StreamingCoordinator {
             handle.shutdown.notify_one();
         }
 
-        // Drain before joining: source tasks blocked on a full channel can't see
-        // the shutdown signal until slots free. Joining first deadlocks.
-        self.source_batches_buf.clear();
-        self.barrier_seen.clear();
-        self.discard_pending_offsets();
-        let mut drain_barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
-        let mut drain_events: u64 = 0;
+        // Skip the drain + final checkpoint on a fault (see `fault` above). Sources are
+        // still notified above and joined below, so old tasks stop before a restart.
+        if fault.is_none() {
+            // Drain before joining: source tasks blocked on a full channel can't see
+            // the shutdown signal until slots free. Joining first deadlocks.
+            self.source_batches_buf.clear();
+            self.barrier_seen.clear();
+            self.discard_pending_offsets();
+            let mut drain_barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
+            let mut drain_events: u64 = 0;
 
-        loop {
-            let deferred = std::mem::take(&mut self.post_barrier_buf);
-            let mut got_any = !deferred.is_empty();
-            for msg in deferred {
-                self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+            loop {
+                let deferred = std::mem::take(&mut self.post_barrier_buf);
+                let mut got_any = !deferred.is_empty();
+                for msg in deferred {
+                    self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+                }
+                while let Ok(msg) = self.rx.try_recv() {
+                    got_any = true;
+                    self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+                }
+                if !got_any {
+                    break;
+                }
             }
+
+            for (name, batch) in self.pending_watermark_batches.drain(..) {
+                callback.extract_watermark(&name, &batch);
+            }
+            callback.tick_idle_watermark();
+            if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
+                let wm = callback.current_watermark();
+                match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                    Ok(results) => {
+                        self.commit_pending_offsets();
+                        callback.update_mv_stores(&results);
+                        callback.push_to_streams(&results);
+                        callback.write_to_sinks(&results).await;
+                    }
+                    Err(e) => {
+                        self.discard_pending_offsets();
+                        tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
+                    }
+                }
+            }
+
+            // Second drain: messages sent between the first drain and source task exit.
+            self.source_batches_buf.clear();
+            self.barrier_seen.clear();
+            self.discard_pending_offsets();
+            drain_barriers.clear();
             while let Ok(msg) = self.rx.try_recv() {
-                got_any = true;
                 self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
             }
-            if !got_any {
-                break;
+            for (name, batch) in self.pending_watermark_batches.drain(..) {
+                callback.extract_watermark(&name, &batch);
             }
-        }
-
-        for (name, batch) in self.pending_watermark_batches.drain(..) {
-            callback.extract_watermark(&name, &batch);
-        }
-        callback.tick_idle_watermark();
-        if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
-            let wm = callback.current_watermark();
-            match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                Ok(results) => {
-                    self.commit_pending_offsets();
-                    callback.update_mv_stores(&results);
-                    callback.push_to_streams(&results);
-                    callback.write_to_sinks(&results).await;
-                }
-                Err(e) => {
-                    self.discard_pending_offsets();
-                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
+            callback.tick_idle_watermark();
+            if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
+                let wm = callback.current_watermark();
+                match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                    Ok(results) => {
+                        self.commit_pending_offsets();
+                        callback.update_mv_stores(&results);
+                        callback.push_to_streams(&results);
+                        callback.write_to_sinks(&results).await;
+                    }
+                    Err(e) => {
+                        self.discard_pending_offsets();
+                        tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
+                    }
                 }
             }
-        }
 
-        // Second drain: messages sent between the first drain and source task exit.
-        self.source_batches_buf.clear();
-        self.barrier_seen.clear();
-        self.discard_pending_offsets();
-        drain_barriers.clear();
-        while let Ok(msg) = self.rx.try_recv() {
-            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
-        }
-        for (name, batch) in self.pending_watermark_batches.drain(..) {
-            callback.extract_watermark(&name, &batch);
-        }
-        callback.tick_idle_watermark();
-        if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
-            let wm = callback.current_watermark();
-            match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                Ok(results) => {
-                    self.commit_pending_offsets();
-                    callback.update_mv_stores(&results);
-                    callback.push_to_streams(&results);
-                    callback.write_to_sinks(&results).await;
+            // Run the final checkpoint before dropping source senders so the EpochCommitted
+            // ack reaches the broker (Kafka group offsets, etc.).
+            let checkpoint_enabled = self.config.checkpoint_interval.is_some();
+            if checkpoint_enabled {
+                let source_offsets = self.current_source_offsets();
+                if let Some(epoch) = callback
+                    .maybe_checkpoint(true, source_offsets.clone())
+                    .await
+                {
+                    tracing::info!(epoch, "final checkpoint completed before shutdown");
+                    self.broadcast_epoch_committed(epoch, &source_offsets);
                 }
-                Err(e) => {
-                    self.discard_pending_offsets();
-                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
-                }
-            }
-        }
-
-        // Run the final checkpoint before dropping source senders so the EpochCommitted
-        // ack reaches the broker (Kafka group offsets, etc.).
-        let checkpoint_enabled = self.config.checkpoint_interval.is_some();
-        if checkpoint_enabled {
-            let source_offsets = self.current_source_offsets();
-            if let Some(epoch) = callback
-                .maybe_checkpoint(true, source_offsets.clone())
-                .await
-            {
-                tracing::info!(epoch, "final checkpoint completed before shutdown");
-                self.broadcast_epoch_committed(epoch, &source_offsets);
             }
         }
 
@@ -740,6 +781,8 @@ impl StreamingCoordinator {
                 }
             }
         }
+
+        fault.map_or(ExitReason::Shutdown, ExitReason::Fault)
     }
 
     /// Process one source message. Post-barrier batches are diverted to `post_barrier_buf`.
@@ -991,6 +1034,9 @@ mod tests {
         watermark: i64,
         /// Optional shared flag set when `maybe_checkpoint(force=true)` fires.
         force_checkpoint_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Fail on this 1-based cycle number.
+        fatal_at_cycle: Option<u32>,
+        cycle_errors: Arc<AtomicU64>,
     }
 
     impl MockCallback {
@@ -1000,6 +1046,8 @@ mod tests {
                 results: Vec::new(),
                 watermark: 0,
                 force_checkpoint_flag: None,
+                fatal_at_cycle: None,
+                cycle_errors: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -1009,8 +1057,14 @@ mod tests {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             _watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
             self.cycle_count += 1;
+            if self.fatal_at_cycle == Some(self.cycle_count) {
+                return Err(CycleError::Fatal(format!(
+                    "injected fatal at cycle {}",
+                    self.cycle_count
+                )));
+            }
             // Pass through source batches as results.
             let results: FxHashMap<Arc<str>, Vec<RecordBatch>> = source_batches
                 .iter()
@@ -1018,6 +1072,10 @@ mod tests {
                 .collect();
             self.results.push(results.clone());
             Ok(results)
+        }
+
+        fn note_cycle_error(&self) {
+            self.cycle_errors.fetch_add(1, Ordering::SeqCst);
         }
 
         fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
@@ -1065,6 +1123,149 @@ mod tests {
         fn record_cycle(&self, _events: u64, _batches: u64, _elapsed_ns: u64) {}
         async fn poll_tables(&mut self) {}
         fn apply_control(&mut self, _msg: crate::pipeline::ControlMsg) {}
+    }
+
+    /// Build a source-less coordinator over a direct channel (bypasses source spawning).
+    fn test_coordinator(
+        rx: SourceMsgRx,
+        control_rx: ControlMsgRx,
+        shutdown: Arc<tokio::sync::Notify>,
+        delivery_guarantee: DeliveryGuarantee,
+        checkpoint_interval: Option<Duration>,
+    ) -> StreamingCoordinator {
+        StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval,
+                delivery_guarantee,
+                barrier_alignment_timeout: Duration::from_secs(30),
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                max_input_buf_batches: 256,
+                max_input_buf_bytes: None,
+                backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
+            },
+            rx,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("test_source")],
+            shutdown,
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
+            control_rx,
+            checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
+        }
+    }
+
+    fn int_batch(v: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![v]))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fatal_cycle_error_faults_and_skips_final_checkpoint_exactly_once() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        let coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::ExactlyOnce,
+            Some(Duration::from_secs(60)),
+        );
+
+        let force_flag = Arc::new(AtomicBool::new(false));
+        let mut callback = MockCallback::new();
+        callback.force_checkpoint_flag = Some(Arc::clone(&force_flag));
+        callback.fatal_at_cycle = Some(1);
+
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: SourceCheckpoint::new(1),
+        })
+        .await
+        .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(5), coordinator.run(callback))
+            .await
+            .expect("run() must return after a fatal cycle error");
+
+        assert!(
+            matches!(exit, ExitReason::Fault(_)),
+            "exactly-once fatal cycle error must fault, got {exit:?}"
+        );
+        assert!(
+            !force_flag.load(Ordering::SeqCst),
+            "the final checkpoint must be skipped on the fault path"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn fatal_cycle_error_continues_at_least_once() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        let coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+
+        let mut callback = MockCallback::new();
+        callback.fatal_at_cycle = Some(1);
+        let errors = Arc::clone(&callback.cycle_errors);
+
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: SourceCheckpoint::new(1),
+        })
+        .await
+        .unwrap();
+
+        let shutdown_clone = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            shutdown_clone.notify_one();
+        });
+
+        let exit = tokio::time::timeout(Duration::from_secs(5), coordinator.run(callback))
+            .await
+            .expect("run() must return on shutdown");
+
+        assert!(
+            matches!(exit, ExitReason::Shutdown),
+            "at-least-once must not fault on a cycle error, got {exit:?}"
+        );
+        assert_eq!(
+            errors.load(Ordering::SeqCst),
+            1,
+            "at-least-once must drop-and-continue and count the error"
+        );
+        drop(tx);
     }
 
     /// Test that the coordinator processes messages via direct mpsc channel.
@@ -1501,7 +1702,7 @@ mod tests {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
             self.cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let total: u64 = source_batches
@@ -1671,7 +1872,7 @@ mod tests {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
             let total: u64 = source_batches
                 .values()
                 .flat_map(|bs| bs.iter())

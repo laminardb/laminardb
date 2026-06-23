@@ -105,6 +105,10 @@ pub struct LaminarDB {
     /// Panic message when the compute thread exits unexpectedly (`Faulted`);
     /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
     pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Self-ref set by `enable_supervision`; empty `Weak` (default) disables auto-restart.
+    pub(crate) supervisor_self: Arc<parking_lot::Mutex<std::sync::Weak<LaminarDB>>>,
+    /// Auto-restart timestamps within the sliding window; bounds restart storms.
+    pub(crate) restart_history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
@@ -366,6 +370,8 @@ impl LaminarDB {
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
+            supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
+            restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),

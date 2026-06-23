@@ -293,6 +293,9 @@ pub struct ServerConfig {
     pub state: StateBackendConfig,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
+    /// `[supervision]` — auto-restart policy on a fatal fault (single-node only).
+    #[serde(default)]
+    pub supervision: SupervisionSection,
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
     #[serde(default, rename = "lookup")]
@@ -403,6 +406,35 @@ impl Default for ServerSection {
             state_memory_budget_bytes: None,
             state_tier_dir: None,
         }
+    }
+}
+
+/// `[supervision]` — auto-restart policy; unset fields fall back to engine defaults.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct SupervisionSection {
+    pub max_restarts: Option<usize>,
+    pub window_secs: Option<u64>,
+    pub initial_backoff_ms: Option<u64>,
+    pub max_backoff_secs: Option<u64>,
+}
+
+impl SupervisionSection {
+    /// Resolve into a [`laminar_db::RestartPolicy`], applying defaults for unset fields.
+    pub fn to_policy(&self) -> laminar_db::RestartPolicy {
+        let mut p = laminar_db::RestartPolicy::default();
+        if let Some(v) = self.max_restarts {
+            p.max_restarts = v;
+        }
+        if let Some(v) = self.window_secs {
+            p.window = std::time::Duration::from_secs(v);
+        }
+        if let Some(v) = self.initial_backoff_ms {
+            p.initial_backoff = std::time::Duration::from_millis(v);
+        }
+        if let Some(v) = self.max_backoff_secs {
+            p.max_backoff = std::time::Duration::from_secs(v);
+        }
+        p
     }
 }
 
@@ -1582,6 +1614,7 @@ alice = "wonderland-key"
             server: ServerSection::default(),
             state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
             sources: vec![],
             lookups: vec![],
             pipelines: vec![],

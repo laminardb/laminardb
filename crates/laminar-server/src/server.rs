@@ -148,6 +148,7 @@ pub async fn run_server(
         _ => Profile::BareMetal,
     };
     builder = builder.profile(profile);
+    builder = builder.restart_policy(config.supervision.to_policy());
     builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint, false);
 
     // Build the state backend + single-owner vnode registry from config so
@@ -177,6 +178,8 @@ pub async fn run_server(
         .await
         .map_err(|e| ServerError::Build(e.to_string()))?;
     let db = Arc::new(db);
+    // Auto-recover from a fatal cycle fault by restarting from the last checkpoint.
+    db.enable_supervision();
 
     // Prometheus registry — must be set before start().
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
@@ -707,6 +710,7 @@ mod tests {
             server: ServerSection::default(),
             state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
             sources: vec![source],
             lookups: vec![],
             pipelines: vec![],
@@ -744,6 +748,7 @@ mod tests {
             server: ServerSection::default(),
             state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
             sources: vec![source],
             lookups: vec![],
             pipelines: vec![],

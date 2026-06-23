@@ -98,6 +98,91 @@ async fn resolve_stream_output_schemas(
     result.map(|()| out)
 }
 
+/// Prune timestamps outside `window`; if under `max_restarts`, record `now` and return
+/// the 0-based attempt index within the window. `None` once the budget is exhausted.
+fn claim_restart_slot(
+    history: &mut Vec<std::time::Instant>,
+    now: std::time::Instant,
+    max_restarts: usize,
+    window: std::time::Duration,
+) -> Option<usize> {
+    history.retain(|t| now.duration_since(*t) < window);
+    if history.len() >= max_restarts {
+        None
+    } else {
+        let attempt = history.len();
+        history.push(now);
+        Some(attempt)
+    }
+}
+
+/// Exponential backoff `initial * 2^attempt`, saturating and capped at `max`.
+fn backoff_for_attempt(
+    initial: std::time::Duration,
+    max: std::time::Duration,
+    attempt: usize,
+) -> std::time::Duration {
+    let factor = 1u32.checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX).min(20));
+    initial.saturating_mul(factor.unwrap_or(u32::MAX)).min(max)
+}
+
+/// Restart on a dedicated thread: `start()` is `!Send`, so `block_on` drives it while its
+/// inner `tokio::spawn` of the next watcher still targets this runtime. Call from a runtime.
+fn spawn_supervised_restart(
+    db: Arc<LaminarDB>,
+    history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
+    metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let handle = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("laminar-restart".into())
+        .spawn(move || handle.block_on(attempt_supervised_restart(db, history, metrics)))
+}
+
+/// One recover-from-checkpoint restart, honoring the restart budget.
+async fn attempt_supervised_restart(
+    db: Arc<LaminarDB>,
+    history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
+    metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+) {
+    let policy = db.config.restart_policy.clone();
+    let slot = {
+        let mut hist = history.lock();
+        claim_restart_slot(
+            &mut hist,
+            std::time::Instant::now(),
+            policy.max_restarts,
+            policy.window,
+        )
+    };
+    let Some(attempt) = slot else {
+        tracing::error!(
+            max = policy.max_restarts,
+            "pipeline faulted too many times within the restart window; \
+             staying faulted for manual recovery"
+        );
+        return;
+    };
+    if let Some(ref m) = metrics {
+        m.pipeline_restarts_total.inc();
+    }
+    let backoff = backoff_for_attempt(policy.initial_backoff, policy.max_backoff, attempt);
+    tokio::time::sleep(backoff).await;
+    // A concurrent stop/shutdown moves the state out of Faulted; don't fight it.
+    if !matches!(DbState::load(&db.state), DbState::Faulted) {
+        return;
+    }
+    // Capture the reason before start() clears `last_fault`, so it survives in the log.
+    let fault = db.last_fault().unwrap_or_else(|| "unknown".to_string());
+    tracing::warn!(
+        fault = %fault, ?backoff,
+        "auto-restarting faulted pipeline from last checkpoint"
+    );
+    if let Err(e) = db.start().await {
+        tracing::error!(error = %e, "auto-restart failed; pipeline left non-running");
+    }
+}
+
 impl LaminarDB {
     /// Shut down the database gracefully.
     pub fn close(&self) {
@@ -189,6 +274,12 @@ impl LaminarDB {
         )
     }
 
+    /// Enable auto-restart from the last checkpoint on a fault. Without it, a fault parks
+    /// in `Faulted` for manual restart (the embedded default).
+    pub fn enable_supervision(self: &Arc<Self>) {
+        *self.supervisor_self.lock() = Arc::downgrade(self);
+    }
+
     /// Start the streaming pipeline. Idempotent if already running. On failure
     /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
@@ -196,24 +287,30 @@ impl LaminarDB {
     ///
     /// Returns an error if the pipeline cannot be started.
     pub async fn start(&self) -> Result<(), DbError> {
-        match DbState::load(&self.state) {
-            DbState::Running | DbState::Starting => return Ok(()),
-            DbState::Stopped => {
-                return Err(DbError::InvalidOperation(
-                    "Cannot start a stopped pipeline. Create a new LaminarDB instance.".into(),
-                ));
+        // CAS-claim the start so a supervisor racing a manual start can't both enter
+        // start_inner and spawn two pipelines over the same state.
+        loop {
+            match DbState::load(&self.state) {
+                DbState::Running | DbState::Starting => return Ok(()),
+                DbState::Stopped => {
+                    return Err(DbError::InvalidOperation(
+                        "Cannot start a stopped pipeline. Create a new LaminarDB instance.".into(),
+                    ));
+                }
+                DbState::ShuttingDown => {
+                    return Err(DbError::InvalidOperation(
+                        "cannot start pipeline: shutdown/stop in progress".into(),
+                    ));
+                }
+                // Faulted and Created are both startable; a lost CAS re-reads.
+                claimed @ (DbState::Created | DbState::Faulted) => {
+                    if DbState::compare_exchange(claimed, DbState::Starting, &self.state).is_ok() {
+                        break;
+                    }
+                }
             }
-            DbState::ShuttingDown => {
-                return Err(DbError::InvalidOperation(
-                    "cannot start pipeline: shutdown/stop in progress".into(),
-                ));
-            }
-            // Faulted is recoverable — fall through and rebuild. Created is the
-            // fresh-start path.
-            DbState::Created | DbState::Faulted => {}
         }
 
-        DbState::Starting.store(&self.state);
         // Clear on entry, not after start_inner — otherwise a panic during this
         // startup (watcher → Faulted + reason) would be immediately overwritten.
         *self.last_fault.lock() = None;
@@ -1796,19 +1893,31 @@ impl LaminarDB {
                         }
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rt.block_on(async move {
-                            coordinator.run(callback).await;
-                        });
+                        rt.block_on(async move { coordinator.run(callback).await })
                     }));
-                    if let Err(panic) = result {
-                        let msg = panic
-                            .downcast_ref::<String>()
-                            .map(String::as_str)
-                            .or_else(|| panic.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown");
-                        tracing::error!(panic = msg, "laminar-compute thread panicked");
+                    // Panic and fault both drop `done_tx` unsent so the watcher faults.
+                    let fault_reason = match result {
+                        Ok(crate::pipeline::ExitReason::Shutdown) => None,
+                        Ok(crate::pipeline::ExitReason::Fault(reason)) => {
+                            tracing::error!(
+                                reason = %reason,
+                                "pipeline faulted on a fatal cycle error; recovering from last checkpoint"
+                            );
+                            Some(reason)
+                        }
+                        Err(panic) => {
+                            let msg = panic
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| panic.downcast_ref::<&str>().copied())
+                                .unwrap_or("unknown");
+                            tracing::error!(panic = msg, "laminar-compute thread panicked");
+                            Some(msg.to_string())
+                        }
+                    };
+                    if let Some(reason) = fault_reason {
                         // Record before dropping done_tx so the watcher sees it.
-                        *fault_slot.lock() = Some(msg.to_string());
+                        *fault_slot.lock() = Some(reason);
                         if let Some(ref m) = fault_metrics {
                             m.pipeline_faults_total.inc();
                         }
@@ -1838,6 +1947,9 @@ impl LaminarDB {
             let watcher_shutdown = Arc::clone(&self.shutdown_signal);
             let watcher_fault = Arc::clone(&self.last_fault);
             let watcher_stop_timed_out = Arc::clone(&self.stop_timed_out);
+            let watcher_supervisor = Arc::clone(&self.supervisor_self);
+            let watcher_restart_history = Arc::clone(&self.restart_history);
+            let watcher_metrics = self.engine_metrics.lock().clone();
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_ok() {
                     // Only finalize for a timed-out stop. A normal stop/shutdown caller is
@@ -1857,6 +1969,12 @@ impl LaminarDB {
                     // Faulted, not Stopped — recoverable via a later start().
                     DbState::Faulted.store(&watcher_state);
                     watcher_shutdown.notify_one();
+                    // Auto-restart if supervised; otherwise the pipeline stays Faulted.
+                    let supervised = watcher_supervisor.lock().upgrade();
+                    if let Some(db) = supervised {
+                        let _ =
+                            spawn_supervised_restart(db, watcher_restart_history, watcher_metrics);
+                    }
                 }
             });
 
@@ -2141,5 +2259,104 @@ mod resolver_tests {
             .to_string();
         assert!(err.contains("unresolvable stream dependency"), "got: {err}");
         assert!(err.contains('a') && err.contains('b'), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::{backoff_for_attempt, claim_restart_slot, spawn_supervised_restart};
+    use crate::config::RestartPolicy;
+    use crate::db::{DbState, LaminarDB};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn restart_budget_caps_within_window_and_prunes_stale() {
+        let p = RestartPolicy::default();
+        let mut hist = Vec::new();
+        let now = Instant::now();
+        for i in 0..p.max_restarts {
+            assert_eq!(
+                claim_restart_slot(&mut hist, now, p.max_restarts, p.window),
+                Some(i)
+            );
+        }
+        assert_eq!(
+            claim_restart_slot(&mut hist, now, p.max_restarts, p.window),
+            None
+        );
+        // A window later the stale entries are pruned, freeing the budget again.
+        let later = now + p.window * 2;
+        assert_eq!(
+            claim_restart_slot(&mut hist, later, p.max_restarts, p.window),
+            Some(0)
+        );
+        assert_eq!(hist.len(), 1);
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_capped() {
+        let init = Duration::from_millis(100);
+        let max = Duration::from_secs(1);
+        assert_eq!(
+            backoff_for_attempt(init, max, 0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            backoff_for_attempt(init, max, 1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            backoff_for_attempt(init, max, 3),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            backoff_for_attempt(init, max, 4),
+            max,
+            "1600ms capped at 1s"
+        );
+        assert_eq!(
+            backoff_for_attempt(init, max, 1000),
+            max,
+            "huge attempt must not overflow"
+        );
+    }
+
+    // Drives the real watcher path (thread + block_on + start) on a multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_restart_recovers_faulted_pipeline() {
+        let db = Arc::new(LaminarDB::open().unwrap());
+        db.enable_supervision();
+        db.execute(
+            "CREATE SOURCE trades (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id FROM trades")
+            .await
+            .unwrap();
+
+        DbState::Faulted.store(&db.state);
+        *db.last_fault.lock() = Some("operator boom".to_string());
+        db.shutdown_signal.notify_one();
+
+        let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
+            &prometheus::Registry::new(),
+        ));
+        let join = spawn_supervised_restart(
+            Arc::clone(&db),
+            Arc::clone(&db.restart_history),
+            Some(Arc::clone(&metrics)),
+        )
+        .expect("spawn restart thread");
+        tokio::task::spawn_blocking(move || join.join().expect("restart thread"))
+            .await
+            .unwrap();
+
+        assert_eq!(db.pipeline_state(), "Running");
+        assert!(db.last_fault().is_none());
+        assert_eq!(metrics.pipeline_restarts_total.get(), 1);
+        db.shutdown().await.unwrap();
     }
 }

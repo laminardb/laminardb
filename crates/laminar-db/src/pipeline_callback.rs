@@ -427,13 +427,18 @@ pub(crate) async fn run_demotion_pass(
 }
 
 impl ConnectorPipelineCallback {
-    /// Map a graph error to a string; `BackpressureFail` also triggers shutdown.
-    fn map_graph_error(err: &crate::error::DbError, shutdown: &tokio::sync::Notify) -> String {
+    /// Classify a graph error; `BackpressureFail` also signals shutdown.
+    fn map_graph_error(
+        err: &crate::error::DbError,
+        shutdown: &tokio::sync::Notify,
+    ) -> crate::pipeline::CycleError {
+        use crate::pipeline::CycleError;
         if let crate::error::DbError::BackpressureFail(msg) = err {
             tracing::error!(reason = %msg, "backpressure_policy=Fail tripped; halting pipeline");
             shutdown.notify_one();
+            return CycleError::Halt(format!("{err}"));
         }
-        format!("{err}")
+        CycleError::Fatal(format!("{err}"))
     }
 
     /// Cap each source watermark by the cluster-wide min, if one has been published.
@@ -1184,7 +1189,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, crate::pipeline::CycleError> {
         self.source_wms_buf.clear();
         if let Some(ref tracker) = self.tracker {
             for (&sid, name_arc) in &self.source_name_arcs {
@@ -1809,6 +1814,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .observe(elapsed_ns as f64 / 1_000_000_000.0);
     }
 
+    fn note_cycle_error(&self) {
+        self.prom.pipeline_cycle_errors_total.inc();
+    }
+
     fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
         match msg {
             crate::pipeline::ControlMsg::AddStream {
@@ -2176,10 +2185,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backpressure_fail_notifies_shutdown() {
+        use crate::pipeline::CycleError;
         let notify = Arc::new(tokio::sync::Notify::new());
         let err = DbError::BackpressureFail("downstream of 'q'".into());
-        let msg = ConnectorPipelineCallback::map_graph_error(&err, &notify);
-        assert!(msg.contains("Backpressure fail"), "unexpected: {msg}");
+        let mapped = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        assert!(
+            matches!(&mapped, CycleError::Halt(m) if m.contains("Backpressure fail")),
+            "unexpected: {mapped:?}"
+        );
 
         tokio::time::timeout(Duration::from_millis(50), notify.notified())
             .await
@@ -2188,9 +2201,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_backpressure_error_does_not_notify() {
+        use crate::pipeline::CycleError;
         let notify = Arc::new(tokio::sync::Notify::new());
         let err = DbError::Pipeline("unrelated".into());
-        let _ = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        let mapped = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        assert!(
+            matches!(mapped, CycleError::Fatal(_)),
+            "non-Fail errors must classify as Fatal"
+        );
 
         let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");

@@ -372,6 +372,13 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Auto-restart policy used when supervision is enabled.
+    #[must_use]
+    pub fn restart_policy(mut self, policy: crate::config::RestartPolicy) -> Self {
+        self.config.restart_policy = policy;
+        self
+    }
+
     /// Register custom connectors; the callback runs after built-ins are wired.
     #[must_use]
     pub fn register_connector(

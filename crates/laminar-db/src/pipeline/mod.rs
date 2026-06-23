@@ -8,9 +8,9 @@ pub mod callback;
 pub mod config;
 pub mod streaming_coordinator;
 
-pub use callback::{BarrierOutcome, PipelineCallback, SkipReason, SourceRegistration};
+pub use callback::{BarrierOutcome, CycleError, PipelineCallback, SkipReason, SourceRegistration};
 pub use config::PipelineConfig;
-pub use streaming_coordinator::StreamingCoordinator;
+pub use streaming_coordinator::{ExitReason, StreamingCoordinator};
 
 use arrow::datatypes::SchemaRef;
 use laminar_sql::parser::EmitClause;

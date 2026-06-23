@@ -47,6 +47,17 @@ pub enum BarrierOutcome {
     Failed,
 }
 
+/// How a failed `execute_cycle` should be handled by the coordinator.
+#[derive(Debug, thiserror::Error)]
+pub enum CycleError {
+    /// Non-deferrable error: `ExactlyOnce` recovers from checkpoint, `AtLeastOnce` drops it.
+    #[error("{0}")]
+    Fatal(String),
+    /// `backpressure_policy=Fail` (shutdown already signaled); stop, don't recover.
+    #[error("{0}")]
+    Halt(String),
+}
+
 /// A registered source with its name and config.
 pub struct SourceRegistration {
     /// Source name.
@@ -70,7 +81,7 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String>;
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError>;
 
     /// Push cycle results to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
@@ -129,6 +140,9 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);
+
+    /// Count a fatal cycle error that was dropped-and-continued (at-least-once only).
+    fn note_cycle_error(&self) {}
 
     /// Poll table sources for incremental CDC changes.
     async fn poll_tables(&mut self);
