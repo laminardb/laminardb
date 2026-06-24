@@ -41,6 +41,9 @@
 //!   (default 256 KiB), `LAMINAR_SOAK_VNODES` (256), `LAMINAR_SOAK_RPS`
 //!   (400), `LAMINAR_SOAK_GROUPS` (2000 — the agg key-space size),
 //!   `LAMINAR_SOAK_SPAN` (12 — consecutive rows per agg key).
+//! - `LAMINAR_SOAK_CHANGELOG_AGG`  any value: add an `EMIT CHANGES` aggregate so
+//!   the changelog `last_emitted` delta path is exercised under kill -9 + rebalance.
+//!   Pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` (else the agg captures FULL).
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -216,9 +219,10 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     );
 
     // Incremental delta checkpoints (Lever 2): `LAMINAR_SOAK_DELTA_CHAIN_MAX=N` enables them and
-    // adds a non-changelog aggregate whose per-vnode state is delta-captured (a changelog agg would
-    // re-base FULL). The agg has no sink — it exists to exercise the delta write+chain-recovery path
-    // under kill -9; the exactly-once proof stays on the pass-through `soak_stream` sink.
+    // adds a non-changelog aggregate whose per-vnode state is delta-captured. (Changelog aggregates
+    // now also take the delta path — add one with `LAMINAR_SOAK_CHANGELOG_AGG` to exercise the
+    // `last_emitted` delta.) The aggs have no sink — they exercise the delta write+chain-recovery
+    // path under kill -9; the exactly-once proof stays on the pass-through `soak_stream` sink.
     let delta_chain_max = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").ok().map(|v| {
         v.parse::<u32>()
             .expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32")
@@ -290,6 +294,23 @@ sql = "SELECT seq, ts_ms, value FROM gen"
 [[pipeline]]
 name = "soak_delta_agg"
 sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups}"
+"#,
+        ));
+    }
+
+    // Changelog aggregate (EMIT CHANGES) under delta capture — exercises the
+    // `last_emitted` delta path (changelog aggs used to force-FULL every epoch).
+    // Pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` so its per-vnode state takes the
+    // delta + chain-recovery path through kill -9 + rebalance. State is the thing
+    // under test; the pass-through `soak_stream` sink still carries the EO proof.
+    if std::env::var("LAMINAR_SOAK_CHANGELOG_AGG").is_ok() {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_changelog_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
 "#,
         ));
     }
