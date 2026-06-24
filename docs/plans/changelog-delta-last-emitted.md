@@ -1,5 +1,16 @@
 # Delta checkpoints for changelog aggregates (Lever 2 v2 — `last_emitted` deltas)
 
+> **STATUS: IMPLEMENTED** (commit `49e98a49` on `feat/shuffle-barrier-after-kill-recovery`).
+> Contained to `aggregate_state.rs` — **no wire-format change** was needed: the changed
+> entries ride in `AggVnodeDelta.changed.last_emitted`, an `AggStateCheckpoint` field that already
+> round-trips through `serialize_agg_cp`→`OpDelta`→recovery (the FULL path already relied on it), so
+> the `OpDelta` extension this plan proposed (step 2) was unnecessary. Removals reuse the existing
+> group tombstones (eviction co-drops group + emission). Force-FULL gate dropped; FULL re-base now
+> carries the dedup map (was zeroed). Unit test `delta_chain_replay_reproduces_changelog_last_emitted`
+> green (groups + last_emitted match after FULL+delta replay; recovery re-emits nothing; later change
+> emits identically). Default-OFF. **Remaining acceptance gate: the changelog-agg upsert-sink soak
+> (below) — not runnable in the current env.**
+
 Follow-up to the landed incremental delta checkpoints (`incremental-delta-checkpoint-lever2.md`,
 commit on `feat/delta-checkpoint-lever2`). Today **changelog aggregates re-base FULL every epoch**
 under delta capture, because a delta doesn't carry the `last_emitted` dedup map. This plan delta-encodes
