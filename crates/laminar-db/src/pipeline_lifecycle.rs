@@ -1818,6 +1818,12 @@ impl LaminarDB {
             .map(|(name, _)| Arc::from(name.as_str()))
             .collect();
 
+        // Snapshot the controller once: locking the same `parking_lot::Mutex` twice
+        // within the struct literal below would deadlock (the first guard lives until
+        // the statement ends).
+        #[cfg(feature = "cluster")]
+        let callback_controller = self.cluster_controller.lock().clone();
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,
@@ -1853,13 +1859,9 @@ impl LaminarDB {
             sink_timed_out: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
             #[cfg(feature = "cluster")]
-            cluster_controller: self.cluster_controller.lock().clone(),
+            converged_rx: callback_controller.as_ref().map(|cc| cc.converged_watch()),
             #[cfg(feature = "cluster")]
-            converged_rx: self
-                .cluster_controller
-                .lock()
-                .as_ref()
-                .map(|cc| cc.converged_watch()),
+            cluster_controller: callback_controller,
             #[cfg(feature = "cluster")]
             follower_tail: Arc::default(),
             #[cfg(feature = "cluster")]
