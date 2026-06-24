@@ -972,12 +972,10 @@ impl StreamingCoordinator {
                 .checkpoint_interval
                 .is_some_and(|interval| self.last_checkpoint.elapsed() >= interval);
 
-        // Hold the interval cadence while a rebalance is converging: a respawned node
-        // is gossip-live before it has adopted+rehydrated the current assignment, so a
-        // checkpoint started now would align-wait on its not-yet-flowing shuffle barrier
-        // and time out, cascading into epoch aborts. The verdict is a local borrow
-        // (watcher-published), so we don't bump `last_checkpoint` here — the first
-        // post-convergence checkpoint fires immediately, not a full interval later.
+        // Hold the interval while a rebalance is converging: a checkpoint started before
+        // a respawned node has adopted the assignment align-waits on its not-yet-flowing
+        // shuffle barrier and times out. The verdict is a local borrow, so don't bump
+        // `last_checkpoint` — the first post-convergence checkpoint fires immediately.
         if interval_due && !callback.assignment_ready_for_checkpoint().await {
             return;
         }

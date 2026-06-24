@@ -2562,38 +2562,6 @@ impl CheckpointCoordinator {
         Ok(result)
     }
 
-    /// Recover to a coordinated cluster target epoch instead of the local latest.
-    ///
-    /// Drives the per-node restore for a leader-coordinated global restart: every
-    /// node restores to the same target so the distributed shuffle cut is consistent
-    /// (see [`crate::recovery_manager::RecoveryManager::recover_to_epoch`]).
-    ///
-    /// # Errors
-    /// Returns `DbError::Checkpoint` if the store read fails.
-    pub async fn recover_to_epoch(
-        &mut self,
-        target_epoch: u64,
-    ) -> Result<Option<crate::recovery_manager::RecoveredState>, DbError> {
-        use crate::recovery_manager::RecoveryManager;
-
-        let mgr = RecoveryManager::new(&*self.store);
-        let result = mgr
-            .recover_to_epoch(target_epoch, &[], &self.sinks, &[])
-            .await?;
-
-        if let Some(ref recovered) = result {
-            self.allocator
-                .advance_to(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
-            let (epoch, checkpoint_id) = self.allocator.peek();
-            info!(
-                epoch,
-                checkpoint_id, "coordinator epoch set after coordinated recovery"
-            );
-        }
-
-        Ok(result)
-    }
-
     /// Load the latest manifest from the store.
     ///
     /// # Errors

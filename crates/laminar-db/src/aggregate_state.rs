@@ -1726,9 +1726,8 @@ impl IncrementalAggState {
                     &mut entries,
                 )?;
                 drop(entries); // release the &mut self.groups borrow before reading last_emitted
-                               // A re-base is the chain's new root, so it carries the FULL dedup map for
-                               // the vnode — a changelog agg must not lose it (an empty map would re-emit
-                               // every group after recovery).
+                               // A re-base carries the full dedup map; an empty one would re-emit every
+                               // group after recovery.
                 let last_emitted = self.last_emitted_for_vnode(v, vnode_count, None)?;
                 out.insert(
                     v,
@@ -1829,10 +1828,8 @@ impl IncrementalAggState {
             arrays_to_ipc(&arrays)?
         };
 
-        // The vnode's changed emission entries ride in `changed.last_emitted`, which
-        // already round-trips through `serialize_agg_cp` (no wire-format change). On
-        // recovery `apply_delta` REPLACEs these into the live dedup map; removals are
-        // covered by the tombstones (eviction drops group + last_emitted together).
+        // Changed emission entries ride in `changed.last_emitted` (already serialized by
+        // `serialize_agg_cp`, so no wire change); removals are covered by the tombstones.
         let vnode_count = self.delta_vnode_count.unwrap_or(1);
         let last_emitted = self.last_emitted_for_vnode(
             vnode,

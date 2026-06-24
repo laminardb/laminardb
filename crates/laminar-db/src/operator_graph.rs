@@ -271,10 +271,6 @@ pub(crate) struct OperatorGraph {
     edges: Vec<GraphEdge>,
     topo_order: Vec<usize>,
     topo_dirty: bool,
-    /// Recovery domain (weakly-connected-component id) per node; `usize::MAX` for
-    /// removed nodes. Queries that share no source land in different domains — the
-    /// unit of blast-radius reporting. Rebuilt in `compute_topo_order`.
-    node_domain: Vec<usize>,
     source_map: FxHashMap<Arc<str>, usize>,
     source_list: Vec<(Arc<str>, usize)>,
     source_node_ids: FxHashSet<usize>,
@@ -334,7 +330,6 @@ impl OperatorGraph {
             edges: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
-            node_domain: Vec::new(),
             source_map: FxHashMap::default(),
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
@@ -1566,67 +1561,7 @@ impl OperatorGraph {
         self.output_node_ids
             .extend(self.output_map.values().copied());
 
-        self.compute_domains();
-        tracing::debug!(
-            domains = self.failure_domain_count(),
-            "recomputed pipeline recovery domains"
-        );
-
         self.topo_dirty = false;
-    }
-
-    /// Partition nodes into recovery domains (weakly-connected components over all
-    /// edges, sources included): queries sharing no source are disjoint, so a global
-    /// checkpoint is the union of per-domain consistent cuts.
-    fn compute_domains(&mut self) {
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]]; // path halving
-                x = parent[x];
-            }
-            x
-        }
-
-        let n = self.nodes.len();
-        let mut parent: Vec<usize> = (0..n).collect();
-        for edge in &self.edges {
-            if self.nodes[edge.source].removed || self.nodes[edge.target].removed {
-                continue;
-            }
-            let (a, b) = (
-                find(&mut parent, edge.source),
-                find(&mut parent, edge.target),
-            );
-            if a != b {
-                parent[a] = b;
-            }
-        }
-
-        // Compact component roots to small, stable domain ids.
-        self.node_domain = vec![usize::MAX; n];
-        let mut canon: FxHashMap<usize, usize> = FxHashMap::default();
-        for i in 0..n {
-            if self.nodes[i].removed {
-                continue;
-            }
-            let root = find(&mut parent, i);
-            let next = canon.len();
-            self.node_domain[i] = *canon.entry(root).or_insert(next);
-        }
-    }
-
-    /// Recovery domain of `node` (`usize::MAX` if removed / out of range).
-    pub(crate) fn domain_of(&self, node: usize) -> usize {
-        self.node_domain.get(node).copied().unwrap_or(usize::MAX)
-    }
-
-    /// Count of independent recovery domains (blast-radius cardinality).
-    pub(crate) fn failure_domain_count(&self) -> usize {
-        self.node_domain
-            .iter()
-            .filter(|&&d| d != usize::MAX)
-            .collect::<FxHashSet<_>>()
-            .len()
     }
 
     fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -1906,14 +1841,6 @@ impl OperatorGraph {
                 .execute_single_operator(node_id, current_watermark, &mut results)
                 .await
             {
-                // Blast-radius attribution. Recovery is still whole-pipeline (global
-                // checkpoint = recovery unit); domain-scoped recovery is a follow-up.
-                tracing::error!(
-                    operator = %self.nodes[node_id].name,
-                    domain = self.domain_of(node_id),
-                    error = %e,
-                    "fatal cycle error"
-                );
                 self.finish_cycle();
                 return Err(e);
             }
@@ -2472,32 +2399,6 @@ mod tests {
             "peer's pre-barrier row folded into the operator"
         );
         assert_eq!(got[0].num_rows(), batch.num_rows());
-    }
-
-    #[test]
-    fn recovery_domains_partition_by_shared_source() {
-        // Two independent chains (src0->q1, src2->q3) → two domains.
-        let mut g = OperatorGraph::new(laminar_sql::create_session_context());
-        for name in ["src_a", "q1", "src_b", "q2"] {
-            g.push_test_node(name, Box::new(SourcePassthrough));
-        }
-        g.add_edge(0, 1, 0);
-        g.add_edge(2, 3, 0);
-        g.compute_topo_order();
-        assert_eq!(g.failure_domain_count(), 2);
-        assert_ne!(g.domain_of(1), g.domain_of(3));
-        assert_eq!(g.domain_of(0), g.domain_of(1));
-
-        // A shared source fuses its consumers into one domain.
-        let mut g = OperatorGraph::new(laminar_sql::create_session_context());
-        for name in ["src", "qa", "qb"] {
-            g.push_test_node(name, Box::new(SourcePassthrough));
-        }
-        g.add_edge(0, 1, 0);
-        g.add_edge(0, 2, 0);
-        g.compute_topo_order();
-        assert_eq!(g.failure_domain_count(), 1);
-        assert_eq!(g.domain_of(1), g.domain_of(2));
     }
 
     #[test]

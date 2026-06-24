@@ -423,68 +423,6 @@ impl<'a> RecoveryManager<'a> {
         Ok(None)
     }
 
-    /// Recover from the newest committed checkpoint with `epoch <= target_epoch`.
-    ///
-    /// A coordinated cluster restart drives every node to one target epoch so the
-    /// distributed shuffle cut stays consistent: a node holding a newer local epoch
-    /// must rewind to the cluster-agreed one rather than its own latest. Returns
-    /// `Ok(None)` when nothing at or below the target restores (fresh start).
-    ///
-    /// # Errors
-    /// Returns `DbError::Checkpoint` if the store fails.
-    pub(crate) async fn recover_to_epoch(
-        &self,
-        target_epoch: u64,
-        sources: &[RegisteredSource],
-        sinks: &[RegisteredSink],
-        table_sources: &[RegisteredSource],
-    ) -> Result<Option<RecoveredState>, DbError> {
-        let mut checkpoints = self.store.list().await.map_err(DbError::from)?;
-        checkpoints.retain(|&(_, epoch)| epoch <= target_epoch);
-        checkpoints.sort_by_key(|&(_, epoch)| std::cmp::Reverse(epoch)); // newest eligible first
-
-        for (checkpoint_id, epoch) in checkpoints {
-            match self.store.load_by_id(checkpoint_id).await {
-                Ok(Some(manifest)) => {
-                    if self.is_checkpoint_corrupt(&manifest).await {
-                        warn!(
-                            checkpoint_id,
-                            epoch, "[LDB-6010] checkpoint corrupt, trying older"
-                        );
-                        continue;
-                    }
-                    if Self::has_pending_sinks(&manifest) {
-                        warn!(
-                            checkpoint_id,
-                            epoch, "[LDB-6015] checkpoint has uncommitted sinks, trying older"
-                        );
-                        continue;
-                    }
-                    let state = self
-                        .restore_from(manifest, sources, sinks, table_sources)
-                        .await;
-                    if let Err(e) = self.check_strict(&state) {
-                        warn!(checkpoint_id, epoch, error = %e, "restore strict errors, trying older");
-                        continue;
-                    }
-                    info!(
-                        checkpoint_id,
-                        epoch, "recovered to coordinated target epoch"
-                    );
-                    return Ok(Some(state));
-                }
-                Ok(None) => {}
-                Err(e) => warn!(checkpoint_id, error = %e, "checkpoint load failed, trying older"),
-            }
-        }
-
-        warn!(
-            target_epoch,
-            "no committed checkpoint at or below target epoch; starting fresh"
-        );
-        Ok(None)
-    }
-
     /// Resolve external operator states from the sidecar file into inline entries.
     ///
     /// Returns `true` if all resolved successfully; `false` on missing/truncated
@@ -941,51 +879,6 @@ mod tests {
         assert_eq!(result.tables_restored, 0);
         assert_eq!(result.sinks_rolled_back, 0);
         assert!(!result.has_errors());
-    }
-
-    #[tokio::test]
-    async fn recover_to_epoch_picks_newest_at_or_below_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-        for (id, epoch) in [(1u64, 3u64), (2, 5), (3, 7)] {
-            store
-                .save(&CheckpointManifest::new(id, epoch))
-                .await
-                .unwrap();
-        }
-        let mgr = RecoveryManager::new(&store);
-
-        assert_eq!(
-            mgr.recover_to_epoch(7, &[], &[], &[])
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch(),
-            7
-        );
-        // A newer local epoch is rewound to the cluster-agreed target.
-        assert_eq!(
-            mgr.recover_to_epoch(6, &[], &[], &[])
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch(),
-            5
-        );
-        assert_eq!(
-            mgr.recover_to_epoch(5, &[], &[], &[])
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch(),
-            5
-        );
-        // Nothing committed at or below the target → fresh start.
-        assert!(mgr
-            .recover_to_epoch(2, &[], &[], &[])
-            .await
-            .unwrap()
-            .is_none());
     }
 
     #[tokio::test]

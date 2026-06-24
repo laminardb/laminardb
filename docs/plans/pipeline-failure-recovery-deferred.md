@@ -24,31 +24,22 @@ All file:line anchors verified against the tree at `92fdf9d8`.
   bumps `last_checkpoint` on a convergence skip, so the first post-convergence checkpoint
   fires immediately. The throttle field Note 3 proposed was never needed.
 
-- **1B — foundation DONE; full isolation deferred (corrected to L).** Recovery domains
-  (weakly-connected components *including* sources — independent queries are disjoint
-  sub-pipelines, so a global-epoch checkpoint is the union of per-domain consistent cuts)
-  are computed in `compute_topo_order` (`node_domain` / `domain_of` / `failure_domain_count`)
-  and wired into fatal-error blast-radius attribution. **Correction to the plan:** the
-  "exclude sources" model creates a shared-source offset inconsistency (option-b dups a
-  sibling's rows on replay); the *including-sources* model avoids it. Full fatal
-  cross-domain isolation (let healthy domains commit while a faulted domain recovers
-  alone) requires **in-flight per-domain recovery** — selective graph restore + per-source
-  re-seek — neither of which exists (recovery is whole-pipeline stop+start; sources consume
-  `restore_checkpoint` only at spawn). That is an **L**, not the **M** estimated here, and
-  is the remaining work for 1B.
-
-- **1A-cluster — foundation DONE; distributed driver deferred (soak-gated).** The
-  deterministic, unit-tested mechanisms landed: leader epoch selector
-  (`CheckpointDecisionStore::highest_committed`, exposed as `LaminarDB::cluster_recovery_target`),
-  per-node recover-to-target (`RecoveryManager::recover_to_epoch` →
-  `CheckpointCoordinator::recover_to_epoch`), and the node-side restart hook
-  (`LaminarDB::set_recover_target_epoch` + `recover_target_epoch` consumed in `start_inner`).
-  The remaining piece is the **distributed driver**: fault-report → leader decision →
-  recover-directive broadcast → every node `set_recover_target_epoch` + coordinated restart
-  → barrier-rearm fence (reusing the Note 2 convergence signal). It is implementable on
-  these primitives but **gated on multi-node kill-9 soak** (depth > 1 cross-node shuffle),
-  which the local environment cannot run reliably — so it is intentionally not yet wired
-  into a live path.
+- **1B + 1A-cluster — NOT STARTED (foundations were built then removed as premature).**
+  An earlier pass landed "foundation" primitives for both (1B recovery-domain partitioning;
+  1A-cluster `recover_to_epoch` / `highest_committed` / `set_recover_target_epoch`). They had
+  **no production caller** — the domain partition only fed a log line, and the recover-to-epoch
+  arming functions were never invoked — so they were unwired speculative scaffolding and were
+  removed. Both remain genuinely useful but should be built **with** the feature that consumes
+  them, not ahead of it:
+  - **1B** full fatal cross-domain isolation needs **in-flight per-domain recovery** (selective
+    graph restore + per-source re-seek); today recovery is whole-pipeline stop+start and sources
+    consume `restore_checkpoint` only at spawn. The domain model should use WCC *including* sources
+    (independent queries are disjoint sub-pipelines); the plan's "exclude sources" model dups a
+    sibling's rows on replay. Effort is **L**, not the **M** estimated below.
+  - **1A-cluster** distributed driver (fault-report → leader decision → recover-directive
+    broadcast → coordinated restart → barrier-rearm via the Note 2 signal) is **gated on a
+    multi-node kill-9 depth>1 soak** the local environment cannot run. Build the primitives
+    alongside the driver when that soak is available.
 
 ---
 
