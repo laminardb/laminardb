@@ -2549,7 +2549,9 @@ impl CheckpointCoordinator {
 
         let mgr = RecoveryManager::new(&*self.store);
         // Sources are restored by the pipeline lifecycle; pass empty slices here.
-        let result = mgr.recover(&[], &self.sinks, &[]).await?;
+        let result = mgr
+            .recover(&[], &self.sinks, &[], self.decision_store.as_deref())
+            .await?;
 
         if let Some(ref recovered) = result {
             // Monotonic: the committed epoch may predate a Pending manifest that seeded ids.
@@ -2557,6 +2559,40 @@ impl CheckpointCoordinator {
                 .advance_to(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
             let (epoch, checkpoint_id) = self.allocator.peek();
             info!(epoch, checkpoint_id, "coordinator epoch set after recovery");
+        }
+
+        Ok(result)
+    }
+
+    /// Recover to a coordinated cluster target epoch instead of the local latest.
+    ///
+    /// # Errors
+    /// Returns `DbError::Checkpoint` if the store read fails.
+    pub async fn recover_to_epoch(
+        &mut self,
+        target_epoch: u64,
+    ) -> Result<Option<crate::recovery_manager::RecoveredState>, DbError> {
+        use crate::recovery_manager::RecoveryManager;
+
+        let mgr = RecoveryManager::new(&*self.store);
+        let result = mgr
+            .recover_to_epoch(
+                target_epoch,
+                &[],
+                &self.sinks,
+                &[],
+                self.decision_store.as_deref(),
+            )
+            .await?;
+
+        if let Some(ref recovered) = result {
+            self.allocator
+                .advance_to(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
+            let (epoch, checkpoint_id) = self.allocator.peek();
+            info!(
+                epoch,
+                checkpoint_id, "coordinator epoch set after coordinated recovery"
+            );
         }
 
         Ok(result)

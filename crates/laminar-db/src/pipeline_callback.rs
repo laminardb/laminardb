@@ -222,6 +222,7 @@ pub(crate) fn assignment_versions_converged(
     true
 }
 
+#[allow(clippy::struct_excessive_bools)] // config/state flags, not a state machine
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -261,6 +262,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    /// Fault (rather than drop) on a fatal cycle error even at-least-once, so coordinated
+    /// recovery can drive a global restart and an EO sink's 2PC keeps output exactly-once.
+    pub(crate) coordinated_recovery: bool,
     pub(crate) serialization_timeout: Duration,
     pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     /// Set when a sink write times out; suppresses the next checkpoint to preserve the replay window.
@@ -1197,6 +1201,36 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, crate::pipeline::CycleError> {
+        // Test-only one-shot fault injector for the recovery soak (inert in release / when
+        // unset): the first cycle after `LAMINAR_FAULT_INJECT_AFTER_MS` faults once.
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::OnceLock;
+            use std::time::{Duration, Instant};
+            static AFTER_MS: OnceLock<Option<u64>> = OnceLock::new();
+            static START: OnceLock<Instant> = OnceLock::new();
+            static FIRED: AtomicBool = AtomicBool::new(false);
+            if let Some(after_ms) = *AFTER_MS.get_or_init(|| {
+                std::env::var("LAMINAR_FAULT_INJECT_AFTER_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            }) {
+                let start = START.get_or_init(Instant::now);
+                if !FIRED.load(Ordering::Relaxed)
+                    && start.elapsed() >= Duration::from_millis(after_ms)
+                    && FIRED
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return Err(crate::pipeline::CycleError::Fatal(
+                        "injected fault for coordinated-recovery soak \
+                         (LAMINAR_FAULT_INJECT_AFTER_MS)"
+                            .into(),
+                    ));
+                }
+            }
+        }
         self.source_wms_buf.clear();
         if let Some(ref tracker) = self.tracker {
             for (&sid, name_arc) in &self.source_name_arcs {
@@ -1306,6 +1340,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             let bytes = store.total_bytes() as u64;
             #[allow(clippy::cast_possible_wrap)]
             self.prom.mv_bytes_stored.set(bytes as i64);
+        }
+    }
+
+    async fn close_sinks(&mut self) {
+        for (_, handle, _, _, _) in &self.sinks {
+            handle.close().await;
         }
     }
 
@@ -1503,6 +1543,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         true
+    }
+
+    fn is_recovering(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            if let Some(ref cc) = self.cluster_controller {
+                return cc.is_recovering();
+            }
+        }
+        false
+    }
+
+    fn fault_on_cycle_error(&self) -> bool {
+        use laminar_connectors::connector::DeliveryGuarantee;
+        self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce || self.coordinated_recovery
     }
 
     #[cfg(feature = "cluster")]

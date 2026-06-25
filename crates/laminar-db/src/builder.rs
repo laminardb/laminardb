@@ -379,6 +379,14 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Enable leader-coordinated recovery (cluster mode). The embedder must also call
+    /// [`LaminarDB::enable_coordinated_recovery`] after building.
+    #[must_use]
+    pub fn coordinated_recovery(mut self, enabled: bool) -> Self {
+        self.config.coordinated_recovery = enabled;
+        self
+    }
+
     /// Register custom connectors; the callback runs after built-ins are wired.
     #[must_use]
     pub fn register_connector(

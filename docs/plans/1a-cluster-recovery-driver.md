@@ -6,10 +6,93 @@ cluster with cross-node shuffle a local-only restart rewinds the faulted node to
 N while peers have produced/consumed shuffle rows for N+1 → lost/dup in-flight rows. This is
 Flink's *global* recovery: drive every node back to one consistent epoch and reprocess.
 
-Status: **NOT built.** A first attempt (reverted) hand-rolled a gossip-KV polling protocol with a
-per-node fence and per-node target computation — it had a real divergence bug and no soak. This
-plan is the correct approach. Build it only with the soak budget below; do not merge before the
-soak is green.
+Status: **Driver core built, flag-off, soak pending.** A first attempt (reverted) hand-rolled a
+gossip-KV polling protocol with a per-node fence and per-node target computation — it had a real
+divergence bug and no soak. This plan is the correct approach. The driver below is now implemented
+behind `[supervision] coordinated_recovery` (default off, zero behavior change when off); the
+fault-injection EO soak is built but **not yet run** — do not merge before it is green.
+
+### Implemented (this branch, default off)
+
+- Primitives re-added (from the reverted `ba32290a`, unit-tested): `CheckpointDecisionStore::highest_committed`,
+  `RecoveryManager::recover_to_epoch` + `CheckpointCoordinator::recover_to_epoch`, the
+  `recover_target_epoch` plumbing (`db.rs` field + `set_recover_target_epoch` + `start_inner`
+  consumption).
+- `Phase::Recover` on the existing announcement (`barrier.rs`): gossip-only delivery (KV-only,
+  observed by the per-node monitor, no phase-RPC fast path — recovery is mutually exclusive with
+  checkpointing so it never races one).
+- `ClusterController` recovery fence (`is_recovering`/`set_recovering`) + KV helpers
+  (`report_fault`/`read_fault_reports`, `announce_recovered`/`read_recovered`).
+- The driver: `crates/laminar-db/src/coordinated_recovery.rs` — a long-lived per-node monitor.
+  (A) any node restores on observing a new `Recover(N, gen)`; (B) the leader edge-triggers on a
+  changed fault report, fixes `N` from the **DB-level decision store** (works even when its own
+  coordinator is stopped → leader-fault case), announces, restores itself, then waits a
+  restored-to-N quorum before releasing the fence. Restore runs on a dedicated thread (`start()` is
+  `!Send`). Recovery generation is a max-wins KV key, decoupled from the epoch, stable across leader
+  change.
+- Fault routing (`pipeline_lifecycle.rs`): in cluster + coordinated-recovery mode a fault reports to
+  the cluster and suppresses the local supervisor restart (a local-only restart would rewind one
+  node → inconsistent cut).
+- Fence wiring (`streaming_coordinator.rs`): the periodic-checkpoint gate holds while recovering,
+  and the shutdown drain skips its final checkpoint (which would seal an epoch past `N`).
+- Config/build: `LaminarConfig::coordinated_recovery` + builder `.coordinated_recovery(..)` +
+  `LaminarDB::enable_coordinated_recovery` (spawns the monitor once); server `[supervision]
+  coordinated_recovery` wired through cluster startup.
+- Harness: a debug-only one-shot cycle-fault injector (`LAMINAR_FAULT_INJECT_AFTER_MS`) and soak
+  knobs (`LAMINAR_SOAK_COORD_RECOVERY`, `LAMINAR_SOAK_FAULT_INJECT_MS`/`_NODE`) in `cluster_soak.rs`.
+
+Gates green: `laminar-core`/`laminar-db`/`laminar-server` compile `--features cluster` (+ non-cluster),
+clippy clean, `highest_committed` + `recover_to_epoch` unit tests pass.
+
+### Soak run (follower-fault variant) — RED, driver correct, 4th-layer blocker
+
+Ran `three_node_kill9_soak` with `LAMINAR_SOAK_COORD_RECOVERY=1 LAMINAR_SOAK_FAULT_INJECT_MS=45000
+LAMINAR_SOAK_FAULT_INJECT_NODE=1 LAMINAR_SOAK_KILLS=0` + Kafka EO sink (fresh Redpanda). The
+**recovery protocol itself is validated**: the leader detects the fault, fixes `N` = highest
+committed, announces `Recover(N)`, and **all three nodes rewind to `N` and the fence releases**. Three
+real bugs were found and fixed getting there:
+
+1. **Fault never triggered under the server's config.** The server never sets the pipeline
+   `delivery_guarantee` (it configures EO per-sink), so a fatal cycle error drops-and-continues —
+   coordinated recovery would never fire in production. Fixed: `PipelineCallback::fault_on_cycle_error`
+   faults under EO **or** coordinated recovery (the EO sink's 2PC + checkpoint replay give end-to-end
+   EO, the kill-9 model); pipeline stays AtLeastOnce so cluster formation still commits.
+2. **`observe_barrier` epoch-merge shadowed the Recover.** It merges gRPC+gossip by highest epoch, so
+   the lower-epoch recovery target was hidden behind the stale in-flight checkpoint announcement.
+   Fixed with `observe_recover` (reads the leader's gossip slot directly).
+3. **EO Kafka producer went Fatal on the in-process restart.** `SinkTaskHandle::close()` was
+   test-only, so the sink was dropped (not gracefully closed) on stop, leaving the transaction open;
+   the new producer's `init_transactions` raced the old → `InvalidProducerEpoch`. Fixed: close sinks
+   (abort txn + flush) on coordinator shutdown.
+
+A 4th bug then surfaced and was fixed: **the restarted node could not resume the cross-node shuffle**
+(leader stuck on `shuffle stream to peer … closed`). Root cause: the shuffle sender's per-peer driver
+tasks are spawned on the compute-thread runtime, which an in-process restart drops — leaving
+`is_alive() == true` zombie connections the pool reused forever. Fixed: `PeerConn::is_alive` also
+checks `!driver.is_finished()`, so the first post-restart send purges the zombie and reconnects.
+
+With all four fixes, the three variants each passed a clean run (follower / leader / rebalance-churn),
+EO-dense on all topics.
+
+A 5th bug (an intermittent duplicate) was then root-caused and fixed: the marker is written *before*
+sink commit, so a fault can land after Kafka commits epoch `N` but before the manifest records it
+(sinks still `Pending`). Recovery was *skipping* that pending-sink checkpoint and rewinding the source
+to `N-1`, while `reconcile_prepared_on_init` re-drove `N`'s commit separately — so the pipeline
+re-produced `N` and the fresh producer re-committed it (dup). Fix: recovery no longer skips a
+pending-sink checkpoint whose **decision marker says committed** (`RecoveryManager::pending_uncommitted`
+gates the skip on `!is_committed`), keeping source and sink aligned; applied to both `recover()` and
+`recover_to_epoch()` (it also removes a latent dup on the plain kill-9 path).
+
+### Status: 3-variant EO soak GREEN
+
+All three variants run EO-dense (no gap, no dup) and reproduce: follower-fault 6/6, leader-fault 2/2,
+rebalance-churn 2/2 after the fix (the sole failure across the batch was a degraded-broker boot
+timeout, not an EO violation — recreate Redpanda `down -v`/`up`). Each variant restarts/faults nodes
+and EO holds on every topic. Flag-off by default; cluster + non-cluster compile, clippy + fmt clean,
+recovery unit tests pass.
+
+**Remaining before production:** real object store (S3/MinIO) + network-partition + large-state +
+depth>1 validation; a formal RTO assertion; many-round endurance; and a rebase/PR.
 
 ## Semantics
 

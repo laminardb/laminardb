@@ -416,6 +416,10 @@ pub struct SupervisionSection {
     pub window_secs: Option<u64>,
     pub initial_backoff_ms: Option<u64>,
     pub max_backoff_secs: Option<u64>,
+    /// Cluster mode: on a fatal fault, rewind every node to the highest cluster-wide
+    /// committed epoch instead of a local-only restart. Default off.
+    #[serde(default)]
+    pub coordinated_recovery: bool,
 }
 
 impl SupervisionSection {

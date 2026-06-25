@@ -108,6 +108,18 @@ pub trait PipelineCallback: Send + 'static {
         true
     }
 
+    /// `true` while a coordinated restart is in flight; the checkpoint gate holds and the
+    /// shutdown drain skips its final checkpoint. Default `false`.
+    fn is_recovering(&self) -> bool {
+        false
+    }
+
+    /// `true` if a fatal cycle error should fault for recovery rather than drop-and-continue
+    /// (exactly-once, or coordinated recovery). Default `false` (at-least-once drops).
+    fn fault_on_cycle_error(&self) -> bool {
+        false
+    }
+
     /// `true` when the cluster is converged enough for the leader to take a periodic
     /// checkpoint (see the gate in `StreamingCoordinator::maybe_checkpoint`). The
     /// cluster impl reads a watcher-published verdict locally — no gossip on the gate.
@@ -186,6 +198,13 @@ pub trait PipelineCallback: Send + 'static {
     /// Next checkpoint ID when managed externally.
     fn next_checkpoint_id(&self) -> Option<u64> {
         None
+    }
+
+    /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
+    /// re-initialises cleanly. Default no-op. The `ready` expression (not `async {}`) keeps
+    /// `trait_variant`'s `impl Future` rewrite.
+    fn close_sinks(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
     }
 
     /// Register the local source barrier injectors.
