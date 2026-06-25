@@ -289,8 +289,8 @@ impl ClusterController {
         self.kv.write("control:fault-report", seq.to_string()).await;
     }
 
-    /// Clear this node's fault report after it recovers, so the report doesn't linger and
-    /// re-trigger recovery when a new/restarted leader reads it. `0` means "no fault".
+    /// Clear this node's fault report (`0` = no fault) after it recovers, so a restarted
+    /// leader doesn't re-trigger recovery for an already-handled fault.
     pub async fn clear_fault_report(&self) {
         self.kv.write("control:fault-report", "0".to_string()).await;
     }
@@ -531,9 +531,8 @@ impl ClusterController {
         (ann.phase == Phase::Recover).then_some(ann)
     }
 
-    /// Overwrite this node's announcement slot with a non-`Recover` phase once a recovery
-    /// round finishes, so [`Self::observe_recover`] stops returning it (a peer that
-    /// restarts after the round, its in-memory generation reset, would otherwise replay it).
+    /// Overwrite this node's announcement slot with a non-`Recover` phase at the end of a
+    /// round, so [`Self::observe_recover`] stops returning a stale generation.
     pub async fn clear_recover_announcement(&self, epoch: u64) {
         let ann = BarrierAnnouncement {
             epoch,

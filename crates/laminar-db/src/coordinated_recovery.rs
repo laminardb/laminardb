@@ -18,6 +18,8 @@ use crate::LaminarDB;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RESTORE_QUORUM_TIMEOUT: Duration = Duration::from_secs(90);
+/// How many times the leader retries restoring itself before abandoning the round.
+const SELF_RESTORE_ATTEMPTS: u32 = 3;
 
 /// Recovery generation, max-wins across leader change so a round keeps a stable id.
 const RECOVERY_GEN_KEY: &str = "control:recovery-gen";
@@ -76,9 +78,8 @@ impl RecoveryMonitor {
         }
     }
 
-    /// `true` when any node's fault sequence changed since we last handled it. A `0`
-    /// report is "no fault" (cleared after recovery), so it never triggers — otherwise a
-    /// new/restarted leader would re-run recovery for an already-handled fault.
+    /// `true` when any node's fault sequence changed since we last handled it. `0` is "no
+    /// fault" (cleared after recovery), so a restarted leader doesn't re-trigger a handled one.
     async fn take_new_fault(&mut self, controller: &ClusterController) -> bool {
         let mut triggered = false;
         for (node, seq) in controller.read_fault_reports().await {
@@ -90,8 +91,9 @@ impl RecoveryMonitor {
         triggered
     }
 
-    /// Leader: fix `N`, bump the generation, announce, restore self, then wait for every
-    /// live node to report restored before releasing the fence.
+    /// Leader: fix `N`, announce, restore self (retrying), then wait for every live node to
+    /// report restored. Always releases the fence and clears the announcement on exit — so a
+    /// failed round can't leave a stale `Recover` for a later peer-restart to replay.
     async fn drive_round(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
         let Some(target) = compute_target_epoch(db).await else {
             tracing::warn!("coordinated recovery: no committed epoch yet; skipping round");
@@ -119,28 +121,35 @@ impl RecoveryMonitor {
             "leader announced recovery"
         );
 
-        // Restore self into the quorum, holding the fence across the wait. On failure,
-        // release the fence and return — the observe path retries on the next tick
-        // (applied_gen is left unchanged).
-        if !self.restore_and_ack(db, controller, target, gen_id).await {
-            controller.set_recovering(false);
-            return;
+        // Retry self-restore inline so the round (and the cleanup below) stays in the
+        // leader's control; the lingering announcement gives peers time to observe it.
+        let mut restored = false;
+        for attempt in 1..=SELF_RESTORE_ATTEMPTS {
+            if self.restore_and_ack(db, controller, target, gen_id).await {
+                restored = true;
+                break;
+            }
+            tracing::warn!(
+                gen = gen_id,
+                attempt,
+                "leader self-restore failed; retrying"
+            );
         }
-        wait_restore_quorum(controller, gen_id, RESTORE_QUORUM_TIMEOUT).await;
+        if restored {
+            wait_restore_quorum(controller, gen_id, RESTORE_QUORUM_TIMEOUT).await;
+            tracing::warn!(
+                gen = gen_id,
+                "coordinated recovery complete; fence released"
+            );
+        } else {
+            tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
+        }
         controller.set_recovering(false);
-        // Clear the Recover from our gossip slot so a peer that restarts after the round
-        // (its in-memory `applied_gen` reset to 0) doesn't replay this generation.
         controller.clear_recover_announcement(target).await;
-        tracing::warn!(
-            gen = gen_id,
-            "coordinated recovery complete; fence released"
-        );
     }
 
-    /// Observe-path restore (follower, or a leader retrying after its own restore failed):
-    /// fence around the restart, then release it. `false` if the restart failed (retried
-    /// next tick). Only the leader injects checkpoints, so its fence lifetime is what
-    /// gates the cluster; a follower's is just final-checkpoint suppression.
+    /// Observe-path restore (a follower seeing the leader's `Recover`): fence the restart,
+    /// then release it. `false` if it failed (retried next tick).
     async fn restore(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -161,9 +170,8 @@ impl RecoveryMonitor {
         ok
     }
 
-    /// Restart this node to `target` and, on success, ack the generation and clear this
-    /// node's fault report. Fence-neutral — the caller owns the fence. `false` on failure
-    /// (`applied_gen` and the fault report are left untouched so the next tick retries).
+    /// Restart this node to `target`, then ack the generation and clear its fault report.
+    /// Fence-neutral. `false` on failure (state untouched so the next tick retries).
     async fn restore_and_ack(
         &mut self,
         db: &Arc<LaminarDB>,

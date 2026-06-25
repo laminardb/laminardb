@@ -1344,8 +1344,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     async fn close_sinks(&mut self) {
-        // Concurrently — a stalled sink shouldn't add its 15s timeout to every other one
-        // (recovery downtime would be N×15s with serial closes).
+        // Concurrently, so one stalled sink doesn't add its 15s timeout to every other.
         futures::future::join_all(self.sinks.iter().map(|(_, h, _, _, _)| h.close())).await;
     }
 

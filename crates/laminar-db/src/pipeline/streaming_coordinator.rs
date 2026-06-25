@@ -989,10 +989,9 @@ impl StreamingCoordinator {
             return;
         }
 
-        // Explicit connector checkpoint requests are honored regardless of convergence —
-        // but NOT during a coordinated restart: sealing an epoch then would advance the
-        // committed state past the recovery target. The fence short-circuits before the
-        // swap so the request stays pending and fires once recovery releases the fence.
+        // Explicit connector checkpoint requests are honored regardless of convergence, but
+        // not during a coordinated restart (sealing an epoch would advance past the recovery
+        // target). The fence short-circuits before the swap, so the request fires afterwards.
         let should_checkpoint = interval_due
             || (callback.is_leader()
                 && !callback.is_recovering()
