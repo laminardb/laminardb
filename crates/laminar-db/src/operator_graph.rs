@@ -573,12 +573,20 @@ impl OperatorGraph {
         }
 
         for (vnode, rehydrated) in drained {
-            // Decode the recovery chain; an undecodable link is skipped (vnode resumes from current).
             let chain: Vec<crate::vnode_partial::VnodePartial> = rehydrated
                 .chain
                 .iter()
                 .filter_map(|b| crate::vnode_partial::VnodePartial::decode(b).ok())
                 .collect();
+            // A dropped link would leave a gapped chain → silently stale state on apply.
+            // Skip the vnode loudly instead (matches the state-tier rehydration path).
+            if chain.len() != rehydrated.chain.len() {
+                tracing::error!(
+                    vnode,
+                    "[LDB-6031] rehydration chain link decode failed; skipping vnode"
+                );
+                continue;
+            }
             // Every operator present anywhere in the chain (full or delta), resolved independently.
             let mut op_names: Vec<String> = Vec::new();
             for p in &chain {

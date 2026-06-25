@@ -10,7 +10,7 @@ use std::time::Duration;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::runtime::Handle;
 
-use laminar_core::cluster::control::{BarrierAnnouncement, ClusterController, Phase};
+use laminar_core::cluster::control::ClusterController;
 use laminar_core::cluster::discovery::NodeId;
 
 use crate::LaminarDB;
@@ -64,11 +64,11 @@ impl RecoveryMonitor {
                 continue;
             };
 
-            // Any node restores on a Recover it hasn't applied; the leader also drives a
+            // Any node restores on a generation it hasn't applied; the leader also drives a
             // new round when a fault report changes.
-            if let Some(ann) = controller.observe_recover().await {
-                if ann.flags > self.applied_gen {
-                    self.restore(&db, &controller, ann.epoch, ann.flags).await;
+            if let Some((epoch, gen)) = controller.observe_recover().await {
+                if gen > self.applied_gen {
+                    self.restore(&db, &controller, epoch, gen).await;
                 }
             }
             if controller.is_leader() && self.take_new_fault(&controller).await {
@@ -77,12 +77,15 @@ impl RecoveryMonitor {
         }
     }
 
-    /// `true` when any node's fault sequence changed since we last handled it. `0` is "no
-    /// fault" (cleared after recovery), so a restarted leader doesn't re-trigger a handled one.
+    /// `true` when any node's fault sequence changed since we last handled it. A `0` report
+    /// is "no fault" (cleared after recovery); seeing it forgets the node, so a re-fault that
+    /// reuses a sequence (e.g. the counter reset by a full process restart) still triggers.
     async fn take_new_fault(&mut self, controller: &ClusterController) -> bool {
         let mut triggered = false;
         for (node, seq) in controller.read_fault_reports().await {
-            if seq != 0 && self.handled_faults.get(&node) != Some(&seq) {
+            if seq == 0 {
+                self.handled_faults.remove(&node);
+            } else if self.handled_faults.get(&node) != Some(&seq) {
                 self.handled_faults.insert(node, seq);
                 triggered = true;
             }
@@ -92,7 +95,7 @@ impl RecoveryMonitor {
 
     /// Leader: fix `N`, announce, restore self (retrying), then wait for every live node to
     /// report restored. Always releases the fence and clears the announcement on exit — so a
-    /// failed round can't leave a stale `Recover` for a later peer-restart to replay.
+    /// failed round can't leave a stale generation for a later peer-restart to replay.
     async fn drive_round(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
         let Some(target) = compute_target_epoch(db).await else {
             tracing::warn!("coordinated recovery: no committed epoch yet; skipping round");
@@ -100,20 +103,10 @@ impl RecoveryMonitor {
         };
         let gen_id = read_recovery_gen(controller).await + 1;
         write_recovery_gen(controller, gen_id).await;
+        let participants: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
 
         controller.set_recovering(true);
-        let ann = BarrierAnnouncement {
-            epoch: target,
-            checkpoint_id: 0,
-            phase: Phase::Recover,
-            flags: gen_id,
-            min_watermark_ms: None,
-        };
-        if let Err(e) = controller.announce_barrier(&ann).await {
-            tracing::error!(error = %e, "coordinated recovery: announce failed");
-            controller.set_recovering(false);
-            return;
-        }
+        controller.announce_recover(target, gen_id).await;
         tracing::warn!(
             target_epoch = target,
             gen = gen_id,
@@ -135,7 +128,7 @@ impl RecoveryMonitor {
             );
         }
         if restored {
-            wait_restore_quorum(controller, gen_id, RESTORE_QUORUM_TIMEOUT).await;
+            wait_restore_quorum(controller, gen_id, &participants, RESTORE_QUORUM_TIMEOUT).await;
             tracing::warn!(
                 gen = gen_id,
                 "coordinated recovery complete; fence released"
@@ -144,11 +137,11 @@ impl RecoveryMonitor {
             tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
         }
         controller.set_recovering(false);
-        controller.clear_recover_announcement(target).await;
+        controller.clear_recover().await;
     }
 
-    /// Observe-path restore (a follower seeing the leader's `Recover`): fence the restart,
-    /// then release it. `false` if it failed (retried next tick).
+    /// Observe-path restore (a follower acting on the leader's announcement): fence the
+    /// restart, then release it. `false` if it failed (retried next tick).
     async fn restore(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -180,6 +173,9 @@ impl RecoveryMonitor {
     ) -> bool {
         if !restore_pipeline(db, target).await {
             return false;
+        }
+        if let Some(m) = db.engine_metrics.lock().clone() {
+            m.coordinated_recoveries_total.inc();
         }
         self.applied_gen = gen_id;
         controller.announce_recovered(gen_id).await;
@@ -248,9 +244,15 @@ async fn write_recovery_gen(controller: &ClusterController, gen_id: u64) {
         .await;
 }
 
-/// Wait until every live node reports restored-to-`gen_id`, or the deadline (a dead node
-/// that never acks recovers on rejoin).
-async fn wait_restore_quorum(controller: &ClusterController, gen_id: u64, timeout: Duration) {
+/// Wait until every still-live `participant` reports restored-to-`gen_id`, or the deadline.
+/// Only the round's original participants are awaited: one that left membership can't ack
+/// (don't burn the timeout on it), and one that joined later recovers on its own observe.
+async fn wait_restore_quorum(
+    controller: &ClusterController,
+    gen_id: u64,
+    participants: &FxHashSet<NodeId>,
+    timeout: Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let live: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
@@ -261,16 +263,16 @@ async fn wait_restore_quorum(controller: &ClusterController, gen_id: u64, timeou
             .filter(|(_, g)| *g >= gen_id)
             .map(|(n, _)| n)
             .collect();
-        if live.iter().all(|n| acked.contains(n)) {
+        let pending: Vec<NodeId> = participants
+            .iter()
+            .copied()
+            .filter(|n| live.contains(n) && !acked.contains(n))
+            .collect();
+        if pending.is_empty() {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            let missing: Vec<NodeId> = live.into_iter().filter(|n| !acked.contains(n)).collect();
-            tracing::error!(
-                gen = gen_id,
-                ?missing,
-                "coordinated recovery: restore quorum timed out"
-            );
+            tracing::error!(gen = gen_id, missing = ?pending, "restore quorum timed out");
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

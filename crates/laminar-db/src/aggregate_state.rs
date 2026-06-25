@@ -574,7 +574,6 @@ pub(crate) struct IncrementalAggState {
     last_emitted_dirty_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
     // Deltas emitted since the last full capture, per vnode — bounds the chain so the full
     // base never ages out of the prune window; cleared to a full re-base on restore/acquire.
-    // Read only by the (not-yet-wired) delta capture path; see incremental-delta-checkpoint-lever2.md.
     #[cfg(feature = "cluster")]
     delta_chain_len: AHashMap<u32, u32>,
 }
@@ -1661,9 +1660,9 @@ impl IncrementalAggState {
 
     /// Per-vnode capture under delta checkpointing: each touched vnode emits a FULL re-base or an
     /// incremental DELTA. Re-bases FULL when the vnode has no chain base (fresh / just-acquired) or
-    /// the chain reached `chain_max`. Changelog aggregates always re-base FULL — `last_emitted` is
-    /// not delta-encoded, so an incremental capture would drop the dedup map on recovery. Clears the
-    /// per-vnode dirty sets; the next delta measures against the state captured here.
+    /// the chain reached `chain_max`. Changelog aggregates delta-encode `last_emitted` alongside the
+    /// groups, so the dedup map survives chain replay. Clears the per-vnode dirty sets; the next
+    /// delta measures against the state captured here.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     pub(crate) fn checkpoint_delta_by_vnode(

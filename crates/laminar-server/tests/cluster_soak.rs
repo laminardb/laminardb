@@ -708,6 +708,21 @@ fn three_node_kill9_soak() {
         );
     }
 
+    // Recovery proof: with a fault injected and no kill-9 churn (which would reset the
+    // per-node metric on restart), the cluster must have applied the leader-coordinated
+    // round. EO + progress prove the data; this proves the feature actually engaged.
+    if fault_inject_ms.is_some() && max_kills == 0 {
+        let recoveries: f64 = nodes
+            .iter()
+            .filter_map(|n| n.metric("laminardb_coordinated_recoveries_total"))
+            .sum();
+        assert!(
+            recoveries >= 1.0,
+            "fault injected but no coordinated recovery recorded across the cluster",
+        );
+        eprintln!("soak: coordinated recoveries applied = {recoveries}");
+    }
+
     if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
         // Let in-flight epochs commit, then stop every writer so the
         // diff reads a stable topic (transactions open at the kill are

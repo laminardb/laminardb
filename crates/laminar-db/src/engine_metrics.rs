@@ -139,6 +139,8 @@ pub struct EngineMetrics {
     pub pipeline_cycle_errors_total: IntCounter,
     /// Automatic recover-from-checkpoint restarts triggered by the fault supervisor.
     pub pipeline_restarts_total: IntCounter,
+    /// Leader-coordinated global restart-to-epoch rounds this node applied (cluster mode).
+    pub coordinated_recoveries_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -471,6 +473,11 @@ impl EngineMetrics {
             pipeline_restarts_total: reg!(IntCounter::new(
                 "pipeline_restarts_total",
                 "Automatic recover-from-checkpoint restarts after a pipeline fault"
+            )
+            .unwrap()),
+            coordinated_recoveries_total: reg!(IntCounter::new(
+                "coordinated_recoveries_total",
+                "Leader-coordinated global restart-to-epoch rounds applied by this node"
             )
             .unwrap()),
         }
