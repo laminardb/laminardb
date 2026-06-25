@@ -289,6 +289,12 @@ impl ClusterController {
         self.kv.write("control:fault-report", seq.to_string()).await;
     }
 
+    /// Clear this node's fault report after it recovers, so the report doesn't linger and
+    /// re-trigger recovery when a new/restarted leader reads it. `0` means "no fault".
+    pub async fn clear_fault_report(&self) {
+        self.kv.write("control:fault-report", "0".to_string()).await;
+    }
+
     /// Each visible node's reported fault sequence.
     pub async fn read_fault_reports(&self) -> Vec<(NodeId, u64)> {
         self.kv
@@ -523,6 +529,22 @@ impl ClusterController {
             .await?;
         let ann: BarrierAnnouncement = serde_json::from_str(&json).ok()?;
         (ann.phase == Phase::Recover).then_some(ann)
+    }
+
+    /// Overwrite this node's announcement slot with a non-`Recover` phase once a recovery
+    /// round finishes, so [`Self::observe_recover`] stops returning it (a peer that
+    /// restarts after the round, its in-memory generation reset, would otherwise replay it).
+    pub async fn clear_recover_announcement(&self, epoch: u64) {
+        let ann = BarrierAnnouncement {
+            epoch,
+            checkpoint_id: 0,
+            phase: Phase::Commit,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        if let Ok(json) = serde_json::to_string(&ann) {
+            self.kv.write(super::barrier::ANNOUNCEMENT_KEY, json).await;
+        }
     }
 
     /// Wait until [`Self::observe_barrier`] yields an announcement

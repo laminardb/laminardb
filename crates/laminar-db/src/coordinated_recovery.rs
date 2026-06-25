@@ -76,11 +76,13 @@ impl RecoveryMonitor {
         }
     }
 
-    /// `true` when any node's fault sequence changed since we last handled it.
+    /// `true` when any node's fault sequence changed since we last handled it. A `0`
+    /// report is "no fault" (cleared after recovery), so it never triggers — otherwise a
+    /// new/restarted leader would re-run recovery for an already-handled fault.
     async fn take_new_fault(&mut self, controller: &ClusterController) -> bool {
         let mut triggered = false;
         for (node, seq) in controller.read_fault_reports().await {
-            if self.handled_faults.get(&node) != Some(&seq) {
+            if seq != 0 && self.handled_faults.get(&node) != Some(&seq) {
                 self.handled_faults.insert(node, seq);
                 triggered = true;
             }
@@ -117,65 +119,99 @@ impl RecoveryMonitor {
             "leader announced recovery"
         );
 
-        // Restore self into the quorum, marking applied so the observe path doesn't repeat it.
-        self.restore_pipeline(db, target).await;
-        self.applied_gen = gen_id;
-        controller.announce_recovered(gen_id).await;
-
+        // Restore self into the quorum, holding the fence across the wait. On failure,
+        // release the fence and return — the observe path retries on the next tick
+        // (applied_gen is left unchanged).
+        if !self.restore_and_ack(db, controller, target, gen_id).await {
+            controller.set_recovering(false);
+            return;
+        }
         wait_restore_quorum(controller, gen_id, RESTORE_QUORUM_TIMEOUT).await;
         controller.set_recovering(false);
+        // Clear the Recover from our gossip slot so a peer that restarts after the round
+        // (its in-memory `applied_gen` reset to 0) doesn't replay this generation.
+        controller.clear_recover_announcement(target).await;
         tracing::warn!(
             gen = gen_id,
             "coordinated recovery complete; fence released"
         );
     }
 
+    /// Observe-path restore (follower, or a leader retrying after its own restore failed):
+    /// fence around the restart, then release it. `false` if the restart failed (retried
+    /// next tick). Only the leader injects checkpoints, so its fence lifetime is what
+    /// gates the cluster; a follower's is just final-checkpoint suppression.
     async fn restore(
         &mut self,
         db: &Arc<LaminarDB>,
         controller: &ClusterController,
         target: u64,
         gen_id: u64,
-    ) {
+    ) -> bool {
         controller.set_recovering(true);
-        self.restore_pipeline(db, target).await;
-        self.applied_gen = gen_id;
-        controller.announce_recovered(gen_id).await;
-        // Only the leader injects, so a follower clearing its fence before the quorum is fine.
+        let ok = self.restore_and_ack(db, controller, target, gen_id).await;
         controller.set_recovering(false);
-        tracing::warn!(
-            target_epoch = target,
-            gen = gen_id,
-            "node restored to recovery epoch"
-        );
+        if ok {
+            tracing::warn!(
+                target_epoch = target,
+                gen = gen_id,
+                "node restored to recovery epoch"
+            );
+        }
+        ok
     }
 
-    /// Stop, arm the target, and restart from `N`, on a dedicated thread since `start()`
-    /// is `!Send`. The fence makes the stop skip its final checkpoint (which would commit
-    /// past `N`).
-    async fn restore_pipeline(&self, db: &Arc<LaminarDB>, target: u64) {
-        let db = Arc::clone(db);
-        let handle = Handle::current();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let spawned = std::thread::Builder::new()
-            .name("laminar-coord-recover".into())
-            .spawn(move || {
-                let res = handle.block_on(async move {
-                    // A faulted node is already stopped, so ignore the stop error.
-                    let _ = db.stop_pipeline().await;
-                    db.set_recover_target_epoch(target);
-                    db.start().await
-                });
-                let _ = tx.send(res);
-            });
-        if let Err(e) = spawned {
-            tracing::error!(error = %e, "coordinated recovery: failed to spawn restore thread");
-            return;
+    /// Restart this node to `target` and, on success, ack the generation and clear this
+    /// node's fault report. Fence-neutral — the caller owns the fence. `false` on failure
+    /// (`applied_gen` and the fault report are left untouched so the next tick retries).
+    async fn restore_and_ack(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        target: u64,
+        gen_id: u64,
+    ) -> bool {
+        if !restore_pipeline(db, target).await {
+            return false;
         }
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(error = %e, "coordinated recovery restart failed"),
-            Err(_) => tracing::error!("coordinated recovery restore thread dropped"),
+        self.applied_gen = gen_id;
+        controller.announce_recovered(gen_id).await;
+        controller.clear_fault_report().await;
+        true
+    }
+}
+
+/// Stop, arm the target, and restart from `N`, on a dedicated thread since `start()` is
+/// `!Send`. `true` on a clean restart. The fence makes the stop skip its final checkpoint
+/// (which would commit past `N`).
+async fn restore_pipeline(db: &Arc<LaminarDB>, target: u64) -> bool {
+    let db = Arc::clone(db);
+    let handle = Handle::current();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("laminar-coord-recover".into())
+        .spawn(move || {
+            let res = handle.block_on(async move {
+                // A faulted node is already stopped, so ignore the stop error.
+                let _ = db.stop_pipeline().await;
+                db.set_recover_target_epoch(target);
+                db.start().await
+            });
+            let _ = tx.send(res);
+        });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "coordinated recovery: failed to spawn restore thread");
+        return false;
+    }
+    match rx.await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "coordinated recovery restart failed");
+            false
+        }
+        Err(_) => {
+            tracing::error!("coordinated recovery restore thread dropped");
+            false
         }
     }
 }

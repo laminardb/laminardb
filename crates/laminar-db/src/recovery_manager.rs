@@ -761,7 +761,16 @@ impl<'a> RecoveryManager<'a> {
             return false;
         }
         match decision_store {
-            Some(ds) => !ds.is_committed(manifest.epoch).await.unwrap_or(false),
+            // A read error can't confirm the commit, so treat as uncommitted (skip) — but
+            // surface it rather than silently rewinding past a maybe-committed checkpoint.
+            Some(ds) => match ds.is_committed(manifest.epoch).await {
+                Ok(committed) => !committed,
+                Err(e) => {
+                    warn!(epoch = manifest.epoch, error = %e,
+                        "[LDB-6040] decision-store read failed; treating epoch as uncommitted");
+                    true
+                }
+            },
             None => true,
         }
     }
