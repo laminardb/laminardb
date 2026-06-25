@@ -172,7 +172,10 @@ mod grpc {
 
     impl PeerConn {
         fn is_alive(&self) -> bool {
-            self.alive.load(Ordering::Acquire)
+            // `is_finished()` also catches a driver cancelled without flipping `alive` — an
+            // in-process restart drops the compute runtime it ran on, leaving an `alive`
+            // zombie that fails every send yet never reconnects.
+            self.alive.load(Ordering::Acquire) && !self.driver.is_finished()
         }
     }
 
@@ -299,6 +302,7 @@ mod grpc {
                 })?,
             };
 
+            tracing::debug!(peer, addr = %addr, "shuffle reconnecting to peer");
             let conn = Arc::new(open_call(self.local_id, addr)?);
 
             // Race: another task may have opened a live call meanwhile.
@@ -701,6 +705,7 @@ mod grpc {
                 }
             }
         }
+        tracing::debug!(peer, frames_received, "shuffle inbound stream ended");
         Ok(ShuffleSummary { frames_received })
     }
 

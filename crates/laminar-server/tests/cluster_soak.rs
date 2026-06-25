@@ -44,6 +44,11 @@
 //! - `LAMINAR_SOAK_CHANGELOG_AGG`  any value: add an `EMIT CHANGES` aggregate so
 //!   the changelog `last_emitted` delta path is exercised under kill -9 + rebalance.
 //!   Pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` (else the agg captures FULL).
+//! - `LAMINAR_SOAK_COORD_RECOVERY`  any value: set `[supervision] coordinated_recovery`.
+//! - `LAMINAR_SOAK_FAULT_INJECT_MS`  arm a one-shot cycle fault on one node this many ms
+//!   in; `LAMINAR_SOAK_FAULT_INJECT_NODE` (default 1 = follower; 0 = leader) picks which.
+//!   The 1A-cluster recovery soak runs these with `LAMINAR_SOAK_COORD_RECOVERY=1`,
+//!   `LAMINAR_SOAK_KILLS=0`, and the Kafka EO sink.
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -68,6 +73,8 @@ struct Node {
     log_path: PathBuf,
     child: Option<Child>,
     http_port: u16,
+    /// `LAMINAR_FAULT_INJECT_AFTER_MS` for this node, when armed (recovery soak).
+    fault_inject_ms: Option<u64>,
 }
 
 impl Node {
@@ -77,18 +84,19 @@ impl Node {
             .append(true)
             .open(&self.log_path)
             .expect("node log file");
-        let child = Command::new(env!("CARGO_BIN_EXE_laminardb"))
-            .arg("--config")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_laminardb"));
+        cmd.arg("--config")
             .arg(&self.config_path)
             .env(
                 "RUST_LOG",
                 "laminardb=info,laminar_server=info,laminar_db=info,laminar_core=info",
             )
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("spawn laminardb");
-        self.child = Some(child);
+            .stderr(Stdio::from(log));
+        if let Some(ms) = self.fault_inject_ms {
+            cmd.env("LAMINAR_FAULT_INJECT_AFTER_MS", ms.to_string());
+        }
+        self.child = Some(cmd.spawn().expect("spawn laminardb"));
     }
 
     /// `kill -9` equivalent: no shutdown hooks, no final checkpoint.
@@ -359,6 +367,10 @@ format = "json"
         ));
     }
 
+    if std::env::var("LAMINAR_SOAK_COORD_RECOVERY").is_ok() {
+        toml.push_str("\n[supervision]\ncoordinated_recovery = true\n");
+    }
+
     let path = dir.join(format!("node{id}.toml"));
     std::fs::write(&path, toml).unwrap();
     path
@@ -532,6 +544,12 @@ fn three_node_kill9_soak() {
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("soak: node logs in {}", log_dir.display());
 
+    // Recovery soak: arm a one-shot fault on a single node (default 1 = follower, 0 = leader).
+    let fault_inject_ms = std::env::var("LAMINAR_SOAK_FAULT_INJECT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let fault_inject_node = env_u64("LAMINAR_SOAK_FAULT_INJECT_NODE", 1) as usize;
+
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
             id,
@@ -539,6 +557,7 @@ fn three_node_kill9_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
+            fault_inject_ms: fault_inject_ms.filter(|_| id == fault_inject_node),
         })
         .collect();
     for n in &mut nodes {
@@ -981,6 +1000,7 @@ fn graceful_rotation_kafka_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
+            fault_inject_ms: None,
         })
         .collect();
 

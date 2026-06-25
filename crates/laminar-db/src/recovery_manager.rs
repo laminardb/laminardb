@@ -327,100 +327,50 @@ impl<'a> RecoveryManager<'a> {
         sources: &[RegisteredSource],
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> Result<Option<RecoveredState>, DbError> {
-        // Fast path: try load_latest() first.
+        // Fast path: the latest checkpoint.
         match self.store.load_latest().await {
             Ok(Some(manifest)) => {
-                if self.is_checkpoint_corrupt(&manifest).await {
-                    warn!(
-                        checkpoint_id = manifest.checkpoint_id,
-                        "[LDB-6010] latest checkpoint corrupt, trying fallback"
-                    );
-                } else if Self::has_pending_sinks(&manifest) {
-                    warn!(
-                        checkpoint_id = manifest.checkpoint_id,
-                        epoch = manifest.epoch,
-                        "[LDB-6015] checkpoint has uncommitted sinks — source offsets \
-                         may be past uncommitted data, falling back to previous checkpoint"
-                    );
-                } else {
-                    let state = self
-                        .restore_from(manifest, sources, sinks, table_sources)
-                        .await;
-                    if let Err(e) = self.check_strict(&state) {
-                        warn!(
-                            checkpoint_id = state.manifest.checkpoint_id,
-                            error = %e,
-                            "latest checkpoint restore had strict errors, trying fallback"
-                        );
-                    } else {
-                        return Ok(Some(state));
-                    }
+                if let Some(state) = self
+                    .try_restore(manifest, sources, sinks, table_sources, decision_store)
+                    .await
+                {
+                    return Ok(Some(state));
                 }
             }
             Ok(None) => {
                 info!("no checkpoint found, starting fresh");
                 return Ok(None);
             }
-            Err(e) => {
-                warn!(error = %e, "latest checkpoint load failed, trying fallback");
-            }
+            Err(e) => warn!(error = %e, "latest checkpoint load failed, trying fallback"),
         }
 
-        // Fallback: iterate through all checkpoints in reverse order.
-        let checkpoints = self.store.list().await.map_err(DbError::from)?;
+        // Fallback: older checkpoints, newest first.
+        let mut checkpoints = self.store.list().await.map_err(DbError::from)?;
+        checkpoints.reverse();
+        self.restore_first(&checkpoints, sources, sinks, table_sources, decision_store)
+            .await
+    }
 
-        if checkpoints.is_empty() {
-            warn!("no checkpoints available for fallback, starting fresh");
-            return Ok(None);
-        }
-
-        for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
-            match self.store.load_by_id(checkpoint_id).await {
-                Ok(Some(manifest)) => {
-                    if self.is_checkpoint_corrupt(&manifest).await {
-                        warn!(
-                            checkpoint_id,
-                            "[LDB-6010] fallback checkpoint corrupt, skipping"
-                        );
-                        continue;
-                    }
-                    if Self::has_pending_sinks(&manifest) {
-                        warn!(
-                            checkpoint_id,
-                            "[LDB-6015] fallback checkpoint has uncommitted sinks, skipping"
-                        );
-                        continue;
-                    }
-                    info!(checkpoint_id, "recovering from fallback checkpoint");
-                    let state = self
-                        .restore_from(manifest, sources, sinks, table_sources)
-                        .await;
-                    if let Err(e) = self.check_strict(&state) {
-                        warn!(
-                            checkpoint_id,
-                            error = %e,
-                            "fallback checkpoint restore had strict errors, trying next"
-                        );
-                        continue;
-                    }
-                    return Ok(Some(state));
-                }
-                Ok(None) => {
-                    debug!(checkpoint_id, "fallback checkpoint not found, skipping");
-                }
-                Err(e) => {
-                    warn!(
-                        checkpoint_id,
-                        error = %e,
-                        "fallback checkpoint load failed, trying next"
-                    );
-                }
-            }
-        }
-
-        warn!("all checkpoints failed to load, starting fresh");
-        Ok(None)
+    /// Recover from the newest viable checkpoint with `epoch <= target_epoch` — the
+    /// coordinated-restart target, which may be older than this node's local latest.
+    ///
+    /// # Errors
+    /// Returns `DbError::Checkpoint` if the store fails.
+    pub(crate) async fn recover_to_epoch(
+        &self,
+        target_epoch: u64,
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Result<Option<RecoveredState>, DbError> {
+        let mut checkpoints = self.store.list().await.map_err(DbError::from)?;
+        checkpoints.retain(|&(_, epoch)| epoch <= target_epoch);
+        checkpoints.sort_by_key(|&(_, epoch)| std::cmp::Reverse(epoch)); // newest eligible first
+        self.restore_first(&checkpoints, sources, sinks, table_sources, decision_store)
+            .await
     }
 
     /// Resolve external operator states from the sidecar file into inline entries.
@@ -798,6 +748,95 @@ impl<'a> RecoveryManager<'a> {
             .any(|s| matches!(s, SinkCommitStatus::Pending))
     }
 
+    /// `true` when a checkpoint must be skipped for genuinely-uncommitted sinks: sinks are
+    /// `Pending` AND the decision marker does not confirm the epoch committed. A
+    /// pending-but-marker-committed epoch is NOT skipped — the sink committed but the
+    /// manifest wasn't updated before the fault, and rewinding the source behind it would
+    /// re-emit committed rows (duplicates); `reconcile_prepared_on_init` re-drives the commit.
+    async fn pending_uncommitted(
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        manifest: &CheckpointManifest,
+    ) -> bool {
+        if !Self::has_pending_sinks(manifest) {
+            return false;
+        }
+        match decision_store {
+            // A read error can't confirm the commit, so treat as uncommitted (skip) — but
+            // surface it rather than silently rewinding past a maybe-committed checkpoint.
+            Some(ds) => match ds.is_committed(manifest.epoch).await {
+                Ok(committed) => !committed,
+                Err(e) => {
+                    warn!(epoch = manifest.epoch, error = %e,
+                        "[LDB-6040] decision-store read failed; treating epoch as uncommitted");
+                    true
+                }
+            },
+            None => true,
+        }
+    }
+
+    /// Restore from `manifest` if it's viable; `None` means try an older checkpoint
+    /// (corrupt, genuinely-uncommitted sinks, or strict-mode restore errors).
+    async fn try_restore(
+        &self,
+        manifest: CheckpointManifest,
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Option<RecoveredState> {
+        let (checkpoint_id, epoch) = (manifest.checkpoint_id, manifest.epoch);
+        if self.is_checkpoint_corrupt(&manifest).await {
+            warn!(
+                checkpoint_id,
+                epoch, "[LDB-6010] checkpoint corrupt, trying older"
+            );
+            return None;
+        }
+        if Self::pending_uncommitted(decision_store, &manifest).await {
+            warn!(
+                checkpoint_id,
+                epoch, "[LDB-6015] uncommitted sinks, trying older"
+            );
+            return None;
+        }
+        let state = self
+            .restore_from(manifest, sources, sinks, table_sources)
+            .await;
+        if let Err(e) = self.check_strict(&state) {
+            warn!(checkpoint_id, epoch, error = %e, "strict restore errors, trying older");
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Restore from the first viable checkpoint in `candidates` (try-order); `Ok(None)`
+    /// if none restore. `candidates` are `(checkpoint_id, epoch)` pairs.
+    async fn restore_first(
+        &self,
+        candidates: &[(u64, u64)],
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Result<Option<RecoveredState>, DbError> {
+        for &(checkpoint_id, _) in candidates {
+            match self.store.load_by_id(checkpoint_id).await {
+                Ok(Some(manifest)) => {
+                    if let Some(state) = self
+                        .try_restore(manifest, sources, sinks, table_sources, decision_store)
+                        .await
+                    {
+                        return Ok(Some(state));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(checkpoint_id, error = %e, "checkpoint load failed, trying older"),
+            }
+        }
+        Ok(None)
+    }
+
     fn check_strict(&self, state: &RecoveredState) -> Result<(), DbError> {
         if !self.strict || !state.has_errors() {
             return Ok(());
@@ -858,7 +897,7 @@ mod tests {
         let store = make_store(dir.path());
         let mgr = RecoveryManager::new(&store);
 
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -872,13 +911,58 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(result.epoch(), 5);
         assert_eq!(result.sources_restored, 0);
         assert_eq!(result.tables_restored, 0);
         assert_eq!(result.sinks_rolled_back, 0);
         assert!(!result.has_errors());
+    }
+
+    #[tokio::test]
+    async fn recover_to_epoch_picks_newest_at_or_below_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        for (id, epoch) in [(1u64, 3u64), (2, 5), (3, 7)] {
+            store
+                .save(&CheckpointManifest::new(id, epoch))
+                .await
+                .unwrap();
+        }
+        let mgr = RecoveryManager::new(&store);
+
+        assert_eq!(
+            mgr.recover_to_epoch(7, &[], &[], &[], None)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            7
+        );
+        // A newer local epoch is rewound to the cluster-agreed target.
+        assert_eq!(
+            mgr.recover_to_epoch(6, &[], &[], &[], None)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            5
+        );
+        assert_eq!(
+            mgr.recover_to_epoch(5, &[], &[], &[], None)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            5
+        );
+        // Nothing committed at or below the target → fresh start.
+        assert!(mgr
+            .recover_to_epoch(2, &[], &[], &[], None)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -891,7 +975,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(result.watermark(), Some(42_000));
     }
@@ -911,7 +995,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(result.operator_states().len(), 2);
         let op0 = result.operator_states().get("0").unwrap();
@@ -928,7 +1012,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(
             result.table_store_checkpoint_path(),
@@ -989,7 +1073,7 @@ mod tests {
         // (it already does from the save, but the manifest file is now corrupt)
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
 
         // Should fall back to checkpoint 1
         let recovered = result.expect("should recover from fallback checkpoint");
@@ -1014,7 +1098,7 @@ mod tests {
         std::fs::write(&manifest_path, "corrupt").unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
 
         // All checkpoints corrupt → fresh start
         assert!(result.is_none());
@@ -1029,7 +1113,7 @@ mod tests {
         store.save(&CheckpointManifest::new(2, 20)).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         // Should use the latest (no fallback needed)
         assert_eq!(result.manifest.checkpoint_id, 2);
@@ -1056,7 +1140,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         // External state should have been resolved to inline
         let op = result.operator_states().get("big-op").unwrap();
@@ -1087,7 +1171,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         let small = result.operator_states().get("small-op").unwrap();
         assert_eq!(small.decode_inline().unwrap(), b"tiny");
@@ -1112,7 +1196,7 @@ mod tests {
         // sidecar state with empty inline. Strict mode rejects this
         // checkpoint entirely (see test_recover_missing_sidecar_strict).
         let mgr = RecoveryManager::lenient(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         // Should still recover (gracefully) — external state replaced with
         // empty inline to avoid dangling offset references
@@ -1166,7 +1250,7 @@ mod tests {
         // and recovery falls back. With only one checkpoint, this means
         // fresh start.
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         assert!(
             result.is_none(),
             "strict mode should reject checkpoint with missing sidecar"
@@ -1191,7 +1275,7 @@ mod tests {
         store.save(&m2).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         let state = result.expect("should recover from epoch 1 fallback");
 
         // Must fall back to epoch 1 (the last fully committed checkpoint),
@@ -1215,7 +1299,7 @@ mod tests {
         store.save(&m).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         assert!(
             result.is_none(),
             "should start fresh when all checkpoints have pending sinks"

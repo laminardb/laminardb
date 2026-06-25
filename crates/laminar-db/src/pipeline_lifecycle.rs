@@ -280,6 +280,29 @@ impl LaminarDB {
         *self.supervisor_self.lock() = Arc::downgrade(self);
     }
 
+    /// Make the next [`Self::start`] restore to `epoch` (the cluster-agreed cut) instead
+    /// of the local latest. Cleared on start.
+    #[cfg(feature = "cluster")]
+    pub fn set_recover_target_epoch(&self, epoch: u64) {
+        *self.recover_target_epoch.lock() = Some(epoch);
+    }
+
+    /// Start the per-node recovery monitor once. No-op when `coordinated_recovery` is off.
+    /// Must be called from a Tokio runtime.
+    #[cfg(feature = "cluster")]
+    pub fn enable_coordinated_recovery(self: &Arc<Self>) {
+        if !self.config.coordinated_recovery {
+            return;
+        }
+        if self
+            .recovery_monitor_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        crate::coordinated_recovery::spawn_monitor(self);
+    }
+
     /// Start the streaming pipeline. Idempotent if already running. On failure
     /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
@@ -1134,7 +1157,18 @@ impl LaminarDB {
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                match coord.recover().await {
+                // Restore to the cluster-agreed epoch if one was armed, else the local
+                // latest. Take it owned first so the guard isn't held across the await.
+                #[cfg(feature = "cluster")]
+                let recover_target = self.recover_target_epoch.lock().take();
+                #[cfg(feature = "cluster")]
+                let recovery = match recover_target {
+                    Some(target) => coord.recover_to_epoch(target).await,
+                    None => coord.recover().await,
+                };
+                #[cfg(not(feature = "cluster"))]
+                let recovery = coord.recover().await;
+                match recovery {
                     Ok(Some(recovered)) => {
                         recovered_source_wms = recovered
                             .manifest
@@ -1820,6 +1854,7 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
+            coordinated_recovery: self.config.coordinated_recovery,
             serialization_timeout: std::time::Duration::from_secs(120),
             sink_event_rx,
             sink_timed_out: false,
@@ -1958,6 +1993,10 @@ impl LaminarDB {
             let watcher_supervisor = Arc::clone(&self.supervisor_self);
             let watcher_restart_history = Arc::clone(&self.restart_history);
             let watcher_metrics = self.engine_metrics.lock().clone();
+            #[cfg(feature = "cluster")]
+            let watcher_coord_recovery = self.config.coordinated_recovery;
+            #[cfg(feature = "cluster")]
+            let watcher_controller = self.cluster_controller.lock().clone();
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_ok() {
                     // Only finalize for a timed-out stop. A normal stop/shutdown caller is
@@ -1977,6 +2016,16 @@ impl LaminarDB {
                     // Faulted, not Stopped — recoverable via a later start().
                     DbState::Faulted.store(&watcher_state);
                     watcher_shutdown.notify_one();
+                    // Coordinated recovery: report the fault and let the leader drive a global
+                    // restart; the monitor restores this node. A local restart would rewind
+                    // only this node while peers advanced — an inconsistent cut.
+                    #[cfg(feature = "cluster")]
+                    if watcher_coord_recovery {
+                        if let Some(controller) = watcher_controller {
+                            crate::coordinated_recovery::report_local_fault(&controller).await;
+                            return;
+                        }
+                    }
                     // Auto-restart if supervised; otherwise the pipeline stays Faulted.
                     let supervised = watcher_supervisor.lock().upgrade();
                     if let Some(db) = supervised {

@@ -35,6 +35,9 @@ pub struct ClusterController {
     /// excludes itself from [`Self::assignable_instances`] so the next
     /// rotation sheds its vnodes elsewhere before it exits.
     draining: Arc<AtomicBool>,
+    /// Held while a coordinated restart is in flight; the checkpoint gate consults it so
+    /// no checkpoint is injected mid-recovery.
+    recovering: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
     /// Peers that recently failed a capture quorum (no ack within the
@@ -90,6 +93,7 @@ impl ClusterController {
             converged_for_checkpoint: watch::channel(true).0,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
+            recovering: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             self_locality: parking_lot::RwLock::new(Locality::default()),
@@ -267,6 +271,55 @@ impl ClusterController {
     #[must_use]
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Set or clear the coordinated-recovery fence.
+    pub fn set_recovering(&self, recovering: bool) {
+        self.recovering.store(recovering, Ordering::SeqCst);
+    }
+
+    /// Whether a coordinated restart is in flight on this node.
+    #[must_use]
+    pub fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::SeqCst)
+    }
+
+    /// Publish this node's fault sequence so the leader drives a recovery round.
+    pub async fn report_fault(&self, seq: u64) {
+        self.kv.write("control:fault-report", seq.to_string()).await;
+    }
+
+    /// Clear this node's fault report (`0` = no fault) after it recovers, so a restarted
+    /// leader doesn't re-trigger recovery for an already-handled fault.
+    pub async fn clear_fault_report(&self) {
+        self.kv.write("control:fault-report", "0".to_string()).await;
+    }
+
+    /// Each visible node's reported fault sequence.
+    pub async fn read_fault_reports(&self) -> Vec<(NodeId, u64)> {
+        self.kv
+            .scan("control:fault-report")
+            .await
+            .into_iter()
+            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|seq| (n, seq)))
+            .collect()
+    }
+
+    /// Publish the recovery generation this node has restored to.
+    pub async fn announce_recovered(&self, recovery_id: u64) {
+        self.kv
+            .write("control:recovered", recovery_id.to_string())
+            .await;
+    }
+
+    /// Each visible node's last restored recovery generation.
+    pub async fn read_recovered(&self) -> Vec<(NodeId, u64)> {
+        self.kv
+            .scan("control:recovered")
+            .await
+            .into_iter()
+            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|id| (n, id)))
+            .collect()
     }
 
     /// Node ids eligible to own vnodes: `Active` peers, plus self unless
@@ -463,6 +516,34 @@ impl ClusterController {
     /// Propagates [`BarrierCoordinator::ack`] errors.
     pub async fn ack_barrier(&self, ack: &BarrierAck) -> Result<(), String> {
         self.barrier.ack(ack).await
+    }
+
+    /// The leader's current `Recover` announcement, if any. Reads the leader's gossip
+    /// slot directly: [`Self::observe_barrier`] merges by highest epoch, which would
+    /// shadow the recovery target (a lower epoch than the in-flight checkpoint).
+    pub async fn observe_recover(&self) -> Option<BarrierAnnouncement> {
+        let leader = self.current_leader()?;
+        let json = self
+            .kv
+            .read_from(leader, super::barrier::ANNOUNCEMENT_KEY)
+            .await?;
+        let ann: BarrierAnnouncement = serde_json::from_str(&json).ok()?;
+        (ann.phase == Phase::Recover).then_some(ann)
+    }
+
+    /// Overwrite this node's announcement slot with a non-`Recover` phase at the end of a
+    /// round, so [`Self::observe_recover`] stops returning a stale generation.
+    pub async fn clear_recover_announcement(&self, epoch: u64) {
+        let ann = BarrierAnnouncement {
+            epoch,
+            checkpoint_id: 0,
+            phase: Phase::Commit,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        if let Ok(json) = serde_json::to_string(&ann) {
+            self.kv.write(super::barrier::ANNOUNCEMENT_KEY, json).await;
+        }
     }
 
     /// Wait until [`Self::observe_barrier`] yields an announcement

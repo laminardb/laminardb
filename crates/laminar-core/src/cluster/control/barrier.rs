@@ -39,6 +39,10 @@ pub enum Phase {
     Commit,
     /// Prepare failed; roll back.
     Abort,
+    /// Leader-coordinated global restart: every node rewinds to `epoch` (the highest
+    /// cluster-wide committed epoch) and reprocesses. `flags` carries the recovery id.
+    /// KV-only delivery (no phase RPC) — recovery is mutually exclusive with checkpointing.
+    Recover,
 }
 
 /// Leader-written barrier announcement.
@@ -538,7 +542,8 @@ async fn send_phase_rpc(
                 .map(|_| ())
                 .map_err(|e| ("abort", e))
         }
-        Phase::Prepare => Ok(()),
+        // KV-only: Prepare RPCs come from wait_for_quorum; Recover rides the gossip announcement.
+        Phase::Prepare | Phase::Recover => Ok(()),
     };
     result.map_err(|(rpc, e)| {
         clients_pool.lock().remove(&peer);
@@ -740,9 +745,9 @@ impl BarrierCoordinator {
                 // early (the RPC receiver does not persist the announcement).
                 let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
                 self.kv.write(ANNOUNCEMENT_KEY, json).await;
-                if ann.phase == Phase::Prepare {
-                    // Prepare gRPC calls are initiated by wait_for_quorum.
-                    // Redundant calls here cause duplicate prepare executions and timeouts on followers.
+                if matches!(ann.phase, Phase::Prepare | Phase::Recover) {
+                    // Prepare RPCs come from wait_for_quorum; Recover is gossip-only (observed
+                    // by the per-node recovery monitor). Redundant RPCs here would double-fire.
                 } else {
                     // A node's barrier address lingers in the KV after it dies,
                     // so announce to peers still Active in membership — a Commit

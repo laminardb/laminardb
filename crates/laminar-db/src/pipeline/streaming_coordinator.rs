@@ -582,11 +582,9 @@ impl StreamingCoordinator {
                             CycleError::Halt(msg) => {
                                 tracing::warn!(reason = %msg, "[LDB-3022] cycle halted");
                             }
-                            // Exactly-once: continuing would drop the drained rows (EO gap).
-                            CycleError::Fatal(msg)
-                                if self.config.delivery_guarantee
-                                    == DeliveryGuarantee::ExactlyOnce =>
-                            {
+                            // Continuing would drop the drained rows (EO gap), so fault for
+                            // recovery under exactly-once or coordinated recovery.
+                            CycleError::Fatal(msg) if callback.fault_on_cycle_error() => {
                                 tracing::error!(
                                     error = %msg,
                                     "[LDB-3021] fatal SQL cycle error; faulting for recovery"
@@ -744,8 +742,10 @@ impl StreamingCoordinator {
             }
 
             // Run the final checkpoint before dropping source senders so the EpochCommitted
-            // ack reaches the broker (Kafka group offsets, etc.).
-            let checkpoint_enabled = self.config.checkpoint_interval.is_some();
+            // ack reaches the broker (Kafka group offsets, etc.). Skip it during a recovery
+            // stop — committing the open epoch would advance the committed epoch past N.
+            let checkpoint_enabled =
+                self.config.checkpoint_interval.is_some() && !callback.is_recovering();
             if checkpoint_enabled {
                 let source_offsets = self.current_source_offsets();
                 if let Some(epoch) = callback
@@ -781,6 +781,12 @@ impl StreamingCoordinator {
                 }
             }
         }
+
+        // Abort an exactly-once producer's open transaction before a restart re-inits one
+        // (else the new producer races the old → InvalidProducerEpoch). A clean shutdown
+        // already committed via the final checkpoint above; this aborts only an in-flight
+        // (faulted or recovery-rewound) epoch.
+        callback.close_sinks().await;
 
         fault.map_or(ExitReason::Shutdown, ExitReason::Fault)
     }
@@ -976,13 +982,19 @@ impl StreamingCoordinator {
         // a respawned node has adopted the assignment align-waits on its not-yet-flowing
         // shuffle barrier and times out. The verdict is a local borrow, so don't bump
         // `last_checkpoint` — the first post-convergence checkpoint fires immediately.
-        if interval_due && !callback.assignment_ready_for_checkpoint().await {
+        // Also hold during a coordinated restart (injecting would seal an epoch past N).
+        if interval_due
+            && (callback.is_recovering() || !callback.assignment_ready_for_checkpoint().await)
+        {
             return;
         }
 
-        // Explicit connector checkpoint requests are honored regardless of convergence.
+        // Explicit connector checkpoint requests are honored regardless of convergence, but
+        // not during a coordinated restart (sealing an epoch would advance past the recovery
+        // target). The fence short-circuits before the swap, so the request fires afterwards.
         let should_checkpoint = interval_due
             || (callback.is_leader()
+                && !callback.is_recovering()
                 && self
                     .checkpoint_request_flags
                     .iter()

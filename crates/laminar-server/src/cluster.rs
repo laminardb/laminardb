@@ -589,7 +589,8 @@ pub async fn start_cluster(
     builder = builder
         .shuffle_sender(Arc::clone(&shuffle_sender))
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
-        .target_partitions(1);
+        .target_partitions(1)
+        .coordinated_recovery(config.supervision.coordinated_recovery);
 
     let db = builder
         .build()
@@ -644,6 +645,10 @@ pub async fn start_cluster(
             }
             _ => None,
         };
+
+    // No-op unless [supervision] coordinated_recovery is on. Before start() so an early
+    // fault is observed.
+    db.enable_coordinated_recovery();
 
     db.start()
         .await
