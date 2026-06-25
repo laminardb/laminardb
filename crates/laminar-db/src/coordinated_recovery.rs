@@ -1,8 +1,7 @@
 //! Leader-coordinated global restart-to-epoch on a fatal fault (cluster mode).
 //!
 //! Every node rewinds to the highest cluster-wide committed epoch so a fault on one node
-//! can't leave the cross-node shuffle cut inconsistent. Off by default; soak-gated (see
-//! `docs/plans/1a-cluster-recovery-driver.md`).
+//! can't leave the cross-node shuffle cut inconsistent. Off by default.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
