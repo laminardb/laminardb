@@ -274,6 +274,9 @@ pub(crate) struct OperatorGraph {
     // Failure domain (connected component) per node; a fatal error is isolated to its domain.
     node_domain: Vec<usize>,
     domain_count: usize,
+    // When set, `compute_node_domains` cuts at source nodes so shared-source queries become
+    // distinct domains (1B Phase 2). Off: shared-source queries fuse into one domain (1B v1).
+    shared_source_isolation: bool,
     // Local source names whose domain faulted this cycle; drained by `take_cycle_failures`.
     cycle_failed_sources: FxHashSet<Arc<str>>,
     cycle_any_failed: bool,
@@ -338,6 +341,7 @@ impl OperatorGraph {
             topo_dirty: true,
             node_domain: Vec::new(),
             domain_count: 0,
+            shared_source_isolation: false,
             cycle_failed_sources: FxHashSet::default(),
             cycle_any_failed: false,
             source_map: FxHashMap::default(),
@@ -415,6 +419,10 @@ impl OperatorGraph {
 
     pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
         self.max_state_bytes = limit;
+    }
+
+    pub fn set_shared_source_isolation(&mut self, on: bool) {
+        self.shared_source_isolation = on;
     }
 
     pub fn set_max_input_buf_batches(&mut self, cap: usize) {
@@ -1603,6 +1611,12 @@ impl OperatorGraph {
             if self.nodes[edge.source].removed || self.nodes[edge.target].removed {
                 continue;
             }
+            // 1B Phase 2: cut at source nodes so two queries reading one source don't fuse
+            // into a single domain. Sources have no incoming edges, so skipping their
+            // outgoing edges leaves each source isolated (left unassigned below).
+            if self.shared_source_isolation && self.source_node_ids.contains(&edge.source) {
+                continue;
+            }
             let a = find(&mut parent, edge.source);
             let b = find(&mut parent, edge.target);
             if a != b {
@@ -1617,13 +1631,34 @@ impl OperatorGraph {
             if self.nodes[i].removed {
                 continue;
             }
+            // Under isolation, sources are shared infrastructure, not a failure domain: a
+            // consumer fault holds the source back, but the source itself never faults.
+            // Leaving them unassigned (MAX) keeps `domain_count` equal to the number of
+            // query domains, so the all-domains-failed check below stays exact.
+            if self.shared_source_isolation && self.source_node_ids.contains(&i) {
+                continue;
+            }
             let root = find(&mut parent, i);
             let next = root_to_domain.len();
             self.node_domain[i] = *root_to_domain.entry(root).or_insert(next);
         }
-        // Includes inert source-only domains, so `failed_domains.len() == domain_count` is a
-        // conservative "all domains failed" test.
+        // When isolation is off this includes inert source-only domains, so
+        // `failed_domains.len() == domain_count` is a conservative "all domains failed" test.
         self.domain_count = root_to_domain.len();
+    }
+
+    // A source is held back when its own domain faulted (isolation off / source unioned into a
+    // consumer's domain) or, under isolation, when any domain it feeds faulted — the source is
+    // cut out of every consumer's domain, so check its direct targets.
+    fn source_feeds_failed_domain(&self, source_node: usize, failed: &FxHashSet<usize>) -> bool {
+        if failed.contains(&self.node_domain[source_node]) {
+            return true;
+        }
+        self.shared_source_isolation
+            && self.nodes[source_node]
+                .output_routes
+                .iter()
+                .any(|&(target, _)| failed.contains(&self.node_domain[target]))
     }
 
     fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -1946,7 +1981,7 @@ impl OperatorGraph {
             let failed_names: Vec<Arc<str>> = self
                 .source_list
                 .iter()
-                .filter(|(_, node_id)| failed_domains.contains(&self.node_domain[*node_id]))
+                .filter(|(_, node_id)| self.source_feeds_failed_domain(*node_id, &failed_domains))
                 .map(|(name, _)| Arc::clone(name))
                 .collect();
             self.cycle_failed_sources.extend(failed_names);
@@ -3150,6 +3185,97 @@ mod tests {
         graph.compute_topo_order();
 
         assert_eq!(graph.domain_count, 1, "queries sharing a source recover together");
+    }
+
+    #[test]
+    fn test_node_domains_shared_source_isolated() {
+        let mut graph = test_graph();
+        graph.set_shared_source_isolation(true);
+        graph.register_source_schema("trades".to_string(), test_schema());
+        graph.add_query(
+            "qa".to_string(),
+            "SELECT symbol FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "qb".to_string(),
+            "SELECT price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.compute_topo_order();
+
+        assert_eq!(
+            graph.domain_count, 2,
+            "isolation splits shared-source queries into separate domains"
+        );
+        let qa = graph.find_node("qa").unwrap();
+        let qb = graph.find_node("qb").unwrap();
+        assert_ne!(graph.node_domain[qa], graph.node_domain[qb]);
+        let src = graph.source_map.get("trades").copied().unwrap();
+        assert_eq!(
+            graph.node_domain[src],
+            usize::MAX,
+            "an isolated source is not a failure domain of its own"
+        );
+    }
+
+    // The Slice 1 win: a fault in one query sharing a source must not sink the sibling that
+    // reads the same source. The healthy query still emits, and the shared source is held back
+    // because it feeds the faulted domain.
+    #[tokio::test]
+    async fn test_execute_cycle_isolates_shared_source_sibling() {
+        let mut graph = test_graph();
+        graph.set_shared_source_isolation(true);
+        graph.set_max_state_bytes(Some(1));
+        graph.register_source_schema("trades".to_string(), test_schema());
+        graph.add_query(
+            "agg".to_string(),
+            "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "healthy".to_string(),
+            "SELECT symbol, price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![test_batch()]);
+
+        let results = graph
+            .execute_cycle(&source, i64::MAX, None)
+            .await
+            .expect("the healthy sibling keeps the cycle Ok though they share a source");
+
+        assert_eq!(
+            total_rows(&results, "healthy"),
+            2,
+            "healthy sibling emitted despite sharing the faulted source"
+        );
+        assert_eq!(total_rows(&results, "agg"), 0, "faulted domain emitted nothing");
+
+        let (any_failed, failed_sources) = graph.take_cycle_failures();
+        assert!(any_failed);
+        assert!(
+            failed_sources.contains(&Arc::from("trades")),
+            "the shared source is held back: it feeds the faulted domain"
+        );
     }
 
     // A fatal error in one disjoint query (the aggregate trips the state-size limit) must not

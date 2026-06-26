@@ -118,6 +118,9 @@ pub struct LaminarConfig {
     /// Cluster mode: on a fatal fault, the leader rewinds every node to the highest
     /// cluster-wide committed epoch instead of a local-only restart. Default off.
     pub coordinated_recovery: bool,
+    /// Isolate queries that share a source into independent failure domains (1B Phase 2).
+    /// Default off; when off, shared-source queries fault and recover together.
+    pub shared_source_isolation: bool,
 }
 
 impl Default for LaminarConfig {
@@ -143,6 +146,7 @@ impl Default for LaminarConfig {
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),
             coordinated_recovery: false,
+            shared_source_isolation: false,
         }
     }
 }

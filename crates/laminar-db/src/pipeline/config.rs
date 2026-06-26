@@ -56,6 +56,16 @@ pub struct PipelineConfig {
 
     /// What to do when either cap is exceeded.
     pub backpressure_policy: BackpressurePolicy,
+
+    /// Isolate queries that share a source into independent failure domains (1B Phase 2).
+    /// Off: shared-source queries fault and recover together (1B v1). On: a fault in one
+    /// shared-source query holds back only its offset; siblings commit and advance.
+    pub shared_source_isolation: bool,
+
+    /// Per-source cap on the in-memory replay buffer used by `shared_source_isolation`.
+    /// On overflow the engine falls back to whole-pipeline recovery. Ignored when the
+    /// flag is off.
+    pub max_replay_buffer_bytes: usize,
 }
 
 impl Default for PipelineConfig {
@@ -75,6 +85,8 @@ impl Default for PipelineConfig {
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: BackpressurePolicy::default(),
+            shared_source_isolation: false,
+            max_replay_buffer_bytes: 256 * 1024 * 1024, // 256 MiB per source
         }
     }
 }
