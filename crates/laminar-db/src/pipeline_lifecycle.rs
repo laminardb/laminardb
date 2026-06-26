@@ -1751,7 +1751,10 @@ impl LaminarDB {
         graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
         graph.set_max_input_buf_bytes(pipeline_config.max_input_buf_bytes);
         graph.set_backpressure_policy(pipeline_config.backpressure_policy);
-        graph.set_shared_source_isolation(pipeline_config.shared_source_isolation);
+        graph.set_shared_source_isolation(
+            pipeline_config.shared_source_isolation,
+            pipeline_config.max_replay_buffer_bytes,
+        );
 
         let sinks_pending_filter_count = sinks
             .iter()

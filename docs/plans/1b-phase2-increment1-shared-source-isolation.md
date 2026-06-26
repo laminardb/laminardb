@@ -191,19 +191,34 @@ work to Slice 2).
 - Remaining for Slice 1: DB-level integration test (two MVs sharing a source, one faults) + soak
   (plain liveness + kill-9 file-checkpoint, `LAMINAR_SOAK_KILLS=4`, no Kafka).
 
-**Slice 2 — online replay + per-domain feeding (the core, addresses the live-provider wall).**
-- Raise buffer retention to "until every domain has replayed past it"; on a domain fault, **re-feed
-  that domain its held slice next cycle** without re-running healthy domains (per-domain, never a
-  whole-`execute_cycle` re-run — that re-wrote healthy sinks and dup'd in prior work; see
-  Guardrails).
-- Resolve the **live-provider wall**: isolated SQL-scan operators (CachedPlan/CachedPhysical, joins)
-  must read a per-`(name,domain)` view, not the shared global-by-name provider. Decide between
-  per-`(name,domain)` live providers vs `input_bufs`-only execution for isolated operators; record
-  the decision here.
-- Eviction + cap (`max_replay_buffer_bytes`) + overflow → fall back to global recovery.
-- Consumer: a faulted shared-source query replays and catches up with the healthy sibling
-  undisturbed — no gap/dup on either sink online.
-- Soak: as Slice 1, plus the validation scenario below.
+**Slice 2a — online replay via preserved `input_bufs` (DONE, 2026-06-26).**
+Key realization: the per-domain replay buffer the plan envisioned **already exists** as each
+operator's `input_bufs`, and the source fan-out (`push_to_port`) already *appends* new arrivals to
+it. So replay needs no separate buffer or cursors — just **don't clear** a faulted operator's input.
+- `execute_single_operator` error path (`operator_graph.rs`): under isolation, preserve the faulted
+  operator's `input_bufs` (instead of clearing) and still return `Err` so the domain is isolated and
+  its source held back. Next cycle, `failed_domains` is reset, the source fan-out appends new rows to
+  the preserved input, and the operator re-runs with **cycle-N rows + cycle-N+1 rows** — replay,
+  with no whole-`execute_cycle` re-run, so healthy sinks are never re-written (the prior dup trap).
+- Composes through multi-node domains: an upstream op that succeeded re-emits next cycle; a faulted
+  downstream op keeps its preserved input until it succeeds.
+- Bounded by `max_replay_buffer_bytes` (per operator, threaded via `set_shared_source_isolation`):
+  past the cap, abandon replay and drop the input (Slice-1 behaviour / EO recovery). Persistent
+  faults (e.g. state-limit) don't replay — the input is already consumed before the limit trips —
+  so they stay isolated/dropped without unbounded growth.
+- Under exactly-once / coordinated recovery the coordinator still rewinds the whole pipeline on any
+  domain fault (unchanged); preserved input is discarded on restart. Replay is the ALO /
+  per-sink-EO online win.
+- Test: `test_shared_source_isolation_replays_faulted_domain` (transient fault → cycle 2 emits 4
+  rows = preserved 2 + new 2; healthy sibling emits only its 2 new rows).
+
+**Slice 2b — the live-provider wall (OPEN, needed only for SQL-scan operators).**
+Operators that execute a DataFusion plan scanning the **global-by-name** live provider
+(CachedPlan/CachedPhysical, joins, asof, temporal) re-read the provider (new data) on replay rather
+than their preserved `input_bufs`, so under isolation they **degrade to Slice-1 drop** (no online
+replay, but no dup/gap beyond Slice 1). Full replay for them needs per-`(name,domain)` views — open
+design: per-`(name,domain)` live providers (needs SQL table rewriting or per-domain `SessionContext`)
+vs forcing isolated SQL-scan operators onto `input_bufs`-only execution. Decide before implementing.
 
 **Slice 3 — hardening + observability.**
 - Metrics: `replay_buffer_bytes{source}`, `replay_buffer_pinned_domain`, replay/eviction counters,

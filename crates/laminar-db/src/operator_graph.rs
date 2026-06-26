@@ -277,6 +277,9 @@ pub(crate) struct OperatorGraph {
     // When set, `compute_node_domains` cuts at source nodes so shared-source queries become
     // distinct domains (1B Phase 2). Off: shared-source queries fuse into one domain (1B v1).
     shared_source_isolation: bool,
+    // Per-operator cap on the preserved input a faulted domain replays from. Past it, replay
+    // is abandoned and the input dropped (Slice-1 behaviour / EO recovery).
+    max_replay_buffer_bytes: usize,
     // Local source names whose domain faulted this cycle; drained by `take_cycle_failures`.
     cycle_failed_sources: FxHashSet<Arc<str>>,
     cycle_any_failed: bool,
@@ -342,6 +345,7 @@ impl OperatorGraph {
             node_domain: Vec::new(),
             domain_count: 0,
             shared_source_isolation: false,
+            max_replay_buffer_bytes: usize::MAX,
             cycle_failed_sources: FxHashSet::default(),
             cycle_any_failed: false,
             source_map: FxHashMap::default(),
@@ -421,8 +425,9 @@ impl OperatorGraph {
         self.max_state_bytes = limit;
     }
 
-    pub fn set_shared_source_isolation(&mut self, on: bool) {
+    pub fn set_shared_source_isolation(&mut self, on: bool, max_replay_buffer_bytes: usize) {
         self.shared_source_isolation = on;
+        self.max_replay_buffer_bytes = max_replay_buffer_bytes;
     }
 
     pub fn set_max_input_buf_batches(&mut self, cap: usize) {
@@ -1752,6 +1757,20 @@ impl OperatorGraph {
                     return Ok(());
                 }
                 if !accept {
+                    return Err(e);
+                }
+                // 1B Phase 2 replay: under shared-source isolation, keep the faulted operator's
+                // input so the next cycle re-runs it with the same rows plus new arrivals — its
+                // input buffer is this domain's in-memory replay slice (operators on the
+                // `input_bufs` path; a DataFusion table-scan operator re-reads the live provider
+                // instead, so it degrades to Slice-1 drop). Still returns Err so the domain is
+                // isolated and its source held back. Bounded by `max_replay_buffer_bytes`: past
+                // the cap, abandon replay and drop the input (Slice-1 behaviour / EO recovery).
+                if self.shared_source_isolation
+                    && input_bytes.iter().sum::<usize>() <= self.max_replay_buffer_bytes
+                {
+                    self.input_bufs[node_id] = inputs;
+                    self.input_buf_bytes[node_id] = input_bytes;
                     return Err(e);
                 }
                 for v in &mut inputs {
@@ -3190,7 +3209,7 @@ mod tests {
     #[test]
     fn test_node_domains_shared_source_isolated() {
         let mut graph = test_graph();
-        graph.set_shared_source_isolation(true);
+        graph.set_shared_source_isolation(true, usize::MAX);
         graph.register_source_schema("trades".to_string(), test_schema());
         graph.add_query(
             "qa".to_string(),
@@ -3233,7 +3252,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_cycle_isolates_shared_source_sibling() {
         let mut graph = test_graph();
-        graph.set_shared_source_isolation(true);
+        graph.set_shared_source_isolation(true, usize::MAX);
         graph.set_max_state_bytes(Some(1));
         graph.register_source_schema("trades".to_string(), test_schema());
         graph.add_query(
@@ -3276,6 +3295,91 @@ mod tests {
             failed_sources.contains(&Arc::from("trades")),
             "the shared source is held back: it feeds the faulted domain"
         );
+    }
+
+    // Slice 2: a transient fault in one shared-source query replays from the preserved input on
+    // the next cycle (cycle-1 rows + cycle-2 rows), while the healthy sibling only sees new rows.
+    #[tokio::test]
+    async fn test_shared_source_isolation_replays_faulted_domain() {
+        struct ReplayTestOp {
+            fail_once: bool,
+            has_failed: bool,
+        }
+        #[async_trait]
+        impl GraphOperator for ReplayTestOp {
+            async fn process(
+                &mut self,
+                inputs: &[Vec<RecordBatch>],
+                _watermarks: &[i64],
+            ) -> Result<Vec<RecordBatch>, DbError> {
+                if self.fail_once && !self.has_failed {
+                    self.has_failed = true;
+                    return Err(DbError::Pipeline("transient fault".into()));
+                }
+                Ok(inputs.first().cloned().unwrap_or_default())
+            }
+            fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+                Ok(None)
+            }
+            fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+                Ok(())
+            }
+        }
+
+        let mut graph = test_graph();
+        graph.set_shared_source_isolation(true, usize::MAX);
+        let src = graph.ensure_source_node("trades");
+        let a = graph.place_operator_node(
+            "a",
+            Box::new(ReplayTestOp {
+                fail_once: true,
+                has_failed: false,
+            }),
+            1,
+        );
+        graph.add_edge(src, a, 0);
+        graph.output_map.insert(Arc::from("a"), a);
+        let b = graph.place_operator_node(
+            "b",
+            Box::new(ReplayTestOp {
+                fail_once: false,
+                has_failed: false,
+            }),
+            1,
+        );
+        graph.add_edge(src, b, 0);
+        graph.output_map.insert(Arc::from("b"), b);
+        graph.topo_dirty = true;
+
+        let mut cycle1 = FxHashMap::default();
+        cycle1.insert(Arc::from("trades"), vec![test_batch()]);
+        let r1 = graph
+            .execute_cycle(&cycle1, i64::MAX, None)
+            .await
+            .expect("healthy sibling keeps cycle 1 Ok");
+        assert_eq!(total_rows(&r1, "b"), 2, "healthy sibling emitted cycle 1");
+        assert_eq!(total_rows(&r1, "a"), 0, "faulted op emitted nothing cycle 1");
+        let (_, failed) = graph.take_cycle_failures();
+        assert!(failed.contains(&Arc::from("trades")));
+
+        let mut cycle2 = FxHashMap::default();
+        cycle2.insert(Arc::from("trades"), vec![test_batch()]);
+        let r2 = graph
+            .execute_cycle(&cycle2, i64::MAX, None)
+            .await
+            .expect("cycle 2 Ok");
+        assert_eq!(
+            total_rows(&r2, "a"),
+            4,
+            "faulted op replays preserved cycle-1 rows plus new cycle-2 rows"
+        );
+        assert_eq!(
+            total_rows(&r2, "b"),
+            2,
+            "healthy sibling sees only new rows (no replay)"
+        );
+        let (any_failed2, _) = graph.take_cycle_failures();
+        assert!(!any_failed2, "no fault on the replay cycle");
     }
 
     // A fatal error in one disjoint query (the aggregate trips the state-size limit) must not
