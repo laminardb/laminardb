@@ -569,11 +569,28 @@ impl StreamingCoordinator {
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                    Ok(results) => {
-                        self.commit_pending_offsets();
-                        callback.update_mv_stores(&results);
-                        callback.push_to_streams(&results);
-                        callback.write_to_sinks(&results).await;
+                    Ok(out) => {
+                        // Exactly-once / coordinated recovery rewinds the whole pipeline, so
+                        // don't partial-commit siblings — recover instead.
+                        if out.any_failed && callback.fault_on_cycle_error() {
+                            self.discard_pending_offsets();
+                            tracing::error!(
+                                "[LDB-3021] failure domain faulted; faulting for recovery"
+                            );
+                            fault = Some("isolated domain fault (exactly-once)".to_string());
+                            break;
+                        }
+                        // At-least-once: healthy domains commit; the faulted domain is held back.
+                        self.commit_pending_offsets_except(&out.failed_sources);
+                        callback.update_mv_stores(&out.results);
+                        callback.push_to_streams(&out.results);
+                        callback.write_to_sinks(&out.results).await;
+                        if out.any_failed {
+                            callback.note_cycle_error();
+                            tracing::warn!(
+                                "[LDB-3020] failure domain dropped (at-least-once: continuing)"
+                            );
+                        }
                     }
                     Err(e) => {
                         self.discard_pending_offsets();
@@ -699,12 +716,14 @@ impl StreamingCoordinator {
             callback.tick_idle_watermark();
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
+                // Drain runs only on a graceful stop (`fault.is_none()` above), so a per-domain
+                // commit here needs no EO fault branch.
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                    Ok(results) => {
-                        self.commit_pending_offsets();
-                        callback.update_mv_stores(&results);
-                        callback.push_to_streams(&results);
-                        callback.write_to_sinks(&results).await;
+                    Ok(out) => {
+                        self.commit_pending_offsets_except(&out.failed_sources);
+                        callback.update_mv_stores(&out.results);
+                        callback.push_to_streams(&out.results);
+                        callback.write_to_sinks(&out.results).await;
                     }
                     Err(e) => {
                         self.discard_pending_offsets();
@@ -728,11 +747,11 @@ impl StreamingCoordinator {
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                    Ok(results) => {
-                        self.commit_pending_offsets();
-                        callback.update_mv_stores(&results);
-                        callback.push_to_streams(&results);
-                        callback.write_to_sinks(&results).await;
+                    Ok(out) => {
+                        self.commit_pending_offsets_except(&out.failed_sources);
+                        callback.update_mv_stores(&out.results);
+                        callback.push_to_streams(&out.results);
+                        callback.write_to_sinks(&out.results).await;
                     }
                     Err(e) => {
                         self.discard_pending_offsets();
@@ -874,6 +893,26 @@ impl StreamingCoordinator {
     fn commit_pending_offsets(&mut self) {
         for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
             if let Some(cp) = pending.take() {
+                self.committed_offsets[i] = Some(cp);
+            }
+        }
+    }
+
+    /// Commit staged offsets for sources whose failure domain succeeded, discarding those
+    /// named in `failed` so the faulted domain replays them on its next cycle (or recovery).
+    fn commit_pending_offsets_except(&mut self, failed: &FxHashSet<Arc<str>>) {
+        if failed.is_empty() {
+            self.commit_pending_offsets();
+            return;
+        }
+        for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
+            let in_failed_domain = self
+                .source_names
+                .get(i)
+                .is_some_and(|name| failed.contains(name));
+            if in_failed_domain {
+                *pending = None;
+            } else if let Some(cp) = pending.take() {
                 self.committed_offsets[i] = Some(cp);
             }
         }
@@ -1032,6 +1071,7 @@ impl StreamingCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use super::super::callback::CycleOutcome;
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1070,7 +1110,7 @@ mod tests {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             _watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
+        ) -> Result<CycleOutcome, CycleError> {
             self.cycle_count += 1;
             if self.fatal_at_cycle == Some(self.cycle_count) {
                 return Err(CycleError::Fatal(format!(
@@ -1084,7 +1124,7 @@ mod tests {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             self.results.push(results.clone());
-            Ok(results)
+            Ok(CycleOutcome::clean(results))
         }
 
         fn note_cycle_error(&self) {
@@ -1694,6 +1734,72 @@ mod tests {
         assert_eq!(barriers.len(), 2, "should have barriers from both sources");
     }
 
+    // A faulted domain's source offset is held back while a healthy sibling source commits.
+    #[tokio::test]
+    async fn test_commit_pending_offsets_except_holds_failed_source() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+        let mut coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: None,
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: Duration::from_secs(30),
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                max_input_buf_batches: 256,
+                max_input_buf_bytes: None,
+                backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
+            },
+            rx: mpsc::bounded_async::<SourceMsg>(64).1,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("s0"), Arc::from("s1")],
+            shutdown,
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None, None],
+            pending_offsets: vec![
+                Some(SourceCheckpoint::new(10)),
+                Some(SourceCheckpoint::new(20)),
+            ],
+            control_rx,
+            checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
+            max_in_flight_epochs: 1,
+            staged_bytes: Arc::new(AtomicU64::new(0)),
+            max_staged_bytes: u64::MAX,
+        };
+
+        let mut failed: FxHashSet<Arc<str>> = FxHashSet::default();
+        failed.insert(Arc::from("s0"));
+        coordinator.commit_pending_offsets_except(&failed);
+
+        assert!(
+            coordinator.committed_offsets[0].is_none(),
+            "faulted s0 must not commit"
+        );
+        assert!(
+            coordinator.pending_offsets[0].is_none(),
+            "faulted s0 staged offset is discarded for replay"
+        );
+        assert_eq!(
+            coordinator.committed_offsets[1].as_ref().unwrap().epoch(),
+            20,
+            "healthy s1 commits and advances"
+        );
+    }
+
     #[allow(clippy::disallowed_types)] // test-only: std::sync::Mutex is fine here
     struct BackpressuredCallback {
         inner: MockCallback,
@@ -1720,7 +1826,7 @@ mod tests {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
+        ) -> Result<CycleOutcome, CycleError> {
             self.cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let total: u64 = source_batches
@@ -1890,7 +1996,7 @@ mod tests {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
+        ) -> Result<CycleOutcome, CycleError> {
             let total: u64 = source_batches
                 .values()
                 .flat_map(|bs| bs.iter())

@@ -1200,7 +1200,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, crate::pipeline::CycleError> {
+    ) -> Result<crate::pipeline::CycleOutcome, crate::pipeline::CycleError> {
         // Test-only one-shot fault injector for the recovery soak (inert in release / when
         // unset): the first cycle after `LAMINAR_FAULT_INJECT_AFTER_MS` faults once.
         #[cfg(debug_assertions)]
@@ -1254,10 +1254,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         } else {
             Some(&self.source_wms_buf)
         };
-        self.graph
+        let results = self
+            .graph
             .execute_cycle(source_batches, watermark, swm_ref)
             .await
-            .map_err(|e| Self::map_graph_error(&e, &self.shutdown_signal))
+            .map_err(|e| Self::map_graph_error(&e, &self.shutdown_signal))?;
+        let (any_failed, failed_sources) = self.graph.take_cycle_failures();
+        Ok(crate::pipeline::CycleOutcome {
+            results,
+            any_failed,
+            failed_sources,
+        })
     }
 
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {

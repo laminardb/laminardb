@@ -10,7 +10,7 @@ use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Why a barrier checkpoint was deliberately skipped, as opposed to
 /// attempted-and-failed.
@@ -58,6 +58,30 @@ pub enum CycleError {
     Halt(String),
 }
 
+/// Result of a pipeline cycle. Per-domain failure isolation lets healthy failure domains
+/// commit and advance while a faulted domain's sources are held back for replay.
+pub struct CycleOutcome {
+    /// Output of the domains that succeeded this cycle.
+    pub results: FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    /// At least one failure domain faulted (it may have no *local* source, e.g. a cluster
+    /// follower reading a remote shuffle), so this can be set with `failed_sources` empty.
+    pub any_failed: bool,
+    /// Names of sources whose domain faulted; the coordinator must not commit their offsets.
+    pub failed_sources: FxHashSet<Arc<str>>,
+}
+
+impl CycleOutcome {
+    /// A fully-successful cycle: every domain committed.
+    #[must_use]
+    pub fn clean(results: FxHashMap<Arc<str>, Vec<RecordBatch>>) -> Self {
+        Self {
+            results,
+            any_failed: false,
+            failed_sources: FxHashSet::default(),
+        }
+    }
+}
+
 /// A registered source with its name and config.
 pub struct SourceRegistration {
     /// Source name.
@@ -76,12 +100,14 @@ pub struct SourceRegistration {
 /// Trait exists for test seam; production impl is `ConnectorPipelineCallback`.
 #[trait_variant::make(Send)]
 pub trait PipelineCallback: Send + 'static {
-    /// Execute a SQL cycle over the accumulated source batches.
+    /// Execute a SQL cycle over the accumulated source batches. `Err` is a whole-cycle
+    /// failure (all domains, or a backpressure halt); per-domain faults surface in
+    /// [`CycleOutcome`] so healthy domains still commit.
     async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError>;
+    ) -> Result<CycleOutcome, CycleError>;
 
     /// Push cycle results to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);

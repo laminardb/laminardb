@@ -271,6 +271,12 @@ pub(crate) struct OperatorGraph {
     edges: Vec<GraphEdge>,
     topo_order: Vec<usize>,
     topo_dirty: bool,
+    // Failure domain (connected component) per node; a fatal error is isolated to its domain.
+    node_domain: Vec<usize>,
+    domain_count: usize,
+    // Local source names whose domain faulted this cycle; drained by `take_cycle_failures`.
+    cycle_failed_sources: FxHashSet<Arc<str>>,
+    cycle_any_failed: bool,
     source_map: FxHashMap<Arc<str>, usize>,
     source_list: Vec<(Arc<str>, usize)>,
     source_node_ids: FxHashSet<usize>,
@@ -330,6 +336,10 @@ impl OperatorGraph {
             edges: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
+            node_domain: Vec::new(),
+            domain_count: 0,
+            cycle_failed_sources: FxHashSet::default(),
+            cycle_any_failed: false,
             source_map: FxHashMap::default(),
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
@@ -1561,6 +1571,8 @@ impl OperatorGraph {
             }
         }
 
+        self.compute_node_domains();
+
         self.source_list.clear();
         self.source_list
             .extend(self.source_map.iter().map(|(k, v)| (Arc::clone(k), *v)));
@@ -1570,6 +1582,48 @@ impl OperatorGraph {
             .extend(self.output_map.values().copied());
 
         self.topo_dirty = false;
+    }
+
+    /// Partition into failure domains (connected components) via union-find over undirected
+    /// edges. Queries sharing a source node join one domain so they recover together —
+    /// re-seeking a shared source for one would re-feed the other.
+    fn compute_node_domains(&mut self) {
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        let n = self.nodes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        for edge in &self.edges {
+            if self.nodes[edge.source].removed || self.nodes[edge.target].removed {
+                continue;
+            }
+            let a = find(&mut parent, edge.source);
+            let b = find(&mut parent, edge.target);
+            if a != b {
+                parent[a] = b;
+            }
+        }
+
+        self.node_domain.clear();
+        self.node_domain.resize(n, usize::MAX);
+        let mut root_to_domain: FxHashMap<usize, usize> = FxHashMap::default();
+        for i in 0..n {
+            if self.nodes[i].removed {
+                continue;
+            }
+            let root = find(&mut parent, i);
+            let next = root_to_domain.len();
+            self.node_domain[i] = *root_to_domain.entry(root).or_insert(next);
+        }
+        // Includes inert source-only domains, so `failed_domains.len() == domain_count` is a
+        // conservative "all domains failed" test.
+        self.domain_count = root_to_domain.len();
     }
 
     fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -1804,10 +1858,20 @@ impl OperatorGraph {
         let cycle_start = std::time::Instant::now();
         let topo_len = self.topo_order.len();
 
+        self.cycle_failed_sources.clear();
+        self.cycle_any_failed = false;
+        let mut failed_domains: FxHashSet<usize> = FxHashSet::default();
+        let mut first_error: Option<DbError> = None;
+
         for i in 0..topo_len {
             let node_id = self.topo_order[i];
 
             if self.nodes[node_id].removed {
+                continue;
+            }
+
+            // Skip a faulted domain; downstream nodes share it, so this cascades.
+            if failed_domains.contains(&self.node_domain[node_id]) {
                 continue;
             }
 
@@ -1834,7 +1898,14 @@ impl OperatorGraph {
                     );
 
                     if let Err(e) = self
-                        .run_one_deferred_operator(i, topo_len, current_watermark, &mut results)
+                        .run_one_deferred_operator(
+                            i,
+                            topo_len,
+                            current_watermark,
+                            &mut results,
+                            &mut failed_domains,
+                            &mut first_error,
+                        )
                         .await
                     {
                         self.finish_cycle();
@@ -1849,8 +1920,17 @@ impl OperatorGraph {
                 .execute_single_operator(node_id, current_watermark, &mut results)
                 .await
             {
-                self.finish_cycle();
-                return Err(e);
+                let domain = self.node_domain[node_id];
+                tracing::warn!(
+                    query = %self.nodes[node_id].name,
+                    error = %e,
+                    domain,
+                    "[LDB-3023] operator faulted; isolating its failure domain"
+                );
+                failed_domains.insert(domain);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
 
@@ -1861,7 +1941,28 @@ impl OperatorGraph {
 
         self.sample_buffer_stats();
 
+        if !failed_domains.is_empty() {
+            self.cycle_any_failed = true;
+            let failed_names: Vec<Arc<str>> = self
+                .source_list
+                .iter()
+                .filter(|(_, node_id)| failed_domains.contains(&self.node_domain[*node_id]))
+                .map(|(name, _)| Arc::clone(name))
+                .collect();
+            self.cycle_failed_sources.extend(failed_names);
+            // All domains failed → whole-cycle `Err` (keeps the single-query contract).
+            if failed_domains.len() == self.domain_count {
+                return Err(first_error.expect("failed_domains non-empty implies an error"));
+            }
+        }
+
         Ok(results)
+    }
+
+    /// `(any domain faulted, local source names whose domain faulted)` from the last
+    /// `execute_cycle`, draining the set. The coordinator holds back these sources' offsets.
+    pub fn take_cycle_failures(&mut self) -> (bool, FxHashSet<Arc<str>>) {
+        (self.cycle_any_failed, std::mem::take(&mut self.cycle_failed_sources))
     }
 
     fn prime_sources(
@@ -1889,12 +1990,16 @@ impl OperatorGraph {
     }
 
     /// Round-robin one deferred operator so a budget overrun can't starve the tail.
+    /// Skips and records failed domains exactly like the main loop; only a backpressure
+    /// `Fail` returns `Err` (whole-cycle halt).
     async fn run_one_deferred_operator(
         &mut self,
         i: usize,
         topo_len: usize,
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        failed_domains: &mut FxHashSet<usize>,
+        first_error: &mut Option<DbError>,
     ) -> Result<(), DbError> {
         let deferred_count = topo_len - i;
         let start = self.deferred_scan_offset % deferred_count;
@@ -1902,6 +2007,9 @@ impl OperatorGraph {
             let j = i + (start + offset) % deferred_count;
             let deferred_id = self.topo_order[j];
             if self.nodes[deferred_id].removed {
+                continue;
+            }
+            if failed_domains.contains(&self.node_domain[deferred_id]) {
                 continue;
             }
             let has_input = self.input_bufs[deferred_id]
@@ -1920,8 +2028,22 @@ impl OperatorGraph {
                 }
                 GateDecision::Run => {}
             }
-            self.execute_single_operator(deferred_id, current_watermark, results)
-                .await?;
+            if let Err(e) = self
+                .execute_single_operator(deferred_id, current_watermark, results)
+                .await
+            {
+                let domain = self.node_domain[deferred_id];
+                tracing::warn!(
+                    query = %self.nodes[deferred_id].name,
+                    error = %e,
+                    domain,
+                    "[LDB-3023] deferred operator faulted; isolating its failure domain"
+                );
+                failed_domains.insert(domain);
+                if first_error.is_none() {
+                    *first_error = Some(e);
+                }
+            }
             self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
             break;
         }
@@ -2970,6 +3092,110 @@ mod tests {
         // Debug builds are slow — use a generous budget for tests.
         graph.set_query_budget_ns(5_000_000_000); // 5 seconds
         graph
+    }
+
+    #[test]
+    fn test_node_domains_disjoint_queries_separate() {
+        let mut graph = test_graph();
+        graph.register_source_schema("trades_a".to_string(), test_schema());
+        graph.register_source_schema("trades_b".to_string(), test_schema());
+        graph.add_query(
+            "qa".to_string(),
+            "SELECT symbol FROM trades_a".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "qb".to_string(),
+            "SELECT symbol FROM trades_b".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.compute_topo_order();
+
+        assert_eq!(graph.domain_count, 2, "disjoint-source queries are separate domains");
+        let a = graph.source_map.get("trades_a").copied().unwrap();
+        let b = graph.source_map.get("trades_b").copied().unwrap();
+        assert_ne!(graph.node_domain[a], graph.node_domain[b]);
+    }
+
+    #[test]
+    fn test_node_domains_shared_source_joined() {
+        let mut graph = test_graph();
+        graph.register_source_schema("trades".to_string(), test_schema());
+        graph.add_query(
+            "qa".to_string(),
+            "SELECT symbol FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "qb".to_string(),
+            "SELECT price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.compute_topo_order();
+
+        assert_eq!(graph.domain_count, 1, "queries sharing a source recover together");
+    }
+
+    // A fatal error in one disjoint query (the aggregate trips the state-size limit) must not
+    // sink the sibling query: the healthy domain still produces output, and only the faulted
+    // domain's source is held back from committing.
+    #[tokio::test]
+    async fn test_execute_cycle_isolates_failed_domain() {
+        let mut graph = test_graph();
+        graph.set_max_state_bytes(Some(1));
+        graph.register_source_schema("trades_a".to_string(), test_schema());
+        graph.register_source_schema("trades_b".to_string(), test_schema());
+        graph.add_query(
+            "agg".to_string(),
+            "SELECT symbol, SUM(price) AS total FROM trades_a GROUP BY symbol".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "filtered".to_string(),
+            "SELECT symbol, price FROM trades_b WHERE price > 100".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades_a"), vec![test_batch()]);
+        source.insert(Arc::from("trades_b"), vec![test_batch()]);
+
+        let results = graph
+            .execute_cycle(&source, i64::MAX, None)
+            .await
+            .expect("a healthy sibling domain keeps the cycle Ok");
+
+        assert_eq!(total_rows(&results, "filtered"), 2, "healthy domain emitted");
+        assert_eq!(total_rows(&results, "agg"), 0, "faulted domain emitted nothing");
+
+        let (any_failed, failed_sources) = graph.take_cycle_failures();
+        assert!(any_failed);
+        assert!(failed_sources.contains(&Arc::from("trades_a")));
+        assert!(!failed_sources.contains(&Arc::from("trades_b")));
     }
 
     #[tokio::test]

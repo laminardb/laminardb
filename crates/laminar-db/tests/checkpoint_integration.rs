@@ -109,7 +109,8 @@ mod exactly_once {
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
     use laminar_db::pipeline::{
-        CycleError, PipelineCallback, PipelineConfig, SourceRegistration, StreamingCoordinator,
+        CycleError, CycleOutcome, PipelineCallback, PipelineConfig, SourceRegistration,
+        StreamingCoordinator,
     };
     use laminar_db::recovery_manager::RecoveryManager;
 
@@ -146,7 +147,7 @@ mod exactly_once {
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             _watermark: i64,
-        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError> {
+        ) -> Result<CycleOutcome, CycleError> {
             self.cycle_count += 1;
             let records: u64 = source_batches
                 .values()
@@ -155,7 +156,7 @@ mod exactly_once {
                 .sum();
             self.total_records_processed
                 .fetch_add(records, Ordering::Relaxed);
-            Ok(FxHashMap::default())
+            Ok(CycleOutcome::clean(FxHashMap::default()))
         }
 
         fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
