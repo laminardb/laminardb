@@ -22,6 +22,9 @@ pub struct ClusterController {
     barrier: BarrierCoordinator,
     snapshot: Option<Arc<AssignmentSnapshotStore>>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
+    /// Leader's checkpoint-convergence verdict, published off the hot path by the
+    /// snapshot watcher; the gate borrows it instead of a per-checkpoint gossip scan.
+    converged_for_checkpoint: watch::Sender<bool>,
     /// Latest cluster-wide minimum watermark published by the leader
     /// in a `Commit` announcement. `i64::MIN` means uninitialised
     /// (no Commit observed yet). Operators consult this instead of
@@ -32,6 +35,9 @@ pub struct ClusterController {
     /// excludes itself from [`Self::assignable_instances`] so the next
     /// rotation sheds its vnodes elsewhere before it exits.
     draining: Arc<AtomicBool>,
+    /// Held while a coordinated restart is in flight; the checkpoint gate consults it so
+    /// no checkpoint is injected mid-recovery.
+    recovering: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
     /// Peers that recently failed a capture quorum (no ack within the
@@ -84,8 +90,10 @@ impl ClusterController {
             kv,
             snapshot,
             members_rx,
+            converged_for_checkpoint: watch::channel(true).0,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
+            recovering: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             self_locality: parking_lot::RwLock::new(Locality::default()),
@@ -265,6 +273,58 @@ impl ClusterController {
         self.draining.load(Ordering::SeqCst)
     }
 
+    /// Set or clear the coordinated-recovery fence.
+    pub fn set_recovering(&self, recovering: bool) {
+        self.recovering.store(recovering, Ordering::SeqCst);
+    }
+
+    /// Whether a coordinated restart is in flight on this node.
+    #[must_use]
+    pub fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::SeqCst)
+    }
+
+    /// Write a `u64` control signal into this node's `key` slot.
+    async fn write_u64(&self, key: &str, value: u64) {
+        self.kv.write(key, value.to_string()).await;
+    }
+
+    /// Every visible node's `u64` value for `key`.
+    async fn read_u64_map(&self, key: &str) -> Vec<(NodeId, u64)> {
+        self.kv
+            .scan(key)
+            .await
+            .into_iter()
+            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|x| (n, x)))
+            .collect()
+    }
+
+    /// Publish this node's fault sequence so the leader drives a recovery round.
+    pub async fn report_fault(&self, seq: u64) {
+        self.write_u64("control:fault-report", seq).await;
+    }
+
+    /// Clear this node's fault report (`0` = no fault) after it recovers, so a restarted
+    /// leader doesn't re-trigger recovery for an already-handled fault.
+    pub async fn clear_fault_report(&self) {
+        self.write_u64("control:fault-report", 0).await;
+    }
+
+    /// Each visible node's reported fault sequence.
+    pub async fn read_fault_reports(&self) -> Vec<(NodeId, u64)> {
+        self.read_u64_map("control:fault-report").await
+    }
+
+    /// Publish the recovery generation this node has restored to.
+    pub async fn announce_recovered(&self, recovery_id: u64) {
+        self.write_u64("control:recovered", recovery_id).await;
+    }
+
+    /// Each visible node's last restored recovery generation.
+    pub async fn read_recovered(&self) -> Vec<(NodeId, u64)> {
+        self.read_u64_map("control:recovered").await
+    }
+
     /// Node ids eligible to own vnodes: `Active` peers, plus self unless
     /// this node is draining. Mirrors how [`Self::live_instances`] folds
     /// self in, but filters non-`Active` peers (see [`assignable_node_ids`])
@@ -321,37 +381,52 @@ impl ClusterController {
 
     /// Write the current assignment snapshot version to gossip KV.
     pub async fn announce_snapshot_version(&self, version: u64) {
-        self.kv
-            .write("control:snapshot-version", version.to_string())
-            .await;
+        self.write_u64("control:snapshot-version", version).await;
     }
 
-    /// Read the snapshot version from all peers in gossip KV and return the maximum version.
+    /// Max snapshot version across all peers.
     pub async fn read_snapshot_version(&self) -> Option<u64> {
-        let scans = self.kv.scan("control:snapshot-version").await;
-        scans
+        self.read_u64_map("control:snapshot-version")
+            .await
             .into_iter()
-            .filter_map(|(_, v)| v.parse::<u64>().ok())
+            .map(|(_, v)| v)
             .max()
     }
 
     /// Announce that this node has adopted a draining snapshot version (paused its
-    /// revoking partitions) so the leader can wait for every node before taking the
-    /// pre-rotation checkpoint.
+    /// revoking partitions) so the leader can wait for every node before the pre-rotation
+    /// checkpoint.
     pub async fn announce_drained_version(&self, version: u64) {
-        self.kv
-            .write("control:drained-version", version.to_string())
-            .await;
+        self.write_u64("control:drained-version", version).await;
     }
 
-    /// Each peer's adopted draining-snapshot version from gossip KV.
+    /// Each peer's adopted draining-snapshot version.
     pub async fn read_drained_versions(&self) -> Vec<(NodeId, u64)> {
-        self.kv
-            .scan("control:drained-version")
-            .await
-            .into_iter()
-            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|ver| (n, ver)))
-            .collect()
+        self.read_u64_map("control:drained-version").await
+    }
+
+    /// Publish the committed-assignment version this node has adopted, for the leader's
+    /// checkpoint-convergence gate in `StreamingCoordinator`.
+    pub async fn announce_adopted_version(&self, version: u64) {
+        self.write_u64("control:adopted-version", version).await;
+    }
+
+    /// Each live peer's adopted committed-assignment version.
+    pub async fn read_adopted_versions(&self) -> Vec<(NodeId, u64)> {
+        self.read_u64_map("control:adopted-version").await
+    }
+
+    /// Publish the leader's checkpoint-convergence verdict. Called off the hot
+    /// path by the snapshot watcher; read locally by the periodic-checkpoint gate.
+    pub fn publish_converged(&self, converged: bool) {
+        self.converged_for_checkpoint.send_replace(converged);
+    }
+
+    /// Watch the leader's checkpoint-convergence verdict — a local borrow that
+    /// replaces the per-checkpoint `read_adopted_versions` gossip scan.
+    #[must_use]
+    pub fn converged_watch(&self) -> watch::Receiver<bool> {
+        self.converged_for_checkpoint.subscribe()
     }
 
     /// Start the direct gRPC barrier sync server.
@@ -428,6 +503,28 @@ impl ClusterController {
     /// Propagates [`BarrierCoordinator::ack`] errors.
     pub async fn ack_barrier(&self, ack: &BarrierAck) -> Result<(), String> {
         self.barrier.ack(ack).await
+    }
+
+    /// Announce a recovery round: rewind every node to `epoch` under generation `gen`.
+    /// On a dedicated key, independent of the 2PC barrier slot.
+    pub async fn announce_recover(&self, epoch: u64, gen: u64) {
+        self.kv
+            .write("control:recover", format!("{epoch}:{gen}"))
+            .await;
+    }
+
+    /// The leader's active recovery target `(epoch, generation)`, if a round is in flight.
+    pub async fn observe_recover(&self) -> Option<(u64, u64)> {
+        let leader = self.current_leader()?;
+        let raw = self.kv.read_from(leader, "control:recover").await?;
+        let (epoch, gen) = raw.split_once(':')?;
+        Some((epoch.parse().ok()?, gen.parse().ok()?))
+    }
+
+    /// Clear the recovery announcement at round end, so a peer that restarts later (its
+    /// in-memory generation reset) can't replay a stale generation.
+    pub async fn clear_recover(&self) {
+        self.kv.write("control:recover", String::new()).await;
     }
 
     /// Wait until [`Self::observe_barrier`] yields an announcement

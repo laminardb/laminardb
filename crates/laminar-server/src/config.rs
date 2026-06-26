@@ -293,6 +293,9 @@ pub struct ServerConfig {
     pub state: StateBackendConfig,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
+    /// `[supervision]` — auto-restart policy on a fatal fault (single-node only).
+    #[serde(default)]
+    pub supervision: SupervisionSection,
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
     #[serde(default, rename = "lookup")]
@@ -406,6 +409,39 @@ impl Default for ServerSection {
     }
 }
 
+/// `[supervision]` — auto-restart policy; unset fields fall back to engine defaults.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct SupervisionSection {
+    pub max_restarts: Option<usize>,
+    pub window_secs: Option<u64>,
+    pub initial_backoff_ms: Option<u64>,
+    pub max_backoff_secs: Option<u64>,
+    /// Cluster mode: on a fatal fault, rewind every node to the highest cluster-wide
+    /// committed epoch instead of a local-only restart. Default off.
+    #[serde(default)]
+    pub coordinated_recovery: bool,
+}
+
+impl SupervisionSection {
+    /// Resolve into a [`laminar_db::RestartPolicy`], applying defaults for unset fields.
+    pub fn to_policy(&self) -> laminar_db::RestartPolicy {
+        let mut p = laminar_db::RestartPolicy::default();
+        if let Some(v) = self.max_restarts {
+            p.max_restarts = v;
+        }
+        if let Some(v) = self.window_secs {
+            p.window = std::time::Duration::from_secs(v);
+        }
+        if let Some(v) = self.initial_backoff_ms {
+            p.initial_backoff = std::time::Duration::from_millis(v);
+        }
+        if let Some(v) = self.max_backoff_secs {
+            p.max_backoff = std::time::Duration::from_secs(v);
+        }
+        p
+    }
+}
+
 /// String that redacts itself in `Debug` output.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
@@ -470,6 +506,11 @@ pub struct CheckpointSection {
     /// Durability-gate poll backoff cap in ms (default 1000).
     #[serde(default)]
     pub restorable_gate_poll_max_ms: Option<u64>,
+    /// Enable incremental delta checkpoints (Lever 2, cluster-only) with this re-base chain bound.
+    /// Default off (full + reference partials). Clamped `< max_retained` so a chain base never ages
+    /// out of the prune window.
+    #[serde(default)]
+    pub delta_chain_max: Option<u32>,
 }
 
 impl Default for CheckpointSection {
@@ -485,6 +526,7 @@ impl Default for CheckpointSection {
             uncommitted_epochs_backpressure: false,
             restorable_gate_poll_initial_ms: None,
             restorable_gate_poll_max_ms: None,
+            delta_chain_max: None,
         }
     }
 }
@@ -1576,6 +1618,7 @@ alice = "wonderland-key"
             server: ServerSection::default(),
             state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
             sources: vec![],
             lookups: vec![],
             pipelines: vec![],

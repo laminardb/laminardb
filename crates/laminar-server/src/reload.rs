@@ -419,6 +419,7 @@ mod tests {
             server: ServerSection::default(),
             state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
             sources: vec![],
             lookups: vec![],
             pipelines: vec![],

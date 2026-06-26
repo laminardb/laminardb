@@ -752,7 +752,12 @@ mod rebalance {
         for &v in &follower_vnodes {
             let entry = staged.get(&v).expect("acquired vnode staged");
             assert_eq!(entry.epoch, SEED_EPOCH);
-            assert_eq!(&entry.bytes[..], format!("vnode-{v}").as_bytes());
+            assert_eq!(
+                entry.chain.len(),
+                1,
+                "simple seed resolves to a single-link chain"
+            );
+            assert_eq!(&entry.chain[0][..], format!("vnode-{v}").as_bytes());
         }
 
         harness.shutdown().await;

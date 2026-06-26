@@ -538,6 +538,7 @@ async fn send_phase_rpc(
                 .map(|_| ())
                 .map_err(|e| ("abort", e))
         }
+        // Prepare RPCs are issued by wait_for_quorum, not here.
         Phase::Prepare => Ok(()),
     };
     result.map_err(|(rpc, e)| {
@@ -741,8 +742,7 @@ impl BarrierCoordinator {
                 let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
                 self.kv.write(ANNOUNCEMENT_KEY, json).await;
                 if ann.phase == Phase::Prepare {
-                    // Prepare gRPC calls are initiated by wait_for_quorum.
-                    // Redundant calls here cause duplicate prepare executions and timeouts on followers.
+                    // Prepare RPCs come from wait_for_quorum; a redundant one here double-fires.
                 } else {
                     // A node's barrier address lingers in the KV after it dies,
                     // so announce to peers still Active in membership — a Commit

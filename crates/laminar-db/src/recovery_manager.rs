@@ -76,8 +76,9 @@ pub struct VnodeRehydration {
     /// Committed epoch the partials were read from. `None` when the backend
     /// has no committed epoch — every vnode starts fresh.
     pub epoch: Option<u64>,
-    /// vnode → restored partial bytes at `epoch`.
-    pub restored: HashMap<u32, Bytes>,
+    /// vnode → recovery chain (decoded-as-bytes partials, oldest→newest): a FULL base followed by
+    /// any delta partials. A simple/reference vnode resolves to a single-element chain.
+    pub restored: HashMap<u32, Vec<Bytes>>,
     /// Vnodes with no durable partial at `epoch`; resume from empty state.
     pub missing: Vec<u32>,
     /// vnode → error for reads that failed.
@@ -147,46 +148,10 @@ impl<'a> VnodeRehydrator<'a> {
         report.epoch = Some(epoch);
 
         for &vnode in vnodes {
-            match self.backend.read_partial(vnode, epoch).await {
-                Ok(Some(bytes)) => {
-                    // An unchanged-vnode partial is a reference to its last full
-                    // upload — follow the single hop. An undecodable blob passes
-                    // through unchanged (the apply path skips it).
-                    let bytes = match crate::vnode_partial::VnodePartial::decode(&bytes) {
-                        Ok(p) => match p.base_epoch {
-                            Some(base) => match self.backend.read_partial(vnode, base).await {
-                                Ok(Some(base_bytes)) => base_bytes,
-                                Ok(None) => {
-                                    warn!(
-                                        vnode,
-                                        epoch,
-                                        base,
-                                        "[LDB-6052] reference partial's base is missing — \
-                                         vnode starts fresh"
-                                    );
-                                    report.missing.push(vnode);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        vnode, epoch, base, error = %e,
-                                        "[LDB-6051] rehydrate: base read failed — vnode starts fresh"
-                                    );
-                                    report.errors.insert(vnode, e.to_string());
-                                    continue;
-                                }
-                            },
-                            None => bytes,
-                        },
-                        Err(_) => bytes,
-                    };
-                    debug!(
-                        vnode,
-                        epoch,
-                        bytes = bytes.len(),
-                        "rehydrated vnode partial"
-                    );
-                    report.restored.insert(vnode, bytes);
+            match self.collect_chain(vnode, epoch).await {
+                Ok(Some(chain)) => {
+                    debug!(vnode, epoch, links = chain.len(), "rehydrated vnode chain");
+                    report.restored.insert(vnode, chain);
                 }
                 Ok(None) => {
                     debug!(
@@ -197,12 +162,10 @@ impl<'a> VnodeRehydrator<'a> {
                 }
                 Err(e) => {
                     warn!(
-                        vnode,
-                        epoch,
-                        error = %e,
-                        "[LDB-6051] rehydrate: read_partial failed — vnode starts fresh"
+                        vnode, epoch, error = %e,
+                        "[LDB-6051] rehydrate: chain read failed — vnode starts fresh"
                     );
-                    report.errors.insert(vnode, e.to_string());
+                    report.errors.insert(vnode, e);
                 }
             }
         }
@@ -216,6 +179,118 @@ impl<'a> VnodeRehydrator<'a> {
         );
         report
     }
+
+    /// Resolve a vnode's recovery chain at `epoch`: collapse leading Lever-1 reference hops, then
+    /// walk `base_epoch` back collecting delta partials until every delta operator at the head has
+    /// its FULL base (or the chain ends / a link is missing). Returns oldest→newest decoded bytes.
+    async fn collect_chain(&self, vnode: u32, epoch: u64) -> Result<Option<Vec<Bytes>>, String> {
+        use crate::vnode_partial::VnodePartial;
+        let Some(mut bytes) = self
+            .backend
+            .read_partial(vnode, epoch)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+
+        // Follow reference hops (no data, just a base pointer) to the real partial.
+        let mut cur_epoch = epoch;
+        loop {
+            let Ok(p) = VnodePartial::decode(&bytes) else {
+                // Undecodable → pass through; the apply path skips it (prior behavior).
+                return Ok(Some(vec![bytes]));
+            };
+            if p.operators.is_empty() && p.deltas.is_empty() {
+                if let Some(base) = p.base_epoch {
+                    // base_epoch always points to an older epoch; a non-decreasing pointer
+                    // is corruption — bail rather than loop forever.
+                    if base >= cur_epoch {
+                        return Ok(None);
+                    }
+                    match self
+                        .backend
+                        .read_partial(vnode, base)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Some(b) => {
+                            bytes = b;
+                            cur_epoch = base;
+                            continue;
+                        }
+                        None => return Ok(None), // reference base missing → start fresh
+                    }
+                }
+            }
+            break;
+        }
+
+        // `bytes` is a FULL or DELTA partial. Walk back until each delta operator has its FULL.
+        let head = VnodePartial::decode(&bytes).map_err(|e| e.to_string())?;
+        let mut need: std::collections::HashSet<String> = head
+            .deltas
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| !head.operators.iter().any(|(on, _)| on == n))
+            .collect();
+        let mut chain_rev: Vec<Bytes> = vec![bytes];
+        let mut cur = head;
+        while !need.is_empty() {
+            let Some(parent) = cur.base_epoch else { break };
+            if parent >= cur_epoch {
+                break; // non-decreasing base → corruption; stop (unresolved ops start fresh)
+            }
+            let Some(pbytes) = self
+                .backend
+                .read_partial(vnode, parent)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                break; // missing link → unresolved operators start fresh (conservative)
+            };
+            let Ok(pp) = VnodePartial::decode(&pbytes) else {
+                break;
+            };
+            for (n, _) in &pp.operators {
+                need.remove(n);
+            }
+            chain_rev.push(pbytes);
+            cur_epoch = parent;
+            cur = pp;
+        }
+        chain_rev.reverse();
+        Ok(Some(chain_rev))
+    }
+}
+
+/// One operator's resolved recovery chain: FULL base bytes + ordered `(changed, tombstones)` deltas.
+#[cfg(feature = "cluster")]
+pub(crate) type ResolvedOpChain<'a> = (&'a [u8], Vec<(&'a [u8], &'a [u8])>);
+
+/// From a vnode's recovery chain (oldest→newest decoded partials), resolve one operator's FULL base
+/// bytes + ordered delta payloads. Returns `None` when no FULL for `op` is present (start fresh).
+#[cfg(feature = "cluster")]
+#[must_use]
+pub(crate) fn resolve_op_chain<'a>(
+    chain: &'a [crate::vnode_partial::VnodePartial],
+    op: &str,
+) -> Option<ResolvedOpChain<'a>> {
+    let base_idx = chain
+        .iter()
+        .rposition(|p| p.operators.iter().any(|(n, _)| n == op))?;
+    let base = chain[base_idx]
+        .operators
+        .iter()
+        .find(|(n, _)| n == op)
+        .map(|(_, b)| b.as_slice())?;
+    let mut deltas: Vec<(&[u8], &[u8])> = Vec::new();
+    for p in &chain[base_idx + 1..] {
+        if let Some((_, d)) = p.deltas.iter().find(|(n, _)| n == op) {
+            deltas.push((d.changed.as_slice(), d.tombstones_ipc.as_slice()));
+        }
+    }
+    Some((base, deltas))
 }
 
 /// Loads the latest [`CheckpointManifest`] and restores sources, sinks, and
@@ -263,100 +338,50 @@ impl<'a> RecoveryManager<'a> {
         sources: &[RegisteredSource],
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> Result<Option<RecoveredState>, DbError> {
-        // Fast path: try load_latest() first.
+        // Fast path: the latest checkpoint.
         match self.store.load_latest().await {
             Ok(Some(manifest)) => {
-                if self.is_checkpoint_corrupt(&manifest).await {
-                    warn!(
-                        checkpoint_id = manifest.checkpoint_id,
-                        "[LDB-6010] latest checkpoint corrupt, trying fallback"
-                    );
-                } else if Self::has_pending_sinks(&manifest) {
-                    warn!(
-                        checkpoint_id = manifest.checkpoint_id,
-                        epoch = manifest.epoch,
-                        "[LDB-6015] checkpoint has uncommitted sinks — source offsets \
-                         may be past uncommitted data, falling back to previous checkpoint"
-                    );
-                } else {
-                    let state = self
-                        .restore_from(manifest, sources, sinks, table_sources)
-                        .await;
-                    if let Err(e) = self.check_strict(&state) {
-                        warn!(
-                            checkpoint_id = state.manifest.checkpoint_id,
-                            error = %e,
-                            "latest checkpoint restore had strict errors, trying fallback"
-                        );
-                    } else {
-                        return Ok(Some(state));
-                    }
+                if let Some(state) = self
+                    .try_restore(manifest, sources, sinks, table_sources, decision_store)
+                    .await
+                {
+                    return Ok(Some(state));
                 }
             }
             Ok(None) => {
                 info!("no checkpoint found, starting fresh");
                 return Ok(None);
             }
-            Err(e) => {
-                warn!(error = %e, "latest checkpoint load failed, trying fallback");
-            }
+            Err(e) => warn!(error = %e, "latest checkpoint load failed, trying fallback"),
         }
 
-        // Fallback: iterate through all checkpoints in reverse order.
-        let checkpoints = self.store.list().await.map_err(DbError::from)?;
+        // Fallback: older checkpoints, newest first.
+        let mut checkpoints = self.store.list().await.map_err(DbError::from)?;
+        checkpoints.reverse();
+        self.restore_first(&checkpoints, sources, sinks, table_sources, decision_store)
+            .await
+    }
 
-        if checkpoints.is_empty() {
-            warn!("no checkpoints available for fallback, starting fresh");
-            return Ok(None);
-        }
-
-        for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
-            match self.store.load_by_id(checkpoint_id).await {
-                Ok(Some(manifest)) => {
-                    if self.is_checkpoint_corrupt(&manifest).await {
-                        warn!(
-                            checkpoint_id,
-                            "[LDB-6010] fallback checkpoint corrupt, skipping"
-                        );
-                        continue;
-                    }
-                    if Self::has_pending_sinks(&manifest) {
-                        warn!(
-                            checkpoint_id,
-                            "[LDB-6015] fallback checkpoint has uncommitted sinks, skipping"
-                        );
-                        continue;
-                    }
-                    info!(checkpoint_id, "recovering from fallback checkpoint");
-                    let state = self
-                        .restore_from(manifest, sources, sinks, table_sources)
-                        .await;
-                    if let Err(e) = self.check_strict(&state) {
-                        warn!(
-                            checkpoint_id,
-                            error = %e,
-                            "fallback checkpoint restore had strict errors, trying next"
-                        );
-                        continue;
-                    }
-                    return Ok(Some(state));
-                }
-                Ok(None) => {
-                    debug!(checkpoint_id, "fallback checkpoint not found, skipping");
-                }
-                Err(e) => {
-                    warn!(
-                        checkpoint_id,
-                        error = %e,
-                        "fallback checkpoint load failed, trying next"
-                    );
-                }
-            }
-        }
-
-        warn!("all checkpoints failed to load, starting fresh");
-        Ok(None)
+    /// Recover from the newest viable checkpoint with `epoch <= target_epoch` — the
+    /// coordinated-restart target, which may be older than this node's local latest.
+    ///
+    /// # Errors
+    /// Returns `DbError::Checkpoint` if the store fails.
+    pub(crate) async fn recover_to_epoch(
+        &self,
+        target_epoch: u64,
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Result<Option<RecoveredState>, DbError> {
+        let mut checkpoints = self.store.list().await.map_err(DbError::from)?;
+        checkpoints.retain(|&(_, epoch)| epoch <= target_epoch);
+        checkpoints.sort_by_key(|&(_, epoch)| std::cmp::Reverse(epoch)); // newest eligible first
+        self.restore_first(&checkpoints, sources, sinks, table_sources, decision_store)
+            .await
     }
 
     /// Resolve external operator states from the sidecar file into inline entries.
@@ -465,6 +490,7 @@ impl<'a> RecoveryManager<'a> {
         sources: &[RegisteredSource],
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> RecoveredState {
         // In strict mode an unresolved sidecar is recorded so check_strict() rejects this checkpoint.
         let sidecar_ok = self.resolve_external_states(&mut manifest).await;
@@ -537,7 +563,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Roll back exactly-once sinks that did not commit. Committed sinks are left alone.
-        Self::rollback_uncommitted_sinks(sinks, &manifest, &mut result).await;
+        Self::rollback_uncommitted_sinks(sinks, &manifest, decision_store, &mut result).await;
 
         info!(
             checkpoint_id = manifest.checkpoint_id,
@@ -650,8 +676,19 @@ impl<'a> RecoveryManager<'a> {
     async fn rollback_uncommitted_sinks(
         sinks: &[RegisteredSink],
         manifest: &CheckpointManifest,
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
         result: &mut RecoveredState,
     ) {
+        // A marker-committed epoch committed its sinks (the manifest just wasn't updated
+        // before the fault); rolling back here would abort a committed transaction.
+        if let Some(ds) = decision_store {
+            match ds.is_committed(manifest.epoch).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => warn!(epoch = manifest.epoch, error = %e,
+                    "[LDB-6040] decision-store read failed; rolling back pending sinks"),
+            }
+        }
         for sink in sinks {
             if !sink.exactly_once {
                 continue;
@@ -734,6 +771,95 @@ impl<'a> RecoveryManager<'a> {
             .any(|s| matches!(s, SinkCommitStatus::Pending))
     }
 
+    /// `true` when a checkpoint must be skipped for genuinely-uncommitted sinks: sinks are
+    /// `Pending` AND the decision marker does not confirm the epoch committed. A
+    /// pending-but-marker-committed epoch is NOT skipped — the sink committed but the
+    /// manifest wasn't updated before the fault, and rewinding the source behind it would
+    /// re-emit committed rows (duplicates); `reconcile_prepared_on_init` re-drives the commit.
+    async fn pending_uncommitted(
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        manifest: &CheckpointManifest,
+    ) -> bool {
+        if !Self::has_pending_sinks(manifest) {
+            return false;
+        }
+        match decision_store {
+            // A read error can't confirm the commit, so treat as uncommitted (skip) — but
+            // surface it rather than silently rewinding past a maybe-committed checkpoint.
+            Some(ds) => match ds.is_committed(manifest.epoch).await {
+                Ok(committed) => !committed,
+                Err(e) => {
+                    warn!(epoch = manifest.epoch, error = %e,
+                        "[LDB-6040] decision-store read failed; treating epoch as uncommitted");
+                    true
+                }
+            },
+            None => true,
+        }
+    }
+
+    /// Restore from `manifest` if it's viable; `None` means try an older checkpoint
+    /// (corrupt, genuinely-uncommitted sinks, or strict-mode restore errors).
+    async fn try_restore(
+        &self,
+        manifest: CheckpointManifest,
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Option<RecoveredState> {
+        let (checkpoint_id, epoch) = (manifest.checkpoint_id, manifest.epoch);
+        if self.is_checkpoint_corrupt(&manifest).await {
+            warn!(
+                checkpoint_id,
+                epoch, "[LDB-6010] checkpoint corrupt, trying older"
+            );
+            return None;
+        }
+        if Self::pending_uncommitted(decision_store, &manifest).await {
+            warn!(
+                checkpoint_id,
+                epoch, "[LDB-6015] uncommitted sinks, trying older"
+            );
+            return None;
+        }
+        let state = self
+            .restore_from(manifest, sources, sinks, table_sources, decision_store)
+            .await;
+        if let Err(e) = self.check_strict(&state) {
+            warn!(checkpoint_id, epoch, error = %e, "strict restore errors, trying older");
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Restore from the first viable checkpoint in `candidates` (try-order); `Ok(None)`
+    /// if none restore. `candidates` are `(checkpoint_id, epoch)` pairs.
+    async fn restore_first(
+        &self,
+        candidates: &[(u64, u64)],
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Result<Option<RecoveredState>, DbError> {
+        for &(checkpoint_id, _) in candidates {
+            match self.store.load_by_id(checkpoint_id).await {
+                Ok(Some(manifest)) => {
+                    if let Some(state) = self
+                        .try_restore(manifest, sources, sinks, table_sources, decision_store)
+                        .await
+                    {
+                        return Ok(Some(state));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(checkpoint_id, error = %e, "checkpoint load failed, trying older"),
+            }
+        }
+        Ok(None)
+    }
+
     fn check_strict(&self, state: &RecoveredState) -> Result<(), DbError> {
         if !self.strict || !state.has_errors() {
             return Ok(());
@@ -794,7 +920,7 @@ mod tests {
         let store = make_store(dir.path());
         let mgr = RecoveryManager::new(&store);
 
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -808,13 +934,58 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(result.epoch(), 5);
         assert_eq!(result.sources_restored, 0);
         assert_eq!(result.tables_restored, 0);
         assert_eq!(result.sinks_rolled_back, 0);
         assert!(!result.has_errors());
+    }
+
+    #[tokio::test]
+    async fn recover_to_epoch_picks_newest_at_or_below_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        for (id, epoch) in [(1u64, 3u64), (2, 5), (3, 7)] {
+            store
+                .save(&CheckpointManifest::new(id, epoch))
+                .await
+                .unwrap();
+        }
+        let mgr = RecoveryManager::new(&store);
+
+        assert_eq!(
+            mgr.recover_to_epoch(7, &[], &[], &[], None)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            7
+        );
+        // A newer local epoch is rewound to the cluster-agreed target.
+        assert_eq!(
+            mgr.recover_to_epoch(6, &[], &[], &[], None)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            5
+        );
+        assert_eq!(
+            mgr.recover_to_epoch(5, &[], &[], &[], None)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            5
+        );
+        // Nothing committed at or below the target → fresh start.
+        assert!(mgr
+            .recover_to_epoch(2, &[], &[], &[], None)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -827,7 +998,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(result.watermark(), Some(42_000));
     }
@@ -847,7 +1018,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(result.operator_states().len(), 2);
         let op0 = result.operator_states().get("0").unwrap();
@@ -864,7 +1035,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         assert_eq!(
             result.table_store_checkpoint_path(),
@@ -925,7 +1096,7 @@ mod tests {
         // (it already does from the save, but the manifest file is now corrupt)
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
 
         // Should fall back to checkpoint 1
         let recovered = result.expect("should recover from fallback checkpoint");
@@ -950,7 +1121,7 @@ mod tests {
         std::fs::write(&manifest_path, "corrupt").unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
 
         // All checkpoints corrupt → fresh start
         assert!(result.is_none());
@@ -965,7 +1136,7 @@ mod tests {
         store.save(&CheckpointManifest::new(2, 20)).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         // Should use the latest (no fallback needed)
         assert_eq!(result.manifest.checkpoint_id, 2);
@@ -992,7 +1163,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         // External state should have been resolved to inline
         let op = result.operator_states().get("big-op").unwrap();
@@ -1023,7 +1194,7 @@ mod tests {
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         let small = result.operator_states().get("small-op").unwrap();
         assert_eq!(small.decode_inline().unwrap(), b"tiny");
@@ -1048,7 +1219,7 @@ mod tests {
         // sidecar state with empty inline. Strict mode rejects this
         // checkpoint entirely (see test_recover_missing_sidecar_strict).
         let mgr = RecoveryManager::lenient(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap().unwrap();
 
         // Should still recover (gracefully) — external state replaced with
         // empty inline to avoid dangling offset references
@@ -1102,7 +1273,7 @@ mod tests {
         // and recovery falls back. With only one checkpoint, this means
         // fresh start.
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         assert!(
             result.is_none(),
             "strict mode should reject checkpoint with missing sidecar"
@@ -1127,7 +1298,7 @@ mod tests {
         store.save(&m2).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         let state = result.expect("should recover from epoch 1 fallback");
 
         // Must fall back to epoch 1 (the last fully committed checkpoint),
@@ -1151,7 +1322,7 @@ mod tests {
         store.save(&m).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
         assert!(
             result.is_none(),
             "should start fresh when all checkpoints have pending sinks"
@@ -1184,8 +1355,8 @@ mod rehydration_tests {
 
         assert_eq!(report.epoch, Some(7));
         assert_eq!(report.restored_count(), 2);
-        assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"v7"[..]));
-        assert_eq!(report.restored.get(&1).map(|b| &b[..]), Some(&b"v7"[..]));
+        assert_eq!(report.restored.get(&0).map(|c| &c[0][..]), Some(&b"v7"[..]));
+        assert_eq!(report.restored.get(&1).map(|c| &c[0][..]), Some(&b"v7"[..]));
         // vnode 3 was never written — fresh start, no error.
         assert_eq!(report.missing, vec![3]);
         assert!(!report.has_errors());
@@ -1200,7 +1371,10 @@ mod rehydration_tests {
         let report = VnodeRehydrator::new(&backend).rehydrate(&[0, 1]).await;
 
         assert_eq!(report.epoch, Some(9), "must read the highest sealed epoch");
-        assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"new"[..]));
+        assert_eq!(
+            report.restored.get(&0).map(|c| &c[0][..]),
+            Some(&b"new"[..])
+        );
     }
 
     /// A reference partial resolves (one hop) to the
@@ -1213,6 +1387,7 @@ mod rehydration_tests {
             checkpoint_id: 1,
             operators: vec![("agg".into(), vec![1, 2, 3])],
             base_epoch: None,
+            deltas: Vec::new(),
         };
         backend
             .write_partial(0, 5, 0, Bytes::from(full.encode().unwrap()))
@@ -1224,6 +1399,7 @@ mod rehydration_tests {
             checkpoint_id: 2,
             operators: Vec::new(),
             base_epoch: Some(5),
+            deltas: Vec::new(),
         };
         backend
             .write_partial(0, 6, 0, Bytes::from(reference.encode().unwrap()))
@@ -1233,10 +1409,9 @@ mod rehydration_tests {
 
         let report = VnodeRehydrator::new(&backend).rehydrate(&[0]).await;
         assert_eq!(report.epoch, Some(6));
-        let restored = crate::vnode_partial::VnodePartial::decode(
-            report.restored.get(&0).expect("vnode restored"),
-        )
-        .unwrap();
+        let chain = report.restored.get(&0).expect("vnode restored");
+        assert_eq!(chain.len(), 1, "reference resolves to a single full base");
+        let restored = crate::vnode_partial::VnodePartial::decode(&chain[0]).unwrap();
         assert_eq!(
             restored.base_epoch, None,
             "the resolved partial must be the full base, not the reference",
@@ -1279,7 +1454,7 @@ mod rehydration_tests {
         assert_eq!(report.epoch, Some(5));
         assert_eq!(report.restored_count(), 2);
         assert_eq!(
-            report.restored.get(&1).map(|b| &b[..]),
+            report.restored.get(&1).map(|c| &c[0][..]),
             Some(&b"durable"[..])
         );
     }

@@ -135,6 +135,12 @@ pub struct EngineMetrics {
     pub placement_blast_radius_ratio: Gauge,
     /// Unexpected compute-thread exits (operator panics) that faulted the pipeline.
     pub pipeline_faults_total: IntCounter,
+    /// Fatal cycle errors dropped-and-continued under at-least-once delivery.
+    pub pipeline_cycle_errors_total: IntCounter,
+    /// Automatic recover-from-checkpoint restarts triggered by the fault supervisor.
+    pub pipeline_restarts_total: IntCounter,
+    /// Leader-coordinated global restart-to-epoch rounds this node applied (cluster mode).
+    pub coordinated_recoveries_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -457,6 +463,21 @@ impl EngineMetrics {
             pipeline_faults_total: reg!(IntCounter::new(
                 "pipeline_faults_total",
                 "Compute-thread crashes that faulted the pipeline"
+            )
+            .unwrap()),
+            pipeline_cycle_errors_total: reg!(IntCounter::new(
+                "pipeline_cycle_errors_total",
+                "Fatal cycle errors dropped-and-continued under at-least-once delivery"
+            )
+            .unwrap()),
+            pipeline_restarts_total: reg!(IntCounter::new(
+                "pipeline_restarts_total",
+                "Automatic recover-from-checkpoint restarts after a pipeline fault"
+            )
+            .unwrap()),
+            coordinated_recoveries_total: reg!(IntCounter::new(
+                "coordinated_recoveries_total",
+                "Leader-coordinated global restart-to-epoch rounds applied by this node"
             )
             .unwrap()),
         }

@@ -173,6 +173,18 @@ struct AggOpCheckpoint {
     cold_vnodes: Vec<u32>,         // absent from `agg`; replayed from durable partials on restart
 }
 
+/// Serialize a per-vnode aggregate checkpoint slice (full or a delta's changed-groups) to bytes.
+#[cfg(feature = "cluster")]
+fn serialize_agg_cp(cp: &AggStateCheckpoint, op_name: &str) -> Result<Vec<u8>, DbError> {
+    rkyv::to_bytes::<rkyv::rancor::Error>(cp)
+        .map(|v| v.to_vec())
+        .map_err(|e| {
+            DbError::Pipeline(format!(
+                "per-vnode checkpoint serialization for '{op_name}': {e}"
+            ))
+        })
+}
+
 pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,
@@ -187,6 +199,12 @@ pub(crate) struct SqlQueryOperator {
     idle_ttl_ms: Option<u64>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
+    // `Some(chain_max)` enables incremental delta checkpoints (Lever 2) with that re-base bound.
+    #[cfg(feature = "cluster")]
+    delta_chain_max: Option<u32>,
+    // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
+    #[cfg(feature = "cluster")]
+    pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
     #[cfg(feature = "state-tier")]
     promotion: Option<AggPromotion>,
     // Held until `lazy_init` builds the aggregate state, then moved into `promotion`.
@@ -227,6 +245,10 @@ impl SqlQueryOperator {
             idle_ttl_ms,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            delta_chain_max: None,
+            #[cfg(feature = "cluster")]
+            pending_restore_deltas: Vec::new(),
             #[cfg(feature = "state-tier")]
             promotion: None,
             #[cfg(feature = "state-tier")]
@@ -243,6 +265,15 @@ impl SqlQueryOperator {
     #[cfg(feature = "state-tier")]
     pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
         self.vnode_count = vnode_count;
+    }
+
+    /// Enable incremental delta checkpoints (Lever 2) with `chain_max` as the re-base bound.
+    #[cfg(feature = "cluster")]
+    pub fn enable_delta_checkpoints(&mut self, chain_max: u32) {
+        self.delta_chain_max = Some(chain_max);
+        if let QueryState::Agg(ref mut agg) = self.state {
+            agg.set_delta_enabled(true);
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -267,8 +298,22 @@ impl SqlQueryOperator {
                     }
                 }
                 self.pending_restore = None;
+                // Replay any deltas stashed during restart, now that the base is restored.
+                #[cfg(feature = "cluster")]
+                for delta in self.pending_restore_deltas.drain(..) {
+                    if let Err(e) = agg_state.apply_delta(&delta) {
+                        tracing::warn!(
+                            query = %self.op_name, error = %e,
+                            "failed to replay restart delta — vnode may be stale"
+                        );
+                    }
+                }
                 if let Some(ttl) = self.idle_ttl_ms {
                     agg_state.idle_ttl_ms = Some(ttl);
+                }
+                #[cfg(feature = "cluster")]
+                if self.delta_chain_max.is_some() {
+                    agg_state.set_delta_enabled(true);
                 }
                 self.log_tier(agg_state.compiled_projection().is_some());
                 self.state = QueryState::Agg(Box::new(agg_state));
@@ -697,10 +742,10 @@ async fn shuffle_pre_agg_batches(
         }
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
         for &v in &row_vn {
-            let owner = cfg.registry.owner(v);
-            if owner.is_unassigned() {
-                return Err(DbError::Pipeline(format!(
-                    "[{op_name}] row-shuffle: vnode {v} is unassigned — refusing to drop rows"
+            if cfg.registry.owner(v).is_unassigned() {
+                // Formation/rebalance transient — defer (recoverable), don't drop.
+                return Err(DbError::ShuffleNotReady(format!(
+                    "[{op_name}] row-shuffle: vnode {v} is unassigned"
                 )));
             }
         }
@@ -718,8 +763,9 @@ async fn shuffle_pre_agg_batches(
 
         for (owner, slice) in remote_slices {
             let msg = ShuffleMessage::VnodeData(op_name.to_string(), 0, slice);
+            // Unreachable peer during formation: `ShuffleNotReady` defers (recoverable).
             cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
-                DbError::Pipeline(format!(
+                DbError::ShuffleNotReady(format!(
                     "[{op_name}] row-shuffle send_to peer {}: {e}",
                     owner.0
                 ))
@@ -1002,6 +1048,35 @@ impl GraphOperator for SqlQueryOperator {
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Ok(None);
         };
+
+        // Incremental delta capture (Lever 2): each touched vnode emits a FULL re-base or a DELTA.
+        if let Some(chain_max) = self.delta_chain_max {
+            if agg_state.delta_enabled() {
+                use crate::aggregate_state::VnodeCapture;
+                let captures = agg_state.checkpoint_delta_by_vnode(vnode_count, chain_max)?;
+                if captures.is_empty() {
+                    return Ok(None);
+                }
+                let mut out = std::collections::HashMap::with_capacity(captures.len());
+                for (vnode, cap) in captures {
+                    let slice = match cap {
+                        VnodeCapture::Full(cp) => StagedSlice::Bytes(bytes::Bytes::from(
+                            serialize_agg_cp(&cp, &self.op_name)?,
+                        )),
+                        VnodeCapture::Delta(d) => StagedSlice::Delta {
+                            changed: bytes::Bytes::from(serialize_agg_cp(
+                                &d.changed,
+                                &self.op_name,
+                            )?),
+                            tombstones: bytes::Bytes::from(d.tombstones_ipc),
+                        },
+                    };
+                    out.insert(vnode, slice);
+                }
+                return Ok(Some(out));
+            }
+        }
+
         let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
         #[cfg(feature = "state-tier")]
         let cold: Vec<u32> = agg_state.cold_vnodes().iter().copied().collect();
@@ -1012,14 +1087,7 @@ impl GraphOperator for SqlQueryOperator {
         }
         let mut out = std::collections::HashMap::with_capacity(per_vnode.len() + cold.len());
         for (vnode, cp) in per_vnode {
-            let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
-                .map(|v| v.to_vec())
-                .map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "per-vnode checkpoint serialization for '{}': {e}",
-                        self.op_name
-                    ))
-                })?;
+            let data = serialize_agg_cp(&cp, &self.op_name)?;
             out.insert(vnode, StagedSlice::Bytes(bytes::Bytes::from(data)));
         }
         // Cold markers let the coordinator fetch the slice instead of treating the vnode as empty.
@@ -1104,6 +1172,80 @@ impl GraphOperator for SqlQueryOperator {
             _ => tracing::warn!(
                 query = %self.op_name, vnode,
                 "ignoring rehydrated vnode state for non-aggregate query"
+            ),
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn apply_vnode_chain(
+        &mut self,
+        vnode: u32,
+        base: &[u8],
+        deltas: &[(&[u8], &[u8])],
+    ) -> Result<(), DbError> {
+        // No deltas → the base alone is the recovered state (full / reference / simple acquire).
+        if deltas.is_empty() {
+            return self.apply_vnode_state(vnode, base);
+        }
+        // Deserialize the chain before touching `self.state` (avoids borrowing `self` twice).
+        let base_cp: AggStateCheckpoint =
+            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(base).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "per-vnode base deserialization for '{}' vnode {vnode}: {e}",
+                    self.op_name
+                ))
+            })?;
+        let delta_objs: Vec<crate::aggregate_state::AggVnodeDelta> = deltas
+            .iter()
+            .map(|(changed, tombstones)| {
+                let cp: AggStateCheckpoint =
+                    rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(changed).map_err(
+                        |e| {
+                            DbError::Pipeline(format!(
+                                "per-vnode delta deserialization for '{}' vnode {vnode}: {e}",
+                                self.op_name
+                            ))
+                        },
+                    )?;
+                Ok(crate::aggregate_state::AggVnodeDelta {
+                    changed: cp,
+                    tombstones_ipc: tombstones.to_vec(),
+                })
+            })
+            .collect::<Result<_, DbError>>()?;
+
+        match self.state {
+            QueryState::Agg(ref mut agg_state) => {
+                let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
+                #[cfg(feature = "state-tier")]
+                {
+                    agg_state.mark_vnode_hot(vnode);
+                    agg_state.mark_vnode_dirty(vnode);
+                }
+                tracing::debug!(
+                    query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
+                    "applied rehydrated vnode chain"
+                );
+            }
+            QueryState::Uninit => {
+                // Restart before the agg is built: fold the base into the pending restore and stash
+                // the deltas; `lazy_init` replays them after `restore_groups`.
+                match self.pending_restore {
+                    Some(ref mut existing) if existing.fingerprint == base_cp.fingerprint => {
+                        existing.append_disjoint(base_cp)?;
+                    }
+                    Some(_) => tracing::warn!(
+                        query = %self.op_name, vnode,
+                        "pending restore fingerprint mismatch — dropping rehydrated chain base"
+                    ),
+                    None => self.pending_restore = Some(base_cp),
+                }
+                self.pending_restore_deltas.extend(delta_objs);
+            }
+            _ => tracing::warn!(
+                query = %self.op_name, vnode,
+                "ignoring rehydrated vnode chain for non-aggregate query"
             ),
         }
         Ok(())

@@ -137,6 +137,10 @@ fn staged_request_bytes(
             crate::checkpoint_coordinator::StagedSlice::Bytes(b) => b.len(),
             // Cold slices are on disk; they hold no RAM.
             crate::checkpoint_coordinator::StagedSlice::Cold => 0,
+            crate::checkpoint_coordinator::StagedSlice::Delta {
+                changed,
+                tombstones,
+            } => changed.len() + tombstones.len(),
         })
         .sum();
     (ops + vnodes) as u64
@@ -194,6 +198,31 @@ impl FollowerTailState {
     }
 }
 
+/// `true` when every live node has reported a committed-assignment version and all
+/// agree. A node missing from `reported` hasn't republished since (re)joining, so it
+/// is treated as not-yet-converged; disagreement means a rebalance is still
+/// propagating (the leader has bumped, a follower lags). The leader's committed
+/// version is the max, so all-equal ⇒ every follower has caught up.
+#[cfg(feature = "cluster")]
+pub(crate) fn assignment_versions_converged(
+    live: &[u64],
+    reported: &rustc_hash::FxHashMap<u64, u64>,
+) -> bool {
+    let mut seen: Option<u64> = None;
+    for id in live {
+        let Some(&v) = reported.get(id) else {
+            return false;
+        };
+        match seen {
+            None => seen = Some(v),
+            Some(s) if s != v => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+#[allow(clippy::struct_excessive_bools)] // config/state flags, not a state machine
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -233,6 +262,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    /// Fault (rather than drop) on a fatal cycle error even at-least-once, so coordinated
+    /// recovery can drive a global restart and an EO sink's 2PC keeps output exactly-once.
+    pub(crate) coordinated_recovery: bool,
     pub(crate) serialization_timeout: Duration,
     pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     /// Set when a sink write times out; suppresses the next checkpoint to preserve the replay window.
@@ -240,6 +272,10 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Cached convergence verdict for the periodic-checkpoint gate, published by the
+    /// snapshot watcher. `None` in single-node mode (gate defaults open).
+    #[cfg(feature = "cluster")]
+    pub(crate) converged_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// In-flight epoch + highest committed epoch for follower tail dedup.
     #[cfg(feature = "cluster")]
     pub(crate) follower_tail: Arc<FollowerTailState>,
@@ -402,13 +438,18 @@ pub(crate) async fn run_demotion_pass(
 }
 
 impl ConnectorPipelineCallback {
-    /// Map a graph error to a string; `BackpressureFail` also triggers shutdown.
-    fn map_graph_error(err: &crate::error::DbError, shutdown: &tokio::sync::Notify) -> String {
+    /// Classify a graph error; `BackpressureFail` also signals shutdown.
+    fn map_graph_error(
+        err: &crate::error::DbError,
+        shutdown: &tokio::sync::Notify,
+    ) -> crate::pipeline::CycleError {
+        use crate::pipeline::CycleError;
         if let crate::error::DbError::BackpressureFail(msg) = err {
             tracing::error!(reason = %msg, "backpressure_policy=Fail tripped; halting pipeline");
             shutdown.notify_one();
+            return CycleError::Halt(format!("{err}"));
         }
-        format!("{err}")
+        CycleError::Fatal(format!("{err}"))
     }
 
     /// Cap each source watermark by the cluster-wide min, if one has been published.
@@ -1159,7 +1200,37 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, crate::pipeline::CycleError> {
+        // Test-only one-shot fault injector for the recovery soak (inert in release / when
+        // unset): the first cycle after `LAMINAR_FAULT_INJECT_AFTER_MS` faults once.
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::OnceLock;
+            use std::time::{Duration, Instant};
+            static AFTER_MS: OnceLock<Option<u64>> = OnceLock::new();
+            static START: OnceLock<Instant> = OnceLock::new();
+            static FIRED: AtomicBool = AtomicBool::new(false);
+            if let Some(after_ms) = *AFTER_MS.get_or_init(|| {
+                std::env::var("LAMINAR_FAULT_INJECT_AFTER_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            }) {
+                let start = START.get_or_init(Instant::now);
+                if !FIRED.load(Ordering::Relaxed)
+                    && start.elapsed() >= Duration::from_millis(after_ms)
+                    && FIRED
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return Err(crate::pipeline::CycleError::Fatal(
+                        "injected fault for coordinated-recovery soak \
+                         (LAMINAR_FAULT_INJECT_AFTER_MS)"
+                            .into(),
+                    ));
+                }
+            }
+        }
         self.source_wms_buf.clear();
         if let Some(ref tracker) = self.tracker {
             for (&sid, name_arc) in &self.source_name_arcs {
@@ -1270,6 +1341,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             #[allow(clippy::cast_possible_wrap)]
             self.prom.mv_bytes_stored.set(bytes as i64);
         }
+    }
+
+    async fn close_sinks(&mut self) {
+        // Concurrently, so one stalled sink doesn't add its 15s timeout to every other.
+        futures::future::join_all(self.sinks.iter().map(|(_, h, _, _, _)| h.close())).await;
     }
 
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -1466,6 +1542,28 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         true
+    }
+
+    fn is_recovering(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            if let Some(ref cc) = self.cluster_controller {
+                return cc.is_recovering();
+            }
+        }
+        false
+    }
+
+    fn fault_on_cycle_error(&self) -> bool {
+        use laminar_connectors::connector::DeliveryGuarantee;
+        self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce || self.coordinated_recovery
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn assignment_ready_for_checkpoint(&mut self) -> bool {
+        // Local borrow of the verdict the snapshot watcher computes off the hot path
+        // (see `rebalance::spawn_snapshot_watcher`); no gossip scan on the gate.
+        self.converged_rx.as_ref().is_none_or(|rx| *rx.borrow())
     }
 
     fn tick_idle_watermark(&mut self) {
@@ -1764,6 +1862,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.prom
             .cycle_duration
             .observe(elapsed_ns as f64 / 1_000_000_000.0);
+    }
+
+    fn note_cycle_error(&self) {
+        self.prom.pipeline_cycle_errors_total.inc();
     }
 
     fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
@@ -2133,10 +2235,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backpressure_fail_notifies_shutdown() {
+        use crate::pipeline::CycleError;
         let notify = Arc::new(tokio::sync::Notify::new());
         let err = DbError::BackpressureFail("downstream of 'q'".into());
-        let msg = ConnectorPipelineCallback::map_graph_error(&err, &notify);
-        assert!(msg.contains("Backpressure fail"), "unexpected: {msg}");
+        let mapped = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        assert!(
+            matches!(&mapped, CycleError::Halt(m) if m.contains("Backpressure fail")),
+            "unexpected: {mapped:?}"
+        );
 
         tokio::time::timeout(Duration::from_millis(50), notify.notified())
             .await
@@ -2145,9 +2251,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_backpressure_error_does_not_notify() {
+        use crate::pipeline::CycleError;
         let notify = Arc::new(tokio::sync::Notify::new());
         let err = DbError::Pipeline("unrelated".into());
-        let _ = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        let mapped = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        assert!(
+            matches!(mapped, CycleError::Fatal(_)),
+            "non-Fail errors must classify as Fatal"
+        );
 
         let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
@@ -2250,6 +2361,39 @@ mod tests {
         // A higher epoch is always processed.
         assert!(!skip(Some(5), None, None, 6));
         assert!(!skip(Some(5), Some(5), Some(5), 6));
+    }
+
+    /// The leader's checkpoint-convergence gate: ready only when every live node
+    /// has reported the same committed-assignment version. A respawned node that
+    /// lags (or hasn't republished yet) holds the gate closed.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn assignment_versions_converged_matrix() {
+        let map = |pairs: &[(u64, u64)]| -> rustc_hash::FxHashMap<u64, u64> {
+            pairs.iter().copied().collect()
+        };
+        // All live nodes on the same version → converged.
+        assert!(assignment_versions_converged(
+            &[1, 2, 3],
+            &map(&[(1, 5), (2, 5), (3, 5)])
+        ));
+        // A follower lagging behind the leader's newer version → not converged.
+        assert!(!assignment_versions_converged(
+            &[1, 2, 3],
+            &map(&[(1, 6), (2, 6), (3, 5)])
+        ));
+        // A live node with no reported version yet (just rejoined) → not converged.
+        assert!(!assignment_versions_converged(
+            &[1, 2, 3],
+            &map(&[(1, 5), (2, 5)])
+        ));
+        // Stale entries for dead nodes don't matter — only live ids are checked.
+        assert!(assignment_versions_converged(
+            &[1, 2],
+            &map(&[(1, 7), (2, 7), (9, 3)])
+        ));
+        // Single live node is trivially converged.
+        assert!(assignment_versions_converged(&[1], &map(&[(1, 4)])));
     }
 
     /// Build a follower-side controller whose `current_leader()` is a

@@ -84,6 +84,34 @@ impl CheckpointDecisionStore {
         }
     }
 
+    /// Highest epoch with a commit marker (committed cluster-wide), or `None`.
+    ///
+    /// # Errors
+    /// Object-store I/O.
+    pub async fn highest_committed(&self) -> Result<Option<u64>, DecisionError> {
+        let root = OsPath::from("checkpoint-decisions/");
+        let mut entries = self.store.list(Some(&root));
+        let mut highest: Option<u64> = None;
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| DecisionError::Io(e.to_string()))?;
+            let loc = entry.location.as_ref();
+            let rest = loc.strip_prefix("checkpoint-decisions/").unwrap_or("");
+            let Some(seg) = rest.split('/').next() else {
+                continue;
+            };
+            let Some(n) = seg.strip_prefix("epoch=") else {
+                continue;
+            };
+            // A non-numeric epoch= marker is store corruption; skipping it would silently
+            // report a lower committed epoch and rewind past committed data.
+            let epoch = n.parse::<u64>().map_err(|_| {
+                DecisionError::Io(format!("malformed checkpoint-decision marker: {loc}"))
+            })?;
+            highest = Some(highest.map_or(epoch, |h: u64| h.max(epoch)));
+        }
+        Ok(highest)
+    }
+
     /// Delete commit markers for `epoch < before`. Called by the
     /// checkpoint coordinator after its state-backend prune so
     /// markers don't accumulate one-per-checkpoint forever.
@@ -108,6 +136,10 @@ impl CheckpointDecisionStore {
                 continue;
             };
             let Ok(epoch) = n.parse::<u64>() else {
+                tracing::warn!(
+                    marker = loc,
+                    "skipping malformed checkpoint-decision marker"
+                );
                 continue;
             };
             if epoch < before {
@@ -166,6 +198,17 @@ mod tests {
         s.record_committed(1).await.unwrap();
         assert!(s.is_committed(1).await.unwrap());
         assert!(!s.is_committed(2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn highest_committed_picks_max() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+        assert_eq!(s.highest_committed().await.unwrap(), None);
+        s.record_committed(3).await.unwrap();
+        s.record_committed(7).await.unwrap();
+        s.record_committed(5).await.unwrap();
+        assert_eq!(s.highest_committed().await.unwrap(), Some(7));
     }
 
     #[tokio::test]

@@ -40,6 +40,8 @@ pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
 mod coordinated_committer;
+#[cfg(feature = "cluster")]
+mod coordinated_recovery;
 mod core_window_state;
 mod db;
 /// Prometheus metrics for the streaming engine.
@@ -121,7 +123,7 @@ pub use checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
     CheckpointStats,
 };
-pub use config::{BackpressurePolicy, LaminarConfig};
+pub use config::{BackpressurePolicy, LaminarConfig, RestartPolicy};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;

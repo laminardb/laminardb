@@ -154,6 +154,11 @@ pub fn spawn_snapshot_watcher(
             let version = registry.assignment_version();
             if version != published_version {
                 published_version = version;
+                // Publish the adopted version so the leader's checkpoint-convergence
+                // gate sees this node has caught up (see `announce_adopted_version`).
+                if let Some(ref c) = controller {
+                    c.announce_adopted_version(version).await;
+                }
                 if let (Some(c), Some(metrics)) = (controller.as_ref(), db.engine_metrics()) {
                     let nodes = c.assignable_with_locality();
                     publish_placement_metrics(
@@ -164,8 +169,34 @@ pub fn spawn_snapshot_watcher(
                     );
                 }
             }
+
+            // Publish the leader's checkpoint-convergence verdict for the local gate
+            // (off the hot path). Every tick: the leader learns a lagging follower
+            // caught up only by re-reading adopted versions — its version need not change.
+            if let Some(ref c) = controller {
+                if c.is_leader() {
+                    let converged = compute_checkpoint_convergence(c).await;
+                    c.publish_converged(converged);
+                }
+            }
         }
     })
+}
+
+/// Leader-side convergence verdict for the periodic-checkpoint gate: `true` when
+/// solo, or when every live node has reported the same adopted-assignment version.
+async fn compute_checkpoint_convergence(c: &ClusterController) -> bool {
+    let live: Vec<u64> = c.live_instances().iter().map(|n| n.0).collect();
+    if live.len() <= 1 {
+        return true;
+    }
+    let reported: rustc_hash::FxHashMap<u64, u64> = c
+        .read_adopted_versions()
+        .await
+        .into_iter()
+        .map(|(n, v)| (n.0, v))
+        .collect();
+    crate::pipeline_callback::assignment_versions_converged(&live, &reported)
 }
 
 /// Publish per-domain owner counts. Resets the gauge so disappeared domains don't leave stale series.

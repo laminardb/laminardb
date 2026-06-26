@@ -43,6 +43,30 @@ impl std::fmt::Debug for SecretString {
     }
 }
 
+/// Auto-restart policy for the fault supervisor (see `LaminarDB::enable_supervision`).
+#[derive(Debug, Clone)]
+pub struct RestartPolicy {
+    /// Max restarts within `window` before the pipeline is left hard-faulted.
+    pub max_restarts: usize,
+    /// Sliding window over which `max_restarts` is counted.
+    pub window: std::time::Duration,
+    /// Backoff before the first restart in a window.
+    pub initial_backoff: std::time::Duration,
+    /// Cap on the exponential backoff.
+    pub max_backoff: std::time::Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            window: std::time::Duration::from_secs(60),
+            initial_backoff: std::time::Duration::from_millis(500),
+            max_backoff: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
@@ -89,6 +113,11 @@ pub struct LaminarConfig {
     pub pipeline_max_input_buf_bytes: Option<usize>,
     /// Backpressure policy. See [`BackpressurePolicy`].
     pub pipeline_backpressure_policy: BackpressurePolicy,
+    /// Auto-restart policy applied when supervision is enabled.
+    pub restart_policy: RestartPolicy,
+    /// Cluster mode: on a fatal fault, the leader rewinds every node to the highest
+    /// cluster-wide committed epoch instead of a local-only restart. Default off.
+    pub coordinated_recovery: bool,
 }
 
 impl Default for LaminarConfig {
@@ -112,6 +141,8 @@ impl Default for LaminarConfig {
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
             pipeline_backpressure_policy: BackpressurePolicy::default(),
+            restart_policy: RestartPolicy::default(),
+            coordinated_recovery: false,
         }
     }
 }

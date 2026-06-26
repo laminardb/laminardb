@@ -105,6 +105,10 @@ pub struct LaminarDB {
     /// Panic message when the compute thread exits unexpectedly (`Faulted`);
     /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
     pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Self-ref set by `enable_supervision`; empty `Weak` (default) disables auto-restart.
+    pub(crate) supervisor_self: Arc<parking_lot::Mutex<std::sync::Weak<LaminarDB>>>,
+    /// Auto-restart timestamps within the sliding window; bounds restart storms.
+    pub(crate) restart_history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
@@ -133,6 +137,13 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
+    /// When set, the next start restores to this cluster-agreed epoch instead of the
+    /// local latest (taken in `start_inner`).
+    #[cfg(feature = "cluster")]
+    pub(crate) recover_target_epoch: parking_lot::Mutex<Option<u64>>,
+    /// One-shot guard for the recovery-monitor spawn.
+    #[cfg(feature = "cluster")]
+    pub(crate) recovery_monitor_started: std::sync::atomic::AtomicBool,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
@@ -226,10 +237,10 @@ pub(crate) use laminar_core::time::parse_duration_str;
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone)]
 pub struct RehydratedVnode {
-    /// Committed epoch the partial was read from.
+    /// Committed epoch the chain head was read from.
     pub epoch: u64,
-    /// `partial.bin` bytes at `epoch`.
-    pub bytes: bytes::Bytes,
+    /// Recovery chain (oldest→newest decoded-as-bytes partials): a FULL base plus any delta partials.
+    pub chain: Vec<bytes::Bytes>,
 }
 
 /// Summary of a single [`LaminarDB::adopt_assignment_snapshot`] call.
@@ -366,6 +377,8 @@ impl LaminarDB {
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
+            supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
+            restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
@@ -383,6 +396,10 @@ impl LaminarDB {
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            recover_target_epoch: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            recovery_monitor_started: std::sync::atomic::AtomicBool::new(false),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
@@ -682,8 +699,8 @@ impl LaminarDB {
             }
             if let Some(epoch) = report.epoch {
                 let mut staged = self.rehydrated_vnode_state.lock();
-                for (vnode, bytes) in report.restored {
-                    staged.insert(vnode, RehydratedVnode { epoch, bytes });
+                for (vnode, chain) in report.restored {
+                    staged.insert(vnode, RehydratedVnode { epoch, chain });
                 }
             }
         } else if !newly_acquired.is_empty() {

@@ -47,6 +47,17 @@ pub enum BarrierOutcome {
     Failed,
 }
 
+/// How a failed `execute_cycle` should be handled by the coordinator.
+#[derive(Debug, thiserror::Error)]
+pub enum CycleError {
+    /// Non-deferrable error: `ExactlyOnce` recovers from checkpoint, `AtLeastOnce` drops it.
+    #[error("{0}")]
+    Fatal(String),
+    /// `backpressure_policy=Fail` (shutdown already signaled); stop, don't recover.
+    #[error("{0}")]
+    Halt(String),
+}
+
 /// A registered source with its name and config.
 pub struct SourceRegistration {
     /// Source name.
@@ -70,7 +81,7 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String>;
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, CycleError>;
 
     /// Push cycle results to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
@@ -97,6 +108,29 @@ pub trait PipelineCallback: Send + 'static {
         true
     }
 
+    /// `true` while a coordinated restart is in flight; the checkpoint gate holds and the
+    /// shutdown drain skips its final checkpoint. Default `false`.
+    fn is_recovering(&self) -> bool {
+        false
+    }
+
+    /// `true` if a fatal cycle error should fault for recovery rather than drop-and-continue
+    /// (exactly-once, or coordinated recovery). Default `false` (at-least-once drops).
+    fn fault_on_cycle_error(&self) -> bool {
+        false
+    }
+
+    /// `true` when the cluster is converged enough for the leader to take a periodic
+    /// checkpoint (see the gate in `StreamingCoordinator::maybe_checkpoint`). The
+    /// cluster impl reads a watcher-published verdict locally — no gossip on the gate.
+    /// Default `true` (single-node). `fn -> impl Future` (not `async fn`) so
+    /// `trait_variant` keeps the default; `&mut self` keeps the future `Send`.
+    fn assignment_ready_for_checkpoint(
+        &mut self,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 
@@ -119,6 +153,9 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);
+
+    /// Count a fatal cycle error that was dropped-and-continued (at-least-once only).
+    fn note_cycle_error(&self) {}
 
     /// Poll table sources for incremental CDC changes.
     async fn poll_tables(&mut self);
@@ -161,6 +198,13 @@ pub trait PipelineCallback: Send + 'static {
     /// Next checkpoint ID when managed externally.
     fn next_checkpoint_id(&self) -> Option<u64> {
         None
+    }
+
+    /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
+    /// re-initialises cleanly. Default no-op. The `ready` expression (not `async {}`) keeps
+    /// `trait_variant`'s `impl Future` rewrite.
+    fn close_sinks(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
     }
 
     /// Register the local source barrier injectors.

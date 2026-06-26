@@ -99,7 +99,7 @@ pub(crate) enum SinkCommand {
     Sync {
         ack: oneshot::TxOneshot<()>,
     },
-    #[cfg(test)]
+    /// Close the connector (abort open transaction, flush) and exit the task.
     Close,
 }
 
@@ -303,12 +303,26 @@ impl SinkTaskHandle {
         ack_rx.await.map_err(|_| self.ack_dropped_err("abandon"))?
     }
 
-    #[cfg(test)]
+    /// Gracefully close the sink: aborts any open transaction (so an exactly-once
+    /// producer doesn't fence the next incarnation on restart) and joins the task.
     pub async fn close(&self) {
-        let _ = self.tx.send(SinkCommand::Close).await;
         let handle = self.task.lock().take();
-        if let Some(handle) = handle {
-            let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
+        // Bound the enqueue: a wedged task with a full channel would otherwise block the
+        // send forever, before any join timeout could fire.
+        let sent = tokio::time::timeout(Duration::from_secs(15), self.tx.send(SinkCommand::Close))
+            .await
+            .is_ok();
+        let Some(mut handle) = handle else {
+            return;
+        };
+        // Abort (not detach) if the send never landed or the join times out, so a stuck
+        // task can't outlive the next pipeline incarnation.
+        if !sent
+            || tokio::time::timeout(Duration::from_secs(15), &mut handle)
+                .await
+                .is_err()
+        {
+            handle.abort();
         }
     }
 
@@ -457,7 +471,6 @@ async fn handle_sink_command(
         SinkCommand::Sync { ack } => {
             ack.send(());
         }
-        #[cfg(test)]
         SinkCommand::Close => {
             if let Err(e) = inner.sink.flush().await {
                 tracing::warn!(sink = %inner.name, error = %e,

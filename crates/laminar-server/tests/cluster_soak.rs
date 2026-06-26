@@ -41,6 +41,14 @@
 //!   (default 256 KiB), `LAMINAR_SOAK_VNODES` (256), `LAMINAR_SOAK_RPS`
 //!   (400), `LAMINAR_SOAK_GROUPS` (2000 — the agg key-space size),
 //!   `LAMINAR_SOAK_SPAN` (12 — consecutive rows per agg key).
+//! - `LAMINAR_SOAK_CHANGELOG_AGG`  any value: add an `EMIT CHANGES` aggregate so
+//!   the changelog `last_emitted` delta path is exercised under kill -9 + rebalance.
+//!   Pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` (else the agg captures FULL).
+//! - `LAMINAR_SOAK_COORD_RECOVERY`  any value: set `[supervision] coordinated_recovery`.
+//! - `LAMINAR_SOAK_FAULT_INJECT_MS`  arm a one-shot cycle fault on one node this many ms
+//!   in; `LAMINAR_SOAK_FAULT_INJECT_NODE` (default 1 = follower; 0 = leader) picks which.
+//!   The 1A-cluster recovery soak runs these with `LAMINAR_SOAK_COORD_RECOVERY=1`,
+//!   `LAMINAR_SOAK_KILLS=0`, and the Kafka EO sink.
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -65,6 +73,8 @@ struct Node {
     log_path: PathBuf,
     child: Option<Child>,
     http_port: u16,
+    /// `LAMINAR_FAULT_INJECT_AFTER_MS` for this node, when armed (recovery soak).
+    fault_inject_ms: Option<u64>,
 }
 
 impl Node {
@@ -74,18 +84,26 @@ impl Node {
             .append(true)
             .open(&self.log_path)
             .expect("node log file");
-        let child = Command::new(env!("CARGO_BIN_EXE_laminardb"))
-            .arg("--config")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_laminardb"));
+        cmd.arg("--config")
             .arg(&self.config_path)
             .env(
                 "RUST_LOG",
                 "laminardb=info,laminar_server=info,laminar_db=info,laminar_core=info",
             )
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("spawn laminardb");
-        self.child = Some(child);
+            .stderr(Stdio::from(log));
+        // One-shot: `take()` arms only the first spawn (no re-arm on restart); the explicit
+        // remove overrides any inherited value so a stray parent env var can't arm other nodes.
+        match self.fault_inject_ms.take() {
+            Some(ms) => {
+                cmd.env("LAMINAR_FAULT_INJECT_AFTER_MS", ms.to_string());
+            }
+            None => {
+                cmd.env_remove("LAMINAR_FAULT_INJECT_AFTER_MS");
+            }
+        }
+        self.child = Some(cmd.spawn().expect("spawn laminardb"));
     }
 
     /// `kill -9` equivalent: no shutdown hooks, no final checkpoint.
@@ -215,6 +233,17 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
 
+    // Incremental delta checkpoints (Lever 2): `LAMINAR_SOAK_DELTA_CHAIN_MAX=N` enables them and
+    // adds a non-changelog aggregate whose per-vnode state is delta-captured. (Changelog aggregates
+    // now also take the delta path — add one with `LAMINAR_SOAK_CHANGELOG_AGG` to exercise the
+    // `last_emitted` delta.) The aggs have no sink — they exercise the delta write+chain-recovery
+    // path under kill -9; the exactly-once proof stays on the pass-through `soak_stream` sink.
+    let delta_chain_max = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").ok().map(|v| {
+        v.parse::<u32>()
+            .expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32")
+    });
+    let delta_line = delta_chain_max.map_or(String::new(), |n| format!("delta_chain_max = {n}"));
+
     let mut toml = format!(
         r#"
 node_id = "n{id}"
@@ -247,6 +276,7 @@ interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = {depth}
 {gate_poll}
+{delta_line}
 
 [checkpoint.storage]
 {storage}
@@ -266,6 +296,39 @@ sql = "SELECT seq, ts_ms, value FROM gen"
         seeds = seeds.join(", "),
         url = checkpoint_url,
     );
+
+    // Non-changelog agg (no EMIT CHANGES) over a bounded, slow-cycling key space: its per-vnode
+    // state accumulates and is captured as delta partials each checkpoint, so kill -9 + rebalance
+    // exercises the delta write + chain-recovery path. No sink — state is the thing under test.
+    // `LAMINAR_SOAK_AGG=1` adds it without delta, to isolate the shuffle path from the delta path.
+    if delta_chain_max.is_some() || std::env::var("LAMINAR_SOAK_AGG").is_ok() {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_delta_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups}"
+"#,
+        ));
+    }
+
+    // Changelog aggregate (EMIT CHANGES) under delta capture — exercises the
+    // `last_emitted` delta path (changelog aggs used to force-FULL every epoch).
+    // Pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` so its per-vnode state takes the
+    // delta + chain-recovery path through kill -9 + rebalance. State is the thing
+    // under test; the pass-through `soak_stream` sink still carries the EO proof.
+    if std::env::var("LAMINAR_SOAK_CHANGELOG_AGG").is_ok() {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_changelog_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+"#,
+        ));
+    }
 
     // Demotable per-vnode aggregate state for the cold tier: an EMIT
     // CHANGES agg over a SLOW-CYCLING bounded key space. Only changelog
@@ -309,6 +372,10 @@ format = "json"
 "#,
             topic = eo_topic(id),
         ));
+    }
+
+    if std::env::var("LAMINAR_SOAK_COORD_RECOVERY").is_ok() {
+        toml.push_str("\n[supervision]\ncoordinated_recovery = true\n");
     }
 
     let path = dir.join(format!("node{id}.toml"));
@@ -484,6 +551,12 @@ fn three_node_kill9_soak() {
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("soak: node logs in {}", log_dir.display());
 
+    // Recovery soak: arm a one-shot fault on a single node (default 1 = follower, 0 = leader).
+    let fault_inject_ms = std::env::var("LAMINAR_SOAK_FAULT_INJECT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let fault_inject_node = env_u64("LAMINAR_SOAK_FAULT_INJECT_NODE", 1) as usize;
+
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
             id,
@@ -491,6 +564,7 @@ fn three_node_kill9_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
+            fault_inject_ms: fault_inject_ms.filter(|_| id == fault_inject_node),
         })
         .collect();
     for n in &mut nodes {
@@ -641,6 +715,21 @@ fn three_node_kill9_soak() {
         );
     }
 
+    // Recovery proof: with a fault injected and no kill-9 churn (which would reset the
+    // per-node metric on restart), the cluster must have applied the leader-coordinated
+    // round. EO + progress prove the data; this proves the feature actually engaged.
+    if fault_inject_ms.is_some() && max_kills == 0 {
+        let recoveries: f64 = nodes
+            .iter()
+            .filter_map(|n| n.metric("laminardb_coordinated_recoveries_total"))
+            .sum();
+        assert!(
+            recoveries >= 1.0,
+            "fault injected but no coordinated recovery recorded across the cluster",
+        );
+        eprintln!("soak: coordinated recoveries applied = {recoveries}");
+    }
+
     if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
         // Let in-flight epochs commit, then stop every writer so the
         // diff reads a stable topic (transactions open at the kill are
@@ -682,6 +771,22 @@ fn write_graceful_config(
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
 
+    // Optional incremental delta checkpoints + a non-changelog agg to exercise the delta
+    // write/chain-recovery path across the graceful rotation (see `write_config`).
+    let (delta_line, delta_agg) = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").map_or_else(
+        |_| (String::new(), String::new()),
+        |v| {
+            let n: u32 = v.parse().expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32");
+            let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+            (
+                format!("delta_chain_max = {n}"),
+                format!(
+                    "\n[[pipeline]]\nname = \"soak_delta_agg\"\nsql = \"SELECT seq % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM kin GROUP BY seq % {groups}\"\n"
+                ),
+            )
+        },
+    );
+
     let toml = format!(
         r#"
 node_id = "n{id}"
@@ -711,6 +816,7 @@ url = "{url}"
 interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = 4
+{delta_line}
 
 [[source]]
 name = "kin"
@@ -729,7 +835,7 @@ nullable = false
 [[pipeline]]
 name = "passthrough"
 sql = "SELECT seq FROM kin"
-
+{delta_agg}
 [[sink]]
 name = "kout"
 pipeline = "passthrough"
@@ -916,6 +1022,7 @@ fn graceful_rotation_kafka_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
+            fault_inject_ms: None,
         })
         .collect();
 
