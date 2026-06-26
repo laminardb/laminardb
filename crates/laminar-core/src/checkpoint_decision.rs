@@ -102,9 +102,12 @@ impl CheckpointDecisionStore {
             let Some(n) = seg.strip_prefix("epoch=") else {
                 continue;
             };
-            if let Ok(epoch) = n.parse::<u64>() {
-                highest = Some(highest.map_or(epoch, |h: u64| h.max(epoch)));
-            }
+            // A non-numeric epoch= marker is store corruption; skipping it would silently
+            // report a lower committed epoch and rewind past committed data.
+            let epoch = n.parse::<u64>().map_err(|_| {
+                DecisionError::Io(format!("malformed checkpoint-decision marker: {loc}"))
+            })?;
+            highest = Some(highest.map_or(epoch, |h: u64| h.max(epoch)));
         }
         Ok(highest)
     }
@@ -133,6 +136,10 @@ impl CheckpointDecisionStore {
                 continue;
             };
             let Ok(epoch) = n.parse::<u64>() else {
+                tracing::warn!(
+                    marker = loc,
+                    "skipping malformed checkpoint-decision marker"
+                );
                 continue;
             };
             if epoch < before {

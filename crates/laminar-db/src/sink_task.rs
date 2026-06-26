@@ -306,10 +306,23 @@ impl SinkTaskHandle {
     /// Gracefully close the sink: aborts any open transaction (so an exactly-once
     /// producer doesn't fence the next incarnation on restart) and joins the task.
     pub async fn close(&self) {
-        let _ = self.tx.send(SinkCommand::Close).await;
         let handle = self.task.lock().take();
-        if let Some(handle) = handle {
-            let _ = tokio::time::timeout(Duration::from_secs(15), handle).await;
+        // Bound the enqueue: a wedged task with a full channel would otherwise block the
+        // send forever, before any join timeout could fire.
+        let sent = tokio::time::timeout(Duration::from_secs(15), self.tx.send(SinkCommand::Close))
+            .await
+            .is_ok();
+        let Some(mut handle) = handle else {
+            return;
+        };
+        // Abort (not detach) if the send never landed or the join times out, so a stuck
+        // task can't outlive the next pipeline incarnation.
+        if !sent
+            || tokio::time::timeout(Duration::from_secs(15), &mut handle)
+                .await
+                .is_err()
+        {
+            handle.abort();
         }
     }
 

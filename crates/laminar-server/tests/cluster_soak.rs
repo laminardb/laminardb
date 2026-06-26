@@ -93,8 +93,15 @@ impl Node {
             )
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log));
-        if let Some(ms) = self.fault_inject_ms {
-            cmd.env("LAMINAR_FAULT_INJECT_AFTER_MS", ms.to_string());
+        // One-shot: `take()` arms only the first spawn (no re-arm on restart); the explicit
+        // remove overrides any inherited value so a stray parent env var can't arm other nodes.
+        match self.fault_inject_ms.take() {
+            Some(ms) => {
+                cmd.env("LAMINAR_FAULT_INJECT_AFTER_MS", ms.to_string());
+            }
+            None => {
+                cmd.env_remove("LAMINAR_FAULT_INJECT_AFTER_MS");
+            }
         }
         self.child = Some(cmd.spawn().expect("spawn laminardb"));
     }

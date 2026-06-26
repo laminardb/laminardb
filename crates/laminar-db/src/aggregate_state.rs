@@ -3511,6 +3511,7 @@ mod tests {
     /// gate (`changelog-delta-last-emitted`).
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one coherent replay scenario with local scaffolding
     async fn delta_chain_replay_reproduces_changelog_last_emitted() {
         use std::collections::BTreeMap;
         const V: u32 = 1; // single vnode → every key lands in vnode 0

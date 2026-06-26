@@ -195,6 +195,7 @@ impl<'a> VnodeRehydrator<'a> {
         };
 
         // Follow reference hops (no data, just a base pointer) to the real partial.
+        let mut cur_epoch = epoch;
         loop {
             let Ok(p) = VnodePartial::decode(&bytes) else {
                 // Undecodable → pass through; the apply path skips it (prior behavior).
@@ -202,6 +203,11 @@ impl<'a> VnodeRehydrator<'a> {
             };
             if p.operators.is_empty() && p.deltas.is_empty() {
                 if let Some(base) = p.base_epoch {
+                    // base_epoch always points to an older epoch; a non-decreasing pointer
+                    // is corruption — bail rather than loop forever.
+                    if base >= cur_epoch {
+                        return Ok(None);
+                    }
                     match self
                         .backend
                         .read_partial(vnode, base)
@@ -210,6 +216,7 @@ impl<'a> VnodeRehydrator<'a> {
                     {
                         Some(b) => {
                             bytes = b;
+                            cur_epoch = base;
                             continue;
                         }
                         None => return Ok(None), // reference base missing → start fresh
@@ -231,6 +238,9 @@ impl<'a> VnodeRehydrator<'a> {
         let mut cur = head;
         while !need.is_empty() {
             let Some(parent) = cur.base_epoch else { break };
+            if parent >= cur_epoch {
+                break; // non-decreasing base → corruption; stop (unresolved ops start fresh)
+            }
             let Some(pbytes) = self
                 .backend
                 .read_partial(vnode, parent)
@@ -246,6 +256,7 @@ impl<'a> VnodeRehydrator<'a> {
                 need.remove(n);
             }
             chain_rev.push(pbytes);
+            cur_epoch = parent;
             cur = pp;
         }
         chain_rev.reverse();
@@ -479,6 +490,7 @@ impl<'a> RecoveryManager<'a> {
         sources: &[RegisteredSource],
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> RecoveredState {
         // In strict mode an unresolved sidecar is recorded so check_strict() rejects this checkpoint.
         let sidecar_ok = self.resolve_external_states(&mut manifest).await;
@@ -551,7 +563,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Roll back exactly-once sinks that did not commit. Committed sinks are left alone.
-        Self::rollback_uncommitted_sinks(sinks, &manifest, &mut result).await;
+        Self::rollback_uncommitted_sinks(sinks, &manifest, decision_store, &mut result).await;
 
         info!(
             checkpoint_id = manifest.checkpoint_id,
@@ -664,8 +676,19 @@ impl<'a> RecoveryManager<'a> {
     async fn rollback_uncommitted_sinks(
         sinks: &[RegisteredSink],
         manifest: &CheckpointManifest,
+        decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
         result: &mut RecoveredState,
     ) {
+        // A marker-committed epoch committed its sinks (the manifest just wasn't updated
+        // before the fault); rolling back here would abort a committed transaction.
+        if let Some(ds) = decision_store {
+            match ds.is_committed(manifest.epoch).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => warn!(epoch = manifest.epoch, error = %e,
+                    "[LDB-6040] decision-store read failed; rolling back pending sinks"),
+            }
+        }
         for sink in sinks {
             if !sink.exactly_once {
                 continue;
@@ -801,7 +824,7 @@ impl<'a> RecoveryManager<'a> {
             return None;
         }
         let state = self
-            .restore_from(manifest, sources, sinks, table_sources)
+            .restore_from(manifest, sources, sinks, table_sources, decision_store)
             .await;
         if let Err(e) = self.check_strict(&state) {
             warn!(checkpoint_id, epoch, error = %e, "strict restore errors, trying older");

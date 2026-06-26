@@ -1047,6 +1047,8 @@ mod tests {
         /// Fail on this 1-based cycle number.
         fatal_at_cycle: Option<u32>,
         cycle_errors: Arc<AtomicU64>,
+        /// Whether a fatal cycle error should fault (exactly-once) vs drop-and-continue.
+        fault_on_error: bool,
     }
 
     impl MockCallback {
@@ -1058,6 +1060,7 @@ mod tests {
                 force_checkpoint_flag: None,
                 fatal_at_cycle: None,
                 cycle_errors: Arc::new(AtomicU64::new(0)),
+                fault_on_error: false,
             }
         }
     }
@@ -1086,6 +1089,10 @@ mod tests {
 
         fn note_cycle_error(&self) {
             self.cycle_errors.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn fault_on_cycle_error(&self) -> bool {
+            self.fault_on_error
         }
 
         fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
@@ -1206,6 +1213,7 @@ mod tests {
         let mut callback = MockCallback::new();
         callback.force_checkpoint_flag = Some(Arc::clone(&force_flag));
         callback.fatal_at_cycle = Some(1);
+        callback.fault_on_error = true; // exactly-once: a fatal cycle error must fault
 
         tx.send(SourceMsg::Batch {
             source_idx: 0,
