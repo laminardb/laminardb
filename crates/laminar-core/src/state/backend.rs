@@ -199,6 +199,14 @@ pub trait StateBackend: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Whether partials written here survive a process restart. Durable backends
+    /// (object-store, including `file://`) return `true`; the in-process backend is
+    /// non-durable and returns `false`. Cluster startup requires a durable backend
+    /// so a peer can recover a dead node's vnodes from shared storage.
+    fn is_durable(&self) -> bool {
+        false
+    }
+
     /// Raise the backend's authoritative assignment version — the
     /// minimum [`VnodeRegistry::assignment_version`] it will accept on
     /// [`write_partial`](Self::write_partial). Hosts call this on boot

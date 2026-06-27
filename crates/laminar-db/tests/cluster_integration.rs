@@ -8,6 +8,42 @@ mod cluster_harness;
 #[path = "common/mod.rs"]
 mod common;
 
+mod durable_backend_gate {
+    use std::sync::Arc;
+
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
+    use laminar_db::LaminarDB;
+    use tokio::sync::watch;
+
+    // Cluster mode must refuse to start on a non-durable (in-process) state backend: a peer
+    // could not recover a dead node's vnodes from another node's local memory.
+    #[tokio::test]
+    async fn cluster_start_rejects_non_durable_backend() {
+        let self_id = NodeId(1);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+
+        let db = LaminarDB::builder()
+            .cluster_controller(controller)
+            .state_backend(Arc::new(InProcessBackend::new(4)))
+            .vnode_registry(Arc::new(VnodeRegistry::new(4)))
+            .build()
+            .await
+            .expect("build succeeds; durability is enforced at start");
+
+        let err = db
+            .start()
+            .await
+            .expect_err("cluster start must reject a non-durable backend");
+        assert!(
+            err.to_string().contains("LDB-0011"),
+            "expected LDB-0011 durable-backend error, got: {err}"
+        );
+    }
+}
+
 mod smoke {
     use std::collections::HashSet;
     use std::time::Duration;

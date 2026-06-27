@@ -130,6 +130,10 @@ impl ObjectStoreBackend {
 
 #[async_trait]
 impl StateBackend for ObjectStoreBackend {
+    fn is_durable(&self) -> bool {
+        true
+    }
+
     async fn write_partial(
         &self,
         vnode: u32,

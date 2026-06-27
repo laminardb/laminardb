@@ -396,6 +396,27 @@ impl LaminarDB {
             tracing::debug!(sink = %name, connector_type = ?reg.connector_type, "Registered sink");
         }
 
+        // Cluster mode needs a durable, shared state backend: a peer recovers a dead node's
+        // vnodes by reading its per-vnode partials from shared storage. The in-process backend
+        // keeps partials in local memory, so a real cluster can't recover them after a node dies.
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.lock().is_some() {
+            let durable = self
+                .state_backend
+                .lock()
+                .as_ref()
+                .is_some_and(|b| b.is_durable());
+            if !durable {
+                return Err(DbError::Config(
+                    "[LDB-0011] cluster mode requires a durable state backend so a peer can \
+                     recover a failed node's vnodes; set object_store_url to shared storage \
+                     (s3://, gs://, az://, or file://) or install an ObjectStoreBackend. The \
+                     in-process backend is non-durable and cannot recover after a node restart."
+                        .into(),
+                ));
+            }
+        }
+
         if let Some(ref cp_config) = self.config.checkpoint {
             use crate::checkpoint_coordinator::{
                 CheckpointConfig as CkpConfig, CheckpointCoordinator,
