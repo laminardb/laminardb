@@ -559,6 +559,10 @@ pub(crate) struct IncrementalAggState {
     // Groups for these vnodes were dropped; captures stage a cold marker.
     #[cfg(feature = "state-tier")]
     cold_vnodes: rustc_hash::FxHashSet<u32>,
+    // Individual groups demoted to the tier (v2 group granularity): dropped from `groups`, their
+    // bytes resident only in the tier until promoted. A FULL re-base must stream these back.
+    #[cfg(feature = "state-tier")]
+    cold_groups: AHashSet<arrow::row::OwnedRow>,
     // Delta-state tracking: keys mutated / removed since the last per-vnode capture,
     // bucketed by vnode. Populated only while `delta_vnode_count` is set (off by
     // default → zero cost).
@@ -913,6 +917,8 @@ impl IncrementalAggState {
             dirty_all: false,
             #[cfg(feature = "state-tier")]
             cold_vnodes: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "state-tier")]
+            cold_groups: AHashSet::new(),
             #[cfg(feature = "cluster")]
             delta_enabled: false,
             delta_vnode_count: None,
@@ -2080,6 +2086,122 @@ impl IncrementalAggState {
     /// Mark a vnode dirty to block demotion until the next capture.
     pub(crate) fn mark_vnode_dirty(&mut self, vnode: u32) {
         self.dirty_vnodes.insert(vnode);
+    }
+
+    /// Groups demoted to the tier (v2 group granularity).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cold_groups(&self) -> &AHashSet<arrow::row::OwnedRow> {
+        &self.cold_groups
+    }
+
+    /// Whether `key` can be demoted now: changelog mode, delta tracking on this `vnode_count`,
+    /// the group resident, and clean (untouched since the last capture, so its tier bytes match a
+    /// restorable checkpoint). Mirrors `can_demote` at group granularity.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn can_demote_group(&self, key: &arrow::row::OwnedRow, vnode_count: u32) -> bool {
+        self.emit_changelog
+            && self.delta_enabled
+            && !self.dirty_all
+            && self.delta_vnode_count == Some(vnode_count)
+            && self.groups.contains_key(key)
+            && !self.is_group_dirty(key, vnode_count)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_group_dirty(&self, key: &arrow::row::OwnedRow, vnode_count: u32) -> bool {
+        let v = self.delta_vnode_of(key.as_ref(), vnode_count);
+        self.dirty_keys_by_vnode
+            .get(&v)
+            .is_some_and(|s| s.contains(key))
+            || self
+                .removed_by_vnode
+                .get(&v)
+                .is_some_and(|s| s.contains(key))
+    }
+
+    /// Serialize one resident group's state (columnar, same shape as a delta's changed-groups,
+    /// carrying the group's `last_emitted` dedup entry) for a tier write. The caller writes the
+    /// bytes to the tier, then calls `drop_demoted_group` — write-before-drop, like `demote_vnode`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn encode_group(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+    ) -> Result<AggStateCheckpoint, DbError> {
+        let fingerprint = self.query_fingerprint();
+        let retractable = self.weight_col_idx.is_some();
+        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
+            .groups
+            .iter_mut()
+            .filter(|(k, _)| *k == key)
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+        if entries.is_empty() {
+            return Err(DbError::Pipeline(
+                "encode_group: group not resident".to_string(),
+            ));
+        }
+        let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
+            &self.row_converter,
+            self.num_group_cols,
+            &self.agg_specs,
+            retractable,
+            &mut entries,
+        )?;
+        drop(entries); // release the &mut self.groups borrow before reading last_emitted
+        let last_emitted = self.last_emitted_for_single(key)?;
+        Ok(AggStateCheckpoint {
+            fingerprint,
+            keys_ipc,
+            acc_state_ipc,
+            last_updated_ms,
+            last_emitted,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn last_emitted_for_single(
+        &self,
+        key: &arrow::row::OwnedRow,
+    ) -> Result<Vec<EmittedCheckpoint>, DbError> {
+        if !self.emit_changelog {
+            return Ok(Vec::new());
+        }
+        let Some(vals) = self.last_emitted.get(key) else {
+            return Ok(Vec::new());
+        };
+        let sv_key = row_to_scalar_key_with_types(&self.row_converter, key, &self.group_types)?;
+        Ok(vec![EmittedCheckpoint {
+            key: scalars_to_ipc(&sv_key)?,
+            values: scalars_to_ipc(vals)?,
+        }])
+    }
+
+    /// Drop a demoted group from live state after its tier write is confirmed. Tracked in
+    /// `cold_groups` so a FULL re-base streams it back (Slice 4).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn drop_demoted_group(&mut self, key: &arrow::row::OwnedRow) {
+        self.groups.remove(key);
+        self.last_emitted.remove(key);
+        self.cold_groups.insert(key.clone());
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
+    }
+
+    /// Rehydrate a demoted group from its tier bytes (decoded to `cp`) back into live state.
+    /// Reuses `apply_delta`'s per-key REPLACE; clears the cold marker.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn promote_group(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+        cp: AggStateCheckpoint,
+    ) -> Result<(), DbError> {
+        self.apply_delta(&AggVnodeDelta {
+            changed: cp,
+            tombstones_ipc: Vec::new(),
+        })?;
+        self.cold_groups.remove(key);
+        self.size_cache.invalidate();
+        Ok(())
     }
 }
 
@@ -3773,6 +3895,140 @@ mod tests {
         assert_eq!(
             cr, pr,
             "post-recovery emit must produce identical changelog output"
+        );
+    }
+
+    /// v2 group-granular tiering (Slice 2): a clean changelog group encodes, drops from live state
+    /// into `cold_groups`, and promotes back exactly (group state + `last_emitted` dedup), so the
+    /// recovered group re-emits nothing. A dirty group is not demotable.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn demote_then_promote_group_round_trips() {
+        use std::collections::BTreeMap;
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        fn snapshot(
+            state: &mut IncrementalAggState,
+        ) -> (BTreeMap<Vec<u8>, String>, BTreeMap<Vec<u8>, String>) {
+            let groups = state
+                .groups
+                .iter_mut()
+                .map(|(k, v)| {
+                    (
+                        k.as_ref().to_vec(),
+                        format!("{:?}", v.accs[0].evaluate().unwrap()),
+                    )
+                })
+                .collect();
+            let emitted = state
+                .last_emitted
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_vec(), format!("{v:?}")))
+                .collect();
+            (groups, emitted)
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true, // emit_changelog
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // Seed + emit + capture → groups clean, delta_vnode_count = Some(V).
+        feed(&mut state, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 8).unwrap();
+
+        let before = snapshot(&mut state);
+        let keys: Vec<arrow::row::OwnedRow> = state.groups.keys().cloned().collect();
+        assert_eq!(keys.len(), 3);
+
+        // Each clean group encodes then drops (the caller writes the bytes to the tier between).
+        let mut demoted: Vec<(arrow::row::OwnedRow, AggStateCheckpoint)> = Vec::new();
+        for k in &keys {
+            assert!(
+                state.can_demote_group(k, V),
+                "a clean group must be demotable"
+            );
+            let cp = state.encode_group(k).unwrap();
+            state.drop_demoted_group(k);
+            demoted.push((k.clone(), cp));
+        }
+        assert!(state.groups.is_empty(), "all groups demoted out of memory");
+        assert_eq!(state.cold_groups().len(), 3);
+
+        // Promote them back; live state must match exactly and re-emit nothing.
+        for (k, cp) in demoted {
+            state.promote_group(&k, cp).unwrap();
+        }
+        assert!(state.cold_groups().is_empty());
+        assert_eq!(
+            snapshot(&mut state),
+            before,
+            "promote must restore group state + last_emitted",
+        );
+        let drained: usize = state
+            .emit()
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(drained, 0, "promoted changelog groups must not re-emit");
+
+        // A group changed since the last capture is dirty → not demotable.
+        feed(&mut state, &[("a", 10.0)], 2000);
+        let dirty = state
+            .groups
+            .keys()
+            .find(|k| state.is_group_dirty(k, V))
+            .cloned()
+            .expect("the changed group is dirty");
+        assert!(
+            !state.can_demote_group(&dirty, V),
+            "a dirty group must not be demotable",
         );
     }
 
