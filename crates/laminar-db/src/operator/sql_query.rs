@@ -75,6 +75,17 @@ struct AggPromotion {
     tier: crate::state_tier::TierTx,
     deferred: VecDeque<(i64, RecordBatch)>,
     inflight: FxHashMap<u32, oneshot::Receiver<Result<Option<Bytes>, DbError>>>,
+    // v2 group granularity: in-flight per-group fetches keyed by the group's row key, carrying the
+    // tier coordinates `(vnode, group_key_bytes)` so a miss can be re-issued.
+    #[allow(clippy::type_complexity)]
+    inflight_groups: FxHashMap<
+        arrow::row::OwnedRow,
+        (
+            u32,
+            Vec<u8>,
+            oneshot::Receiver<Result<Option<Bytes>, DbError>>,
+        ),
+    >,
     max_deferred_rows: usize,
 }
 
@@ -89,6 +100,7 @@ impl AggPromotion {
             tier,
             deferred: VecDeque::new(),
             inflight: FxHashMap::default(),
+            inflight_groups: FxHashMap::default(),
             max_deferred_rows: MAX_DEFERRED_PROMOTION_ROWS,
         }
     }
@@ -143,12 +155,62 @@ impl AggPromotion {
         let _ = self.tier.try_send(req);
     }
 
+    fn drain_ready_groups(&mut self) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>, Option<Bytes>)> {
+        let mut ready = Vec::new();
+        let mut still = FxHashMap::default();
+        for (key, (vnode, group, mut rx)) in self.inflight_groups.drain() {
+            match rx.try_recv() {
+                Ok(Ok(slice)) => ready.push((key, vnode, group, slice)),
+                Ok(Err(e)) => tracing::warn!(
+                    operator = %self.op_name, vnode, error = %e,
+                    "cold-tier group promotion fetch failed — will retry"
+                ),
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    still.insert(key, (vnode, group, rx));
+                }
+                Err(oneshot::error::TryRecvError::Closed) => tracing::warn!(
+                    operator = %self.op_name, vnode,
+                    "cold-tier worker dropped a group promotion fetch"
+                ),
+            }
+        }
+        self.inflight_groups = still;
+        ready
+    }
+
+    fn issue_fetch_group(&mut self, key: arrow::row::OwnedRow, vnode: u32, group: Vec<u8>) {
+        if self.inflight_groups.contains_key(&key) {
+            return;
+        }
+        let (reply, rx) = oneshot::channel();
+        let req = crate::state_tier::TierRequest::FetchGroup {
+            operator: Arc::clone(&self.op_name),
+            vnode,
+            group: group.clone(),
+            reply,
+        };
+        if self.tier.try_send(req).is_ok() {
+            self.inflight_groups.insert(key, (vnode, group, rx));
+        }
+    }
+
+    fn drop_group(&self, vnode: u32, group: Vec<u8>) {
+        let (reply, _rx) = oneshot::channel();
+        let req = crate::state_tier::TierRequest::DropGroup {
+            operator: Arc::clone(&self.op_name),
+            vnode,
+            group,
+            reply,
+        };
+        let _ = self.tier.try_send(req);
+    }
+
     fn defer(&mut self, watermark: i64, batch: RecordBatch) {
         self.deferred.push_back((watermark, batch));
     }
 
     fn has_pending(&self) -> bool {
-        !self.inflight.is_empty() || !self.deferred.is_empty()
+        !self.inflight.is_empty() || !self.deferred.is_empty() || !self.inflight_groups.is_empty()
     }
 
     fn take_deferred(&mut self) -> Vec<(i64, RecordBatch)> {
@@ -599,6 +661,28 @@ impl SqlQueryOperator {
             }
         }
 
+        // v2 group granularity: rehydrate any cold groups whose fetch resolved.
+        let ready_groups = self
+            .promotion
+            .as_mut()
+            .map(AggPromotion::drain_ready_groups)
+            .unwrap_or_default();
+        for (key, vnode, group, slice) in ready_groups {
+            match slice {
+                Some(bytes) => {
+                    self.apply_group_state(&key, &bytes)?;
+                    if let Some(p) = self.promotion.as_ref() {
+                        p.drop_group(vnode, group);
+                    }
+                }
+                None => {
+                    if let Some(p) = self.promotion.as_mut() {
+                        p.issue_fetch_group(key, vnode, group);
+                    }
+                }
+            }
+        }
+
         let mut candidates = self
             .promotion
             .as_mut()
@@ -621,11 +705,19 @@ impl SqlQueryOperator {
         let mut to_process: Vec<(i64, RecordBatch)> = Vec::new();
         for (wm, batch) in candidates {
             let touched = cold_vnodes_touched(&batch, num_group_cols, vnode_count, &cold);
-            if touched.is_empty() {
+            let touched_groups = if let QueryState::Agg(ref agg) = self.state {
+                agg.cold_groups_touched(&batch, vnode_count)?
+            } else {
+                Vec::new()
+            };
+            if touched.is_empty() && touched_groups.is_empty() {
                 to_process.push((wm, batch));
             } else if let Some(p) = self.promotion.as_mut() {
                 for v in touched {
                     p.issue_fetch(v);
+                }
+                for (key, vnode, group) in touched_groups {
+                    p.issue_fetch_group(key, vnode, group);
                 }
                 p.defer(wm, batch);
             }
@@ -641,6 +733,32 @@ impl SqlQueryOperator {
         }
 
         self.emit_agg_output(watermark).await
+    }
+
+    /// Rehydrate one demoted group from its tier bytes back into live aggregate state (v2 group
+    /// promotion).
+    #[cfg(feature = "state-tier")]
+    fn apply_group_state(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        let cp: AggStateCheckpoint =
+            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "cold-group state deserialization for '{}': {e}",
+                    self.op_name
+                ))
+            })?;
+        if let QueryState::Agg(ref mut agg) = self.state {
+            agg.promote_group(key, cp)?;
+        } else {
+            tracing::warn!(
+                query = %self.op_name,
+                "ignoring rehydrated group state for non-aggregate query"
+            );
+        }
+        Ok(())
     }
 
     async fn emit_agg_output(&mut self, watermark: i64) -> Result<Vec<RecordBatch>, DbError> {

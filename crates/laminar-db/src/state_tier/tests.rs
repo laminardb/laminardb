@@ -158,3 +158,42 @@ async fn worker_demote_fetch_drop() {
     .unwrap();
     assert_eq!(rx.await.unwrap().unwrap(), None);
 }
+
+#[tokio::test]
+async fn worker_fetch_group_and_drop_group() {
+    let (_tmp, dir) = tier_dir();
+    let store = Arc::new(StateTierStore::open(&dir, None).unwrap());
+    store.put_group("agg", 2, b"k", b"gv").unwrap();
+    let tx = spawn_worker(&tokio::runtime::Handle::current(), store, 16);
+    let op: Arc<str> = Arc::from("agg");
+
+    let (reply, rx) = oneshot::channel();
+    tx.try_send(TierRequest::FetchGroup {
+        operator: Arc::clone(&op),
+        vnode: 2,
+        group: b"k".to_vec(),
+        reply,
+    })
+    .unwrap();
+    assert_eq!(rx.await.unwrap().unwrap().unwrap().as_ref(), b"gv");
+
+    let (reply, rx) = oneshot::channel();
+    tx.try_send(TierRequest::DropGroup {
+        operator: Arc::clone(&op),
+        vnode: 2,
+        group: b"k".to_vec(),
+        reply,
+    })
+    .unwrap();
+    rx.await.unwrap().unwrap();
+
+    let (reply, rx) = oneshot::channel();
+    tx.try_send(TierRequest::FetchGroup {
+        operator: op,
+        vnode: 2,
+        group: b"k".to_vec(),
+        reply,
+    })
+    .unwrap();
+    assert_eq!(rx.await.unwrap().unwrap(), None);
+}

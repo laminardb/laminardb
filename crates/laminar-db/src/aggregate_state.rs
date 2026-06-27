@@ -2203,6 +2203,39 @@ impl IncrementalAggState {
         self.size_cache.invalidate();
         Ok(())
     }
+
+    /// Distinct cold (demoted) group keys touched by `batch`, with tier coordinates
+    /// `(key, vnode, group_key_bytes)`. Empty when no group is cold. The caller fetches each and
+    /// defers the batch until they rehydrate (fetch-on-access promotion). `group_key_bytes` and
+    /// `vnode` match what `drop_demoted_group`'s caller wrote, so the tier keys line up.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cold_groups_touched(
+        &self,
+        batch: &RecordBatch,
+        vnode_count: u32,
+    ) -> Result<Vec<(arrow::row::OwnedRow, u32, Vec<u8>)>, DbError> {
+        if self.cold_groups.is_empty() || self.num_group_cols == 0 || batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("cold-group row conversion: {e}")))?;
+        let mut seen: AHashSet<arrow::row::OwnedRow> = AHashSet::new();
+        let mut out = Vec::new();
+        for i in 0..batch.num_rows() {
+            let owned = rows.row(i).owned();
+            if self.cold_groups.contains(&owned) && seen.insert(owned.clone()) {
+                let vnode = self.delta_vnode_of(owned.as_ref(), vnode_count);
+                let group_bytes = owned.as_ref().to_vec();
+                out.push((owned, vnode, group_bytes));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -3999,6 +4032,23 @@ mod tests {
         }
         assert!(state.groups.is_empty(), "all groups demoted out of memory");
         assert_eq!(state.cold_groups().len(), 3);
+
+        // cold_groups_touched detects a demoted key in an incoming batch (fetch-on-access promotion,
+        // Slice 3): a row for the cold "a" is reported; a never-seen key is not.
+        let probe = RecordBatch::try_new(
+            pre_agg_schema(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "never"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let touched = state.cold_groups_touched(&probe, V).unwrap();
+        assert_eq!(touched.len(), 1, "only the demoted key 'a' is cold");
+        assert!(
+            state.cold_groups().contains(&touched[0].0),
+            "reported key is one of the cold groups",
+        );
 
         // Promote them back; live state must match exactly and re-emit nothing.
         for (k, cp) in demoted {

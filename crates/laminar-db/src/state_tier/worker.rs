@@ -41,6 +41,20 @@ pub(crate) enum TierRequest {
         vnode: u32,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
+    /// Fetch one demoted group for promotion (v2 group granularity).
+    FetchGroup {
+        operator: Arc<str>,
+        vnode: u32,
+        group: Vec<u8>,
+        reply: oneshot::Sender<Result<Option<Bytes>, DbError>>,
+    },
+    /// Drop one demoted group after promotion (v2 group granularity).
+    DropGroup {
+        operator: Arc<str>,
+        vnode: u32,
+        group: Vec<u8>,
+        reply: oneshot::Sender<Result<(), DbError>>,
+    },
 }
 
 /// Spawn the worker on `runtime` and return its request channel.
@@ -93,6 +107,32 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                         .unwrap_or_else(|e| {
                             Err(DbError::Storage(format!("state tier worker: {e}")))
                         });
+                let _ = reply.send(res);
+            }
+            TierRequest::FetchGroup {
+                operator,
+                vnode,
+                group,
+                reply,
+            } => {
+                let res = tokio::task::spawn_blocking(move || {
+                    store.get_group(operator.as_ref(), vnode, &group)
+                })
+                .await
+                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
+                let _ = reply.send(res);
+            }
+            TierRequest::DropGroup {
+                operator,
+                vnode,
+                group,
+                reply,
+            } => {
+                let res = tokio::task::spawn_blocking(move || {
+                    store.remove_group(operator.as_ref(), vnode, &group)
+                })
+                .await
+                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
                 let _ = reply.send(res);
             }
         }
