@@ -55,6 +55,65 @@ fn open_wipes_leftover_dir() {
     assert_eq!(store.logical_slices(), 0);
 }
 
+#[test]
+fn group_round_trip_overwrite_and_remove() {
+    let (_tmp, dir) = tier_dir();
+    let store = StateTierStore::open(&dir, None).unwrap();
+
+    assert_eq!(store.get_group("agg", 7, b"k1").unwrap(), None);
+    store.put_group("agg", 7, b"k1", b"g1").unwrap();
+    assert_eq!(
+        store.get_group("agg", 7, b"k1").unwrap().unwrap().as_ref(),
+        b"g1"
+    );
+    assert_eq!(store.logical_slices(), 1);
+
+    // A second group in the same vnode is a distinct slice.
+    store.put_group("agg", 7, b"k2", b"g2-longer").unwrap();
+    assert_eq!(store.logical_slices(), 2);
+
+    // Overwrite adjusts bytes, not the count.
+    store.put_group("agg", 7, b"k1", b"g1-bigger").unwrap();
+    assert_eq!(store.logical_slices(), 2);
+    assert_eq!(
+        store.get_group("agg", 7, b"k1").unwrap().unwrap().as_ref(),
+        b"g1-bigger"
+    );
+
+    store.remove_group("agg", 7, b"k1").unwrap();
+    assert_eq!(store.get_group("agg", 7, b"k1").unwrap(), None);
+    assert_eq!(store.logical_slices(), 1);
+    store.remove_group("agg", 7, b"k2").unwrap();
+    assert_eq!(store.logical_slices(), 0);
+}
+
+#[test]
+fn scan_groups_is_isolated_per_vnode_and_operator_and_from_the_vnode_blob() {
+    let (_tmp, dir) = tier_dir();
+    let store = StateTierStore::open(&dir, None).unwrap();
+
+    // A vnode-blob for (agg, 7) plus per-group entries for several (operator, vnode)s, including
+    // a group key that begins with NUL bytes (group keys are arbitrary OwnedRow bytes).
+    store.put("agg", 7, b"whole-vnode-blob").unwrap();
+    store.put_group("agg", 7, b"a", b"va").unwrap();
+    store.put_group("agg", 7, b"\0\0b", b"vb").unwrap();
+    store.put_group("agg", 8, b"a", b"other-vnode").unwrap();
+    store.put_group("other", 7, b"a", b"other-op").unwrap();
+
+    let mut got = store.scan_groups("agg", 7).unwrap();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (b"\0\0b".to_vec(), Bytes::from_static(b"vb")),
+            (b"a".to_vec(), Bytes::from_static(b"va")),
+        ]
+    );
+
+    // The vnode-blob key is NOT a group (no trailing-NUL boundary), and other (op,vnode)s don't leak.
+    assert_eq!(store.scan_groups("agg", 9).unwrap(), vec![]);
+}
+
 #[tokio::test]
 async fn worker_demote_fetch_drop() {
     let (_tmp, dir) = tier_dir();

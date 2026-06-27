@@ -82,16 +82,31 @@ impl StateTierStore {
         k
     }
 
-    /// Store a demoted slice. No fsync — the tier is rebuildable from checkpoint partials.
-    pub(crate) fn put(&self, operator: &str, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
-        let key = Self::key(operator, vnode);
+    /// Per-group key: the vnode key plus a NUL and the group-key bytes. A strict extension of
+    /// `key(operator, vnode)`, so vnode-blob and per-group entries never collide (v2 group tier).
+    fn group_key(operator: &str, vnode: u32, group: &[u8]) -> Vec<u8> {
+        let mut k = Self::key(operator, vnode);
+        k.push(0);
+        k.extend_from_slice(group);
+        k
+    }
+
+    /// Prefix matching every group of `(operator, vnode)` — the vnode key plus the NUL boundary,
+    /// which excludes the vnode-blob key itself (it has no trailing NUL).
+    fn group_prefix(operator: &str, vnode: u32) -> Vec<u8> {
+        let mut k = Self::key(operator, vnode);
+        k.push(0);
+        k
+    }
+
+    fn put_key(&self, key: &[u8], bytes: &[u8]) -> Result<(), DbError> {
         let old_len = self
             .slices
-            .get(&key)
+            .get(key)
             .map_err(|e| DbError::Storage(format!("state tier read-before-put: {e}")))?
             .map(|o| o.len());
         self.slices
-            .insert(&key, bytes)
+            .insert(key, bytes)
             .map_err(|e| DbError::Storage(format!("state tier put: {e}")))?;
         #[allow(clippy::cast_possible_wrap)]
         let new_total = (key.len() + bytes.len()) as i64;
@@ -103,18 +118,15 @@ impl StateTierStore {
             self.logical_bytes.fetch_add(new_total, Ordering::Relaxed);
             self.logical_slices.fetch_add(1, Ordering::Relaxed);
         }
-        // `state_tier_demote_total` is incremented by the graph, not here — a write
-        // may still be rolled back if the vnode turns out dirty.
         self.publish_gauges();
         Ok(())
     }
 
-    /// Fetch a slice for promotion. `None` if not resident.
-    pub(crate) fn get(&self, operator: &str, vnode: u32) -> Result<Option<Bytes>, DbError> {
+    fn get_key(&self, key: &[u8]) -> Result<Option<Bytes>, DbError> {
         let start = std::time::Instant::now();
         let v = self
             .slices
-            .get(Self::key(operator, vnode))
+            .get(key)
             .map_err(|e| DbError::Storage(format!("state tier get: {e}")))?;
         if let Some(ref m) = self.metrics {
             m.state_tier_fetch_total.inc();
@@ -124,16 +136,14 @@ impl StateTierStore {
         Ok(v.map(|v| Bytes::copy_from_slice(&v)))
     }
 
-    /// Remove a slice after promotion or vnode release.
-    pub(crate) fn remove(&self, operator: &str, vnode: u32) -> Result<(), DbError> {
-        let key = Self::key(operator, vnode);
+    fn remove_key(&self, key: &[u8]) -> Result<(), DbError> {
         let old = self
             .slices
-            .get(&key)
+            .get(key)
             .map_err(|e| DbError::Storage(format!("state tier read-before-remove: {e}")))?;
         if let Some(old) = old {
             self.slices
-                .remove(&key)
+                .remove(key)
                 .map_err(|e| DbError::Storage(format!("state tier remove: {e}")))?;
             #[allow(clippy::cast_possible_wrap)]
             self.logical_bytes
@@ -142,6 +152,77 @@ impl StateTierStore {
             self.publish_gauges();
         }
         Ok(())
+    }
+
+    /// Store a demoted slice. No fsync — the tier is rebuildable from checkpoint partials.
+    pub(crate) fn put(&self, operator: &str, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
+        // `state_tier_demote_total` is incremented by the graph, not here — a write
+        // may still be rolled back if the vnode turns out dirty.
+        self.put_key(&Self::key(operator, vnode), bytes)
+    }
+
+    /// Fetch a slice for promotion. `None` if not resident.
+    pub(crate) fn get(&self, operator: &str, vnode: u32) -> Result<Option<Bytes>, DbError> {
+        self.get_key(&Self::key(operator, vnode))
+    }
+
+    /// Remove a slice after promotion or vnode release.
+    pub(crate) fn remove(&self, operator: &str, vnode: u32) -> Result<(), DbError> {
+        self.remove_key(&Self::key(operator, vnode))
+    }
+
+    /// Store a single demoted group (v2 group-granular tier). `group` is the group-key bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn put_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        self.put_key(&Self::group_key(operator, vnode, group), bytes)
+    }
+
+    /// Fetch one demoted group for promotion. `None` if not resident.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn get_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> Result<Option<Bytes>, DbError> {
+        self.get_key(&Self::group_key(operator, vnode, group))
+    }
+
+    /// Remove one demoted group after promotion or eviction.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn remove_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> Result<(), DbError> {
+        self.remove_key(&Self::group_key(operator, vnode, group))
+    }
+
+    /// All demoted groups of `(operator, vnode)` as `(group_key_bytes, value)`. Used by a FULL
+    /// re-base to stream the cold portion back before serializing the whole vnode.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn scan_groups(
+        &self,
+        operator: &str,
+        vnode: u32,
+    ) -> Result<Vec<(Vec<u8>, Bytes)>, DbError> {
+        let prefix = Self::group_prefix(operator, vnode);
+        let mut out = Vec::new();
+        for guard in self.slices.prefix(&prefix) {
+            let (k, v) = guard
+                .into_inner()
+                .map_err(|e| DbError::Storage(format!("state tier scan: {e}")))?;
+            let group = k.get(prefix.len()..).unwrap_or_default().to_vec();
+            out.push((group, Bytes::copy_from_slice(&v)));
+        }
+        Ok(out)
     }
 
     pub(crate) fn logical_bytes(&self) -> i64 {
