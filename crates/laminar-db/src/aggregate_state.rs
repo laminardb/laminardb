@@ -791,9 +791,15 @@ impl IncrementalAggState {
             clauses.where_clause,
         );
 
-        // Skip compilation when upstream has __weight: the compiled path omits
-        // it, which would shift column indices in process_batch.
-        let compiled_projection = if compile_ok && weight_col_idx.is_none() {
+        // The compiled pre-agg evaluates on the operator's routed input batch. For a changelog
+        // source it must carry the `__weight` column through (as the last column, at
+        // `weight_col_idx`); otherwise a chained aggregate would have to re-scan the source's
+        // per-cycle live provider, which desyncs from the routed changelog and mis-nets
+        // retractions. The unoptimized plan's input schema keeps every source column, so the
+        // compiled exprs and the appended `__weight` index the routed batch correctly.
+        let compiled_projection = if !compile_ok {
+            None
+        } else if weight_col_idx.is_none() {
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
                     Some(phys)
@@ -812,6 +818,24 @@ impl IncrementalAggState {
                 })
             } else {
                 None
+            }
+        } else if agg_info.where_predicate.is_none() {
+            // Changelog source, no WHERE: append the `__weight` passthrough. A WHERE over a
+            // changelog needs retraction-aware filtering (Phase 2) — fall back to the cached plan.
+            match create_physical_expr(&datafusion_expr::col(WEIGHT_COLUMN), input_df_schema, props)
+            {
+                Ok(weight_expr) => {
+                    let mut exprs = compiled_exprs;
+                    let mut fields = proj_fields;
+                    exprs.push(weight_expr);
+                    fields.push(Field::new(WEIGHT_COLUMN, DataType::Int64, false));
+                    Some(CompiledProjection {
+                        exprs,
+                        filter: None,
+                        output_schema: Arc::new(Schema::new(fields)),
+                    })
+                }
+                Err(_) => None,
             }
         } else {
             None

@@ -66,6 +66,39 @@ async fn read_mv(db: &LaminarDB, mv: &str) -> Vec<(i64, i64, i64)> {
     rows
 }
 
+/// Run `sql` and return its rows as `ncols` i64 columns, sorted.
+async fn read_query(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
+    let result = db.execute(sql).await.unwrap();
+    let ExecuteResult::Query(mut q) = result else {
+        panic!("expected Query result");
+    };
+    tokio::task::yield_now().await;
+    let mut sub = q.subscribe_raw().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut rows = Vec::new();
+    for _ in 0..4096 {
+        match sub.poll() {
+            Some(b) => {
+                for r in 0..b.num_rows() {
+                    let row: Vec<i64> = (0..ncols)
+                        .map(|c| {
+                            b.column(c)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(r)
+                        })
+                        .collect();
+                    rows.push(row);
+                }
+            }
+            None => break,
+        }
+    }
+    rows.sort();
+    rows
+}
+
 const SRC: &str = "CREATE SOURCE events (k BIGINT, v BIGINT)";
 const MV: &str = "CREATE MATERIALIZED VIEW agg AS \
                   SELECT k, SUM(v) AS total, COUNT(*) AS cnt FROM events GROUP BY k";
@@ -150,32 +183,74 @@ async fn incremental_emit_survives_checkpoint_restart() {
     }
 }
 
+/// Stage 2 Phase 1: a chained *aggregate* over an incremental MV nets the retraction changelog
+/// correctly under UPDATES (the value-correctness gate). `SUM(total)` over `{k1:10→15, k2:20}` = 35.
 #[tokio::test]
-async fn incremental_emit_terminality_guard_rejects_consumers() {
+async fn chained_aggregate_over_incremental_nets_under_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    // Global roll-up and a keyed roll-up, both over the incremental MV's changelog.
+    db.execute("CREATE MATERIALIZED VIEW total_sum AS SELECT SUM(total) AS s FROM agg")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW per_key AS SELECT k, SUM(total) AS s FROM agg GROUP BY k")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    source.push_arrow(batch(&[1], &[5])).unwrap(); // k=1 total: 10 -> 15 (an UPDATE)
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // agg snapshot is correct (k=1 saw two events: cnt=2, sum=15), and the roll-ups net the
+    // retraction (no double-count).
+    assert_eq!(read_mv(&db, "agg").await, vec![(1, 15, 2), (2, 20, 1)]);
+    assert_eq!(
+        read_query(&db, "SELECT s FROM total_sum", 1).await,
+        vec![vec![35]]
+    );
+    assert_eq!(
+        read_query(&db, "SELECT k, s FROM per_key", 2).await,
+        vec![vec![1, 15], vec![2, 20]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// Stage 2 Phase 1 guard: a chained *aggregate* over an incremental MV is allowed (nets the
+/// changelog); a non-aggregate (projection/filter) MV or stream, and a sink, are rejected.
+#[tokio::test]
+async fn terminality_guard_allows_chained_agg_rejects_nonagg_and_sink() {
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
 
-    // A chained MV reading the incremental MV's changelog is rejected.
-    let chained = db
-        .execute("CREATE MATERIALIZED VIEW chained AS SELECT k, total FROM agg")
+    // Chained aggregate (keyed or global) is allowed.
+    db.execute("CREATE MATERIALIZED VIEW rollup AS SELECT k, SUM(total) AS s FROM agg GROUP BY k")
+        .await
+        .expect("chained aggregate over incremental MV is allowed");
+
+    // Non-aggregate projection MV / stream is rejected (Phase 2).
+    let proj_mv = db
+        .execute("CREATE MATERIALIZED VIEW projm AS SELECT k, total FROM agg")
         .await;
     assert!(
-        chained.is_err(),
-        "chained MV over incremental MV must be rejected"
+        proj_mv.is_err(),
+        "projection MV over incremental MV must be rejected"
     );
-
-    // A stream reading it is rejected.
-    let stream = db
-        .execute("CREATE STREAM s AS SELECT k, total FROM agg")
+    let proj_stream = db
+        .execute("CREATE STREAM projs AS SELECT k, total FROM agg")
         .await;
     assert!(
-        stream.is_err(),
-        "stream over incremental MV must be rejected"
+        proj_stream.is_err(),
+        "projection stream over incremental MV must be rejected"
     );
 
-    // A sink from it is rejected.
+    // A sink consuming the raw changelog is rejected.
     let sink = db
         .execute("CREATE SINK out FROM agg INTO KAFKA (topic = 't', bootstrap_servers = 'x')")
         .await;
@@ -187,26 +262,5 @@ async fn incremental_emit_terminality_guard_rejects_consumers() {
     source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
-    db.shutdown().await.unwrap();
-}
-
-/// With the flag off, the same MV uses full-emit (replace-all) and is freely consumable.
-#[tokio::test]
-async fn flag_off_keeps_full_emit_and_allows_consumers() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), false)).unwrap();
-    db.execute(SRC).await.unwrap();
-    db.execute(MV).await.unwrap();
-
-    // Not incremental → a chained MV is allowed.
-    db.execute("CREATE MATERIALIZED VIEW chained AS SELECT k, total FROM agg")
-        .await
-        .unwrap();
-
-    db.start().await.unwrap();
-    let source = db.source_untyped("events").unwrap();
-    source.push_arrow(batch(&[1, 2, 2], &[10, 20, 5])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 25, 2)]);
     db.shutdown().await.unwrap();
 }

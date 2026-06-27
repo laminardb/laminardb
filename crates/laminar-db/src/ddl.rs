@@ -742,8 +742,10 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
-        // A1-emit terminality guard: a stream cannot consume an incremental MV's changelog.
-        self.reject_reading_incremental_mv(query_sql, "a stream")?;
+        // Stage-2 Phase-1: a stream over an incremental MV must be an aggregate (nets the
+        // changelog); a projection/filter would lose retractions — rejected until Phase 2.
+        self.reject_non_agg_reading_incremental_mv(query_sql, "a stream")
+            .await?;
         self.catalog.register_stream(&name_str)?;
 
         if let Some(bytes) = retention_bytes {
@@ -1018,8 +1020,10 @@ impl LaminarDB {
         }
 
         let query_sql = query_sql.to_string();
-        // A1-emit terminality guard: a chained MV cannot consume an incremental MV's changelog.
-        self.reject_reading_incremental_mv(&query_sql, "a materialized view")?;
+        // Stage-2 Phase-1: a chained MV over an incremental MV must be an aggregate (nets the
+        // changelog); a projection/filter would lose retractions — rejected until Phase 2.
+        self.reject_non_agg_reading_incremental_mv(&query_sql, "a materialized view")
+            .await?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
         let sources = self.collect_mv_sources(&query_sql, &name_str);
 
@@ -1172,9 +1176,10 @@ impl LaminarDB {
         sources
     }
 
-    /// A1-emit Stage-1 terminality guard. An incremental MV's operator emits a dirty-only
-    /// changelog, not a full snapshot, so only `SELECT * FROM mv` (snapshot) reads are supported;
-    /// every streaming consumer (chained MV/stream, sink, SUBSCRIBE) is rejected at DDL time.
+    /// `true` if `name` is an A1-emit incremental MV (operator emits a dirty-only `__weight`
+    /// changelog into a keyed upsert store). A chained *aggregate* reader nets the changelog via
+    /// the retraction-aware path (Stage 2 Phase 1); non-aggregate readers (projection/filter),
+    /// sinks, and SUBSCRIBE — which can't yet net retractions — are rejected at DDL.
     pub(crate) fn is_incremental_mv(&self, name: &str) -> bool {
         self.connector_manager
             .lock()
@@ -1183,20 +1188,33 @@ impl LaminarDB {
             .is_some_and(|r| r.incremental)
     }
 
-    /// Reject `consumer` when `query_sql` references any incremental MV.
-    fn reject_reading_incremental_mv(
+    /// Stage-2 Phase-1 guard: a query that reads an incremental MV must itself be an aggregate
+    /// (which nets the retraction changelog). A non-aggregate (projection/filter) would drop the
+    /// `__weight` column and accumulate stale rows — rejected until Phase 2.
+    async fn reject_non_agg_reading_incremental_mv(
         &self,
         query_sql: &str,
         consumer: &str,
     ) -> Result<(), DbError> {
         let refs = crate::sql_analysis::extract_table_references(query_sql);
-        let mgr = self.connector_manager.lock();
-        for r in &refs {
-            if mgr.streams().get(r.as_str()).is_some_and(|s| s.incremental) {
-                return Err(incremental_mv_consumer_error(r, consumer));
-            }
+        let incremental_ref = {
+            let mgr = self.connector_manager.lock();
+            refs.iter()
+                .find(|r| mgr.streams().get(r.as_str()).is_some_and(|s| s.incremental))
+                .cloned()
+        };
+        let Some(mv) = incremental_ref else {
+            return Ok(());
+        };
+        let is_agg =
+            self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
+                crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
+            });
+        if is_agg {
+            Ok(())
+        } else {
+            Err(incremental_mv_consumer_error(&mv, consumer))
         }
-        Ok(())
     }
 
     /// `Some(group-by column indices)` when this MV qualifies for A1-emit incremental emit: the
