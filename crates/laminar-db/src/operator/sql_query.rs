@@ -1286,6 +1286,60 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "state-tier")]
+    async fn demote_cold_groups(&mut self, target_bytes: usize, vnode_count: u32) -> usize {
+        let Some(tier) = self.promotion.as_ref().map(|p| p.tier.clone()) else {
+            return 0;
+        };
+        let candidates = match self.state {
+            QueryState::Agg(ref agg) => agg.demotable_groups(vnode_count, 256),
+            _ => return 0,
+        };
+        let mut freed = 0usize;
+        let mut count = 0usize;
+        for (key, vnode, group) in candidates {
+            if freed >= target_bytes {
+                break;
+            }
+            // Encode the clean group, write it to the tier (off-compute, awaited), then drop —
+            // write-before-drop, so a failed write leaves the group resident.
+            let QueryState::Agg(ref mut agg) = self.state else {
+                break;
+            };
+            let cp = match agg.encode_group(&key) {
+                Ok(cp) => cp,
+                Err(e) => {
+                    tracing::warn!(query = %self.op_name, error = %e, "encode_group failed; skipping");
+                    continue;
+                }
+            };
+            let Ok(bytes) = serialize_agg_cp(&cp, &self.op_name) else {
+                continue;
+            };
+            let blen = bytes.len();
+            let (reply, rx) = oneshot::channel();
+            let req = crate::state_tier::TierRequest::DemoteGroup {
+                operator: Arc::clone(&self.op_name),
+                vnode,
+                group,
+                bytes: Bytes::from(bytes),
+                reply,
+            };
+            if tier.send(req).await.is_err() {
+                break;
+            }
+            if !matches!(rx.await, Ok(Ok(()))) {
+                continue;
+            }
+            if let QueryState::Agg(ref mut agg) = self.state {
+                agg.drop_demoted_group(&key);
+            }
+            freed += blen;
+            count += 1;
+        }
+        count
+    }
+
+    #[cfg(feature = "state-tier")]
     fn can_demote(&self, vnode: u32, vnode_count: u32) -> bool {
         match self.state {
             QueryState::Agg(ref agg_state) => agg_state.can_demote(vnode, vnode_count),

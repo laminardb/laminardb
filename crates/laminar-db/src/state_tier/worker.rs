@@ -41,6 +41,14 @@ pub(crate) enum TierRequest {
         vnode: u32,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
+    /// Store one demoted group (v2 group granularity).
+    DemoteGroup {
+        operator: Arc<str>,
+        vnode: u32,
+        group: Vec<u8>,
+        bytes: Bytes,
+        reply: oneshot::Sender<Result<(), DbError>>,
+    },
     /// Fetch one demoted group for promotion (v2 group granularity).
     FetchGroup {
         operator: Arc<str>,
@@ -107,6 +115,20 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                         .unwrap_or_else(|e| {
                             Err(DbError::Storage(format!("state tier worker: {e}")))
                         });
+                let _ = reply.send(res);
+            }
+            TierRequest::DemoteGroup {
+                operator,
+                vnode,
+                group,
+                bytes,
+                reply,
+            } => {
+                let res = tokio::task::spawn_blocking(move || {
+                    store.put_group(operator.as_ref(), vnode, &group, &bytes)
+                })
+                .await
+                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
                 let _ = reply.send(res);
             }
             TierRequest::FetchGroup {

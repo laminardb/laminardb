@@ -319,6 +319,9 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Cold-tier send channel; `None` = no tier configured.
     #[cfg(feature = "state-tier")]
     pub(crate) state_tier: Option<crate::state_tier::TierTx>,
+    /// Demote at group granularity (v2) rather than whole vnodes.
+    #[cfg(feature = "state-tier")]
+    pub(crate) state_tier_group_demotion: bool,
 }
 
 /// Minimum interval between budget probes; each probe walks all operator estimates.
@@ -1986,6 +1989,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return;
         }
         let target = budget / STATE_DEMOTE_TARGET_DEN * STATE_DEMOTE_TARGET_NUM;
+        if self.state_tier_group_demotion {
+            // v2: shed individual idle groups (skew-proof). `tier` is held by each operator's
+            // promotion channel, so the pass needs only the free budget.
+            let to_free = total.saturating_sub(target);
+            let demoted = self.graph.demote_cold_groups(to_free).await;
+            if demoted > 0 {
+                tracing::debug!(demoted, "demoted idle groups to the cold tier");
+            }
+            return;
+        }
         let coordinator = Arc::clone(&self.coordinator);
         let demoted = run_demotion_pass(&mut self.graph, &coordinator, &tier, total, target).await;
         if demoted > 0 {

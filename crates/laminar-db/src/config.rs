@@ -98,6 +98,10 @@ pub struct LaminarConfig {
     /// demoted here (off-heap) instead of backpressuring. `None` = no tier.
     /// Requires the `state-tier` build feature; ignored otherwise.
     pub state_tier_dir: Option<PathBuf>,
+    /// Demote at GROUP granularity (v2): shed individual idle aggregate groups to the tier rather
+    /// than only whole idle vnodes. Skew-proof but newer; default off until soak-validated.
+    /// Requires the `state-tier` feature; ignored otherwise.
+    pub state_tier_group_demotion: bool,
 
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
@@ -137,6 +141,7 @@ impl Default for LaminarConfig {
             max_state_bytes_per_operator: None,
             state_memory_budget_bytes: None,
             state_tier_dir: None,
+            state_tier_group_demotion: false,
             pipeline_channel_capacity: None,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,

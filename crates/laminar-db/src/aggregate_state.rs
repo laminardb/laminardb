@@ -2211,6 +2211,38 @@ impl IncrementalAggState {
         Ok(())
     }
 
+    /// Up to `max` resident groups eligible for demotion, idle-first (oldest `last_updated_ms`):
+    /// changelog mode, delta tracking on this `vnode_count`, and clean (untouched since the last
+    /// capture). `(key, vnode, group_key_bytes)`. Empty when demotion is unsafe.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn demotable_groups(
+        &self,
+        vnode_count: u32,
+        max: usize,
+    ) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>)> {
+        if !self.emit_changelog
+            || !self.delta_enabled
+            || self.dirty_all
+            || self.delta_vnode_count != Some(vnode_count)
+        {
+            return Vec::new();
+        }
+        let mut cand: Vec<(i64, &arrow::row::OwnedRow)> = self
+            .groups
+            .iter()
+            .filter(|(k, _)| !self.is_group_dirty(k, vnode_count))
+            .map(|(k, e)| (e.last_updated_ms, k))
+            .collect();
+        cand.sort_by_key(|(ts, _)| *ts);
+        cand.into_iter()
+            .take(max)
+            .map(|(_, k)| {
+                let v = self.delta_vnode_of(k.as_ref(), vnode_count);
+                (k.clone(), v, k.as_ref().to_vec())
+            })
+            .collect()
+    }
+
     /// Cold groups whose vnode's delta chain has reached `chain_max` — its re-base is deferred
     /// until they are promoted back (Slice 4). The caller promotes these proactively so the block
     /// clears within the `max_retained` prune window. `(key, vnode, group_key_bytes)`.

@@ -117,6 +117,13 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "state-tier")]
     fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
 
+    /// Demote idle resident groups to the cold tier until `target_bytes` is freed (v2 group
+    /// granularity). Encodes + tier-writes + drops each off the compute path; returns the count.
+    #[cfg(feature = "state-tier")]
+    async fn demote_cold_groups(&mut self, _target_bytes: usize, _vnode_count: u32) -> usize {
+        0
+    }
+
     /// Vnodes this operator had demoted at the restored checkpoint; must be
     /// replayed from durable partials since the cold tier is wiped on restart.
     #[cfg(feature = "state-tier")]
@@ -2505,6 +2512,33 @@ impl OperatorGraph {
             }
         }
         demoted
+    }
+
+    /// Demote idle resident groups across all operators until `target_bytes` is freed (v2 group
+    /// granularity). Each operator encodes + tier-writes + drops its own idle groups off the
+    /// compute path. Returns the number of groups demoted.
+    #[cfg(feature = "state-tier")]
+    pub(crate) async fn demote_cold_groups(&mut self, target_bytes: usize) -> u64 {
+        let Some(vnode_count) = self.vnode_count else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            let n = node
+                .operator
+                .demote_cold_groups(target_bytes, vnode_count)
+                .await;
+            total += n as u64;
+        }
+        if total > 0 {
+            if let Some(ref prom) = self.prom {
+                prom.state_tier_demote_total.inc_by(total);
+            }
+        }
+        total
     }
 
     /// Whether the named operator could demote `vnode` right now (no tier I/O performed).

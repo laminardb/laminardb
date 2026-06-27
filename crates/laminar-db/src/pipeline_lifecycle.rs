@@ -2005,6 +2005,8 @@ impl LaminarDB {
             state_budget_exceeded: false,
             #[cfg(feature = "state-tier")]
             state_tier: state_tier_sender,
+            #[cfg(feature = "state-tier")]
+            state_tier_group_demotion: self.config.state_tier_group_demotion,
         };
 
         {
