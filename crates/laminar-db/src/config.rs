@@ -100,7 +100,8 @@ pub struct LaminarConfig {
     pub state_tier_dir: Option<PathBuf>,
     /// Demote at GROUP granularity (v2): shed individual idle aggregate groups to the tier rather
     /// than only whole idle vnodes. Skew-proof but newer; default off until soak-validated.
-    /// Requires the `state-tier` feature; ignored otherwise.
+    /// Requires the `state-tier` feature and delta checkpoints (`checkpoint.delta_chain_max`),
+    /// whose per-group machinery it reuses; a no-op without them.
     pub state_tier_group_demotion: bool,
 
     /// Source-to-coordinator channel capacity. `None` = 64.

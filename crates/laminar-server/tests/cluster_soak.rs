@@ -208,6 +208,11 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
             .replace('\\', "/");
         server_extra =
             format!("state_tier_dir = \"{tier_dir}\"\nstate_memory_budget_bytes = {budget}\n");
+        // v2: shed idle GROUPS, not whole vnodes. Needs delta on (pair with
+        // LAMINAR_SOAK_DELTA_CHAIN_MAX). Gated so default tier runs stay byte-identical.
+        if std::env::var("LAMINAR_SOAK_STATE_TIER_GROUP").is_ok() {
+            server_extra.push_str("state_tier_group_demotion = true\n");
+        }
     }
 
     let mut storage = String::new();

@@ -259,6 +259,15 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Demote at group granularity (v2): shed individual idle aggregate groups rather than only
+    /// whole idle vnodes. Skew-proof; default off until soak-validated.
+    #[cfg(feature = "state-tier")]
+    #[must_use]
+    pub fn state_tier_group_demotion(mut self, enabled: bool) -> Self {
+        self.config.state_tier_group_demotion = enabled;
+        self
+    }
+
     /// Set checkpoint configuration.
     #[must_use]
     pub fn checkpoint(mut self, config: StreamCheckpointConfig) -> Self {

@@ -133,6 +133,7 @@ pub async fn run_server(
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
         builder = builder.state_tier_dir(dir);
+        builder = builder.state_tier_group_demotion(config.server.state_tier_group_demotion);
     }
 
     let storage_dir = config.state.local_storage_dir();

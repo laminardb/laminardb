@@ -102,6 +102,36 @@ key == a "group"). The `IncrementalJoinOperator` (inner + left + multi-way, hand
 A_old⋈δB`) uses the trait; checkpoint via the group-delta path. See the design captured in memory
 `a1-emit-stage1` (Phase 3b notes) — separate plan doc once v2 lands.
 
+## Implementation status (2026-06-28)
+
+Slices 1–5 implemented, unit-tested, committed (`feat/shuffle-barrier-after-kill-recovery`):
+- **S1 `d38ac15e`** per-group tier KV (`put/get/remove/scan_groups`).
+- **S2 `119b672b`** group demotion in `AggregateState` (`can_demote_group`/`encode_group`/
+  `drop_demoted_group`/`promote_group`, `cold_groups`).
+- **S3 `c5f28257`** group promotion fetch-on-access (worker `FetchGroup`/`DropGroup`,
+  `cold_groups_touched`, `AggPromotion` group path).
+- **S4 `bc31edae`** defer FULL re-base while a vnode has cold groups (no silent loss); proactive
+  promotion of deferring vnodes' cold groups.
+- **S5 `7f5ce0fc`** live budget trigger (`demotable_groups`, async `demote_cold_groups` on
+  operator+graph, `maybe_demote_state` group path, `state_tier_group_demotion` config flag,
+  default-OFF). Builder setter + server-config plumbing + soak knob added for S6.
+
+**KEY FINDING (S6): group demotion currently requires DELTA checkpoints, which are wired
+CLUSTER-ONLY.** `demotable_groups`/`is_group_dirty` rely on the delta dirty-tracking
+(`dirty_keys_by_vnode` + `delta_vnode_count`), enabled by `enable_delta_checkpoints`, which is
+gated on `cluster_shuffle` (`operator_graph.rs`). So:
+- The single-node tier integration test cannot drive group demotion (delta never enables single-node;
+  enabling it there would make the delta chain the *primary* checkpoint, with unvalidated single-node
+  restart recovery — a separate effort). Reverted the single-node group test.
+- v2 group demotion is therefore **cluster + delta only** for now. Single-node group demotion needs
+  delta single-node (dirty-tracking decoupled from delta-primary-checkpoint, + single-node delta
+  restart recovery) — a follow-up.
+- The **kill-9 EO** soak with a distributed agg hits a *pre-existing* shuffle-barrier-after-kill bug
+  (see `delta-checkpoint-lever2-phase3` memory), unrelated to tiering. The achievable S6 gate is a
+  **no-kill** (`LAMINAR_SOAK_KILLS=0`) or graceful-rotation cluster soak validating that group
+  demotion fires, promotion fetches, RAM stays bounded, and output is correct. Knob:
+  `LAMINAR_SOAK_STATE_TIER_GROUP=1` (pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX`).
+
 ## Risks / notes
 - Highest-risk subsystem (EO checkpoint, cluster, kill-9). Default-OFF until Slice-6 soaks are green.
 - Per-group overhead: tiny groups ⇒ many fjall keys; KV-separation tuned for KB..MB blobs may need a

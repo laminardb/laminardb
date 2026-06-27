@@ -373,6 +373,10 @@ pub struct ServerSection {
     /// backpressuring. Requires a `state-tier` build. `None` = no tier.
     #[serde(default)]
     pub state_tier_dir: Option<std::path::PathBuf>,
+    /// Demote at GROUP granularity (v2): shed individual idle aggregate groups rather than whole
+    /// idle vnodes. Requires the cold tier and delta checkpoints. Default off.
+    #[serde(default)]
+    pub state_tier_group_demotion: bool,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -405,6 +409,7 @@ impl Default for ServerSection {
             console_cors_allowed_origins: None,
             state_memory_budget_bytes: None,
             state_tier_dir: None,
+            state_tier_group_demotion: false,
         }
     }
 }
