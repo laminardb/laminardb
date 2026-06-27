@@ -230,10 +230,19 @@ section above.
 - **1b — wire the agg emit.** In `ddl.rs:1153`, under `incremental_emit`, register non-windowed agg
   MVs as `Upsert` (key = GROUP BY col indices) and make the agg operator `emit_changelog=true` so it
   emits dirty-only. MV provider schema stays plain (no `__weight`).
-- **1c — the live-provider/chained-MV fix (cross-layer).** Serve the *snapshot* (not the changelog)
-  to chained readers of an incremental-emit MV. Either feed `route_output`'s live provider from the
-  MV-store snapshot, or restrict 1a/1b to leaf MVs and reject chaining onto an incremental MV at DDL
-  until this lands.
+- **1c — terminality guard (anti-sprawl; the cross-layer fix is deliberately OUT of Stage 1).**
+  Do NOT try to serve snapshots to chained readers in Stage 1 — that's the sprawl trap (cross-layer:
+  snapshot in `mv_store`/callback vs `route_output`/live-provider in operator_graph vs the `input_bufs`
+  edge path). Instead, **Stage 1 incremental emit applies only to *terminal* agg MVs** (read solely
+  via `SELECT * FROM mv`). Implement as a **local DDL guard** at `ddl.rs`:
+  - agg MV with no consumer at creation → incremental (`Upsert` + changelog);
+  - any query / sink / `SUBSCRIBE` that references an incremental MV → **DDL error** (no
+    back-compat needed → clean reject, no compat shim);
+  - every other MV → full-emit, unchanged.
+  This is a catalog check (mode of each MV + table-refs of the new query), ~30 lines, no cross-layer
+  plumbing. **Serving the snapshot to chained readers** (so they *can* consume an incremental MV —
+  feeding `route_output`'s live provider from the MV-store snapshot) is a **separate later stage**,
+  not Stage 1. Keep it out to bound the work.
 - **1d — recovery same-epoch invariant** (ADR-007's named gate): the chain-recovered accumulators
   (A1-capture) and the manifest-recovered MV snapshot must reflect the same epoch.
 
@@ -241,6 +250,11 @@ section above.
 many cycles and asserts `SELECT * FROM mv` == full-recompute, then a crash+restart asserting the
 snapshot is correct; plus the `profile_agg_emit_vs_capture` before/after showing emit is now O(dirty).
 
-**Stage 2/3 (after Stage 1):** upsert/transactional sinks via the existing changelog-collapse path
-(`docs/plans/changelog-collapse-for-upsert-sinks.md`); `SUBSCRIBE` = snapshot-then-changelog;
-append-only sink of a running aggregate rejected at DDL (or opt-in changelog-append).
+**Stage 2/3 (after Stage 1 — each lifts one part of the 1c guard's reject set):**
+- **chained-MV reads of an incremental MV** — the cross-layer snapshot-serving deferred from 1c
+  (feed `route_output`'s live provider / chained `input_bufs` from the MV-store snapshot instead of
+  the changelog). This is the hard cross-layer piece; its own stage.
+- **upsert / transactional sinks** via the existing changelog-collapse path
+  (`docs/plans/changelog-collapse-for-upsert-sinks.md`).
+- **`SUBSCRIBE`** = snapshot-then-changelog.
+- **append-only sink** of a running aggregate rejected at DDL (or opt-in changelog-append).
