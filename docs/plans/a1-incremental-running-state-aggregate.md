@@ -193,3 +193,54 @@ first increment; A1-emit is where the throughput ceiling actually lifts.
 - Reuse `dirty_vnodes` (dirty-since-capture) for A1-capture and `dirty_keys` (dirty-since-emit,
   already wired for `EMIT CHANGES`) for A1-emit — don't conflate them.
 - Format/recovery-model change is free (zero external users); delete the superseded whole-node path.
+
+## A1-emit — cold-start implementation plan (START HERE next session)
+
+Decision: **ADR-007 Option A** (`docs/adr/ADR-007-incremental-emit-running-state-aggregates.md`,
+local/gitignored) — default non-windowed running-state MV emits a **dirty-only changelog** into a
+**keyed upsert MV store**; `SELECT * FROM mv` keeps returning the full snapshot. A1-capture (capture
+side) is DONE; this is the emit side. Profiler proves the win: emit is 358 ms @ 1M groups *every
+cycle* (`profile_agg_emit_vs_capture`, `#[ignore]`d in `aggregate_state.rs`).
+
+**Read first:** ADR-007 (decision + rejected options + open questions), then this doc's A1-emit
+section above.
+
+**Grounded entry points (verified 2026-06-27):**
+- MV storage-mode choice: `ddl.rs:1153` `register_mv_provider` (`MvStorageMode::Aggregate` for
+  non-windowed aggs) — add the `Upsert` mode here, keyed by the GROUP BY column indices.
+- Changelog already exists: `emit_changelog` appends `WEIGHT_COLUMN` (`aggregate_state.rs:831`,
+  `laminar_core::changelog::WEIGHT_COLUMN`); dirty-only emit path at `aggregate_state.rs:~1300`
+  (`dirty_keys`). `EMIT CHANGES` is the working precedent — reuse it; don't reinvent dirty-emit.
+- Output → MV store: `streaming_coordinator.rs` `update_mv_stores(&out.results)` →
+  `mv_store.rs::MvStore::update(name, batch)` → `MvEntry::update` (`mv_store.rs:56`).
+- MV read path: `table_provider.rs` `MvTableProvider::scan` over `mv_store.to_record_batch`.
+- Checkpoint/restore of MV store: `mv_store.rs` `checkpoint_states` / `restore_from_ipc`.
+- The cross-layer snag: `operator_graph.rs::route_output` swaps the operator **output** into the
+  name-keyed live provider (`live_handles`) for chained MVs; under incremental emit that output is
+  the changelog (`__weight`), so chained readers must instead see the **snapshot** — and the snapshot
+  lives in `mv_store` (pipeline_callback layer), not in `route_output` (operator_graph layer). This
+  is the hard part of Stage 1.
+
+**Slices (each flag-gated default-OFF; new `incremental_emit` config, plumbed like `delta_chain_max`):**
+- **1a — keyed upsert MV store mode.** `MvStorageMode::Upsert { key_cols: Vec<usize> }`; `MvEntry`
+  keeps a keyed snapshot (key via `RowConverter` over `key_cols`); `update(changelog)` applies
+  `+WEIGHT → upsert`, `−WEIGHT → delete`, storing rows **without** the weight column;
+  `to_record_batch` materializes the plain snapshot. Checkpoint = materialize → IPC; restore = replay
+  into the keyed map. **Unit tests**: feed changelog batches, assert snapshot == full-recompute.
+- **1b — wire the agg emit.** In `ddl.rs:1153`, under `incremental_emit`, register non-windowed agg
+  MVs as `Upsert` (key = GROUP BY col indices) and make the agg operator `emit_changelog=true` so it
+  emits dirty-only. MV provider schema stays plain (no `__weight`).
+- **1c — the live-provider/chained-MV fix (cross-layer).** Serve the *snapshot* (not the changelog)
+  to chained readers of an incremental-emit MV. Either feed `route_output`'s live provider from the
+  MV-store snapshot, or restrict 1a/1b to leaf MVs and reject chaining onto an incremental MV at DDL
+  until this lands.
+- **1d — recovery same-epoch invariant** (ADR-007's named gate): the chain-recovered accumulators
+  (A1-capture) and the manifest-recovered MV snapshot must reflect the same epoch.
+
+**Validation (mirror A1-capture):** a deterministic `cluster_integration` test that feeds an agg over
+many cycles and asserts `SELECT * FROM mv` == full-recompute, then a crash+restart asserting the
+snapshot is correct; plus the `profile_agg_emit_vs_capture` before/after showing emit is now O(dirty).
+
+**Stage 2/3 (after Stage 1):** upsert/transactional sinks via the existing changelog-collapse path
+(`docs/plans/changelog-collapse-for-upsert-sinks.md`); `SUBSCRIBE` = snapshot-then-changelog;
+append-only sink of a running aggregate rejected at DDL (or opt-in changelog-append).
