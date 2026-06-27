@@ -73,17 +73,39 @@ Stage-1 tests; 777 db lib tests green (no regression to the existing changelog/E
 clippy `--features cluster --tests -D warnings` + fmt clean. This also fixes `EMIT CHANGES`
 aggregate chaining (was broken/empty; same machinery).
 
-### Phase 2 — projection / filter pass-through
-- A non-agg `SqlQueryOperator` over a changelog source preserves `__weight` in its output
-  (compiled-projection + cached-plan paths) so retractions propagate.
-- Chained projection/filter MV becomes incremental. **Open design question — the upsert key:** a
-  projection has no declared key. Options: (a) require/derive the key from the upstream GROUP BY
-  columns if they survive the projection; (b) reject projections that drop the key columns; (c) key
-  on all projected columns (retraction must match a prior insert exactly). Decide before building.
-- Lift the 1c guard for chained projection/filter reads.
+### Phase 2 — projection / filter pass-through — DONE (2026-06-27)
+
+**Upsert-key decision (owner): Z-set multiset.** A chained projection/filter has no declared key,
+so its snapshot store keys on the **full output row** with an integer **multiplicity** (`+weight`).
+Correct for every projection including key-dropping ones that produce duplicate rows (a retraction
+decrements multiplicity, so a row another upstream key still produces survives); matches SQL
+multiset semantics. Simpler than keying on the upstream GROUP BY (no key-column mapping); a plain
+set (key-on-all-cols, no count) is **wrong** (a retraction would delete a row another key produces).
+
+**Implemented:**
+- **`MvStorageMode::Multiset`** (`mv_store.rs`): `MultisetState` = full-row `RowConverter` +
+  `HashMap<OwnedRow, i64>`. `apply(changelog)` strips `__weight`, `counts[row] += weight`, drops at
+  0; `to_record_batch` emits each row `count` times (`convert_rows`); checkpoint = materialize→IPC,
+  restore = replay counting occurrences. Unit tests incl. the duplicate/key-dropping case.
+- **`__weight` pass-through** (`operator/sql_query.rs::try_build_compiled_projection`): when the
+  source schema carries `__weight`, append a `__weight` passthrough column to the compiled
+  projection (unless already projected). The compiled path consumes the routed `inputs` (no
+  live-provider desync), and a `WHERE` filters each changelog row by its own values (retracts carry
+  old values, inserts new) so the multiset nets correctly — **filters work for free**.
+- **DDL** (`ddl.rs`): `incremental_emit_mode` → `IncEmit::{Upsert(keyed agg) | Multiset
+  (projection/filter over a changelog) | None}`; `register_mv_provider` maps it to the store mode.
+  Guard broadened (`reject_unsupported_reading_incremental_mv`): a chained **aggregate or simple
+  projection/filter** over an incremental MV is allowed; a **complex shape (join)** and
+  sinks/`SUBSCRIBE` are rejected (Phase 3 / later).
+
+**Validated:** `chained_projection_over_incremental_is_correct_under_updates` (projection AND a
+`WHERE` filter track an update with no stale row), updated guard test (agg + projection allowed,
+join + sink rejected); 3 `MultisetState` unit tests; 780 db lib tests green; clippy
+`--features cluster --tests -D warnings` + fmt clean.
 
 ### Phase 3 — joins / multi-input over changelogs
-- Scope TBD: a join with a changelog input must net both sides. Likely its own effort.
+- Scope TBD: a join with a changelog input must net both sides. Likely its own effort. Currently
+  rejected at DDL by the Stage-2 guard.
 
 ## Validation
 Deterministic `incremental_emit` tests per phase: agg roll-up nets under updates; projection drops

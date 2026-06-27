@@ -220,35 +220,69 @@ async fn chained_aggregate_over_incremental_nets_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 2 Phase 1 guard: a chained *aggregate* over an incremental MV is allowed (nets the
-/// changelog); a non-aggregate (projection/filter) MV or stream, and a sink, are rejected.
+/// Stage 2 Phase 2: a chained projection/filter over an incremental MV maintains a correct
+/// snapshot under UPDATES — the retraction drops the stale row (no accumulation).
 #[tokio::test]
-async fn terminality_guard_allows_chained_agg_rejects_nonagg_and_sink() {
+async fn chained_projection_over_incremental_is_correct_under_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.execute("CREATE MATERIALIZED VIEW proj AS SELECT k, total FROM agg")
+        .await
+        .unwrap();
+    // A filter over the changelog too: only keys whose running total exceeds 12.
+    db.execute("CREATE MATERIALIZED VIEW big AS SELECT k, total FROM agg WHERE total > 12")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    source.push_arrow(batch(&[1], &[5])).unwrap(); // k=1 total: 10 -> 15
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Projection snapshot tracks the update with NO stale (1,10) row.
+    assert_eq!(
+        read_query(&db, "SELECT k, total FROM proj", 2).await,
+        vec![vec![1, 15], vec![2, 20]]
+    );
+    // Filter: k=1 crossed 12 (10->15), so it now appears alongside k=2.
+    assert_eq!(
+        read_query(&db, "SELECT k, total FROM big", 2).await,
+        vec![vec![1, 15], vec![2, 20]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// Stage 2 guard: chained aggregates AND simple projections/filters over an incremental MV are
+/// allowed (they net the changelog); a complex shape (join) and a sink are rejected.
+#[tokio::test]
+async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
 
-    // Chained aggregate (keyed or global) is allowed.
+    // Aggregate and projection/filter chained reads are allowed.
     db.execute("CREATE MATERIALIZED VIEW rollup AS SELECT k, SUM(total) AS s FROM agg GROUP BY k")
         .await
-        .expect("chained aggregate over incremental MV is allowed");
+        .expect("chained aggregate is allowed");
+    db.execute("CREATE MATERIALIZED VIEW projm AS SELECT k, total FROM agg")
+        .await
+        .expect("chained projection is allowed (Phase 2)");
+    db.execute("CREATE STREAM projs AS SELECT k, total FROM agg")
+        .await
+        .expect("chained projection stream is allowed (Phase 2)");
 
-    // Non-aggregate projection MV / stream is rejected (Phase 2).
-    let proj_mv = db
-        .execute("CREATE MATERIALIZED VIEW projm AS SELECT k, total FROM agg")
+    // A join over the changelog (complex shape) is rejected — a later phase.
+    let join = db
+        .execute(
+            "CREATE MATERIALIZED VIEW j AS SELECT agg.k FROM agg JOIN events ON agg.k = events.k",
+        )
         .await;
-    assert!(
-        proj_mv.is_err(),
-        "projection MV over incremental MV must be rejected"
-    );
-    let proj_stream = db
-        .execute("CREATE STREAM projs AS SELECT k, total FROM agg")
-        .await;
-    assert!(
-        proj_stream.is_err(),
-        "projection stream over incremental MV must be rejected"
-    );
+    assert!(join.is_err(), "join over incremental MV must be rejected");
 
     // A sink consuming the raw changelog is rejected.
     let sink = db

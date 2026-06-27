@@ -285,6 +285,7 @@ impl SqlQueryOperator {
         self.delta_chain_max.is_some()
     }
     #[cfg(not(feature = "cluster"))]
+    #[allow(clippy::unused_self)] // mirrors the cluster variant's `&self` signature
     fn skip_whole_node_agg(&self) -> bool {
         false
     }
@@ -434,6 +435,33 @@ impl SqlQueryOperator {
         } else {
             None
         };
+
+        // A1-emit Stage 2: when the source carries a Z-set weight (it's a changelog), pass
+        // `__weight` through so a chained projection/filter propagates retractions. The filter is
+        // applied per changelog row by its own values (retracts carry old values, inserts new), so
+        // the downstream multiset nets correctly. Skipped if the projection already selects it
+        // (e.g. `SELECT *`).
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        if info
+            .input_df_schema
+            .as_arrow()
+            .column_with_name(weight)
+            .is_some()
+            && !proj_fields.iter().any(|f| f.name() == weight)
+        {
+            let weight_expr = datafusion::physical_expr::create_physical_expr(
+                &datafusion_expr::col(weight),
+                &info.input_df_schema,
+                props,
+            )
+            .ok()?;
+            proj_fields.push(arrow::datatypes::Field::new(
+                weight,
+                arrow::datatypes::DataType::Int64,
+                false,
+            ));
+            compiled_exprs.push(weight_expr);
+        }
 
         let output_schema = Arc::new(arrow::datatypes::Schema::new(proj_fields));
         Some(CompiledProjection {

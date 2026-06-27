@@ -21,6 +21,9 @@ const DEFAULT_APPEND_MAX_BATCHES: usize = 1000;
 /// Default byte limit per MV in append mode (256 MB).
 const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// Rough per-row memory estimate for the multiset snapshot (encoded key + count).
+const APPROX_BYTES_PER_MULTISET_ROW: usize = 32;
+
 /// How a materialized view accumulates results.
 #[derive(Debug, Clone)]
 pub(crate) enum MvStorageMode {
@@ -31,6 +34,10 @@ pub(crate) enum MvStorageMode {
     /// Incremental running-state aggregate (A1-emit): maintain a keyed snapshot from a
     /// dirty-only `__weight` changelog. `key_cols` index the GROUP BY columns in the MV schema.
     Upsert { key_cols: Vec<usize> },
+    /// Chained projection/filter over a changelog (A1-emit Stage 2): a Z-set multiset keyed by the
+    /// full output row, tracking an integer multiplicity. Handles key-dropping projections that
+    /// produce duplicate rows; the snapshot emits each row by its multiplicity.
+    Multiset,
 }
 
 impl MvStorageMode {
@@ -160,6 +167,106 @@ impl UpsertState {
     }
 }
 
+/// Z-set multiset snapshot from a `__weight` changelog (A1-emit Stage 2): keyed by the full output
+/// row with an integer multiplicity. Correct for chained projections/filters over a changelog,
+/// including key-dropping projections whose distinct rows can repeat.
+struct MultisetState {
+    row_converter: RowConverter,
+    counts: HashMap<OwnedRow, i64>,
+    approx_bytes: usize,
+}
+
+impl MultisetState {
+    fn new(schema: &SchemaRef) -> Result<Self, DbError> {
+        let sort_fields: Vec<SortField> = schema
+            .fields()
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect();
+        let row_converter = RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Storage(format!("multiset MV row converter: {e}")))?;
+        Ok(Self {
+            row_converter,
+            counts: HashMap::new(),
+            approx_bytes: 0,
+        })
+    }
+
+    /// Apply a `__weight` changelog: the full (weightless) row's multiplicity += weight; drop at 0.
+    fn apply(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN)
+            .map_err(|e| DbError::Storage(format!("multiset MV changelog missing weight: {e}")))?;
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DbError::Storage("multiset MV weight column not Int64".into()))?;
+        let plain_cols: Vec<ArrayRef> = (0..batch.num_columns())
+            .filter(|&c| c != weight_idx)
+            .map(|c| Arc::clone(batch.column(c)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&plain_cols)
+            .map_err(|e| DbError::Storage(format!("multiset MV row conversion: {e}")))?;
+
+        for row_idx in 0..batch.num_rows() {
+            let w = weights.value(row_idx);
+            if w == 0 {
+                continue;
+            }
+            let key = rows.row(row_idx).owned();
+            let new_count = self.counts.get(&key).copied().unwrap_or(0) + w;
+            if new_count <= 0 {
+                self.counts.remove(&key);
+            } else {
+                self.counts.insert(key, new_count);
+            }
+        }
+        self.approx_bytes = self.counts.len() * APPROX_BYTES_PER_MULTISET_ROW;
+        Ok(())
+    }
+
+    /// Restore from a materialized snapshot: each row occurrence increments its multiplicity.
+    fn load_snapshot(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let rows = self
+            .row_converter
+            .convert_columns(batch.columns())
+            .map_err(|e| DbError::Storage(format!("multiset MV restore conversion: {e}")))?;
+        for row_idx in 0..batch.num_rows() {
+            let key = rows.row(row_idx).owned();
+            *self.counts.entry(key).or_insert(0) += 1;
+        }
+        self.approx_bytes = self.counts.len() * APPROX_BYTES_PER_MULTISET_ROW;
+        Ok(())
+    }
+
+    fn to_record_batch(&self, schema: &SchemaRef) -> RecordBatch {
+        if self.counts.is_empty() {
+            return RecordBatch::new_empty(schema.clone());
+        }
+        let mut rows: Vec<arrow::row::Row> = Vec::new();
+        for (key, &count) in &self.counts {
+            for _ in 0..count.max(0) {
+                rows.push(key.row());
+            }
+        }
+        match self.row_converter.convert_rows(rows.iter().copied()) {
+            Ok(arrays) => RecordBatch::try_new(schema.clone(), arrays)
+                .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone())),
+            Err(_) => RecordBatch::new_empty(schema.clone()),
+        }
+    }
+}
+
 /// Per-MV result store.
 pub(crate) struct MvEntry {
     schema: SchemaRef,
@@ -167,6 +274,8 @@ pub(crate) struct MvEntry {
     batches: VecDeque<RecordBatch>,
     /// Set only in `Upsert` mode; carries the keyed running snapshot.
     upsert: Option<UpsertState>,
+    /// Set only in `Multiset` mode; carries the Z-set snapshot.
+    multiset: Option<MultisetState>,
     approx_bytes: usize,
 }
 
@@ -176,11 +285,16 @@ impl MvEntry {
             MvStorageMode::Upsert { key_cols } => Some(UpsertState::new(&schema, key_cols)?),
             _ => None,
         };
+        let multiset = match &mode {
+            MvStorageMode::Multiset => Some(MultisetState::new(&schema)?),
+            _ => None,
+        };
         Ok(Self {
             schema,
             mode,
             batches: VecDeque::new(),
             upsert,
+            multiset,
             approx_bytes: 0,
         })
     }
@@ -215,12 +329,23 @@ impl MvEntry {
                     self.approx_bytes = up.approx_bytes;
                 }
             }
+            MvStorageMode::Multiset => {
+                if let Some(ms) = self.multiset.as_mut() {
+                    if let Err(e) = ms.apply(batch) {
+                        tracing::error!(error = %e, "multiset MV update failed");
+                    }
+                    self.approx_bytes = ms.approx_bytes;
+                }
+            }
         }
     }
 
     fn to_record_batch(&self) -> RecordBatch {
         if let Some(up) = self.upsert.as_ref() {
             return up.to_record_batch(&self.schema);
+        }
+        if let Some(ms) = self.multiset.as_ref() {
+            return ms.to_record_batch(&self.schema);
         }
         if self.batches.is_empty() {
             return RecordBatch::new_empty(self.schema.clone());
@@ -292,8 +417,8 @@ impl MvStore {
     pub fn checkpoint_states(&self) -> Result<HashMap<String, bytes::Bytes>, DbError> {
         let mut out = HashMap::new();
         for (name, entry) in &self.entries {
-            let bytes = if entry.upsert.is_some() {
-                // Upsert mode keeps no batches; serialize the materialized snapshot.
+            let bytes = if entry.upsert.is_some() || entry.multiset.is_some() {
+                // Upsert/Multiset keep no batches; serialize the materialized snapshot.
                 let batch = entry.to_record_batch();
                 if batch.num_rows() == 0 {
                     continue;
@@ -334,6 +459,15 @@ impl MvStore {
                 up.load_snapshot(b)?;
             }
             entry.approx_bytes = up.approx_bytes;
+            return Ok(true);
+        }
+        if let Some(ms) = entry.multiset.as_mut() {
+            ms.counts.clear();
+            ms.approx_bytes = 0;
+            for b in &batches {
+                ms.load_snapshot(b)?;
+            }
+            entry.approx_bytes = ms.approx_bytes;
             return Ok(true);
         }
         entry.batches.clear();
@@ -690,5 +824,101 @@ mod tests {
         // A restored store keeps applying changelog correctly.
         store2.update("u", &changelog_batch(&[(1, 10, -1), (1, 99, 1)]));
         assert_eq!(snapshot_rows(&store2, "u"), vec![(1, 99), (3, 30)]);
+    }
+
+    // ── Multiset (Z-set) mode (Stage 2: chained projections/filters over a changelog) ──
+
+    /// Single-column changelog `(v, __weight)` for the key-dropping multiset case.
+    fn weight_batch_1col(rows: &[(i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let vs: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let ws: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vs)),
+                Arc::new(arrow::array::Int64Array::from(ws)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn one_col_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
+    }
+
+    /// `v` snapshot values sorted (with multiplicity).
+    fn multiset_values(store: &MvStore, name: &str) -> Vec<i64> {
+        use arrow::array::Int64Array;
+        let batch = store.to_record_batch(name).unwrap();
+        let vs = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut out: Vec<i64> = (0..batch.num_rows()).map(|i| vs.value(i)).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn multiset_nets_retractions_for_keyed_rows() {
+        let mut store = MvStore::new();
+        store
+            .create_mv("m", upsert_plain_schema(), MvStorageMode::Multiset)
+            .unwrap();
+        store.update("m", &changelog_batch(&[(1, 10, 1), (2, 20, 1)]));
+        assert_eq!(snapshot_rows(&store, "m"), vec![(1, 10), (2, 20)]);
+        // Change k=1: retract old full row, insert new full row.
+        store.update("m", &changelog_batch(&[(1, 10, -1), (1, 15, 1)]));
+        assert_eq!(snapshot_rows(&store, "m"), vec![(1, 15), (2, 20)]);
+    }
+
+    #[test]
+    fn multiset_tracks_duplicate_rows() {
+        // Key-dropping projection: two upstream keys with the same value v=10 → multiplicity 2.
+        let mut store = MvStore::new();
+        store
+            .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
+            .unwrap();
+        store.update("m", &weight_batch_1col(&[(10, 1), (10, 1), (20, 1)]));
+        assert_eq!(multiset_values(&store, "m"), vec![10, 10, 20]);
+
+        // One source of the 10 changes 10→15: retract one (10), insert (15). The other 10 survives.
+        store.update("m", &weight_batch_1col(&[(10, -1), (15, 1)]));
+        assert_eq!(multiset_values(&store, "m"), vec![10, 15, 20]);
+
+        // The remaining 10 retracts → gone.
+        store.update("m", &weight_batch_1col(&[(10, -1)]));
+        assert_eq!(multiset_values(&store, "m"), vec![15, 20]);
+    }
+
+    #[test]
+    fn multiset_checkpoint_round_trip_preserves_multiplicity() {
+        let mut store = MvStore::new();
+        store
+            .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
+            .unwrap();
+        store.update("m", &weight_batch_1col(&[(10, 1), (10, 1), (20, 1)]));
+        let before = multiset_values(&store, "m");
+        assert_eq!(before, vec![10, 10, 20]);
+
+        let states = store.checkpoint_states().unwrap();
+        let mut store2 = MvStore::new();
+        store2
+            .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
+            .unwrap();
+        for (key, bytes) in &states {
+            let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
+            assert!(store2.restore_from_ipc(name, bytes).unwrap());
+        }
+        // Multiplicity (10 appears twice) survives the round-trip.
+        assert_eq!(multiset_values(&store2, "m"), before);
+        // And a restored store keeps netting: retract one 10.
+        store2.update("m", &weight_batch_1col(&[(10, -1)]));
+        assert_eq!(multiset_values(&store2, "m"), vec![10, 20]);
     }
 }
