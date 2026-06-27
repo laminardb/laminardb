@@ -734,6 +734,115 @@ fn build_lookup_projection_sql(
     )
 }
 
+/// Temp table name the changelog batch is registered under for the enrich-join SQL.
+pub(crate) const CHANGELOG_ENRICH_TMP: &str = "__changelog_enrich_tmp";
+
+/// A1-emit Stage 3a: a `<incremental MV> JOIN <static table>` dimension enrichment.
+pub(crate) struct ChangelogEnrichConfig {
+    /// The left (incremental MV / changelog) table the operator consumes from `input_bufs`.
+    pub changelog_table: String,
+    /// Temp-rewritten join SQL (over [`CHANGELOG_ENRICH_TMP`]) that preserves `__weight`.
+    pub projection_sql: String,
+}
+
+/// Detect a single equi-join whose left is an incremental MV (changelog) and right is a static
+/// (non-incremental) table — A1-emit Stage 3a dimension enrichment. Returns the changelog table and
+/// a temp-rewritten join SQL preserving `__weight`. `None` for changelog⋈changelog, asof/temporal/
+/// time-bound joins, aggregates/group-by, or non-single-join shapes.
+pub(crate) fn detect_changelog_enrich_query(
+    sql: &str,
+    incremental_mvs: &FxHashSet<String>,
+    static_tables: &FxHashSet<String>,
+) -> Option<ChangelogEnrichConfig> {
+    use laminar_sql::parser::join_parser::JoinType;
+
+    if incremental_mvs.is_empty() || static_tables.is_empty() {
+        return None;
+    }
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let has_group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        sqlparser::ast::GroupByExpr::All(_) => false,
+    };
+    if select.distinct.is_some()
+        || has_group_by
+        || select.having.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || query.with.is_some()
+    {
+        return None;
+    }
+    let multi = analyze_joins(select).ok()??;
+    if multi.joins.len() != 1 {
+        return None;
+    }
+    let j = &multi.joins[0];
+    if j.is_asof_join || j.is_temporal_join || j.time_bound.is_some() {
+        return None;
+    }
+    // Left = changelog (incremental MV); right = a static reference/dimension table. The reverse,
+    // a streaming/source right, or both-sides-changelog is a full incremental join (a later phase).
+    if !incremental_mvs.contains(&j.left_table) || !static_tables.contains(&j.right_table) {
+        return None;
+    }
+    let join_kw = match j.join_type {
+        JoinType::Inner => "JOIN",
+        JoinType::Left => "LEFT JOIN",
+        _ => return None,
+    };
+
+    let weight = laminar_core::changelog::WEIGHT_COLUMN;
+    let lalias = j.left_alias.as_deref().unwrap_or(&j.left_table);
+    let ralias = j.right_alias.as_deref().unwrap_or(&j.right_table);
+
+    let mut items: Vec<String> = select.projection.iter().map(ToString::to_string).collect();
+    let has_wildcard = select.projection.iter().any(|i| {
+        matches!(
+            i,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    });
+    if !has_wildcard {
+        items.push(format!("{lalias}.\"{weight}\""));
+    }
+
+    let mut on_clauses = vec![format!(
+        "{lalias}.\"{}\" = {ralias}.\"{}\"",
+        j.left_key_column, j.right_key_column
+    )];
+    for (lk, rk) in &j.additional_key_columns {
+        on_clauses.push(format!("{lalias}.\"{lk}\" = {ralias}.\"{rk}\""));
+    }
+    let on = on_clauses.join(" AND ");
+    let right_from = match &j.right_alias {
+        Some(a) => format!("{} AS {a}", j.right_table),
+        None => j.right_table.clone(),
+    };
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map_or(String::new(), |e| format!(" WHERE {e}"));
+    let projection_sql = format!(
+        "SELECT {} FROM {CHANGELOG_ENRICH_TMP} AS {lalias} {join_kw} {right_from} ON {on}{where_clause}",
+        items.join(", ")
+    );
+    Some(ChangelogEnrichConfig {
+        changelog_table: j.left_table.clone(),
+        projection_sql,
+    })
+}
+
 fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> String {
     match item {
         SelectItem::UnnamedExpr(expr) => rewrite_lookup_expr(expr, ctx),

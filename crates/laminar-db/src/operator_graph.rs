@@ -266,6 +266,80 @@ impl GraphOperator for SqlFilterOperator {
     }
 }
 
+/// A1-emit Stage 3a: enriches an incremental MV's changelog with a static dimension. Consumes the
+/// changelog from `input_bufs` (no live-provider desync), registers it as a temp live source, and
+/// joins against the dimension (in the graph context) preserving `__weight` — emitting the joined
+/// changelog. The physical plan is re-created each cycle so the join's build-side hash table
+/// (`DataFusion` `OnceAsync`) doesn't freeze on the first cycle's temp data. Stateless; the join
+/// MV's `Multiset` store holds the snapshot.
+struct ChangelogEnrichOperator {
+    join_sql: String,
+    ctx: SessionContext,
+    handle: Option<LiveSourceHandle>,
+    logical: Option<datafusion_expr::LogicalPlan>,
+}
+
+impl ChangelogEnrichOperator {
+    fn new(ctx: SessionContext, join_sql: String) -> Self {
+        Self {
+            join_sql,
+            ctx,
+            handle: None,
+            logical: None,
+        }
+    }
+}
+
+#[async_trait]
+impl GraphOperator for ChangelogEnrichOperator {
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let batches = inputs.first().cloned().unwrap_or_default();
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
+        if self.handle.is_none() {
+            let provider = LiveSourceProvider::new(batches[0].schema());
+            self.handle = Some(provider.handle());
+            let tmp = crate::sql_analysis::CHANGELOG_ENRICH_TMP;
+            let _ = self.ctx.deregister_table(tmp);
+            self.ctx
+                .register_table(tmp, Arc::new(provider))
+                .map_err(|e| DbError::Pipeline(format!("changelog-enrich register temp: {e}")))?;
+            let logical = self
+                .ctx
+                .sql(&self.join_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline("changelog-enrich", &e))?
+                .logical_plan()
+                .clone();
+            self.logical = Some(logical);
+        }
+        self.handle.as_ref().unwrap().swap(batches);
+        // Fresh physical plan each cycle resets the hash join's cached build side.
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(self.logical.as_ref().unwrap())
+            .await
+            .map_err(|e| DbError::query_pipeline("changelog-enrich", &e))?;
+        datafusion::physical_plan::collect(physical, self.ctx.task_ctx())
+            .await
+            .map_err(|e| DbError::query_pipeline("changelog-enrich", &e))
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Ok(())
+    }
+}
+
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
@@ -315,6 +389,11 @@ pub(crate) struct OperatorGraph {
     main_runtime_handle: Option<tokio::runtime::Handle>,
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
+    // Incremental MV names (changelog producers); routes a `changelog ⋈ static dim` join to the
+    // ChangelogEnrich operator (A1-emit Stage 3a). Kept current as incremental MVs are added.
+    incremental_tables: FxHashSet<String>,
+    // Static reference/dimension table names — valid right sides of a changelog enrich join.
+    reference_tables: FxHashSet<String>,
     // Plan-time errors from add_query (returns ()); surfaced by take_build_errors at start.
     build_errors: Vec<DbError>,
     #[cfg(feature = "cluster")]
@@ -387,8 +466,23 @@ impl OperatorGraph {
             ai_runtime: None,
             main_runtime_handle: None,
             partial_lookup_tables: FxHashMap::default(),
+            incremental_tables: FxHashSet::default(),
+            reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
         }
+    }
+
+    /// Register the static reference/dimension table names (valid right sides of a changelog
+    /// enrich join, A1-emit Stage 3a).
+    pub fn set_reference_tables(&mut self, tables: FxHashSet<String>) {
+        self.reference_tables = tables;
+    }
+
+    /// Seed the incremental-MV (changelog producer) set before operators are built, so a
+    /// `changelog ⋈ static dim` consumer detects its source regardless of build order. Kept
+    /// current by `add_query` as MVs are hot-added.
+    pub fn set_incremental_tables(&mut self, tables: FxHashSet<String>) {
+        self.incremental_tables = tables;
     }
 
     /// Install the AI subsystem and main runtime handle for inference workers.
@@ -995,6 +1089,12 @@ impl OperatorGraph {
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
 
+        // Record changelog producers so a later `changelog ⋈ static dim` consumer routes to the
+        // ChangelogEnrich operator (A1-emit Stage 3a).
+        if incremental {
+            self.incremental_tables.insert(name.clone());
+        }
+
         let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
         if ai_calls.len() > 1 {
             self.build_errors.push(DbError::InvalidOperation(
@@ -1023,6 +1123,20 @@ impl OperatorGraph {
             return;
         }
 
+        // A1-emit Stage 3a: `changelog ⋈ static dim`. Detected first so it wins over the generic
+        // processing-time equi-join — a changelog left makes this a retraction-aware enrich, not a
+        // stream join.
+        let changelog_enrich_config = if self.incremental_tables.is_empty() {
+            None
+        } else {
+            crate::sql_analysis::detect_changelog_enrich_query(
+                &sql,
+                &self.incremental_tables,
+                &self.reference_tables,
+            )
+        };
+        let enrich = changelog_enrich_config.is_some();
+
         // TemporalProbe is parsed off the token stream (not the sqlparser AST), so it
         // never appears in join_config and always needs its own detector pass.
         let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
@@ -1036,22 +1150,25 @@ impl OperatorGraph {
             })
         });
 
-        let (temporal_probe_config, temporal_probe_projection_sql) =
-            detect_temporal_probe_query(&sql);
+        let (temporal_probe_config, temporal_probe_projection_sql) = if enrich {
+            (None, None)
+        } else {
+            detect_temporal_probe_query(&sql)
+        };
         let (asof_config, projection_sql) =
-            if temporal_probe_config.is_none() && needs_specialized_detection {
+            if !enrich && temporal_probe_config.is_none() && needs_specialized_detection {
                 detect_asof_query(&sql)
             } else {
                 (None, None)
             };
         let (temporal_config, temporal_projection_sql) =
-            if temporal_probe_config.is_none() && needs_specialized_detection {
+            if !enrich && temporal_probe_config.is_none() && needs_specialized_detection {
                 detect_temporal_query(&sql)
             } else {
                 (None, None)
             };
         let stream_join_detection =
-            if temporal_probe_config.is_none() && needs_specialized_detection {
+            if !enrich && temporal_probe_config.is_none() && needs_specialized_detection {
                 // Interval join first; falls back to processing-time equi-join.
                 detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
             } else {
@@ -1062,8 +1179,9 @@ impl OperatorGraph {
             .as_ref()
             .map(|d| d.projection_sql.clone());
 
-        // Lookup-enrich: only when no other specialized join matched.
-        let (lookup_enrich_config, lookup_projection_sql) = if temporal_probe_config.is_none()
+        // Lookup-enrich: only when no other specialized join (incl. changelog-enrich) matched.
+        let (lookup_enrich_config, lookup_projection_sql) = if !enrich
+            && temporal_probe_config.is_none()
             && asof_config.is_none()
             && temporal_config.is_none()
             && stream_join_config.is_none()
@@ -1101,6 +1219,11 @@ impl OperatorGraph {
         if let Some(cfg) = &lookup_enrich_config {
             table_refs.remove(&cfg.table_name);
         }
+        // ChangelogEnrich: only the changelog (left) is a graph input; the dimension is read from
+        // the context, not wired as an edge.
+        if let Some(cfg) = &changelog_enrich_config {
+            table_refs.retain(|t| t == &cfg.changelog_table);
+        }
 
         if let Some(ref tc) = temporal_config {
             self.temporal_configs.push(tc.clone());
@@ -1119,6 +1242,7 @@ impl OperatorGraph {
             projection_sql.as_deref(),
             idle_ttl_ms,
             incremental,
+            changelog_enrich_config,
         );
 
         let input_port_count = if asof_config.is_some()
@@ -1323,8 +1447,18 @@ impl OperatorGraph {
         projection_sql: Option<&str>,
         idle_ttl_ms: Option<u64>,
         incremental: bool,
+        changelog_enrich_config: Option<crate::sql_analysis::ChangelogEnrichConfig>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
+
+        // A1-emit Stage 3a: `changelog ⋈ static dim` — consume the changelog, join against the
+        // dimension (in the graph context), preserve `__weight` → joined changelog.
+        if let Some(cfg) = changelog_enrich_config {
+            return Box::new(ChangelogEnrichOperator::new(
+                self.ctx.clone(),
+                cfg.projection_sql,
+            ));
+        }
 
         // Falls through to the DataFusion lookup path if the registry/handle is absent.
         if let Some(cfg) = lookup_enrich_config {

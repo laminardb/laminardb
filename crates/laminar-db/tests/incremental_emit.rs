@@ -183,6 +183,44 @@ async fn incremental_emit_survives_checkpoint_restart() {
     }
 }
 
+/// Stage 3a: a `changelog ⋈ static dimension` enrich join maintains a correct snapshot under
+/// UPDATES — the dimension enriches each changelog row and the retraction drops the stale row.
+#[tokio::test]
+async fn chained_dim_enrich_join_is_correct_under_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    // Static dimension table (keyed reference table).
+    db.execute("CREATE TABLE dim (k BIGINT PRIMARY KEY, label BIGINT)")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO dim VALUES (1, 100), (2, 200)")
+        .await
+        .unwrap();
+    // Enrich join: changelog (agg) ⋈ static dim.
+    db.execute(
+        "CREATE MATERIALIZED VIEW enriched AS \
+         SELECT agg.k, agg.total, dim.label FROM agg JOIN dim ON agg.k = dim.k",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    source.push_arrow(batch(&[1], &[5])).unwrap(); // k=1 total: 10 -> 15
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Enriched snapshot tracks the update (no stale (1,10,100)) and carries the dim column.
+    assert_eq!(
+        read_query(&db, "SELECT k, total, label FROM enriched", 3).await,
+        vec![vec![1, 15, 100], vec![2, 20, 200]]
+    );
+    db.shutdown().await.unwrap();
+}
+
 /// Stage 2 Phase 1: a chained *aggregate* over an incremental MV nets the retraction changelog
 /// correctly under UPDATES (the value-correctness gate). `SUM(total)` over `{k1:10→15, k2:20}` = 35.
 #[tokio::test]

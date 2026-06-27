@@ -691,6 +691,8 @@ impl LaminarDB {
                 })
                 .collect()
         };
+        let reference_table_names: rustc_hash::FxHashSet<String> =
+            lookup_tables.iter().map(|(n, _)| n.clone()).collect();
         for (name, schema) in lookup_tables {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 name.clone(),
@@ -709,6 +711,7 @@ impl LaminarDB {
         let mut graph = OperatorGraph::new(ctx);
         graph.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
+        graph.set_reference_tables(reference_table_names);
         if let Some(ref prom) = *self.engine_metrics.lock() {
             graph.set_metrics(Arc::clone(prom));
         }
@@ -827,6 +830,16 @@ impl LaminarDB {
                 coord.set_state_tier(sender.clone());
             }
         }
+
+        // Seed incremental MVs up front so a `changelog ⋈ static dim` consumer detects its source
+        // regardless of the (HashMap-ordered) build loop below.
+        graph.set_incremental_tables(
+            stream_regs
+                .values()
+                .filter(|r| r.incremental)
+                .map(|r| r.name.clone())
+                .collect(),
+        );
 
         for reg in stream_regs.values() {
             graph.add_query(

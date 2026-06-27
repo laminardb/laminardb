@@ -103,9 +103,36 @@ set (key-on-all-cols, no count) is **wrong** (a retraction would delete a row an
 join + sink rejected); 3 `MultisetState` unit tests; 780 db lib tests green; clippy
 `--features cluster --tests -D warnings` + fmt clean.
 
-### Phase 3 — joins / multi-input over changelogs
-- Scope TBD: a join with a changelog input must net both sides. Likely its own effort. Currently
-  rejected at DDL by the Stage-2 guard.
+### Phase 3a — changelog ⋈ static dimension — DONE (2026-06-27)
+
+**Owner decision: dimension enrichment** (changelog ⋈ a *static* reference/dimension table) — the
+tractable, incremental, high-value case. A `changelog ⋈ changelog` (both incremental) full IVM join
+stays deferred (Phase 3b), rejected at DDL.
+
+**Implemented:**
+- **Detection** (`sql_analysis::detect_changelog_enrich_query`): a single equi-join (inner/left, no
+  time bound) whose left is an incremental MV and right is a **static reference table** (in the
+  table store — requires a PRIMARY KEY to register there). Generates a temp-rewritten join SQL
+  preserving `__weight`: `SELECT <cols>, tmp."__weight" FROM <tmp> AS <lalias> JOIN dim ON …`.
+- **Operator** (`ChangelogEnrichOperator`): consumes the changelog from `input_bufs`, registers it
+  as a temp live source, joins against the dimension (graph context), emits the joined changelog →
+  `Multiset` store. **The physical plan is re-created each cycle** — `LiveSqlCache`/cached-plan reuse
+  freezes a hash join's build-side hash table (DataFusion `OnceAsync`) on the first cycle's temp
+  data, so a fresh `create_physical_plan` per cycle is required for correctness. (Perf: bounded to
+  change-cycles; a future optimization could reset join state instead of full re-plan.)
+- **Routing** (`operator_graph`): detected **before** the generic processing-time equi-join so it
+  wins; `incremental_tables` + `reference_tables` sets seeded up front in `pipeline_lifecycle`
+  (build order is HashMap-nondeterministic). DDL `incremental_emit_mode` → `Multiset`; the guard
+  allows it (aggregate OR projection/filter OR changelog-enrich), still rejecting joins with a
+  non-static (source / second-changelog) right side and sinks/SUBSCRIBE.
+
+**Validated:** `chained_dim_enrich_join_is_correct_under_updates` (dim-enriched snapshot tracks an
+update with no stale row, dim column carried), guard test (join with a source right side rejected);
+db lib green; clippy + fmt clean.
+
+### Phase 3b — changelog ⋈ changelog / multi-input — deferred
+- A join with two changelog inputs needs two-sided incremental state (full IVM). Its own effort;
+  rejected at DDL by the guard.
 
 ## Validation
 Deterministic `incremental_emit` tests per phase: agg roll-up nets under updates; projection drops

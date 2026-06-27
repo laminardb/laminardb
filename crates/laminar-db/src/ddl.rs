@@ -1201,6 +1201,22 @@ impl LaminarDB {
             .cloned()
     }
 
+    /// All registered incremental MV (changelog producer) names.
+    fn incremental_mv_names(&self) -> rustc_hash::FxHashSet<String> {
+        self.connector_manager
+            .lock()
+            .streams()
+            .iter()
+            .filter(|(_, r)| r.incremental)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Static (reference/dimension) table names — valid right sides for a changelog enrich join.
+    fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
+        self.table_store.read().table_names().into_iter().collect()
+    }
+
     /// Stage-2 guard: a query reading an incremental MV must be a shape that nets the retraction
     /// changelog — an aggregate (retraction-aware) or a simple projection/filter (`__weight`
     /// pass-through → Z-set multiset). A complex shape (e.g. a join) would mishandle retractions
@@ -1213,11 +1229,20 @@ impl LaminarDB {
         let Some(mv) = self.first_incremental_ref(query_sql) else {
             return Ok(());
         };
-        let supported = self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
-            let plan = df.logical_plan();
-            crate::aggregate_state::find_aggregate(plan).is_some()
-                || crate::sql_analysis::extract_projection_filter(plan).is_some()
-        });
+        // Aggregate or simple projection/filter (Stage 2), or a `changelog ⋈ static dim` enrich
+        // join (Stage 3a). A changelog⋈changelog join / other complex shape is still rejected.
+        let inc = self.incremental_mv_names();
+        let supported = crate::sql_analysis::detect_changelog_enrich_query(
+            query_sql,
+            &inc,
+            &self.static_table_names(),
+        )
+        .is_some()
+            || self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
+                let plan = df.logical_plan();
+                crate::aggregate_state::find_aggregate(plan).is_some()
+                    || crate::sql_analysis::extract_projection_filter(plan).is_some()
+            });
         if supported {
             Ok(())
         } else {
@@ -1255,6 +1280,17 @@ impl LaminarDB {
         }
         // Projection/filter over an incremental MV's changelog → Z-set multiset snapshot.
         if reads_incremental && crate::sql_analysis::extract_projection_filter(plan).is_some() {
+            return IncEmit::Multiset;
+        }
+        // `changelog ⋈ static dim` enrich join (Stage 3a) → Z-set multiset snapshot.
+        if reads_incremental
+            && crate::sql_analysis::detect_changelog_enrich_query(
+                query_sql,
+                &self.incremental_mv_names(),
+                &self.static_table_names(),
+            )
+            .is_some()
+        {
             return IncEmit::Multiset;
         }
         IncEmit::None
