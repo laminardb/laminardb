@@ -74,15 +74,28 @@ impl ClusterEngineHarness {
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs).await
+        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs, None).await
     }
 
-    /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`.
+    /// Like `spawn`, with incremental delta checkpoints (`chain_max`). Enabling delta makes the
+    /// per-vnode chain the primary aggregate checkpoint (A1-capture: aggregates skip the whole-node
+    /// manifest capture and recover from the chain).
+    pub async fn spawn_delta(n: usize, vnode_count: u32, chain_max: u32) -> Self {
+        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
+        let checkpoint_dirs: Vec<TempDir> = (0..n)
+            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
+            .collect();
+        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs, Some(chain_max)).await
+    }
+
+    /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`. `delta` is
+    /// `Some(chain_max)` to enable incremental delta checkpoints (A1-capture, chain-primary).
     pub async fn spawn_with_dirs(
         n: usize,
         vnode_count: u32,
         shared_state_dir: TempDir,
         checkpoint_dirs: Vec<TempDir>,
+        delta: Option<u32>,
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
@@ -161,6 +174,7 @@ impl ClusterEngineHarness {
                 interval_ms: None, // manual only — tests drive checkpoint() explicitly
                 data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
+                delta_chain_max: delta,
                 ..StreamCheckpointConfig::default()
             };
 

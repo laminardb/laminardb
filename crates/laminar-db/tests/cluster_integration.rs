@@ -232,6 +232,7 @@ mod failures {
             VNODE_COUNT,
             shared_dir,
             cp_dirs2,
+            None,
         )
         .await;
         let assignment_b: Vec<super::cluster_harness::NodeIdView> = harness_b
@@ -447,6 +448,179 @@ mod failures {
             sleep(Duration::from_millis(200)).await;
         }
 
+        harness.shutdown().await;
+    }
+
+    // A1-capture, crash path: with the delta chain as the PRIMARY aggregate checkpoint the manifest
+    // carries no aggregate state, so the survivor can only recover the crashed node's keys from the
+    // per-vnode delta chain. Doubled totals (k*10 phase-A + k*10 phase-C) prove the accumulators
+    // came back from the chain, not the manifest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delta_primary_crash_rehydrates_aggregate_from_chain() {
+        let mut harness = ClusterEngineHarness::spawn_delta(N_NODES, VNODE_COUNT, 2).await;
+        let leader_idx = harness.leader_idx();
+        let follower_idx = harness.follower_idxs()[0];
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners = vec![
+            (
+                harness.nodes[leader_idx].instance_id,
+                harness.nodes[leader_idx].owned_vnodes(),
+            ),
+            (
+                harness.nodes[follower_idx].instance_id,
+                harness.nodes[follower_idx].owned_vnodes(),
+            ),
+        ];
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 4).expect("pick keys");
+        let follower_keys = key_buckets[1].1.clone();
+        let phase_a: Vec<i64> = key_buckets
+            .iter()
+            .flat_map(|(_, ks)| ks.iter().copied())
+            .collect();
+
+        harness.nodes[leader_idx]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&phase_a))
+            .expect("push phase_a");
+        harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint phase_a");
+        sleep(Duration::from_millis(500)).await;
+
+        let crashed_runtime = harness.nodes.swap_remove(follower_idx);
+        let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
+        drop(crashed_runtime);
+        crashed_node.crash().await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "survivor never acquired the crashed node's vnodes",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        harness.nodes[0]
+            .db
+            .source_untyped("src")
+            .expect("src on survivor")
+            .push_arrow(input_batch(&follower_keys))
+            .expect("push phase_c");
+
+        let mut expected: std::collections::HashMap<i64, i64> =
+            key_buckets[0].1.iter().map(|&k| (k, k * 10)).collect();
+        for &k in &follower_keys {
+            expected.insert(k, k * 10 * 2);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got: std::collections::HashMap<i64, i64> =
+                read_mv_sums(&harness.nodes[0].db, "sums")
+                    .await
+                    .into_iter()
+                    .collect();
+            if got == expected {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delta_primary crash recovery totals wrong: got {got:?}, want {expected:?}",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+        harness.shutdown().await;
+    }
+
+    // A1-capture, graceful full-cluster restart: every node re-owns its vnodes, but the manifest
+    // carries no aggregate state under delta_primary, so each node must rehydrate its OWN vnodes
+    // from the delta chain (the start_inner staging path — the one the kill-9 soak can't exercise
+    // because a respawned node owns nothing until rebalance). Re-feeding the same keys must DOUBLE
+    // the totals, proving the accumulators survived the restart via the chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delta_primary_aggregate_survives_graceful_restart() {
+        let mut harness = ClusterEngineHarness::spawn_delta(N_NODES, VNODE_COUNT, 2).await;
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners: Vec<_> = harness
+            .nodes
+            .iter()
+            .map(|n| (n.instance_id, n.owned_vnodes()))
+            .collect();
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 3).expect("pick keys");
+        let keys: Vec<i64> = key_buckets
+            .iter()
+            .flat_map(|(_, ks)| ks.iter().copied())
+            .collect();
+
+        let leader = harness.leader_idx();
+        harness.nodes[leader]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&keys))
+            .expect("push batch1");
+        harness.nodes[leader]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint batch1");
+        sleep(Duration::from_millis(500)).await;
+
+        let baseline: std::collections::HashMap<i64, i64> =
+            union_sums(&harness).await.into_iter().collect();
+        for &k in &keys {
+            assert_eq!(baseline.get(&k), Some(&(k * 10)), "baseline total for key {k}");
+        }
+
+        // Graceful full-cluster restart, delta_primary still on.
+        let (shared, cp_dirs) = harness.shutdown_keep_dirs().await;
+        let mut harness =
+            ClusterEngineHarness::spawn_with_dirs(N_NODES, VNODE_COUNT, shared, cp_dirs, Some(2))
+                .await;
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        // Re-feed the same keys: doubled totals iff the accumulators recovered from the chain.
+        let leader = harness.leader_idx();
+        harness.nodes[leader]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&keys))
+            .expect("push batch2");
+
+        let expected: std::collections::HashMap<i64, i64> =
+            keys.iter().map(|&k| (k, k * 10 * 2)).collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got: std::collections::HashMap<i64, i64> = union_sums(&harness)
+                .await
+                .into_iter()
+                .filter(|(k, _)| keys.contains(k))
+                .collect();
+            if got == expected {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delta_primary graceful-restart totals wrong: got {got:?}, want {expected:?}",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
         harness.shutdown().await;
     }
 }

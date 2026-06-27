@@ -200,12 +200,10 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
     // `Some(chain_max)` enables incremental delta checkpoints (Lever 2) with that re-base bound.
+    // When set, the delta chain is the PRIMARY agg checkpoint (A1-capture): `checkpoint()` skips
+    // the whole-node group capture and recovery comes from the per-vnode partials.
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
-    // With delta enabled, the chain is the PRIMARY agg checkpoint: `checkpoint()` skips the
-    // whole-node group capture (state lives in per-vnode partials) — A1-capture.
-    #[cfg(feature = "cluster")]
-    delta_primary: bool,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
@@ -252,8 +250,6 @@ impl SqlQueryOperator {
             #[cfg(feature = "cluster")]
             delta_chain_max: None,
             #[cfg(feature = "cluster")]
-            delta_primary: false,
-            #[cfg(feature = "cluster")]
             pending_restore_deltas: Vec::new(),
             #[cfg(feature = "state-tier")]
             promotion: None,
@@ -282,17 +278,11 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Make the delta chain the primary agg checkpoint: `checkpoint()` skips the whole-node group
-    /// capture (recovery comes from per-vnode partials). Effective only with delta enabled.
-    #[cfg(feature = "cluster")]
-    pub fn set_delta_primary(&mut self, on: bool) {
-        self.delta_primary = on;
-    }
-
-    /// Whether the whole-node aggregate capture should be skipped (delta chain is authoritative).
+    /// Whether the whole-node aggregate capture should be skipped — true once incremental delta
+    /// checkpoints are enabled, since the per-vnode chain is then the authoritative agg checkpoint.
     #[cfg(feature = "cluster")]
     fn skip_whole_node_agg(&self) -> bool {
-        self.delta_primary && self.delta_chain_max.is_some()
+        self.delta_chain_max.is_some()
     }
     #[cfg(not(feature = "cluster"))]
     fn skip_whole_node_agg(&self) -> bool {
@@ -1338,23 +1328,21 @@ mod delta_primary_tests {
             receiver,
             self_id: NodeId(1),
         });
-        op.enable_delta_checkpoints(4);
-        op.set_delta_primary(true);
-
         op.process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
             .await
             .unwrap();
 
-        assert!(
-            op.checkpoint().unwrap().is_none(),
-            "delta_primary must skip the whole-node aggregate capture"
-        );
-
-        // Off again: the whole-node capture reappears.
-        op.set_delta_primary(false);
+        // Delta not yet enabled → whole-node capture present.
         assert!(
             op.checkpoint().unwrap().is_some(),
-            "without delta_primary the whole-node aggregate capture is present"
+            "without delta the whole-node aggregate capture is present"
+        );
+
+        // Enabling delta makes the chain authoritative → whole-node capture is skipped.
+        op.enable_delta_checkpoints(4);
+        assert!(
+            op.checkpoint().unwrap().is_none(),
+            "delta-enabled aggregate must skip the whole-node capture (chain is primary)"
         );
     }
 }

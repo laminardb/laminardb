@@ -127,9 +127,26 @@ Two steps, both committed behind a default-OFF `delta_primary` flag:
   - Unit test `delta_primary_skips_whole_node_agg_capture` (operator: checkpoint None on / Some off).
   - Soak knob `LAMINAR_SOAK_DELTA_PRIMARY` added to `cluster_soak.rs`.
 - **Gate before flipping default:** MinIO 3-node kill-9 soak
-  (`LAMINAR_SOAK_DELTA_CHAIN_MAX=6 LAMINAR_SOAK_DELTA_PRIMARY=1 …`) — assert chains rehydrate, the
-  manifest carries no agg state, recovery is chain-only, no gap/dup. Then delete the whole-node agg
-  capture path.
+  (`LAMINAR_SOAK_DELTA_CHAIN_MAX=6 …`) — assert chains rehydrate, the manifest carries no agg state,
+  recovery is chain-only, no gap/dup. Then delete the whole-node agg capture path.
+
+#### VALIDATED + FLIPPED + UNIFIED (2026-06-27)
+- **Validation:** kill-9 soak (chains rehydrate, zero delta/chain errors, EO intact) + two
+  deterministic `cluster_integration` tests asserting **correct values** (doubled totals) after
+  recovery on both paths: `delta_primary_crash_rehydrates_aggregate_from_chain` (crash + rebalance)
+  and `delta_primary_aggregate_survives_graceful_restart` (full restart — the path the soak can't
+  reach, since a respawned node owns nothing until rebalance). The graceful test is the one that
+  proves the `stage_owned_vnodes_for_delta_primary` restart path with `owned>0`.
+- **Flip + cleanup (unification):** the separate `delta_primary` flag is **removed** — enabling
+  incremental delta checkpoints (`delta_chain_max`) now *implies* chain-primary recovery. One
+  mechanism, per the delta plan's endpoint. `skip_whole_node_agg() == delta_chain_max.is_some()`;
+  recovery staging keyed on `delta_chain_max`. The escape hatch is simply not enabling delta
+  (`delta_chain_max = None` → whole-node manifest, unchanged). Removed: the `delta_primary` fields on
+  `StreamCheckpointConfig` / server `CheckpointSection`, `OperatorGraph`/`SqlQueryOperator`
+  `set_delta_primary`, the soak `LAMINAR_SOAK_DELTA_PRIMARY` knob.
+- **Remaining:** the whole-node `checkpoint_groups` function stays (non-sharded / non-delta aggs
+  still use it); for delta-enabled sharded aggs it is no longer called (skip). A future single-node
+  embedded-durable-partials effort could extend A1-capture beyond cluster/object-store.
 
 ### A1-emit — per-cycle emit O(dirty)  (addresses #1; the bigger win, higher risk)
 

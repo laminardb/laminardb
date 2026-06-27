@@ -300,7 +300,6 @@ pub(crate) fn apply_checkpoint_config(
         restorable_gate_poll_initial_ms: checkpoint.restorable_gate_poll_initial_ms,
         restorable_gate_poll_max_ms: checkpoint.restorable_gate_poll_max_ms,
         delta_chain_max: checkpoint.delta_chain_max,
-        delta_primary: checkpoint.delta_primary,
     };
     builder = builder.checkpoint(cfg);
 

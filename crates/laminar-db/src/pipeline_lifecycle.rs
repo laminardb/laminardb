@@ -272,6 +272,10 @@ impl LaminarDB {
             Some(registry) => laminar_core::state::owned_vnodes(registry, self_id),
             None => return Ok(()),
         };
+        tracing::info!(
+            owned = owned.len(),
+            "A1-capture: delta-primary recovery rehydrating owned vnodes"
+        );
         if owned.is_empty() {
             return Ok(());
         }
@@ -294,6 +298,12 @@ impl LaminarDB {
                 staged = staged.len(),
                 epoch,
                 "A1-capture: staged owned vnodes for delta-primary aggregate recovery"
+            );
+        } else {
+            tracing::warn!(
+                owned = owned.len(),
+                "A1-capture: delta-primary recovery found no committed epoch — \
+                 aggregates start empty (no durable partials yet)"
             );
         }
         Ok(())
@@ -726,8 +736,11 @@ impl LaminarDB {
                             u32::try_from(cp.max_retained.unwrap_or(3)).unwrap_or(u32::MAX);
                         let bounded = chain_max.min(retain.saturating_sub(1)).max(1);
                         graph.set_delta_chain_max(bounded);
-                        // A1-capture: make the delta chain the primary agg checkpoint.
-                        graph.set_delta_primary(cp.delta_primary);
+                        // Enabling delta makes the chain the primary agg checkpoint (A1-capture).
+                        tracing::info!(
+                            delta_chain_max = bounded,
+                            "delta checkpoints enabled (chain is the primary aggregate checkpoint)"
+                        );
                     }
                 }
             }
@@ -1342,7 +1355,7 @@ impl LaminarDB {
                             }
                         }
 
-                        // A1-capture: under delta_primary the manifest holds no aggregate state;
+                        // A1-capture: with delta enabled the manifest holds no aggregate state;
                         // rebuild aggregates from each owned vnode's delta chain instead.
                         #[cfg(feature = "cluster")]
                         if !graph_restore_failed
@@ -1350,7 +1363,7 @@ impl LaminarDB {
                                 .config
                                 .checkpoint
                                 .as_ref()
-                                .is_some_and(|cp| cp.delta_primary && cp.delta_chain_max.is_some())
+                                .is_some_and(|cp| cp.delta_chain_max.is_some())
                         {
                             self.stage_owned_vnodes_for_delta_primary().await?;
                         }
