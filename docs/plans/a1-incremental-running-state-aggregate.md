@@ -1,0 +1,158 @@
+# A1 — incremental running-state aggregates (O(dirty), not O(total groups))
+
+Status: **scoped / not started.** Targets the **non-windowed `GROUP BY` MV** path (default running
+state, no `EMIT CHANGES`). `EMIT CHANGES` (changelog) and windowed aggregates are already
+incremental.
+
+## Why (profiled, release, this machine)
+
+Non-windowed running-state aggregate, per cycle:
+
+| groups | #1 emit (`emit_running_state`) | #2 capture (`checkpoint_groups`) | baseline (fold 1 row) | emit/baseline |
+| --- | --- | --- | --- | --- |
+| 10k | 1.3 ms | 6.6 ms | 6 µs | 222× |
+| 100k | 21 ms | 91 ms | 25 µs | 829× |
+| 1M | **358 ms** | **1.05 s** | 34 µs | **10,536×** |
+
+Both costs are **O(total groups)**; the real work is O(changed groups) and is ~tens of µs. Emit
+fires **every cycle** (the throughput ceiling — can't cycle faster than ~2.8×/s at 1M) and
+cascades (MV store replace-all → sinks → serialize → shuffle). Capture fires **per checkpoint**
+(stalls ingest >1 s at 1M, inline on the pipeline task). A3 already took capture's constant factor
+(~9×, ~1 µs/grp); the remaining lever is making both **O(dirty)**.
+
+Profiler lives at `aggregate_state.rs::tests::profile_agg_emit_vs_capture` (`#[ignore]`d) — use it
+as the before/after gate.
+
+## A1 = two separable halves
+
+They share the goal (O(dirty)) but touch different machinery and carry different risk. They can
+ship independently.
+
+### A1-capture — checkpoint O(dirty)  (addresses #2; lower risk, self-contained)
+
+Make per-vnode partial capture the **primary** agg checkpoint instead of whole-node
+`checkpoint_groups`.
+
+- **Today:** `sql_query.rs:894` `checkpoint()` → `checkpoint_groups()` (whole-node, O(groups));
+  recovery → `restore_groups` (`aggregate_state.rs:1484`). Per-vnode (`checkpoint_groups_by_vnode`
+  :1564, `write_vnode_partials` in `checkpoint_coordinator.rs:993`, `VnodeRehydrator` +
+  `apply_vnode_state` :1131) is supplementary (cluster rebalance).
+- **Change:** capture only **dirty vnodes'** groups (reuse `dirty_vnodes` = dirty-since-capture,
+  reset at capture ~`:1646`), persist via `write_vnode_partials`, and switch single-instance
+  recovery from `restore_groups` to `VnodeRehydrator` + `apply_vnode_state`. Give single-instance a
+  `vnode_count` (cluster fences already no-op single-instance per the prior separability spike).
+- **Granularity:** vnode-coarse — one changed group dirties one vnode (~`N/vnode_count` groups
+  captured). At 256 vnodes that's ~256× less work (1M → ~4k groups ≈ ~4 ms vs 1.05 s). Per-group
+  capture granularity would need a new dirty-since-capture *key* set (more memory) — out of scope.
+- **Risk:** it's a **recovery-model switch** (per-vnode becomes the source of truth). Must preserve
+  the destructive-accumulator rebuild (DataFusion `distinct`/`array_agg` have destructive
+  `state()`; A3's `snapshot_state_scalars` handles this — keep it on the per-vnode path). Whole-node
+  `checkpoint_groups`/`restore_groups` can be deleted once per-vnode is primary (no back-compat).
+- **Gate:** kill-9 EO file-checkpoint soak (the reliable green here) + the profiler before/after +
+  full lib/state-tier suites. Flag-gated default-OFF until soaked, then make default.
+- **Size:** M–L. **No consumer-contract change.**
+
+#### BLOCKER found during scoping (2026-06-27): per-vnode partials have no durable home in embedded single-instance
+
+The prior "machinery exists, just un-gate it" premise holds **only for object-store-backed
+deployments**. Verified:
+- Per-vnode partials are written via `StateBackend::write_partial` to `(vnode, epoch)`. The durable
+  impl is `ObjectStoreBackend` (`laminar-core/state/object_store.rs`). The embedded default is
+  `InProcessBackend` — explicitly **non-durable** ("in-memory hashmap… embedded single-process
+  runs"); `write_partial` inserts into a `RwLock<HashMap>` → **lost on kill-9**. And a `StateBackend`
+  is only installed if explicitly provided (`builder.rs:488`).
+- Durable single-instance recovery today uses the **file manifest** (`db.rs:2201`,
+  `ObjectStoreCheckpointStore` on a local dir) carrying **whole-node `operator_states`**, *not*
+  per-vnode partials.
+
+So switching the primary agg checkpoint to per-vnode partials in embedded single-instance would
+write the partials to a non-durable backend and **break kill-9 recovery**. A1-capture therefore
+forks by deployment:
+- **A1-capture (object-store-backed)** — cluster, or single-instance with `object_store_url` set.
+  Durable partials already exist → genuinely "un-gate + make primary + switch recovery". Medium.
+  Validate with an object-store kill-9 soak.
+- **A1-capture (embedded/file single-instance)** — needs **new durable per-vnode partial storage**
+  (a file-backed `StateBackend`, or fold partials into the manifest store). Larger; new storage code.
+
+**Recommendation:** target **object-store-backed first** — that's where large-state (high-cardinality)
+aggregates are realistically checkpointed anyway, the durable machinery is present, and it's the
+lower-risk increment. Add embedded-durable partials only if an embedded high-cardinality deployment
+needs it. Decide the target deployment before implementing.
+
+#### REFRAME (2026-06-27): A1-capture = the delta-checkpoint "staged-unification flip", not a new build
+
+Owner decision: **object-store-backed**, validated via MinIO in Docker. Crucial overlap found — the
+**Delta-checkpoint Lever 2** work, committed on *this branch* (`5e6cc265` + `49e98a49`,
+`docs/plans/incremental-delta-checkpoint-lever2.md`), already built and **kill-9/changelog
+soak-validated** the hard parts, default-OFF and cluster-gated:
+- per-vnode **O(dirty) delta capture** (`checkpoint_delta_by_vnode`), durable object-store partials
+  (`write_vnode_partials`), multi-hop **chain recovery** (`collect_chain`/`resolve_op_chain`,
+  `apply_vnode_chain`), per-operator chain resolution.
+
+But it runs **alongside** the whole-node path, not replacing it. Verified: every
+`checkpoint_with_barrier` does **both** `capture_and_serialize_operator_state` (whole-node
+`snapshot_state` → `checkpoint_groups`, O(all groups), into the manifest) **and** `capture_vnode_states`
+(delta partials). So today delta-ON *adds* cost; the O(dirty) win needs the whole-node agg capture
+**removed**. That removal + routing agg recovery through the chain is exactly the delta plan's
+remaining step: *"flip default → delete the full-every-epoch path"* (soak-gated).
+
+**So A1-capture (object-store) = the unification flip, scoped to cluster/sharded + object-store:**
+1. Behind a flag, make `snapshot_state` **skip whole-node agg state** (aggs no longer serialized into
+   the manifest `operator_graph` blob) when the delta chain is the authority — non-agg operators +
+   MV stores + source offsets stay in the manifest.
+2. Route **agg recovery through the chain** (`VnodeRehydrator` + `apply_vnode_chain`) as primary,
+   not `restore_groups` from the manifest.
+3. Keep `delta_chain_max` set (delta path active). Flag-gated default-OFF.
+4. Validate with the **MinIO 3-node kill-9 soak** (`cluster_soak.rs`, `LAMINAR_SOAK_DELTA_CHAIN_MAX`),
+   which already exercises delta chain recovery; assert the manifest no longer carries agg state and
+   recovery is chain-only, with no gap/dup.
+
+This is far smaller and lower-risk than a from-scratch build — the codec, durability, and chain
+recovery are soaked; A1-capture is making them authoritative. Requires cluster + sharding (the
+vnode partitioning) + an object-store backend — the deployment the MinIO soak covers.
+
+### A1-emit — per-cycle emit O(dirty)  (addresses #1; the bigger win, higher risk)
+
+Stop re-evaluating + re-materializing all groups every cycle.
+
+- **Today:** `emit_running_state` (`aggregate_state.rs:1232`) walks **all** groups: `convert_rows`
+  on all keys + per agg `evaluate()` per group + `iter_to_array` over N rows. It must emit the full
+  snapshot because the MV store is **replace-all** (`mv_store.rs:58`) and append-only consumers
+  expect a full snapshot, not a changelog.
+- **The shortcut that doesn't work:** an eval-cache (old P0.1b — cache clean groups' `ScalarValue`,
+  skip `evaluate()`) only removes the `evaluate()` axis. For cheap accumulators (SUM/COUNT)
+  `evaluate()` is already trivial; the O(N) cost is **materializing the N-row arrays**
+  (`convert_rows` + `iter_to_array`), which eval-cache does **not** remove. So eval-cache is *not*
+  the win here (this is why P0.1b was shelved). The only way to make emit O(dirty) is to **emit
+  fewer rows** → a changelog/upsert, which is a consumer-contract change.
+- **Change (own ADR):** give the default non-windowed running-state MV **incremental emit**: emit
+  only dirty groups (reuse the `dirty_keys` changelog machinery already at `:1300`) into an
+  **upsert MV store** mode (merge dirty groups, keep the full snapshot for `SELECT * FROM mv`
+  reads) instead of `MvStorageMode::Aggregate` replace-all. Per-cycle work becomes O(dirty); the
+  full snapshot is read on demand from the upsert store.
+- **Consumer-contract decision (the crux — decide before building):** the operator output also
+  feeds chained MVs, stream subscribers, and sinks. Incremental emit hands them an upsert/retraction
+  changelog. Options: (a) upsert-capable consumers only (MV reads + upsert sinks + retraction-aware
+  chained MVs) and keep full-emit for append-only sinks; (b) maintain the snapshot in the store and
+  re-derive full output only for append-only consumers (partial win). This is the "upsert MV +
+  delta-aware consumers" ADR — large blast radius across every downstream consumer.
+- **Risk:** high (output-semantics change across consumers). **Size:** L–XL.
+
+## Recommended sequence
+
+1. **A1-capture first** — bounded, self-contained, machinery exists, no consumer change; removes the
+   1 s checkpoint stall. Soak, make default.
+2. **Decide the A1-emit consumer contract** (the ADR above) — this is the gate, not code. Without an
+   upsert/delta consumer model there is no O(dirty) emit.
+3. **A1-emit** — only after (2). It's the larger throughput win but the larger blast radius.
+
+Note on totals: emit fires every cycle, capture per checkpoint — so over a window with infrequent
+checkpoints, **emit dominates total cost**, but it's the harder change. A1-capture is the safer
+first increment; A1-emit is where the throughput ceiling actually lifts.
+
+## Don't repeat / constraints
+- No in-memory byte cache of group state (doubles memory, violates the memory budget).
+- Preserve destructive-accumulator rebuild (`snapshot_state_scalars`) on any incremental path.
+- Reuse `dirty_vnodes` (dirty-since-capture) for A1-capture and `dirty_keys` (dirty-since-emit,
+  already wired for `EMIT CHANGES`) for A1-emit — don't conflate them.
+- Format/recovery-model change is free (zero external users); delete the superseded whole-node path.

@@ -212,7 +212,11 @@ it. So replay needs no separate buffer or cursors — just **don't clear** a fau
 - Test: `test_shared_source_isolation_replays_faulted_domain` (transient fault → cycle 2 emits 4
   rows = preserved 2 + new 2; healthy sibling emits only its 2 new rows).
 
-**Slice 2b — the live-provider wall (OPEN, needed only for SQL-scan operators).**
+**Slice 2b — the live-provider wall (DEFERRED — Decision A, 2026-06-26).**
+Owner decision: **accept the degradation and document it.** Slice 2a covers the common shared-source
+shapes (projections, filters, single-table aggregations) with full online replay; SQL-scan operators
+degrade safely (no dup/gap, recovery-based isolation). Build 2b only if a real shared-source
+join/asof workload needs *online* isolation. Options if revisited below.
 Operators that execute a DataFusion plan scanning the **global-by-name** live provider
 (CachedPlan/CachedPhysical, joins, asof, temporal) re-read the provider (new data) on replay rather
 than their preserved `input_bufs`, so under isolation they **degrade to Slice-1 drop** (no online
