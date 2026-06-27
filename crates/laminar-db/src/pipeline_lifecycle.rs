@@ -265,7 +265,12 @@ impl LaminarDB {
     /// staged, so a missing backend is fatal rather than a silent empty-state start.
     #[cfg(feature = "cluster")]
     async fn stage_owned_vnodes_for_delta_primary(&self) -> Result<(), DbError> {
-        let Some(self_id) = self.cluster_controller.lock().as_ref().map(|c| c.instance_id()) else {
+        let Some(self_id) = self
+            .cluster_controller
+            .lock()
+            .as_ref()
+            .map(|c| c.instance_id())
+        else {
             return Ok(());
         };
         let owned = match self.vnode_registry.lock().as_ref() {
@@ -832,6 +837,7 @@ impl LaminarDB {
                 reg.order_config.clone(),
                 None,
                 reg.join_config.clone(),
+                reg.incremental,
             );
         }
         graph.take_build_errors()?;
@@ -2273,6 +2279,7 @@ mod resolver_tests {
             }),
             order_config: None,
             join_config: None,
+            incremental: false,
         }
     }
 

@@ -511,6 +511,11 @@ pub struct CheckpointSection {
     /// out of the prune window.
     #[serde(default)]
     pub delta_chain_max: Option<u32>,
+    /// Incremental emit for terminal non-windowed running-state aggregate MVs (A1-emit): emit a
+    /// dirty-only changelog into a keyed upsert store instead of re-materializing every group each
+    /// cycle. `SELECT * FROM mv` still returns the full snapshot. Default off.
+    #[serde(default)]
+    pub incremental_emit: bool,
 }
 
 impl Default for CheckpointSection {
@@ -527,6 +532,7 @@ impl Default for CheckpointSection {
             restorable_gate_poll_initial_ms: None,
             restorable_gate_poll_max_ms: None,
             delta_chain_max: None,
+            incremental_emit: false,
         }
     }
 }

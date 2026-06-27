@@ -39,6 +39,10 @@ pub(crate) struct StreamRegistration {
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
     pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
+    /// A1-emit: this MV emits a dirty-only changelog into a keyed upsert store. Decided once at
+    /// DDL time (`incremental_emit` flag + terminal non-windowed agg); the operator reads it to
+    /// emit a changelog and the MV store is created in `Upsert` mode.
+    pub incremental: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +376,7 @@ mod tests {
             window_config: None,
             order_config: None,
             join_config: None,
+            incremental: false,
         });
         assert_eq!(mgr.stream_names(), vec!["agg_stream"]);
     }
@@ -530,6 +535,7 @@ mod tests {
             window_config: None,
             order_config: None,
             join_config: None,
+            incremental: false,
         });
         assert!(mgr.unregister_sink("s1"));
         assert!(!mgr.unregister_sink("s1"));

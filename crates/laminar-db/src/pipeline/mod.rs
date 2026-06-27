@@ -36,6 +36,9 @@ pub enum ControlMsg {
         order_config: Option<OrderOperatorConfig>,
         /// Per-step join configs (left-deep).
         join_config: Option<Vec<JoinOperatorConfig>>,
+        /// A1-emit: emit a dirty-only changelog (terminal non-windowed agg MV under
+        /// `incremental_emit`); the MV store for this name is created in `Upsert` mode.
+        incremental: bool,
     },
     /// Remove a streaming query from the running pipeline.
     DropStream {

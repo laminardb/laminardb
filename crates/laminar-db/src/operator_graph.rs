@@ -991,6 +991,7 @@ impl OperatorGraph {
         order_config: Option<OrderOperatorConfig>,
         idle_ttl_ms: Option<u64>,
         join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
+        incremental: bool,
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
 
@@ -1117,6 +1118,7 @@ impl OperatorGraph {
             lookup_enrich_config,
             projection_sql.as_deref(),
             idle_ttl_ms,
+            incremental,
         );
 
         let input_port_count = if asof_config.is_some()
@@ -1320,6 +1322,7 @@ impl OperatorGraph {
         lookup_enrich_config: Option<crate::operator::lookup_enrich::LookupEnrichConfig>,
         projection_sql: Option<&str>,
         idle_ttl_ms: Option<u64>,
+        incremental: bool,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
 
@@ -1454,7 +1457,10 @@ impl OperatorGraph {
             ));
         }
 
-        let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
+        // `EMIT CHANGES` is an explicit changelog; A1-emit (`incremental`) drives the same
+        // dirty-only emit internally for a terminal running-state aggregate MV.
+        let emit_changelog =
+            incremental || emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
         #[cfg_attr(
             not(any(feature = "cluster", feature = "state-tier")),
@@ -2019,7 +2025,10 @@ impl OperatorGraph {
     /// `(any domain faulted, local source names whose domain faulted)` from the last
     /// `execute_cycle`, draining the set. The coordinator holds back these sources' offsets.
     pub fn take_cycle_failures(&mut self) -> (bool, FxHashSet<Arc<str>>) {
-        (self.cycle_any_failed, std::mem::take(&mut self.cycle_failed_sources))
+        (
+            self.cycle_any_failed,
+            std::mem::take(&mut self.cycle_failed_sources),
+        )
     }
 
     fn prime_sources(
@@ -2615,6 +2624,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert_eq!(graph.nodes.len(), 2); // source "trades" + query "q1"
@@ -2636,6 +2646,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q2".to_string(),
@@ -2645,6 +2656,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // source "trades" + query "q1" + query "q2" = 3 nodes
@@ -2668,6 +2680,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q1".to_string(),
@@ -2677,6 +2690,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         graph.compute_topo_order();
@@ -2711,6 +2725,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(graph.output_map.contains_key("q1"));
 
@@ -2733,6 +2748,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let batch = test_batch();
@@ -2834,6 +2850,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph
             .take_build_errors()
@@ -2878,6 +2895,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(
             graph.take_build_errors().is_err(),
@@ -2951,6 +2969,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph
             .take_build_errors()
@@ -2997,6 +3016,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let source_batches = FxHashMap::default();
@@ -3025,6 +3045,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q2".to_string(),
@@ -3034,6 +3055,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let batch = test_batch();
@@ -3060,6 +3082,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // No state yet → None
         let cp = graph.snapshot_state().unwrap();
@@ -3080,6 +3103,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let mut src = FxHashMap::default();
         src.insert(Arc::from("trades"), vec![test_batch()]);
@@ -3099,6 +3123,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(g2.restore_from_bytes(&bytes).unwrap(), 1);
 
@@ -3164,6 +3189,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "qb".to_string(),
@@ -3173,10 +3199,14 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.compute_topo_order();
 
-        assert_eq!(graph.domain_count, 2, "disjoint-source queries are separate domains");
+        assert_eq!(
+            graph.domain_count, 2,
+            "disjoint-source queries are separate domains"
+        );
         let a = graph.source_map.get("trades_a").copied().unwrap();
         let b = graph.source_map.get("trades_b").copied().unwrap();
         assert_ne!(graph.node_domain[a], graph.node_domain[b]);
@@ -3194,6 +3224,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "qb".to_string(),
@@ -3203,10 +3234,14 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.compute_topo_order();
 
-        assert_eq!(graph.domain_count, 1, "queries sharing a source recover together");
+        assert_eq!(
+            graph.domain_count, 1,
+            "queries sharing a source recover together"
+        );
     }
 
     #[test]
@@ -3222,6 +3257,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "qb".to_string(),
@@ -3231,6 +3267,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.compute_topo_order();
 
@@ -3266,6 +3303,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "healthy".to_string(),
@@ -3275,6 +3313,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3290,7 +3329,11 @@ mod tests {
             2,
             "healthy sibling emitted despite sharing the faulted source"
         );
-        assert_eq!(total_rows(&results, "agg"), 0, "faulted domain emitted nothing");
+        assert_eq!(
+            total_rows(&results, "agg"),
+            0,
+            "faulted domain emitted nothing"
+        );
 
         let (any_failed, failed_sources) = graph.take_cycle_failures();
         assert!(any_failed);
@@ -3361,7 +3404,11 @@ mod tests {
             .await
             .expect("healthy sibling keeps cycle 1 Ok");
         assert_eq!(total_rows(&r1, "b"), 2, "healthy sibling emitted cycle 1");
-        assert_eq!(total_rows(&r1, "a"), 0, "faulted op emitted nothing cycle 1");
+        assert_eq!(
+            total_rows(&r1, "a"),
+            0,
+            "faulted op emitted nothing cycle 1"
+        );
         let (_, failed) = graph.take_cycle_failures();
         assert!(failed.contains(&Arc::from("trades")));
 
@@ -3402,6 +3449,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "filtered".to_string(),
@@ -3411,6 +3459,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3422,8 +3471,16 @@ mod tests {
             .await
             .expect("a healthy sibling domain keeps the cycle Ok");
 
-        assert_eq!(total_rows(&results, "filtered"), 2, "healthy domain emitted");
-        assert_eq!(total_rows(&results, "agg"), 0, "faulted domain emitted nothing");
+        assert_eq!(
+            total_rows(&results, "filtered"),
+            2,
+            "healthy domain emitted"
+        );
+        assert_eq!(
+            total_rows(&results, "agg"),
+            0,
+            "faulted domain emitted nothing"
+        );
 
         let (any_failed, failed_sources) = graph.take_cycle_failures();
         assert!(any_failed);
@@ -3443,6 +3500,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3471,6 +3529,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3492,6 +3551,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3540,6 +3600,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "step2".to_string(),
@@ -3549,6 +3610,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3573,6 +3635,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "low".to_string(),
@@ -3582,6 +3645,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // C selects from both A and B — this will use cached plan (multi-source)
         graph.add_query(
@@ -3593,6 +3657,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3619,6 +3684,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q2".to_string(),
@@ -3628,6 +3694,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3661,6 +3728,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
         }
 
@@ -3698,6 +3766,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3724,6 +3793,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3749,6 +3819,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Need one cycle to lazy-init state before restore will take effect
@@ -3775,6 +3846,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3808,6 +3880,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q1".to_string(),
@@ -3817,6 +3890,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // "q1" should NOT be in source_map (it was replaced with a real query)
@@ -3867,6 +3941,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Cycle 1: inject both sides, watermark=102k (only offset=0 resolves)
@@ -3920,6 +3995,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // Push some data into the source buffer
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -3940,6 +4016,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // Fill source buffer to 50% of cap
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -3960,6 +4037,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // Overfill the buffer beyond cap — pressure clamps at 1.0.
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -3990,6 +4068,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "downstream".to_string(),
@@ -3999,6 +4078,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Find the downstream node id and pre-fill its input buffer at cap,
@@ -4044,6 +4124,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Now register `derived` — this replaces the placeholder.
@@ -4055,6 +4136,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let derived_id = *graph.output_map.get("derived").unwrap();
@@ -4077,6 +4159,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Pre-fill sink's input at cap. Because sink has no downstream, sink
@@ -4163,6 +4246,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let batch = test_batch(); // AAPL + GOOG
@@ -4218,6 +4302,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // source + 2 filter nodes + join operator = 4
@@ -4283,6 +4368,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "consumer".to_string(),
@@ -4292,6 +4378,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let consumer_id = *graph.output_map.get("consumer").unwrap();
         prefill_port(&mut graph, consumer_id, 0, vec![test_batch(); cap]);
@@ -4365,6 +4452,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "consumer".to_string(),
@@ -4374,6 +4462,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let consumer_id = *graph.output_map.get("consumer").unwrap();
         prefill_port(&mut graph, consumer_id, 0, vec![test_batch()]);

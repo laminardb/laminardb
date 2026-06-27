@@ -150,6 +150,7 @@ fn build_scoring_graph(runtime: Arc<AiRuntime>) -> OperatorGraph {
         None,
         None,
         None,
+        false,
     );
     graph
         .take_build_errors()
@@ -232,6 +233,7 @@ async fn ai_degrades_to_null_on_provider_500() {
         None,
         None,
         None,
+        false,
     );
     graph
         .take_build_errors()
@@ -313,6 +315,7 @@ async fn join_matches_buckets_closing_in_different_cycles() {
         None,
         None,
         None,
+        false,
     );
     graph
         .take_build_errors()

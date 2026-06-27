@@ -1884,6 +1884,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 window_config,
                 order_config,
                 join_config,
+                incremental,
             } => {
                 self.graph.add_query(
                     name.clone(),
@@ -1893,6 +1894,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     order_config,
                     None,
                     join_config,
+                    incremental,
                 );
                 tracing::info!(stream = %name, "Stream added via control channel");
             }
@@ -2604,6 +2606,7 @@ mod demotion_tests {
             None,
             None,
             None,
+            false,
         );
         graph.take_build_errors().unwrap();
         graph

@@ -1586,6 +1586,11 @@ impl LaminarDB {
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
+        // A1-emit terminality guard: an incremental MV emits a changelog, not a snapshot stream.
+        if self.is_incremental_mv(name) {
+            return Err(crate::ddl::incremental_mv_consumer_error(name, "SUBSCRIBE"));
+        }
+
         let attached = self.subscription_registry.subscriber_count(name);
         if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
             return Err(DbError::Pipeline(format!(

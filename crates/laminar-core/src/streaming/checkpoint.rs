@@ -39,6 +39,11 @@ pub struct StreamCheckpointConfig {
     /// Requires a durable (object-store) backend. Clamped `< max_retained` so the chain base never
     /// ages out of the prune window. Default off.
     pub delta_chain_max: Option<u32>,
+    /// Incremental emit for non-windowed running-state aggregate MVs (A1-emit). When on, a
+    /// terminal `GROUP BY` MV emits a dirty-only changelog into a keyed upsert store instead of
+    /// re-materializing every group each cycle (`SELECT * FROM mv` still returns the full
+    /// snapshot). Default off.
+    pub incremental_emit: bool,
 }
 
 /// Errors from checkpoint operations.

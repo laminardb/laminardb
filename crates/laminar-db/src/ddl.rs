@@ -32,6 +32,15 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// A1-emit terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
+pub(crate) fn incremental_mv_consumer_error(mv: &str, consumer: &str) -> DbError {
+    DbError::MaterializedView(format!(
+        "[LDB-1300] {consumer} cannot consume incremental materialized view '{mv}': it emits a \
+         dirty-only changelog, not a full snapshot. Read it with `SELECT * FROM {mv}` (snapshot), \
+         or recreate '{mv}' without `incremental_emit`."
+    ))
+}
+
 /// Parsed `WITH (...)` clause of a `CREATE TABLE`.
 #[derive(Default)]
 struct CreateTableWith {
@@ -451,6 +460,13 @@ impl LaminarDB {
             laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
         };
 
+        // A1-emit terminality guard: a sink cannot consume an incremental MV's changelog.
+        if matches!(&create.from, laminar_sql::parser::SinkFrom::Table(_))
+            && self.is_incremental_mv(&input)
+        {
+            return Err(incremental_mv_consumer_error(&input, "a sink"));
+        }
+
         // Validate before mutating catalog/planner — no half-created sink on error.
         let resolved = self.prepare_connector(
             create.connector_type.as_ref(),
@@ -726,6 +742,8 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
+        // A1-emit terminality guard: a stream cannot consume an incremental MV's changelog.
+        self.reject_reading_incremental_mv(query_sql, "a stream")?;
         self.catalog.register_stream(&name_str)?;
 
         if let Some(bytes) = retention_bytes {
@@ -768,6 +786,7 @@ impl LaminarDB {
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
+                incremental: false,
             });
         }
 
@@ -802,6 +821,7 @@ impl LaminarDB {
                 window_config: plan_window,
                 order_config: plan_order,
                 join_config: plan_joins,
+                incremental: false,
             })
             .map_err(|e| {
                 self.catalog.drop_stream(&name_str);
@@ -998,6 +1018,8 @@ impl LaminarDB {
         }
 
         let query_sql = query_sql.to_string();
+        // A1-emit terminality guard: a chained MV cannot consume an incremental MV's changelog.
+        self.reject_reading_incremental_mv(&query_sql, "a materialized view")?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
         let sources = self.collect_mv_sources(&query_sql, &name_str);
 
@@ -1039,6 +1061,14 @@ impl LaminarDB {
             }
         };
 
+        // A1-emit: a terminal non-windowed running-state aggregate MV emits a dirty-only changelog
+        // into a keyed upsert store. Decide once so the operator (changelog) and the MV store
+        // (Upsert mode) agree; the terminality guard rejects streaming consumers of incremental MVs.
+        let incremental_key_cols = self
+            .incremental_mv_key_cols(&query_sql, plan_window.is_some())
+            .await;
+        let incremental = incremental_key_cols.is_some();
+
         {
             let mut mgr = self.connector_manager.lock();
             mgr.register_stream(crate::connector_manager::StreamRegistration {
@@ -1048,11 +1078,18 @@ impl LaminarDB {
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
+                incremental,
             });
         }
 
-        self.register_mv_provider(&name_str, schema, &query_sql, plan_window.is_some())
-            .await?;
+        self.register_mv_provider(
+            &name_str,
+            schema,
+            &query_sql,
+            plan_window.is_some(),
+            incremental_key_cols,
+        )
+        .await?;
 
         // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
         if let Some(ref tx) = *self.control_tx.lock() {
@@ -1063,6 +1100,7 @@ impl LaminarDB {
                 window_config: plan_window,
                 order_config: plan_order,
                 join_config: plan_joins,
+                incremental,
             })
             .map_err(|e| {
                 let _ = self.ctx.deregister_table(&name_str);
@@ -1134,6 +1172,57 @@ impl LaminarDB {
         sources
     }
 
+    /// A1-emit Stage-1 terminality guard. An incremental MV's operator emits a dirty-only
+    /// changelog, not a full snapshot, so only `SELECT * FROM mv` (snapshot) reads are supported;
+    /// every streaming consumer (chained MV/stream, sink, SUBSCRIBE) is rejected at DDL time.
+    pub(crate) fn is_incremental_mv(&self, name: &str) -> bool {
+        self.connector_manager
+            .lock()
+            .streams()
+            .get(name)
+            .is_some_and(|r| r.incremental)
+    }
+
+    /// Reject `consumer` when `query_sql` references any incremental MV.
+    fn reject_reading_incremental_mv(
+        &self,
+        query_sql: &str,
+        consumer: &str,
+    ) -> Result<(), DbError> {
+        let refs = crate::sql_analysis::extract_table_references(query_sql);
+        let mgr = self.connector_manager.lock();
+        for r in &refs {
+            if mgr.streams().get(r.as_str()).is_some_and(|s| s.incremental) {
+                return Err(incremental_mv_consumer_error(r, consumer));
+            }
+        }
+        Ok(())
+    }
+
+    /// `Some(group-by column indices)` when this MV qualifies for A1-emit incremental emit: the
+    /// `incremental_emit` flag is on and the query is a non-windowed, non-global aggregate. A
+    /// global aggregate (no `GROUP BY`) is already single-row, so full-emit stays.
+    async fn incremental_mv_key_cols(
+        &self,
+        query_sql: &str,
+        has_window: bool,
+    ) -> Option<Vec<usize>> {
+        if has_window
+            || !self
+                .config
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.incremental_emit)
+        {
+            return None;
+        }
+        let df = self.ctx.sql(query_sql).await.ok()?;
+        let agg = crate::aggregate_state::find_aggregate(df.logical_plan())?;
+        let n = agg.group_exprs.len();
+        // Group-by columns are the output prefix; the upsert store keys on them.
+        (n > 0).then(|| (0..n).collect())
+    }
+
     /// Cluster mode wraps the provider to union peer vnode slices on read.
     async fn register_mv_provider(
         &self,
@@ -1141,24 +1230,29 @@ impl LaminarDB {
         schema: Arc<Schema>,
         query_sql: &str,
         has_window: bool,
+        incremental_key_cols: Option<Vec<usize>>,
     ) -> Result<(), DbError> {
         use crate::mv_store::MvStorageMode;
 
-        // Non-windowed aggs emit all groups every cycle (replace-all); windowed aggs emit
-        // only closing windows (append) so previous windows aren't overwritten.
-        let has_aggregate =
-            self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
+        // A1-emit terminal aggs maintain a keyed upsert snapshot from a dirty-only changelog.
+        // Otherwise: non-windowed aggs replace-all every cycle; windowed aggs append (so previous
+        // windows aren't overwritten); non-aggregates append.
+        let mode = if let Some(key_cols) = incremental_key_cols {
+            MvStorageMode::Upsert { key_cols }
+        } else {
+            let has_aggregate = self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
                 crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
             });
-        let mode = if has_aggregate && !has_window {
-            MvStorageMode::Aggregate
-        } else {
-            MvStorageMode::append_default()
+            if has_aggregate && !has_window {
+                MvStorageMode::Aggregate
+            } else {
+                MvStorageMode::append_default()
+            }
         };
 
         self.mv_store
             .write()
-            .create_mv(name_str, schema.clone(), mode);
+            .create_mv(name_str, schema.clone(), mode)?;
 
         let mv_provider = crate::table_provider::MvTableProvider::new(
             name_str.to_string(),

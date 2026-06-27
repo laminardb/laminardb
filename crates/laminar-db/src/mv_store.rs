@@ -5,10 +5,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use arrow::row::{OwnedRow, RowConverter, SortField};
+use datafusion_common::ScalarValue;
+use laminar_core::changelog::WEIGHT_COLUMN;
 
 use crate::error::DbError;
 
@@ -25,6 +28,9 @@ pub(crate) enum MvStorageMode {
     Aggregate,
     /// Non-aggregate queries: append with bounded retention.
     Append { max_batches: usize },
+    /// Incremental running-state aggregate (A1-emit): maintain a keyed snapshot from a
+    /// dirty-only `__weight` changelog. `key_cols` index the GROUP BY columns in the MV schema.
+    Upsert { key_cols: Vec<usize> },
 }
 
 impl MvStorageMode {
@@ -35,22 +41,148 @@ impl MvStorageMode {
     }
 }
 
+/// Keyed running snapshot maintained from a `__weight` changelog (A1-emit). Stored rows omit
+/// the weight column, so the snapshot materializes directly into the plain MV schema.
+struct UpsertState {
+    key_cols: Vec<usize>,
+    key_converter: RowConverter,
+    rows: HashMap<OwnedRow, Vec<ScalarValue>>,
+    approx_bytes: usize,
+}
+
+impl UpsertState {
+    fn new(schema: &SchemaRef, key_cols: &[usize]) -> Result<Self, DbError> {
+        let sort_fields: Vec<SortField> = key_cols
+            .iter()
+            .map(|&c| SortField::new(schema.field(c).data_type().clone()))
+            .collect();
+        let key_converter = RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Storage(format!("upsert MV key converter: {e}")))?;
+        Ok(Self {
+            key_cols: key_cols.to_vec(),
+            key_converter,
+            rows: HashMap::new(),
+            approx_bytes: 0,
+        })
+    }
+
+    fn keys(&self, batch: &RecordBatch) -> Result<arrow::row::Rows, DbError> {
+        let key_arrays: Vec<ArrayRef> = self
+            .key_cols
+            .iter()
+            .map(|&c| Arc::clone(batch.column(c)))
+            .collect();
+        self.key_converter
+            .convert_columns(&key_arrays)
+            .map_err(|e| DbError::Storage(format!("upsert MV key conversion: {e}")))
+    }
+
+    /// `+weight` upserts the row, `−weight` deletes the key. Retracts precede inserts within a
+    /// changelog batch, so a changed key (retract old, insert new) nets to the new row.
+    fn apply(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN)
+            .map_err(|e| DbError::Storage(format!("upsert MV changelog missing weight: {e}")))?;
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DbError::Storage("upsert MV weight column not Int64".into()))?;
+        let keys = self.keys(batch)?;
+        let plain_cols: Vec<usize> = (0..batch.num_columns())
+            .filter(|&c| c != weight_idx)
+            .collect();
+
+        for row_idx in 0..batch.num_rows() {
+            let key = keys.row(row_idx).owned();
+            if weights.value(row_idx) > 0 {
+                let mut vals = Vec::with_capacity(plain_cols.len());
+                for &c in &plain_cols {
+                    vals.push(
+                        ScalarValue::try_from_array(batch.column(c), row_idx)
+                            .map_err(|e| DbError::Storage(format!("upsert MV scalar: {e}")))?,
+                    );
+                }
+                let added: usize = vals.iter().map(ScalarValue::size).sum();
+                if let Some(old) = self.rows.insert(key, vals) {
+                    self.approx_bytes = self
+                        .approx_bytes
+                        .saturating_sub(old.iter().map(ScalarValue::size).sum());
+                }
+                self.approx_bytes += added;
+            } else if let Some(old) = self.rows.remove(&key) {
+                self.approx_bytes = self
+                    .approx_bytes
+                    .saturating_sub(old.iter().map(ScalarValue::size).sum());
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore from a materialized plain snapshot (no weight column): every row is an insert.
+    fn load_snapshot(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let keys = self.keys(batch)?;
+        for row_idx in 0..batch.num_rows() {
+            let key = keys.row(row_idx).owned();
+            let mut vals = Vec::with_capacity(batch.num_columns());
+            for c in 0..batch.num_columns() {
+                vals.push(
+                    ScalarValue::try_from_array(batch.column(c), row_idx)
+                        .map_err(|e| DbError::Storage(format!("upsert MV restore scalar: {e}")))?,
+                );
+            }
+            self.approx_bytes += vals.iter().map(ScalarValue::size).sum::<usize>();
+            self.rows.insert(key, vals);
+        }
+        Ok(())
+    }
+
+    fn to_record_batch(&self, schema: &SchemaRef) -> RecordBatch {
+        if self.rows.is_empty() {
+            return RecordBatch::new_empty(schema.clone());
+        }
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for c in 0..schema.fields().len() {
+            match ScalarValue::iter_to_array(self.rows.values().map(|r| r[c].clone())) {
+                Ok(a) => arrays.push(a),
+                Err(_) => return RecordBatch::new_empty(schema.clone()),
+            }
+        }
+        RecordBatch::try_new(schema.clone(), arrays)
+            .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone()))
+    }
+}
+
 /// Per-MV result store.
 pub(crate) struct MvEntry {
     schema: SchemaRef,
     mode: MvStorageMode,
     batches: VecDeque<RecordBatch>,
+    /// Set only in `Upsert` mode; carries the keyed running snapshot.
+    upsert: Option<UpsertState>,
     approx_bytes: usize,
 }
 
 impl MvEntry {
-    fn new(schema: SchemaRef, mode: MvStorageMode) -> Self {
-        Self {
+    fn new(schema: SchemaRef, mode: MvStorageMode) -> Result<Self, DbError> {
+        let upsert = match &mode {
+            MvStorageMode::Upsert { key_cols } => Some(UpsertState::new(&schema, key_cols)?),
+            _ => None,
+        };
+        Ok(Self {
             schema,
             mode,
             batches: VecDeque::new(),
+            upsert,
             approx_bytes: 0,
-        }
+        })
     }
 
     fn update(&mut self, batch: &RecordBatch) {
@@ -75,10 +207,21 @@ impl MvEntry {
                     }
                 }
             }
+            MvStorageMode::Upsert { .. } => {
+                if let Some(up) = self.upsert.as_mut() {
+                    if let Err(e) = up.apply(batch) {
+                        tracing::error!(error = %e, "upsert MV update failed");
+                    }
+                    self.approx_bytes = up.approx_bytes;
+                }
+            }
         }
     }
 
     fn to_record_batch(&self) -> RecordBatch {
+        if let Some(up) = self.upsert.as_ref() {
+            return up.to_record_batch(&self.schema);
+        }
         if self.batches.is_empty() {
             return RecordBatch::new_empty(self.schema.clone());
         }
@@ -107,10 +250,16 @@ impl MvStore {
         Arc::clone(&self.has_any)
     }
 
-    pub fn create_mv(&mut self, name: &str, schema: SchemaRef, mode: MvStorageMode) {
+    pub fn create_mv(
+        &mut self,
+        name: &str,
+        schema: SchemaRef,
+        mode: MvStorageMode,
+    ) -> Result<(), DbError> {
         self.entries
-            .insert(name.to_string(), MvEntry::new(schema, mode));
+            .insert(name.to_string(), MvEntry::new(schema, mode)?);
         self.has_any.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn drop_mv(&mut self, name: &str) -> bool {
@@ -143,10 +292,19 @@ impl MvStore {
     pub fn checkpoint_states(&self) -> Result<HashMap<String, bytes::Bytes>, DbError> {
         let mut out = HashMap::new();
         for (name, entry) in &self.entries {
-            if entry.batches.is_empty() {
-                continue;
-            }
-            let bytes = batches_to_ipc(&entry.schema, &entry.batches)?;
+            let bytes = if entry.upsert.is_some() {
+                // Upsert mode keeps no batches; serialize the materialized snapshot.
+                let batch = entry.to_record_batch();
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                batches_to_ipc(&entry.schema, std::iter::once(&batch))?
+            } else {
+                if entry.batches.is_empty() {
+                    continue;
+                }
+                batches_to_ipc(&entry.schema, &entry.batches)?
+            };
             out.insert(format!("mv:{name}"), bytes::Bytes::from(bytes));
         }
         Ok(out)
@@ -168,6 +326,15 @@ impl MvStore {
                     entry.schema.fields().len(),
                 )));
             }
+        }
+        if let Some(up) = entry.upsert.as_mut() {
+            up.rows.clear();
+            up.approx_bytes = 0;
+            for b in &batches {
+                up.load_snapshot(b)?;
+            }
+            entry.approx_bytes = up.approx_bytes;
+            return Ok(true);
         }
         entry.batches.clear();
         entry.approx_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
@@ -230,10 +397,67 @@ mod tests {
         .unwrap()
     }
 
+    /// Plain (weightless) schema for the upsert tests: `(k Int64, total Int64)`.
+    fn upsert_plain_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("total", DataType::Int64, true),
+        ]))
+    }
+
+    /// Changelog schema = plain schema + appended `__weight`.
+    fn upsert_changelog_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("total", DataType::Int64, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]))
+    }
+
+    /// Build a `__weight` changelog batch from `(key, total, weight)` rows.
+    fn changelog_batch(rows: &[(i64, i64, i64)]) -> RecordBatch {
+        use arrow::array::Int64Array;
+        let ks: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let totals: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let weights: Vec<i64> = rows.iter().map(|r| r.2).collect();
+        RecordBatch::try_new(
+            upsert_changelog_schema(),
+            vec![
+                Arc::new(Int64Array::from(ks)),
+                Arc::new(Int64Array::from(totals)),
+                Arc::new(Int64Array::from(weights)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// `(k, total)` snapshot rows sorted by key, for order-independent assertions.
+    fn snapshot_rows(store: &MvStore, name: &str) -> Vec<(i64, i64)> {
+        use arrow::array::Int64Array;
+        let batch = store.to_record_batch(name).unwrap();
+        let ks = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let totals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut out: Vec<(i64, i64)> = (0..batch.num_rows())
+            .map(|i| (ks.value(i), totals.value(i)))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     #[test]
     fn create_and_drop() {
         let mut store = MvStore::new();
-        store.create_mv("mv1", test_schema(), MvStorageMode::Aggregate);
+        store
+            .create_mv("mv1", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
         assert!(store.has_mv("mv1"));
         assert!(store.drop_mv("mv1"));
         assert!(!store.has_mv("mv1"));
@@ -243,7 +467,9 @@ mod tests {
     #[test]
     fn aggregate_replaces_on_each_update() {
         let mut store = MvStore::new();
-        store.create_mv("agg", test_schema(), MvStorageMode::Aggregate);
+        store
+            .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
 
         store.update("agg", &make_batch(&[1], &["a"], &[1.0]));
         assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 1);
@@ -255,11 +481,13 @@ mod tests {
     #[test]
     fn append_evicts_oldest() {
         let mut store = MvStore::new();
-        store.create_mv(
-            "app",
-            test_schema(),
-            MvStorageMode::Append { max_batches: 3 },
-        );
+        store
+            .create_mv(
+                "app",
+                test_schema(),
+                MvStorageMode::Append { max_batches: 3 },
+            )
+            .unwrap();
 
         for i in 0..4 {
             store.update("app", &make_batch(&[i], &["x"], &[f64::from(i)]));
@@ -280,7 +508,9 @@ mod tests {
     #[test]
     fn empty_mv_returns_empty_batch() {
         let mut store = MvStore::new();
-        store.create_mv("empty", test_schema(), MvStorageMode::Aggregate);
+        store
+            .create_mv("empty", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
         let result = store.to_record_batch("empty").unwrap();
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.schema(), test_schema());
@@ -295,7 +525,9 @@ mod tests {
     #[test]
     fn checkpoint_round_trip() {
         let mut store = MvStore::new();
-        store.create_mv("agg", test_schema(), MvStorageMode::Aggregate);
+        store
+            .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
         store.update("agg", &make_batch(&[1, 2], &["a", "b"], &[1.0, 2.0]));
 
         let states = store.checkpoint_states().unwrap();
@@ -304,7 +536,9 @@ mod tests {
 
         // Simulate recovery into a fresh store
         let mut store2 = MvStore::new();
-        store2.create_mv("agg", test_schema(), MvStorageMode::Aggregate);
+        store2
+            .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
         for (key, bytes) in &states {
             let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
             assert!(store2.restore_from_ipc(name, bytes).unwrap());
@@ -322,11 +556,15 @@ mod tests {
     #[test]
     fn create_replaces_existing() {
         let mut store = MvStore::new();
-        store.create_mv("mv1", test_schema(), MvStorageMode::Aggregate);
+        store
+            .create_mv("mv1", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
         store.update("mv1", &make_batch(&[1], &["a"], &[1.0]));
         assert_eq!(store.to_record_batch("mv1").unwrap().num_rows(), 1);
 
-        store.create_mv("mv1", test_schema(), MvStorageMode::append_default());
+        store
+            .create_mv("mv1", test_schema(), MvStorageMode::append_default())
+            .unwrap();
         assert_eq!(store.to_record_batch("mv1").unwrap().num_rows(), 0);
     }
 
@@ -353,8 +591,104 @@ mod tests {
 
         // Try to restore into an MV with schema_a
         let mut store = MvStore::new();
-        store.create_mv("mv1", schema_a, MvStorageMode::Aggregate);
+        store
+            .create_mv("mv1", schema_a, MvStorageMode::Aggregate)
+            .unwrap();
         let err = store.restore_from_ipc("mv1", &ipc_bytes);
         assert!(err.is_err(), "should reject mismatched schema");
+    }
+
+    #[test]
+    fn upsert_applies_inserts_changes_and_deletes() {
+        let mut store = MvStore::new();
+        store
+            .create_mv(
+                "u",
+                upsert_plain_schema(),
+                MvStorageMode::Upsert { key_cols: vec![0] },
+            )
+            .unwrap();
+
+        // Two new keys.
+        store.update("u", &changelog_batch(&[(1, 10, 1), (2, 20, 1)]));
+        assert_eq!(snapshot_rows(&store, "u"), vec![(1, 10), (2, 20)]);
+
+        // Change key 1: retract old (−1) then insert new (+1) nets to the new value.
+        store.update("u", &changelog_batch(&[(1, 10, -1), (1, 15, 1)]));
+        assert_eq!(snapshot_rows(&store, "u"), vec![(1, 15), (2, 20)]);
+
+        // Delete key 2 (pure retract).
+        store.update("u", &changelog_batch(&[(2, 20, -1)]));
+        assert_eq!(snapshot_rows(&store, "u"), vec![(1, 15)]);
+    }
+
+    #[test]
+    fn upsert_snapshot_equals_full_recompute() {
+        use std::collections::BTreeMap;
+
+        // A changelog stream and the running ground-truth (last +weight value per key).
+        let batches = [
+            vec![(1i64, 5i64, 1i64), (2, 7, 1), (3, 9, 1)],
+            vec![(2, 7, -1), (2, 8, 1), (4, 1, 1)],
+            vec![(1, 5, -1)], // delete key 1
+            vec![(3, 9, -1), (3, 100, 1)],
+        ];
+        let mut truth: BTreeMap<i64, i64> = BTreeMap::new();
+        let mut store = MvStore::new();
+        store
+            .create_mv(
+                "u",
+                upsert_plain_schema(),
+                MvStorageMode::Upsert { key_cols: vec![0] },
+            )
+            .unwrap();
+        for rows in &batches {
+            for &(k, v, w) in rows {
+                if w > 0 {
+                    truth.insert(k, v);
+                } else {
+                    truth.remove(&k);
+                }
+            }
+            store.update("u", &changelog_batch(rows));
+        }
+        let expected: Vec<(i64, i64)> = truth.into_iter().collect();
+        assert_eq!(snapshot_rows(&store, "u"), expected);
+    }
+
+    #[test]
+    fn upsert_checkpoint_round_trip() {
+        let mut store = MvStore::new();
+        store
+            .create_mv(
+                "u",
+                upsert_plain_schema(),
+                MvStorageMode::Upsert { key_cols: vec![0] },
+            )
+            .unwrap();
+        store.update("u", &changelog_batch(&[(1, 10, 1), (2, 20, 1), (3, 30, 1)]));
+        store.update("u", &changelog_batch(&[(2, 20, -1)]));
+        let before = snapshot_rows(&store, "u");
+
+        let states = store.checkpoint_states().unwrap();
+        assert!(states.contains_key("mv:u"));
+
+        let mut store2 = MvStore::new();
+        store2
+            .create_mv(
+                "u",
+                upsert_plain_schema(),
+                MvStorageMode::Upsert { key_cols: vec![0] },
+            )
+            .unwrap();
+        for (key, bytes) in &states {
+            let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
+            assert!(store2.restore_from_ipc(name, bytes).unwrap());
+        }
+        assert_eq!(snapshot_rows(&store2, "u"), before);
+
+        // A restored store keeps applying changelog correctly.
+        store2.update("u", &changelog_batch(&[(1, 10, -1), (1, 99, 1)]));
+        assert_eq!(snapshot_rows(&store2, "u"), vec![(1, 99), (3, 30)]);
     }
 }

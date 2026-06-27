@@ -250,6 +250,45 @@ section above.
 many cycles and asserts `SELECT * FROM mv` == full-recompute, then a crash+restart asserting the
 snapshot is correct; plus the `profile_agg_emit_vs_capture` before/after showing emit is now O(dirty).
 
+### IMPLEMENTED — Stage 1 (2026-06-27, default-OFF `incremental_emit`)
+
+All four slices landed and green on this box; default-OFF so existing behaviour is unchanged.
+
+- **Config:** `incremental_emit: bool` on `StreamCheckpointConfig` (laminar-core) + server
+  `[checkpoint] incremental_emit` (TOML), default false — co-located with `delta_chain_max` (so it
+  requires a `[checkpoint]` block to enable).
+- **1a — keyed upsert MV store** (`mv_store.rs`): `MvStorageMode::Upsert { key_cols }`; `UpsertState`
+  keeps an `OwnedRow`-keyed snapshot (`RowConverter` over `key_cols`), `apply(changelog)` does
+  `+weight`→upsert / `−weight`→delete storing rows **without** the weight column, `to_record_batch`
+  materializes the plain snapshot; checkpoint = materialize→IPC, restore = `load_snapshot` replay.
+  `create_mv` is now fallible (RowConverter build). 3 new unit tests (apply, snapshot==recompute,
+  checkpoint round-trip).
+- **1b — wiring (single source of truth):** the decision is `incremental_emit && non-windowed agg
+  WITH a GROUP BY` (global aggregates stay full-emit — already single-row), computed **once** in
+  `ddl.rs::incremental_mv_key_cols`. It drives BOTH the MV-store mode (`Upsert` in
+  `register_mv_provider`) and the operator's changelog emit, threaded as one `incremental: bool`
+  through `StreamRegistration` → `ControlMsg::AddStream` → `OperatorGraph::add_query` →
+  `create_operator` (`emit_changelog = incremental || EMIT CHANGES`). The two layers cannot disagree.
+  MV provider schema stays plain (no `__weight`); the changelog rides operator→MV-store only.
+- **1c — terminality guard** (`ddl.rs`): `incremental_mv_consumer_error` (`[LDB-1300]`). A chained MV
+  / `CREATE STREAM` / sink (`FROM <mv>`) / `SUBSCRIBE` that references an incremental MV is rejected;
+  ad-hoc `SELECT * FROM mv` snapshot reads stay allowed. The cross-layer snapshot-serving for chained
+  readers stays OUT (Stage 2).
+- **1d — recovery:** validated single-node by `incremental_emit_survives_checkpoint_restart` (the MV
+  snapshot recovers from the manifest `mv:` entry; upsert restore is idempotent so a post-restart
+  re-emit of unchanged groups can't corrupt it).
+- **Tests:** `crates/laminar-db/tests/incremental_emit.rs` (4: snapshot==recompute, restart survival,
+  guard rejection, flag-off regression) all green; 777 db lib tests + 12 `mv_store` tests green;
+  clippy (`--features cluster --tests`) + fmt clean.
+- **Deferred / caveats:** (a) the `profile_agg_emit_vs_capture` before/after isn't re-run yet (the
+  profiler asserts emit-path cost, not consumer contract; O(dirty) follows from emitting only
+  `dirty_keys`). (b) **Cluster composition is opt-in but unvalidated** — with the flag on in a sharded
+  cluster each node's `Upsert` store would hold only its owned-vnode groups (the changelog already
+  shuffles for `EMIT CHANGES`) and `DistributedTableProvider` would union them, but rebalance must
+  move the MV snapshot with the vnodes (ADR-007 open Q4), and the cluster kill-9 soak is blocked on
+  the pre-existing shuffle-barrier-after-kill bug. Keep `incremental_emit` to single-node until that
+  is fixed and a cluster soak is run.
+
 **Stage 2/3 (after Stage 1 — each lifts one part of the 1c guard's reject set):**
 - **chained-MV reads of an incremental MV** — the cross-layer snapshot-serving deferred from 1c
   (feed `route_output`'s live provider / chained `input_bufs` from the MV-store snapshot instead of
