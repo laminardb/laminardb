@@ -266,6 +266,7 @@ impl GraphOperator for SqlFilterOperator {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent execution/checkpoint flags, not a state machine
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
@@ -322,6 +323,10 @@ pub(crate) struct OperatorGraph {
     // `Some(chain_max)` enables incremental delta checkpoints on aggregate operators.
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
+    // When set with delta enabled, the delta chain is the PRIMARY agg checkpoint (A1-capture):
+    // aggregates skip the whole-node manifest capture and recover from the chain.
+    #[cfg(feature = "cluster")]
+    delta_primary: bool,
     // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
@@ -368,6 +373,8 @@ impl OperatorGraph {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             delta_chain_max: None,
+            #[cfg(feature = "cluster")]
+            delta_primary: false,
             #[cfg(feature = "cluster")]
             vnode_count: None,
             #[cfg(feature = "cluster")]
@@ -517,6 +524,13 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     pub fn set_delta_chain_max(&mut self, chain_max: u32) {
         self.delta_chain_max = Some(chain_max);
+    }
+
+    /// Make the delta chain the primary aggregate checkpoint (A1-capture). Effective only when
+    /// delta checkpoints are also enabled and the operator is sharded.
+    #[cfg(feature = "cluster")]
+    pub fn set_delta_primary(&mut self, on: bool) {
+        self.delta_primary = on;
     }
 
     /// Set the vnode count for the single-node tier path (no shuffle config).
@@ -1472,6 +1486,9 @@ impl OperatorGraph {
             // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
             if let Some(chain_max) = self.delta_chain_max {
                 op.enable_delta_checkpoints(chain_max);
+                if self.delta_primary {
+                    op.set_delta_primary(true);
+                }
             }
         }
         #[cfg(feature = "state-tier")]

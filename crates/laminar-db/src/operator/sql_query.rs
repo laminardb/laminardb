@@ -202,6 +202,10 @@ pub(crate) struct SqlQueryOperator {
     // `Some(chain_max)` enables incremental delta checkpoints (Lever 2) with that re-base bound.
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
+    // With delta enabled, the chain is the PRIMARY agg checkpoint: `checkpoint()` skips the
+    // whole-node group capture (state lives in per-vnode partials) — A1-capture.
+    #[cfg(feature = "cluster")]
+    delta_primary: bool,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
@@ -248,6 +252,8 @@ impl SqlQueryOperator {
             #[cfg(feature = "cluster")]
             delta_chain_max: None,
             #[cfg(feature = "cluster")]
+            delta_primary: false,
+            #[cfg(feature = "cluster")]
             pending_restore_deltas: Vec::new(),
             #[cfg(feature = "state-tier")]
             promotion: None,
@@ -274,6 +280,23 @@ impl SqlQueryOperator {
         if let QueryState::Agg(ref mut agg) = self.state {
             agg.set_delta_enabled(true);
         }
+    }
+
+    /// Make the delta chain the primary agg checkpoint: `checkpoint()` skips the whole-node group
+    /// capture (recovery comes from per-vnode partials). Effective only with delta enabled.
+    #[cfg(feature = "cluster")]
+    pub fn set_delta_primary(&mut self, on: bool) {
+        self.delta_primary = on;
+    }
+
+    /// Whether the whole-node aggregate capture should be skipped (delta chain is authoritative).
+    #[cfg(feature = "cluster")]
+    fn skip_whole_node_agg(&self) -> bool {
+        self.delta_primary && self.delta_chain_max.is_some()
+    }
+    #[cfg(not(feature = "cluster"))]
+    fn skip_whole_node_agg(&self) -> bool {
+        false
     }
 
     #[cfg(feature = "cluster")]
@@ -889,11 +912,17 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        let agg: Option<AggStateCheckpoint> = match self.state {
-            QueryState::Uninit => self.pending_restore.clone(),
-            QueryState::Agg(ref mut agg_state) => Some(agg_state.checkpoint_groups()?),
-            QueryState::Compiled(_) | QueryState::CachedPlan(_) | QueryState::CachedPhysical(_) => {
-                None
+        // A1-capture: when the delta chain is authoritative, aggregate groups are NOT captured
+        // into the whole-node manifest blob — they live in (and recover from) per-vnode partials.
+        let agg: Option<AggStateCheckpoint> = if self.skip_whole_node_agg() {
+            None
+        } else {
+            match self.state {
+                QueryState::Uninit => self.pending_restore.clone(),
+                QueryState::Agg(ref mut agg_state) => Some(agg_state.checkpoint_groups()?),
+                QueryState::Compiled(_)
+                | QueryState::CachedPlan(_)
+                | QueryState::CachedPhysical(_) => None,
             }
         };
         #[cfg(feature = "state-tier")]
@@ -1249,6 +1278,84 @@ impl GraphOperator for SqlQueryOperator {
             ),
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod delta_primary_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+
+    // A1-capture: a sharded aggregate with the delta chain as primary must NOT capture its groups
+    // into the whole-node manifest blob (state lives in per-vnode partials); with delta_primary off
+    // the same operator captures whole-node as before.
+    #[tokio::test]
+    async fn delta_primary_skips_whole_node_agg_capture() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let batch = |keys: &[&str], vals: &[i64]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(keys.to_vec())),
+                    Arc::new(Int64Array::from(vals.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+
+        let ctx = laminar_sql::create_session_context();
+        let mem = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![batch(&["seed"], &[0])]],
+        )
+        .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut op = SqlQueryOperator::new(
+            "out",
+            "SELECT key, SUM(val) AS total FROM events GROUP BY key",
+            ctx,
+            None,
+            false,
+            None,
+        );
+
+        let registry = Arc::new(VnodeRegistry::new(8));
+        registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        op.attach_cluster_shuffle(ClusterShuffleConfig {
+            registry,
+            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+            receiver,
+            self_id: NodeId(1),
+        });
+        op.enable_delta_checkpoints(4);
+        op.set_delta_primary(true);
+
+        op.process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
+            .await
+            .unwrap();
+
+        assert!(
+            op.checkpoint().unwrap().is_none(),
+            "delta_primary must skip the whole-node aggregate capture"
+        );
+
+        // Off again: the whole-node capture reappears.
+        op.set_delta_primary(false);
+        assert!(
+            op.checkpoint().unwrap().is_some(),
+            "without delta_primary the whole-node aggregate capture is present"
+        );
     }
 }
 

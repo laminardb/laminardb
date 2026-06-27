@@ -243,6 +243,13 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
             .expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32")
     });
     let delta_line = delta_chain_max.map_or(String::new(), |n| format!("delta_chain_max = {n}"));
+    // A1-capture: make the delta chain the primary agg checkpoint (skip whole-node capture,
+    // recover aggregates from the chain). Needs `LAMINAR_SOAK_DELTA_CHAIN_MAX` too.
+    let delta_primary_line = if std::env::var("LAMINAR_SOAK_DELTA_PRIMARY").is_ok() {
+        "delta_primary = true"
+    } else {
+        ""
+    };
 
     let mut toml = format!(
         r#"
@@ -277,6 +284,7 @@ max_retained = 5
 max_in_flight_epochs = {depth}
 {gate_poll}
 {delta_line}
+{delta_primary_line}
 
 [checkpoint.storage]
 {storage}

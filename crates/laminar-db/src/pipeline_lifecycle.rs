@@ -259,6 +259,46 @@ impl LaminarDB {
         Ok(())
     }
 
+    /// A1-capture: under `delta_primary` the manifest carries no aggregate state, so rehydrate
+    /// every owned vnode's delta chain into the staging map — the first cycle's
+    /// `apply_rehydrated_vnodes` rebuilds the aggregates from it. Source offsets are already
+    /// staged, so a missing backend is fatal rather than a silent empty-state start.
+    #[cfg(feature = "cluster")]
+    async fn stage_owned_vnodes_for_delta_primary(&self) -> Result<(), DbError> {
+        let Some(self_id) = self.cluster_controller.lock().as_ref().map(|c| c.instance_id()) else {
+            return Ok(());
+        };
+        let owned = match self.vnode_registry.lock().as_ref() {
+            Some(registry) => laminar_core::state::owned_vnodes(registry, self_id),
+            None => return Ok(()),
+        };
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let Some(backend) = self.state_backend.lock().clone() else {
+            return Err(DbError::Checkpoint(
+                "[LDB-6031] delta_primary recovery requires a durable state backend but none is \
+                 wired — refusing to start with staged source offsets and empty aggregate state"
+                    .to_string(),
+            ));
+        };
+        let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+            .rehydrate(&owned)
+            .await;
+        if let Some(epoch) = report.epoch {
+            let mut staged = self.rehydrated_vnode_state.lock();
+            for (vnode, chain) in report.restored {
+                staged.insert(vnode, crate::db::RehydratedVnode { epoch, chain });
+            }
+            tracing::info!(
+                staged = staged.len(),
+                epoch,
+                "A1-capture: staged owned vnodes for delta-primary aggregate recovery"
+            );
+        }
+        Ok(())
+    }
+
     /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
@@ -686,6 +726,8 @@ impl LaminarDB {
                             u32::try_from(cp.max_retained.unwrap_or(3)).unwrap_or(u32::MAX);
                         let bounded = chain_max.min(retain.saturating_sub(1)).max(1);
                         graph.set_delta_chain_max(bounded);
+                        // A1-capture: make the delta chain the primary agg checkpoint.
+                        graph.set_delta_primary(cp.delta_primary);
                     }
                 }
             }
@@ -1298,6 +1340,19 @@ impl LaminarDB {
                             if !cold_map.is_empty() {
                                 self.rehydrate_cold_vnodes(&mut graph, &cold_map).await?;
                             }
+                        }
+
+                        // A1-capture: under delta_primary the manifest holds no aggregate state;
+                        // rebuild aggregates from each owned vnode's delta chain instead.
+                        #[cfg(feature = "cluster")]
+                        if !graph_restore_failed
+                            && self
+                                .config
+                                .checkpoint
+                                .as_ref()
+                                .is_some_and(|cp| cp.delta_primary && cp.delta_chain_max.is_some())
+                        {
+                            self.stage_owned_vnodes_for_delta_primary().await?;
                         }
 
                         if !graph_restore_failed {

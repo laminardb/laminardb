@@ -511,6 +511,11 @@ pub struct CheckpointSection {
     /// out of the prune window.
     #[serde(default)]
     pub delta_chain_max: Option<u32>,
+    /// Make the per-vnode delta chain the primary aggregate checkpoint (A1-capture): aggregates
+    /// recover from the chain instead of the whole-node manifest, dropping per-cycle checkpoint
+    /// cost to O(dirty). Requires `delta_chain_max` and a durable object-store backend. Default off.
+    #[serde(default)]
+    pub delta_primary: bool,
 }
 
 impl Default for CheckpointSection {
@@ -527,6 +532,7 @@ impl Default for CheckpointSection {
             restorable_gate_poll_initial_ms: None,
             restorable_gate_poll_max_ms: None,
             delta_chain_max: None,
+            delta_primary: false,
         }
     }
 }

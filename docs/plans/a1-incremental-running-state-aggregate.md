@@ -111,6 +111,26 @@ This is far smaller and lower-risk than a from-scratch build — the codec, dura
 recovery are soaked; A1-capture is making them authoritative. Requires cluster + sharding (the
 vnode partitioning) + an object-store backend — the deployment the MinIO soak covers.
 
+#### IMPLEMENTED (2026-06-27, default-OFF, MinIO soak pending)
+Two steps, both committed behind a default-OFF `delta_primary` flag:
+- **Step 1** — cluster startup requires a durable `StateBackend` (`is_durable()`; LDB-0011). Committed
+  `d41907a6`.
+- **Step 2** — the flip:
+  - Flag `delta_primary` plumbed `StreamCheckpointConfig`/server `CheckpointSection` → `OperatorGraph`
+    (`set_delta_primary`) → `SqlQueryOperator`, effective only with delta enabled + sharded.
+  - Capture-skip: agg `checkpoint()` returns no whole-node group state when `delta_primary`
+    (`skip_whole_node_agg`).
+  - Recovery: `stage_owned_vnodes_for_delta_primary` (pipeline_lifecycle) rehydrates every owned
+    vnode's delta chain into the existing `rehydrated_vnode_state` staging map after the graph restore;
+    the first cycle's `apply_rehydrated_vnodes` rebuilds the aggregates — reusing the soaked
+    rebalance-acquire apply path, no new apply code.
+  - Unit test `delta_primary_skips_whole_node_agg_capture` (operator: checkpoint None on / Some off).
+  - Soak knob `LAMINAR_SOAK_DELTA_PRIMARY` added to `cluster_soak.rs`.
+- **Gate before flipping default:** MinIO 3-node kill-9 soak
+  (`LAMINAR_SOAK_DELTA_CHAIN_MAX=6 LAMINAR_SOAK_DELTA_PRIMARY=1 …`) — assert chains rehydrate, the
+  manifest carries no agg state, recovery is chain-only, no gap/dup. Then delete the whole-node agg
+  capture path.
+
 ### A1-emit — per-cycle emit O(dirty)  (addresses #1; the bigger win, higher risk)
 
 Stop re-evaluating + re-materializing all groups every cycle.

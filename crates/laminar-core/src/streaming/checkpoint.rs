@@ -36,6 +36,11 @@ pub struct StreamCheckpointConfig {
     /// `None` = off (full + reference partials only). Clamped `< max_retained` so the chain base
     /// never ages out of the prune window. Default off.
     pub delta_chain_max: Option<u32>,
+    /// Make the per-vnode delta chain the PRIMARY aggregate checkpoint (A1-capture): aggregates
+    /// stop being captured into the whole-node manifest blob and recover from the chain instead,
+    /// so per-cycle checkpoint cost drops to O(dirty). Requires `delta_chain_max` set and a durable
+    /// (object-store) backend. Default off (whole-node manifest is authoritative).
+    pub delta_primary: bool,
 }
 
 /// Errors from checkpoint operations.
