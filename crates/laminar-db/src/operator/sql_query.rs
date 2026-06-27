@@ -683,6 +683,21 @@ impl SqlQueryOperator {
             }
         }
 
+        // Proactively fetch cold groups whose vnode re-base is deferred (Slice 4), so the block
+        // clears within the prune window rather than growing the chain unbounded.
+        if let Some(chain_max) = self.delta_chain_max {
+            let pending = if let QueryState::Agg(ref agg) = self.state {
+                agg.cold_groups_pending_rebase(chain_max, self.vnode_count)
+            } else {
+                Vec::new()
+            };
+            if let Some(p) = self.promotion.as_mut() {
+                for (key, vnode, group) in pending {
+                    p.issue_fetch_group(key, vnode, group);
+                }
+            }
+        }
+
         let mut candidates = self
             .promotion
             .as_mut()

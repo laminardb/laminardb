@@ -1736,9 +1736,16 @@ impl IncrementalAggState {
         let mut out: std::collections::HashMap<u32, VnodeCapture> =
             std::collections::HashMap::with_capacity(touched.len());
         for v in touched {
+            // Defer a re-base while the vnode has demoted groups: a FULL captures only resident
+            // groups, so re-basing now would drop the cold ones from the chain. Keeping the chain
+            // on DELTA holds the old base (which carries them) alive until they are promoted back.
+            #[cfg(feature = "state-tier")]
+            let has_cold = self.cold_groups.iter().any(|k| vnode_of(k) == v);
+            #[cfg(not(feature = "state-tier"))]
+            let has_cold = false;
             let force_full = match self.delta_chain_len.get(&v).copied() {
-                None => true,              // no base yet (fresh / just-acquired)
-                Some(n) => n >= chain_max, // chain reached the bound → re-base
+                None => true, // no base yet (fresh / just-acquired)
+                Some(n) => n >= chain_max && !has_cold,
             };
             if force_full {
                 let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
@@ -2202,6 +2209,25 @@ impl IncrementalAggState {
         self.cold_groups.remove(key);
         self.size_cache.invalidate();
         Ok(())
+    }
+
+    /// Cold groups whose vnode's delta chain has reached `chain_max` — its re-base is deferred
+    /// until they are promoted back (Slice 4). The caller promotes these proactively so the block
+    /// clears within the `max_retained` prune window. `(key, vnode, group_key_bytes)`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cold_groups_pending_rebase(
+        &self,
+        chain_max: u32,
+        vnode_count: u32,
+    ) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for k in &self.cold_groups {
+            let v = self.delta_vnode_of(k.as_ref(), vnode_count);
+            if self.delta_chain_len.get(&v).copied().unwrap_or(0) >= chain_max {
+                out.push((k.clone(), v, k.as_ref().to_vec()));
+            }
+        }
+        out
     }
 
     /// Distinct cold (demoted) group keys touched by `batch`, with tier coordinates
@@ -4079,6 +4105,94 @@ mod tests {
         assert!(
             !state.can_demote_group(&dirty, V),
             "a dirty group must not be demotable",
+        );
+    }
+
+    /// v2 Slice 4: a vnode with a demoted group must DEFER its FULL re-base (emit a DELTA) so the
+    /// re-base never drops the cold group; once the group is promoted back, the next capture
+    /// re-bases to a FULL again (which now includes it).
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn cold_group_defers_full_rebase_until_promoted() {
+        const V: u32 = 1; // single vnode → vnode 0
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // cap0: FULL base (no prior base), chain_len[0] = 1.
+        feed(&mut state, &[("a", 1.0), ("b", 2.0)], 1000);
+        state.emit().unwrap();
+        let cap0 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        assert!(matches!(cap0.get(&0), Some(VnodeCapture::Full(_))));
+
+        // Demote one (now-clean) group, then capture at the chain bound: a re-base would drop it,
+        // so the vnode stays on DELTA instead.
+        let cold_key = state.groups.keys().next().cloned().unwrap();
+        let cp = state.encode_group(&cold_key).unwrap();
+        state.drop_demoted_group(&cold_key);
+        feed(&mut state, &[("b", 20.0)], 2000);
+        state.emit().unwrap();
+        let cap1 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        assert!(
+            matches!(cap1.get(&0), Some(VnodeCapture::Delta(_))),
+            "re-base must be deferred (DELTA) while a group is cold",
+        );
+
+        // Promote it back; the next capture re-bases to FULL again.
+        state.promote_group(&cold_key, cp).unwrap();
+        feed(&mut state, &[("b", 30.0)], 3000);
+        state.emit().unwrap();
+        let cap2 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        assert!(
+            matches!(cap2.get(&0), Some(VnodeCapture::Full(_))),
+            "re-base resumes (FULL) once no group is cold",
         );
     }
 
