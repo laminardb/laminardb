@@ -47,8 +47,17 @@ pub(crate) fn server_tls() -> Option<&'static ServerTlsConfig> {
 pub(crate) fn client_endpoint(host_port: &str) -> Result<Endpoint, String> {
     let tls = CLUSTER_TLS.get();
     let scheme = if tls.is_some() { "https" } else { "http" };
-    let endpoint =
-        Endpoint::from_shared(format!("{scheme}://{host_port}")).map_err(|e| e.to_string())?;
+    // HTTP/2 keepalive + connect timeout so a half-open conn (peer machine gone with no
+    // TCP RST — kill-9 on loopback RST-closes promptly, but a true network/host failure
+    // does not) flips dead within ~6s instead of blocking sends until the OS TCP timeout
+    // (minutes). Sub-`align_shuffle_barriers` ALIGN_TIMEOUT (8s) so the driver errors and
+    // the next send reconnects before alignment gives up.
+    let endpoint = Endpoint::from_shared(format!("{scheme}://{host_port}"))
+        .map_err(|e| e.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(3))
+        .keep_alive_timeout(std::time::Duration::from_secs(3))
+        .keep_alive_while_idle(true);
     match tls {
         Some(t) => endpoint
             .tls_config(t.client.clone())

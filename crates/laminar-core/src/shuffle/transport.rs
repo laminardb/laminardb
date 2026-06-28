@@ -248,22 +248,44 @@ mod grpc {
             })
         }
 
-        /// Ship `barrier` to every peer in order, short-circuiting on the first
-        /// failure (the gossip side-channel is authoritative, so a partial
-        /// fan-out is tolerable).
+        /// Ship `barrier` to every peer, BEST-EFFORT. A transiently unreachable peer
+        /// (e.g. a respawned node whose shuffle address hasn't propagated through gossip
+        /// yet) is logged and skipped so it can't block delivery to the others — a
+        /// fail-fast `?` would drop the barrier to every peer after the first failure,
+        /// including the leader still waiting on it, wedging the whole alignment. A
+        /// genuinely-down peer is handled by the align wait-set self-heal + the
+        /// convergence gate, not here.
         ///
         /// # Errors
-        /// Returns the first `io::Error` from any peer's `send_to`.
+        /// Returns the last `io::Error` only when NO peer could be reached (total fan-out
+        /// failure); a partial fan-out succeeds.
         pub async fn fan_out_barrier(
             &self,
             peers: &[ShufflePeerId],
             barrier: CheckpointBarrier,
         ) -> io::Result<()> {
+            let cid = barrier.checkpoint_id;
             let msg = ShuffleMessage::Barrier(barrier);
+            let mut reached = 0usize;
+            let mut last_err = None;
             for &peer in peers {
-                self.send_to(peer, &msg).await?;
+                match self.send_to(peer, &msg).await {
+                    Ok(()) => reached += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer,
+                            checkpoint_id = cid,
+                            error = %e,
+                            "shuffle barrier fan-out: peer unreachable, skipping (best-effort)"
+                        );
+                        last_err = Some(e);
+                    }
+                }
             }
-            Ok(())
+            match last_err {
+                Some(e) if reached == 0 && !peers.is_empty() => Err(e),
+                _ => Ok(()),
+            }
         }
 
         /// Resolve `peer`'s address from the KV (`SHUFFLE_ADDR_KEY` on the peer's
@@ -855,18 +877,29 @@ mod shim {
             }
         }
 
+        /// Best-effort fan-out (mirrors the cluster build): a partial fan-out succeeds;
+        /// total failure returns the last error.
+        ///
         /// # Errors
-        /// Returns the first `io::Error` from any peer's `send_to`.
+        /// Returns the last `io::Error` only when NO peer could be reached.
         pub async fn fan_out_barrier(
             &self,
             peers: &[ShufflePeerId],
             barrier: CheckpointBarrier,
         ) -> io::Result<()> {
             let msg = ShuffleMessage::Barrier(barrier);
+            let mut reached = 0usize;
+            let mut last_err = None;
             for &peer in peers {
-                self.send_to(peer, &msg).await?;
+                match self.send_to(peer, &msg).await {
+                    Ok(()) => reached += 1,
+                    Err(e) => last_err = Some(e),
+                }
             }
-            Ok(())
+            match last_err {
+                Some(e) if reached == 0 && !peers.is_empty() => Err(e),
+                _ => Ok(()),
+            }
         }
     }
 

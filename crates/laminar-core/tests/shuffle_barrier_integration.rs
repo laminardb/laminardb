@@ -66,6 +66,39 @@ async fn fan_out_errors_on_unregistered_peer() {
         epoch: 1,
         flags: 0,
     };
+    // TOTAL failure (the only peer is unreachable) still errors.
     let err = sender.fan_out_barrier(&[99], barrier).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// Regression for the shuffle-barrier-after-kill bug: a transiently unreachable peer
+/// (a respawned node whose shuffle address hasn't propagated through gossip yet) must
+/// not block the barrier to a healthy peer. The old fail-fast `?` dropped the barrier to
+/// every peer after the first failure — so if the unreachable peer sorted before the
+/// leader, the leader never saw the barrier and timed out "waiting on {X}".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fan_out_best_effort_delivers_to_reachable_despite_unreachable() {
+    let recv = ShuffleReceiver::bind(10, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let sender = ShuffleSender::new(1);
+    sender.register_peer(10, recv.local_addr()).await;
+
+    let barrier = CheckpointBarrier {
+        checkpoint_id: 5,
+        epoch: 1,
+        flags: 0,
+    };
+    // Peer 99 is unregistered/unreachable and listed FIRST; a partial fan-out must succeed
+    // and still deliver to the reachable peer 10.
+    sender.fan_out_barrier(&[99, 10], barrier).await.unwrap();
+
+    let (_from, msg) = tokio::time::timeout(Duration::from_secs(2), recv.recv())
+        .await
+        .expect("deadline")
+        .expect("channel open");
+    assert!(
+        matches!(msg, ShuffleMessage::Barrier(b) if b.checkpoint_id == 5),
+        "reachable peer must receive the barrier despite the unreachable one"
+    );
 }
