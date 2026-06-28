@@ -374,9 +374,11 @@ pub struct ServerSection {
     #[serde(default)]
     pub state_tier_dir: Option<std::path::PathBuf>,
     /// Demote at GROUP granularity (v2): shed individual idle aggregate groups rather than whole
-    /// idle vnodes. Requires the cold tier and delta checkpoints. Default off.
+    /// idle vnodes. Requires the cold tier. `None` (unset) defaults by topology: ON for embedded
+    /// single-node (kill-9-soaked) and OFF for cluster (gated on the shuffle-barrier-after-kill fix);
+    /// `Some(b)` forces it either way.
     #[serde(default)]
-    pub state_tier_group_demotion: bool,
+    pub state_tier_group_demotion: Option<bool>,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -389,6 +391,16 @@ fn default_pgwire_max_auth_failures_per_min() -> u32 {
 
 fn default_pgwire_tls_min_version() -> String {
     "1.2".to_string()
+}
+
+impl ServerSection {
+    /// Effective group-demotion setting. Unset defaults by topology: ON for embedded single-node
+    /// (kill-9-soaked), OFF for cluster (gated on the shuffle-barrier-after-kill fix). Explicit
+    /// config wins either way.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn group_demotion(&self, embedded: bool) -> bool {
+        self.state_tier_group_demotion.unwrap_or(embedded)
+    }
 }
 
 impl Default for ServerSection {
@@ -409,7 +421,7 @@ impl Default for ServerSection {
             console_cors_allowed_origins: None,
             state_memory_budget_bytes: None,
             state_tier_dir: None,
-            state_tier_group_demotion: false,
+            state_tier_group_demotion: None,
         }
     }
 }
@@ -967,6 +979,26 @@ fn default_heartbeat_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "state-tier")]
+    #[test]
+    fn group_demotion_defaults_by_topology() {
+        let mut s = ServerSection::default();
+        assert_eq!(s.state_tier_group_demotion, None, "unset by default");
+        assert!(s.group_demotion(true), "embedded single-node defaults ON");
+        assert!(!s.group_demotion(false), "cluster defaults OFF");
+
+        s.state_tier_group_demotion = Some(false);
+        assert!(
+            !s.group_demotion(true),
+            "explicit OFF overrides embedded default"
+        );
+        s.state_tier_group_demotion = Some(true);
+        assert!(
+            s.group_demotion(false),
+            "explicit ON overrides cluster default"
+        );
+    }
 
     const AI_TOML: &str = r#"
 [server]

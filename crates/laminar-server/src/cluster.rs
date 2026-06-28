@@ -456,7 +456,9 @@ pub async fn start_cluster(
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
         builder = builder.state_tier_dir(dir);
-        builder = builder.state_tier_group_demotion(config.server.state_tier_group_demotion);
+        // Cluster: group demotion defaults OFF (vnode demotion is kill-9-validated; group-demotion
+        // cluster kill-9 is gated on the shuffle-barrier-after-kill fix).
+        builder = builder.state_tier_group_demotion(config.server.group_demotion(false));
     }
 
     if let Some(path) = config.state.local_storage_dir() {
