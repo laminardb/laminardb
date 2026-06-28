@@ -4395,7 +4395,10 @@ mod tests {
             }
         }
         #[allow(clippy::disallowed_types)]
-        fn delta_of(cap: &mut std::collections::HashMap<u32, VnodeCapture>, v: u32) -> AggVnodeDelta {
+        fn delta_of(
+            cap: &mut std::collections::HashMap<u32, VnodeCapture>,
+            v: u32,
+        ) -> AggVnodeDelta {
             match cap.remove(&v) {
                 Some(VnodeCapture::Delta(d)) => d,
                 _ => panic!("expected a DELTA for vnode {v}"),
@@ -4425,10 +4428,16 @@ mod tests {
         // Bucket a string key to a vnode exactly as the capture path does (row-encode → hash).
         let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
             let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
-            state.row_converter.convert_columns(&cols).unwrap().row(0).owned()
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
         };
-        let vnode_of =
-            |state: &IncrementalAggState, key: &str| state.delta_vnode_of(row_of(state, key).as_ref(), VC);
+        let vnode_of = |state: &IncrementalAggState, key: &str| {
+            state.delta_vnode_of(row_of(state, key).as_ref(), VC)
+        };
 
         // Two keys in one vnode Y (resident + cold) and one key in a different vnode X.
         let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
@@ -4441,12 +4450,19 @@ mod tests {
             .find(|(_, ks)| ks.len() >= 2)
             .map(|(v, _)| v)
             .expect("a vnode with >=2 candidate keys");
-        let x = *by_v.keys().find(|v| **v != y).expect("a second distinct vnode");
+        let x = *by_v
+            .keys()
+            .find(|v| **v != y)
+            .expect("a second distinct vnode");
         let (y_res, y_cold) = (by_v[&y][0].clone(), by_v[&y][1].clone());
         let x_trig = by_v[&x][0].clone();
 
         // Seed all three, emit, capture FULL bases (delta_vnode_count := VC, chain_len[X]=[Y]=0).
-        feed(&mut state, &[(&y_res, 1.0), (&y_cold, 2.0), (&x_trig, 3.0)], 1000);
+        feed(
+            &mut state,
+            &[(&y_res, 1.0), (&y_cold, 2.0), (&x_trig, 3.0)],
+            1000,
+        );
         state.emit().unwrap();
         let mut cap0 = state.checkpoint_delta_by_vnode(VC, 8).unwrap();
         let base_x = full_of(&mut cap0, x);
@@ -4454,7 +4470,10 @@ mod tests {
 
         // Demote the clean cold group in Y.
         let y_cold_row = row_of(&state, &y_cold);
-        assert!(state.can_demote_group(&y_cold_row, VC), "clean group is demotable");
+        assert!(
+            state.can_demote_group(&y_cold_row, VC),
+            "clean group is demotable"
+        );
         state.encode_group(&y_cold_row).unwrap(); // write-before-drop (bytes go to the tier)
         state.drop_demoted_group(&y_cold_row);
         assert!(state.cold_groups().contains(&y_cold_row));
@@ -4482,7 +4501,10 @@ mod tests {
             "the demoted group must survive rehydration",
         );
         assert!(
-            owner.last_emitted.keys().all(|k| owner.groups.contains_key(k)),
+            owner
+                .last_emitted
+                .keys()
+                .all(|k| owner.groups.contains_key(k)),
             "last_emitted must remain a subset of groups after rehydration",
         );
     }
@@ -4549,23 +4571,37 @@ mod tests {
 
         let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
             let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
-            state.row_converter.convert_columns(&cols).unwrap().row(0).owned()
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
         };
         let vnode_of = |state: &IncrementalAggState, key: &str| {
             state.delta_vnode_of(row_of(state, key).as_ref(), VC)
         };
 
         let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
-        let mut by_v: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+        let mut by_v: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::new();
         for c in &cands {
             by_v.entry(vnode_of(&state, c)).or_default().push(c.clone());
         }
-        let y = *by_v.iter().find(|(_, ks)| ks.len() >= 2).map(|(v, _)| v).unwrap();
+        let y = *by_v
+            .iter()
+            .find(|(_, ks)| ks.len() >= 2)
+            .map(|(v, _)| v)
+            .unwrap();
         let x = *by_v.keys().find(|v| **v != y).unwrap();
         let (y_res, y_cold) = (by_v[&y][0].clone(), by_v[&y][1].clone());
         let x_key = by_v[&x][0].clone();
 
-        feed(&mut state, &[(&y_res, 1.0), (&y_cold, 2.0), (&x_key, 3.0)], 1000);
+        feed(
+            &mut state,
+            &[(&y_res, 1.0), (&y_cold, 2.0), (&x_key, 3.0)],
+            1000,
+        );
         state.emit().unwrap();
         let _ = state.checkpoint_delta_by_vnode(VC, 8).unwrap(); // chain_len[X]=[Y]=0
 
@@ -4588,7 +4624,10 @@ mod tests {
             matches!(cap1.get(&x), Some(VnodeCapture::Full(_))),
             "the acquired vnode re-bases FULL",
         );
-        assert!(state.cold_groups().contains(&y_cold_row), "Y's cold group is untouched");
+        assert!(
+            state.cold_groups().contains(&y_cold_row),
+            "Y's cold group is untouched"
+        );
 
         // Now acquire Y itself: its chain re-bases and its stale cold tracking is dropped.
         let acquired_y: rustc_hash::FxHashSet<u32> = [y].into_iter().collect();

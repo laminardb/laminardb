@@ -581,7 +581,11 @@ mod failures {
         let baseline: std::collections::HashMap<i64, i64> =
             union_sums(&harness).await.into_iter().collect();
         for &k in &keys {
-            assert_eq!(baseline.get(&k), Some(&(k * 10)), "baseline total for key {k}");
+            assert_eq!(
+                baseline.get(&k),
+                Some(&(k * 10)),
+                "baseline total for key {k}"
+            );
         }
 
         // Graceful full-cluster restart, delta_primary still on.

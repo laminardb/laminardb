@@ -23,7 +23,9 @@ impl FromBatch for CapturedBatch {
         Self(batch.slice(row, 1))
     }
     fn from_batch_all(batch: &RecordBatch) -> Vec<Self> {
-        (0..batch.num_rows()).map(|i| Self(batch.slice(i, 1))).collect()
+        (0..batch.num_rows())
+            .map(|i| Self(batch.slice(i, 1)))
+            .collect()
     }
 }
 
@@ -84,7 +86,11 @@ async fn healthy_rows_with_isolation(isolation: bool) -> usize {
     let source = db.source_untyped("trades").unwrap();
     for i in 0..20 {
         source
-            .push_arrow(make_batch(&["AAPL"], &[100.0 + f64::from(i)], &[i64::from(i) * 1000]))
+            .push_arrow(make_batch(
+                &["AAPL"],
+                &[100.0 + f64::from(i)],
+                &[i64::from(i) * 1000],
+            ))
             .unwrap();
     }
 

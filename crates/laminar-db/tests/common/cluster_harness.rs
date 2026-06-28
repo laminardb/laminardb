@@ -85,7 +85,14 @@ impl ClusterEngineHarness {
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs, Some(chain_max)).await
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            Some(chain_max),
+        )
+        .await
     }
 
     /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`. `delta` is

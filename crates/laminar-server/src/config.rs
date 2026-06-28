@@ -983,7 +983,10 @@ mod tests {
     fn group_demotion_defaults_on() {
         let mut s = ServerSection::default();
         assert_eq!(s.state_tier_group_demotion, None, "unset by default");
-        assert!(s.group_demotion(), "unset defaults ON (embedded and cluster)");
+        assert!(
+            s.group_demotion(),
+            "unset defaults ON (embedded and cluster)"
+        );
 
         s.state_tier_group_demotion = Some(false);
         assert!(!s.group_demotion(), "explicit OFF overrides the default");
