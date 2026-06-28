@@ -283,6 +283,10 @@ pub(crate) struct SqlQueryOperator {
     // Set from the vnode registry; threaded separately since single-node has no shuffle config.
     #[cfg(feature = "state-tier")]
     vnode_count: u32,
+    // v2 group demotion single-node: turns on the agg's delta DIRTY-tracking (so `demotable_groups`
+    // has candidates) WITHOUT `delta_chain_max` — the whole-node manifest stays authoritative.
+    #[cfg(feature = "state-tier")]
+    group_delta_tracking: bool,
 }
 
 impl SqlQueryOperator {
@@ -323,12 +327,26 @@ impl SqlQueryOperator {
             pending_cold_rehydrate: Vec::new(),
             #[cfg(feature = "state-tier")]
             vnode_count: 1,
+            #[cfg(feature = "state-tier")]
+            group_delta_tracking: false,
         }
     }
 
     #[cfg(feature = "state-tier")]
     pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
         self.vnode_count = vnode_count;
+    }
+
+    /// v2 group demotion single-node: enable the agg's delta DIRTY-tracking so idle groups become
+    /// demotable, WITHOUT making the delta chain the primary checkpoint (no `delta_chain_max`). The
+    /// whole-node manifest stays authoritative; the coordinator writes demoted groups to cold-only
+    /// partials that recovery merges back. Re-asserted in `lazy_init`.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn enable_delta_tracking(&mut self) {
+        self.group_delta_tracking = true;
+        if let QueryState::Agg(ref mut agg) = self.state {
+            agg.set_delta_enabled(true);
+        }
     }
 
     /// Enable incremental delta checkpoints (Lever 2) with `chain_max` as the re-base bound.
@@ -389,6 +407,10 @@ impl SqlQueryOperator {
                 }
                 #[cfg(feature = "cluster")]
                 if self.delta_chain_max.is_some() {
+                    agg_state.set_delta_enabled(true);
+                }
+                #[cfg(feature = "state-tier")]
+                if self.group_delta_tracking {
                     agg_state.set_delta_enabled(true);
                 }
                 self.log_tier(agg_state.compiled_projection().is_some());
@@ -1096,9 +1118,17 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "state-tier"))]
         let deferred: Vec<(i64, Vec<u8>)> = Vec::new();
 
+        // Vnodes whose state must be rehydrated from durable partials on restart: whole demoted
+        // vnodes, AND partially-demoted vnodes (their cold groups ride a cold-only partial that the
+        // additive `rehydrate` merges on top of the manifest's resident groups).
         #[cfg(feature = "state-tier")]
         let cold_vnodes: Vec<u32> = match self.state {
-            QueryState::Agg(ref agg_state) => agg_state.cold_vnodes().iter().copied().collect(),
+            QueryState::Agg(ref agg_state) => {
+                let mut v: rustc_hash::FxHashSet<u32> =
+                    agg_state.cold_vnodes().iter().copied().collect();
+                v.extend(agg_state.cold_groups_by_vnode(self.vnode_count).into_keys());
+                v.into_iter().collect()
+            }
             _ => Vec::new(),
         };
         #[cfg(not(feature = "state-tier"))]
@@ -1262,13 +1292,32 @@ impl GraphOperator for SqlQueryOperator {
         let cold: Vec<u32> = agg_state.cold_vnodes().iter().copied().collect();
         #[cfg(not(feature = "state-tier"))]
         let cold: Vec<u32> = Vec::new();
-        if per_vnode.is_empty() && cold.is_empty() {
+        // v2 group demotion: a partially-demoted vnode's demoted groups, re-fetched + written as a
+        // cold-only partial (its resident groups still ride the whole-node manifest).
+        #[cfg(feature = "state-tier")]
+        let cold_groups = agg_state.cold_groups_by_vnode(vnode_count);
+        #[cfg(not(feature = "state-tier"))]
+        let cold_groups: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        if per_vnode.is_empty() && cold.is_empty() && cold_groups.is_empty() {
             return Ok(None);
         }
-        let mut out = std::collections::HashMap::with_capacity(per_vnode.len() + cold.len());
+        let mut out = std::collections::HashMap::with_capacity(
+            per_vnode.len() + cold.len() + cold_groups.len(),
+        );
         for (vnode, cp) in per_vnode {
+            // A vnode with cold groups stages those instead (cold-only); its resident is in the
+            // manifest, so writing a resident per-vnode partial here would be redundant.
+            #[cfg(feature = "state-tier")]
+            if cold_groups.contains_key(&vnode) {
+                continue;
+            }
             let data = serialize_agg_cp(&cp, &self.op_name)?;
             out.insert(vnode, StagedSlice::Bytes(bytes::Bytes::from(data)));
+        }
+        #[cfg(feature = "state-tier")]
+        for (vnode, group_keys) in cold_groups {
+            out.insert(vnode, StagedSlice::ColdGroups { group_keys });
         }
         // Cold markers let the coordinator fetch the slice instead of treating the vnode as empty.
         for vnode in cold {
@@ -1354,6 +1403,11 @@ impl GraphOperator for SqlQueryOperator {
         } else {
             self.tier_sender = Some(tier);
         }
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn enable_group_delta_tracking(&mut self) {
+        self.enable_delta_tracking();
     }
 
     #[cfg(feature = "state-tier")]

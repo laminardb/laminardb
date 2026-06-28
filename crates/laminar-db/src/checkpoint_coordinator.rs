@@ -32,6 +32,13 @@ pub(crate) enum StagedSlice {
         changed: bytes::Bytes,
         tombstones: bytes::Bytes,
     },
+    // v2 group demotion (single-node): this vnode's demoted groups, by tier key. The coordinator
+    // fetches each from the tier and writes a COLD-ONLY partial (no resident — that lives in the
+    // whole-node manifest); recovery merges it additively. Always forces a full upload.
+    #[cfg(feature = "state-tier")]
+    ColdGroups {
+        group_keys: Vec<Vec<u8>>,
+    },
 }
 
 pub(crate) type StagedVnodeStates = HashMap<u32, HashMap<String, StagedSlice>>;
@@ -57,6 +64,9 @@ impl UploadedSlice {
             (StagedSlice::Bytes(b), UploadedSlice::Bytes(prev)) => b == prev,
             // A delta never matches a prior full — it rides the delta-chain path, not the reference path.
             (StagedSlice::Bytes(_), UploadedSlice::Cold) | (StagedSlice::Delta { .. }, _) => false,
+            // A cold-groups slice re-fetches+merges from the tier — always force a full upload.
+            #[cfg(feature = "state-tier")]
+            (StagedSlice::ColdGroups { .. }, _) => false,
         }
     }
 }
@@ -526,6 +536,60 @@ impl CheckpointCoordinator {
             "cold slice staged without state-tier support \
              (operator={operator}, vnode={vnode})"
         )))
+    }
+
+    /// Fetch one demoted GROUP's bytes from the cold tier. A miss fails the epoch — silently
+    /// dropping a demoted group would break recovery (v2 group demotion).
+    #[cfg(feature = "state-tier")]
+    async fn fetch_cold_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> Result<bytes::Bytes, DbError> {
+        let Some(ref tier) = self.state_tier else {
+            return Err(DbError::Checkpoint(format!(
+                "cold group staged but no state tier is wired (operator={operator}, vnode={vnode})"
+            )));
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tier.send(crate::state_tier::TierRequest::FetchGroup {
+            operator: Arc::from(operator),
+            vnode,
+            group: group.to_vec(),
+            reply,
+        })
+        .await
+        .map_err(|_| DbError::Checkpoint("state tier worker is gone".to_string()))?;
+        match rx
+            .await
+            .map_err(|_| DbError::Checkpoint("state tier worker dropped the reply".to_string()))??
+        {
+            Some(bytes) => Ok(bytes),
+            None => Err(DbError::Checkpoint(format!(
+                "demoted group missing from the state tier (operator={operator}, vnode={vnode}) — \
+                 failing the epoch rather than dropping it from recovery truth"
+            ))),
+        }
+    }
+
+    /// Resolve a `ColdGroups` slice into one COLD-ONLY `AggStateCheckpoint`: fetch each demoted group
+    /// from the tier and merge over disjoint keys. Recovery applies it additively (merge) on top of
+    /// the manifest's resident groups — no resident overlap.
+    #[cfg(feature = "state-tier")]
+    async fn resolve_cold_groups(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group_keys: &[Vec<u8>],
+    ) -> Result<bytes::Bytes, DbError> {
+        let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len());
+        for gk in group_keys {
+            parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
+        }
+        Ok(bytes::Bytes::from(
+            crate::aggregate_state::merge_serialized_agg_cps(&parts)?,
+        ))
     }
 
     /// Vnodes with memory-resident slices, as `(vnode, bytes)`, largest first.
@@ -1060,6 +1124,12 @@ impl CheckpointCoordinator {
                                 operators.push((name.clone(), bytes.to_vec()));
                                 recorded.insert(name.clone(), UploadedSlice::Cold);
                             }
+                            #[cfg(feature = "state-tier")]
+                            StagedSlice::ColdGroups { group_keys } => {
+                                let bytes = self.resolve_cold_groups(name, v, group_keys).await?;
+                                operators.push((name.clone(), bytes.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Cold);
+                            }
                         }
                     }
                 }
@@ -1099,21 +1169,25 @@ impl CheckpointCoordinator {
                         std::collections::HashMap::new();
                     if let Some(ops) = ops {
                         for (name, slice) in ops {
-                            let bytes = match slice {
-                                StagedSlice::Bytes(b) => b.clone(),
-                                StagedSlice::Cold => self.fetch_cold_slice(name, v).await?,
+                            // Cold slices/groups contribute bytes to this full upload but stay
+                            // pinned in the tier (recorded as `Cold`). A `ColdGroups` partial is
+                            // cold-only — the resident lives in the whole-node manifest.
+                            let (bytes, rec) = match slice {
+                                StagedSlice::Bytes(b) => {
+                                    (b.clone(), UploadedSlice::Bytes(b.clone()))
+                                }
+                                StagedSlice::Cold => {
+                                    (self.fetch_cold_slice(name, v).await?, UploadedSlice::Cold)
+                                }
+                                #[cfg(feature = "state-tier")]
+                                StagedSlice::ColdGroups { group_keys } => (
+                                    self.resolve_cold_groups(name, v, group_keys).await?,
+                                    UploadedSlice::Cold,
+                                ),
                                 StagedSlice::Delta { .. } => unreachable!("delta routed above"),
                             };
                             resolved.push((name.clone(), bytes.to_vec()));
-                            // Cold slices contribute bytes to this upload but stay pinned in the tier.
-                            recorded.insert(
-                                name.clone(),
-                                match slice {
-                                    StagedSlice::Bytes(b) => UploadedSlice::Bytes(b.clone()),
-                                    StagedSlice::Cold => UploadedSlice::Cold,
-                                    StagedSlice::Delta { .. } => unreachable!("delta routed above"),
-                                },
-                            );
+                            recorded.insert(name.clone(), rec);
                         }
                     }
                     if recorded.is_empty() {

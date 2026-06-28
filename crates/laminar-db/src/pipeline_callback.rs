@@ -141,6 +141,9 @@ fn staged_request_bytes(
                 changed,
                 tombstones,
             } => changed.len() + tombstones.len(),
+            // Cold-only — the demoted groups are on disk; no RAM.
+            #[cfg(feature = "state-tier")]
+            crate::checkpoint_coordinator::StagedSlice::ColdGroups { .. } => 0,
         })
         .sum();
     (ops + vnodes) as u64

@@ -117,6 +117,11 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "state-tier")]
     fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
 
+    /// Enable agg delta dirty-tracking for single-node v2 group demotion (no delta chain). Only
+    /// aggregate operators act on it.
+    #[cfg(feature = "state-tier")]
+    fn enable_group_delta_tracking(&mut self) {}
+
     /// Demote idle resident groups to the cold tier until `target_bytes` is freed (v2 group
     /// granularity). Encodes + tier-writes + drops each off the compute path; returns the count.
     #[cfg(feature = "state-tier")]
@@ -347,6 +352,7 @@ impl GraphOperator for ChangelogEnrichOperator {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // distinct independent flags, not a state enum
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
@@ -421,6 +427,10 @@ pub(crate) struct OperatorGraph {
     // Stored so DDL-added operators also receive the tier channel.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
+    // Single-node v2 group demotion: enable the agg delta dirty-tracking (no delta chain) so idle
+    // groups are demotable; the coordinator writes demoted groups to cold-only durable partials.
+    #[cfg(feature = "state-tier")]
+    group_delta_tracking: bool,
 }
 
 impl OperatorGraph {
@@ -462,6 +472,8 @@ impl OperatorGraph {
             rehydrated_vnode_state: None,
             #[cfg(feature = "state-tier")]
             state_tier: None,
+            #[cfg(feature = "state-tier")]
+            group_delta_tracking: false,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -642,6 +654,16 @@ impl OperatorGraph {
             node.operator.attach_state_tier(tier.clone());
         }
         self.state_tier = Some(tier);
+    }
+
+    /// Single-node v2 group demotion: enable agg delta dirty-tracking on built operators and
+    /// remember it so operators built later (DDL hot-add) pick it up. No `delta_chain_max`.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn enable_group_delta_tracking(&mut self) {
+        self.group_delta_tracking = true;
+        for node in &mut self.nodes {
+            node.operator.enable_group_delta_tracking();
+        }
     }
 
     /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
@@ -1662,6 +1684,9 @@ impl OperatorGraph {
             // Single-node path has no shuffle config to read the count from.
             if let Some(vnode_count) = self.vnode_count {
                 op.set_vnode_count(vnode_count);
+            }
+            if self.group_delta_tracking {
+                op.enable_delta_tracking();
             }
         }
         Box::new(op)

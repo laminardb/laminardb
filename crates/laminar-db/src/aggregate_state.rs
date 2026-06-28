@@ -491,6 +491,26 @@ impl AggStateCheckpoint {
     }
 }
 
+/// Merge serialized per-group agg slices over DISJOINT keys into one (the coordinator's entry point
+/// for folding a vnode's cold/demoted groups into one cold-only `AggStateCheckpoint` at checkpoint).
+#[cfg(feature = "state-tier")]
+pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
+    let mut iter = slices.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| DbError::Pipeline("merge agg slices: empty".into()))?;
+    let mut merged = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(first)
+        .map_err(|e| DbError::Pipeline(format!("merge agg slices: decode: {e}")))?;
+    for s in iter {
+        let other = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(s)
+            .map_err(|e| DbError::Pipeline(format!("merge agg slices: decode: {e}")))?;
+        merged.append_disjoint(other)?;
+    }
+    rkyv::to_bytes::<rkyv::rancor::Error>(&merged)
+        .map(|v| v.to_vec())
+        .map_err(|e| DbError::Pipeline(format!("merge agg slices: encode: {e}")))
+}
+
 /// Minimum interval between full O(groups) size re-walks.
 const SIZE_REWALK_MIN_INTERVAL_MS: u64 = 2_000;
 
@@ -2099,6 +2119,24 @@ impl IncrementalAggState {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cold_groups(&self) -> &AHashSet<arrow::row::OwnedRow> {
         &self.cold_groups
+    }
+
+    /// Cold (demoted) group tier keys bucketed by vnode — `vnode -> [group_key_bytes]`, matching the
+    /// `(vnode, group_key)` the demotion wrote. The checkpoint coordinator fetches these and writes a
+    /// cold-only partial per vnode; recovery merges them additively on top of the manifest's resident.
+    #[cfg(feature = "state-tier")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    pub(crate) fn cold_groups_by_vnode(
+        &self,
+        vnode_count: u32,
+    ) -> std::collections::HashMap<u32, Vec<Vec<u8>>> {
+        let mut out: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for k in &self.cold_groups {
+            let v = self.delta_vnode_of(k.as_ref(), vnode_count);
+            out.entry(v).or_default().push(k.as_ref().to_vec());
+        }
+        out
     }
 
     /// Whether `key` can be demoted now: changelog mode, delta tracking on this `vnode_count`,

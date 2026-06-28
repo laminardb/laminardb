@@ -800,6 +800,12 @@ impl LaminarDB {
                                 let sender =
                                     crate::state_tier::spawn_worker(&handle, Arc::new(store), 256);
                                 graph.set_state_tier(sender.clone());
+                                // v2 group demotion: turn on agg delta dirty-tracking (no delta
+                                // chain) so idle groups are demotable; demoted groups go to cold-only
+                                // durable partials the coordinator writes + recovery merges back.
+                                if self.config.state_tier_group_demotion {
+                                    graph.enable_group_delta_tracking();
+                                }
                                 tracing::info!(dir = %dir.display(), "state cold tier enabled");
                                 Some(sender)
                             }
