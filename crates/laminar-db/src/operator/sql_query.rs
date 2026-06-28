@@ -261,6 +261,10 @@ pub(crate) struct SqlQueryOperator {
     idle_ttl_ms: Option<u64>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
+    // Vnodes owned at the last capture; the diff vs the current owned-set yields the vnodes acquired
+    // since, whose delta chains must re-base FULL (`IncrementalAggState::reset_acquired_vnodes`).
+    #[cfg(feature = "cluster")]
+    prev_owned: rustc_hash::FxHashSet<u32>,
     // `Some(chain_max)` enables incremental delta checkpoints (Lever 2) with that re-base bound.
     // When set, the delta chain is the PRIMARY agg checkpoint (A1-capture): `checkpoint()` skips
     // the whole-node group capture and recovery comes from the per-vnode partials.
@@ -313,6 +317,8 @@ impl SqlQueryOperator {
             idle_ttl_ms,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            prev_owned: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
             delta_chain_max: None,
             #[cfg(feature = "cluster")]
@@ -377,6 +383,22 @@ impl SqlQueryOperator {
             self.vnode_count = config.registry.vnode_count();
         }
         self.cluster_shuffle = Some(config);
+    }
+
+    /// Vnodes owned now but not at the last capture; advances `prev_owned`. The agg re-bases their
+    /// delta chains FULL (a just-acquired vnode has no parent epoch on this node).
+    #[cfg(feature = "cluster")]
+    fn take_newly_acquired(&mut self) -> rustc_hash::FxHashSet<u32> {
+        let owned: rustc_hash::FxHashSet<u32> = match self.cluster_shuffle.as_ref() {
+            Some(cfg) => laminar_core::state::owned_vnodes(&cfg.registry, cfg.self_id)
+                .into_iter()
+                .collect(),
+            None => return rustc_hash::FxHashSet::default(),
+        };
+        let newly: rustc_hash::FxHashSet<u32> =
+            owned.difference(&self.prev_owned).copied().collect();
+        self.prev_owned = owned;
+        newly
     }
 
     async fn lazy_init(&mut self) -> Result<(), DbError> {
@@ -1255,9 +1277,13 @@ impl GraphOperator for SqlQueryOperator {
         DbError,
     > {
         use crate::checkpoint_coordinator::StagedSlice;
+        // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
+        // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
+        let newly_acquired = self.take_newly_acquired();
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Ok(None);
         };
+        agg_state.reset_acquired_vnodes(&newly_acquired);
 
         // Incremental delta capture (Lever 2): each touched vnode emits a FULL re-base or a DELTA.
         if let Some(chain_max) = self.delta_chain_max {
