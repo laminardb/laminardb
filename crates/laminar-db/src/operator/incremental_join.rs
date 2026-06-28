@@ -411,7 +411,10 @@ impl IncrementalJoinOperator {
     }
 
     /// Serialize one side's Z-set as a `__weight` changelog batch (weight column carries the stored
-    /// multiplicity), keyed by the side's live input schema. `None` if the side is empty/unresolved.
+    /// multiplicity), keyed by the side's live input schema. `None` only if the side was never
+    /// observed; a seen-but-empty side still emits a 0-row, schema-carrying blob so restore
+    /// re-establishes the side schema and "seen" status (else a LEFT join's first-right catch-up
+    /// would fire again on recovery and double-emit NULL-pads).
     fn side_checkpoint_bytes(&self, side: JoinSide) -> Result<Option<Vec<u8>>, DbError> {
         let (info, store) = match side {
             JoinSide::Left => (&self.left_info, &self.left_state),
@@ -421,30 +424,33 @@ impl IncrementalJoinOperator {
             return Ok(None);
         };
         let snap = store.snapshot();
-        if snap.is_empty() {
-            return Ok(None);
-        }
-        let nfields = info.schema.fields().len();
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(nfields);
-        for si in 0..nfields {
-            if si == info.weight_idx {
-                let mults = Int64Array::from(snap.iter().map(|(_, m)| *m).collect::<Vec<i64>>());
-                cols.push(Arc::new(mults));
-            } else {
-                let pos = info
-                    .plain_cols
-                    .iter()
-                    .position(|&c| c == si)
-                    .expect("non-weight column is a plain column");
-                let arr = ScalarValue::iter_to_array(snap.iter().map(|(r, _)| r[pos].clone()))
-                    .map_err(|e| {
-                        DbError::Pipeline(format!("incremental join: checkpoint column: {e}"))
-                    })?;
-                cols.push(arr);
+        let batch = if snap.is_empty() {
+            RecordBatch::new_empty(info.schema.clone())
+        } else {
+            let nfields = info.schema.fields().len();
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(nfields);
+            for si in 0..nfields {
+                if si == info.weight_idx {
+                    let mults =
+                        Int64Array::from(snap.iter().map(|(_, m)| *m).collect::<Vec<i64>>());
+                    cols.push(Arc::new(mults));
+                } else {
+                    let pos = info
+                        .plain_cols
+                        .iter()
+                        .position(|&c| c == si)
+                        .expect("non-weight column is a plain column");
+                    let arr = ScalarValue::iter_to_array(snap.iter().map(|(r, _)| r[pos].clone()))
+                        .map_err(|e| {
+                            DbError::Pipeline(format!("incremental join: checkpoint column: {e}"))
+                        })?;
+                    cols.push(arr);
+                }
             }
-        }
-        let batch = RecordBatch::try_new(info.schema.clone(), cols)
-            .map_err(|e| DbError::Pipeline(format!("incremental join: checkpoint batch: {e}")))?;
+            RecordBatch::try_new(info.schema.clone(), cols).map_err(|e| {
+                DbError::Pipeline(format!("incremental join: checkpoint batch: {e}"))
+            })?
+        };
         Ok(Some(batches_to_ipc(&info.schema, std::iter::once(&batch))?))
     }
 
@@ -1098,6 +1104,58 @@ mod tests {
         );
         assert_eq!(snap.get(&(1, 15, 100)), Some(&1));
         assert_eq!(snap.get(&(2, 20, 200)), Some(&1), "untouched key intact");
+        assert_eq!(snap.len(), 2);
+    }
+
+    // LEFT join: a checkpoint taken while the right side is SEEN-but-EMPTY must record that the
+    // right was seen, so a post-restart right batch does NOT re-fire the catch-up (which would
+    // double-emit NULL-pads and never retract the stale ones).
+    #[tokio::test]
+    async fn left_outer_checkpoint_with_empty_seen_right_no_catchup_resurrection() {
+        const NULL: i64 = i64::MIN;
+        let mut op = IncrementalJoinOperator::new(left_config());
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        // Cycle 1: both sides present → inner rows.
+        let out = op
+            .process(
+                &[
+                    vec![left_batch(&[(1, 10, 1), (2, 20, 1)])],
+                    vec![right_batch(&[(1, 100, 1), (2, 200, 1)])],
+                ],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+
+        // Cycle 2: right retracts everything → pads re-emitted, right_state now empty (but seen).
+        let out = op
+            .process(
+                &[vec![], vec![right_batch(&[(1, 100, -1), (2, 200, -1)])]],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+        assert_eq!(snap.get(&(1, 10, NULL)), Some(&1));
+        assert_eq!(snap.get(&(2, 20, NULL)), Some(&1));
+
+        // Checkpoint (right is seen-but-empty), restore into a fresh operator.
+        let cp = op.checkpoint().unwrap().expect("left state checkpoints");
+        let mut restored = IncrementalJoinOperator::new(left_config());
+        restored.restore(cp).unwrap();
+
+        // Cycle 3: right returns at k1 only. k1's pad must retract + inner appear; k2's pad must
+        // stay at multiplicity 1 (no catch-up resurrection).
+        let out = restored
+            .process(&[vec![], vec![right_batch(&[(1, 100, 1)])]], &[0, 0])
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+        assert_eq!(snap.get(&(1, 10, NULL)), None, "k1 pad retracted on return");
+        assert_eq!(snap.get(&(1, 10, 100)), Some(&1), "k1 inner row");
+        assert_eq!(snap.get(&(2, 20, NULL)), Some(&1), "k2 pad NOT doubled");
         assert_eq!(snap.len(), 2);
     }
 }
