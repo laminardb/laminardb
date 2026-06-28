@@ -736,6 +736,7 @@ impl LaminarDB {
                     self_id,
                 });
                 graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
+                graph.set_revoke_handle(Arc::clone(&self.pending_revoke_vnodes));
                 // Incremental delta checkpoints (opt-in). Clamp the chain bound below the prune
                 // window so a chain base never ages out before the chain head.
                 if let Some(cp) = self.config.checkpoint.as_ref() {

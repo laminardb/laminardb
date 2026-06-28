@@ -273,6 +273,11 @@ pub(crate) struct SqlQueryOperator {
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
+    // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
+    // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore, so a
+    // later re-acquire still merges into empty state (no double-count).
+    #[cfg(feature = "cluster")]
+    deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
     #[cfg(feature = "state-tier")]
     promotion: Option<AggPromotion>,
     // Held until `lazy_init` builds the aggregate state, then moved into `promotion`.
@@ -323,6 +328,8 @@ impl SqlQueryOperator {
             delta_chain_max: None,
             #[cfg(feature = "cluster")]
             pending_restore_deltas: Vec::new(),
+            #[cfg(feature = "cluster")]
+            deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "state-tier")]
             promotion: None,
             #[cfg(feature = "state-tier")]
@@ -401,6 +408,7 @@ impl SqlQueryOperator {
         newly
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
         match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
@@ -422,6 +430,19 @@ impl SqlQueryOperator {
                             query = %self.op_name, error = %e,
                             "failed to replay restart delta — vnode may be stale"
                         );
+                    }
+                }
+                // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
+                // so a later re-acquire merges into empty state instead of double-counting.
+                #[cfg(feature = "cluster")]
+                if !self.deferred_revoke_vnodes.is_empty() {
+                    if let Some(vc) = self
+                        .cluster_shuffle
+                        .as_ref()
+                        .map(|c| c.registry.vnode_count())
+                    {
+                        let revoked = std::mem::take(&mut self.deferred_revoke_vnodes);
+                        agg_state.drop_vnodes(&revoked, vc);
                     }
                 }
                 if let Some(ttl) = self.idle_ttl_ms {
@@ -1564,6 +1585,32 @@ impl GraphOperator for SqlQueryOperator {
         }
         Ok(())
     }
+
+    #[cfg(feature = "cluster")]
+    fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) {
+        if revoked.is_empty() {
+            return;
+        }
+        // A revoked vnode must stop counting as previously-owned, else a later re-acquire would not
+        // register in `take_newly_acquired` and would skip the FULL re-base.
+        for v in revoked {
+            self.prev_owned.remove(v);
+        }
+        let vnode_count = self
+            .cluster_shuffle
+            .as_ref()
+            .map(|c| c.registry.vnode_count());
+        match self.state {
+            QueryState::Agg(ref mut agg_state) => {
+                if let Some(vc) = vnode_count {
+                    agg_state.drop_vnodes(revoked, vc);
+                }
+            }
+            // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until
+            // `lazy_init` folds them in, else they'd survive to a later re-acquire and double-count.
+            _ => self.deferred_revoke_vnodes.extend(revoked.iter().copied()),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "cluster"))]
@@ -1638,6 +1685,258 @@ mod delta_primary_tests {
         assert!(
             op.checkpoint().unwrap().is_none(),
             "delta-enabled aggregate must skip the whole-node capture (chain is primary)"
+        );
+    }
+
+    // Lose-then-reacquire: rehydrating a vnode's durable slice must merge into EMPTY state, not on
+    // top of the stale leftover. `drop_owned_vnodes` (revocation) clears the leftover so the
+    // additive `merge_groups` reproduces the original value; without the drop it double-counts.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn reacquire_after_revoke_does_not_double_count() {
+        async fn populated_op() -> SqlQueryOperator {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("val", DataType::Int64, false),
+            ]));
+            let seed = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["seed"])),
+                    Arc::new(Int64Array::from(vec![0_i64])),
+                ],
+            )
+            .unwrap();
+            let ctx = laminar_sql::create_session_context();
+            let mem =
+                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                    .unwrap();
+            ctx.register_table("events", Arc::new(mem)).unwrap();
+            let mut op = SqlQueryOperator::new(
+                "out",
+                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
+                ctx,
+                None,
+                false,
+                None,
+            );
+            let registry = Arc::new(VnodeRegistry::new(8));
+            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
+            let receiver = Arc::new(
+                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            op.attach_cluster_shuffle(ClusterShuffleConfig {
+                registry,
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                receiver,
+                self_id: NodeId(1),
+            });
+            op
+        }
+
+        fn total_sum(op: &mut SqlQueryOperator) -> i64 {
+            let QueryState::Agg(ref mut agg) = op.state else {
+                panic!("expected aggregate state");
+            };
+            let batches = agg.emit().unwrap();
+            let mut sum = 0;
+            for b in &batches {
+                let total = b
+                    .column(b.schema().index_of("total").unwrap())
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for i in 0..b.num_rows() {
+                    sum += total.value(i);
+                }
+            }
+            sum
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let batch = move |keys: &[&str], vals: &[i64]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(keys.to_vec())),
+                    Arc::new(Int64Array::from(vals.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+
+        // The durable per-vnode slice for some owned vnode `v`, captured from {a:1, b:2}.
+        let mut donor = populated_op().await;
+        donor
+            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
+            .await
+            .unwrap();
+        let slices = donor
+            .checkpoint_by_vnode(8)
+            .unwrap()
+            .expect("per-vnode slices");
+        let (v, slice_bytes) = slices
+            .iter()
+            .find_map(|(v, s)| match s {
+                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => Some((*v, b.clone())),
+                _ => None,
+            })
+            .expect("at least one full vnode slice");
+
+        // Control: re-apply v's slice WITHOUT dropping → its groups double-count.
+        let mut control = populated_op().await;
+        control
+            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
+            .await
+            .unwrap();
+        control.apply_vnode_state(v, &slice_bytes).unwrap();
+        assert!(
+            total_sum(&mut control) > 3,
+            "without the revoke-drop, re-applying a vnode slice double-counts (additive merge)"
+        );
+
+        // Fixed: drop v on revocation, THEN re-apply → merges into empty, original value restored.
+        let mut fixed = populated_op().await;
+        fixed
+            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
+            .await
+            .unwrap();
+        let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
+        fixed.drop_owned_vnodes(&revoked);
+        fixed.apply_vnode_state(v, &slice_bytes).unwrap();
+        assert_eq!(
+            total_sum(&mut fixed),
+            3,
+            "after revoke-drop, re-acquiring the vnode reproduces the exact aggregate (no doubling)"
+        );
+    }
+
+    // A revoke that lands while the operator is still Uninit (restart + rebalance before the first
+    // process) must be deferred and applied after `lazy_init` folds `pending_restore`; otherwise the
+    // restored groups for the lost vnode survive and double-count on a later re-acquire.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn uninit_revoke_defers_drop_no_double_count() {
+        async fn populated_op() -> SqlQueryOperator {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("val", DataType::Int64, false),
+            ]));
+            let seed = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["seed"])),
+                    Arc::new(Int64Array::from(vec![0_i64])),
+                ],
+            )
+            .unwrap();
+            let ctx = laminar_sql::create_session_context();
+            let mem =
+                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                    .unwrap();
+            ctx.register_table("events", Arc::new(mem)).unwrap();
+            let mut op = SqlQueryOperator::new(
+                "out",
+                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
+                ctx,
+                None,
+                false,
+                None,
+            );
+            let registry = Arc::new(VnodeRegistry::new(8));
+            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
+            let receiver = Arc::new(
+                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            op.attach_cluster_shuffle(ClusterShuffleConfig {
+                registry,
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                receiver,
+                self_id: NodeId(1),
+            });
+            op
+        }
+        fn total_sum(op: &mut SqlQueryOperator) -> i64 {
+            let QueryState::Agg(ref mut agg) = op.state else {
+                panic!("expected aggregate state");
+            };
+            agg.emit()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    let total = b
+                        .column(b.schema().index_of("total").unwrap())
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    (0..b.num_rows()).map(|i| total.value(i)).sum::<i64>()
+                })
+                .sum()
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+            ],
+        )
+        .unwrap();
+
+        // Durable whole-node checkpoint + a per-vnode slice, both from {a:1, b:2}.
+        let mut donor = populated_op().await;
+        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        let (v, slice_bytes) = donor
+            .checkpoint_by_vnode(8)
+            .unwrap()
+            .expect("per-vnode slices")
+            .iter()
+            .find_map(|(v, s)| match s {
+                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => Some((*v, b.clone())),
+                _ => None,
+            })
+            .expect("a full vnode slice");
+        let whole = donor
+            .checkpoint()
+            .unwrap()
+            .expect("whole-node checkpoint")
+            .data;
+
+        // Control: restore, init (folds {a:1,b:2}) WITHOUT dropping v, then re-acquire v → doubles.
+        let mut control = populated_op().await;
+        control
+            .restore(OperatorCheckpoint {
+                data: whole.clone(),
+            })
+            .unwrap();
+        control.process(&[], &[i64::MIN]).await.unwrap();
+        control.apply_vnode_state(v, &slice_bytes).unwrap();
+        assert!(
+            total_sum(&mut control) > 3,
+            "restoring then re-acquiring without the deferred drop double-counts"
+        );
+
+        // Fixed: revoke v WHILE Uninit (deferred), init folds then drops v, re-acquire merges clean.
+        let mut fixed = populated_op().await;
+        fixed.restore(OperatorCheckpoint { data: whole }).unwrap();
+        let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
+        fixed.drop_owned_vnodes(&revoked); // Uninit → deferred
+        fixed.process(&[], &[i64::MIN]).await.unwrap(); // lazy_init folds restore, then drops v
+        fixed.apply_vnode_state(v, &slice_bytes).unwrap();
+        assert_eq!(
+            total_sum(&mut fixed),
+            3,
+            "a revoke deferred from the Uninit window still prevents the re-acquire double-count"
         );
     }
 }

@@ -112,6 +112,12 @@ pub(crate) trait GraphOperator: Send {
         Ok(())
     }
 
+    /// Drop in-memory state for vnodes this node lost on a rebalance, before any later re-acquire
+    /// merges rehydrated state on top of it (the agg merge is additive → double-count). Default
+    /// no-op; only vnode-sharded aggregates act on it.
+    #[cfg(feature = "cluster")]
+    fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) {}
+
     /// Wire the cold-tier channel for vnode promotion. Only vnode-sharded
     /// aggregates use it; others ignore it.
     #[cfg(feature = "state-tier")]
@@ -424,6 +430,9 @@ pub(crate) struct OperatorGraph {
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     rehydrated_vnode_state:
         Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
+    // Staged set of vnodes lost on rebalance; drained at the top of each cycle to drop their state.
+    #[cfg(feature = "cluster")]
+    pending_revoke_vnodes: Option<Arc<parking_lot::Mutex<FxHashSet<u32>>>>,
     // Stored so DDL-added operators also receive the tier channel.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
@@ -470,6 +479,8 @@ impl OperatorGraph {
             vnode_count: None,
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
+            #[cfg(feature = "cluster")]
+            pending_revoke_vnodes: None,
             #[cfg(feature = "state-tier")]
             state_tier: None,
             #[cfg(feature = "state-tier")]
@@ -682,6 +693,35 @@ impl OperatorGraph {
         staged: Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>,
     ) {
         self.rehydrated_vnode_state = Some(staged);
+    }
+
+    /// Share the staged revoked-vnode set; drained at the top of each cycle to drop lost state.
+    #[cfg(feature = "cluster")]
+    pub fn set_revoke_handle(&mut self, staged: Arc<parking_lot::Mutex<FxHashSet<u32>>>) {
+        self.pending_revoke_vnodes = Some(staged);
+    }
+
+    /// Drop in-memory state for vnodes lost since the last cycle, before `apply_rehydrated_vnodes`
+    /// merges any re-acquired ones — so a lose-then-reacquire merges into empty state. Disjoint from
+    /// the rehydrated set per rotation; the ordering is defensive against rapid cross-rotation churn.
+    #[cfg(feature = "cluster")]
+    fn apply_revoked_vnodes(&mut self) {
+        let Some(handle) = self.pending_revoke_vnodes.as_ref() else {
+            return;
+        };
+        let revoked: FxHashSet<u32> = {
+            let mut guard = handle.lock();
+            if guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            node.operator.drop_owned_vnodes(&revoked);
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -2106,7 +2146,10 @@ impl OperatorGraph {
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         #[cfg(feature = "cluster")]
-        self.apply_rehydrated_vnodes();
+        {
+            self.apply_revoked_vnodes();
+            self.apply_rehydrated_vnodes();
+        }
 
         if self.topo_dirty {
             self.compute_topo_order();
@@ -3399,6 +3442,21 @@ mod tests {
         // Debug builds are slow — use a generous budget for tests.
         graph.set_query_budget_ns(5_000_000_000); // 5 seconds
         graph
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn apply_revoked_vnodes_drains_handle() {
+        let mut graph = test_graph();
+        let handle = Arc::new(parking_lot::Mutex::new(
+            [1u32, 2, 3].into_iter().collect::<FxHashSet<u32>>(),
+        ));
+        graph.set_revoke_handle(Arc::clone(&handle));
+        graph.apply_revoked_vnodes();
+        assert!(
+            handle.lock().is_empty(),
+            "the revoke handle is drained after apply_revoked_vnodes",
+        );
     }
 
     #[test]

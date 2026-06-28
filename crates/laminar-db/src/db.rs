@@ -174,6 +174,10 @@ pub struct LaminarDB {
     /// `OperatorGraph` via `ClusterShuffleConfig`.
     #[cfg(feature = "cluster")]
     pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
+    /// Vnodes lost on rebalance adoption; operators drain this each cycle and drop the stale
+    /// in-memory state so a later re-acquire merges into empty state (no additive double-count).
+    #[cfg(feature = "cluster")]
+    pub(crate) pending_revoke_vnodes: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<u32>>>,
     /// Routes `db.checkpoint()` requests to the pipeline callback so operator
     /// state is captured. When `None`, the coordinator is driven directly
     /// (stateless / pre-start path).
@@ -416,6 +420,10 @@ impl LaminarDB {
             catalog_manifest_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            #[cfg(feature = "cluster")]
+            pending_revoke_vnodes: Arc::new(parking_lot::Mutex::new(
+                rustc_hash::FxHashSet::default(),
+            )),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             #[cfg(feature = "cluster")]
@@ -662,6 +670,16 @@ impl LaminarDB {
         // Rotation committed — drop the drain marks (revoked partitions are gone).
         registry.clear_draining();
         let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        // Vnodes lost this rotation: stage them so operators drop the stale in-memory state next
+        // cycle (a later re-acquire's additive merge would otherwise double-count). Disjoint from
+        // `newly_acquired` per rotation.
+        {
+            let new_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
+            let revoked: Vec<u32> = old_set.difference(&new_set).copied().collect();
+            if !revoked.is_empty() {
+                self.pending_revoke_vnodes.lock().extend(revoked);
+            }
+        }
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
         }

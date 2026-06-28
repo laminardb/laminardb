@@ -1,6 +1,31 @@
 # Cluster revoked-vnode operator-state cleanup
 
-Status: **planned** (follow-up to the cluster group-demotion rehydration-panic fix `84b1cd8f`).
+Status: **implemented** (Slices 1–4; follow-up to the cluster group-demotion rehydration-panic fix
+`84b1cd8f`).
+
+## Implemented
+
+- **Slice 1** `IncrementalAggState::drop_vnodes` — clears `groups`, `last_emitted`, `dirty_keys`, the
+  per-vnode delta maps, `delta_chain_len`, and (state-tier) `cold_groups`/`cold_vnodes`/`dirty_vnodes`
+  for revoked vnodes. Unit test `drop_vnodes_purges_revoked_keeps_sibling`.
+- **Slice 2** `GraphOperator::drop_owned_vnodes` (default no-op); `SqlQueryOperator` forwards to the
+  agg state and resets `prev_owned`.
+- **Slice 3** `Db::pending_revoke_vnodes` handle; `adopt_assignment_snapshot` stages
+  `revoked = old − new`; `OperatorGraph::apply_revoked_vnodes` drains it each cycle **before**
+  `apply_rehydrated_vnodes`; wired in `pipeline_lifecycle`. Drain test
+  `apply_revoked_vnodes_drains_handle`.
+- **Slice 4 (re-evaluated)** the `reset_acquired_vnodes` cold-group retain is now a no-op on every
+  reachable path (drop-at-revoke + restart-starts-empty), so it is kept as documented
+  defense-in-depth and the doc corrected to credit the `delta_chain_len` re-base — not the cold
+  retain — for the restart FULL re-base.
+- **Uninit-window hardening** (from adversarial review): a revoke arriving while the operator is still
+  `Uninit` is deferred (`deferred_revoke_vnodes`) and applied after `lazy_init` folds
+  `pending_restore`, so the restored-then-lost vnode can't double-count on re-acquire. Tests
+  `reacquire_after_revoke_does_not_double_count` (operator-level, with doubling control) and
+  `uninit_revoke_defers_drop_no_double_count`.
+
+Validated: 845 laminar-db lib tests green under `state-tier`; clippy clean for cluster-only,
+state-tier, and non-cluster.
 
 ## Problem
 

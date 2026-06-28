@@ -2092,6 +2092,14 @@ impl IncrementalAggState {
     /// would otherwise emit a parentless delta — LDB-6025). Stale cold-group tracking for an
     /// acquired vnode is dropped too: the rehydrated chain is authoritative and any prior owner's
     /// node-local tier bytes are gone.
+    ///
+    /// Complements (does not duplicate) `drop_vnodes`: that handles the REVOCATION transition
+    /// (clearing all state for a lost vnode); this handles the ACQUISITION transition, whose
+    /// load-bearing work is the `delta_chain_len` re-base — after a restart `prev_owned` is empty, so
+    /// every owned vnode reads as newly-acquired and must re-base FULL (no parent epoch here). The
+    /// `cold_groups` retain below is now defense-in-depth only: `drop_vnodes` already clears a vnode's
+    /// cold tracking at revocation, and a restart starts with `cold_groups` empty, so on every
+    /// reachable path it is a no-op by the time a vnode is re-acquired.
     #[cfg(feature = "cluster")]
     pub(crate) fn reset_acquired_vnodes(&mut self, acquired: &rustc_hash::FxHashSet<u32>) {
         if acquired.is_empty() {
@@ -2115,6 +2123,50 @@ impl IncrementalAggState {
                 !acquired.contains(&v)
             });
         }
+    }
+
+    /// Drop all in-memory state for vnodes this node lost on a rebalance (revoked). Without this the
+    /// stale leftover survives, and a later re-acquire's `merge_groups` (additive) double-counts on
+    /// top of it. Mirrors `demote_vnode`'s key bucketing but over a set, and clears the per-vnode
+    /// delta and cold tracking for the revoked vnodes too. Runs on the compute thread at the
+    /// revoking rotation; revoked and acquired sets are disjoint per rotation, so it never races an
+    /// acquire-merge.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn drop_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>, vnode_count: u32) {
+        if revoked.is_empty() {
+            return;
+        }
+        let global = self.num_group_cols == 0;
+        let in_revoked = |k: &arrow::row::OwnedRow| -> bool {
+            let v = if global {
+                0
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    (laminar_core::state::key_hash(k.as_ref()) % u64::from(vnode_count)) as u32
+                }
+            };
+            revoked.contains(&v)
+        };
+        self.groups.retain(|k, _| !in_revoked(k));
+        self.last_emitted.retain(|k, _| !in_revoked(k));
+        self.dirty_keys.retain(|k| !in_revoked(k));
+        for v in revoked {
+            self.dirty_keys_by_vnode.remove(v);
+            self.removed_by_vnode.remove(v);
+            self.last_emitted_dirty_by_vnode.remove(v);
+            self.delta_chain_len.remove(v);
+        }
+        #[cfg(feature = "state-tier")]
+        {
+            self.cold_groups.retain(|k| !in_revoked(k));
+            for v in revoked {
+                self.cold_vnodes.remove(v);
+                self.dirty_vnodes.remove(v);
+            }
+        }
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
     }
 }
 
@@ -4105,6 +4157,7 @@ mod tests {
     /// into `cold_groups`, and promotes back exactly (group state + `last_emitted` dedup), so the
     /// recovered group re-emits nothing. A dirty group is not demotable.
     #[cfg(feature = "state-tier")]
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn demote_then_promote_group_round_trips() {
         use std::collections::BTreeMap;
@@ -4514,6 +4567,7 @@ mod tests {
     /// `has_cold` deferral (DELTA). This is the ownership-driven hook that replaced clearing the
     /// chain inside `merge_groups`, fixing both the rehydration panic and the parentless-delta stall.
     #[cfg(feature = "state-tier")]
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn reset_acquired_vnodes_rebases_acquired_keeps_cold_deferral() {
         use arrow::array::ArrayRef;
@@ -4643,6 +4697,178 @@ mod tests {
             matches!(cap2.get(&y), Some(VnodeCapture::Full(_))),
             "after acquisition (no cold groups) Y re-bases FULL — no parentless delta",
         );
+    }
+
+    /// `drop_vnodes` purges ALL state for a revoked vnode — resident groups, `last_emitted`, the
+    /// per-vnode delta maps, the chain length, and (state-tier) its cold-group tracking — while a
+    /// sibling vnode is untouched and `last_emitted ⊆ groups` still holds. This is what stops a
+    /// later re-acquire's additive `merge_groups` from double-counting on stale leftovers.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn drop_vnodes_purges_revoked_keeps_sibling() {
+        use arrow::array::ArrayRef;
+        const VC: u32 = 8;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
+            let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
+        };
+        let vnode_of = |state: &IncrementalAggState, key: &str| {
+            state.delta_vnode_of(row_of(state, key).as_ref(), VC)
+        };
+
+        // A vnode `y` with two keys (one stays resident, one is demoted), and a distinct vnode `x`.
+        let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+        let mut by_v: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for c in &cands {
+            by_v.entry(vnode_of(&state, c)).or_default().push(c.clone());
+        }
+        let vy = *by_v
+            .iter()
+            .find(|(_, ks)| ks.len() >= 2)
+            .map(|(v, _)| v)
+            .expect("a vnode with two keys");
+        let vx = *by_v
+            .keys()
+            .find(|v| **v != vy)
+            .expect("a second distinct vnode");
+        let (y_res, y_cold) = (by_v[&vy][0].clone(), by_v[&vy][1].clone());
+        let x_key = by_v[&vx][0].clone();
+
+        feed(
+            &mut state,
+            &[(&y_res, 1.0), (&y_cold, 2.0), (&x_key, 3.0)],
+            1000,
+        );
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(VC, 8).unwrap(); // chain_len[vx]=[vy]=0
+
+        let y_cold_row = row_of(&state, &y_cold);
+        #[cfg(feature = "state-tier")]
+        {
+            state.encode_group(&y_cold_row).unwrap();
+            state.drop_demoted_group(&y_cold_row);
+            assert!(state.cold_groups().contains(&y_cold_row));
+        }
+
+        // Re-dirty both vnodes so the per-vnode delta maps are populated at drop time.
+        feed(&mut state, &[(&y_res, 5.0), (&x_key, 7.0)], 2000);
+
+        let y_res_row = row_of(&state, &y_res);
+        let x_row = row_of(&state, &x_key);
+        assert!(
+            state.groups.contains_key(&y_res_row),
+            "precondition: y resident"
+        );
+        assert!(
+            state.groups.contains_key(&x_row),
+            "precondition: x resident"
+        );
+
+        // Revoke vy.
+        let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
+        state.drop_vnodes(&revoked, VC);
+
+        // Every vy entry is gone.
+        assert!(
+            !state.groups.contains_key(&y_res_row),
+            "revoked resident group dropped"
+        );
+        assert!(
+            !state.groups.contains_key(&y_cold_row),
+            "revoked cold key absent from groups"
+        );
+        assert!(
+            !state.last_emitted.contains_key(&y_res_row),
+            "revoked last_emitted dropped"
+        );
+        assert!(!state.dirty_keys_by_vnode.contains_key(&vy));
+        assert!(!state.removed_by_vnode.contains_key(&vy));
+        assert!(!state.last_emitted_dirty_by_vnode.contains_key(&vy));
+        assert!(!state.delta_chain_len.contains_key(&vy));
+        #[cfg(feature = "state-tier")]
+        {
+            assert!(
+                !state.cold_groups().contains(&y_cold_row),
+                "revoked cold tracking dropped"
+            );
+            assert!(!state.cold_vnodes().contains(&vy));
+        }
+
+        // The sibling vnode is untouched.
+        assert!(
+            state.groups.contains_key(&x_row),
+            "sibling resident group kept"
+        );
+        assert!(
+            state.delta_chain_len.contains_key(&vx),
+            "sibling chain kept"
+        );
+
+        // Invariant preserved: the dedup map stays a subset of resident groups.
+        for k in state.last_emitted.keys() {
+            assert!(
+                state.groups.contains_key(k),
+                "last_emitted must remain a subset of groups",
+            );
+        }
     }
 
     #[tokio::test]
