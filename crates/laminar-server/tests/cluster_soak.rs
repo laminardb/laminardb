@@ -535,6 +535,178 @@ fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) ->
     new_epoch
 }
 
+/// EMBEDDED (non-cluster) single-node config: the `Profile::Embedded` path (single-owner registry,
+/// no controller/gossip/shuffle) that v2 single-node group demotion targets. A tiny budget + a
+/// slow-cycling `EMIT CHANGES` agg drive group demote→promote; the cold groups must survive kill -9
+/// via the cold-only partials the coordinator writes.
+fn write_embedded_config(dir: &Path, id: usize, interval_ms: u64) -> PathBuf {
+    let data_dir = dir.join(format!("node{id}-data"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let state_shared = dir.join("state");
+    std::fs::create_dir_all(&state_shared).unwrap();
+    let ckpt_shared = dir.join("checkpoints");
+    std::fs::create_dir_all(&ckpt_shared).unwrap();
+    let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+
+    let http = BASE_PORT + id as u16;
+    let budget = env_u64("LAMINAR_SOAK_BUDGET_BYTES", 8192);
+    let vnodes = env_u64("LAMINAR_SOAK_VNODES", 64);
+    let rps = env_u64("LAMINAR_SOAK_RPS", 400);
+    let groups = env_u64("LAMINAR_SOAK_GROUPS", 600);
+    let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+    let tier_dir = fwd(&data_dir.join("tier"));
+
+    // No delta_chain_max: single-node group demotion enables delta DIRTY-tracking (not the primary
+    // chain), so the whole-node manifest stays authoritative and the coordinator folds demoted
+    // groups into cold-only partials the additive rehydrate merges back.
+    // `backend = "local"` builds an ObjectStoreBackend over the local FS (durable + per-vnode partials)
+    // AND supplies the local_storage_dir the Embedded profile requires; object_store/file:// has neither.
+    let toml = format!(
+        r#"
+node_id = "n{id}"
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:{http}"
+state_tier_dir = "{tier_dir}"
+state_memory_budget_bytes = {budget}
+state_tier_group_demotion = true
+
+[state]
+backend = "local"
+path = "{state_path}"
+instance_id = "n{id}"
+vnode_capacity = {vnodes}
+
+[checkpoint]
+url = "file:///{ckpt_url}"
+interval = "{interval_ms}ms"
+max_retained = 5
+
+[[source]]
+name = "gen"
+connector = "generator"
+properties = {{ "rows.per.second" = "{rps}", "batch.max.size" = "256" }}
+
+[[pipeline]]
+name = "soak_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+"#,
+        state_path = fwd(&state_shared),
+        ckpt_url = fwd(&ckpt_shared),
+    );
+    let path = dir.join(format!("node{id}-embedded.toml"));
+    std::fs::write(&path, toml).unwrap();
+    path
+}
+
+/// Single-node EMBEDDED v2 group-demotion recovery under kill -9. Validates the path the
+/// single-node-CLUSTER soak can't (it stalls on the convergence gate): the embedded node demotes
+/// idle groups, gets hard-killed, and on restart recovers them from the cold-only partials and
+/// resumes checkpointing. Run with `--features state-tier`.
+#[test]
+#[ignore = "spawns a real laminardb process; run with --ignored --features state-tier"]
+fn embedded_kill9_group_demotion_soak() {
+    let soak_secs = env_u64("LAMINAR_SOAK_SECONDS", 75);
+    let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 300).max(100);
+    let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = std::env::temp_dir().join(format!("soak-embed-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    eprintln!("soak: embedded node logs in {}", log_dir.display());
+
+    let mut node = Node {
+        id: 0,
+        config_path: write_embedded_config(dir.path(), 0, interval_ms),
+        log_path: log_dir.join("node0.log"),
+        child: None,
+        http_port: BASE_PORT,
+        fault_inject_ms: None,
+    };
+
+    node.spawn();
+    wait_for(
+        "embedded node to commit a checkpoint",
+        Duration::from_secs(30),
+        || node.commits().unwrap_or(0.0) >= 1.0,
+    );
+    eprintln!("soak: embedded node up");
+
+    // Wait for group demotion to fire AND a subsequent checkpoint to capture the cold-only partials,
+    // so the first kill actually exercises cold-group recovery.
+    wait_for("group demotion to fire", Duration::from_secs(60), || {
+        node.metric("laminardb_state_tier_demote_total")
+            .unwrap_or(0.0)
+            > 0.0
+    });
+    let after_demote = node.commits().unwrap_or(0.0);
+    wait_for(
+        "a checkpoint after demotion (captures cold-only partials)",
+        Duration::from_secs(30),
+        || node.commits().unwrap_or(0.0) >= after_demote + 1.0,
+    );
+    eprintln!(
+        "soak: demotion fired (demotes={}), cold groups captured",
+        node.metric("laminardb_state_tier_demote_total")
+            .unwrap_or(0.0)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(soak_secs);
+    let mut kills = 0u64;
+    let mut round = 0u64;
+    while Instant::now() < deadline {
+        round += 1;
+        if kills < max_kills {
+            eprintln!("soak round {round}: kill -9 embedded node");
+            node.kill9();
+            kills += 1;
+            node.spawn();
+            // The node must recover from its checkpoint (cold groups from cold-only partials) and
+            // resume committing — the single-node-cluster path stalls here; embedded must not.
+            assert_progress(
+                std::slice::from_ref(&node),
+                0.0,
+                Duration::from_secs(60),
+                "progress after kill",
+            );
+        } else {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        eprintln!(
+            "soak round {round}: demotes={} fetches={} resident_bytes={} state_bytes={}",
+            node.metric("laminardb_state_tier_demote_total")
+                .unwrap_or(0.0),
+            node.metric("laminardb_state_tier_fetch_total")
+                .unwrap_or(0.0),
+            node.metric("laminardb_state_tier_bytes").unwrap_or(0.0),
+            node.metric("laminardb_state_bytes").unwrap_or(0.0),
+        );
+    }
+
+    let demotes = node
+        .metric("laminardb_state_tier_demote_total")
+        .unwrap_or(0.0);
+    let fetches = node
+        .metric("laminardb_state_tier_fetch_total")
+        .unwrap_or(0.0);
+    eprintln!(
+        "soak: completed {round} rounds ({kills} kills); demotes={demotes} fetches={fetches}"
+    );
+    // demote→promote both fired and survived the kill -9 rounds: a row hitting a cold group after a
+    // restart promotes it back, which only works if recovery rebuilt the group from the cold-only
+    // partial (not silently from zero).
+    assert!(
+        demotes > 0.0,
+        "embedded: group demotion never fired: demotes={demotes}"
+    );
+    assert!(
+        fetches > 0.0,
+        "embedded: demoted groups never promoted across kills — recovery may have lost them: fetches={fetches}"
+    );
+    node.kill9();
+}
+
 #[test]
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
 fn three_node_kill9_soak() {
