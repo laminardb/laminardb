@@ -5,10 +5,12 @@
 //! net naturally. Both side states are indexed Z-sets keyed by the join key. The joined changelog
 //! feeds the join MV's `Multiset` store, which accumulates the snapshot.
 //!
-//! Slice 1 scope: INNER equi-join, in-memory state, plain-column projection (no wildcards, no
-//! WHERE, no expression projections). Both side Z-sets ARE checkpointed (each serialized as a
-//! `__weight` changelog where the weight column carries the stored multiplicity), so a restart
-//! restores them consistently with the join MV's `Multiset` snapshot. Single-node, default-OFF.
+//! INNER or LEFT equi-join, in-memory state, plain-column projection (no wildcards, no WHERE, no
+//! expression projections). A LEFT join NULL-pads unmatched left rows and tracks the pad↔inner
+//! transition via per-key right-match presence (and back-fills on first sight of the right schema).
+//! Both side Z-sets ARE checkpointed (each serialized as a `__weight` changelog where the weight
+//! column carries the stored multiplicity), so a restart restores them consistently with the join
+//! MV's `Multiset` snapshot. Single-node, default-OFF.
 
 use std::sync::Arc;
 
@@ -32,7 +34,9 @@ pub(crate) trait JoinStateStore: Send {
     fn upsert(&mut self, key: &[ScalarValue], row: &[ScalarValue], weight: i64);
     /// Every `(row, multiplicity)` currently held for `key`.
     fn get(&self, key: &[ScalarValue]) -> Vec<(Vec<ScalarValue>, i64)>;
-    /// All `(full_row, multiplicity)` entries, for checkpointing.
+    /// Whether any row is held for `key` (i.e. a left-join match count > 0).
+    fn contains_key(&self, key: &[ScalarValue]) -> bool;
+    /// All `(full_row, multiplicity)` entries, for checkpointing and left-join catch-up.
     fn snapshot(&self) -> Vec<(Vec<ScalarValue>, i64)>;
     fn estimated_bytes(&self) -> usize;
 }
@@ -88,6 +92,10 @@ impl JoinStateStore for InMemoryJoinState {
         }
     }
 
+    fn contains_key(&self, key: &[ScalarValue]) -> bool {
+        self.rows.contains_key(key)
+    }
+
     fn snapshot(&self) -> Vec<(Vec<ScalarValue>, i64)> {
         let mut out = Vec::new();
         for inner in self.rows.values() {
@@ -109,6 +117,9 @@ struct SideInfo {
     weight_idx: usize,
     plain_cols: Vec<usize>,
     key_idx: Vec<usize>,
+    // Position of each key column within `plain_cols` — lets the left-join catch-up re-derive a
+    // key from a stored (plain) row.
+    key_plain_pos: Vec<usize>,
     name_to_plain_pos: FxHashMap<String, usize>,
     schema: SchemaRef,
 }
@@ -133,10 +144,20 @@ impl SideInfo {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let key_plain_pos = key_idx
+            .iter()
+            .map(|k| {
+                plain_cols
+                    .iter()
+                    .position(|c| c == k)
+                    .expect("key column is a plain column")
+            })
+            .collect();
         Ok(Self {
             weight_idx,
             plain_cols,
             key_idx,
+            key_plain_pos,
             name_to_plain_pos,
             schema: schema.clone(),
         })
@@ -150,11 +171,12 @@ struct DeltaRow {
     weight: i64,
 }
 
-/// A1-emit Stage 3b inner IVM join operator (two-input: port 0 = left changelog, port 1 = right).
+/// A1-emit Stage 3b INNER/LEFT IVM join operator (two-input: port 0 = left changelog, port 1 = right).
 pub(crate) struct IncrementalJoinOperator {
     left_keys: Vec<String>,
     right_keys: Vec<String>,
     projection: Vec<JoinProjItem>,
+    left_outer: bool,
     left_state: Box<dyn JoinStateStore>,
     right_state: Box<dyn JoinStateStore>,
     left_info: Option<SideInfo>,
@@ -171,6 +193,7 @@ impl IncrementalJoinOperator {
             left_keys: config.left_keys,
             right_keys: config.right_keys,
             projection: config.projection,
+            left_outer: config.left_outer,
             left_state: Box::new(InMemoryJoinState::default()),
             right_state: Box::new(InMemoryJoinState::default()),
             left_info: None,
@@ -180,7 +203,14 @@ impl IncrementalJoinOperator {
         }
     }
 
-    fn parse_side(info: &SideInfo, batches: &[RecordBatch]) -> Result<Vec<DeltaRow>, DbError> {
+    /// Parse a changelog batch into `(key, row, weight)` deltas. `skip_null_keys` drops NULL-key
+    /// rows — correct for the right side always, and for the left side of an INNER join (such rows
+    /// never match). A LEFT join keeps NULL-key left rows so they are still NULL-padded.
+    fn parse_side(
+        info: &SideInfo,
+        batches: &[RecordBatch],
+        skip_null_keys: bool,
+    ) -> Result<Vec<DeltaRow>, DbError> {
         let mut out = Vec::new();
         for batch in batches {
             if batch.num_rows() == 0 {
@@ -197,8 +227,7 @@ impl IncrementalJoinOperator {
                     continue;
                 }
                 let key = scalars_at(batch, &info.key_idx, r)?;
-                // A NULL join key never matches in an equi-join (SQL NULL != NULL); drop the row.
-                if key.iter().any(ScalarValue::is_null) {
+                if skip_null_keys && key.iter().any(ScalarValue::is_null) {
                     continue;
                 }
                 let row = scalars_at(batch, &info.plain_cols, r)?;
@@ -261,6 +290,7 @@ impl IncrementalJoinOperator {
                 },
             }
         }
+        let left_outer = self.left_outer;
         let mut fields: Vec<Field> = cols
             .iter()
             .map(|&(side, pos)| {
@@ -268,7 +298,10 @@ impl IncrementalJoinOperator {
                     JoinSide::Left => l,
                     JoinSide::Right => r,
                 };
-                info.schema.field(info.plain_cols[pos]).clone()
+                let f = info.schema.field(info.plain_cols[pos]);
+                // Right columns become NULL-able under a LEFT join (NULL-padded unmatched rows).
+                let nullable = f.is_nullable() || (left_outer && side == JoinSide::Right);
+                Field::new(f.name(), f.data_type().clone(), nullable)
             })
             .collect();
         fields.push(Field::new(
@@ -339,6 +372,44 @@ impl IncrementalJoinOperator {
         Ok(vec![batch])
     }
 
+    /// Project a left row with every right output column NULL-padded (LEFT join, unmatched row).
+    fn nullpad_row(&self, left_row: &[ScalarValue]) -> Result<Vec<ScalarValue>, DbError> {
+        let resolved = self
+            .out_cols
+            .as_ref()
+            .ok_or_else(|| DbError::Pipeline("incremental join: null-pad unresolved".into()))?;
+        let r = self.right_info.as_ref().ok_or_else(|| {
+            DbError::Pipeline("incremental join: null-pad needs right schema".into())
+        })?;
+        resolved
+            .iter()
+            .map(|&(side, pos)| match side {
+                JoinSide::Left => Ok(left_row[pos].clone()),
+                JoinSide::Right => {
+                    let dt = r.schema.field(r.plain_cols[pos]).data_type();
+                    ScalarValue::try_from(dt)
+                        .map_err(|e| DbError::Pipeline(format!("incremental join: null-pad: {e}")))
+                }
+            })
+            .collect()
+    }
+
+    /// LEFT join catch-up: the first time the right side is observed, emit a NULL-padded row for
+    /// every resident left row whose key has no right match (the join MV had emitted nothing while
+    /// the right schema was unknown).
+    fn emit_left_catchup(&self, out: &mut Vec<(Vec<ScalarValue>, i64)>) -> Result<(), DbError> {
+        let Some(l) = self.left_info.as_ref() else {
+            return Ok(());
+        };
+        for (row, mult) in self.left_state.snapshot() {
+            let key: Vec<ScalarValue> = l.key_plain_pos.iter().map(|&p| row[p].clone()).collect();
+            if !self.right_state.contains_key(&key) {
+                out.push((self.nullpad_row(&row)?, mult));
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize one side's Z-set as a `__weight` changelog batch (weight column carries the stored
     /// multiplicity), keyed by the side's live input schema. `None` if the side is empty/unresolved.
     fn side_checkpoint_bytes(&self, side: JoinSide) -> Result<Option<Vec<u8>>, DbError> {
@@ -391,7 +462,8 @@ impl IncrementalJoinOperator {
             JoinSide::Right => &self.right_keys,
         };
         let info = SideInfo::resolve(&first.schema(), keys)?;
-        let rows = Self::parse_side(&info, &batches)?;
+        let skip_null = side == JoinSide::Right || !self.left_outer;
+        let rows = Self::parse_side(&info, &batches, skip_null)?;
         let store = match side {
             JoinSide::Left => &mut self.left_state,
             JoinSide::Right => &mut self.right_state,
@@ -463,6 +535,7 @@ impl GraphOperator for IncrementalJoinOperator {
         let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
 
+        let right_was_seen = self.right_info.is_some();
         if self.left_info.is_none() {
             if let Some(b) = left_batches.first() {
                 self.left_info = Some(SideInfo::resolve(&b.schema(), &self.left_keys)?);
@@ -474,18 +547,34 @@ impl GraphOperator for IncrementalJoinOperator {
             }
         }
         self.resolve_output()?;
+        // First time the right schema is known: a LEFT join must back-fill NULL-padded rows for the
+        // left state accumulated while it was unknown (the join MV emitted nothing until now).
+        let first_right = self.left_outer && !right_was_seen && self.right_info.is_some();
 
+        // A LEFT join keeps NULL-key left rows (they NULL-pad); the right side always drops them.
         let delta_a = match &self.left_info {
-            Some(info) => Self::parse_side(info, left_batches)?,
+            Some(info) => Self::parse_side(info, left_batches, !self.left_outer)?,
             None => Vec::new(),
         };
         let delta_b = match &self.right_info {
-            Some(info) => Self::parse_side(info, right_batches)?,
+            Some(info) => Self::parse_side(info, right_batches, true)?,
             None => Vec::new(),
         };
-        if delta_a.is_empty() && delta_b.is_empty() {
+        if delta_a.is_empty() && delta_b.is_empty() && !first_right {
             return Ok(Vec::new());
         }
+
+        // Right match presence per δB key BEFORE applying δB (for LEFT-join NULL-pad transitions).
+        let presence_old: FxHashMap<Vec<ScalarValue>, bool> = if self.left_outer && !first_right {
+            let mut m = FxHashMap::default();
+            for d in &delta_b {
+                m.entry(d.key.clone())
+                    .or_insert_with(|| self.right_state.contains_key(&d.key));
+            }
+            m
+        } else {
+            FxHashMap::default()
+        };
 
         let mut out: Vec<(Vec<ScalarValue>, i64)> = Vec::new();
         // term2 = A_old ⋈ δB (before any state mutation), then advance B, then term1 = δA ⋈ B_new.
@@ -493,7 +582,33 @@ impl GraphOperator for IncrementalJoinOperator {
         for d in &delta_b {
             self.right_state.upsert(&d.key, &d.row, d.weight);
         }
+
+        if self.left_outer {
+            if first_right {
+                self.emit_left_catchup(&mut out)?;
+            } else {
+                // A right key flipping empty↔non-empty retracts/re-emits the NULL-pad of every
+                // resident left row at that key (A_old — δA not yet applied).
+                for (key, &was_present) in &presence_old {
+                    let now_present = self.right_state.contains_key(key);
+                    if was_present != now_present {
+                        let sign = if now_present { -1 } else { 1 };
+                        for (a_row, wa) in self.left_state.get(key) {
+                            out.push((self.nullpad_row(&a_row)?, sign * wa));
+                        }
+                    }
+                }
+            }
+        }
+
         self.join_term(&delta_a, JoinSide::Left, &mut out);
+        if self.left_outer && self.right_info.is_some() {
+            for d in &delta_a {
+                if !self.right_state.contains_key(&d.key) {
+                    out.push((self.nullpad_row(&d.row)?, d.weight));
+                }
+            }
+        }
         for d in &delta_a {
             self.left_state.upsert(&d.key, &d.row, d.weight);
         }
@@ -531,6 +646,7 @@ impl GraphOperator for IncrementalJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
 
@@ -620,6 +736,38 @@ mod tests {
                     column: "vb".into(),
                 },
             ],
+            left_outer: false,
+        }
+    }
+
+    fn left_config() -> IncrementalJoinConfig {
+        IncrementalJoinConfig {
+            left_outer: true,
+            ..config()
+        }
+    }
+
+    // Net the emitted (k, va, vb, weight) deltas into a snapshot multiset, treating a NULL right
+    // value (LEFT-join pad) as the sentinel i64::MIN.
+    fn net_into_nullable(snapshot: &mut BTreeMap<(i64, i64, i64), i64>, batches: &[RecordBatch]) {
+        for b in batches {
+            let c = |i: usize| {
+                b.column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone()
+            };
+            let (k, va, vb, w) = (c(0), c(1), c(2), c(3));
+            for r in 0..b.num_rows() {
+                let vb_val = if vb.is_null(r) { i64::MIN } else { vb.value(r) };
+                let key = (k.value(r), va.value(r), vb_val);
+                let e = snapshot.entry(key).or_insert(0);
+                *e += w.value(r);
+                if *e == 0 {
+                    snapshot.remove(&key);
+                }
+            }
         }
     }
 
@@ -723,6 +871,149 @@ mod tests {
         net_into(&mut snap, &out);
         assert_eq!(snap.len(), 1);
         assert_eq!(snap.get(&(1, 15, 200)), Some(&1));
+    }
+
+    // LEFT join: unmatched left rows are NULL-padded (NULL right value = i64::MIN sentinel here),
+    // a first right match (0→1) retracts the pad and emits the inner row, and the last-match retract
+    // re-emits the pad.
+    #[tokio::test]
+    async fn left_outer_nullpad_emit_retract_reemit() {
+        const NULL: i64 = i64::MIN;
+        let mut op = IncrementalJoinOperator::new(left_config());
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        // Cycle 1: left k=1, right has only k=2 (so right schema is known, k=1 has no match).
+        let out = op
+            .process(
+                &[
+                    vec![left_batch(&[(1, 10, 1)])],
+                    vec![right_batch(&[(2, 200, 1)])],
+                ],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+        assert_eq!(
+            snap.get(&(1, 10, NULL)),
+            Some(&1),
+            "unmatched left NULL-padded"
+        );
+        assert_eq!(snap.len(), 1);
+
+        // Cycle 2: right k=1 arrives (0→1). Pad retracts, inner (1,10,100) appears.
+        let out = op
+            .process(&[vec![], vec![right_batch(&[(1, 100, 1)])]], &[0, 0])
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+        assert_eq!(
+            snap.get(&(1, 10, NULL)),
+            None,
+            "pad retracted on first match"
+        );
+        assert_eq!(snap.get(&(1, 10, 100)), Some(&1));
+        assert_eq!(snap.len(), 1);
+
+        // Cycle 3: right k=1 retracts (last match gone). Inner retracts, pad re-emitted.
+        let out = op
+            .process(&[vec![], vec![right_batch(&[(1, 100, -1)])]], &[0, 0])
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+        assert_eq!(snap.get(&(1, 10, 100)), None, "inner retracted");
+        assert_eq!(snap.get(&(1, 10, NULL)), Some(&1), "pad re-emitted");
+        assert_eq!(snap.len(), 1);
+    }
+
+    // LEFT join catch-up: left rows accumulate before the right side is ever seen; once the first
+    // right batch arrives, the back-fill emits their NULL-pad.
+    #[tokio::test]
+    async fn left_outer_catchup_on_first_right() {
+        const NULL: i64 = i64::MIN;
+        let mut op = IncrementalJoinOperator::new(left_config());
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        // Cycles 1-2: only left data; right never seen → no output yet.
+        let out = op
+            .process(&[vec![left_batch(&[(1, 10, 1)])], vec![]], &[0, 0])
+            .await
+            .unwrap();
+        assert!(
+            out.iter().all(|b| b.num_rows() == 0),
+            "no output before right seen"
+        );
+        let out = op
+            .process(&[vec![left_batch(&[(2, 20, 1)])], vec![]], &[0, 0])
+            .await
+            .unwrap();
+        assert!(out.iter().all(|b| b.num_rows() == 0));
+
+        // Cycle 3: right k=2 arrives. Catch-up pads k=1 (no match); k=2 joins inner.
+        let out = op
+            .process(&[vec![], vec![right_batch(&[(2, 200, 1)])]], &[0, 0])
+            .await
+            .unwrap();
+        net_into_nullable(&mut snap, &out);
+        assert_eq!(
+            snap.get(&(1, 10, NULL)),
+            Some(&1),
+            "k=1 caught up as NULL-pad"
+        );
+        assert_eq!(snap.get(&(2, 20, 200)), Some(&1), "k=2 joined inner");
+        assert_eq!(snap.len(), 2);
+    }
+
+    // A LEFT join must NULL-pad a left row with a NULL join key (it can never match), not drop it.
+    #[tokio::test]
+    async fn left_outer_nullpads_left_row_with_null_key() {
+        let nullable_left = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("va", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let left = RecordBatch::try_new(
+            nullable_left,
+            vec![
+                Arc::new(Int64Array::from(vec![None, Some(1)])), // k = NULL, 1
+                Arc::new(Int64Array::from(vec![10, 11])),        // va
+                Arc::new(Int64Array::from(vec![1, 1])),
+            ],
+        )
+        .unwrap();
+        let right = right_batch(&[(1, 100, 1)]);
+
+        let mut op = IncrementalJoinOperator::new(left_config());
+        let out = op
+            .process(&[vec![left], vec![right]], &[0, 0])
+            .await
+            .unwrap();
+
+        let mut rows: Vec<(i64, bool)> = Vec::new();
+        for b in &out {
+            let col = |i: usize| {
+                b.column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone()
+            };
+            let (va, vb, w) = (col(1), col(2), col(3));
+            for r in 0..b.num_rows() {
+                if w.value(r) > 0 {
+                    rows.push((va.value(r), vb.is_null(r)));
+                }
+            }
+        }
+        rows.sort_unstable();
+        assert!(
+            rows.contains(&(10, true)),
+            "NULL-key left row NULL-padded (va=10, vb NULL), not dropped"
+        );
+        assert!(
+            rows.contains(&(11, false)),
+            "k=1 left row joins inner (va=11)"
+        );
     }
 
     #[tokio::test]

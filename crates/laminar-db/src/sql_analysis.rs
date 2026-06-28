@@ -870,12 +870,15 @@ pub(crate) struct IncrementalJoinConfig {
     pub left_keys: Vec<String>,
     pub right_keys: Vec<String>,
     pub projection: Vec<JoinProjItem>,
+    /// `true` for `LEFT JOIN` (NULL-pad unmatched left rows), `false` for inner.
+    pub left_outer: bool,
 }
 
-/// Detect a single inner equi-join whose BOTH sides are incremental MVs (changelogs) — A1-emit
-/// Stage 3b. Returns the join keys (left/right ON columns) and a resolved output projection. `None`
-/// for changelog⋈static (that is Stage 3a enrich), changelog⋈source, LEFT/outer joins (Slice 2),
-/// asof/temporal/time-bound joins, aggregates/group-by, a WHERE clause, or expression projections.
+/// Detect a single INNER or LEFT equi-join whose BOTH sides are incremental MVs (changelogs) —
+/// A1-emit Stage 3b. Returns the join keys (left/right ON columns), the output projection, and
+/// whether it is a LEFT outer join. `None` for changelog⋈static (Stage 3a enrich), changelog⋈source,
+/// RIGHT/FULL joins, self-joins, asof/temporal/time-bound joins, aggregates/group-by, a WHERE clause,
+/// wildcards, expression projections, or a non-pure-equi ON clause.
 pub(crate) fn detect_changelog_incremental_join(
     sql: &str,
     incremental_mvs: &FxHashSet<String>,
@@ -922,13 +925,15 @@ pub(crate) fn detect_changelog_incremental_join(
     if !incremental_mvs.contains(&j.left_table) || !incremental_mvs.contains(&j.right_table) {
         return None;
     }
-    // A self-join feeds one changelog into both ports — out of Slice-1 scope.
+    // A self-join feeds one changelog into both ports — out of scope.
     if j.left_table == j.right_table {
         return None;
     }
-    if !matches!(j.join_type, JoinType::Inner) {
-        return None; // LEFT/outer is Slice 2.
-    }
+    let left_outer = match j.join_type {
+        JoinType::Inner => false,
+        JoinType::Left => true,
+        _ => return None, // RIGHT/FULL are later slices.
+    };
     // The ON clause must be a pure conjunction of column equalities — a non-equi residual (e.g.
     // `AND a.x > b.y`) is silently dropped by the key extractor, which would emit unfiltered rows.
     if !single_join_on_is_pure_equi(select) {
@@ -980,6 +985,7 @@ pub(crate) fn detect_changelog_incremental_join(
         left_keys,
         right_keys,
         projection,
+        left_outer,
     })
 }
 
@@ -995,8 +1001,10 @@ fn single_join_on_is_pure_equi(select: &sqlparser::ast::Select) -> bool {
     if twj.joins.len() != 1 {
         return false;
     }
-    let (JoinOperator::Inner(constraint) | JoinOperator::Join(constraint)) =
-        &twj.joins[0].join_operator
+    let (JoinOperator::Inner(constraint)
+    | JoinOperator::Join(constraint)
+    | JoinOperator::Left(constraint)
+    | JoinOperator::LeftOuter(constraint)) = &twj.joins[0].join_operator
     else {
         return false;
     };

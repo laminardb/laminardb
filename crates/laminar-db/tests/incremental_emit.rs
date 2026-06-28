@@ -446,10 +446,58 @@ async fn incremental_join_survives_checkpoint_restart() {
     }
 }
 
-/// Stage 3b guard: an inner `changelog ⋈ changelog` join is allowed; a LEFT/outer join (a later
-/// slice) and a `changelog ⋈ source` join stay rejected.
+/// Stage 3b: a LEFT outer `changelog ⋈ changelog` join NULL-pads unmatched left rows and tracks
+/// the pad↔inner transition as right matches come and go.
 #[tokio::test]
-async fn incremental_join_guard_allows_inner_rejects_outer_and_source() {
+async fn left_outer_incremental_join_nullpads_unmatched_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS total FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS wtotal FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW joined AS \
+         SELECT a.k, a.total, b.wtotal FROM agg_a a LEFT JOIN agg_b b ON a.k = b.k",
+    )
+    .await
+    .expect("inner+LEFT changelog join allowed (Stage 3b Slice 2)");
+    db.start().await.unwrap();
+
+    let sa = db.source_untyped("ev_a").unwrap();
+    let sb = db.source_untyped("ev_b").unwrap();
+    // Left has k=1,2; right matches only k=1. k=2 must show NULL wtotal.
+    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    sb.push_arrow(batch(&[1], &[100])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // wtotal is nullable; COALESCE the NULL to -1 to read it as an i64 column.
+    assert_eq!(
+        read_query(&db, "SELECT k, total, COALESCE(wtotal, -1) FROM joined", 3).await,
+        vec![vec![1, 10, 100], vec![2, 20, -1]]
+    );
+
+    // Right k=2 arrives → its NULL-pad retracts, the inner row appears.
+    sb.push_arrow(batch(&[2], &[200])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        read_query(&db, "SELECT k, total, COALESCE(wtotal, -1) FROM joined", 3).await,
+        vec![vec![1, 10, 100], vec![2, 20, 200]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// Stage 3b guard: inner and LEFT `changelog ⋈ changelog` joins are allowed; a RIGHT/outer join (a
+/// later slice) and a `changelog ⋈ source` join stay rejected.
+#[tokio::test]
+async fn incremental_join_guard_allows_inner_left_rejects_right_and_source() {
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
@@ -471,14 +519,23 @@ async fn incremental_join_guard_allows_inner_rejects_outer_and_source() {
     )
     .await
     .expect("inner changelog join allowed");
+    db.execute(
+        "CREATE MATERIALIZED VIEW jl AS \
+         SELECT a.k, a.total, b.wtotal FROM agg_a a LEFT JOIN agg_b b ON a.k = b.k",
+    )
+    .await
+    .expect("LEFT changelog join allowed (Slice 2)");
 
-    let outer = db
+    let right = db
         .execute(
-            "CREATE MATERIALIZED VIEW jl AS \
-             SELECT a.k FROM agg_a a LEFT JOIN agg_b b ON a.k = b.k",
+            "CREATE MATERIALIZED VIEW jr AS \
+             SELECT a.k FROM agg_a a RIGHT JOIN agg_b b ON a.k = b.k",
         )
         .await;
-    assert!(outer.is_err(), "LEFT join over changelogs is a later slice");
+    assert!(
+        right.is_err(),
+        "RIGHT join over changelogs is a later slice"
+    );
 
     let src = db
         .execute(
