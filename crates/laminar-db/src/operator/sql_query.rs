@@ -1466,6 +1466,13 @@ impl GraphOperator for SqlQueryOperator {
         std::mem::take(&mut self.pending_cold_rehydrate)
     }
 
+    #[cfg(feature = "state-tier")]
+    fn has_pending_promotion(&self) -> bool {
+        self.promotion
+            .as_ref()
+            .is_some_and(AggPromotion::has_pending)
+    }
+
     #[cfg(feature = "cluster")]
     fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
         let cp: AggStateCheckpoint =

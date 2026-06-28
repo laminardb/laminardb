@@ -655,6 +655,7 @@ fn embedded_kill9_group_demotion_soak() {
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
     let mut kills = 0u64;
     let mut round = 0u64;
+    let mut max_resident = 0.0f64;
     while Instant::now() < deadline {
         round += 1;
         if kills < max_kills {
@@ -682,6 +683,7 @@ fn embedded_kill9_group_demotion_soak() {
             node.metric("laminardb_state_tier_bytes").unwrap_or(0.0),
             node.metric("laminardb_state_bytes").unwrap_or(0.0),
         );
+        max_resident = max_resident.max(node.metric("laminardb_state_bytes").unwrap_or(0.0));
     }
 
     let demotes = node
@@ -704,6 +706,20 @@ fn embedded_kill9_group_demotion_soak() {
         fetches > 0.0,
         "embedded: demoted groups never promoted across kills — recovery may have lost them: fetches={fetches}"
     );
+    // Bounded-RAM gate (opt-in): with high GROUPS and a small budget, group demotion must keep
+    // resident agg state from growing to the full key-space. Set LAMINAR_SOAK_MAX_RESIDENT_BYTES to
+    // assert a ceiling (meaningful only when GROUPS >> budget); otherwise just report it.
+    eprintln!("soak: max resident agg state across rounds: {max_resident} B");
+    if let Ok(v) = std::env::var("LAMINAR_SOAK_MAX_RESIDENT_BYTES") {
+        let ceiling: f64 = v
+            .parse()
+            .expect("LAMINAR_SOAK_MAX_RESIDENT_BYTES must be a number");
+        assert!(
+            max_resident <= ceiling,
+            "embedded: resident agg state {max_resident} B exceeded the {ceiling} B ceiling — \
+             group demotion is not bounding RAM"
+        );
+    }
     node.kill9();
 }
 

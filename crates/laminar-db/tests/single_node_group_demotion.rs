@@ -32,6 +32,16 @@ async fn open(
     state_dir: &std::path::Path,
     tier_dir: &std::path::Path,
 ) -> LaminarDB {
+    open_with(ckpt, state_dir, tier_dir, 2048, true).await
+}
+
+async fn open_with(
+    ckpt: &std::path::Path,
+    state_dir: &std::path::Path,
+    tier_dir: &std::path::Path,
+    budget_bytes: usize,
+    group_demotion: bool,
+) -> LaminarDB {
     let store = Arc::new(LocalFileSystem::new_with_prefix(state_dir).unwrap());
     let backend = Arc::new(ObjectStoreBackend::new(store, "node-0", VNODES));
     let registry = Arc::new(VnodeRegistry::new(VNODES));
@@ -47,8 +57,8 @@ async fn open(
         .state_backend(backend)
         .vnode_registry(registry)
         .state_tier_dir(tier_dir)
-        .state_memory_budget_bytes(2048) // tiny — forces group demotion
-        .state_tier_group_demotion(true)
+        .state_memory_budget_bytes(budget_bytes)
+        .state_tier_group_demotion(group_demotion)
         .build()
         .await
         .unwrap();
@@ -168,4 +178,81 @@ async fn single_node_group_demotion_survives_restart() {
         );
         db.shutdown().await.unwrap();
     }
+}
+
+/// Group demotion must not change aggregate VALUES: the same deterministic workload run with
+/// demotion ON (tiny budget → demote/promote cycles) must produce a per-group count map identical
+/// to the no-demotion oracle. This is the exact-value correctness check the kill-9 soaks omit (they
+/// assert only progress / demote-promote counters), now in a deterministic, runnable form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_demotion_matches_no_demotion_oracle() {
+    // Final count for key k: 4 for the first half (fed in the extra round), 3 for the second half.
+    async fn run(group_demotion: bool) -> (BTreeMap<i64, i64>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt");
+        let state_dir = dir.path().join("state");
+        let tier_dir = dir.path().join("tier");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // Tiny budget forces demotion; a large one keeps every group resident (the oracle).
+        let budget = if group_demotion { 2048 } else { 64 << 20 };
+        let db = open_with(&ckpt, &state_dir, &tier_dir, budget, group_demotion).await;
+        db.start().await.unwrap();
+        let source = db.source_untyped("events").unwrap();
+
+        // Three full rounds over all keys, with an idle gap so the demoting run sheds idle groups.
+        for _ in 0..3 {
+            source
+                .push_arrow(key_batch(&(0..KEYS).collect::<Vec<_>>()))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        // Checkpoint marks groups clean (a prerequisite for demotion), then wait for it to fire.
+        assert!(db.checkpoint().await.unwrap().success);
+        if group_demotion {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while db.tier_metrics().demote_total == 0 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                assert!(Instant::now() < deadline, "group demotion never fired");
+            }
+        }
+        // Extra round over the first half — re-touching demoted groups promotes them back (async
+        // fetch-on-access, then the deferred batch re-processes) and bumps their count. Poll until
+        // key 0 settles at 4; if promotion genuinely lost the increment the deadline lapses and the
+        // diff below fails loudly.
+        source
+            .push_arrow(key_batch(&(0..KEYS / 2).collect::<Vec<_>>()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut map = read_counts(&db).await;
+        while map.get(&0) != Some(&4) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            map = read_counts(&db).await;
+        }
+        let demotes = db.tier_metrics().demote_total;
+        db.shutdown().await.unwrap();
+        (map, demotes)
+    }
+
+    let (oracle, _) = run(false).await;
+    let (demoted, demotes) = run(true).await;
+
+    assert!(
+        demotes > 0,
+        "demotion never fired — the differential would not be exercising the demote/promote path"
+    );
+    assert_eq!(
+        oracle.len() as i64,
+        KEYS,
+        "oracle should hold every key (sanity)"
+    );
+    assert_eq!(oracle.get(&0), Some(&4), "first-half key counted 4 times");
+    assert_eq!(
+        oracle.get(&(KEYS - 1)),
+        Some(&3),
+        "second-half key counted 3 times"
+    );
+    assert_eq!(
+        demoted, oracle,
+        "group demotion changed aggregate values vs the no-demotion oracle"
+    );
 }

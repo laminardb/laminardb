@@ -2018,6 +2018,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return true;
             }
         }
+        // Single-node: keep cycling while any operator has promotion work pending (a batch deferred
+        // until its cold-group fetch resolves) so it drains even when the source goes quiet.
+        #[cfg(feature = "state-tier")]
+        if self.graph.has_pending_promotion() {
+            return true;
+        }
         self.graph.has_pending_input()
     }
 

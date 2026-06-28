@@ -146,6 +146,13 @@ pub(crate) trait GraphOperator: Send {
     fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// Promotion work pending (fetched cold groups/vnodes awaiting apply, or batches deferred until
+    /// a fetch resolves) that needs a cycle to drain even with no new input. Default `false`.
+    #[cfg(feature = "state-tier")]
+    fn has_pending_promotion(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -618,6 +625,15 @@ impl OperatorGraph {
         self.input_bufs.iter().enumerate().any(|(id, ports)| {
             ports.iter().any(|port| !port.is_empty()) && !self.source_node_ids.contains(&id)
         })
+    }
+
+    /// Any operator has promotion work pending — the coordinator must keep cycling to drain it even
+    /// when no input is arriving (single-node; cluster already cycles every idle tick).
+    #[cfg(feature = "state-tier")]
+    pub fn has_pending_promotion(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| !n.removed && n.operator.has_pending_promotion())
     }
 
     /// Estimated state bytes per operator; cheap (operators maintain a counter).
