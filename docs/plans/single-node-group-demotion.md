@@ -1,10 +1,13 @@
 # Single-node v2 group demotion — enablement + restart durability
 
-Status: **IMPLEMENTED 2026-06-28 (`7c9781c2`), default-OFF** — cold-only artifact recovery built + restart
-integration test green (`single_node_group_demotion_survives_restart`); 839 state-tier lib tests + the
-vnode-demotion test pass; clippy/fmt clean on state-tier + cluster. **Single-node kill-9 soak is the
-remaining acceptance gate before any default-ON.** Branch `feat/shuffle-barrier-after-kill-recovery`.
-Goal (DONE): make v2 group-granular demotion fire AND survive restart **single-node** (no controller).
+Status: **DONE 2026-06-28.** Cold-only artifact recovery (`7c9781c2`) + restart integration test
+(`single_node_group_demotion_survives_restart`); embedded kill-9 soak GREEN (`02ab972a` —
+`embedded_kill9_group_demotion_soak`, 39 rounds/4 kills, cold-only partials rehydrate under SIGKILL); and
+the topology-scoped default flip (`c7259d94` — embedded server defaults group demotion ON, cluster stays
+OFF/vnode pending the shuffle-barrier fix). 839 state-tier lib + 47 server config + vnode-demotion tests
+pass; clippy/fmt clean on state-tier + cluster + non-state-tier. Branch
+`feat/shuffle-barrier-after-kill-recovery`. Goal (DONE): v2 group-granular demotion fires, survives kill-9,
+and is the default for embedded single-node.
 
 ## Why it doesn't work today (grounded)
 
