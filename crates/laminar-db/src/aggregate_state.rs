@@ -4374,6 +4374,80 @@ mod tests {
         assert_eq!(touched[0].1, 0, "the global group maps to vnode 0");
     }
 
+    /// A global (no-GROUP-BY) changelog aggregate with delta checkpoints must capture without
+    /// panicking on the empty group key (`row_to_scalar_key_with_types` on the global sentinel),
+    /// and the captured slice must restore to the same value.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn global_changelog_delta_checkpoint_roundtrips() {
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(ctx, "SELECT SUM(value) as total FROM events", true)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let pre = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_1",
+            DataType::Float64,
+            true,
+        )]));
+        let feed = |state: &mut IncrementalAggState, vals: Vec<f64>, ts: i64| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&pre),
+                vec![Arc::new(arrow::array::Float64Array::from(vals))],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        };
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+        feed(&mut state, vec![1.0, 2.0, 3.0], 1000);
+        state.emit().unwrap();
+
+        // Before the fix this panicked: the empty global key hit convert_rows on a 0-field converter.
+        let caps = state.checkpoint_delta_by_vnode(1, 8).unwrap();
+        assert!(
+            caps.contains_key(&0),
+            "the global group is captured under vnode 0"
+        );
+
+        // Restore into a fresh aggregate; the single global group must total 6.0.
+        let mut restored = agg(&ctx).await;
+        match caps.get(&0).expect("vnode-0 capture") {
+            VnodeCapture::Full(cp) => {
+                restored.merge_groups(cp).unwrap();
+            }
+            VnodeCapture::Delta(d) => {
+                restored.apply_delta(d).unwrap();
+            }
+        }
+        let value = restored
+            .groups
+            .get_mut(&global_aggregate_key())
+            .expect("global group restored")
+            .accs[0]
+            .evaluate()
+            .unwrap();
+        assert_eq!(value, ScalarValue::Float64(Some(6.0)));
+    }
+
     /// v2 Slice 4: a vnode with a demoted group must DEFER its FULL re-base (emit a DELTA) so the
     /// re-base never drops the cold group; once the group is promoted back, the next capture
     /// re-bases to a FULL again (which now includes it).

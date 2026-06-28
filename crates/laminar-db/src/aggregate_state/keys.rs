@@ -13,6 +13,12 @@ pub(crate) fn row_to_scalar_key_with_types(
     row_key: &arrow::row::OwnedRow,
     group_types: &[DataType],
 ) -> Result<Vec<ScalarValue>, DbError> {
+    // Global aggregate (no GROUP BY): the converter has zero fields and the key is the empty
+    // sentinel — there is nothing to decode, and `convert_rows` would panic on the field mismatch.
+    // `scalar_key_to_owned_row` reverses an empty key back to `global_aggregate_key()`.
+    if group_types.is_empty() {
+        return Ok(Vec::new());
+    }
     let row_as_cols = converter
         .convert_rows(std::iter::once(row_key.row()))
         .map_err(|e| DbError::Pipeline(format!("row→key: {e}")))?;
