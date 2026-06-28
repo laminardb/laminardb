@@ -294,6 +294,19 @@ impl LaminarDB {
         let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
             .rehydrate(&owned)
             .await;
+        // A per-vnode partial read can fail (transient object-store error) while report.epoch is
+        // still Some; `restored` then holds only the successes. Starting anyway would silently run
+        // the unreadable owned vnodes with EMPTY aggregate state while their source offsets are
+        // already staged — a permanent gap. Fail fast (the supervisor retries), mirroring
+        // rehydrate_cold_vnodes' lost>0 guard.
+        if report.has_errors() {
+            return Err(DbError::Checkpoint(
+                "[LDB-6032] one or more owned-vnode partials were unreadable on delta-primary \
+                 recovery (see [LDB-6051] above) — refusing to start with staged source offsets \
+                 and lost aggregate state"
+                    .to_string(),
+            ));
+        }
         if let Some(epoch) = report.epoch {
             let mut staged = self.rehydrated_vnode_state.lock();
             for (vnode, chain) in report.restored {
@@ -691,8 +704,10 @@ impl LaminarDB {
                 })
                 .collect()
         };
-        let reference_table_names: rustc_hash::FxHashSet<String> =
-            lookup_tables.iter().map(|(n, _)| n.clone()).collect();
+        // Record only tables that actually registered into `ctx`, so the graph's reference-table
+        // set can't name a table the DataFusion context is missing (enrich detection would then
+        // build SQL against a non-existent table).
+        let mut reference_table_names = rustc_hash::FxHashSet::default();
         for (name, schema) in lookup_tables {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 name.clone(),
@@ -705,6 +720,8 @@ impl LaminarDB {
                     error = %e,
                     "failed to register lookup table in operator graph context"
                 );
+            } else {
+                reference_table_names.insert(name);
             }
         }
 

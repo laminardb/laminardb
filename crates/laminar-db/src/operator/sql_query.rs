@@ -1382,13 +1382,17 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "state-tier")]
-    async fn demote_cold_groups(&mut self, target_bytes: usize, vnode_count: u32) -> usize {
+    async fn demote_cold_groups(
+        &mut self,
+        target_bytes: usize,
+        vnode_count: u32,
+    ) -> (usize, usize) {
         let Some(tier) = self.promotion.as_ref().map(|p| p.tier.clone()) else {
-            return 0;
+            return (0, 0);
         };
         let candidates = match self.state {
             QueryState::Agg(ref agg) => agg.demotable_groups(vnode_count, 256),
-            _ => return 0,
+            _ => return (0, 0),
         };
         let mut freed = 0usize;
         let mut count = 0usize;
@@ -1432,7 +1436,7 @@ impl GraphOperator for SqlQueryOperator {
             freed += blen;
             count += 1;
         }
-        count
+        (count, freed)
     }
 
     #[cfg(feature = "state-tier")]

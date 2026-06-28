@@ -237,6 +237,11 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     if config.checkpoint.max_in_flight_epochs == Some(0) {
         errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
     }
+    // 0 makes claim_restart_slot prune every prior timestamp, so the restart-rate budget
+    // never trips — an unbounded auto-restart loop. None keeps the default window.
+    if config.supervision.window_secs == Some(0) {
+        errors.push("supervision.window_secs must be > 0".to_string());
+    }
 
     validate_ai(config, &mut errors);
     validate_cluster_tls(config, &mut errors);

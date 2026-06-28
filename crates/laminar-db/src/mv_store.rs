@@ -57,6 +57,12 @@ struct UpsertState {
     approx_bytes: usize,
 }
 
+/// A resolved upsert row mutation, staged so a changelog batch applies all-or-nothing.
+enum Mutation {
+    Insert(OwnedRow, Vec<ScalarValue>),
+    Remove(OwnedRow),
+}
+
 impl UpsertState {
     fn new(schema: &SchemaRef, key_cols: &[usize]) -> Result<Self, DbError> {
         let sort_fields: Vec<SortField> = key_cols
@@ -104,6 +110,11 @@ impl UpsertState {
             .filter(|&c| c != weight_idx)
             .collect();
 
+        // Resolve every row's mutation first — `ScalarValue::try_from_array` is the only fallible
+        // step, so extracting it all before touching `rows`/`approx_bytes` makes the batch
+        // all-or-nothing. Otherwise a mid-batch failure could leave a retract applied without its
+        // paired insert, silently diverging the snapshot from the changelog.
+        let mut staged = Vec::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let key = keys.row(row_idx).owned();
             if weights.value(row_idx) > 0 {
@@ -114,17 +125,30 @@ impl UpsertState {
                             .map_err(|e| DbError::Storage(format!("upsert MV scalar: {e}")))?,
                     );
                 }
-                let added: usize = vals.iter().map(ScalarValue::size).sum();
-                if let Some(old) = self.rows.insert(key, vals) {
-                    self.approx_bytes = self
-                        .approx_bytes
-                        .saturating_sub(old.iter().map(ScalarValue::size).sum());
+                staged.push(Mutation::Insert(key, vals));
+            } else {
+                staged.push(Mutation::Remove(key));
+            }
+        }
+        // All rows validated — apply in order (preserves net retract-before-insert per key).
+        for m in staged {
+            match m {
+                Mutation::Insert(key, vals) => {
+                    let added: usize = vals.iter().map(ScalarValue::size).sum();
+                    if let Some(old) = self.rows.insert(key, vals) {
+                        self.approx_bytes = self
+                            .approx_bytes
+                            .saturating_sub(old.iter().map(ScalarValue::size).sum());
+                    }
+                    self.approx_bytes += added;
                 }
-                self.approx_bytes += added;
-            } else if let Some(old) = self.rows.remove(&key) {
-                self.approx_bytes = self
-                    .approx_bytes
-                    .saturating_sub(old.iter().map(ScalarValue::size).sum());
+                Mutation::Remove(key) => {
+                    if let Some(old) = self.rows.remove(&key) {
+                        self.approx_bytes = self
+                            .approx_bytes
+                            .saturating_sub(old.iter().map(ScalarValue::size).sum());
+                    }
+                }
             }
         }
         Ok(())
@@ -299,7 +323,7 @@ impl MvEntry {
         })
     }
 
-    fn update(&mut self, batch: &RecordBatch) {
+    fn update(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         match &self.mode {
             MvStorageMode::Aggregate => {
                 self.batches.clear();
@@ -323,21 +347,20 @@ impl MvEntry {
             }
             MvStorageMode::Upsert { .. } => {
                 if let Some(up) = self.upsert.as_mut() {
-                    if let Err(e) = up.apply(batch) {
-                        tracing::error!(error = %e, "upsert MV update failed");
-                    }
+                    // apply() is atomic, so a failure leaves the prior snapshot intact; surface it
+                    // to the caller (which logs the MV name) instead of swallowing.
+                    up.apply(batch)?;
                     self.approx_bytes = up.approx_bytes;
                 }
             }
             MvStorageMode::Multiset => {
                 if let Some(ms) = self.multiset.as_mut() {
-                    if let Err(e) = ms.apply(batch) {
-                        tracing::error!(error = %e, "multiset MV update failed");
-                    }
+                    ms.apply(batch)?;
                     self.approx_bytes = ms.approx_bytes;
                 }
             }
         }
+        Ok(())
     }
 
     fn to_record_batch(&self) -> RecordBatch {
@@ -401,7 +424,13 @@ impl MvStore {
 
     pub fn update(&mut self, name: &str, batch: &RecordBatch) {
         if let Some(entry) = self.entries.get_mut(name) {
-            entry.update(batch);
+            if let Err(e) = entry.update(batch) {
+                tracing::error!(
+                    mv = %name,
+                    error = %e,
+                    "MV update failed — snapshot may diverge from the changelog"
+                );
+            }
         }
     }
 

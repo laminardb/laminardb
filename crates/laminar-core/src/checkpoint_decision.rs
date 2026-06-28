@@ -46,6 +46,15 @@ impl CheckpointDecisionStore {
         OsPath::from(format!("checkpoint-decisions/epoch={epoch}/commit"))
     }
 
+    /// Epoch segment of a `checkpoint-decisions/epoch={N}/...` marker, if it has that shape.
+    /// Callers keep their own parse-failure policy (`highest_committed` errors, `prune_before` skips).
+    fn epoch_segment(loc: &str) -> Option<&str> {
+        loc.strip_prefix("checkpoint-decisions/")?
+            .split('/')
+            .next()?
+            .strip_prefix("epoch=")
+    }
+
     /// CAS-create the commit marker for `epoch`. `Ok(true)` means our
     /// write landed; `Ok(false)` means someone else recorded first
     /// (idempotent — retries after commit are cheap no-ops).
@@ -95,16 +104,12 @@ impl CheckpointDecisionStore {
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| DecisionError::Io(e.to_string()))?;
             let loc = entry.location.as_ref();
-            let rest = loc.strip_prefix("checkpoint-decisions/").unwrap_or("");
-            let Some(seg) = rest.split('/').next() else {
-                continue;
-            };
-            let Some(n) = seg.strip_prefix("epoch=") else {
+            let Some(seg) = Self::epoch_segment(loc) else {
                 continue;
             };
             // A non-numeric epoch= marker is store corruption; skipping it would silently
             // report a lower committed epoch and rewind past committed data.
-            let epoch = n.parse::<u64>().map_err(|_| {
+            let epoch = seg.parse::<u64>().map_err(|_| {
                 DecisionError::Io(format!("malformed checkpoint-decision marker: {loc}"))
             })?;
             highest = Some(highest.map_or(epoch, |h: u64| h.max(epoch)));
@@ -128,14 +133,10 @@ impl CheckpointDecisionStore {
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| DecisionError::Io(e.to_string()))?;
             let loc = entry.location.as_ref();
-            let rest = loc.strip_prefix("checkpoint-decisions/").unwrap_or("");
-            let Some(seg) = rest.split('/').next() else {
+            let Some(seg) = Self::epoch_segment(loc) else {
                 continue;
             };
-            let Some(n) = seg.strip_prefix("epoch=") else {
-                continue;
-            };
-            let Ok(epoch) = n.parse::<u64>() else {
+            let Ok(epoch) = seg.parse::<u64>() else {
                 tracing::warn!(
                     marker = loc,
                     "skipping malformed checkpoint-decision marker"

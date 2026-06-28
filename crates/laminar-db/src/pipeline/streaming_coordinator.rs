@@ -716,56 +716,87 @@ impl StreamingCoordinator {
             callback.tick_idle_watermark();
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
-                // Drain runs only on a graceful stop (`fault.is_none()` above), so a per-domain
-                // commit here needs no EO fault branch.
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(out) => {
-                        self.commit_pending_offsets_except(&out.failed_sources);
-                        callback.update_mv_stores(&out.results);
-                        callback.push_to_streams(&out.results);
-                        callback.write_to_sinks(&out.results).await;
+                        // A domain can fault on drain-only data even during a graceful stop. EO /
+                        // coordinated recovery rewinds the whole pipeline, so don't partial-commit
+                        // siblings or persist partial state — fault and let recovery rewind.
+                        if out.any_failed && callback.fault_on_cycle_error() {
+                            self.discard_pending_offsets();
+                            fault = Some(
+                                "isolated domain fault during shutdown drain (exactly-once)"
+                                    .to_string(),
+                            );
+                        } else {
+                            self.commit_pending_offsets_except(&out.failed_sources);
+                            callback.update_mv_stores(&out.results);
+                            callback.push_to_streams(&out.results);
+                            callback.write_to_sinks(&out.results).await;
+                        }
                     }
                     Err(e) => {
                         self.discard_pending_offsets();
                         tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
+                        if callback.fault_on_cycle_error() {
+                            fault = Some(
+                                "SQL cycle error during shutdown drain (exactly-once)".to_string(),
+                            );
+                        }
                     }
                 }
             }
 
-            // Second drain: messages sent between the first drain and source task exit.
-            self.source_batches_buf.clear();
-            self.barrier_seen.clear();
-            self.discard_pending_offsets();
-            drain_barriers.clear();
-            while let Ok(msg) = self.rx.try_recv() {
-                self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
-            }
-            for (name, batch) in self.pending_watermark_batches.drain(..) {
-                callback.extract_watermark(&name, &batch);
-            }
-            callback.tick_idle_watermark();
-            if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
-                let wm = callback.current_watermark();
-                match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                    Ok(out) => {
-                        self.commit_pending_offsets_except(&out.failed_sources);
-                        callback.update_mv_stores(&out.results);
-                        callback.push_to_streams(&out.results);
-                        callback.write_to_sinks(&out.results).await;
-                    }
-                    Err(e) => {
-                        self.discard_pending_offsets();
-                        tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
+            // Second drain: messages sent between the first drain and source task exit. Skipped
+            // once a drain fault is pending — recovery will rewind the whole pipeline.
+            if fault.is_none() {
+                self.source_batches_buf.clear();
+                self.barrier_seen.clear();
+                self.discard_pending_offsets();
+                drain_barriers.clear();
+                while let Ok(msg) = self.rx.try_recv() {
+                    self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+                }
+                for (name, batch) in self.pending_watermark_batches.drain(..) {
+                    callback.extract_watermark(&name, &batch);
+                }
+                callback.tick_idle_watermark();
+                if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
+                    let wm = callback.current_watermark();
+                    match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                        Ok(out) => {
+                            if out.any_failed && callback.fault_on_cycle_error() {
+                                self.discard_pending_offsets();
+                                fault = Some(
+                                    "isolated domain fault during final drain (exactly-once)"
+                                        .to_string(),
+                                );
+                            } else {
+                                self.commit_pending_offsets_except(&out.failed_sources);
+                                callback.update_mv_stores(&out.results);
+                                callback.push_to_streams(&out.results);
+                                callback.write_to_sinks(&out.results).await;
+                            }
+                        }
+                        Err(e) => {
+                            self.discard_pending_offsets();
+                            tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
+                            if callback.fault_on_cycle_error() {
+                                fault = Some(
+                                    "SQL cycle error during final drain (exactly-once)".to_string(),
+                                );
+                            }
+                        }
                     }
                 }
             }
 
             // Run the final checkpoint before dropping source senders so the EpochCommitted
             // ack reaches the broker (Kafka group offsets, etc.). Skip it during a recovery
-            // stop — committing the open epoch would advance the committed epoch past N.
+            // stop or a pending drain fault — committing the open epoch would advance the
+            // committed epoch past N or persist partially-applied state as the new baseline.
             let checkpoint_enabled =
                 self.config.checkpoint_interval.is_some() && !callback.is_recovering();
-            if checkpoint_enabled {
+            if fault.is_none() && checkpoint_enabled {
                 let source_offsets = self.current_source_offsets();
                 if let Some(epoch) = callback
                     .maybe_checkpoint(true, source_offsets.clone())

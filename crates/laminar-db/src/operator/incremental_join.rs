@@ -261,7 +261,7 @@ impl IncrementalJoinOperator {
         let mut cols: Vec<(JoinSide, usize)> = Vec::new();
         for item in &self.projection {
             match item {
-                JoinProjItem::Qualified { side, column } => {
+                JoinProjItem::Qualified { side, column, .. } => {
                     let info = match side {
                         JoinSide::Left => l,
                         JoinSide::Right => r,
@@ -271,7 +271,7 @@ impl IncrementalJoinOperator {
                     })?;
                     cols.push((*side, pos));
                 }
-                JoinProjItem::Unqualified { column } => match (
+                JoinProjItem::Unqualified { column, .. } => match (
                     l.name_to_plain_pos.get(column),
                     r.name_to_plain_pos.get(column),
                 ) {
@@ -291,9 +291,11 @@ impl IncrementalJoinOperator {
             }
         }
         let left_outer = self.left_outer;
+        // `cols` is built 1:1 in projection order, so zip recovers each item's optional alias.
         let mut fields: Vec<Field> = cols
             .iter()
-            .map(|&(side, pos)| {
+            .zip(&self.projection)
+            .map(|(&(side, pos), item)| {
                 let info = match side {
                     JoinSide::Left => l,
                     JoinSide::Right => r,
@@ -301,7 +303,13 @@ impl IncrementalJoinOperator {
                 let f = info.schema.field(info.plain_cols[pos]);
                 // Right columns become NULL-able under a LEFT join (NULL-padded unmatched rows).
                 let nullable = f.is_nullable() || (left_outer && side == JoinSide::Right);
-                Field::new(f.name(), f.data_type().clone(), nullable)
+                // An explicit projection alias renames the output column; else keep the source name.
+                let alias = match item {
+                    JoinProjItem::Qualified { alias, .. }
+                    | JoinProjItem::Unqualified { alias, .. } => alias.as_deref(),
+                };
+                let name = alias.unwrap_or(f.name());
+                Field::new(name, f.data_type().clone(), nullable)
             })
             .collect();
         fields.push(Field::new(
@@ -732,14 +740,17 @@ mod tests {
                 JoinProjItem::Qualified {
                     side: JoinSide::Left,
                     column: "k".into(),
+                    alias: None,
                 },
                 JoinProjItem::Qualified {
                     side: JoinSide::Left,
                     column: "va".into(),
+                    alias: None,
                 },
                 JoinProjItem::Qualified {
                     side: JoinSide::Right,
                     column: "vb".into(),
+                    alias: None,
                 },
             ],
             left_outer: false,

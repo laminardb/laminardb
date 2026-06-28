@@ -86,37 +86,17 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                 vnode,
                 bytes,
                 reply,
-            } => {
-                let res = tokio::task::spawn_blocking(move || {
-                    store.put(operator.as_ref(), vnode, &bytes)
-                })
-                .await
-                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
-            }
+            } => dispatch(reply, move || store.put(operator.as_ref(), vnode, &bytes)).await,
             TierRequest::Fetch {
                 operator,
                 vnode,
                 reply,
-            } => {
-                let res = tokio::task::spawn_blocking(move || store.get(operator.as_ref(), vnode))
-                    .await
-                    .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
-            }
+            } => dispatch(reply, move || store.get(operator.as_ref(), vnode)).await,
             TierRequest::Drop {
                 operator,
                 vnode,
                 reply,
-            } => {
-                let res =
-                    tokio::task::spawn_blocking(move || store.remove(operator.as_ref(), vnode))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(DbError::Storage(format!("state tier worker: {e}")))
-                        });
-                let _ = reply.send(res);
-            }
+            } => dispatch(reply, move || store.remove(operator.as_ref(), vnode)).await,
             TierRequest::DemoteGroup {
                 operator,
                 vnode,
@@ -124,12 +104,10 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                 bytes,
                 reply,
             } => {
-                let res = tokio::task::spawn_blocking(move || {
+                dispatch(reply, move || {
                     store.put_group(operator.as_ref(), vnode, &group, &bytes)
                 })
-                .await
-                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
+                .await;
             }
             TierRequest::FetchGroup {
                 operator,
@@ -137,12 +115,10 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                 group,
                 reply,
             } => {
-                let res = tokio::task::spawn_blocking(move || {
+                dispatch(reply, move || {
                     store.get_group(operator.as_ref(), vnode, &group)
                 })
-                .await
-                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
+                .await;
             }
             TierRequest::DropGroup {
                 operator,
@@ -150,13 +126,22 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                 group,
                 reply,
             } => {
-                let res = tokio::task::spawn_blocking(move || {
+                dispatch(reply, move || {
                     store.remove_group(operator.as_ref(), vnode, &group)
                 })
-                .await
-                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
+                .await;
             }
         }
     }
+}
+
+/// Run one blocking tier op off the async worker and reply, mapping a join error uniformly.
+async fn dispatch<T: Send + 'static>(
+    reply: oneshot::Sender<Result<T, DbError>>,
+    f: impl FnOnce() -> Result<T, DbError> + Send + 'static,
+) {
+    let res = tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
+    let _ = reply.send(res);
 }

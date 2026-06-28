@@ -317,11 +317,16 @@ impl SinkTaskHandle {
         };
         // Abort (not detach) if the send never landed or the join times out, so a stuck
         // task can't outlive the next pipeline incarnation.
-        if !sent
-            || tokio::time::timeout(Duration::from_secs(15), &mut handle)
+        let joined = sent
+            && tokio::time::timeout(Duration::from_secs(15), &mut handle)
                 .await
-                .is_err()
-        {
+                .is_ok();
+        if !joined {
+            tracing::warn!(
+                sink = %self.name,
+                enqueued = sent,
+                "sink close timed out; aborting task (connector may be wedged)"
+            );
             handle.abort();
         }
     }

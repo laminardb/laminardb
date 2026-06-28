@@ -129,10 +129,15 @@ pub(crate) trait GraphOperator: Send {
     fn enable_group_delta_tracking(&mut self) {}
 
     /// Demote idle resident groups to the cold tier until `target_bytes` is freed (v2 group
-    /// granularity). Encodes + tier-writes + drops each off the compute path; returns the count.
+    /// granularity). Encodes + tier-writes + drops each off the compute path; returns
+    /// `(groups_demoted, bytes_freed)` so the caller can hold a budget across operators.
     #[cfg(feature = "state-tier")]
-    async fn demote_cold_groups(&mut self, _target_bytes: usize, _vnode_count: u32) -> usize {
-        0
+    async fn demote_cold_groups(
+        &mut self,
+        _target_bytes: usize,
+        _vnode_count: u32,
+    ) -> (usize, usize) {
+        (0, 0)
     }
 
     /// Vnodes this operator had demoted at the restored checkpoint; must be
@@ -2623,15 +2628,22 @@ impl OperatorGraph {
             return 0;
         };
         let mut total = 0u64;
+        // Hold the budget across operators: each gets only what's left, so the total freed never
+        // exceeds target_bytes. Iteration order sets demotion priority (earlier operators first).
+        let mut remaining = target_bytes;
         for node in &mut self.nodes {
             if node.removed {
                 continue;
             }
-            let n = node
+            if remaining == 0 {
+                break;
+            }
+            let (n, freed) = node
                 .operator
-                .demote_cold_groups(target_bytes, vnode_count)
+                .demote_cold_groups(remaining, vnode_count)
                 .await;
             total += n as u64;
+            remaining = remaining.saturating_sub(freed);
         }
         if total > 0 {
             if let Some(ref prom) = self.prom {

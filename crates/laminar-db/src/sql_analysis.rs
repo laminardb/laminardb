@@ -802,6 +802,23 @@ pub(crate) fn detect_changelog_enrich_query(
         _ => return None,
     };
 
+    // The ON clause is reconstructed from the extracted equi-keys only, so a non-equi residual
+    // (e.g. `AND a.x > b.y`) would be silently dropped and widen the join — reject it so general
+    // execution honors the residual instead.
+    if !single_join_on_is_pure_equi(select) {
+        return None;
+    }
+    // An aliasless left table is emitted as `... AS {name}`; a compound (schema-qualified) name
+    // would produce invalid SQL (`AS schema.tbl`). Reject so the user adds an explicit alias. Use
+    // the identifier part-count, not a `.` scan — a quoted `"a.b"` is a single legal identifier.
+    if j.left_alias.is_none()
+        && select.from.first().is_some_and(
+            |t| matches!(&t.relation, TableFactor::Table { name, .. } if name.0.len() > 1),
+        )
+    {
+        return None;
+    }
+
     let weight = laminar_core::changelog::WEIGHT_COLUMN;
     let lalias = j.left_alias.as_deref().unwrap_or(&j.left_table);
     let ralias = j.right_alias.as_deref().unwrap_or(&j.right_table);
@@ -855,10 +872,17 @@ pub(crate) enum JoinSide {
 /// side schemas at the operator.
 #[derive(Debug, Clone)]
 pub(crate) enum JoinProjItem {
-    /// `a.col` — a column on a known side.
-    Qualified { side: JoinSide, column: String },
-    /// `col` — resolved against both side schemas at the operator (ambiguous ⇒ error).
-    Unqualified { column: String },
+    /// `a.col [AS x]` — a column on a known side, plus its optional output alias.
+    Qualified {
+        side: JoinSide,
+        column: String,
+        alias: Option<String>,
+    },
+    /// `col [AS x]` — resolved against both side schemas at the operator (ambiguous ⇒ error).
+    Unqualified {
+        column: String,
+        alias: Option<String>,
+    },
 }
 
 /// A1-emit Stage 3b: a `<incremental MV> JOIN <incremental MV>` two-sided IVM join. The operator
@@ -963,16 +987,20 @@ pub(crate) fn detect_changelog_incremental_join(
     for item in &select.projection {
         // Slice 1: explicit column references only. Wildcards (which would yield a duplicate-named
         // MV schema for the shared join key) and expressions are later slices.
-        let proj = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => match expr {
-                Expr::Identifier(id) => JoinProjItem::Unqualified {
-                    column: id.value.clone(),
-                },
-                Expr::CompoundIdentifier(parts) if parts.len() == 2 => JoinProjItem::Qualified {
-                    side: side_of(&parts[0].value)?,
-                    column: parts[1].value.clone(),
-                },
-                _ => return None,
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            _ => return None,
+        };
+        let proj = match expr {
+            Expr::Identifier(id) => JoinProjItem::Unqualified {
+                column: id.value.clone(),
+                alias,
+            },
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => JoinProjItem::Qualified {
+                side: side_of(&parts[0].value)?,
+                column: parts[1].value.clone(),
+                alias,
             },
             _ => return None,
         };

@@ -29,7 +29,8 @@ pub(crate) struct OpDelta {
 pub(crate) struct VnodePartial {
     /// Sealed epoch, for audit.
     pub checkpoint_id: u64,
-    /// `(operator_name, vnode-slice bytes)`. Empty for references and deltas.
+    /// `(operator_name, vnode-slice bytes)`: FULL operator slices. Empty for references; for a
+    /// delta partial, any operators that re-based FULL this epoch (per-operator chains).
     pub operators: Vec<(String, Vec<u8>)>,
     /// `Some(epoch)` = parent link (reference base, or delta parent).
     pub base_epoch: Option<u64>,

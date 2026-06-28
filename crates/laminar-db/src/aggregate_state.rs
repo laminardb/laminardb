@@ -2436,8 +2436,20 @@ impl IncrementalAggState {
         batch: &RecordBatch,
         vnode_count: u32,
     ) -> Result<Vec<(arrow::row::OwnedRow, u32, Vec<u8>)>, DbError> {
-        if self.cold_groups.is_empty() || self.num_group_cols == 0 || batch.num_rows() == 0 {
+        if self.cold_groups.is_empty() || batch.num_rows() == 0 {
             return Ok(Vec::new());
+        }
+        // Global aggregate (no GROUP BY): the single group lives at the empty key (vnode 0). If it
+        // was demoted, defer this batch so `process_with_promotion` fetches it back — otherwise
+        // `process_batch_no_groups` rebuilds a fresh zeroed accumulator and double-counts on capture.
+        if self.num_group_cols == 0 {
+            let key = global_aggregate_key();
+            if !self.cold_groups.contains(&key) {
+                return Ok(Vec::new());
+            }
+            let vnode = self.delta_vnode_of(key.as_ref(), vnode_count);
+            let bytes = key.as_ref().to_vec();
+            return Ok(vec![(key, vnode, bytes)]);
         }
         let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
             .map(|i| Arc::clone(batch.column(i)))
@@ -4303,6 +4315,63 @@ mod tests {
             !state.can_demote_group(&dirty, V),
             "a dirty group must not be demotable",
         );
+    }
+
+    /// A group-demoted GLOBAL aggregate (no GROUP BY) must still be reported by
+    /// `cold_groups_touched` so the batch defers for fetch-on-access promotion — otherwise
+    /// `process_batch_no_groups` rebuilds a fresh zeroed accumulator and double-counts on capture.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn global_aggregate_cold_group_is_rehydrated() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state =
+            IncrementalAggState::try_from_sql(&ctx, "SELECT SUM(value) as total FROM events", true)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            state.num_group_cols, 0,
+            "global aggregate has no group columns"
+        );
+
+        let key = global_aggregate_key();
+        let probe = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![5.0]))],
+        )
+        .unwrap();
+
+        // No cold groups → nothing to promote.
+        assert!(state.cold_groups_touched(&probe, 1).unwrap().is_empty());
+
+        // Simulate the single global group demoted to the tier.
+        state.cold_groups.insert(key.clone());
+
+        // The fix: the demoted global group is reported so the batch defers for promotion. Before
+        // the fix `cold_groups_touched` short-circuited on `num_group_cols == 0` and returned empty,
+        // so `process_batch_no_groups` rebuilt a zeroed accumulator and double-counted on capture.
+        let touched = state.cold_groups_touched(&probe, 1).unwrap();
+        assert_eq!(
+            touched.len(),
+            1,
+            "the demoted global group is reported for promotion"
+        );
+        assert_eq!(touched[0].0, key);
+        assert_eq!(touched[0].1, 0, "the global group maps to vnode 0");
     }
 
     /// v2 Slice 4: a vnode with a demoted group must DEFER its FULL re-base (emit a DELTA) so the
