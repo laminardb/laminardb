@@ -1229,8 +1229,9 @@ impl LaminarDB {
         let Some(mv) = self.first_incremental_ref(query_sql) else {
             return Ok(());
         };
-        // Aggregate or simple projection/filter (Stage 2), or a `changelog ⋈ static dim` enrich
-        // join (Stage 3a). A changelog⋈changelog join / other complex shape is still rejected.
+        // Aggregate or simple projection/filter (Stage 2), a `changelog ⋈ static dim` enrich join
+        // (Stage 3a), or a `changelog ⋈ changelog` inner IVM join (Stage 3b). Other complex shapes
+        // (LEFT/outer joins, joins with a non-incremental right, etc.) are still rejected.
         let inc = self.incremental_mv_names();
         let supported = crate::sql_analysis::detect_changelog_enrich_query(
             query_sql,
@@ -1238,6 +1239,7 @@ impl LaminarDB {
             &self.static_table_names(),
         )
         .is_some()
+            || crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
             || self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
                 let plan = df.logical_plan();
                 crate::aggregate_state::find_aggregate(plan).is_some()
@@ -1288,6 +1290,16 @@ impl LaminarDB {
                 query_sql,
                 &self.incremental_mv_names(),
                 &self.static_table_names(),
+            )
+            .is_some()
+        {
+            return IncEmit::Multiset;
+        }
+        // `changelog ⋈ changelog` inner IVM join (Stage 3b) → Z-set multiset snapshot.
+        if reads_incremental
+            && crate::sql_analysis::detect_changelog_incremental_join(
+                query_sql,
+                &self.incremental_mv_names(),
             )
             .is_some()
         {

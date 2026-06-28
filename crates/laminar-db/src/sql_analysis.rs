@@ -843,6 +843,189 @@ pub(crate) fn detect_changelog_enrich_query(
     })
 }
 
+/// Which side of the join an output column comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinSide {
+    Left,
+    Right,
+}
+
+/// One output projection item of an incremental join. Slice 1 supports plain column references
+/// only (wildcards/expressions are a later slice); an `Unqualified` column is resolved against both
+/// side schemas at the operator.
+#[derive(Debug, Clone)]
+pub(crate) enum JoinProjItem {
+    /// `a.col` — a column on a known side.
+    Qualified { side: JoinSide, column: String },
+    /// `col` — resolved against both side schemas at the operator (ambiguous ⇒ error).
+    Unqualified { column: String },
+}
+
+/// A1-emit Stage 3b: a `<incremental MV> JOIN <incremental MV>` two-sided IVM join. The operator
+/// does the weighted Z-set join in Rust, so detection yields a structured config (not rewritten SQL).
+#[derive(Debug, Clone)]
+pub(crate) struct IncrementalJoinConfig {
+    pub left_table: String,
+    pub right_table: String,
+    pub left_keys: Vec<String>,
+    pub right_keys: Vec<String>,
+    pub projection: Vec<JoinProjItem>,
+}
+
+/// Detect a single inner equi-join whose BOTH sides are incremental MVs (changelogs) — A1-emit
+/// Stage 3b. Returns the join keys (left/right ON columns) and a resolved output projection. `None`
+/// for changelog⋈static (that is Stage 3a enrich), changelog⋈source, LEFT/outer joins (Slice 2),
+/// asof/temporal/time-bound joins, aggregates/group-by, a WHERE clause, or expression projections.
+pub(crate) fn detect_changelog_incremental_join(
+    sql: &str,
+    incremental_mvs: &FxHashSet<String>,
+) -> Option<IncrementalJoinConfig> {
+    use laminar_sql::parser::join_parser::JoinType;
+
+    if incremental_mvs.len() < 2 {
+        return None;
+    }
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let has_group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        sqlparser::ast::GroupByExpr::All(_) => false,
+    };
+    if select.distinct.is_some()
+        || has_group_by
+        || select.having.is_some()
+        || select.selection.is_some() // no WHERE yet (Slice 1)
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || query.with.is_some()
+    {
+        return None;
+    }
+    let multi = analyze_joins(select).ok()??;
+    if multi.joins.len() != 1 {
+        return None;
+    }
+    let j = &multi.joins[0];
+    if j.is_asof_join || j.is_temporal_join || j.time_bound.is_some() {
+        return None;
+    }
+    // Both sides must be incremental MVs; a static or source right is a different operator.
+    if !incremental_mvs.contains(&j.left_table) || !incremental_mvs.contains(&j.right_table) {
+        return None;
+    }
+    // A self-join feeds one changelog into both ports — out of Slice-1 scope.
+    if j.left_table == j.right_table {
+        return None;
+    }
+    if !matches!(j.join_type, JoinType::Inner) {
+        return None; // LEFT/outer is Slice 2.
+    }
+    // The ON clause must be a pure conjunction of column equalities — a non-equi residual (e.g.
+    // `AND a.x > b.y`) is silently dropped by the key extractor, which would emit unfiltered rows.
+    if !single_join_on_is_pure_equi(select) {
+        return None;
+    }
+
+    let mut left_keys = vec![j.left_key_column.clone()];
+    let mut right_keys = vec![j.right_key_column.clone()];
+    for (lk, rk) in &j.additional_key_columns {
+        left_keys.push(lk.clone());
+        right_keys.push(rk.clone());
+    }
+
+    let lalias = j.left_alias.as_deref().unwrap_or(&j.left_table);
+    let ralias = j.right_alias.as_deref().unwrap_or(&j.right_table);
+    let side_of = |qualifier: &str| -> Option<JoinSide> {
+        if qualifier == lalias || qualifier == j.left_table {
+            Some(JoinSide::Left)
+        } else if qualifier == ralias || qualifier == j.right_table {
+            Some(JoinSide::Right)
+        } else {
+            None
+        }
+    };
+
+    let mut projection = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        // Slice 1: explicit column references only. Wildcards (which would yield a duplicate-named
+        // MV schema for the shared join key) and expressions are later slices.
+        let proj = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => match expr {
+                Expr::Identifier(id) => JoinProjItem::Unqualified {
+                    column: id.value.clone(),
+                },
+                Expr::CompoundIdentifier(parts) if parts.len() == 2 => JoinProjItem::Qualified {
+                    side: side_of(&parts[0].value)?,
+                    column: parts[1].value.clone(),
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+        projection.push(proj);
+    }
+
+    Some(IncrementalJoinConfig {
+        left_table: j.left_table.clone(),
+        right_table: j.right_table.clone(),
+        left_keys,
+        right_keys,
+        projection,
+    })
+}
+
+/// `true` if the single join's ON clause is a pure conjunction of `col = col` equalities (or a
+/// `USING` list). Anything else (`>`, function, residual predicate) ⇒ the equi-key extractor would
+/// silently drop it, so the IVM join must reject the query.
+fn single_join_on_is_pure_equi(select: &sqlparser::ast::Select) -> bool {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    if select.from.len() != 1 {
+        return false;
+    }
+    let twj = &select.from[0];
+    if twj.joins.len() != 1 {
+        return false;
+    }
+    let (JoinOperator::Inner(constraint) | JoinOperator::Join(constraint)) =
+        &twj.joins[0].join_operator
+    else {
+        return false;
+    };
+    match constraint {
+        JoinConstraint::On(expr) => on_expr_is_pure_equi(expr),
+        JoinConstraint::Using(_) => true,
+        _ => false,
+    }
+}
+
+fn on_expr_is_pure_equi(expr: &Expr) -> bool {
+    use sqlparser::ast::BinaryOperator;
+    let is_col = |e: &Expr| matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+    match expr {
+        Expr::Nested(inner) => on_expr_is_pure_equi(inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => on_expr_is_pure_equi(left) && on_expr_is_pure_equi(right),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => is_col(left) && is_col(right),
+        _ => false,
+    }
+}
+
 fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> String {
     match item {
         SelectItem::UnnamedExpr(expr) => rewrite_lookup_expr(expr, ctx),

@@ -1000,9 +1000,17 @@ impl OperatorGraph {
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         stream_join_detection: Option<&StreamJoinDetection>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
+        incremental_join_config: Option<&crate::sql_analysis::IncrementalJoinConfig>,
         table_refs: &FxHashSet<String>,
     ) -> bool {
-        if let Some(tpc) = temporal_probe_config {
+        if let Some(ijc) = incremental_join_config {
+            // Stage 3b: both sides are incremental MV producers — wire left → port 0, right → 1.
+            let left_id = self.find_node(&ijc.left_table).expect("source ensured");
+            let right_id = self.find_node(&ijc.right_table).expect("source ensured");
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+            true
+        } else if let Some(tpc) = temporal_probe_config {
             let left_id = self.find_node(&tpc.left_table).expect("source ensured");
             let right_id = self.find_node(&tpc.right_table).expect("source ensured");
             self.add_edge(left_id, node_id, 0);
@@ -1144,6 +1152,16 @@ impl OperatorGraph {
         };
         let enrich = changelog_enrich_config.is_some();
 
+        // A1-emit Stage 3b: `changelog ⋈ changelog` two-sided IVM join — both sides incremental
+        // MVs. Like enrich, it wins over the generic stream join (a changelog left/right makes it a
+        // retraction-aware IVM join, not a windowed stream join).
+        let incremental_join_config = if enrich || self.incremental_tables.len() < 2 {
+            None
+        } else {
+            crate::sql_analysis::detect_changelog_incremental_join(&sql, &self.incremental_tables)
+        };
+        let inc_join = incremental_join_config.is_some();
+
         // TemporalProbe is parsed off the token stream (not the sqlparser AST), so it
         // never appears in join_config and always needs its own detector pass.
         let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
@@ -1157,30 +1175,29 @@ impl OperatorGraph {
             })
         });
 
-        let (temporal_probe_config, temporal_probe_projection_sql) = if enrich {
+        let (temporal_probe_config, temporal_probe_projection_sql) = if enrich || inc_join {
             (None, None)
         } else {
             detect_temporal_probe_query(&sql)
         };
-        let (asof_config, projection_sql) =
-            if !enrich && temporal_probe_config.is_none() && needs_specialized_detection {
-                detect_asof_query(&sql)
-            } else {
-                (None, None)
-            };
-        let (temporal_config, temporal_projection_sql) =
-            if !enrich && temporal_probe_config.is_none() && needs_specialized_detection {
-                detect_temporal_query(&sql)
-            } else {
-                (None, None)
-            };
-        let stream_join_detection =
-            if !enrich && temporal_probe_config.is_none() && needs_specialized_detection {
-                // Interval join first; falls back to processing-time equi-join.
-                detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
-            } else {
-                None
-            };
+        let specialized =
+            !enrich && !inc_join && temporal_probe_config.is_none() && needs_specialized_detection;
+        let (asof_config, projection_sql) = if specialized {
+            detect_asof_query(&sql)
+        } else {
+            (None, None)
+        };
+        let (temporal_config, temporal_projection_sql) = if specialized {
+            detect_temporal_query(&sql)
+        } else {
+            (None, None)
+        };
+        let stream_join_detection = if specialized {
+            // Interval join first; falls back to processing-time equi-join.
+            detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
+        } else {
+            None
+        };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
         let stream_join_projection_sql = stream_join_detection
             .as_ref()
@@ -1188,6 +1205,7 @@ impl OperatorGraph {
 
         // Lookup-enrich: only when no other specialized join (incl. changelog-enrich) matched.
         let (lookup_enrich_config, lookup_projection_sql) = if !enrich
+            && !inc_join
             && temporal_probe_config.is_none()
             && asof_config.is_none()
             && temporal_config.is_none()
@@ -1250,11 +1268,13 @@ impl OperatorGraph {
             idle_ttl_ms,
             incremental,
             changelog_enrich_config,
+            incremental_join_config.clone(),
         );
 
         let input_port_count = if asof_config.is_some()
             || stream_join_config.is_some()
             || temporal_probe_config.is_some()
+            || inc_join
         {
             2
         } else {
@@ -1276,6 +1296,7 @@ impl OperatorGraph {
             stream_join_config.as_ref(),
             stream_join_detection.as_ref(),
             temporal_config.as_ref(),
+            incremental_join_config.as_ref(),
             &table_refs,
         );
         if depends {
@@ -1400,7 +1421,8 @@ impl OperatorGraph {
 
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
         let node_id = self.place_operator_node(name, operator, 1);
-        let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
+        let depends =
+            self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -1431,7 +1453,8 @@ impl OperatorGraph {
         table_refs.insert(plan.source_table.clone());
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
         let node_id = self.place_operator_node(name, operator, 1);
-        let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
+        let depends =
+            self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -1455,8 +1478,17 @@ impl OperatorGraph {
         idle_ttl_ms: Option<u64>,
         incremental: bool,
         changelog_enrich_config: Option<crate::sql_analysis::ChangelogEnrichConfig>,
+        incremental_join_config: Option<crate::sql_analysis::IncrementalJoinConfig>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
+
+        // A1-emit Stage 3b: `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join
+        // emitting a joined changelog into the join MV's `Multiset` store.
+        if let Some(cfg) = incremental_join_config {
+            return Box::new(operator::incremental_join::IncrementalJoinOperator::new(
+                cfg,
+            ));
+        }
 
         // A1-emit Stage 3a: `changelog ⋈ static dim` — consume the changelog, join against the
         // dimension (in the graph context), preserve `__weight` → joined changelog.
