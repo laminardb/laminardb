@@ -1,9 +1,10 @@
 # Single-node v2 group demotion — enablement + restart durability
 
-Status: **designed (2026-06-28), grounded, cold-start ready.** Branch `feat/shuffle-barrier-after-kill-recovery`.
-Default-OFF. Goal: make v2 group-granular demotion (per [[tiered-state-adr005-plan]]) fire AND survive
-restart **single-node** (no cluster controller). Today it is a silent no-op single-node and would lose
-demoted groups on restart.
+Status: **IMPLEMENTED 2026-06-28 (`7c9781c2`), default-OFF** — cold-only artifact recovery built + restart
+integration test green (`single_node_group_demotion_survives_restart`); 839 state-tier lib tests + the
+vnode-demotion test pass; clippy/fmt clean on state-tier + cluster. **Single-node kill-9 soak is the
+remaining acceptance gate before any default-ON.** Branch `feat/shuffle-barrier-after-kill-recovery`.
+Goal (DONE): make v2 group-granular demotion fire AND survive restart **single-node** (no controller).
 
 ## Why it doesn't work today (grounded)
 
