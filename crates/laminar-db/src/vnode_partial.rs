@@ -5,9 +5,8 @@
 
 use crate::error::DbError;
 
-/// One operator's incremental delta (Lever 2): the groups changed this epoch
-/// (columnar `AggStateCheckpoint` bytes) plus the keys removed (tombstone IPC).
-/// Both empty = a carry-forward (nothing changed since the parent).
+/// One operator's incremental delta: the groups changed this epoch (columnar
+/// `AggStateCheckpoint` bytes) plus keys removed (tombstone IPC). Both empty = carry-forward.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct OpDelta {
     pub changed: Vec<u8>,
@@ -17,9 +16,9 @@ pub(crate) struct OpDelta {
 /// Operator-state slices for one vnode at one epoch. One of three kinds:
 ///
 /// - FULL: `operators` non-empty, `base_epoch = None`, `deltas` empty.
-/// - REFERENCE (Lever 1): `operators`/`deltas` empty, `base_epoch = Some(N)` — byte-identical
+/// - REFERENCE: `operators`/`deltas` empty, `base_epoch = Some(N)` — byte-identical
 ///   to the full partial at epoch N; the reader follows this one hop.
-/// - DELTA (Lever 2): `deltas` non-empty, `base_epoch = Some(parent)` — per-operator changes
+/// - DELTA: `deltas` non-empty, `base_epoch = Some(parent)` — per-operator changes
 ///   since `parent` (itself a FULL, REFERENCE, or DELTA); the reader walks parents back to a
 ///   FULL collecting deltas, then replays FULL → deltas forward.
 ///

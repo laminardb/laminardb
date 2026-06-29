@@ -75,8 +75,8 @@ struct AggPromotion {
     tier: crate::state_tier::TierTx,
     deferred: VecDeque<(i64, RecordBatch)>,
     inflight: FxHashMap<u32, oneshot::Receiver<Result<Option<Bytes>, DbError>>>,
-    // v2 group granularity: in-flight per-group fetches keyed by the group's row key, carrying the
-    // tier coordinates `(vnode, group_key_bytes)` so a miss can be re-issued.
+    // In-flight per-group fetches keyed by the group's row key, carrying the tier coordinates
+    // `(vnode, group_key_bytes)` so a miss can be re-issued.
     #[allow(clippy::type_complexity)]
     inflight_groups: FxHashMap<
         arrow::row::OwnedRow,
@@ -265,9 +265,8 @@ pub(crate) struct SqlQueryOperator {
     // since, whose delta chains must re-base FULL (`IncrementalAggState::reset_acquired_vnodes`).
     #[cfg(feature = "cluster")]
     prev_owned: rustc_hash::FxHashSet<u32>,
-    // `Some(chain_max)` enables incremental delta checkpoints (Lever 2) with that re-base bound.
-    // When set, the delta chain is the PRIMARY agg checkpoint (A1-capture): `checkpoint()` skips
-    // the whole-node group capture and recovery comes from the per-vnode partials.
+    // `Some(chain_max)` enables incremental delta checkpoints with that re-base bound. When set, the
+    // delta chain is the PRIMARY agg checkpoint; whole-node capture is skipped, partials recover.
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
@@ -292,7 +291,7 @@ pub(crate) struct SqlQueryOperator {
     // Set from the vnode registry; threaded separately since single-node has no shuffle config.
     #[cfg(feature = "state-tier")]
     vnode_count: u32,
-    // v2 group demotion single-node: turns on the agg's delta DIRTY-tracking (so `demotable_groups`
+    // Single-node group demotion: turns on the agg's delta DIRTY-tracking (so `demotable_groups`
     // has candidates) WITHOUT `delta_chain_max` — the whole-node manifest stays authoritative.
     #[cfg(feature = "state-tier")]
     group_delta_tracking: bool,
@@ -350,10 +349,8 @@ impl SqlQueryOperator {
         self.vnode_count = vnode_count;
     }
 
-    /// v2 group demotion single-node: enable the agg's delta DIRTY-tracking so idle groups become
-    /// demotable, WITHOUT making the delta chain the primary checkpoint (no `delta_chain_max`). The
-    /// whole-node manifest stays authoritative; the coordinator writes demoted groups to cold-only
-    /// partials that recovery merges back. Re-asserted in `lazy_init`.
+    /// Single-node group demotion: enable the agg's delta DIRTY-tracking so idle groups become
+    /// demotable, WITHOUT making the delta chain the primary checkpoint (no `delta_chain_max`).
     #[cfg(feature = "state-tier")]
     pub(crate) fn enable_delta_tracking(&mut self) {
         self.group_delta_tracking = true;
@@ -362,7 +359,7 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Enable incremental delta checkpoints (Lever 2) with `chain_max` as the re-base bound.
+    /// Enable incremental delta checkpoints with `chain_max` as the re-base bound.
     #[cfg(feature = "cluster")]
     pub fn enable_delta_checkpoints(&mut self, chain_max: u32) {
         self.delta_chain_max = Some(chain_max);
@@ -563,11 +560,8 @@ impl SqlQueryOperator {
             None
         };
 
-        // A1-emit Stage 2: when the source carries a Z-set weight (it's a changelog), pass
-        // `__weight` through so a chained projection/filter propagates retractions. The filter is
-        // applied per changelog row by its own values (retracts carry old values, inserts new), so
-        // the downstream multiset nets correctly. Skipped if the projection already selects it
-        // (e.g. `SELECT *`).
+        // When the source carries a Z-set weight (it's a changelog), pass `__weight` through so a
+        // chained projection/filter propagates retractions. Skipped if the projection selects it.
         let weight = laminar_core::changelog::WEIGHT_COLUMN;
         if info
             .input_df_schema
@@ -726,7 +720,7 @@ impl SqlQueryOperator {
             }
         }
 
-        // v2 group granularity: rehydrate any cold groups whose fetch resolved.
+        // Rehydrate any cold groups whose fetch resolved.
         let ready_groups = self
             .promotion
             .as_mut()
@@ -748,8 +742,8 @@ impl SqlQueryOperator {
             }
         }
 
-        // Proactively fetch cold groups whose vnode re-base is deferred (Slice 4), so the block
-        // clears within the prune window rather than growing the chain unbounded.
+        // Proactively fetch cold groups whose vnode re-base is deferred, so the block clears
+        // within the prune window rather than growing the chain unbounded.
         if let Some(chain_max) = self.delta_chain_max {
             let pending = if let QueryState::Agg(ref agg) = self.state {
                 agg.cold_groups_pending_rebase(chain_max, self.vnode_count)
@@ -815,8 +809,7 @@ impl SqlQueryOperator {
         self.emit_agg_output(watermark).await
     }
 
-    /// Rehydrate one demoted group from its tier bytes back into live aggregate state (v2 group
-    /// promotion).
+    /// Rehydrate one demoted group from its tier bytes back into live aggregate state.
     #[cfg(feature = "state-tier")]
     fn apply_group_state(
         &mut self,
@@ -1128,8 +1121,8 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // A1-capture: when the delta chain is authoritative, aggregate groups are NOT captured
-        // into the whole-node manifest blob — they live in (and recover from) per-vnode partials.
+        // When the delta chain is authoritative, aggregate groups are NOT captured into the
+        // whole-node manifest blob — they live in (and recover from) per-vnode partials.
         let agg: Option<AggStateCheckpoint> = if self.skip_whole_node_agg() {
             None
         } else {
@@ -1306,7 +1299,7 @@ impl GraphOperator for SqlQueryOperator {
         };
         agg_state.reset_acquired_vnodes(&newly_acquired);
 
-        // Incremental delta capture (Lever 2): each touched vnode emits a FULL re-base or a DELTA.
+        // Incremental delta capture: each touched vnode emits a FULL re-base or a DELTA.
         if let Some(chain_max) = self.delta_chain_max {
             if agg_state.delta_enabled() {
                 use crate::aggregate_state::VnodeCapture;
@@ -1339,8 +1332,8 @@ impl GraphOperator for SqlQueryOperator {
         let cold: Vec<u32> = agg_state.cold_vnodes().iter().copied().collect();
         #[cfg(not(feature = "state-tier"))]
         let cold: Vec<u32> = Vec::new();
-        // v2 group demotion: a partially-demoted vnode's demoted groups, re-fetched + written as a
-        // cold-only partial (its resident groups still ride the whole-node manifest).
+        // A partially-demoted vnode's demoted groups, re-fetched + written as a cold-only partial
+        // (its resident groups still ride the whole-node manifest).
         #[cfg(feature = "state-tier")]
         let cold_groups = agg_state.cold_groups_by_vnode(vnode_count);
         #[cfg(not(feature = "state-tier"))]
@@ -1631,9 +1624,8 @@ mod delta_primary_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use laminar_core::state::{NodeId, VnodeRegistry};
 
-    // A1-capture: a sharded aggregate with the delta chain as primary must NOT capture its groups
-    // into the whole-node manifest blob (state lives in per-vnode partials); with delta_primary off
-    // the same operator captures whole-node as before.
+    // A sharded aggregate with the delta chain as primary must NOT capture its groups into the
+    // whole-node manifest blob (state lives in per-vnode partials); delta-off captures whole-node.
     #[tokio::test]
     async fn delta_primary_skips_whole_node_agg_capture() {
         let schema = Arc::new(Schema::new(vec![
@@ -2173,11 +2165,8 @@ mod promotion_tests {
         );
         assert_eq!(decoded.deferred[0].0, 20, "carried at its ingest watermark");
 
-        // Restoring into a fresh operator replays the row rather than dropping
-        // it. The merge of the demoted slice's prior contribution (+1) is
-        // restored only once restart recovery rehydrates cold vnodes from the
-        // partials (Phase 4a); a fresh operator holds no demoted state, so the
-        // replayed row stands alone — what matters here is that it is not lost.
+        // Restoring into a fresh operator replays the row rather than dropping it. The demoted
+        // slice's prior contribution returns only via restart rehydration; the row stands alone.
         let mut op2 = build_op(tier_tx).await;
         op2.restore(cp).unwrap();
         let mut final_a = None;

@@ -47,7 +47,7 @@
 //! - `LAMINAR_SOAK_COORD_RECOVERY`  any value: set `[supervision] coordinated_recovery`.
 //! - `LAMINAR_SOAK_FAULT_INJECT_MS`  arm a one-shot cycle fault on one node this many ms
 //!   in; `LAMINAR_SOAK_FAULT_INJECT_NODE` (default 1 = follower; 0 = leader) picks which.
-//!   The 1A-cluster recovery soak runs these with `LAMINAR_SOAK_COORD_RECOVERY=1`,
+//!   The cluster recovery soak runs these with `LAMINAR_SOAK_COORD_RECOVERY=1`,
 //!   `LAMINAR_SOAK_KILLS=0`, and the Kafka EO sink.
 
 use std::io::{Read, Write as _};
@@ -188,13 +188,8 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Optional disk cold tier (Phase 5 soak). A tiny budget forces
-    // demotion under load, a larger vnode ring keeps most vnodes clean
-    // each capture interval (only clean vnodes are demotable), and the
-    // `soak_agg` pipeline below gives the tier demotable per-vnode state
-    // (the pass-through `soak_stream` has none). Bounded key space (mod
-    // GROUPS) means demoted keys are revisited, driving promotion too.
-    // Gated on the env var so default runs are byte-identical.
+    // Optional cold tier: a tiny budget forces demotion, a larger vnode ring keeps vnodes clean
+    // (only clean vnodes are demotable). Gated so default runs stay byte-identical.
     let tier = std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok();
     let rps = env_u64("LAMINAR_SOAK_RPS", if tier { 400 } else { 200 });
     let vnodes = env_u64("LAMINAR_SOAK_VNODES", if tier { 256 } else { 64 });
@@ -208,7 +203,7 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
             .replace('\\', "/");
         server_extra =
             format!("state_tier_dir = \"{tier_dir}\"\nstate_memory_budget_bytes = {budget}\n");
-        // v2: shed idle GROUPS, not whole vnodes. Needs delta on (pair with
+        // Shed idle GROUPS, not whole vnodes. Needs delta on (pair with
         // LAMINAR_SOAK_DELTA_CHAIN_MAX). Gated so default tier runs stay byte-identical.
         if std::env::var("LAMINAR_SOAK_STATE_TIER_GROUP").is_ok() {
             server_extra.push_str("state_tier_group_demotion = true\n");
@@ -238,16 +233,13 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
 
-    // Incremental delta checkpoints (Lever 2): `LAMINAR_SOAK_DELTA_CHAIN_MAX=N` enables them and
-    // adds a non-changelog aggregate whose per-vnode state is delta-captured. (Changelog aggregates
-    // now also take the delta path — add one with `LAMINAR_SOAK_CHANGELOG_AGG` to exercise the
-    // `last_emitted` delta.) The aggs have no sink — they exercise the delta write+chain-recovery
-    // path under kill -9; the exactly-once proof stays on the pass-through `soak_stream` sink.
+    // Delta checkpoints: `LAMINAR_SOAK_DELTA_CHAIN_MAX=N` enables them plus a non-changelog agg
+    // (no sink) so kill -9 exercises the delta write + chain-recovery path.
     let delta_chain_max = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").ok().map(|v| {
         v.parse::<u32>()
             .expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32")
     });
-    // Enabling delta also makes the chain the primary aggregate checkpoint (A1-capture).
+    // Enabling delta also makes the chain the primary aggregate checkpoint.
     let delta_line = delta_chain_max.map_or(String::new(), |n| format!("delta_chain_max = {n}"));
 
     let mut toml = format!(
@@ -535,10 +527,8 @@ fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) ->
     new_epoch
 }
 
-/// EMBEDDED (non-cluster) single-node config: the `Profile::Embedded` path (single-owner registry,
-/// no controller/gossip/shuffle) that v2 single-node group demotion targets. A tiny budget + a
-/// slow-cycling `EMIT CHANGES` agg drive group demote→promote; the cold groups must survive kill -9
-/// via the cold-only partials the coordinator writes.
+/// EMBEDDED single-node config (`Profile::Embedded`): tiny budget + slow-cycling `EMIT CHANGES`
+/// agg drive group demote→promote; cold groups survive kill -9 via the cold-only partials.
 fn write_embedded_config(dir: &Path, id: usize, interval_ms: u64) -> PathBuf {
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -600,10 +590,8 @@ sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (s
     path
 }
 
-/// Single-node EMBEDDED v2 group-demotion recovery under kill -9. Validates the path the
-/// single-node-CLUSTER soak can't (it stalls on the convergence gate): the embedded node demotes
-/// idle groups, gets hard-killed, and on restart recovers them from the cold-only partials and
-/// resumes checkpointing. Run with `--features state-tier`.
+/// Single-node EMBEDDED group-demotion recovery under kill -9: demote idle groups, hard-kill, then
+/// recover them from the cold-only partials — what the single-node CLUSTER soak can't (gate stalls).
 #[test]
 #[ignore = "spawns a real laminardb process; run with --ignored --features state-tier"]
 fn embedded_kill9_group_demotion_soak() {
@@ -936,7 +924,7 @@ fn three_node_kill9_soak() {
     }
 }
 
-// ── Graceful-rotation soak (B2) ─────────────────────────────────────────────
+// ── Graceful-rotation soak ─────────────────────────────────────────────
 
 /// Node config for the graceful-rotation soak: a shared vnode-partitioned Kafka
 /// source, a pass-through pipeline, and a per-node exactly-once Kafka sink (the
@@ -1170,11 +1158,8 @@ fn collect_output_seqs(brokers: &str, n_nodes: usize) -> (Vec<i64>, Vec<usize>) 
     (all, per_topic)
 }
 
-/// B2 end-to-end: a shared Kafka source is consumed across the cluster; adding a
-/// node mid-run triggers a GRACEFUL vnode rotation (the exactly-once sink makes it
-/// run the pre-rotation drain). The union of all output topics must then be a
-/// dense `0..=TOTAL-1` with no duplicates — proving the rotation handed off each
-/// partition at a clean cut.
+/// End-to-end graceful rotation (a node joins mid-run; the EO sink forces the pre-rotation drain).
+/// Output topics must union to a dense `0..=TOTAL-1`, proving each partition handed off cleanly.
 #[test]
 #[ignore = "spawns 4 real laminardb processes; needs LAMINAR_SOAK_KAFKA_BROKERS; run with --ignored"]
 fn graceful_rotation_kafka_soak() {

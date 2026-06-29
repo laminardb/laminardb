@@ -378,9 +378,8 @@ pub struct ServerSection {
     /// backpressuring. Requires a `state-tier` build. `None` = no tier.
     #[serde(default)]
     pub state_tier_dir: Option<std::path::PathBuf>,
-    /// Demote at GROUP granularity (v2): shed individual idle aggregate groups rather than whole
-    /// idle vnodes. Requires the cold tier. `None` (unset) defaults ON for both embedded single-node
-    /// and cluster (both kill-9-soaked); `Some(b)` forces it.
+    /// Demote at GROUP granularity: shed individual idle aggregate groups rather than whole idle
+    /// vnodes. Requires the cold tier. Unset defaults ON (single-node and cluster); `Some(b)` forces it.
     #[serde(default)]
     pub state_tier_group_demotion: Option<bool>,
 }
@@ -398,8 +397,7 @@ fn default_pgwire_tls_min_version() -> String {
 }
 
 impl ServerSection {
-    /// Effective group-demotion setting. Unset defaults ON for both embedded single-node and cluster
-    /// (both kill-9-soaked, incl. the rehydration-panic fix). Explicit config wins.
+    /// Effective group-demotion setting. Unset defaults ON (single-node and cluster); explicit config wins.
     #[cfg(feature = "state-tier")]
     pub(crate) fn group_demotion(&self) -> bool {
         self.state_tier_group_demotion.unwrap_or(true)
@@ -526,14 +524,12 @@ pub struct CheckpointSection {
     /// Durability-gate poll backoff cap in ms (default 1000).
     #[serde(default)]
     pub restorable_gate_poll_max_ms: Option<u64>,
-    /// Enable incremental delta checkpoints (Lever 2, cluster-only) with this re-base chain bound.
-    /// Default off (full + reference partials). Clamped `< max_retained` so a chain base never ages
-    /// out of the prune window.
+    /// Enable incremental delta checkpoints (cluster-only) with this re-base chain bound.
+    /// Default off; clamped `< max_retained` so a chain base never ages out of the prune window.
     #[serde(default)]
     pub delta_chain_max: Option<u32>,
-    /// Incremental emit for terminal non-windowed running-state aggregate MVs (A1-emit): emit a
-    /// dirty-only changelog into a keyed upsert store instead of re-materializing every group each
-    /// cycle. `SELECT * FROM mv` still returns the full snapshot. Default off.
+    /// Incremental emit for non-windowed running-state aggregate MVs: a dirty-only changelog into
+    /// a keyed upsert store instead of re-materializing every group each cycle. Default off.
     #[serde(default)]
     pub incremental_emit: bool,
 }

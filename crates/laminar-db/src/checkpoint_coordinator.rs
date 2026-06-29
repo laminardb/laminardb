@@ -26,15 +26,14 @@ pub(crate) enum StagedSlice {
     // No bytes; the coordinator emits a reference partial or fetches from the tier on a forced
     // full re-upload.
     Cold,
-    // An incremental delta (Lever 2): changed-group columnar bytes + tombstone IPC, chained to the
-    // previous epoch's partial for this vnode. Bypasses the byte-compare reference path.
+    // An incremental delta: changed-group columnar bytes + tombstone IPC, chained to the previous
+    // epoch's partial for this vnode. Bypasses the byte-compare reference path.
     Delta {
         changed: bytes::Bytes,
         tombstones: bytes::Bytes,
     },
-    // v2 group demotion (single-node): this vnode's demoted groups, by tier key. The coordinator
-    // fetches each from the tier and writes a COLD-ONLY partial (no resident — that lives in the
-    // whole-node manifest); recovery merges it additively. Always forces a full upload.
+    // Demoted groups for this vnode, by tier key. Fetched from the tier into a COLD-ONLY partial
+    // (resident lives in the whole-node manifest); recovery merges it additively, always full upload.
     #[cfg(feature = "state-tier")]
     ColdGroups {
         group_keys: Vec<Vec<u8>>,
@@ -539,7 +538,7 @@ impl CheckpointCoordinator {
     }
 
     /// Fetch one demoted GROUP's bytes from the cold tier. A miss fails the epoch — silently
-    /// dropping a demoted group would break recovery (v2 group demotion).
+    /// dropping a demoted group would break recovery.
     #[cfg(feature = "state-tier")]
     async fn fetch_cold_group(
         &self,

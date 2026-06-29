@@ -32,14 +32,14 @@ pub struct StreamCheckpointConfig {
     pub restorable_gate_poll_initial_ms: Option<u64>,
     /// Durability-gate poll backoff cap (ms). `None` = engine default (1000).
     pub restorable_gate_poll_max_ms: Option<u64>,
-    /// Enable incremental delta checkpoints (Lever 2, cluster-only) with this re-base chain bound.
+    /// Enable incremental delta checkpoints (cluster-only) with this re-base chain bound.
     /// `None` = off (whole-node manifest is the aggregate checkpoint). When set, the per-vnode delta
-    /// chain becomes the PRIMARY aggregate checkpoint (A1-capture): aggregates skip the whole-node
+    /// chain becomes the PRIMARY aggregate checkpoint via incremental per-vnode capture: aggregates skip the whole-node
     /// manifest capture and recover from the chain, dropping per-cycle checkpoint cost to O(dirty).
     /// Requires a durable (object-store) backend. Clamped `< max_retained` so the chain base never
     /// ages out of the prune window. Default off.
     pub delta_chain_max: Option<u32>,
-    /// Incremental emit for non-windowed running-state aggregate MVs (A1-emit). When on, a
+    /// Incremental emit for non-windowed running-state aggregate MVs. When on, a
     /// terminal `GROUP BY` MV emits a dirty-only changelog into a keyed upsert store instead of
     /// re-materializing every group each cycle (`SELECT * FROM mv` still returns the full
     /// snapshot). Default off.

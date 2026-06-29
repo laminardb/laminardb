@@ -123,14 +123,13 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "state-tier")]
     fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
 
-    /// Enable agg delta dirty-tracking for single-node v2 group demotion (no delta chain). Only
+    /// Enable agg delta dirty-tracking for single-node group demotion (no delta chain). Only
     /// aggregate operators act on it.
     #[cfg(feature = "state-tier")]
     fn enable_group_delta_tracking(&mut self) {}
 
-    /// Demote idle resident groups to the cold tier until `target_bytes` is freed (v2 group
-    /// granularity). Encodes + tier-writes + drops each off the compute path; returns
-    /// `(groups_demoted, bytes_freed)` so the caller can hold a budget across operators.
+    /// Demote idle resident groups to the cold tier until `target_bytes` is freed; encodes,
+    /// tier-writes and drops each off the compute path. Returns `(groups_demoted, bytes_freed)`.
     #[cfg(feature = "state-tier")]
     async fn demote_cold_groups(
         &mut self,
@@ -296,12 +295,8 @@ impl GraphOperator for SqlFilterOperator {
     }
 }
 
-/// A1-emit Stage 3a: enriches an incremental MV's changelog with a static dimension. Consumes the
-/// changelog from `input_bufs` (no live-provider desync), registers it as a temp live source, and
-/// joins against the dimension (in the graph context) preserving `__weight` — emitting the joined
-/// changelog. The physical plan is re-created each cycle so the join's build-side hash table
-/// (`DataFusion` `OnceAsync`) doesn't freeze on the first cycle's temp data. Stateless; the join
-/// MV's `Multiset` store holds the snapshot.
+/// Enriches an incremental MV's changelog with a static dimension, preserving `__weight`. Re-creates
+/// the physical plan each cycle so the hash join's `OnceAsync` build side doesn't freeze on cycle-1 temp.
 struct ChangelogEnrichOperator {
     join_sql: String,
     ctx: SessionContext,
@@ -380,10 +375,10 @@ pub(crate) struct OperatorGraph {
     node_domain: Vec<usize>,
     domain_count: usize,
     // When set, `compute_node_domains` cuts at source nodes so shared-source queries become
-    // distinct domains (1B Phase 2). Off: shared-source queries fuse into one domain (1B v1).
+    // distinct domains. Off: shared-source queries fuse into one domain.
     shared_source_isolation: bool,
     // Per-operator cap on the preserved input a faulted domain replays from. Past it, replay
-    // is abandoned and the input dropped (Slice-1 behaviour / EO recovery).
+    // is abandoned and the input dropped (EO recovery).
     max_replay_buffer_bytes: usize,
     // Local source names whose domain faulted this cycle; drained by `take_cycle_failures`.
     cycle_failed_sources: FxHashSet<Arc<str>>,
@@ -421,7 +416,7 @@ pub(crate) struct OperatorGraph {
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
     // Incremental MV names (changelog producers); routes a `changelog ⋈ static dim` join to the
-    // ChangelogEnrich operator (A1-emit Stage 3a). Kept current as incremental MVs are added.
+    // ChangelogEnrich operator. Kept current as incremental MVs are added.
     incremental_tables: FxHashSet<String>,
     // Static reference/dimension table names — valid right sides of a changelog enrich join.
     reference_tables: FxHashSet<String>,
@@ -430,8 +425,7 @@ pub(crate) struct OperatorGraph {
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
     // `Some(chain_max)` enables incremental delta checkpoints on aggregate operators; the delta
-    // chain then becomes the PRIMARY agg checkpoint (A1-capture: skip the whole-node manifest
-    // capture, recover from the chain).
+    // chain then becomes the PRIMARY agg checkpoint (skip the whole-node manifest, recover from the chain).
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
     // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
@@ -448,7 +442,7 @@ pub(crate) struct OperatorGraph {
     // Stored so DDL-added operators also receive the tier channel.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
-    // Single-node v2 group demotion: enable the agg delta dirty-tracking (no delta chain) so idle
+    // Single-node group demotion: enable the agg delta dirty-tracking (no delta chain) so idle
     // groups are demotable; the coordinator writes demoted groups to cold-only durable partials.
     #[cfg(feature = "state-tier")]
     group_delta_tracking: bool,
@@ -515,7 +509,7 @@ impl OperatorGraph {
     }
 
     /// Register the static reference/dimension table names (valid right sides of a changelog
-    /// enrich join, A1-emit Stage 3a).
+    /// enrich join).
     pub fn set_reference_tables(&mut self, tables: FxHashSet<String>) {
         self.reference_tables = tables;
     }
@@ -688,7 +682,7 @@ impl OperatorGraph {
         self.state_tier = Some(tier);
     }
 
-    /// Single-node v2 group demotion: enable agg delta dirty-tracking on built operators and
+    /// Single-node group demotion: enable agg delta dirty-tracking on built operators and
     /// remember it so operators built later (DDL hot-add) pick it up. No `delta_chain_max`.
     #[cfg(feature = "state-tier")]
     pub(crate) fn enable_group_delta_tracking(&mut self) {
@@ -1087,7 +1081,7 @@ impl OperatorGraph {
         table_refs: &FxHashSet<String>,
     ) -> bool {
         if let Some(ijc) = incremental_join_config {
-            // Stage 3b: both sides are incremental MV producers — wire left → port 0, right → 1.
+            // Both sides are incremental MV producers — wire left → port 0, right → 1.
             let left_id = self.find_node(&ijc.left_table).expect("source ensured");
             let right_id = self.find_node(&ijc.right_table).expect("source ensured");
             self.add_edge(left_id, node_id, 0);
@@ -1188,7 +1182,7 @@ impl OperatorGraph {
         use laminar_sql::translator::JoinOperatorConfig;
 
         // Record changelog producers so a later `changelog ⋈ static dim` consumer routes to the
-        // ChangelogEnrich operator (A1-emit Stage 3a).
+        // ChangelogEnrich operator.
         if incremental {
             self.incremental_tables.insert(name.clone());
         }
@@ -1221,9 +1215,8 @@ impl OperatorGraph {
             return;
         }
 
-        // A1-emit Stage 3a: `changelog ⋈ static dim`. Detected first so it wins over the generic
-        // processing-time equi-join — a changelog left makes this a retraction-aware enrich, not a
-        // stream join.
+        // `changelog ⋈ static dim`: detected first so it wins over the generic processing-time
+        // equi-join — a changelog left makes this a retraction-aware enrich, not a stream join.
         let changelog_enrich_config = if self.incremental_tables.is_empty() {
             None
         } else {
@@ -1235,9 +1228,8 @@ impl OperatorGraph {
         };
         let enrich = changelog_enrich_config.is_some();
 
-        // A1-emit Stage 3b: `changelog ⋈ changelog` two-sided IVM join — both sides incremental
-        // MVs. Like enrich, it wins over the generic stream join (a changelog left/right makes it a
-        // retraction-aware IVM join, not a windowed stream join).
+        // `changelog ⋈ changelog` two-sided IVM join — both sides incremental MVs. Like enrich, it
+        // wins over the generic stream join (a changelog left/right makes it retraction-aware).
         let incremental_join_config = if enrich || self.incremental_tables.len() < 2 {
             None
         } else {
@@ -1565,16 +1557,16 @@ impl OperatorGraph {
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
 
-        // A1-emit Stage 3b: `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join
-        // emitting a joined changelog into the join MV's `Multiset` store.
+        // `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join emitting a joined
+        // changelog into the join MV's `Multiset` store.
         if let Some(cfg) = incremental_join_config {
             return Box::new(operator::incremental_join::IncrementalJoinOperator::new(
                 cfg,
             ));
         }
 
-        // A1-emit Stage 3a: `changelog ⋈ static dim` — consume the changelog, join against the
-        // dimension (in the graph context), preserve `__weight` → joined changelog.
+        // `changelog ⋈ static dim` — consume the changelog, join against the dimension (in the
+        // graph context), preserve `__weight` → joined changelog.
         if let Some(cfg) = changelog_enrich_config {
             return Box::new(ChangelogEnrichOperator::new(
                 self.ctx.clone(),
@@ -1713,8 +1705,8 @@ impl OperatorGraph {
             ));
         }
 
-        // `EMIT CHANGES` is an explicit changelog; A1-emit (`incremental`) drives the same
-        // dirty-only emit internally for a terminal running-state aggregate MV.
+        // `EMIT CHANGES` is an explicit changelog; `incremental` drives the same dirty-only emit
+        // internally for a terminal running-state aggregate MV.
         let emit_changelog =
             incremental || emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
@@ -1734,7 +1726,7 @@ impl OperatorGraph {
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
             // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
-            // Enabling delta also makes the chain the primary agg checkpoint (A1-capture).
+            // Enabling delta also makes the chain the primary agg checkpoint.
             if let Some(chain_max) = self.delta_chain_max {
                 op.enable_delta_checkpoints(chain_max);
             }
@@ -1884,9 +1876,8 @@ impl OperatorGraph {
             if self.nodes[edge.source].removed || self.nodes[edge.target].removed {
                 continue;
             }
-            // 1B Phase 2: cut at source nodes so two queries reading one source don't fuse
-            // into a single domain. Sources have no incoming edges, so skipping their
-            // outgoing edges leaves each source isolated (left unassigned below).
+            // Cut at source nodes so two queries reading one source don't fuse into a single domain.
+            // Sources have no incoming edges, so skipping their outgoing edges leaves each isolated.
             if self.shared_source_isolation && self.source_node_ids.contains(&edge.source) {
                 continue;
             }
@@ -2027,13 +2018,8 @@ impl OperatorGraph {
                 if !accept {
                     return Err(e);
                 }
-                // 1B Phase 2 replay: under shared-source isolation, keep the faulted operator's
-                // input so the next cycle re-runs it with the same rows plus new arrivals — its
-                // input buffer is this domain's in-memory replay slice (operators on the
-                // `input_bufs` path; a DataFusion table-scan operator re-reads the live provider
-                // instead, so it degrades to Slice-1 drop). Still returns Err so the domain is
-                // isolated and its source held back. Bounded by `max_replay_buffer_bytes`: past
-                // the cap, abandon replay and drop the input (Slice-1 behaviour / EO recovery).
+                // Under shared-source isolation, keep the faulted operator's input so the next cycle
+                // replays it with new arrivals; returns Err to isolate the domain. Bounded by `max_replay_buffer_bytes`.
                 if self.shared_source_isolation
                     && input_bytes.iter().sum::<usize>() <= self.max_replay_buffer_bytes
                 {
@@ -2635,9 +2621,8 @@ impl OperatorGraph {
         demoted
     }
 
-    /// Demote idle resident groups across all operators until `target_bytes` is freed (v2 group
-    /// granularity). Each operator encodes + tier-writes + drops its own idle groups off the
-    /// compute path. Returns the number of groups demoted.
+    /// Demote idle resident groups across all operators until `target_bytes` is freed. Each operator
+    /// encodes, tier-writes and drops its own idle groups off the compute path; returns the count demoted.
     #[cfg(feature = "state-tier")]
     pub(crate) async fn demote_cold_groups(&mut self, target_bytes: usize) -> u64 {
         let Some(vnode_count) = self.vnode_count else {
@@ -3062,7 +3047,7 @@ mod tests {
         assert_eq!(total_rows, 1);
     }
 
-    // --- AI routing (B5.3b) ---
+    // --- AI routing ---
 
     struct PosProvider;
 
@@ -3597,9 +3582,8 @@ mod tests {
         );
     }
 
-    // The Slice 1 win: a fault in one query sharing a source must not sink the sibling that
-    // reads the same source. The healthy query still emits, and the shared source is held back
-    // because it feeds the faulted domain.
+    // A fault in one query sharing a source must not sink a sibling reading the same source: the
+    // healthy query still emits, and the shared source is held back because it feeds the faulted domain.
     #[tokio::test]
     async fn test_execute_cycle_isolates_shared_source_sibling() {
         let mut graph = test_graph();
@@ -3654,8 +3638,8 @@ mod tests {
         );
     }
 
-    // Slice 2: a transient fault in one shared-source query replays from the preserved input on
-    // the next cycle (cycle-1 rows + cycle-2 rows), while the healthy sibling only sees new rows.
+    // A transient fault in one shared-source query replays from the preserved input on the next
+    // cycle (cycle-1 rows + cycle-2 rows), while the healthy sibling only sees new rows.
     #[tokio::test]
     async fn test_shared_source_isolation_replays_faulted_domain() {
         struct ReplayTestOp {

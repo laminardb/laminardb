@@ -98,10 +98,8 @@ pub struct LaminarConfig {
     /// demoted here (off-heap) instead of backpressuring. `None` = no tier.
     /// Requires the `state-tier` build feature; ignored otherwise.
     pub state_tier_dir: Option<PathBuf>,
-    /// Demote at GROUP granularity (v2): shed individual idle aggregate groups to the tier rather
-    /// than only whole idle vnodes. Skew-proof but newer; default off until soak-validated.
-    /// Requires the `state-tier` feature and delta checkpoints (`checkpoint.delta_chain_max`),
-    /// whose per-group machinery it reuses; a no-op without them.
+    /// Demote at GROUP granularity: shed individual idle aggregate groups to the tier instead of
+    /// only whole idle vnodes. Requires the `state-tier` feature and delta checkpoints; else a no-op.
     pub state_tier_group_demotion: bool,
 
     /// Source-to-coordinator channel capacity. `None` = 64.
@@ -123,7 +121,7 @@ pub struct LaminarConfig {
     /// Cluster mode: on a fatal fault, the leader rewinds every node to the highest
     /// cluster-wide committed epoch instead of a local-only restart. Default off.
     pub coordinated_recovery: bool,
-    /// Isolate queries that share a source into independent failure domains (1B Phase 2).
+    /// Isolate queries that share a source into independent failure domains.
     /// Default off; when off, shared-source queries fault and recover together.
     pub shared_source_isolation: bool,
 }

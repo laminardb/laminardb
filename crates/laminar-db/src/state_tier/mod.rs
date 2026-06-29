@@ -83,7 +83,7 @@ impl StateTierStore {
     }
 
     /// Per-group key: the vnode key plus a NUL and the group-key bytes. A strict extension of
-    /// `key(operator, vnode)`, so vnode-blob and per-group entries never collide (v2 group tier).
+    /// `key(operator, vnode)`, so vnode-blob and per-group entries never collide.
     fn group_key(operator: &str, vnode: u32, group: &[u8]) -> Vec<u8> {
         let mut k = Self::key(operator, vnode);
         k.push(0);
@@ -171,7 +171,7 @@ impl StateTierStore {
         self.remove_key(&Self::key(operator, vnode))
     }
 
-    /// Store a single demoted group (v2 group-granular tier). `group` is the group-key bytes.
+    /// Store a single demoted group. `group` is the group-key bytes.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn put_group(
         &self,

@@ -180,9 +180,8 @@ impl<'a> VnodeRehydrator<'a> {
         report
     }
 
-    /// Resolve a vnode's recovery chain at `epoch`: collapse leading Lever-1 reference hops, then
-    /// walk `base_epoch` back collecting delta partials until every delta operator at the head has
-    /// its FULL base (or the chain ends / a link is missing). Returns oldest→newest decoded bytes.
+    /// Resolve a vnode's recovery chain at `epoch`: collapse leading reference hops, then walk
+    /// `base_epoch` back collecting deltas until each head op has its FULL base (oldest→newest).
     async fn collect_chain(&self, vnode: u32, epoch: u64) -> Result<Option<Vec<Bytes>>, String> {
         use crate::vnode_partial::VnodePartial;
         let Some(mut bytes) = self

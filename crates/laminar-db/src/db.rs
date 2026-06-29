@@ -1604,7 +1604,7 @@ impl LaminarDB {
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
-        // A1-emit terminality guard: an incremental MV emits a changelog, not a snapshot stream.
+        // An incremental MV emits a changelog, not a snapshot stream, so it can't be a SUBSCRIBE terminal.
         if self.is_incremental_mv(name) {
             return Err(crate::ddl::incremental_mv_consumer_error(name, "SUBSCRIBE"));
         }

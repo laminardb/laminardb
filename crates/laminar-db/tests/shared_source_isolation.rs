@@ -1,4 +1,4 @@
-//! 1B Phase 2 — shared-source failure isolation, end to end.
+//! Shared-source failure isolation, end to end.
 //!
 //! Two streams read one source. The aggregating one is forced to fault every cycle
 //! (a 1-byte operator state limit), the projection one is healthy. With

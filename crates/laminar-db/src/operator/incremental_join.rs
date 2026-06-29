@@ -1,4 +1,4 @@
-//! A1-emit Stage 3b: hand-rolled two-sided incremental (IVM) join over two changelogs.
+//! Hand-rolled two-sided incremental (IVM) join over two changelogs.
 //!
 //! For `A ⋈ B` with per-cycle Z-set deltas δA, δB (`__weight` changelogs), the output delta is
 //! `δA ⋈ B_new + A_old ⋈ δB` where `B_new = B_old + δB`; matched weights multiply and retractions
@@ -28,7 +28,7 @@ use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{IncrementalJoinConfig, JoinProjItem, JoinSide};
 
 /// Indexed Z-set: `join_key -> { full_row -> multiplicity }`. The in-memory impl validates IVM
-/// correctness; Slice 4 swaps a tier-backed impl over the v2 group KV.
+/// correctness; a tier-backed impl over the group KV will replace it.
 pub(crate) trait JoinStateStore: Send {
     /// Net `weight` into the Z-set for `key`; a row drops at multiplicity ≤ 0.
     fn upsert(&mut self, key: &[ScalarValue], row: &[ScalarValue], weight: i64);
@@ -171,7 +171,7 @@ struct DeltaRow {
     weight: i64,
 }
 
-/// A1-emit Stage 3b INNER/LEFT IVM join operator (two-input: port 0 = left changelog, port 1 = right).
+/// INNER/LEFT IVM join operator (two-input: port 0 = left changelog, port 1 = right).
 pub(crate) struct IncrementalJoinOperator {
     left_keys: Vec<String>,
     right_keys: Vec<String>,

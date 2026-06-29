@@ -259,10 +259,8 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// A1-capture: under `delta_primary` the manifest carries no aggregate state, so rehydrate
-    /// every owned vnode's delta chain into the staging map — the first cycle's
-    /// `apply_rehydrated_vnodes` rebuilds the aggregates from it. Source offsets are already
-    /// staged, so a missing backend is fatal rather than a silent empty-state start.
+    /// Under `delta_primary` the manifest carries no aggregate state; stage each owned vnode's
+    /// delta chain so the first cycle rebuilds aggregates. A missing backend is fatal (offsets staged).
     #[cfg(feature = "cluster")]
     async fn stage_owned_vnodes_for_delta_primary(&self) -> Result<(), DbError> {
         let Some(self_id) = self
@@ -762,7 +760,7 @@ impl LaminarDB {
                             u32::try_from(cp.max_retained.unwrap_or(3)).unwrap_or(u32::MAX);
                         let bounded = chain_max.min(retain.saturating_sub(1)).max(1);
                         graph.set_delta_chain_max(bounded);
-                        // Enabling delta makes the chain the primary agg checkpoint (A1-capture).
+                        // Enabling delta makes the chain the primary aggregate checkpoint.
                         tracing::info!(
                             delta_chain_max = bounded,
                             "delta checkpoints enabled (chain is the primary aggregate checkpoint)"
@@ -818,9 +816,8 @@ impl LaminarDB {
                                 let sender =
                                     crate::state_tier::spawn_worker(&handle, Arc::new(store), 256);
                                 graph.set_state_tier(sender.clone());
-                                // v2 group demotion: turn on agg delta dirty-tracking (no delta
-                                // chain) so idle groups are demotable; demoted groups go to cold-only
-                                // durable partials the coordinator writes + recovery merges back.
+                                // Group demotion: dirty-track agg deltas (no delta chain) so idle groups
+                                // are demotable to cold-only durable partials, merged back on recovery.
                                 if self.config.state_tier_group_demotion {
                                     graph.enable_group_delta_tracking();
                                 }
@@ -1398,8 +1395,8 @@ impl LaminarDB {
                             }
                         }
 
-                        // A1-capture: with delta enabled the manifest holds no aggregate state;
-                        // rebuild aggregates from each owned vnode's delta chain instead.
+                        // With delta enabled the manifest holds no aggregate state; rebuild
+                        // aggregates from each owned vnode's delta chain instead.
                         #[cfg(feature = "cluster")]
                         if !graph_restore_failed
                             && self
@@ -1849,10 +1846,8 @@ impl LaminarDB {
                 }
             }
 
-            // Drive the B2 pre-rotation drain off the actual sinks: an exactly-once
-            // sink can't dedup a rotation duplicate, so a vnode rotation must pause
-            // the source at the checkpoint cut. (The DB-level `delivery_guarantee` is
-            // not set by the server, which configures delivery per sink.)
+            // Drive the pre-rotation drain off the sinks, not the DB-level guarantee (set per sink
+            // by the server): an EO sink can't dedup a rotation dup, so rotation pauses the source.
             let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
             self.rotation_drain_required
                 .store(has_eo_sink, std::sync::atomic::Ordering::Release);

@@ -31,10 +31,10 @@ pub(crate) enum MvStorageMode {
     Aggregate,
     /// Non-aggregate queries: append with bounded retention.
     Append { max_batches: usize },
-    /// Incremental running-state aggregate (A1-emit): maintain a keyed snapshot from a
+    /// Incremental running-state aggregate: maintain a keyed snapshot from a
     /// dirty-only `__weight` changelog. `key_cols` index the GROUP BY columns in the MV schema.
     Upsert { key_cols: Vec<usize> },
-    /// Chained projection/filter over a changelog (A1-emit Stage 2): a Z-set multiset keyed by the
+    /// Chained projection/filter over a changelog: a Z-set multiset keyed by the
     /// full output row, tracking an integer multiplicity. Handles key-dropping projections that
     /// produce duplicate rows; the snapshot emits each row by its multiplicity.
     Multiset,
@@ -48,7 +48,7 @@ impl MvStorageMode {
     }
 }
 
-/// Keyed running snapshot maintained from a `__weight` changelog (A1-emit). Stored rows omit
+/// Keyed running snapshot maintained from a `__weight` changelog. Stored rows omit
 /// the weight column, so the snapshot materializes directly into the plain MV schema.
 struct UpsertState {
     key_cols: Vec<usize>,
@@ -191,9 +191,8 @@ impl UpsertState {
     }
 }
 
-/// Z-set multiset snapshot from a `__weight` changelog (A1-emit Stage 2): keyed by the full output
-/// row with an integer multiplicity. Correct for chained projections/filters over a changelog,
-/// including key-dropping projections whose distinct rows can repeat.
+/// Z-set multiset snapshot from a `__weight` changelog: keyed by the full output row with an
+/// integer multiplicity. Correct for chained projections/filters, including key-dropping ones.
 struct MultisetState {
     row_converter: RowConverter,
     counts: HashMap<OwnedRow, i64>,
@@ -855,7 +854,7 @@ mod tests {
         assert_eq!(snapshot_rows(&store2, "u"), vec![(1, 99), (3, 30)]);
     }
 
-    // ── Multiset (Z-set) mode (Stage 2: chained projections/filters over a changelog) ──
+    // ── Multiset (Z-set) mode: chained projections/filters over a changelog ──
 
     /// Single-column changelog `(v, __weight)` for the key-dropping multiset case.
     fn weight_batch_1col(rows: &[(i64, i64)]) -> RecordBatch {

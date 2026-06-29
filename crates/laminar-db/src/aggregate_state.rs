@@ -595,8 +595,8 @@ pub(crate) struct IncrementalAggState {
     // Groups for these vnodes were dropped; captures stage a cold marker.
     #[cfg(feature = "state-tier")]
     cold_vnodes: rustc_hash::FxHashSet<u32>,
-    // Individual groups demoted to the tier (v2 group granularity): dropped from `groups`, their
-    // bytes resident only in the tier until promoted. A FULL re-base must stream these back.
+    // Individual groups demoted to the tier: dropped from `groups`, their bytes resident only in
+    // the tier until promoted. A FULL re-base must stream these back.
     #[cfg(feature = "state-tier")]
     cold_groups: AHashSet<arrow::row::OwnedRow>,
     // Delta-state tracking: keys mutated / removed since the last per-vnode capture,
@@ -678,7 +678,7 @@ pub(crate) struct GroupEntry {
     pub(crate) last_updated_ms: i64,
 }
 
-/// A per-vnode state delta (Lever 2): the groups changed since the chain base
+/// A per-vnode state delta: the groups changed since the chain base
 /// (columnar, same shape as a `FULL` slice) plus the keys removed (tombstones).
 #[cfg(feature = "cluster")]
 pub(crate) struct AggVnodeDelta {
@@ -861,7 +861,7 @@ impl IncrementalAggState {
             }
         } else if agg_info.where_predicate.is_none() {
             // Changelog source, no WHERE: append the `__weight` passthrough. A WHERE over a
-            // changelog needs retraction-aware filtering (Phase 2) — fall back to the cached plan.
+            // changelog needs retraction-aware filtering — fall back to the cached plan.
             match create_physical_expr(&datafusion_expr::col(WEIGHT_COLUMN), input_df_schema, props)
             {
                 Ok(weight_expr) => {
@@ -2230,7 +2230,7 @@ impl IncrementalAggState {
         self.dirty_vnodes.insert(vnode);
     }
 
-    /// Groups demoted to the tier (v2 group granularity).
+    /// Groups demoted to the tier.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cold_groups(&self) -> &AHashSet<arrow::row::OwnedRow> {
         &self.cold_groups
@@ -2337,7 +2337,7 @@ impl IncrementalAggState {
     }
 
     /// Drop a demoted group from live state after its tier write is confirmed. Tracked in
-    /// `cold_groups` so a FULL re-base streams it back (Slice 4).
+    /// `cold_groups` so a FULL re-base streams it back.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn drop_demoted_group(&mut self, key: &arrow::row::OwnedRow) {
         self.groups.remove(key);
@@ -2408,7 +2408,7 @@ impl IncrementalAggState {
     }
 
     /// Cold groups whose vnode's delta chain has reached `chain_max` — its re-base is deferred
-    /// until they are promoted back (Slice 4). The caller promotes these proactively so the block
+    /// until they are promoted back. The caller promotes these proactively so the block
     /// clears within the `max_retained` prune window. `(key, vnode, group_key_bytes)`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cold_groups_pending_rebase(
@@ -4165,9 +4165,8 @@ mod tests {
         );
     }
 
-    /// v2 group-granular tiering (Slice 2): a clean changelog group encodes, drops from live state
-    /// into `cold_groups`, and promotes back exactly (group state + `last_emitted` dedup), so the
-    /// recovered group re-emits nothing. A dirty group is not demotable.
+    /// A clean changelog group encodes, drops into `cold_groups`, and promotes back exactly
+    /// (group state + `last_emitted` dedup) so it re-emits nothing; a dirty group is not demotable.
     #[cfg(feature = "state-tier")]
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
@@ -4268,8 +4267,8 @@ mod tests {
         assert!(state.groups.is_empty(), "all groups demoted out of memory");
         assert_eq!(state.cold_groups().len(), 3);
 
-        // cold_groups_touched detects a demoted key in an incoming batch (fetch-on-access promotion,
-        // Slice 3): a row for the cold "a" is reported; a never-seen key is not.
+        // cold_groups_touched detects a demoted key in an incoming batch (fetch-on-access
+        // promotion): a row for the cold "a" is reported; a never-seen key is not.
         let probe = RecordBatch::try_new(
             pre_agg_schema(),
             vec![
@@ -4448,9 +4447,8 @@ mod tests {
         assert_eq!(value, ScalarValue::Float64(Some(6.0)));
     }
 
-    /// v2 Slice 4: a vnode with a demoted group must DEFER its FULL re-base (emit a DELTA) so the
-    /// re-base never drops the cold group; once the group is promoted back, the next capture
-    /// re-bases to a FULL again (which now includes it).
+    /// A vnode with a demoted group must DEFER its FULL re-base (emit a DELTA) so the re-base never
+    /// drops the cold group; once the group is promoted back, the next capture re-bases to a FULL.
     #[cfg(feature = "state-tier")]
     #[tokio::test]
     async fn cold_group_defers_full_rebase_until_promoted() {

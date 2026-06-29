@@ -737,7 +737,7 @@ fn build_lookup_projection_sql(
 /// Temp table name the changelog batch is registered under for the enrich-join SQL.
 pub(crate) const CHANGELOG_ENRICH_TMP: &str = "__changelog_enrich_tmp";
 
-/// A1-emit Stage 3a: a `<incremental MV> JOIN <static table>` dimension enrichment.
+/// A `<incremental MV> JOIN <static table>` dimension enrichment.
 pub(crate) struct ChangelogEnrichConfig {
     /// The left (incremental MV / changelog) table the operator consumes from `input_bufs`.
     pub changelog_table: String,
@@ -745,10 +745,8 @@ pub(crate) struct ChangelogEnrichConfig {
     pub projection_sql: String,
 }
 
-/// Detect a single equi-join whose left is an incremental MV (changelog) and right is a static
-/// (non-incremental) table — A1-emit Stage 3a dimension enrichment. Returns the changelog table and
-/// a temp-rewritten join SQL preserving `__weight`. `None` for changelog⋈changelog, asof/temporal/
-/// time-bound joins, aggregates/group-by, or non-single-join shapes.
+/// Detect a single equi-join of an incremental MV (changelog) left and a static table right; returns
+/// the changelog table and a `__weight`-preserving temp-rewritten join SQL, else `None`.
 pub(crate) fn detect_changelog_enrich_query(
     sql: &str,
     incremental_mvs: &FxHashSet<String>,
@@ -792,7 +790,7 @@ pub(crate) fn detect_changelog_enrich_query(
         return None;
     }
     // Left = changelog (incremental MV); right = a static reference/dimension table. The reverse,
-    // a streaming/source right, or both-sides-changelog is a full incremental join (a later phase).
+    // a streaming/source right, or both-sides-changelog is a full incremental join handled elsewhere.
     if !incremental_mvs.contains(&j.left_table) || !static_tables.contains(&j.right_table) {
         return None;
     }
@@ -867,9 +865,8 @@ pub(crate) enum JoinSide {
     Right,
 }
 
-/// One output projection item of an incremental join. Slice 1 supports plain column references
-/// only (wildcards/expressions are a later slice); an `Unqualified` column is resolved against both
-/// side schemas at the operator.
+/// One output projection item of an incremental join. Plain column references only (no wildcards or
+/// expressions); an `Unqualified` column is resolved against both side schemas at the operator.
 #[derive(Debug, Clone)]
 pub(crate) enum JoinProjItem {
     /// `a.col [AS x]` — a column on a known side, plus its optional output alias.
@@ -885,8 +882,8 @@ pub(crate) enum JoinProjItem {
     },
 }
 
-/// A1-emit Stage 3b: a `<incremental MV> JOIN <incremental MV>` two-sided IVM join. The operator
-/// does the weighted Z-set join in Rust, so detection yields a structured config (not rewritten SQL).
+/// A `<incremental MV> JOIN <incremental MV>` two-sided IVM join. The operator does the weighted
+/// Z-set join in Rust, so detection yields a structured config (not rewritten SQL).
 #[derive(Debug, Clone)]
 pub(crate) struct IncrementalJoinConfig {
     pub left_table: String,
@@ -898,11 +895,8 @@ pub(crate) struct IncrementalJoinConfig {
     pub left_outer: bool,
 }
 
-/// Detect a single INNER or LEFT equi-join whose BOTH sides are incremental MVs (changelogs) —
-/// A1-emit Stage 3b. Returns the join keys (left/right ON columns), the output projection, and
-/// whether it is a LEFT outer join. `None` for changelog⋈static (Stage 3a enrich), changelog⋈source,
-/// RIGHT/FULL joins, self-joins, asof/temporal/time-bound joins, aggregates/group-by, a WHERE clause,
-/// wildcards, expression projections, or a non-pure-equi ON clause.
+/// Detect a single INNER or LEFT equi-join whose BOTH sides are incremental MVs (changelogs).
+/// Returns the join keys, output projection, and LEFT-outer flag; `None` for any other shape.
 pub(crate) fn detect_changelog_incremental_join(
     sql: &str,
     incremental_mvs: &FxHashSet<String>,
@@ -929,7 +923,7 @@ pub(crate) fn detect_changelog_incremental_join(
     if select.distinct.is_some()
         || has_group_by
         || select.having.is_some()
-        || select.selection.is_some() // no WHERE yet (Slice 1)
+        || select.selection.is_some() // WHERE unsupported here
         || query.order_by.is_some()
         || query.limit_clause.is_some()
         || query.fetch.is_some()
@@ -956,7 +950,7 @@ pub(crate) fn detect_changelog_incremental_join(
     let left_outer = match j.join_type {
         JoinType::Inner => false,
         JoinType::Left => true,
-        _ => return None, // RIGHT/FULL are later slices.
+        _ => return None, // RIGHT/FULL unsupported.
     };
     // The ON clause must be a pure conjunction of column equalities — a non-equi residual (e.g.
     // `AND a.x > b.y`) is silently dropped by the key extractor, which would emit unfiltered rows.
@@ -985,8 +979,8 @@ pub(crate) fn detect_changelog_incremental_join(
 
     let mut projection = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
-        // Slice 1: explicit column references only. Wildcards (which would yield a duplicate-named
-        // MV schema for the shared join key) and expressions are later slices.
+        // Explicit column references only. Wildcards (which would yield a duplicate-named MV schema
+        // for the shared join key) and expressions are unsupported.
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),

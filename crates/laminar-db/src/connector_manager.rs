@@ -39,9 +39,8 @@ pub(crate) struct StreamRegistration {
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
     pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
-    /// A1-emit: this MV emits a dirty-only changelog into a keyed upsert store. Decided once at
-    /// DDL time (`incremental_emit` flag + terminal non-windowed agg); the operator reads it to
-    /// emit a changelog and the MV store is created in `Upsert` mode.
+    /// Marks this MV to emit a dirty-only changelog into a keyed `Upsert` store. Decided at DDL
+    /// time (`incremental_emit` flag + terminal non-windowed agg); drives operator + store mode.
     pub incremental: bool,
 }
 

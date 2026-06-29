@@ -20,7 +20,7 @@ enum ConnectorKind {
     Sink,
 }
 
-/// A1-emit store decision for a non-windowed MV.
+/// Incremental-emit store decision for a non-windowed MV.
 enum IncEmit {
     /// Keyed running aggregate → keyed upsert snapshot (key = GROUP BY column indices).
     Upsert(Vec<usize>),
@@ -42,7 +42,7 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
     Ok(())
 }
 
-/// A1-emit terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
+/// Terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
 pub(crate) fn incremental_mv_consumer_error(mv: &str, consumer: &str) -> DbError {
     DbError::MaterializedView(format!(
         "[LDB-1300] {consumer} cannot consume incremental materialized view '{mv}': it emits a \
@@ -470,7 +470,7 @@ impl LaminarDB {
             laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
         };
 
-        // A1-emit terminality guard: a sink cannot consume an incremental MV's changelog.
+        // Terminality guard: a sink cannot consume an incremental MV's changelog.
         if matches!(&create.from, laminar_sql::parser::SinkFrom::Table(_))
             && self.is_incremental_mv(&input)
         {
@@ -752,8 +752,8 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
-        // Stage 2: a stream over an incremental MV must net the changelog — an aggregate or a
-        // simple projection/filter; a complex shape (e.g. a join) is rejected until a later phase.
+        // A stream over an incremental MV must net the changelog — an aggregate or a simple
+        // projection/filter; a complex shape (e.g. a join) is rejected.
         self.reject_unsupported_reading_incremental_mv(query_sql, "a stream")
             .await?;
         self.catalog.register_stream(&name_str)?;
@@ -1030,8 +1030,8 @@ impl LaminarDB {
         }
 
         let query_sql = query_sql.to_string();
-        // Stage 2: a chained MV over an incremental MV must net the changelog — an aggregate or a
-        // simple projection/filter; a complex shape (e.g. a join) is rejected until a later phase.
+        // A chained MV over an incremental MV must net the changelog — an aggregate or a simple
+        // projection/filter; a complex shape (e.g. a join) is rejected.
         self.reject_unsupported_reading_incremental_mv(&query_sql, "a materialized view")
             .await?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
@@ -1075,9 +1075,8 @@ impl LaminarDB {
             }
         };
 
-        // A1-emit: an incremental MV emits a dirty-only changelog into a snapshot store (keyed
-        // upsert for aggregates, Z-set multiset for projections/filters). Decide once so the
-        // operator (changelog) and the MV store agree; downstream consumers are guarded above.
+        // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
+        // so the operator and MV store agree (keyed upsert for aggregates, Z-set for proj/filter).
         let inc = self
             .incremental_emit_mode(&query_sql, plan_window.is_some())
             .await;
@@ -1180,10 +1179,8 @@ impl LaminarDB {
         sources
     }
 
-    /// `true` if `name` is an A1-emit incremental MV (operator emits a dirty-only `__weight`
-    /// changelog into a snapshot store). Chained aggregates and simple projections/filters net the
-    /// changelog (Stage 2); complex shapes (joins), sinks, and SUBSCRIBE — which can't yet net
-    /// retractions — are rejected at DDL.
+    /// `true` if `name` is an incremental MV (emits a dirty-only `__weight` changelog into a
+    /// snapshot store). Consumers that can't net retractions are rejected at DDL.
     pub(crate) fn is_incremental_mv(&self, name: &str) -> bool {
         self.connector_manager
             .lock()
@@ -1217,10 +1214,8 @@ impl LaminarDB {
         self.table_store.read().table_names().into_iter().collect()
     }
 
-    /// Stage-2 guard: a query reading an incremental MV must be a shape that nets the retraction
-    /// changelog — an aggregate (retraction-aware) or a simple projection/filter (`__weight`
-    /// pass-through → Z-set multiset). A complex shape (e.g. a join) would mishandle retractions
-    /// and is rejected until a later phase.
+    /// A query reading an incremental MV must net the retraction changelog — an aggregate or a
+    /// simple projection/filter; complex shapes (e.g. joins) mishandle retractions and are rejected.
     async fn reject_unsupported_reading_incremental_mv(
         &self,
         query_sql: &str,
@@ -1229,9 +1224,8 @@ impl LaminarDB {
         let Some(mv) = self.first_incremental_ref(query_sql) else {
             return Ok(());
         };
-        // Aggregate or simple projection/filter (Stage 2), a `changelog ⋈ static dim` enrich join
-        // (Stage 3a), or a `changelog ⋈ changelog` inner IVM join (Stage 3b). Other complex shapes
-        // (LEFT/outer joins, joins with a non-incremental right, etc.) are still rejected.
+        // Allowed: aggregate, simple projection/filter, `changelog ⋈ static dim` enrich, or
+        // `changelog ⋈ changelog` inner IVM join. Other complex shapes (LEFT/outer, etc.) are rejected.
         let inc = self.incremental_mv_names();
         let supported = crate::sql_analysis::detect_changelog_enrich_query(
             query_sql,
@@ -1252,10 +1246,8 @@ impl LaminarDB {
         }
     }
 
-    /// A1-emit store decision for a non-windowed MV: keyed `Upsert` for a keyed running aggregate
-    /// (terminal under `incremental_emit`, or chained over an incremental MV); `Multiset` for a
-    /// projection/filter over a changelog; `None` (full-emit) otherwise. A global aggregate stays
-    /// full-emit (single row) but still nets its source changelog via the aggregate path.
+    /// Store decision for a non-windowed MV: keyed `Upsert` for a keyed aggregate, `Multiset` for a
+    /// projection/filter over a changelog, `None` (full-emit) otherwise (incl. global aggregates).
     async fn incremental_emit_mode(&self, query_sql: &str, has_window: bool) -> IncEmit {
         if has_window {
             return IncEmit::None;
@@ -1284,7 +1276,7 @@ impl LaminarDB {
         if reads_incremental && crate::sql_analysis::extract_projection_filter(plan).is_some() {
             return IncEmit::Multiset;
         }
-        // `changelog ⋈ static dim` enrich join (Stage 3a) → Z-set multiset snapshot.
+        // `changelog ⋈ static dim` enrich join → Z-set multiset snapshot.
         if reads_incremental
             && crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
@@ -1295,7 +1287,7 @@ impl LaminarDB {
         {
             return IncEmit::Multiset;
         }
-        // `changelog ⋈ changelog` inner IVM join (Stage 3b) → Z-set multiset snapshot.
+        // `changelog ⋈ changelog` inner IVM join → Z-set multiset snapshot.
         if reads_incremental
             && crate::sql_analysis::detect_changelog_incremental_join(
                 query_sql,
@@ -1319,10 +1311,8 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         use crate::mv_store::MvStorageMode;
 
-        // A1-emit incremental MVs maintain a snapshot from a dirty-only changelog (keyed upsert for
-        // aggregates, Z-set multiset for projections/filters). Otherwise: non-windowed aggs
-        // replace-all every cycle; windowed aggs append (so previous windows aren't overwritten);
-        // non-aggregates append.
+        // Incremental MVs maintain a snapshot from a dirty-only changelog. Otherwise: non-windowed
+        // aggs replace-all every cycle; windowed aggs append (preserving prior windows), as do non-aggregates.
         let mode = match inc {
             IncEmit::Upsert(key_cols) => MvStorageMode::Upsert { key_cols },
             IncEmit::Multiset => MvStorageMode::Multiset,

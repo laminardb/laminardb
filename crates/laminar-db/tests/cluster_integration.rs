@@ -451,10 +451,8 @@ mod failures {
         harness.shutdown().await;
     }
 
-    // A1-capture, crash path: with the delta chain as the PRIMARY aggregate checkpoint the manifest
-    // carries no aggregate state, so the survivor can only recover the crashed node's keys from the
-    // per-vnode delta chain. Doubled totals (k*10 phase-A + k*10 phase-C) prove the accumulators
-    // came back from the chain, not the manifest.
+    // Delta chain is the PRIMARY aggregate checkpoint; the manifest has none, so the
+    // survivor recovers the crashed node's keys from the per-vnode chain; doubled totals prove it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delta_primary_crash_rehydrates_aggregate_from_chain() {
         let mut harness = ClusterEngineHarness::spawn_delta(N_NODES, VNODE_COUNT, 2).await;
@@ -540,11 +538,8 @@ mod failures {
         harness.shutdown().await;
     }
 
-    // A1-capture, graceful full-cluster restart: every node re-owns its vnodes, but the manifest
-    // carries no aggregate state under delta_primary, so each node must rehydrate its OWN vnodes
-    // from the delta chain (the start_inner staging path — the one the kill-9 soak can't exercise
-    // because a respawned node owns nothing until rebalance). Re-feeding the same keys must DOUBLE
-    // the totals, proving the accumulators survived the restart via the chain.
+    // Graceful full-cluster restart, delta_primary: the manifest holds no aggregate state, so each
+    // node rehydrates its OWN vnodes from the chain (start_inner staging); re-fed keys double.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delta_primary_aggregate_survives_graceful_restart() {
         let mut harness = ClusterEngineHarness::spawn_delta(N_NODES, VNODE_COUNT, 2).await;
@@ -700,10 +695,8 @@ mod rebalance {
         harness.shutdown().await;
     }
 
-    /// B2 barrier-aligned handoff: the draining phase marks a node's to-be-lost
-    /// vnodes draining (so its source pauses them for a clean checkpoint cut)
-    /// WITHOUT changing ownership; the committed phase then rotates and clears the
-    /// drain.
+    /// Barrier-aligned handoff: the draining phase marks to-be-lost vnodes draining (source pauses
+    /// them for a clean cut) without changing ownership; the commit phase rotates and clears it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_watcher_handles_draining_phase() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;

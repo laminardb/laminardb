@@ -78,8 +78,7 @@ impl ClusterEngineHarness {
     }
 
     /// Like `spawn`, with incremental delta checkpoints (`chain_max`). Enabling delta makes the
-    /// per-vnode chain the primary aggregate checkpoint (A1-capture: aggregates skip the whole-node
-    /// manifest capture and recover from the chain).
+    /// per-vnode chain the primary aggregate checkpoint, so aggregates recover from the chain.
     pub async fn spawn_delta(n: usize, vnode_count: u32, chain_max: u32) -> Self {
         let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
         let checkpoint_dirs: Vec<TempDir> = (0..n)
@@ -96,7 +95,7 @@ impl ClusterEngineHarness {
     }
 
     /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`. `delta` is
-    /// `Some(chain_max)` to enable incremental delta checkpoints (A1-capture, chain-primary).
+    /// `Some(chain_max)` to enable incremental delta checkpoints (chain-primary).
     pub async fn spawn_with_dirs(
         n: usize,
         vnode_count: u32,

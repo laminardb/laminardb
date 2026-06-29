@@ -1,5 +1,5 @@
 #![allow(clippy::disallowed_types)]
-//! A1-emit (incremental running-state aggregate) integration tests.
+//! Incremental running-state aggregate integration tests.
 //!
 //! Validates that a terminal non-windowed `GROUP BY` MV under `incremental_emit`:
 //! 1. serves `SELECT * FROM mv` snapshots equal to a full recompute (the upsert store is
@@ -183,8 +183,8 @@ async fn incremental_emit_survives_checkpoint_restart() {
     }
 }
 
-/// Stage 3a: a `changelog ⋈ static dimension` enrich join maintains a correct snapshot under
-/// UPDATES — the dimension enriches each changelog row and the retraction drops the stale row.
+/// A `changelog ⋈ static dimension` enrich join maintains a correct snapshot under UPDATES —
+/// the dimension enriches each changelog row and the retraction drops the stale row.
 #[tokio::test]
 async fn chained_dim_enrich_join_is_correct_under_updates() {
     let dir = tempfile::tempdir().unwrap();
@@ -221,8 +221,8 @@ async fn chained_dim_enrich_join_is_correct_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 2 Phase 1: a chained *aggregate* over an incremental MV nets the retraction changelog
-/// correctly under UPDATES (the value-correctness gate). `SUM(total)` over `{k1:10→15, k2:20}` = 35.
+/// A chained *aggregate* over an incremental MV nets the retraction changelog correctly under
+/// UPDATES (the value-correctness gate). `SUM(total)` over `{k1:10→15, k2:20}` = 35.
 #[tokio::test]
 async fn chained_aggregate_over_incremental_nets_under_updates() {
     let dir = tempfile::tempdir().unwrap();
@@ -258,8 +258,8 @@ async fn chained_aggregate_over_incremental_nets_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 2 Phase 2: a chained projection/filter over an incremental MV maintains a correct
-/// snapshot under UPDATES — the retraction drops the stale row (no accumulation).
+/// A chained projection/filter over an incremental MV maintains a correct snapshot under
+/// UPDATES — the retraction drops the stale row (no accumulation).
 #[tokio::test]
 async fn chained_projection_over_incremental_is_correct_under_updates() {
     let dir = tempfile::tempdir().unwrap();
@@ -294,8 +294,8 @@ async fn chained_projection_over_incremental_is_correct_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 2 guard: chained aggregates AND simple projections/filters over an incremental MV are
-/// allowed (they net the changelog); a complex shape (join) and a sink are rejected.
+/// Guard: chained aggregates AND simple projections/filters over an incremental MV are allowed
+/// (they net the changelog); a complex shape (join) and a sink are rejected.
 #[tokio::test]
 async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
     let dir = tempfile::tempdir().unwrap();
@@ -314,7 +314,7 @@ async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
         .await
         .expect("chained projection stream is allowed (Phase 2)");
 
-    // A join over the changelog (complex shape) is rejected — a later phase.
+    // A join over the changelog (complex shape) is rejected — not yet supported.
     let join = db
         .execute(
             "CREATE MATERIALIZED VIEW j AS SELECT agg.k FROM agg JOIN events ON agg.k = events.k",
@@ -337,8 +337,8 @@ async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 3b: an inner `changelog ⋈ changelog` IVM join over TWO incremental MVs maintains a correct
-/// snapshot under UPDATES on BOTH sides — the δA⋈B + A⋈δB netting drops stale joined rows.
+/// An inner `changelog ⋈ changelog` IVM join over TWO incremental MVs maintains a correct snapshot
+/// under UPDATES on BOTH sides — the δA⋈B + A⋈δB netting drops stale joined rows.
 #[tokio::test]
 async fn incremental_join_over_two_changelogs_nets_both_sides() {
     let dir = tempfile::tempdir().unwrap();
@@ -382,9 +382,8 @@ async fn incremental_join_over_two_changelogs_nets_both_sides() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 3b: an incremental join survives checkpoint → restart. The post-restart UPDATE only nets
-/// correctly if the operator's per-side Z-set state was restored (else the stale joined row would
-/// persist — the divergence the checkpoint prevents).
+/// An incremental join survives checkpoint → restart: the post-restart UPDATE only nets correctly
+/// if the operator's per-side Z-set state was restored (else the stale joined row persists).
 #[tokio::test]
 async fn incremental_join_survives_checkpoint_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -446,8 +445,8 @@ async fn incremental_join_survives_checkpoint_restart() {
     }
 }
 
-/// Stage 3b: a LEFT outer `changelog ⋈ changelog` join NULL-pads unmatched left rows and tracks
-/// the pad↔inner transition as right matches come and go.
+/// A LEFT outer `changelog ⋈ changelog` join NULL-pads unmatched left rows and tracks the
+/// pad↔inner transition as right matches come and go.
 #[tokio::test]
 async fn left_outer_incremental_join_nullpads_unmatched_left() {
     let dir = tempfile::tempdir().unwrap();
@@ -494,8 +493,8 @@ async fn left_outer_incremental_join_nullpads_unmatched_left() {
     db.shutdown().await.unwrap();
 }
 
-/// Stage 3b guard: inner and LEFT `changelog ⋈ changelog` joins are allowed; a RIGHT/outer join (a
-/// later slice) and a `changelog ⋈ source` join stay rejected.
+/// Guard: inner and LEFT `changelog ⋈ changelog` joins are allowed; a RIGHT/outer join and a
+/// `changelog ⋈ source` join stay rejected.
 #[tokio::test]
 async fn incremental_join_guard_allows_inner_left_rejects_right_and_source() {
     let dir = tempfile::tempdir().unwrap();

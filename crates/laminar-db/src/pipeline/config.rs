@@ -57,9 +57,8 @@ pub struct PipelineConfig {
     /// What to do when either cap is exceeded.
     pub backpressure_policy: BackpressurePolicy,
 
-    /// Isolate queries that share a source into independent failure domains (1B Phase 2).
-    /// Off: shared-source queries fault and recover together (1B v1). On: a fault in one
-    /// shared-source query holds back only its offset; siblings commit and advance.
+    /// Isolate queries that share a source into independent failure domains.
+    /// Off: they fault and recover together; on: a fault holds back only its own offset.
     pub shared_source_isolation: bool,
 
     /// Per-source cap on the in-memory replay buffer used by `shared_source_isolation`.
