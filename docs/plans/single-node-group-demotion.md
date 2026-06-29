@@ -3,8 +3,10 @@
 Status: **DONE 2026-06-28.** Cold-only artifact recovery (`7c9781c2`) + restart integration test
 (`single_node_group_demotion_survives_restart`); embedded kill-9 soak GREEN (`02ab972a` —
 `embedded_kill9_group_demotion_soak`, 39 rounds/4 kills, cold-only partials rehydrate under SIGKILL); and
-the topology-scoped default flip (`c7259d94` — embedded server defaults group demotion ON, cluster stays
-OFF/vnode pending the shuffle-barrier fix). 839 state-tier lib + 47 server config + vnode-demotion tests
+the topology-scoped default (`group_demotion(embedded)` — embedded server defaults group demotion ON,
+cluster stays OFF/vnode-granular pending the cluster correctness/soak gaps in
+`docs/plans/state-tier-hardening-followups.md`; the interim cluster-ON flip `57c34251` was reverted
+0.28.0). 839 state-tier lib + 47 server config + vnode-demotion tests
 pass; clippy/fmt clean on state-tier + cluster + non-state-tier. Branch
 `feat/shuffle-barrier-after-kill-recovery`. Goal (DONE): v2 group-granular demotion fires, survives kill-9,
 and is the default for embedded single-node.

@@ -1,6 +1,9 @@
 # Tiered state v2 — group-granularity demotion (prerequisite for IVM join state)
 
-Status: **planned (2026-06-27)**, cold-start ready. Branch `feat/shuffle-barrier-after-kill-recovery`.
+Status: **Slices 1–6 implemented & committed (2026-06-28); default ON embedded / OFF cluster.**
+Cluster group-demotion correctness/soak hardening tracked in
+`docs/plans/state-tier-hardening-followups.md`. Branch `feat/shuffle-barrier-after-kill-recovery`.
+(See the Implementation-status section below; the original "planned" header predated the slices.)
 Driver: A1-emit Stage 3b (`changelog ⋈ changelog` incremental join) needs **per-join-key** state with
 spill-to-disk; the v1 tier is vnode-blob granularity only. Owner decision: **build tiered-state v2
 (group granularity) first, then the join on top** (v2 also unblocks skew-proof aggregate demotion).
@@ -116,7 +119,14 @@ Slices 1–5 implemented, unit-tested, committed (`feat/shuffle-barrier-after-ki
   operator+graph, `maybe_demote_state` group path, `state_tier_group_demotion` config flag,
   default-OFF). Builder setter + server-config plumbing + soak knob added for S6.
 
-**KEY FINDING (S6): group demotion currently requires DELTA checkpoints, which are wired
+**KEY FINDING (S6) — SUPERSEDED 2026-06-28.** Single-node group demotion was subsequently
+implemented (cold-only-artifact recovery, `7c9781c2`; embedded kill-9 soak `02ab972a`; restart test
+`single_node_group_demotion_survives_restart`) — see `docs/plans/single-node-group-demotion.md`. The
+shuffle-barrier-after-kill bug is also fixed (`dd35291c`). Current default: group demotion ON for
+embedded single-node, OFF for cluster (the cluster group path's remaining correctness/soak gaps are
+tracked in `docs/plans/state-tier-hardening-followups.md`). The original finding, kept for history:
+
+**group demotion currently requires DELTA checkpoints, which are wired
 CLUSTER-ONLY.** `demotable_groups`/`is_group_dirty` rely on the delta dirty-tracking
 (`dirty_keys_by_vnode` + `delta_vnode_count`), enabled by `enable_delta_checkpoints`, which is
 gated on `cluster_shuffle` (`operator_graph.rs`). So:

@@ -72,6 +72,12 @@ log_level = "info"
 # tier's demoted state is replayed from it on restart, so an `in_process`
 # backend is rejected. Set a memory budget too, or nothing is demoted.
 # state_tier_dir = "/var/lib/laminardb/state-tier"
+# Demote at GROUP granularity (shed individual idle aggregate groups) instead of
+# whole idle vnodes. Requires the cold tier. Unset defaults ON for embedded
+# single-node (kill-9-soaked) and OFF for cluster (the cluster group path has
+# open correctness gaps; it stays vnode-granular). Set true to force it on either
+# topology, false to force vnode-granular.
+# state_tier_group_demotion = true
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.
