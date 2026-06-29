@@ -101,22 +101,23 @@ with `LAMINAR_SOAK_STATE_TIER_GROUP` before adding format complexity. **Effort:*
 
 ## Test / acceptance-gate gaps
 
-- **Cluster exact-value correctness test (MEDIUM) — PARTIALLY DONE.** The cluster soaks assert only
-  commit progress, epoch monotonicity, `demotes>0 && fetches>0`, and EO sink density — never aggregate
-  VALUES. `ClusterEngineHarness` now supports the cold tier (`spawn_delta_tier`, `tier_budget` param,
-  `incremental_emit` when tiered), and two deterministic exact-value tests landed in
-  `cluster_integration.rs::failures` (commits `8f204b99`, `5ce023e2`), both green + stable:
+- **Cluster exact-value correctness test (MEDIUM) — DONE.** The cluster soaks assert only commit
+  progress, epoch monotonicity, `demotes>0 && fetches>0`, and EO sink density — never aggregate VALUES.
+  `ClusterEngineHarness` now supports the cold tier (`spawn_delta_tier`, `tier_budget` param,
+  `incremental_emit` when tiered), and **three** deterministic exact-value tests landed in
+  `cluster_integration.rs::failures` (commits `8f204b99`, `5ce023e2`, `3941bf08`), all green + stable
+  (~2-8s, CI-runnable, not `#[ignore]`):
   - `cluster_group_demotion_preserves_aggregate_values` — steady-state: 2-node cluster, tiny budget,
     demote → promote, union per-key totals == analytic expectation.
   - `cluster_demoted_groups_survive_crash_failover` — a follower demotes, then crashes; the survivor
-    must rehydrate the demoted groups from the durable delta chain (re-fed keys double).
-  **REMAINING (the highest-value sub-case): the lose-then-REACQUIRE rotation.** The `7528e24a`-class
-  revoked-vnode double-count fires only when a node loses a vnode and **reacquires** it (additive merge
-  on stale state) — neither test above moves a vnode back to a node that already held it. Add a third
-  test using the `rebalance` module's rotation (`RotateOutcome`) to revoke a vnode from a node with
-  demoted groups and rotate it back, asserting no double-count. Note C2's prune race (deferred re-base
-  past the horizon) did NOT trigger with only 2 checkpoints — a variant that drives many checkpoints to
-  age the chain base is needed to exercise C2 deterministically.
+    rehydrates the demoted groups from the durable delta chain (re-fed keys double).
+  - `cluster_demoted_group_survives_lose_then_reacquire` — the `7528e24a` class: a vnode with a demoted
+    group rotates off its node and back; the revoke path must drop A's resident + cold tracking before
+    re-acquire rehydrates the chain (asserts A's total is single-counted, not doubled).
+  None of these reproduced C1 or C2 (C1 needs the alignment-drain timing window; C2 needs the chain
+  base aged past the prune horizon). **Remaining sub-case (LOW, for Phase 2 validation):** a
+  many-checkpoint variant that drives `delta_chain_len` past `chain_max` with a vnode holding cold
+  groups, to exercise C2's deferred-rebase prune race deterministically.
 - **Kill-9 + group-demotion + EO-Kafka soak (HIGH-value, S).** The 3/3 green cluster group soak used
   the built-in generator (file://), not the EO Kafka sink. Demotion/promotion mutate the same per-vnode
   delta artifacts EO recovery replays. Run `three_node_kill9_soak` with
