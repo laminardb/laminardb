@@ -843,6 +843,209 @@ mod failures {
         }
         harness.shutdown().await;
     }
+
+    /// Lose-then-REACQUIRE of a vnode whose aggregate group was demoted to the cold tier must not
+    /// double-count on re-acquire (the `7528e24a` class) and must not lose the group. Node A
+    /// (follower) owns V, demotes idle groups and durably folds them into V's delta chain; V then
+    /// moves to B (leader) and back to A. On revoke, `drop_vnodes` must purge A's resident AND cold
+    /// tracking for V before the additive `merge_groups` rehydrates the chain — otherwise re-acquire
+    /// merges the chain onto A's stale state and doubles its totals. Read-back is on A (the final
+    /// owner) only, isolating the operator-state property from any cross-node MV cleanup concern.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_demoted_group_survives_lose_then_reacquire() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
+        use laminar_core::state::NodeId;
+
+        let mut harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let leader_idx = harness.leader_idx(); // B: temporarily gains V
+        let follower_idx = harness.follower_idxs()[0]; // A: holds V, demotes, loses then reacquires
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners = vec![
+            (
+                harness.nodes[leader_idx].instance_id,
+                harness.nodes[leader_idx].owned_vnodes(),
+            ),
+            (
+                harness.nodes[follower_idx].instance_id,
+                harness.nodes[follower_idx].owned_vnodes(),
+            ),
+        ];
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
+        let leader_keys = key_buckets[0].1.clone();
+        let follower_keys = key_buckets[1].1.clone();
+        let phase_a: Vec<i64> = leader_keys.iter().chain(&follower_keys).copied().collect();
+
+        // K is a non-zero follower key (so a doubled total is detectable); V is the vnode it hashes to.
+        let k: i64 = *follower_keys
+            .iter()
+            .find(|&&x| x != 0)
+            .expect("a non-zero follower key");
+        let v: u32 = super::cluster_harness::vnode_for_key(k, VNODE_COUNT);
+        assert!(
+            harness.nodes[follower_idx].owned_vnodes().contains(&v),
+            "precondition: follower (A) owns V={v} for K={k}",
+        );
+        let node_a = NodeId(harness.nodes[follower_idx].instance_id.0);
+        let node_b = NodeId(harness.nodes[leader_idx].instance_id.0);
+        let store: Arc<AssignmentSnapshotStore> =
+            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
+
+        // Seed durable demoted state: feed all keys with idle gaps → checkpoint (clean baseline +
+        // delta seed) → wait for A to demote → checkpoint AGAIN so the cold-only partial folds into
+        // V's chain. Without the second checkpoint, re-acquire rehydrates nothing → loss, not a fix.
+        const ROUNDS: i64 = 3;
+        for _ in 0..ROUNDS {
+            harness.nodes[leader_idx]
+                .db
+                .source_untyped("src")
+                .expect("src")
+                .push_arrow(input_batch(&phase_a))
+                .expect("push round");
+            sleep(Duration::from_millis(150)).await;
+        }
+        harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint phase_a");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while harness.nodes[follower_idx].db.tier_metrics().demote_total == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "follower (A) never demoted a group before the rotation",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+        harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint post-demote");
+        sleep(Duration::from_millis(300)).await;
+
+        // (1) LOSE: move ONLY V from A -> B, preserving every other vnode->owner mapping.
+        let seed = store.load().await.unwrap().unwrap();
+        let mut vnodes: BTreeMap<u32, NodeId> = seed
+            .to_vnode_vec(VNODE_COUNT)
+            .into_iter()
+            .enumerate()
+            .map(|(i, owner)| (i as u32, owner))
+            .collect();
+        vnodes.insert(v, node_b);
+        let moved = seed.next(vnodes);
+        let v_moved = moved.version;
+        assert!(matches!(
+            store.save_if_version(&moved, seed.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness
+            .nodes
+            .iter()
+            .all(|n| n.vnode_registry.assignment_version() >= v_moved)
+        {
+            assert!(Instant::now() < deadline, "nodes never adopted the A->B move");
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            harness.nodes[follower_idx]
+                .owned_vnodes()
+                .iter()
+                .all(|&x| x != v),
+            "A must drop V",
+        );
+        // Let A run cycles so apply_revoked_vnodes drains pending_revoke (drop_vnodes purges V).
+        sleep(Duration::from_millis(600)).await;
+
+        // (2) REACQUIRE: move V back B -> A (exercises the revoked-state-drop-then-rehydrate path).
+        let seed2 = store.load().await.unwrap().unwrap();
+        let mut vnodes2: BTreeMap<u32, NodeId> = seed2
+            .to_vnode_vec(VNODE_COUNT)
+            .into_iter()
+            .enumerate()
+            .map(|(i, owner)| (i as u32, owner))
+            .collect();
+        vnodes2.insert(v, node_a);
+        let back = seed2.next(vnodes2);
+        let v_back = back.version;
+        assert!(matches!(
+            store.save_if_version(&back, seed2.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness
+            .nodes
+            .iter()
+            .all(|n| n.vnode_registry.assignment_version() >= v_back)
+        {
+            assert!(Instant::now() < deadline, "nodes never adopted the B->A move-back");
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            harness.nodes[follower_idx].owned_vnodes().contains(&v),
+            "A must re-acquire V",
+        );
+        // Let A run cycles so apply_rehydrated_vnodes folds the durable chain onto now-empty V.
+        sleep(Duration::from_millis(600)).await;
+
+        // (3) Re-feed K once → shuffles to V's owner (A); A re-emits its rehydrated changelog.
+        harness.nodes[leader_idx]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&[k]))
+            .expect("push K re-feed");
+
+        // K fed ROUNDS times pre-rotation + once after re-acquire. A double-count (chain merged onto
+        // un-dropped state) shows ~2x; a lost group shows < expected.
+        let expected_k = k * 10 * (ROUNDS + 1);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let got_k: i64 = read_mv_sums(&harness.nodes[follower_idx].db, "sums")
+                .await
+                .into_iter()
+                .filter(|(kk, _)| *kk == k)
+                .map(|(_, t)| t)
+                .sum();
+            if got_k == expected_k {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "K total after lose-then-reacquire wrong: got {got_k}, want {expected_k} \
+                 (double-count or loss across the rotation)",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        // A sibling key on a vnode that never moved must be unchanged (single-counted).
+        let sibling: i64 = *leader_keys
+            .iter()
+            .find(|&&x| x != 0)
+            .expect("a non-zero leader key");
+        let sib_total: i64 = read_mv_sums(&harness.nodes[leader_idx].db, "sums")
+            .await
+            .into_iter()
+            .filter(|(kk, _)| *kk == sibling)
+            .map(|(_, t)| t)
+            .sum();
+        assert_eq!(
+            sib_total,
+            sibling * 10 * ROUNDS,
+            "untouched sibling key changed across the rotation",
+        );
+
+        harness.shutdown().await;
+    }
 }
 
 mod rebalance {
