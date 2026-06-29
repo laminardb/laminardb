@@ -1275,6 +1275,35 @@ impl GraphOperator for SqlQueryOperator {
         if matches!(self.state, QueryState::Uninit) {
             self.lazy_init().await?;
         }
+        // Peer rows arriving during checkpoint barrier alignment (or pre-staged before it) must NOT
+        // fold a demoted vnode/group straight back in: `process_batch` would rebuild a fresh zeroed
+        // accumulator while the authoritative state sits in the cold tier, corrupting the aggregate.
+        // Mirror the steady-state path — defer any batch touching cold state for fetch-on-access.
+        #[cfg(feature = "state-tier")]
+        if self.promotion.is_some() {
+            let (num_group_cols, cold) = match self.state {
+                QueryState::Agg(ref agg) => (agg.num_group_cols(), agg.cold_vnodes().clone()),
+                _ => (0, FxHashSet::default()),
+            };
+            let touched = cold_vnodes_touched(&batch, num_group_cols, self.vnode_count, &cold);
+            let touched_groups = if let QueryState::Agg(ref agg) = self.state {
+                agg.cold_groups_touched(&batch, self.vnode_count)?
+            } else {
+                Vec::new()
+            };
+            if !touched.is_empty() || !touched_groups.is_empty() {
+                if let Some(p) = self.promotion.as_mut() {
+                    for v in touched {
+                        p.issue_fetch(v);
+                    }
+                    for (key, vnode, group) in touched_groups {
+                        p.issue_fetch_group(key, vnode, group);
+                    }
+                    p.defer(watermark, batch);
+                }
+                return Ok(());
+            }
+        }
         if let QueryState::Agg(ref mut agg) = self.state {
             agg.process_batch(&batch, watermark)?;
         }
@@ -2115,6 +2144,70 @@ mod promotion_tests {
             None,
             "nothing deferred after promotion"
         );
+    }
+
+    /// C1 regression: a peer batch arriving via `ingest_shuffle` (the checkpoint barrier-alignment
+    /// drain) for a DEMOTED vnode must DEFER for fetch-on-access promotion — exactly like the
+    /// steady-state `process` path — not fold straight into `process_batch`, which would rebuild a
+    /// fresh zeroed accumulator while the authoritative state sits in the tier (a silent lost-update
+    /// or, at the next capture, a double-count). The same branch covers demoted groups
+    /// (`cold_groups_touched`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_shuffle_defers_row_for_demoted_vnode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
+        );
+        let tier_tx = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::clone(&store),
+            64,
+        );
+        let mut op = build_op(tier_tx).await;
+
+        // Establish a=1, b=2, c=3, then capture the clean baseline + demote every vnode to the tier.
+        op.process(&[vec![events_batch(&["a", "b", "c"], &[1, 2, 3])]], &[10])
+            .await
+            .unwrap();
+        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
+        for (v, slice) in &staged {
+            if let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice {
+                store.put("out", *v, bytes.as_ref()).unwrap();
+            }
+        }
+        for &v in staged.keys() {
+            assert!(op.demote_vnode(v, VNODES), "clean vnode must demote");
+        }
+        assert_eq!(op.estimated_state_bytes(), 0, "all groups demoted");
+
+        // A peer row for 'a' arrives via ingest_shuffle (as it would mid barrier-alignment). With the
+        // fix it DEFERS (holds the watermark); the buggy path would fold it in and emit immediately.
+        op.ingest_shuffle("out", events_batch(&["a"], &[5]), 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            op.watermark_hold(),
+            Some(20),
+            "ingest_shuffle must defer a row touching a demoted vnode, not fold it into a fresh acc",
+        );
+
+        // Idle cycles drive the promotion fetch + replay: 'a' must reflect restored 1 + new 5 = 6.
+        // A recreated-from-scratch 'a' would read 5; a double-count would read 7.
+        let mut final_a = None;
+        for _ in 0..200 {
+            let out = op.process(&[vec![]], &[30]).await.unwrap();
+            if let Some(&t) = inserts(&out).get("a") {
+                final_a = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            final_a,
+            Some(6),
+            "ingest_shuffle deferred row replayed onto the promoted slice: 1 + 5",
+        );
+        assert_eq!(op.watermark_hold(), None, "nothing deferred after promotion");
     }
 
     /// A checkpoint taken while a row is deferred for promotion must carry
