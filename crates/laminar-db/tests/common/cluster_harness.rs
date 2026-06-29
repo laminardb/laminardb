@@ -74,7 +74,7 @@ impl ClusterEngineHarness {
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs, None).await
+        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs, None, None).await
     }
 
     /// Like `spawn`, with incremental delta checkpoints (`chain_max`). Enabling delta makes the
@@ -90,18 +90,45 @@ impl ClusterEngineHarness {
             shared_state_dir,
             checkpoint_dirs,
             Some(chain_max),
+            None,
+        )
+        .await
+    }
+
+    /// Like `spawn_delta`, but also opens a per-node cold tier with `budget_bytes` and group
+    /// demotion ON. Group demotion needs the delta chain, so `chain_max` enables it (chain-primary).
+    #[cfg(feature = "state-tier")]
+    pub async fn spawn_delta_tier(
+        n: usize,
+        vnode_count: u32,
+        chain_max: u32,
+        budget_bytes: usize,
+    ) -> Self {
+        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
+        let checkpoint_dirs: Vec<TempDir> = (0..n)
+            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
+            .collect();
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            Some(chain_max),
+            Some(budget_bytes),
         )
         .await
     }
 
     /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`. `delta` is
-    /// `Some(chain_max)` to enable incremental delta checkpoints (chain-primary).
+    /// `Some(chain_max)` to enable incremental delta checkpoints (chain-primary); `tier_budget` is
+    /// `Some(bytes)` to open a per-node cold tier with group demotion ON (needs `delta`).
     pub async fn spawn_with_dirs(
         n: usize,
         vnode_count: u32,
         shared_state_dir: TempDir,
         checkpoint_dirs: Vec<TempDir>,
         delta: Option<u32>,
+        tier_budget: Option<usize>,
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
@@ -181,6 +208,9 @@ impl ClusterEngineHarness {
                 data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
                 delta_chain_max: delta,
+                // The cold tier only demotes changelog aggregates; enable incremental emit so the
+                // tier test's GROUP BY becomes one (a no-op for non-tier callers).
+                incremental_emit: tier_budget.is_some(),
                 ..StreamCheckpointConfig::default()
             };
 
@@ -188,7 +218,7 @@ impl ClusterEngineHarness {
             // `block_on`s internally and panics inside a tokio runtime.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
 
-            let db = LaminarDB::builder()
+            let mut builder = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
                 .checkpoint(cp_cfg)
                 .cluster_controller(Arc::clone(&nh.controller))
@@ -199,11 +229,16 @@ impl ClusterEngineHarness {
                 .decision_store(Arc::clone(&decision_store))
                 .assignment_snapshot_store(Arc::clone(&snapshot_store))
                 // Mirror production: DataFusion partitions track vnode count.
-                .target_partitions(vnode_count as usize)
-                .build()
-                .await
-                .expect("LaminarDB::builder().build()");
-            let db = Arc::new(db);
+                .target_partitions(vnode_count as usize);
+            // Per-node cold tier (node-local, wiped on restart). Group demotion ON.
+            #[cfg(feature = "state-tier")]
+            if let Some(budget) = tier_budget {
+                builder = builder
+                    .state_tier_dir(checkpoint_dirs[idx].path().join("state-tier"))
+                    .state_memory_budget_bytes(budget)
+                    .state_tier_group_demotion(true);
+            }
+            let db = Arc::new(builder.build().await.expect("LaminarDB::builder().build()"));
 
             node_runtimes.push(NodeRuntime {
                 db,

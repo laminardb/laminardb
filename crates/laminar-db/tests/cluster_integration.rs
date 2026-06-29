@@ -233,6 +233,7 @@ mod failures {
             shared_dir,
             cp_dirs2,
             None,
+            None,
         )
         .await;
         let assignment_b: Vec<super::cluster_harness::NodeIdView> = harness_b
@@ -586,7 +587,7 @@ mod failures {
         // Graceful full-cluster restart, delta_primary still on.
         let (shared, cp_dirs) = harness.shutdown_keep_dirs().await;
         let mut harness =
-            ClusterEngineHarness::spawn_with_dirs(N_NODES, VNODE_COUNT, shared, cp_dirs, Some(2))
+            ClusterEngineHarness::spawn_with_dirs(N_NODES, VNODE_COUNT, shared, cp_dirs, Some(2), None)
                 .await;
         for node in &harness.nodes {
             setup_query(&node.db).await;
@@ -620,6 +621,110 @@ mod failures {
             );
             sleep(Duration::from_millis(200)).await;
         }
+        harness.shutdown().await;
+    }
+
+    /// Exact-value correctness under cluster GROUP demotion. A deterministic keyed SUM workload run
+    /// across a 2-node cluster with a tiny per-node budget (idle groups demote to the cold tier;
+    /// re-touched ones promote back) must produce the same per-key totals as the analytic
+    /// expectation. This is the exact-value guarantee the kill-9 soaks omit — they assert only
+    /// demote/promote counters + EO density, so a wrong-value regression (e.g. a demoted group
+    /// recreated with a fresh accumulator) would pass them. Keys span both owners so cross-node
+    /// shuffle exercises the demote↔promote path under checkpoint barrier alignment.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_group_demotion_preserves_aggregate_values() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        // chain_max=2 enables the delta chain (group demotion needs it); 2 KiB/node forces demotion.
+        let mut harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners: Vec<_> = harness
+            .nodes
+            .iter()
+            .map(|n| (n.instance_id, n.owned_vnodes()))
+            .collect();
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
+        let all_keys: Vec<i64> = key_buckets
+            .iter()
+            .flat_map(|(_, ks)| ks.iter().copied())
+            .collect();
+        let leader = harness.leader_idx();
+
+        // Three rounds over every key with idle gaps (so clean groups become demotable), then a
+        // checkpoint to mark them clean — the demotion precondition + delta-tracking seed.
+        const ROUNDS: i64 = 3;
+        for _ in 0..ROUNDS {
+            harness.nodes[leader]
+                .db
+                .source_untyped("src")
+                .expect("src")
+                .push_arrow(input_batch(&all_keys))
+                .expect("push round");
+            sleep(Duration::from_millis(150)).await;
+        }
+        harness.nodes[leader]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint");
+
+        let demotes = |h: &ClusterEngineHarness| -> u64 {
+            h.nodes
+                .iter()
+                .map(|n| n.db.tier_metrics().demote_total)
+                .sum()
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while demotes(&harness) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "cluster group demotion never fired (tier never shed an idle group)",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        // Re-touch the first half once more → demoted groups promote back (fetch-on-access) and bump.
+        let half: Vec<i64> = all_keys.iter().take(all_keys.len() / 2).copied().collect();
+        harness.nodes[leader]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&half))
+            .expect("push promote round");
+
+        // value = key*10; fed ROUNDS times, plus once more for the re-touched half.
+        let mut expected: HashMap<i64, i64> =
+            all_keys.iter().map(|&k| (k, k * 10 * ROUNDS)).collect();
+        for &k in &half {
+            *expected.get_mut(&k).expect("half ⊆ all_keys") += k * 10;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let got: HashMap<i64, i64> = union_sums(&harness).await.into_iter().collect();
+            if got == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cluster group demotion changed aggregate values (demotes={}): {:?}",
+                demotes(&harness),
+                expected
+                    .iter()
+                    .filter(|(k, v)| got.get(k) != Some(v))
+                    .map(|(k, v)| (*k, *v, got.get(k).copied()))
+                    .take(10)
+                    .collect::<Vec<_>>(),
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+        assert!(demotes(&harness) > 0, "demote/promote path must be exercised");
         harness.shutdown().await;
     }
 }
