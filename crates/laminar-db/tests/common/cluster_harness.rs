@@ -218,6 +218,7 @@ impl ClusterEngineHarness {
             // `block_on`s internally and panics inside a tokio runtime.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
 
+            #[cfg_attr(not(feature = "state-tier"), allow(unused_mut))]
             let mut builder = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
                 .checkpoint(cp_cfg)
