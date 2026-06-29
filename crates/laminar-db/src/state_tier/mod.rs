@@ -91,14 +91,6 @@ impl StateTierStore {
         k
     }
 
-    /// Prefix matching every group of `(operator, vnode)` — the vnode key plus the NUL boundary,
-    /// which excludes the vnode-blob key itself (it has no trailing NUL).
-    fn group_prefix(operator: &str, vnode: u32) -> Vec<u8> {
-        let mut k = Self::key(operator, vnode);
-        k.push(0);
-        k
-    }
-
     fn put_key(&self, key: &[u8], bytes: &[u8]) -> Result<(), DbError> {
         let old_len = self
             .slices
@@ -172,7 +164,6 @@ impl StateTierStore {
     }
 
     /// Store a single demoted group. `group` is the group-key bytes.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn put_group(
         &self,
         operator: &str,
@@ -184,7 +175,6 @@ impl StateTierStore {
     }
 
     /// Fetch one demoted group for promotion. `None` if not resident.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get_group(
         &self,
         operator: &str,
@@ -195,7 +185,6 @@ impl StateTierStore {
     }
 
     /// Remove one demoted group after promotion or eviction.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remove_group(
         &self,
         operator: &str,
@@ -203,26 +192,6 @@ impl StateTierStore {
         group: &[u8],
     ) -> Result<(), DbError> {
         self.remove_key(&Self::group_key(operator, vnode, group))
-    }
-
-    /// All demoted groups of `(operator, vnode)` as `(group_key_bytes, value)`. Used by a FULL
-    /// re-base to stream the cold portion back before serializing the whole vnode.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn scan_groups(
-        &self,
-        operator: &str,
-        vnode: u32,
-    ) -> Result<Vec<(Vec<u8>, Bytes)>, DbError> {
-        let prefix = Self::group_prefix(operator, vnode);
-        let mut out = Vec::new();
-        for guard in self.slices.prefix(&prefix) {
-            let (k, v) = guard
-                .into_inner()
-                .map_err(|e| DbError::Storage(format!("state tier scan: {e}")))?;
-            let group = k.get(prefix.len()..).unwrap_or_default().to_vec();
-            out.push((group, Bytes::copy_from_slice(&v)));
-        }
-        Ok(out)
     }
 
     pub(crate) fn logical_bytes(&self) -> i64 {

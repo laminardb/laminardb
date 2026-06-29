@@ -586,6 +586,10 @@ pub(crate) struct IncrementalAggState {
     // None = no per-vnode capture yet; dirty tracking is off.
     #[cfg(feature = "state-tier")]
     tier_vnode_count: Option<u32>,
+    // Highest watermark seen by `process_batch` — the reference for the idle-TTL demotion cutoff
+    // (a group already past the cutoff must be retracted by `evict_idle`, never demoted).
+    #[cfg(feature = "state-tier")]
+    last_watermark_ms: i64,
     // Vnodes touched since the last capture; demoting them would lose changes.
     #[cfg(feature = "state-tier")]
     dirty_vnodes: rustc_hash::FxHashSet<u32>,
@@ -948,6 +952,8 @@ impl IncrementalAggState {
             #[cfg(feature = "state-tier")]
             tier_vnode_count: None,
             #[cfg(feature = "state-tier")]
+            last_watermark_ms: i64::MIN,
+            #[cfg(feature = "state-tier")]
             dirty_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "state-tier")]
             dirty_all: false,
@@ -1077,6 +1083,11 @@ impl IncrementalAggState {
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
+        }
+
+        #[cfg(feature = "state-tier")]
+        {
+            self.last_watermark_ms = self.last_watermark_ms.max(watermark_ms);
         }
 
         if self.num_group_cols == 0 {
@@ -2391,10 +2402,19 @@ impl IncrementalAggState {
         {
             return Vec::new();
         }
+        // With an idle TTL, a group already past the eviction cutoff must be RETRACTED by
+        // `evict_idle`, not demoted: a demoted group is dropped from `groups`, so `evict_idle` can no
+        // longer see it → the downstream changelog row leaks past the TTL and its cold-tier entry is
+        // never reclaimed. Only demote groups that are idle but still within the TTL window.
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff = self
+            .idle_ttl_ms
+            .map(|ttl| self.last_watermark_ms.saturating_sub(ttl as i64));
         let mut cand: Vec<(i64, &arrow::row::OwnedRow)> = self
             .groups
             .iter()
             .filter(|(k, _)| !self.is_group_dirty(k, vnode_count))
+            .filter(|(_, e)| cutoff.is_none_or(|c| e.last_updated_ms >= c))
             .map(|(k, e)| (e.last_updated_ms, k))
             .collect();
         cand.sort_by_key(|(ts, _)| *ts);
@@ -4314,6 +4334,89 @@ mod tests {
             !state.can_demote_group(&dirty, V),
             "a dirty group must not be demotable",
         );
+    }
+
+    /// With an idle TTL set, a clean group already past the eviction cutoff must NOT be a demotion
+    /// candidate — `evict_idle` has to retract it (a demoted group is dropped from `groups`, so
+    /// eviction can no longer see it → the changelog row leaks past the TTL and its cold-tier entry
+    /// is never reclaimed). Only groups idle-but-within the TTL window are demotable.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn demotable_groups_excludes_groups_past_idle_ttl() {
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true, // emit_changelog
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.set_delta_enabled(true);
+        state.idle_ttl_ms = Some(5_000);
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let feed = |state: &mut IncrementalAggState, name: &str, ts: i64| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&pre_agg_schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![name])),
+                    Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        };
+
+        // "old" last touched at wm=1_000; "fresh" at wm=10_000 → current watermark = 10_000.
+        feed(&mut state, "old", 1_000);
+        feed(&mut state, "fresh", 10_000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 8).unwrap();
+
+        let old_key: Vec<u8> = state
+            .groups
+            .iter()
+            .find(|(_, e)| e.last_updated_ms == 1_000)
+            .map(|(k, _)| k.as_ref().to_vec())
+            .expect("the 'old' group is resident");
+
+        // cutoff = 10_000 - 5_000 = 5_000 → "old" (1_000) is excluded, "fresh" (10_000) demotable.
+        let demotable: Vec<Vec<u8>> = state
+            .demotable_groups(V, 256)
+            .into_iter()
+            .map(|(_, _, g)| g)
+            .collect();
+        assert_eq!(demotable.len(), 1, "only the within-TTL group is demotable");
+        assert!(
+            !demotable.contains(&old_key),
+            "a group past the idle-TTL cutoff must be retracted by evict_idle, not demoted",
+        );
+
+        // The exclusion is TTL-gated: with no idle TTL, both clean groups are demotable.
+        state.idle_ttl_ms = None;
+        assert_eq!(state.demotable_groups(V, 256).len(), 2);
     }
 
     /// A group-demoted GLOBAL aggregate (no GROUP BY) must still be reported by

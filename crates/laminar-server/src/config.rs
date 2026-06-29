@@ -379,7 +379,9 @@ pub struct ServerSection {
     #[serde(default)]
     pub state_tier_dir: Option<std::path::PathBuf>,
     /// Demote at GROUP granularity: shed individual idle aggregate groups rather than whole idle
-    /// vnodes. Requires the cold tier. Unset defaults ON (single-node and cluster); `Some(b)` forces it.
+    /// vnodes. Requires the cold tier. Unset defaults ON for embedded single-node (kill-9-soaked)
+    /// and OFF for cluster (the cluster group path has open correctness gaps; it stays
+    /// vnode-granular). `Some(b)` forces it for either topology.
     #[serde(default)]
     pub state_tier_group_demotion: Option<bool>,
 }
@@ -397,10 +399,12 @@ fn default_pgwire_tls_min_version() -> String {
 }
 
 impl ServerSection {
-    /// Effective group-demotion setting. Unset defaults ON (single-node and cluster); explicit config wins.
+    /// Effective group-demotion setting. Unset defaults to `embedded` — ON for embedded single-node
+    /// (kill-9-soaked), OFF for cluster (the cluster group path has open correctness gaps, so it
+    /// stays vnode-granular). Explicit config wins.
     #[cfg(feature = "state-tier")]
-    pub(crate) fn group_demotion(&self) -> bool {
-        self.state_tier_group_demotion.unwrap_or(true)
+    pub(crate) fn group_demotion(&self, embedded: bool) -> bool {
+        self.state_tier_group_demotion.unwrap_or(embedded)
     }
 }
 
@@ -981,18 +985,16 @@ mod tests {
 
     #[cfg(feature = "state-tier")]
     #[test]
-    fn group_demotion_defaults_on() {
+    fn group_demotion_defaults_by_topology() {
         let mut s = ServerSection::default();
         assert_eq!(s.state_tier_group_demotion, None, "unset by default");
-        assert!(
-            s.group_demotion(),
-            "unset defaults ON (embedded and cluster)"
-        );
+        assert!(s.group_demotion(true), "unset defaults ON for embedded");
+        assert!(!s.group_demotion(false), "unset defaults OFF for cluster");
 
         s.state_tier_group_demotion = Some(false);
-        assert!(!s.group_demotion(), "explicit OFF overrides the default");
+        assert!(!s.group_demotion(true), "explicit OFF overrides embedded");
         s.state_tier_group_demotion = Some(true);
-        assert!(s.group_demotion(), "explicit ON honored");
+        assert!(s.group_demotion(false), "explicit ON overrides cluster");
     }
 
     const AI_TOML: &str = r#"
