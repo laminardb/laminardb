@@ -727,6 +727,122 @@ mod failures {
         assert!(demotes(&harness) > 0, "demote/promote path must be exercised");
         harness.shutdown().await;
     }
+
+    /// A crashed node's DEMOTED groups must survive failover. With the cold tier on, the follower
+    /// demotes idle groups — their durable home is the per-vnode delta chain, NOT the node-local tier
+    /// (which dies with the process). When the follower crashes, the survivor acquires its vnodes and
+    /// must rehydrate those demoted groups from the chain. Re-feeding the dead node's keys doubles
+    /// their totals iff the prior (demoted) counts recovered; a lost demoted group would instead show
+    /// only the re-fed value.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_demoted_groups_survive_crash_failover() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let leader_idx = harness.leader_idx();
+        let follower_idx = harness.follower_idxs()[0];
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners = vec![
+            (
+                harness.nodes[leader_idx].instance_id,
+                harness.nodes[leader_idx].owned_vnodes(),
+            ),
+            (
+                harness.nodes[follower_idx].instance_id,
+                harness.nodes[follower_idx].owned_vnodes(),
+            ),
+        ];
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
+        let leader_keys = key_buckets[0].1.clone();
+        let follower_keys = key_buckets[1].1.clone();
+        let phase_a: Vec<i64> = leader_keys.iter().chain(&follower_keys).copied().collect();
+
+        // Feed everything, checkpoint (clean baseline + delta seed), then wait for the FOLLOWER to
+        // demote idle groups; checkpoint again so the demoted state is captured in the durable chain.
+        harness.nodes[leader_idx]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&phase_a))
+            .expect("push phase_a");
+        harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint phase_a");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while harness.nodes[follower_idx].db.tier_metrics().demote_total == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "follower never demoted a group before the crash",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+        harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint post-demote");
+        sleep(Duration::from_millis(300)).await;
+
+        // Crash the follower.
+        let crashed_runtime = harness.nodes.swap_remove(follower_idx);
+        let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
+        drop(crashed_runtime);
+        crashed_node.crash().await;
+
+        // Survivor acquires the crashed node's vnodes.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
+            assert!(
+                Instant::now() < deadline,
+                "survivor never acquired the crashed node's vnodes",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        // Re-feed the dead node's keys on the survivor → totals double iff the demoted groups
+        // recovered from the chain (a lost demoted group would show only this re-fed value).
+        harness.nodes[0]
+            .db
+            .source_untyped("src")
+            .expect("src on survivor")
+            .push_arrow(input_batch(&follower_keys))
+            .expect("push phase_c");
+
+        let mut expected: HashMap<i64, i64> = leader_keys.iter().map(|&k| (k, k * 10)).collect();
+        for &k in &follower_keys {
+            expected.insert(k, k * 10 * 2);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let got: HashMap<i64, i64> = read_mv_sums(&harness.nodes[0].db, "sums")
+                .await
+                .into_iter()
+                .collect();
+            if got == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "demoted-group crash-failover totals wrong: {:?}",
+                expected
+                    .iter()
+                    .filter(|(k, v)| got.get(k) != Some(v))
+                    .map(|(k, v)| (*k, *v, got.get(k).copied()))
+                    .take(10)
+                    .collect::<Vec<_>>(),
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+        harness.shutdown().await;
+    }
 }
 
 mod rebalance {
