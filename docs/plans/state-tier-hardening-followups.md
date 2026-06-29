@@ -12,7 +12,16 @@ OFF for cluster (`group_demotion(embedded)` in `crates/laminar-server/src/config
 correctness bugs below are therefore **not on a default path**; they must be fixed AND soaked before
 cluster group demotion can default ON.
 
-## C1 (HIGH) — barrier-alignment shuffle drain bypasses cold-group/cold-vnode promotion
+## C1 (HIGH) — barrier-alignment shuffle drain bypasses cold-group/cold-vnode promotion — FIXED
+
+**FIXED 2026-06-29 (`ec647bd5`).** `ingest_shuffle` now mirrors `process_with_promotion`: it computes
+`cold_vnodes_touched`/`cold_groups_touched` and, on a hit, issues the tier fetch + `defer`s the batch
+into the promotion queue instead of `process_batch`. The deferred queue is drained+replayed on the next
+cycle (`has_pending`) and serialized into `AggOpCheckpoint`, so recovery is unchanged and EO holds.
+Regression test `ingest_shuffle_defers_row_for_demoted_vnode` (proven RED on the old path:
+`watermark_hold` None vs Some(20)); 848 state-tier lib + 10 cluster integration tests green; clippy
+`-D warnings` clean. Still needs the EO-Kafka group kill-9 soak before cluster default-ON. Original
+analysis below.
 
 **Where:** `crates/laminar-db/src/operator/sql_query.rs::ingest_shuffle` (~1268-1282) folds a shuffle
 batch straight into `IncrementalAggState::process_batch` with NO cold check, unlike the steady-state
