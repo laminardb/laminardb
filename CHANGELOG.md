@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.28.0]
+
+### Added
+
+- **Tiered operator state (ADR-005, experimental, `state-tier` feature)**: a disk
+  cold tier for larger-than-memory aggregate state. A node-level memory budget
+  (`state_memory_budget_bytes`) backpressures source intake when state grows; with a
+  cold tier configured (`state_tier_dir`, fjall-backed, capacity-not-durability —
+  wiped on restart, truth stays in the object-store checkpoint partials), idle state
+  approaching the budget is demoted to local disk and fetched back on demand instead.
+  v1 demotes at `(operator, vnode)`-slice granularity; v2 adds per-group granularity
+  (`state_tier_group_demotion`) so individual idle aggregate groups can be shed.
+  Requires a durable `[state]` backend; works single-node (no controller needed).
+  Observability via `state_bytes` / `state_over_budget` / `state_tier_*` metrics.
+
+### Notes
+
+- `state_tier_group_demotion` defaults ON for embedded single-node (kill-9-soaked) and
+  OFF for cluster, where it stays vnode-granular pending correctness/soak work tracked
+  in `docs/plans/state-tier-hardening-followups.md`.
+- This release backfills the changelog for the state-tier subsystem only; the
+  0.23–0.27 history is otherwise not itemized here.
+
 ## [0.22.0]
 
 ### Added
