@@ -86,11 +86,22 @@ struct AggPromotion {
             oneshot::Receiver<Result<Option<Bytes>, DbError>>,
         ),
     >,
+    // Consecutive `Ok(None)` fetch replies per key — a demoted slice/group the tier cannot produce
+    // (corruption / out-of-order drop). Without a bound the touching batch re-issues forever and the
+    // operator wedges silently behind its watermark hold; past `MAX_PROMOTION_FETCH_MISSES` we fail
+    // loud instead. Reset on a successful promote.
+    vnode_fetch_misses: FxHashMap<u32, u32>,
+    group_fetch_misses: FxHashMap<arrow::row::OwnedRow, u32>,
     max_deferred_rows: usize,
 }
 
 #[cfg(feature = "state-tier")]
 const MAX_DEFERRED_PROMOTION_ROWS: usize = 8192;
+
+/// A demoted slice/group genuinely absent from the tier stays deferred and re-fetched each cycle.
+/// After this many consecutive misses for one key, escalate to a hard error rather than wedge.
+#[cfg(feature = "state-tier")]
+const MAX_PROMOTION_FETCH_MISSES: u32 = 32;
 
 #[cfg(feature = "state-tier")]
 impl AggPromotion {
@@ -101,8 +112,32 @@ impl AggPromotion {
             deferred: VecDeque::new(),
             inflight: FxHashMap::default(),
             inflight_groups: FxHashMap::default(),
+            vnode_fetch_misses: FxHashMap::default(),
+            group_fetch_misses: FxHashMap::default(),
             max_deferred_rows: MAX_DEFERRED_PROMOTION_ROWS,
         }
+    }
+
+    /// Record a `None` fetch reply for `vnode`; returns the new consecutive-miss streak.
+    fn note_vnode_miss(&mut self, vnode: u32) -> u32 {
+        let c = self.vnode_fetch_misses.entry(vnode).or_insert(0);
+        *c += 1;
+        *c
+    }
+
+    fn clear_vnode_miss(&mut self, vnode: u32) {
+        self.vnode_fetch_misses.remove(&vnode);
+    }
+
+    /// Record a `None` fetch reply for a group; returns the new consecutive-miss streak.
+    fn note_group_miss(&mut self, key: &arrow::row::OwnedRow) -> u32 {
+        let c = self.group_fetch_misses.entry(key.clone()).or_insert(0);
+        *c += 1;
+        *c
+    }
+
+    fn clear_group_miss(&mut self, key: &arrow::row::OwnedRow) {
+        self.group_fetch_misses.remove(key);
     }
 
     fn drain_ready(&mut self) -> Vec<(u32, Option<Bytes>)> {
@@ -709,12 +744,22 @@ impl SqlQueryOperator {
             match slice {
                 Some(bytes) => {
                     self.apply_vnode_state(vnode, &bytes)?;
-                    if let Some(p) = self.promotion.as_ref() {
+                    if let Some(p) = self.promotion.as_mut() {
+                        p.clear_vnode_miss(vnode);
                         p.drop_slice(vnode);
                     }
                 }
                 None => {
                     if let Some(p) = self.promotion.as_mut() {
+                        let misses = p.note_vnode_miss(vnode);
+                        if misses > MAX_PROMOTION_FETCH_MISSES {
+                            return Err(DbError::Checkpoint(format!(
+                                "[state-tier] demoted vnode {vnode} absent from the cold tier after \
+                                 {misses} promotion fetches (operator={}) — failing rather than \
+                                 wedging the operator behind its watermark hold",
+                                p.op_name
+                            )));
+                        }
                         p.issue_fetch(vnode);
                     }
                 }
@@ -731,12 +776,22 @@ impl SqlQueryOperator {
             match slice {
                 Some(bytes) => {
                     self.apply_group_state(&key, &bytes)?;
-                    if let Some(p) = self.promotion.as_ref() {
+                    if let Some(p) = self.promotion.as_mut() {
+                        p.clear_group_miss(&key);
                         p.drop_group(vnode, group);
                     }
                 }
                 None => {
                     if let Some(p) = self.promotion.as_mut() {
+                        let misses = p.note_group_miss(&key);
+                        if misses > MAX_PROMOTION_FETCH_MISSES {
+                            return Err(DbError::Checkpoint(format!(
+                                "[state-tier] demoted group (vnode {vnode}) absent from the cold \
+                                 tier after {misses} promotion fetches (operator={}) — failing \
+                                 rather than wedging the operator behind its watermark hold",
+                                p.op_name
+                            )));
+                        }
                         p.issue_fetch_group(key, vnode, group);
                     }
                 }
@@ -2157,6 +2212,56 @@ mod promotion_tests {
             op.watermark_hold(),
             None,
             "nothing deferred after promotion"
+        );
+    }
+
+    /// C4: a demoted vnode the tier genuinely cannot produce (here: marked cold but its bytes were
+    /// never written) must ESCALATE to a hard error after a bounded number of promotion fetches —
+    /// not retry forever, holding the watermark and backpressuring the source with no signal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_fetch_miss_escalates_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
+        );
+        let tier_tx = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::clone(&store),
+            64,
+        );
+        let mut op = build_op(tier_tx).await;
+
+        // Establish 'a', capture the clean baseline, then mark every vnode cold WITHOUT writing its
+        // slice to the tier — so a promotion fetch returns Ok(None) (the genuine-miss case).
+        op.process(&[vec![events_batch(&["a"], &[1])]], &[10])
+            .await
+            .unwrap();
+        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
+        for &v in staged.keys() {
+            assert!(op.demote_vnode(v, VNODES), "clean vnode must demote");
+        }
+
+        // A row for 'a' defers; its vnode's fetch can never resolve.
+        op.process(&[vec![events_batch(&["a"], &[5])]], &[20])
+            .await
+            .unwrap();
+        assert_eq!(op.watermark_hold(), Some(20), "the missing-tier row defers");
+
+        // Idle cycles drive the fetch→miss loop; it must error within the bound, not spin forever.
+        let mut escalation: Option<String> = None;
+        for _ in 0..(MAX_PROMOTION_FETCH_MISSES + 50) {
+            match op.process(&[vec![]], &[30]).await {
+                Ok(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+                Err(e) => {
+                    escalation = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let msg = escalation.expect("a genuinely-absent demoted vnode must escalate, not wedge");
+        assert!(
+            msg.contains("absent from the cold tier"),
+            "unexpected error: {msg}",
         );
     }
 
