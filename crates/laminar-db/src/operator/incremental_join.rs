@@ -187,6 +187,9 @@ pub(crate) struct IncrementalJoinOperator {
     // side schemas are known (from a live batch per side, or from restore).
     out_cols: Option<Vec<(JoinSide, usize)>>,
     out_schema: Option<SchemaRef>,
+    // LEFT join: set once the first-sight catch-up has run (or once a checkpoint with a seen right side
+    // is restored), so it fires exactly once and survives a deferred cycle (S4.3).
+    left_catchup_done: bool,
     #[cfg(feature = "state-tier")]
     tier: JoinTierState,
 }
@@ -204,6 +207,7 @@ impl IncrementalJoinOperator {
             right_info: None,
             out_cols: None,
             out_schema: None,
+            left_catchup_done: false,
             #[cfg(feature = "state-tier")]
             tier: JoinTierState::new(),
         }
@@ -465,7 +469,12 @@ impl IncrementalJoinOperator {
         }
         match side {
             JoinSide::Left => self.left_info = Some(info),
-            JoinSide::Right => self.right_info = Some(info),
+            JoinSide::Right => {
+                self.right_info = Some(info);
+                // Right was seen pre-checkpoint ⇒ the first-sight catch-up already ran; restoring it
+                // must not let the catch-up re-fire (and re-emit NULL-pads) post-restart.
+                self.left_catchup_done = true;
+            }
         }
         Ok(())
     }
@@ -852,35 +861,17 @@ impl IncrementalJoinOperator {
     }
 }
 
-#[async_trait]
-impl GraphOperator for IncrementalJoinOperator {
-    #[allow(clippy::too_many_lines)]
-    async fn process(
+impl IncrementalJoinOperator {
+    /// One IVM cycle over already-resolved schemas: `output = δA ⋈ B_new + A_old ⋈ δB`, plus the
+    /// LEFT-join NULL-pad transitions and (when `first_right`) the first-sight catch-up. Mutates both
+    /// side states in place. `process` resolves schemas + computes `first_right`; the fetch-on-access
+    /// path (S4.3) calls this only once any touched cold keys are resident.
+    fn run_ivm_cycle(
         &mut self,
-        inputs: &[Vec<RecordBatch>],
-        _watermarks: &[i64],
+        left_batches: &[RecordBatch],
+        right_batches: &[RecordBatch],
+        first_right: bool,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
-        let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
-
-        let right_was_seen = self.right_info.is_some();
-        if self.left_info.is_none() {
-            if let Some(b) = left_batches.first() {
-                self.left_info = Some(SideInfo::resolve(&b.schema(), &self.left_keys)?);
-            }
-        }
-        if self.right_info.is_none() {
-            if let Some(b) = right_batches.first() {
-                self.right_info = Some(SideInfo::resolve(&b.schema(), &self.right_keys)?);
-            }
-        }
-        self.resolve_output()?;
-        #[cfg(feature = "state-tier")]
-        self.ensure_codec()?;
-        // First time the right schema is known: a LEFT join must back-fill NULL-padded rows for the
-        // left state accumulated while it was unknown (the join MV emitted nothing until now).
-        let first_right = self.left_outer && !right_was_seen && self.right_info.is_some();
-
         // A LEFT join keeps NULL-key left rows (they NULL-pad); the right side always drops them.
         let delta_a = match &self.left_info {
             Some(info) => Self::parse_side(info, left_batches, !self.left_outer)?,
@@ -922,6 +913,7 @@ impl GraphOperator for IncrementalJoinOperator {
         if self.left_outer {
             if first_right {
                 self.emit_left_catchup(&mut out)?;
+                self.left_catchup_done = true;
             } else {
                 // A right key flipping empty↔non-empty retracts/re-emits the NULL-pad of every
                 // resident left row at that key (A_old — δA not yet applied).
@@ -956,6 +948,38 @@ impl GraphOperator for IncrementalJoinOperator {
         }
 
         self.build_output(&out)
+    }
+}
+
+#[async_trait]
+impl GraphOperator for IncrementalJoinOperator {
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
+        let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
+
+        if self.left_info.is_none() {
+            if let Some(b) = left_batches.first() {
+                self.left_info = Some(SideInfo::resolve(&b.schema(), &self.left_keys)?);
+            }
+        }
+        if self.right_info.is_none() {
+            if let Some(b) = right_batches.first() {
+                self.right_info = Some(SideInfo::resolve(&b.schema(), &self.right_keys)?);
+            }
+        }
+        self.resolve_output()?;
+        #[cfg(feature = "state-tier")]
+        self.ensure_codec()?;
+
+        // First sight of the right schema (LEFT join): back-fill NULL-pads for left state accumulated
+        // while it was unknown. Gated on `left_catchup_done` (not "was right seen this cycle") so the
+        // trigger survives a deferred cycle (S4.3) and a checkpoint restore (set in `restore_side`).
+        let first_right = self.left_outer && !self.left_catchup_done && self.right_info.is_some();
+        self.run_ivm_cycle(left_batches, right_batches, first_right)
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
