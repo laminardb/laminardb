@@ -1,11 +1,15 @@
 # State-tier hardening — deferred follow-ups
 
-Status: **planned (2026-06-29).** Branch `feat/shuffle-barrier-after-kill-recovery`.
-These are the gaps a grounded, adversarially-verified audit of the state-tier subsystem surfaced
-that were NOT closed in the 0.28.0 "safe release" pass. The 0.28.0 pass shipped: cluster group
-demotion default-OFF (embedded stays ON, soaked), the idle-TTL demotion fix (C3 below), dead-code
-cleanup, and docs. Everything here is **cluster-path correctness or test/acceptance-gate work** that
-needs soak validation this project's rules say must not be rushed.
+Status: **correctness fixes landed 2026-06-30 (C1, C2, C3, C4); soaks + perf gates owed.** Branch
+`feat/shuffle-barrier-after-kill-recovery`. These are the gaps a grounded, adversarially-verified audit
+of the state-tier subsystem surfaced that were NOT closed in the 0.28.0 "safe release" pass. The 0.28.0
+pass shipped: cluster group demotion default-OFF (embedded stays ON, soaked), the idle-TTL demotion fix
+(C3 partial), dead-code cleanup, and docs. **All four correctness bugs (C1 `ec647bd5`, C2 `d80c1b40`,
+C3-residual `4b55a096`, C4 `768d3153`) are now fixed with deterministic unit tests + clippy clean across
+the default / cluster / state-tier build configs.** What remains is **acceptance-gate work** — the
+cluster kill-9 EO-Kafka group soak (the gate before cluster group demotion can default ON), the
+soaks-in-CI lane, and the perf gates — which need infra/soak validation this project's rules say must
+not be rushed. C5 (per-group size floor) stays INFO/optional (quantify before adding format complexity).
 
 Default posture until these land: group demotion is ON for embedded single-node (kill-9-soaked) and
 OFF for cluster (`group_demotion(embedded)` in `crates/laminar-server/src/config.rs`). The cluster
@@ -48,7 +52,25 @@ during alignment is insufficient — `cold_groups` from prior epochs is the haza
 **Effort:** M. **Gate:** unit test (alignment batch touching a cold group must defer, not recreate) +
 cluster kill-9 EO group soak.
 
-## C2 (HIGH) — deferred re-base while `has_cold` lets the delta-chain base age past the prune horizon
+## C2 (HIGH) — deferred re-base while `has_cold` lets the delta-chain base age past the prune horizon — FIXED
+
+**FIXED 2026-06-30 (`d80c1b40`).** A cold-bearing vnode now re-bases at `chain_max` like any other
+and the re-base CARRIES its demoted groups, so the new base is self-contained and the old base
+unreferences — the `chain_max`/prune-window invariant holds with no special-casing. New
+`VnodeCapture::FullWithColdGroups` / `StagedSlice::FullWithColdGroups`: the operator stages the
+resident FULL plus the cold group keys; the coordinator (`resolve_full_with_cold_groups`) re-fetches
+each group from the tier and `merge_serialized_agg_cps`-folds them into ONE base over disjoint keys.
+Recovery is unchanged (a normal full base). **Adversarial review caught a blocker the first design
+missed:** a FULLY cold vnode (every resident group demoted, incl. a demoted global aggregate) was in
+none of the capture seed sets, so it staged nothing and the coordinator wrote an empty
+`base_epoch=None` partial that orphaned the chain base IMMEDIATELY (worse than the original bug). Fix:
+the capture set is now seeded from `cold_groups` too, so a fully-cold vnode emits an empty delta below
+the bound and a cold-carrying re-base at it. Removed the now-redundant `cold_groups_pending_rebase`
+proactive promotion (replaced by the re-base; it also thrashed demote/promote). Tests:
+`cold_bearing_vnode_rebases_with_groups_at_chain_bound` (recover from the re-base alone after pruning
+the old base) + `fully_cold_global_aggregate_keeps_chain_alive_and_recovers`; `debug_assert` guards
+resident∩cold disjointness. Still needs the cluster kill-9 EO group soak before cluster default-ON.
+Original analysis below.
 
 **Where:** `crates/laminar-db/src/aggregate_state.rs` (~1778-1819) sets `force_full=false` whenever a
 vnode `has_cold`, regardless of `delta_chain_len` (incremented unbounded). `delta_chain_max` is
@@ -76,29 +98,32 @@ so prune cannot delete them (analogous to the existing coordinated-commit floor 
 **Effort:** L. **Gate:** unit test (demote groups → defer past chain_max → prune → recovery == full
 baseline) + cluster kill-9 EO group soak.
 
-## C3 (MEDIUM) — idle-TTL + demoted groups — PARTIALLY FIXED in 0.28.0; residual remains
+## C3 (MEDIUM) — idle-TTL + demoted groups — FIXED
 
 **Fixed (0.28.0):** `demotable_groups` (`aggregate_state.rs`) is now idle-TTL-aware — it excludes
 groups already past the eviction cutoff (`last_watermark_ms - idle_ttl_ms`), so they are retracted by
 `evict_idle` instead of being demoted out from under it. Test
 `demotable_groups_excludes_groups_past_idle_ttl`.
 
-**Residual (deferred):** a group demoted while idle-but-within-TTL can later cross the TTL while cold.
-`evict_idle` scans only `self.groups`, so a cold group past TTL is never retracted → its downstream
-changelog row leaks past TTL and its cold-tier entry is never reclaimed. Full fix needs `evict_idle`
-(or the demotion pass) to also scan `cold_groups` for keys past the cutoff and promote-then-retract
-them — which requires round-tripping the tier blob to recover `last_emitted` for the retraction
-(`drop_demoted_group` discards it). **Effort:** M.
+**Residual FIXED 2026-06-30 (`4b55a096`).** `cold_groups` now carries each demoted group's
+`last_updated_ms` frozen at demotion (`AHashSet` → `AHashMap<OwnedRow, i64>`; a cold group is never
+touched without first promoting it, so the stamp stays accurate). New `cold_groups_past_idle_ttl`
+reports cold groups whose frozen stamp fell past the cutoff; `process_with_promotion` fetch-on-access
+promotes them, and the existing `evict_idle` pass then retracts them (`promote_group` restores
+`last_emitted`, so the retraction value is exact) and the resolution's `DropGroup` reclaims the tier
+entry — no change to `evict_idle` itself. Test `cold_group_past_idle_ttl_is_detected_then_retracted`.
 
-## C4 (LOW, unverified) — runtime group-promotion fetch returning `None` retries forever
+## C4 (LOW) — runtime group-promotion fetch returning `None` retries forever — VERIFIED + FIXED
 
-**Where (claim):** `sql_query.rs` ~729-742 (`drain_ready_groups` re-issues `issue_fetch_group` on
-`Ok(Ok(None))`) and ~158-179. A genuinely-absent group (tier corruption / out-of-order drop) is
-treated as transient → the touching batch stays deferred, `wants_input` backpressures, and the
-operator wedges silently with no error. (The coordinator-side fetch correctly fails the epoch; this is
-the runtime path.) **NOTE:** this finding's adversarial verification did not complete — verify against
-current code before acting. **Fix:** bound retries; after N consecutive `None` for a key, escalate to
-a hard error (a 6xxx checkpoint or 3xxx error) / rising-severity log. **Effort:** S.
+**VERIFIED then FIXED 2026-06-30 (`768d3153`).** Confirmed real against current code: the worker
+replies `Ok(None)` on a genuine miss (corruption / out-of-order drop), `drain_ready_groups` surfaces
+it, and the `None` arm re-issued `issue_fetch_group`/`issue_fetch` every cycle forever — the touching
+batch stayed deferred, the watermark held, the source backpressured, all silently. (The
+coordinator-side fetch already fails the epoch; only the runtime path wedged.) Fix: `AggPromotion`
+tracks consecutive `Ok(None)` replies per vnode and per group; a successful promote clears the streak;
+past `MAX_PROMOTION_FETCH_MISSES` (32), `process_with_promotion` returns a hard `DbError::Checkpoint`
+instead of re-issuing. Covers both the vnode (`Fetch`) and group (`FetchGroup`) paths. Test
+`promotion_fetch_miss_escalates_instead_of_wedging`.
 
 ## C5 (INFO) — no per-group size floor / batching
 
@@ -124,9 +149,13 @@ with `LAMINAR_SOAK_STATE_TIER_GROUP` before adding format complexity. **Effort:*
     group rotates off its node and back; the revoke path must drop A's resident + cold tracking before
     re-acquire rehydrates the chain (asserts A's total is single-counted, not doubled).
   None of these reproduced C1 or C2 (C1 needs the alignment-drain timing window; C2 needs the chain
-  base aged past the prune horizon). **Remaining sub-case (LOW, for Phase 2 validation):** a
-  many-checkpoint variant that drives `delta_chain_len` past `chain_max` with a vnode holding cold
-  groups, to exercise C2's deferred-rebase prune race deterministically.
+  base aged past the prune horizon). **C2 is now covered deterministically at the unit level** by
+  `cold_bearing_vnode_rebases_with_groups_at_chain_bound` + `fully_cold_global_aggregate_keeps_chain_
+  alive_and_recovers` (`d80c1b40`), which drive a cold-bearing vnode to the chain bound and recover
+  from the re-base ALONE (the old base + deltas discarded == pruned), proving the demoted state
+  survives. **Remaining (LOW, optional):** a cluster-level many-checkpoint integration variant that
+  also exercises the real prune + tier fetch path; the unit tests already cover the mechanism, so this
+  is confidence-only.
 - **Kill-9 + group-demotion + EO-Kafka soak (HIGH-value, S).** The 3/3 green cluster group soak used
   the built-in generator (file://), not the EO Kafka sink. Demotion/promotion mutate the same per-vnode
   delta artifacts EO recovery replays. Run `three_node_kill9_soak` with
