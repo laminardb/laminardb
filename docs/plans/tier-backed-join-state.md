@@ -1,9 +1,31 @@
 # Tier-backed IVM join state (A1-emit Stage 3b — Slice 4, XL)
 
-Status: **scoped + adversarially reviewed, unstarted (2026-06-30).** This is the spill-to-disk
-replacement for the in-memory changelog⋈changelog join's `JoinStateStore`. It is the last hardening item
-adjacent to the state-tier work; it is tracked under the A1-emit track, NOT the state-tier track.
-Default-OFF, `[LDB-1300]`-gated.
+Status: **S4.1 implemented (2026-06-30)** — codec + two-sided per-key cold blob + cold/dirty tracking,
+all `cfg(state-tier)`, 6 unit tests green (15/15 in the join module). S4.0/S4.2–S4.6 unstarted. This is
+the spill-to-disk replacement for the in-memory changelog⋈changelog join's `JoinStateStore`. It is the
+last hardening item adjacent to the state-tier work; tracked under the A1-emit track, NOT the state-tier
+track. Default-OFF, `[LDB-1300]`-gated.
+
+> **Grounding sweep (2026-06-30, pre-S4.1).** A 6-surface verification against current code confirmed the
+> plan and folded these corrections in: (a) **no `scan_groups`** on `StateTierStore` — cold-key
+> enumeration is operator-side tracked (as §4/§6 already assume); the §3 mention is stray. (b) **Reuse
+> the codec, don't hand-roll**: `crate::aggregate_state::scalar_key_to_owned_row` (arrow-row bytes,
+> NULL-safe/multi-column) + `laminar_core::state::key_hash` (xxh3, restart-stable) — the same encoding the
+> agg tier + shuffle use; value blobs reuse the join's `batches_to_ipc`/`ipc_to_batches`. (c) `StagedSlice`
+> variants are `Bytes / Cold / Delta / ColdGroups{group_keys} / FullWithColdGroups{resident, group_keys}`
+> — there is **no `VnodePartial` variant** (it's a separate `crate::vnode_partial` struct); relevant to
+> S4.4. (d) **cfg dual-gating**: tier hooks are `state-tier`, the recovery hooks `apply_vnode_chain` /
+> `resolve_op_chain` are `cluster`; `state-tier` implies `cluster`, so the join mirrors the agg under
+> `cfg(state-tier)` and its `apply_vnode_chain` override must compile under both.
+>
+> **Realized design (S4.1) — deviation from the literal plan, justified.** Tier state is realized as
+> **operator-level coordination** (a `JoinTierState` field on `IncrementalJoinOperator`), NOT a new
+> `JoinStateStore` dyn impl. The two per-side `InMemoryJoinState` stay as the hot resident maps; the
+> operator owns `cold_keys`, dirty tracking, the key codec, `demote_key`/`promote_key`. This mirrors the
+> agg precisely (the agg has no separate store object — `IncrementalAggState` owns groups + cold + codec)
+> and avoids a two-sided dyn store fighting the per-side `process()` probes. Demote drops a key's rows
+> via **negative upserts** through the existing store, so `estimated_state_bytes` sheds bytes for free
+> (M5); promote re-adds via positive upserts, returning bytes to baseline (unit-tested).
 
 > **Review note.** An adversarial review of this plan against the code found 2 blockers and ~5 majors,
 > all folded in below (see §3, §4, §5.2/§5.3/§5.7/§5.8, §6). The headline corrections: recovery
@@ -299,12 +321,16 @@ Build in-memory correctness is done (3b S1–S3). This slice (3b-S4) breaks down
 
 - **S4.0 — Interim loud ceiling (S).** Make the per-operator ceiling fail with a join-specific 3xxx
   error instead of silently throttling intake forever. Ships value immediately, independent of the rest.
-- **S4.1 — Key codec + `JoinTierStore` + two-sided per-key blob (M→L).** FIRST build the §5.7 key codec
-  (reversible, type-tagged, NULL-safe, multi-column) + stable hash, property-tested. Then the store over
-  the per-group KV: `encode_key`/`decode` of both sides packed; **`bytes` accounting that decrements on
-  demote, increments on promote (M5)**; dirty tracking on `upsert`; `cold_keys`, `demotable_keys`
-  (exclude NULL-key left rows), `cold_keys_touched` (per-side `key_idx` projection, §5.8). Unit tests:
-  encode→drop→promote round-trip; clean-vs-dirty gate; bytes-returns-to-baseline after promote.
+- **S4.1 — Key codec + tier state + two-sided per-key blob (M→L). DONE 2026-06-30.** Built the §5.7 key
+  codec as `JoinKeyCodec` (reuses arrow-row `scalar_key_to_owned_row` + xxh3 `key_hash`; the key bytes are
+  an opaque stable identifier — never decoded, since key columns also ride inside the value blob, so
+  "reversible" is satisfied at the value level via IPC, not the key level). `JoinTierState` over the hot
+  per-side stores: `encode_key_blob`/`decode_key_blob` (an absent side encodes as `None` — §5.2);
+  `bytes` accounting via ±upserts (M5); dirty tracking on `upsert` (`after_upsert`); `cold_keys`,
+  idle-first `demotable_keys` (excludes NULL keys), `cold_keys_touched` (per-side `key_idx` projection,
+  §5.8). 6 unit tests (codec stability/NULL-safety; demote→promote round-trip + bytes-to-baseline;
+  clean-vs-dirty gate; NULL-key exclusion; per-side cold-key projection; LEFT-unmatched right-absent).
+  All items `cfg(state-tier)` + `#[allow(dead_code)]` until S4.2/S4.3/S4.5 wire them to the trait hooks.
 - **S4.2 — Single-owner vnode + dirty-tracking enable (S).** Bucket keys by `key_hash % vnode_count`;
   honor `enable_group_delta_tracking`/`set_vnode_count`/`attach_state_tier`.
 - **S4.3 — Fetch-on-access `JoinPromotion` (L).** Defer-before-probe in `process`; promote both sides

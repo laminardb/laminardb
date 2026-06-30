@@ -19,6 +19,8 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use rustc_hash::FxHashMap;
+#[cfg(feature = "state-tier")]
+use rustc_hash::FxHashSet;
 
 use laminar_core::changelog::WEIGHT_COLUMN;
 
@@ -185,6 +187,8 @@ pub(crate) struct IncrementalJoinOperator {
     // side schemas are known (from a live batch per side, or from restore).
     out_cols: Option<Vec<(JoinSide, usize)>>,
     out_schema: Option<SchemaRef>,
+    #[cfg(feature = "state-tier")]
+    tier: JoinTierState,
 }
 
 impl IncrementalJoinOperator {
@@ -200,6 +204,8 @@ impl IncrementalJoinOperator {
             right_info: None,
             out_cols: None,
             out_schema: None,
+            #[cfg(feature = "state-tier")]
+            tier: JoinTierState::new(),
         }
     }
 
@@ -431,35 +437,7 @@ impl IncrementalJoinOperator {
         let Some(info) = info else {
             return Ok(None);
         };
-        let snap = store.snapshot();
-        let batch = if snap.is_empty() {
-            RecordBatch::new_empty(info.schema.clone())
-        } else {
-            let nfields = info.schema.fields().len();
-            let mut cols: Vec<ArrayRef> = Vec::with_capacity(nfields);
-            for si in 0..nfields {
-                if si == info.weight_idx {
-                    let mults =
-                        Int64Array::from(snap.iter().map(|(_, m)| *m).collect::<Vec<i64>>());
-                    cols.push(Arc::new(mults));
-                } else {
-                    let pos = info
-                        .plain_cols
-                        .iter()
-                        .position(|&c| c == si)
-                        .expect("non-weight column is a plain column");
-                    let arr = ScalarValue::iter_to_array(snap.iter().map(|(r, _)| r[pos].clone()))
-                        .map_err(|e| {
-                            DbError::Pipeline(format!("incremental join: checkpoint column: {e}"))
-                        })?;
-                    cols.push(arr);
-                }
-            }
-            RecordBatch::try_new(info.schema.clone(), cols).map_err(|e| {
-                DbError::Pipeline(format!("incremental join: checkpoint batch: {e}"))
-            })?
-        };
-        Ok(Some(batches_to_ipc(&info.schema, std::iter::once(&batch))?))
+        Ok(Some(side_rows_to_ipc(info, &store.snapshot())?))
     }
 
     /// Rebuild one side's Z-set from its checkpoint changelog (the inverse of
@@ -539,8 +517,329 @@ fn scalars_at(
         .collect()
 }
 
+/// Serialize a row list (with multiplicities) as one `__weight` changelog IPC blob keyed by `info`'s
+/// schema — the weight column carries each row's stored multiplicity. An empty list yields a 0-row,
+/// schema-carrying batch (so a seen-but-empty side still round-trips its schema on restore).
+fn side_rows_to_ipc(info: &SideInfo, rows: &[(Vec<ScalarValue>, i64)]) -> Result<Vec<u8>, DbError> {
+    let batch = if rows.is_empty() {
+        RecordBatch::new_empty(info.schema.clone())
+    } else {
+        let nfields = info.schema.fields().len();
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(nfields);
+        for si in 0..nfields {
+            if si == info.weight_idx {
+                let mults = Int64Array::from(rows.iter().map(|(_, m)| *m).collect::<Vec<i64>>());
+                cols.push(Arc::new(mults));
+            } else {
+                let pos = info
+                    .plain_cols
+                    .iter()
+                    .position(|&c| c == si)
+                    .expect("non-weight column is a plain column");
+                let arr = ScalarValue::iter_to_array(rows.iter().map(|(r, _)| r[pos].clone()))
+                    .map_err(|e| {
+                        DbError::Pipeline(format!("incremental join: side column: {e}"))
+                    })?;
+                cols.push(arr);
+            }
+        }
+        RecordBatch::try_new(info.schema.clone(), cols)
+            .map_err(|e| DbError::Pipeline(format!("incremental join: side batch: {e}")))?
+    };
+    batches_to_ipc(&info.schema, std::iter::once(&batch))
+}
+
+// ─── Tier-backed join state (A1-emit Stage 3b — Slice 4) ────────────────────────────────────────
+// S4.1 (this slice): the join-key codec, the two-sided per-key cold blob, and cold/dirty tracking,
+// all unit-tested. The demotion driver (S4.5), fetch-on-access promotion (S4.3), and cold-only-partial
+// recovery (S4.4) wire these into the `GraphOperator` tier hooks; until they do, the items below have
+// only test callers — hence the `allow(dead_code)` until the wiring slices land. Demotion unit = the
+// join key (sides never co-partition onto a shared vnode).
+
+/// Reversible, NULL-safe, multi-column join-key encoding for the tier group key + a restart-stable
+/// vnode bucket. Reuses the engine's arrow-row encoding (matching the aggregate tier) and the
+/// engine-wide xxh3 `key_hash`, so a key buckets to the same vnode before and after a restart.
+#[cfg(feature = "state-tier")]
+#[allow(dead_code)]
+struct JoinKeyCodec {
+    converter: arrow::row::RowConverter,
+    key_types: Vec<arrow::datatypes::DataType>,
+}
+
+#[cfg(feature = "state-tier")]
+#[allow(dead_code)]
+impl JoinKeyCodec {
+    fn new(key_types: Vec<arrow::datatypes::DataType>) -> Result<Self, DbError> {
+        let fields: Vec<arrow::row::SortField> = key_types
+            .iter()
+            .map(|t| arrow::row::SortField::new(t.clone()))
+            .collect();
+        let converter = arrow::row::RowConverter::new(fields)
+            .map_err(|e| DbError::Pipeline(format!("incremental join: key converter: {e}")))?;
+        Ok(Self {
+            converter,
+            key_types,
+        })
+    }
+
+    /// Encode a join key to its stable tier group-key bytes. The key columns also ride inside the
+    /// value blob, so these bytes are only ever an opaque identifier + hash input (never decoded).
+    fn encode(&self, key: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
+        let row =
+            crate::aggregate_state::scalar_key_to_owned_row(&self.converter, key, &self.key_types)?;
+        Ok(row.as_ref().to_vec())
+    }
+
+    fn vnode(&self, key: &[ScalarValue], vnode_count: u32) -> Result<u32, DbError> {
+        let bytes = self.encode(key)?;
+        let count = u64::from(vnode_count.max(1));
+        // `% count` (count ≤ u32::MAX) keeps the result in u32 range.
+        #[allow(clippy::cast_possible_truncation)]
+        let vnode = (laminar_core::state::key_hash(&bytes) % count) as u32;
+        Ok(vnode)
+    }
+}
+
+/// Cold/dirty bookkeeping for key-granular demotion. The hot Z-sets stay in `left_state`/`right_state`;
+/// this tracks which join keys are clean (demotable) and which are currently cold (their two-sided
+/// Z-set lives in the tier, not in the hot stores).
+#[cfg(feature = "state-tier")]
+#[allow(dead_code)]
+struct JoinTierState {
+    codec: Option<JoinKeyCodec>,
+    vnode_count: u32,
+    delta_tracking: bool,
+    touch_counter: u64,
+    // Keys mutated since the last capture — not demotable (their tier blob would diverge from a
+    // checkpoint taken at that capture).
+    dirty: FxHashSet<Vec<ScalarValue>>,
+    // Last touch order per resident key, for idle-first demotion.
+    touch_seq: FxHashMap<Vec<ScalarValue>, u64>,
+    cold_keys: FxHashSet<Vec<ScalarValue>>,
+}
+
+#[cfg(feature = "state-tier")]
+#[allow(dead_code)]
+impl JoinTierState {
+    fn new() -> Self {
+        Self {
+            codec: None,
+            vnode_count: 1,
+            delta_tracking: false,
+            touch_counter: 0,
+            dirty: FxHashSet::default(),
+            touch_seq: FxHashMap::default(),
+            cold_keys: FxHashSet::default(),
+        }
+    }
+
+    fn after_upsert(&mut self, key: &[ScalarValue], resident: bool) {
+        if !self.delta_tracking {
+            return;
+        }
+        if resident {
+            self.touch_counter += 1;
+            self.dirty.insert(key.to_vec());
+            self.touch_seq.insert(key.to_vec(), self.touch_counter);
+        } else {
+            self.dirty.remove(key);
+            self.touch_seq.remove(key);
+        }
+    }
+
+    /// Mark every resident key clean — called when a checkpoint captures the current state.
+    fn clear_dirty(&mut self) {
+        self.dirty.clear();
+    }
+
+    fn mark_demoted(&mut self, key: &[ScalarValue]) {
+        self.dirty.remove(key);
+        self.touch_seq.remove(key);
+        self.cold_keys.insert(key.to_vec());
+    }
+
+    fn mark_promoted(&mut self, key: &[ScalarValue]) {
+        self.cold_keys.remove(key);
+        self.touch_counter += 1;
+        self.dirty.insert(key.to_vec());
+        self.touch_seq.insert(key.to_vec(), self.touch_counter);
+    }
+
+    fn is_cold(&self, key: &[ScalarValue]) -> bool {
+        self.cold_keys.contains(key)
+    }
+}
+
+#[cfg(feature = "state-tier")]
+#[allow(dead_code)]
+impl IncrementalJoinOperator {
+    /// Build the join-key codec once both side schemas are resolved. Key column types match across
+    /// sides (`resolve_output` enforces this), so the left side's types suffice.
+    fn ensure_codec(&mut self) -> Result<(), DbError> {
+        if self.tier.codec.is_some() {
+            return Ok(());
+        }
+        let (Some(l), Some(_)) = (&self.left_info, &self.right_info) else {
+            return Ok(());
+        };
+        let key_types: Vec<arrow::datatypes::DataType> = l
+            .key_idx
+            .iter()
+            .map(|&i| l.schema.field(i).data_type().clone())
+            .collect();
+        self.tier.codec = Some(JoinKeyCodec::new(key_types)?);
+        Ok(())
+    }
+
+    /// Pack both sides' Z-set for one join key into a single cold blob (`encode_frame` of each side's
+    /// `__weight` IPC). An empty side encodes as absent, so a LEFT-join key with left rows but no
+    /// right match decodes to a right-absent state — a promote never fabricates a match.
+    fn encode_key_blob(&self, key: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
+        let l = self.left_info.as_ref().ok_or_else(|| {
+            DbError::Pipeline("incremental join: demote needs left schema".into())
+        })?;
+        let r = self.right_info.as_ref().ok_or_else(|| {
+            DbError::Pipeline("incremental join: demote needs right schema".into())
+        })?;
+        let left_rows = self.left_state.get(key);
+        let right_rows = self.right_state.get(key);
+        let lb = if left_rows.is_empty() {
+            None
+        } else {
+            Some(side_rows_to_ipc(l, &left_rows)?)
+        };
+        let rb = if right_rows.is_empty() {
+            None
+        } else {
+            Some(side_rows_to_ipc(r, &right_rows)?)
+        };
+        Ok(encode_frame(lb.as_deref(), rb.as_deref()))
+    }
+
+    /// Inverse of [`encode_key_blob`](Self::encode_key_blob): parse each side's rows back out of a
+    /// cold blob. An absent side yields no rows.
+    fn decode_key_blob(&self, blob: &[u8]) -> Result<(Vec<DeltaRow>, Vec<DeltaRow>), DbError> {
+        let (lb, rb) = decode_frame(blob)?;
+        let left = match lb {
+            Some(bytes) => {
+                let info = self.left_info.as_ref().ok_or_else(|| {
+                    DbError::Pipeline("incremental join: promote needs left schema".into())
+                })?;
+                let batches = ipc_to_batches(bytes).map_err(|e| {
+                    DbError::Pipeline(format!("incremental join: promote left ipc: {e}"))
+                })?;
+                Self::parse_side(info, &batches, false)?
+            }
+            None => Vec::new(),
+        };
+        let right = match rb {
+            Some(bytes) => {
+                let info = self.right_info.as_ref().ok_or_else(|| {
+                    DbError::Pipeline("incremental join: promote needs right schema".into())
+                })?;
+                let batches = ipc_to_batches(bytes).map_err(|e| {
+                    DbError::Pipeline(format!("incremental join: promote right ipc: {e}"))
+                })?;
+                Self::parse_side(info, &batches, false)?
+            }
+            None => Vec::new(),
+        };
+        Ok((left, right))
+    }
+
+    /// Demote one join key: capture its two-sided blob, then drop its rows from both hot stores via
+    /// negative upserts so `estimated_state_bytes` sheds the freed bytes. The caller persists the
+    /// blob to the tier BEFORE this drops the rows (write-before-drop — wired in S4.5).
+    fn demote_key(&mut self, key: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
+        let blob = self.encode_key_blob(key)?;
+        for (row, w) in self.left_state.get(key) {
+            self.left_state.upsert(key, &row, -w);
+        }
+        for (row, w) in self.right_state.get(key) {
+            self.right_state.upsert(key, &row, -w);
+        }
+        self.tier.mark_demoted(key);
+        Ok(blob)
+    }
+
+    /// Promote one cold join key back into the hot stores from its blob, re-incrementing
+    /// `estimated_state_bytes` and re-marking the key dirty so the next capture carries it.
+    fn promote_key(&mut self, key: &[ScalarValue], blob: &[u8]) -> Result<(), DbError> {
+        let (left, right) = self.decode_key_blob(blob)?;
+        for d in &left {
+            self.left_state.upsert(&d.key, &d.row, d.weight);
+        }
+        for d in &right {
+            self.right_state.upsert(&d.key, &d.row, d.weight);
+        }
+        self.tier.mark_promoted(key);
+        Ok(())
+    }
+
+    /// Clean, idle-first, non-NULL join keys eligible for demotion, capped at `max`. A NULL join key
+    /// only ever NULL-pads on the LEFT side (it can never match a right row), so it is never demoted.
+    fn demotable_keys(&self, max: usize) -> Vec<Vec<ScalarValue>> {
+        if !self.tier.delta_tracking || max == 0 {
+            return Vec::new();
+        }
+        let mut candidates: FxHashMap<Vec<ScalarValue>, u64> = FxHashMap::default();
+        for (store, info) in [
+            (&self.left_state, &self.left_info),
+            (&self.right_state, &self.right_info),
+        ] {
+            let Some(info) = info else {
+                continue;
+            };
+            for (row, _) in store.snapshot() {
+                let key: Vec<ScalarValue> =
+                    info.key_plain_pos.iter().map(|&p| row[p].clone()).collect();
+                if key.iter().any(ScalarValue::is_null) || self.tier.dirty.contains(&key) {
+                    continue;
+                }
+                let seq = self.tier.touch_seq.get(&key).copied().unwrap_or(0);
+                candidates.entry(key).or_insert(seq);
+            }
+        }
+        let mut ranked: Vec<(Vec<ScalarValue>, u64)> = candidates.into_iter().collect();
+        ranked.sort_by_key(|(_, seq)| *seq);
+        ranked.into_iter().take(max).map(|(k, _)| k).collect()
+    }
+
+    /// The cold join keys referenced by `batches` on `side`, projected through THAT side's key
+    /// columns (not a leading-column slice — the join's keys are not leading and differ per side).
+    /// The fetch-on-access path (S4.3) defers a cycle whose batches touch any cold key.
+    fn cold_keys_touched(
+        &self,
+        side: JoinSide,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<Vec<ScalarValue>>, DbError> {
+        if self.tier.cold_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let info = match side {
+            JoinSide::Left => self.left_info.as_ref(),
+            JoinSide::Right => self.right_info.as_ref(),
+        };
+        let Some(info) = info else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut seen: FxHashSet<Vec<ScalarValue>> = FxHashSet::default();
+        for batch in batches {
+            for r in 0..batch.num_rows() {
+                let key = scalars_at(batch, &info.key_idx, r)?;
+                if self.tier.is_cold(&key) && seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[async_trait]
 impl GraphOperator for IncrementalJoinOperator {
+    #[allow(clippy::too_many_lines)]
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -561,6 +860,8 @@ impl GraphOperator for IncrementalJoinOperator {
             }
         }
         self.resolve_output()?;
+        #[cfg(feature = "state-tier")]
+        self.ensure_codec()?;
         // First time the right schema is known: a LEFT join must back-fill NULL-padded rows for the
         // left state accumulated while it was unknown (the join MV emitted nothing until now).
         let first_right = self.left_outer && !right_was_seen && self.right_info.is_some();
@@ -595,6 +896,12 @@ impl GraphOperator for IncrementalJoinOperator {
         self.join_term(&delta_b, JoinSide::Right, &mut out);
         for d in &delta_b {
             self.right_state.upsert(&d.key, &d.row, d.weight);
+            #[cfg(feature = "state-tier")]
+            {
+                let resident =
+                    self.right_state.contains_key(&d.key) || self.left_state.contains_key(&d.key);
+                self.tier.after_upsert(&d.key, resident);
+            }
         }
 
         if self.left_outer {
@@ -625,6 +932,12 @@ impl GraphOperator for IncrementalJoinOperator {
         }
         for d in &delta_a {
             self.left_state.upsert(&d.key, &d.row, d.weight);
+            #[cfg(feature = "state-tier")]
+            {
+                let resident =
+                    self.left_state.contains_key(&d.key) || self.right_state.contains_key(&d.key);
+                self.tier.after_upsert(&d.key, resident);
+            }
         }
 
         self.build_output(&out)
@@ -1168,5 +1481,191 @@ mod tests {
         assert_eq!(snap.get(&(1, 10, 100)), Some(&1), "k1 inner row");
         assert_eq!(snap.get(&(2, 20, NULL)), Some(&1), "k2 pad NOT doubled");
         assert_eq!(snap.len(), 2);
+    }
+
+    // ─── Tier-backed join state (A1-emit 3b-S4.1) ───────────────────────────────────────────────
+
+    #[cfg(feature = "state-tier")]
+    #[test]
+    fn tier_key_codec_is_stable_and_null_safe() {
+        let codec = JoinKeyCodec::new(vec![DataType::Int64, DataType::Utf8]).unwrap();
+        let k1 = vec![i64_scalar(1), ScalarValue::Utf8(Some("a".into()))];
+        let k2 = vec![i64_scalar(1), ScalarValue::Utf8(Some("b".into()))];
+        let k_null = vec![
+            ScalarValue::Int64(None),
+            ScalarValue::Utf8(Some("a".into())),
+        ];
+
+        // Deterministic: a key encodes to the same bytes every time, distinct keys differ.
+        assert_eq!(codec.encode(&k1).unwrap(), codec.encode(&k1).unwrap());
+        assert_ne!(codec.encode(&k1).unwrap(), codec.encode(&k2).unwrap());
+        // NULL-safe: a NULL component encodes and is distinct from a non-NULL key.
+        assert_ne!(codec.encode(&k_null).unwrap(), codec.encode(&k1).unwrap());
+
+        // Restart-stable: a freshly-built converter of the same types yields identical bytes + vnode.
+        let codec2 = JoinKeyCodec::new(vec![DataType::Int64, DataType::Utf8]).unwrap();
+        assert_eq!(codec.encode(&k1).unwrap(), codec2.encode(&k1).unwrap());
+        assert_eq!(codec.vnode(&k1, 8).unwrap(), codec2.vnode(&k1, 8).unwrap());
+        assert!(codec.vnode(&k1, 8).unwrap() < 8);
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn tier_demote_then_promote_round_trips() {
+        let mut op = IncrementalJoinOperator::new(config());
+        op.tier.delta_tracking = true;
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+
+        let baseline = op.estimated_state_bytes();
+        let k1 = vec![i64_scalar(1)];
+        let left_before = op.left_state.get(&k1);
+        let right_before = op.right_state.get(&k1);
+        assert!(!left_before.is_empty() && !right_before.is_empty());
+
+        let blob = op.demote_key(&k1).unwrap();
+        assert!(!op.left_state.contains_key(&k1));
+        assert!(!op.right_state.contains_key(&k1));
+        assert!(op.tier.is_cold(&k1));
+        assert!(op.estimated_state_bytes() < baseline, "demote sheds bytes");
+
+        op.promote_key(&k1, &blob).unwrap();
+        assert!(!op.tier.is_cold(&k1));
+        assert_eq!(
+            op.estimated_state_bytes(),
+            baseline,
+            "bytes return to baseline after promote"
+        );
+        // Both sides' Z-set content is preserved (one row per side for k1).
+        assert_eq!(op.left_state.get(&k1), left_before);
+        assert_eq!(op.right_state.get(&k1), right_before);
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn tier_demotable_clean_vs_dirty_gate() {
+        let mut op = IncrementalJoinOperator::new(config());
+        op.tier.delta_tracking = true;
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+
+        // Every key was just mutated → dirty → none demotable.
+        assert!(op.demotable_keys(10).is_empty());
+        // A capture clears dirty → both keys become demotable.
+        op.tier.clear_dirty();
+        assert_eq!(op.demotable_keys(10).len(), 2);
+        // Touch k1 again → only the untouched k2 stays demotable.
+        op.process(&[vec![left_batch(&[(1, 11, 1)])], vec![]], &[0, 0])
+            .await
+            .unwrap();
+        assert_eq!(op.demotable_keys(10), vec![vec![i64_scalar(2)]]);
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn tier_demotable_excludes_null_keys() {
+        // A LEFT join keeps a NULL-key left row; it must never be demoted (it can never match).
+        let nullable_left = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("va", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let left = RecordBatch::try_new(
+            nullable_left,
+            vec![
+                Arc::new(Int64Array::from(vec![None, Some(1)])),
+                Arc::new(Int64Array::from(vec![10, 11])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+            ],
+        )
+        .unwrap();
+        let mut op = IncrementalJoinOperator::new(left_config());
+        op.tier.delta_tracking = true;
+        op.process(&[vec![left], vec![right_batch(&[(1, 100, 1)])]], &[0, 0])
+            .await
+            .unwrap();
+        op.tier.clear_dirty();
+
+        let demotable = op.demotable_keys(10);
+        assert!(demotable.iter().all(|k| k.iter().all(|s| !s.is_null())));
+        assert_eq!(
+            demotable,
+            vec![vec![i64_scalar(1)]],
+            "NULL key excluded; only k=1 demotable"
+        );
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn tier_cold_keys_touched_projects_side_key() {
+        let mut op = IncrementalJoinOperator::new(config());
+        op.tier.delta_tracking = true;
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+        op.demote_key(&[i64_scalar(1)]).unwrap();
+
+        // A left batch referencing cold key 1 and live key 2 → only 1 is reported.
+        let touched = op
+            .cold_keys_touched(JoinSide::Left, &[left_batch(&[(1, 99, 1), (2, 99, 1)])])
+            .unwrap();
+        assert_eq!(touched, vec![vec![i64_scalar(1)]]);
+        // A right batch referencing only a live key → none.
+        let touched = op
+            .cold_keys_touched(JoinSide::Right, &[right_batch(&[(2, 5, 1)])])
+            .unwrap();
+        assert!(touched.is_empty());
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn tier_left_outer_unmatched_key_blob_stays_right_absent() {
+        // A LEFT-join key with left rows but no right match must demote+promote to a right-ABSENT
+        // state, so a later presence probe still reads "no match" (no fabricated NULL-pad flip).
+        let mut op = IncrementalJoinOperator::new(left_config());
+        op.tier.delta_tracking = true;
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1)])],
+                vec![right_batch(&[(2, 200, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let k1 = vec![i64_scalar(1)];
+        assert!(op.left_state.contains_key(&k1) && !op.right_state.contains_key(&k1));
+        let blob = op.demote_key(&k1).unwrap();
+        assert!(!op.left_state.contains_key(&k1));
+
+        op.promote_key(&k1, &blob).unwrap();
+        assert!(op.left_state.contains_key(&k1), "left rows restored");
+        assert!(
+            !op.right_state.contains_key(&k1),
+            "right side stays absent after promote"
+        );
     }
 }
