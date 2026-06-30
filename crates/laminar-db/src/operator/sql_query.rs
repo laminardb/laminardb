@@ -1416,6 +1416,7 @@ impl GraphOperator for SqlQueryOperator {
                                     &self.op_name,
                                 )?),
                                 group_keys,
+                                codec: crate::checkpoint_coordinator::StateCodec::Agg,
                             }
                         }
                     };
@@ -1455,7 +1456,13 @@ impl GraphOperator for SqlQueryOperator {
         }
         #[cfg(feature = "state-tier")]
         for (vnode, group_keys) in cold_groups {
-            out.insert(vnode, StagedSlice::ColdGroups { group_keys });
+            out.insert(
+                vnode,
+                StagedSlice::ColdGroups {
+                    group_keys,
+                    codec: crate::checkpoint_coordinator::StateCodec::Agg,
+                },
+            );
         }
         // Cold markers let the coordinator fetch the slice instead of treating the vnode as empty.
         for vnode in cold {

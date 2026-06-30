@@ -29,9 +29,9 @@ use laminar_core::changelog::WEIGHT_COLUMN;
 use crate::error::DbError;
 use crate::mv_store::{batches_to_ipc, ipc_to_batches};
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+use crate::sql_analysis::{IncrementalJoinConfig, JoinProjItem, JoinSide};
 #[cfg(feature = "state-tier")]
 use crate::state_tier::TierRequest;
-use crate::sql_analysis::{IncrementalJoinConfig, JoinProjItem, JoinSide};
 
 /// Indexed Z-set: `join_key -> { full_row -> multiplicity }`. The in-memory impl validates IVM
 /// correctness; a tier-backed impl over the group KV will replace it.
@@ -484,7 +484,73 @@ impl IncrementalJoinOperator {
     }
 }
 
-/// Frame two optional side blobs as `[left_len:u32 LE][left][right_len:u32 LE][right]`.
+/// Whole-operator checkpoint: resident side Z-sets + the vnodes holding cold keys (rehydrated from
+/// durable cold-only partials on restart) + any promotion-deferred batches (a mid-promotion capture
+/// must carry them — the source already counts them consumed). Replaces the bare two-blob frame.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct JoinOpCheckpoint {
+    left: Option<Vec<u8>>,
+    right: Option<Vec<u8>>,
+    cold_vnodes: Vec<u32>,
+    deferred: Vec<(i64, u8, Vec<u8>)>, // (watermark, side: 0=left/1=right, IPC batch)
+}
+
+#[cfg(feature = "state-tier")]
+fn side_to_u8(side: JoinSide) -> u8 {
+    match side {
+        JoinSide::Left => 0,
+        JoinSide::Right => 1,
+    }
+}
+
+#[cfg(feature = "state-tier")]
+fn u8_to_side(b: u8) -> JoinSide {
+    if b == 0 {
+        JoinSide::Left
+    } else {
+        JoinSide::Right
+    }
+}
+
+/// Concatenate same-side IPC batches into one stream (`None` if empty). All batches for a side share
+/// its schema, so the first batch's schema frames the stream.
+#[cfg(feature = "state-tier")]
+fn frames_to_ipc(batches: &[RecordBatch]) -> Result<Option<Vec<u8>>, DbError> {
+    let Some(first) = batches.first() else {
+        return Ok(None);
+    };
+    Ok(Some(batches_to_ipc(&first.schema(), batches.iter())?))
+}
+
+/// Merge N per-key two-sided cold blobs into ONE cold-only partial: collect every key's left-side IPC
+/// into one left stream and every key's right-side IPC into one right stream, then re-frame. The join
+/// analog of the aggregate's `append_disjoint` — cold keys are disjoint from resident, so recovery
+/// applies this additively. Called by the coordinator's cold-group resolver.
+#[cfg(feature = "state-tier")]
+pub(crate) fn merge_serialized_join_frames(parts: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
+    let mut left_batches: Vec<RecordBatch> = Vec::new();
+    let mut right_batches: Vec<RecordBatch> = Vec::new();
+    for part in parts {
+        let (lb, rb) = decode_frame(part.as_ref())?;
+        if let Some(b) = lb {
+            left_batches.extend(ipc_to_batches(b).map_err(|e| {
+                DbError::Pipeline(format!("incremental join: merge left ipc: {e}"))
+            })?);
+        }
+        if let Some(b) = rb {
+            right_batches.extend(ipc_to_batches(b).map_err(|e| {
+                DbError::Pipeline(format!("incremental join: merge right ipc: {e}"))
+            })?);
+        }
+    }
+    let left = frames_to_ipc(&left_batches)?;
+    let right = frames_to_ipc(&right_batches)?;
+    Ok(encode_frame(left.as_deref(), right.as_deref()))
+}
+
+/// Frame two optional side blobs as `[left_len:u32 LE][left][right_len:u32 LE][right]`. Used only for
+/// per-key cold blobs (the whole-op manifest is the rkyv `JoinOpCheckpoint`).
+#[cfg(feature = "state-tier")]
 fn encode_frame(left: Option<&[u8]>, right: Option<&[u8]>) -> Vec<u8> {
     let l = left.unwrap_or(&[]);
     let r = right.unwrap_or(&[]);
@@ -496,9 +562,11 @@ fn encode_frame(left: Option<&[u8]>, right: Option<&[u8]>) -> Vec<u8> {
     out
 }
 
-/// The two optional side blobs decoded from a checkpoint frame.
+/// The two optional side blobs decoded from a per-key cold frame.
+#[cfg(feature = "cluster")]
 type FramedSides<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
 
+#[cfg(feature = "cluster")]
 fn decode_frame(data: &[u8]) -> Result<FramedSides<'_>, DbError> {
     let bad = || DbError::Pipeline("incremental join: truncated checkpoint frame".into());
     let ll = u32::from_le_bytes(data.get(0..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
@@ -650,6 +718,9 @@ struct JoinTierState {
     deferred: VecDeque<(i64, JoinSide, RecordBatch)>,
     inflight: FxHashMap<Vec<ScalarValue>, FetchRx>,
     fetch_misses: FxHashMap<Vec<ScalarValue>, u32>,
+    // Vnodes whose cold keys must be rehydrated from durable cold-only partials; set on restore,
+    // drained by `take_tier_cold_vnodes`.
+    pending_cold_rehydrate: Vec<u32>,
 }
 
 #[cfg(feature = "state-tier")]
@@ -669,6 +740,7 @@ impl JoinTierState {
             deferred: VecDeque::new(),
             inflight: FxHashMap::default(),
             fetch_misses: FxHashMap::default(),
+            pending_cold_rehydrate: Vec::new(),
         }
     }
 
@@ -980,6 +1052,30 @@ impl IncrementalJoinOperator {
         Ok(out)
     }
 
+    /// Distinct vnodes holding cold keys — persisted in the manifest so restart rehydrates them.
+    fn cold_vnodes_for_checkpoint(&self) -> Result<Vec<u32>, DbError> {
+        let Some(codec) = &self.tier.codec else {
+            return Ok(Vec::new());
+        };
+        let mut set: FxHashSet<u32> = FxHashSet::default();
+        for key in &self.tier.cold_keys {
+            set.insert(codec.vnode(key, self.tier.vnode_count)?);
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    /// Serialize promotion-deferred batches (side-tagged) so a mid-promotion checkpoint can replay them.
+    fn serialize_deferred(&self) -> Result<Vec<(i64, u8, Vec<u8>)>, DbError> {
+        let mut out = Vec::with_capacity(self.tier.deferred.len());
+        for (wm, side, batch) in &self.tier.deferred {
+            let ipc = laminar_core::serialization::serialize_batch_stream(batch).map_err(|e| {
+                DbError::Pipeline(format!("incremental join: defer serialize: {e}"))
+            })?;
+            out.push((*wm, side_to_u8(*side), ipc));
+        }
+        Ok(out)
+    }
+
     /// Issue a fetch for one cold key, deriving its tier coordinates from the codec.
     fn fetch_cold_key(&mut self, key: &[ScalarValue]) -> Result<(), DbError> {
         let (group, vnode) = {
@@ -1014,7 +1110,10 @@ impl IncrementalJoinOperator {
                     let Some(codec) = &self.tier.codec else {
                         continue;
                     };
-                    (codec.encode(&key)?, codec.vnode(&key, self.tier.vnode_count)?)
+                    (
+                        codec.encode(&key)?,
+                        codec.vnode(&key, self.tier.vnode_count)?,
+                    )
                 };
                 self.tier.drop_group(coords.1, coords.0);
             } else {
@@ -1196,29 +1295,79 @@ impl GraphOperator for IncrementalJoinOperator {
 
         #[cfg(feature = "state-tier")]
         if self.tier.promotion_active() {
-            return self.process_with_promotion(left_batches, right_batches, first_right, watermarks);
+            return self.process_with_promotion(
+                left_batches,
+                right_batches,
+                first_right,
+                watermarks,
+            );
         }
         self.run_ivm_cycle(left_batches, right_batches, first_right)
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        // Resident side Z-sets ride the whole-op manifest; cold keys' rows are absent from the hot
+        // stores, so `side_checkpoint_bytes` (over `snapshot`) is already resident-only.
         let left = self.side_checkpoint_bytes(JoinSide::Left)?;
         let right = self.side_checkpoint_bytes(JoinSide::Right)?;
-        if left.is_none() && right.is_none() {
+        #[cfg(feature = "state-tier")]
+        let cold_vnodes = self.cold_vnodes_for_checkpoint()?;
+        #[cfg(not(feature = "state-tier"))]
+        let cold_vnodes: Vec<u32> = Vec::new();
+        #[cfg(feature = "state-tier")]
+        let deferred = self.serialize_deferred()?;
+        #[cfg(not(feature = "state-tier"))]
+        let deferred: Vec<(i64, u8, Vec<u8>)> = Vec::new();
+
+        if left.is_none() && right.is_none() && cold_vnodes.is_empty() && deferred.is_empty() {
             return Ok(None);
         }
-        Ok(Some(OperatorCheckpoint {
-            data: encode_frame(left.as_deref(), right.as_deref()),
-        }))
+        let cp = JoinOpCheckpoint {
+            left,
+            right,
+            cold_vnodes,
+            deferred,
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!("incremental join: checkpoint serialize: {e}"))
+            })?;
+        Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let (left, right) = decode_frame(&checkpoint.data)?;
-        if let Some(bytes) = left {
+        let cp: JoinOpCheckpoint = rkyv::from_bytes::<JoinOpCheckpoint, rkyv::rancor::Error>(
+            &checkpoint.data,
+        )
+        .map_err(|e| DbError::Pipeline(format!("incremental join: checkpoint deserialize: {e}")))?;
+        if let Some(bytes) = &cp.left {
             self.restore_side(JoinSide::Left, bytes)?;
         }
-        if let Some(bytes) = right {
+        if let Some(bytes) = &cp.right {
             self.restore_side(JoinSide::Right, bytes)?;
+        }
+        #[cfg(feature = "state-tier")]
+        {
+            if !cp.cold_vnodes.is_empty() {
+                self.tier.pending_cold_rehydrate = cp.cold_vnodes;
+            }
+            for (wm, side, ipc) in &cp.deferred {
+                let batch =
+                    laminar_core::serialization::deserialize_batch_stream(ipc).map_err(|e| {
+                        DbError::Pipeline(format!("incremental join: defer restore: {e}"))
+                    })?;
+                self.tier
+                    .deferred
+                    .push_back((*wm, u8_to_side(*side), batch));
+            }
+        }
+        #[cfg(not(feature = "state-tier"))]
+        if !cp.deferred.is_empty() {
+            tracing::warn!(
+                count = cp.deferred.len(),
+                "dropping checkpointed incremental-join deferred batches — no state-tier support"
+            );
         }
         Ok(())
     }
@@ -1257,6 +1406,85 @@ impl GraphOperator for IncrementalJoinOperator {
     #[cfg(feature = "state-tier")]
     fn has_pending_promotion(&self) -> bool {
         self.tier.has_pending()
+    }
+
+    // Cold keys ride durable cold-only partials: stage their keys per vnode; resident rides the
+    // whole-op manifest. Demotion unit = the join key, bucketed by `self.tier.vnode_count` (the same
+    // count demote/fetch use, so the tier KV vnode agrees).
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map (matches the trait)
+    fn checkpoint_by_vnode(
+        &mut self,
+        _vnode_count: u32,
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
+        #[cfg(feature = "state-tier")]
+        {
+            use crate::checkpoint_coordinator::{StagedSlice, StateCodec};
+            let Some(codec) = &self.tier.codec else {
+                return Ok(None);
+            };
+            if self.tier.cold_keys.is_empty() {
+                return Ok(None);
+            }
+            let mut by_vnode: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+                std::collections::HashMap::new();
+            for key in &self.tier.cold_keys {
+                let group = codec.encode(key)?;
+                let vnode = codec.vnode(key, self.tier.vnode_count)?;
+                by_vnode.entry(vnode).or_default().push(group);
+            }
+            let mut out = std::collections::HashMap::with_capacity(by_vnode.len());
+            for (vnode, group_keys) in by_vnode {
+                out.insert(
+                    vnode,
+                    StagedSlice::ColdGroups {
+                        group_keys,
+                        codec: StateCodec::Join,
+                    },
+                );
+            }
+            Ok(Some(out))
+        }
+        #[cfg(not(feature = "state-tier"))]
+        Ok(None)
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.tier.pending_cold_rehydrate)
+    }
+
+    // Rehydrate cold keys from a cold-only partial (a merged join frame). Decode + upsert both sides
+    // ADDITIVELY — cold keys are disjoint from the manifest's resident keys, so no double count.
+    // `restore_side` resolves a never-resident side's schema from the blob (m11). Single-node has no
+    // delta chain, so `deltas` is normally empty; applied additively if present.
+    #[cfg(feature = "cluster")]
+    fn apply_vnode_chain(
+        &mut self,
+        _vnode: u32,
+        base: &[u8],
+        deltas: &[(&[u8], &[u8])],
+    ) -> Result<(), DbError> {
+        let (left, right) = decode_frame(base)?;
+        if let Some(b) = left {
+            self.restore_side(JoinSide::Left, b)?;
+        }
+        if let Some(b) = right {
+            self.restore_side(JoinSide::Right, b)?;
+        }
+        for (changed, _tombstones) in deltas {
+            let (l, r) = decode_frame(changed)?;
+            if let Some(b) = l {
+                self.restore_side(JoinSide::Left, b)?;
+            }
+            if let Some(b) = r {
+                self.restore_side(JoinSide::Right, b)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1977,7 +2205,11 @@ mod tests {
         // Tracking is on → after a capture the key is demotable, and the codec was built.
         op.tier.clear_dirty();
         assert_eq!(op.demotable_keys(10), vec![vec![i64_scalar(1)]]);
-        let codec = op.tier.codec.as_ref().expect("codec built once both schemas seen");
+        let codec = op
+            .tier
+            .codec
+            .as_ref()
+            .expect("codec built once both schemas seen");
         assert!(codec.vnode(&[i64_scalar(1)], 8).unwrap() < 8);
         assert_eq!(op.tier.vnode_count, 8);
     }
@@ -1988,8 +2220,11 @@ mod tests {
     fn spawn_tier() -> (crate::state_tier::TierTx, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::state_tier::StateTierStore::open(dir.path(), None).unwrap();
-        let tier =
-            crate::state_tier::spawn_worker(&tokio::runtime::Handle::current(), Arc::new(store), 256);
+        let tier = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::new(store),
+            256,
+        );
         (tier, dir)
     }
 
@@ -2046,7 +2281,10 @@ mod tests {
 
         // Updating the cold key defers the cycle, issues a fetch, and holds the barrier.
         let out = op
-            .process(&[vec![left_batch(&[(1, 10, -1), (1, 15, 1)])], vec![]], &[5, 0])
+            .process(
+                &[vec![left_batch(&[(1, 10, -1), (1, 15, 1)])], vec![]],
+                &[5, 0],
+            )
             .await
             .unwrap();
         assert!(out.iter().all(|b| b.num_rows() == 0), "deferred while cold");
@@ -2098,10 +2336,16 @@ mod tests {
         demote_to_tier(&mut op, &tier, &k1).await;
 
         let out = op
-            .process(&[vec![], vec![right_batch(&[(1, 100, -1), (1, 200, 1)])]], &[0, 7])
+            .process(
+                &[vec![], vec![right_batch(&[(1, 100, -1), (1, 200, 1)])]],
+                &[0, 7],
+            )
             .await
             .unwrap();
-        assert!(out.iter().all(|b| b.num_rows() == 0), "deferred: δB touches cold key");
+        assert!(
+            out.iter().all(|b| b.num_rows() == 0),
+            "deferred: δB touches cold key"
+        );
 
         let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
         snap.insert((1, 10, 100), 1);
@@ -2115,7 +2359,11 @@ mod tests {
         }
         assert!(!op.tier.is_cold(&k1));
         assert_eq!(snap.get(&(1, 10, 100)), None, "old right value retracted");
-        assert_eq!(snap.get(&(1, 10, 200)), Some(&1), "left joins the new right value");
+        assert_eq!(
+            snap.get(&(1, 10, 200)),
+            Some(&1),
+            "left joins the new right value"
+        );
     }
 
     // A demoted key whose blob never reached the tier must ESCALATE (not wedge behind the hold).
@@ -2156,5 +2404,175 @@ mod tests {
         }
         let err = err.expect("repeated fetch misses must escalate");
         assert!(format!("{err}").contains("LDB-3005"), "got: {err}");
+    }
+
+    // ─── Cold-only-partial recovery (A1-emit 3b-S4.4) ───────────────────────────────────────────
+
+    #[cfg(feature = "state-tier")]
+    async fn fetch_group(
+        tier: &crate::state_tier::TierTx,
+        op_name: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> bytes::Bytes {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tier.send(TierRequest::FetchGroup {
+            operator: Arc::from(op_name),
+            vnode,
+            group: group.to_vec(),
+            reply,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap().expect("blob present in tier")
+    }
+
+    // Resolve the cold-only partials the coordinator would build: fetch each staged cold key's blob
+    // and merge per vnode (mirrors resolve_cold_groups → merge_serialized_join_frames).
+    #[cfg(feature = "state-tier")]
+    #[allow(clippy::disallowed_types)] // vnode-keyed map mirroring the coordinator
+    async fn resolve_cold_partials(
+        op: &mut IncrementalJoinOperator,
+        tier: &crate::state_tier::TierTx,
+    ) -> std::collections::HashMap<u32, Vec<u8>> {
+        let staged = op
+            .checkpoint_by_vnode(op.tier.vnode_count)
+            .unwrap()
+            .expect("cold groups staged");
+        let mut out = std::collections::HashMap::new();
+        for (vnode, slice) in staged {
+            if let crate::checkpoint_coordinator::StagedSlice::ColdGroups { group_keys, .. } = slice
+            {
+                let mut parts = Vec::new();
+                for gk in &group_keys {
+                    parts.push(fetch_group(tier, "join", vnode, gk).await);
+                }
+                out.insert(vnode, merge_serialized_join_frames(&parts).unwrap());
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_restart_survives_demotion() {
+        let (tier, _dir) = spawn_tier();
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_op_name("join");
+        op.attach_state_tier(tier.clone());
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1), (3, 30, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let k2 = vec![i64_scalar(2)];
+        demote_to_tier(&mut op, &tier, &k2).await;
+        assert!(op.tier.is_cold(&k2) && !op.left_state.contains_key(&k2));
+
+        // Capture: whole-op manifest (resident 1,3) + resolved cold-only partials (key 2).
+        let manifest = op.checkpoint().unwrap().expect("non-empty manifest");
+        let cold_partials = resolve_cold_partials(&mut op, &tier).await;
+        assert!(!cold_partials.is_empty(), "key 2 staged as a cold partial");
+
+        // Restart: fresh operator, restore the manifest, then rehydrate cold vnodes from the partials.
+        let mut restored = IncrementalJoinOperator::new(config());
+        restored.set_op_name("join");
+        restored.attach_state_tier(tier.clone());
+        restored.enable_delta_tracking();
+        restored.restore(manifest).unwrap();
+        let cold_vnodes = restored.take_tier_cold_vnodes();
+        assert!(!cold_vnodes.is_empty(), "manifest recorded cold vnodes");
+        for v in cold_vnodes {
+            let base = cold_partials.get(&v).expect("partial for cold vnode");
+            restored.apply_vnode_chain(v, base, &[]).unwrap();
+        }
+
+        // All three keys resident again (1,3 from the manifest; 2 rehydrated), both sides.
+        for k in [1, 2, 3] {
+            assert!(
+                restored.left_state.contains_key(&[i64_scalar(k)]),
+                "left {k}"
+            );
+            assert!(
+                restored.right_state.contains_key(&[i64_scalar(k)]),
+                "right {k}"
+            );
+        }
+
+        // An update to the rehydrated key 2 nets correctly — proves both sides recovered consistently.
+        let out = restored
+            .process(
+                &[vec![left_batch(&[(2, 20, -1), (2, 25, 1)])], vec![]],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        snap.insert((2, 20, 200), 1); // pre-restart joined row in the MV
+        net_into(&mut snap, &out);
+        assert_eq!(
+            snap.get(&(2, 20, 200)),
+            None,
+            "stale row retracted post-rehydrate"
+        );
+        assert_eq!(snap.get(&(2, 25, 200)), Some(&1));
+    }
+
+    // A checkpoint taken mid-promotion must persist the deferred batch (the source counts it consumed).
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_checkpoint_persists_deferred_promotion() {
+        let (tier, _dir) = spawn_tier();
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_op_name("join");
+        op.attach_state_tier(tier.clone());
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let k2 = vec![i64_scalar(2)];
+        demote_to_tier(&mut op, &tier, &k2).await;
+        // Update the cold key → the cycle defers (fetch in flight) at watermark 9.
+        let out = op
+            .process(
+                &[vec![left_batch(&[(2, 20, -1), (2, 25, 1)])], vec![]],
+                &[9, 0],
+            )
+            .await
+            .unwrap();
+        assert!(out.iter().all(|b| b.num_rows() == 0));
+        assert!(op.tier.has_pending());
+
+        // Mid-promotion checkpoint carries the deferred batch + the cold vnode.
+        let manifest = op.checkpoint().unwrap().expect("non-empty manifest");
+        let mut restored = IncrementalJoinOperator::new(config());
+        restored.set_op_name("join");
+        restored.attach_state_tier(tier.clone());
+        restored.enable_delta_tracking();
+        restored.restore(manifest).unwrap();
+        assert!(
+            !restored.tier.deferred.is_empty(),
+            "deferred batch persisted + restored"
+        );
+        assert_eq!(restored.watermark_hold(), Some(9), "barrier hold restored");
+        assert!(
+            !restored.take_tier_cold_vnodes().is_empty(),
+            "cold vnode recorded"
+        );
     }
 }

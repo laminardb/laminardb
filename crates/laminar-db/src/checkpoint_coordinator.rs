@@ -19,6 +19,25 @@ use tracing::{debug, error, info, warn};
 use crate::error::DbError;
 
 /// One operator's staged slice for one vnode of the next checkpoint.
+/// Which operator's blob codec a cold-group partial uses — the coordinator merges agg checkpoints
+/// columnar-disjoint but join frames side-regrouped, so it dispatches the merge on this tag.
+#[cfg(feature = "state-tier")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateCodec {
+    Agg,
+    Join,
+}
+
+/// Merge cold-group blobs fetched from the tier into one cold-only partial, per the operator codec:
+/// aggregates fold columnar-disjoint, joins regroup each side's IPC frames.
+#[cfg(feature = "state-tier")]
+fn merge_cold_groups(codec: StateCodec, parts: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
+    match codec {
+        StateCodec::Agg => crate::aggregate_state::merge_serialized_agg_cps(parts),
+        StateCodec::Join => crate::operator::incremental_join::merge_serialized_join_frames(parts),
+    }
+}
+
 #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum StagedSlice {
@@ -37,6 +56,7 @@ pub(crate) enum StagedSlice {
     #[cfg(feature = "state-tier")]
     ColdGroups {
         group_keys: Vec<Vec<u8>>,
+        codec: StateCodec,
     },
     // A delta-chain re-base of a vnode that still holds demoted groups: the resident FULL bytes plus
     // the cold group keys, merged with the tier-fetched groups into ONE self-contained base. Always a
@@ -45,6 +65,7 @@ pub(crate) enum StagedSlice {
     FullWithColdGroups {
         resident: bytes::Bytes,
         group_keys: Vec<Vec<u8>>,
+        codec: StateCodec,
     },
 }
 
@@ -589,14 +610,13 @@ impl CheckpointCoordinator {
         operator: &str,
         vnode: u32,
         group_keys: &[Vec<u8>],
+        codec: StateCodec,
     ) -> Result<bytes::Bytes, DbError> {
         let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len());
         for gk in group_keys {
             parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
         }
-        Ok(bytes::Bytes::from(
-            crate::aggregate_state::merge_serialized_agg_cps(&parts)?,
-        ))
+        Ok(bytes::Bytes::from(merge_cold_groups(codec, &parts)?))
     }
 
     /// Resolve a `FullWithColdGroups` re-base into ONE self-contained base: fold the resident FULL
@@ -609,15 +629,14 @@ impl CheckpointCoordinator {
         vnode: u32,
         resident: &bytes::Bytes,
         group_keys: &[Vec<u8>],
+        codec: StateCodec,
     ) -> Result<bytes::Bytes, DbError> {
         let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len() + 1);
         parts.push(resident.clone());
         for gk in group_keys {
             parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
         }
-        Ok(bytes::Bytes::from(
-            crate::aggregate_state::merge_serialized_agg_cps(&parts)?,
-        ))
+        Ok(bytes::Bytes::from(merge_cold_groups(codec, &parts)?))
     }
 
     /// Vnodes with memory-resident slices, as `(vnode, bytes)`, largest first.
@@ -1156,16 +1175,21 @@ impl CheckpointCoordinator {
                             StagedSlice::FullWithColdGroups {
                                 resident,
                                 group_keys,
+                                codec,
                             } => {
                                 let bytes = self
-                                    .resolve_full_with_cold_groups(name, v, resident, group_keys)
+                                    .resolve_full_with_cold_groups(
+                                        name, v, resident, group_keys, *codec,
+                                    )
                                     .await?;
                                 operators.push((name.clone(), bytes.to_vec()));
                                 recorded.insert(name.clone(), UploadedSlice::Cold);
                             }
                             #[cfg(feature = "state-tier")]
-                            StagedSlice::ColdGroups { group_keys } => {
-                                let bytes = self.resolve_cold_groups(name, v, group_keys).await?;
+                            StagedSlice::ColdGroups { group_keys, codec } => {
+                                let bytes = self
+                                    .resolve_cold_groups(name, v, group_keys, *codec)
+                                    .await?;
                                 operators.push((name.clone(), bytes.to_vec()));
                                 recorded.insert(name.clone(), UploadedSlice::Cold);
                             }
@@ -1222,16 +1246,18 @@ impl CheckpointCoordinator {
                                 StagedSlice::FullWithColdGroups {
                                     resident,
                                     group_keys,
+                                    codec,
                                 } => (
                                     self.resolve_full_with_cold_groups(
-                                        name, v, resident, group_keys,
+                                        name, v, resident, group_keys, *codec,
                                     )
                                     .await?,
                                     UploadedSlice::Cold,
                                 ),
                                 #[cfg(feature = "state-tier")]
-                                StagedSlice::ColdGroups { group_keys } => (
-                                    self.resolve_cold_groups(name, v, group_keys).await?,
+                                StagedSlice::ColdGroups { group_keys, codec } => (
+                                    self.resolve_cold_groups(name, v, group_keys, *codec)
+                                        .await?,
                                     UploadedSlice::Cold,
                                 ),
                                 StagedSlice::Delta { .. } => unreachable!("delta routed above"),
