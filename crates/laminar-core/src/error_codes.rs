@@ -71,6 +71,9 @@ pub const JOIN_TIME_BOUND_MISSING: &str = "LDB-3002";
 pub const TEMPORAL_JOIN_NO_PK: &str = "LDB-3003";
 /// Unsupported join type for streaming queries.
 pub const JOIN_TYPE_UNSUPPORTED: &str = "LDB-3004";
+/// Tier-backed join: a demoted cold join key could not be fetched back (the cold
+/// tier lost it). The operator escalates rather than wedging behind the hold.
+pub const JOIN_STATE_FETCH_MISS: &str = "LDB-3005";
 
 // ── Serialization / State (LDB-4xxx) ──
 

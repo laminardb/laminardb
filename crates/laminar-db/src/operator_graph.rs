@@ -1564,6 +1564,7 @@ impl OperatorGraph {
             let mut op = operator::incremental_join::IncrementalJoinOperator::new(cfg);
             #[cfg(feature = "state-tier")]
             if let Some(tier) = self.state_tier.clone() {
+                op.set_op_name(name);
                 op.attach_state_tier(tier);
                 if let Some(vnode_count) = self.vnode_count {
                     op.set_vnode_count(vnode_count);

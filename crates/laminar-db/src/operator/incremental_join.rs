@@ -21,12 +21,16 @@ use datafusion_common::ScalarValue;
 use rustc_hash::FxHashMap;
 #[cfg(feature = "state-tier")]
 use rustc_hash::FxHashSet;
+#[cfg(feature = "state-tier")]
+use std::collections::VecDeque;
 
 use laminar_core::changelog::WEIGHT_COLUMN;
 
 use crate::error::DbError;
 use crate::mv_store::{batches_to_ipc, ipc_to_batches};
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+#[cfg(feature = "state-tier")]
+use crate::state_tier::TierRequest;
 use crate::sql_analysis::{IncrementalJoinConfig, JoinProjItem, JoinSide};
 
 /// Indexed Z-set: `join_key -> { full_row -> multiplicity }`. The in-memory impl validates IVM
@@ -609,12 +613,26 @@ impl JoinKeyCodec {
     }
 }
 
+/// Past this many deferred rows the operator stops accepting input (backpressure while promoting).
+#[cfg(feature = "state-tier")]
+const MAX_DEFERRED_PROMOTION_ROWS: usize = 8192;
+/// Consecutive `Ok(None)` fetch replies for one cold key before escalating (the tier lost it).
+#[cfg(feature = "state-tier")]
+const MAX_PROMOTION_FETCH_MISSES: u32 = 32;
+
+#[cfg(feature = "state-tier")]
+type FetchRx = tokio::sync::oneshot::Receiver<Result<Option<bytes::Bytes>, DbError>>;
+/// A landed fetch: the cold join key and the tier's reply (`Ok(Some)` = blob, `Ok(None)` = miss).
+#[cfg(feature = "state-tier")]
+type ReadyFetch = (Vec<ScalarValue>, Result<Option<bytes::Bytes>, DbError>);
+
 /// Cold/dirty bookkeeping for key-granular demotion. The hot Z-sets stay in `left_state`/`right_state`;
 /// this tracks which join keys are clean (demotable) and which are currently cold (their two-sided
 /// Z-set lives in the tier, not in the hot stores).
 #[cfg(feature = "state-tier")]
 #[allow(dead_code)]
 struct JoinTierState {
+    op_name: Arc<str>,
     codec: Option<JoinKeyCodec>,
     vnode_count: u32,
     delta_tracking: bool,
@@ -627,6 +645,11 @@ struct JoinTierState {
     cold_keys: FxHashSet<Vec<ScalarValue>>,
     // The cold-tier worker channel; the demotion driver (S4.5) and fetch-on-access (S4.3) use it.
     tier_sender: Option<crate::state_tier::TierTx>,
+    // Fetch-on-access: input batches awaiting cold-key promotion (tagged by side + watermark), and
+    // the per-key in-flight fetches + consecutive-miss counters.
+    deferred: VecDeque<(i64, JoinSide, RecordBatch)>,
+    inflight: FxHashMap<Vec<ScalarValue>, FetchRx>,
+    fetch_misses: FxHashMap<Vec<ScalarValue>, u32>,
 }
 
 #[cfg(feature = "state-tier")]
@@ -634,6 +657,7 @@ struct JoinTierState {
 impl JoinTierState {
     fn new() -> Self {
         Self {
+            op_name: Arc::from("incremental_join"),
             codec: None,
             vnode_count: 1,
             delta_tracking: false,
@@ -642,7 +666,98 @@ impl JoinTierState {
             touch_seq: FxHashMap::default(),
             cold_keys: FxHashSet::default(),
             tier_sender: None,
+            deferred: VecDeque::new(),
+            inflight: FxHashMap::default(),
+            fetch_misses: FxHashMap::default(),
         }
+    }
+
+    /// Fetch-on-access is live once a tier channel and key codec are both present.
+    fn promotion_active(&self) -> bool {
+        self.tier_sender.is_some() && self.codec.is_some()
+    }
+
+    /// Issue a `FetchGroup` for one cold key (deduped on in-flight). Best-effort: a full channel just
+    /// means the next cycle retries.
+    fn issue_fetch(&mut self, key: &[ScalarValue], vnode: u32, group: Vec<u8>) {
+        if self.inflight.contains_key(key) {
+            return;
+        }
+        let Some(tier) = &self.tier_sender else {
+            return;
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let req = TierRequest::FetchGroup {
+            operator: self.op_name.clone(),
+            vnode,
+            group,
+            reply,
+        };
+        if tier.try_send(req).is_ok() {
+            self.inflight.insert(key.to_vec(), rx);
+        }
+    }
+
+    /// Collect fetches whose reply has landed; keep the still-pending ones.
+    fn drain_ready(&mut self) -> Vec<ReadyFetch> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let mut ready = Vec::new();
+        let mut pending = FxHashMap::default();
+        for (key, mut rx) in self.inflight.drain() {
+            match rx.try_recv() {
+                Ok(result) => ready.push((key, result)),
+                Err(TryRecvError::Empty) => {
+                    pending.insert(key, rx);
+                }
+                Err(TryRecvError::Closed) => {}
+            }
+        }
+        self.inflight = pending;
+        ready
+    }
+
+    fn defer_all(&mut self, batches: VecDeque<(i64, JoinSide, RecordBatch)>) {
+        self.deferred = batches;
+    }
+
+    fn take_deferred(&mut self) -> VecDeque<(i64, JoinSide, RecordBatch)> {
+        std::mem::take(&mut self.deferred)
+    }
+
+    fn deferred_rows(&self) -> usize {
+        self.deferred.iter().map(|(_, _, b)| b.num_rows()).sum()
+    }
+
+    fn min_deferred_watermark(&self) -> Option<i64> {
+        self.deferred.iter().map(|(w, _, _)| *w).min()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.inflight.is_empty() || !self.deferred.is_empty()
+    }
+
+    fn note_miss(&mut self, key: &[ScalarValue]) -> u32 {
+        let c = self.fetch_misses.entry(key.to_vec()).or_insert(0);
+        *c += 1;
+        *c
+    }
+
+    fn clear_miss(&mut self, key: &[ScalarValue]) {
+        self.fetch_misses.remove(key);
+    }
+
+    /// Fire-and-forget drop of a cold key's tier copy once it is resident again.
+    fn drop_group(&self, vnode: u32, group: Vec<u8>) {
+        let Some(tier) = &self.tier_sender else {
+            return;
+        };
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let _ = tier.try_send(TierRequest::DropGroup {
+            operator: self.op_name.clone(),
+            vnode,
+            group,
+            reply,
+        });
     }
 
     fn after_upsert(&mut self, key: &[ScalarValue], resident: bool) {
@@ -685,6 +800,11 @@ impl JoinTierState {
 #[cfg(feature = "state-tier")]
 #[allow(dead_code)]
 impl IncrementalJoinOperator {
+    /// The graph operator name, used as the tier KV prefix (must match across demote/fetch/recovery).
+    pub(crate) fn set_op_name(&mut self, name: &str) {
+        self.tier.op_name = Arc::from(name);
+    }
+
     /// Single-owner vnode count for key bucketing (`vnode = key_hash(join_key) % count`). Threaded
     /// from the vnode registry at build time; single-node defaults to 1.
     pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
@@ -859,6 +979,99 @@ impl IncrementalJoinOperator {
         }
         Ok(out)
     }
+
+    /// Issue a fetch for one cold key, deriving its tier coordinates from the codec.
+    fn fetch_cold_key(&mut self, key: &[ScalarValue]) -> Result<(), DbError> {
+        let (group, vnode) = {
+            let Some(codec) = &self.tier.codec else {
+                return Ok(());
+            };
+            (codec.encode(key)?, codec.vnode(key, self.tier.vnode_count)?)
+        };
+        self.tier.issue_fetch(key, vnode, group);
+        Ok(())
+    }
+
+    /// Fetch-on-access cycle: promote any ready cold keys (both sides atomically), then EITHER defer
+    /// the whole cycle and fetch it (if any touched key is still cold) OR run one IVM cycle over
+    /// deferred+new batches once every touched key is resident. Demotion is atomic per join key across
+    /// both sides, so deferring the whole cycle covers every per-cycle probe (§5.2). Fetch/recv are
+    /// non-blocking (`try_send`/`try_recv`), so this never awaits.
+    fn process_with_promotion(
+        &mut self,
+        new_left: &[RecordBatch],
+        new_right: &[RecordBatch],
+        first_right: bool,
+        watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // 1. Promote keys whose fetch has landed, then drop the now-redundant tier copy. A miss
+        //    (Ok(None)/Err) re-fetches; a persistent miss escalates rather than wedging the barrier.
+        for (key, result) in self.tier.drain_ready() {
+            if let Ok(Some(blob)) = result {
+                self.promote_key(&key, &blob)?;
+                self.tier.clear_miss(&key);
+                let coords = {
+                    let Some(codec) = &self.tier.codec else {
+                        continue;
+                    };
+                    (codec.encode(&key)?, codec.vnode(&key, self.tier.vnode_count)?)
+                };
+                self.tier.drop_group(coords.1, coords.0);
+            } else {
+                let misses = self.tier.note_miss(&key);
+                if misses > MAX_PROMOTION_FETCH_MISSES {
+                    return Err(DbError::Checkpoint(format!(
+                        "[{}] incremental join '{}': cold key fetch missed {misses}x",
+                        laminar_core::error_codes::JOIN_STATE_FETCH_MISS,
+                        self.tier.op_name
+                    )));
+                }
+                self.fetch_cold_key(&key)?;
+            }
+        }
+
+        // 2. Candidates = deferred ++ this cycle's new batches (tagged by side + watermark).
+        let lwm = watermarks.first().copied().unwrap_or(0);
+        let rwm = watermarks.get(1).copied().unwrap_or(0);
+        let mut pending = self.tier.take_deferred();
+        for b in new_left {
+            pending.push_back((lwm, JoinSide::Left, b.clone()));
+        }
+        for b in new_right {
+            pending.push_back((rwm, JoinSide::Right, b.clone()));
+        }
+
+        // 3. Cold keys touched by any pending batch (projected per side, §5.8).
+        let left_pending: Vec<RecordBatch> = pending
+            .iter()
+            .filter(|(_, s, _)| *s == JoinSide::Left)
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        let right_pending: Vec<RecordBatch> = pending
+            .iter()
+            .filter(|(_, s, _)| *s == JoinSide::Right)
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        let mut touched = self.cold_keys_touched(JoinSide::Left, &left_pending)?;
+        touched.extend(self.cold_keys_touched(JoinSide::Right, &right_pending)?);
+        // §5.3: the LEFT first-sight catch-up scans the WHOLE left side, so every cold key must be
+        // resident before it runs. Treat all cold keys as touched on that cycle.
+        if first_right && !self.tier.cold_keys.is_empty() {
+            touched.extend(self.tier.cold_keys.iter().cloned());
+        }
+
+        // 4. Any touched key still cold → fetch it + defer the whole cycle (process nothing).
+        if !touched.is_empty() {
+            for key in &touched {
+                self.fetch_cold_key(key)?;
+            }
+            self.tier.defer_all(pending);
+            return Ok(Vec::new());
+        }
+
+        // 5. Fully resident → one IVM cycle over all pending batches; the deferred queue is now empty.
+        self.run_ivm_cycle(&left_pending, &right_pending, first_right)
+    }
 }
 
 impl IncrementalJoinOperator {
@@ -953,10 +1166,11 @@ impl IncrementalJoinOperator {
 
 #[async_trait]
 impl GraphOperator for IncrementalJoinOperator {
+    #[cfg_attr(not(feature = "state-tier"), allow(unused_variables))]
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermarks: &[i64],
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
@@ -979,6 +1193,11 @@ impl GraphOperator for IncrementalJoinOperator {
         // while it was unknown. Gated on `left_catchup_done` (not "was right seen this cycle") so the
         // trigger survives a deferred cycle (S4.3) and a checkpoint restore (set in `restore_side`).
         let first_right = self.left_outer && !self.left_catchup_done && self.right_info.is_some();
+
+        #[cfg(feature = "state-tier")]
+        if self.tier.promotion_active() {
+            return self.process_with_promotion(left_batches, right_batches, first_right, watermarks);
+        }
         self.run_ivm_cycle(left_batches, right_batches, first_right)
     }
 
@@ -1008,6 +1227,23 @@ impl GraphOperator for IncrementalJoinOperator {
         self.left_state.estimated_bytes() + self.right_state.estimated_bytes()
     }
 
+    /// Hold the checkpoint barrier until deferred (un-promoted) batches drain, so a checkpoint never
+    /// captures state missing their effect.
+    fn watermark_hold(&self) -> Option<i64> {
+        #[cfg(feature = "state-tier")]
+        return self.tier.min_deferred_watermark();
+        #[cfg(not(feature = "state-tier"))]
+        return None;
+    }
+
+    /// Backpressure source intake once too many rows are queued behind cold-key promotion.
+    fn wants_input(&self) -> bool {
+        #[cfg(feature = "state-tier")]
+        return self.tier.deferred_rows() < MAX_DEFERRED_PROMOTION_ROWS;
+        #[cfg(not(feature = "state-tier"))]
+        return true;
+    }
+
     #[cfg(feature = "state-tier")]
     fn attach_state_tier(&mut self, tier: crate::state_tier::TierTx) {
         self.tier.tier_sender = Some(tier);
@@ -1016,6 +1252,11 @@ impl GraphOperator for IncrementalJoinOperator {
     #[cfg(feature = "state-tier")]
     fn enable_group_delta_tracking(&mut self) {
         self.enable_delta_tracking();
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn has_pending_promotion(&self) -> bool {
+        self.tier.has_pending()
     }
 }
 
@@ -1739,5 +1980,181 @@ mod tests {
         let codec = op.tier.codec.as_ref().expect("codec built once both schemas seen");
         assert!(codec.vnode(&[i64_scalar(1)], 8).unwrap() < 8);
         assert_eq!(op.tier.vnode_count, 8);
+    }
+
+    // ─── Fetch-on-access against a real cold tier (A1-emit 3b-S4.3) ──────────────────────────────
+
+    #[cfg(feature = "state-tier")]
+    fn spawn_tier() -> (crate::state_tier::TierTx, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::state_tier::StateTierStore::open(dir.path(), None).unwrap();
+        let tier =
+            crate::state_tier::spawn_worker(&tokio::runtime::Handle::current(), Arc::new(store), 256);
+        (tier, dir)
+    }
+
+    // Demote a key the way S4.5 will: capture its blob (dropping the hot rows) and persist it.
+    #[cfg(feature = "state-tier")]
+    async fn demote_to_tier(
+        op: &mut IncrementalJoinOperator,
+        tier: &crate::state_tier::TierTx,
+        key: &[ScalarValue],
+    ) {
+        let (group, vnode) = {
+            let c = op.tier.codec.as_ref().unwrap();
+            (
+                c.encode(key).unwrap(),
+                c.vnode(key, op.tier.vnode_count).unwrap(),
+            )
+        };
+        let blob = op.demote_key(key).unwrap();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tier.send(TierRequest::DemoteGroup {
+            operator: op.tier.op_name.clone(),
+            vnode,
+            group,
+            bytes: blob.into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_fetch_on_access_defers_then_replays() {
+        let (tier, _dir) = spawn_tier();
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_op_name("join");
+        op.attach_state_tier(tier.clone());
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let k1 = vec![i64_scalar(1)];
+        demote_to_tier(&mut op, &tier, &k1).await;
+        assert!(op.tier.is_cold(&k1) && !op.left_state.contains_key(&k1));
+
+        // Updating the cold key defers the cycle, issues a fetch, and holds the barrier.
+        let out = op
+            .process(&[vec![left_batch(&[(1, 10, -1), (1, 15, 1)])], vec![]], &[5, 0])
+            .await
+            .unwrap();
+        assert!(out.iter().all(|b| b.num_rows() == 0), "deferred while cold");
+        assert!(op.has_pending_promotion());
+        assert_eq!(op.watermark_hold(), Some(5), "barrier held at deferred wm");
+        assert!(op.wants_input());
+
+        // Pre-demotion joined rows, as the MV Multiset would hold them.
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        snap.insert((1, 10, 100), 1);
+        snap.insert((2, 20, 200), 1);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            let out = op.process(&[vec![], vec![]], &[0, 0]).await.unwrap();
+            net_into(&mut snap, &out);
+            if !op.tier.has_pending() {
+                break;
+            }
+        }
+        assert!(!op.tier.is_cold(&k1), "key 1 promoted");
+        assert_eq!(op.watermark_hold(), None, "hold released after drain");
+        assert_eq!(snap.get(&(1, 10, 100)), None, "stale row retracted");
+        assert_eq!(snap.get(&(1, 15, 100)), Some(&1));
+        assert_eq!(snap.get(&(2, 20, 200)), Some(&1), "untouched key intact");
+    }
+
+    // §5.2: a δB-only cycle touching a cold key must defer (term2 = A_old ⋈ δB probes the LEFT side,
+    // which is cold) and only join after both sides are promoted atomically.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_right_update_on_cold_key_promotes_and_joins() {
+        let (tier, _dir) = spawn_tier();
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_op_name("join");
+        op.attach_state_tier(tier.clone());
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1)])],
+                vec![right_batch(&[(1, 100, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let k1 = vec![i64_scalar(1)];
+        demote_to_tier(&mut op, &tier, &k1).await;
+
+        let out = op
+            .process(&[vec![], vec![right_batch(&[(1, 100, -1), (1, 200, 1)])]], &[0, 7])
+            .await
+            .unwrap();
+        assert!(out.iter().all(|b| b.num_rows() == 0), "deferred: δB touches cold key");
+
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        snap.insert((1, 10, 100), 1);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            let out = op.process(&[vec![], vec![]], &[0, 0]).await.unwrap();
+            net_into(&mut snap, &out);
+            if !op.tier.has_pending() {
+                break;
+            }
+        }
+        assert!(!op.tier.is_cold(&k1));
+        assert_eq!(snap.get(&(1, 10, 100)), None, "old right value retracted");
+        assert_eq!(snap.get(&(1, 10, 200)), Some(&1), "left joins the new right value");
+    }
+
+    // A demoted key whose blob never reached the tier must ESCALATE (not wedge behind the hold).
+    // The miss replies are injected so the escalation count is deterministic (no worker timing).
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_fetch_miss_escalates() {
+        let (tier, _dir) = spawn_tier();
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_op_name("join");
+        op.attach_state_tier(tier.clone());
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1)])],
+                vec![right_batch(&[(1, 100, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let k1 = vec![i64_scalar(1)];
+        op.demote_key(&k1).unwrap();
+        assert!(op.tier.is_cold(&k1));
+
+        let mut err = None;
+        for _ in 0..(MAX_PROMOTION_FETCH_MISSES + 5) {
+            // Force a ready `Ok(None)` reply for k1 each cycle (the tier "lost" the blob).
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            reply.send(Ok(None)).unwrap();
+            op.tier.inflight.insert(k1.clone(), rx);
+            if let Err(e) = op.process(&[vec![], vec![]], &[0, 0]).await {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("repeated fetch misses must escalate");
+        assert!(format!("{err}").contains("LDB-3005"), "got: {err}");
     }
 }
