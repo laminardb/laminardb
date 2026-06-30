@@ -1560,9 +1560,19 @@ impl OperatorGraph {
         // `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join emitting a joined
         // changelog into the join MV's `Multiset` store.
         if let Some(cfg) = incremental_join_config {
-            return Box::new(operator::incremental_join::IncrementalJoinOperator::new(
-                cfg,
-            ));
+            #[cfg_attr(not(feature = "state-tier"), allow(unused_mut))]
+            let mut op = operator::incremental_join::IncrementalJoinOperator::new(cfg);
+            #[cfg(feature = "state-tier")]
+            if let Some(tier) = self.state_tier.clone() {
+                op.attach_state_tier(tier);
+                if let Some(vnode_count) = self.vnode_count {
+                    op.set_vnode_count(vnode_count);
+                }
+                if self.group_delta_tracking {
+                    op.enable_delta_tracking();
+                }
+            }
+            return Box::new(op);
         }
 
         // `changelog ⋈ static dim` — consume the changelog, join against the dimension (in the

@@ -616,6 +616,8 @@ struct JoinTierState {
     // Last touch order per resident key, for idle-first demotion.
     touch_seq: FxHashMap<Vec<ScalarValue>, u64>,
     cold_keys: FxHashSet<Vec<ScalarValue>>,
+    // The cold-tier worker channel; the demotion driver (S4.5) and fetch-on-access (S4.3) use it.
+    tier_sender: Option<crate::state_tier::TierTx>,
 }
 
 #[cfg(feature = "state-tier")]
@@ -630,6 +632,7 @@ impl JoinTierState {
             dirty: FxHashSet::default(),
             touch_seq: FxHashMap::default(),
             cold_keys: FxHashSet::default(),
+            tier_sender: None,
         }
     }
 
@@ -673,6 +676,18 @@ impl JoinTierState {
 #[cfg(feature = "state-tier")]
 #[allow(dead_code)]
 impl IncrementalJoinOperator {
+    /// Single-owner vnode count for key bucketing (`vnode = key_hash(join_key) % count`). Threaded
+    /// from the vnode registry at build time; single-node defaults to 1.
+    pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
+        self.tier.vnode_count = vnode_count.max(1);
+    }
+
+    /// Enable key-granular dirty tracking so idle keys become demotable. Single-node group demotion:
+    /// the whole-op manifest stays authoritative (no delta chain).
+    pub(crate) fn enable_delta_tracking(&mut self) {
+        self.tier.delta_tracking = true;
+    }
+
     /// Build the join-key codec once both side schemas are resolved. Key column types match across
     /// sides (`resolve_output` enforces this), so the left side's types suffice.
     fn ensure_codec(&mut self) -> Result<(), DbError> {
@@ -967,6 +982,16 @@ impl GraphOperator for IncrementalJoinOperator {
 
     fn estimated_state_bytes(&self) -> usize {
         self.left_state.estimated_bytes() + self.right_state.estimated_bytes()
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn attach_state_tier(&mut self, tier: crate::state_tier::TierTx) {
+        self.tier.tier_sender = Some(tier);
+    }
+
+    #[cfg(feature = "state-tier")]
+    fn enable_group_delta_tracking(&mut self) {
+        self.enable_delta_tracking();
     }
 }
 
@@ -1667,5 +1692,28 @@ mod tests {
             !op.right_state.contains_key(&k1),
             "right side stays absent after promote"
         );
+    }
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn tier_enable_hooks_drive_tracking_and_vnode() {
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_vnode_count(8);
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1)])],
+                vec![right_batch(&[(1, 100, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        // Tracking is on → after a capture the key is demotable, and the codec was built.
+        op.tier.clear_dirty();
+        assert_eq!(op.demotable_keys(10), vec![vec![i64_scalar(1)]]);
+        let codec = op.tier.codec.as_ref().expect("codec built once both schemas seen");
+        assert!(codec.vnode(&[i64_scalar(1)], 8).unwrap() < 8);
+        assert_eq!(op.tier.vnode_count, 8);
     }
 }

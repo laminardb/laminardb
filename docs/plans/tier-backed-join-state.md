@@ -337,6 +337,37 @@ Build in-memory correctness is done (3b S1–S3). This slice (3b-S4) breaks down
   atomically; **two-port side-tagged defer + `watermark_hold = min(left,right)` (M6)**; miss-escalation;
   `wants_input`. **Includes the §5.2 LEFT-outer presence-vs-cold design + RED test and the §5.3 catch-up
   decision (tier-aware scan + resident-only `snapshot`).**
+
+  **Refined design (worked out 2026-06-30, pre-implementation; owner approved plan-recommended §9):**
+  1. *Whole-cycle deferral* (plan §4): if this cycle's batches touch any cold key (either port), issue
+     `FetchGroup` for each touched cold key and defer the ENTIRE cycle. Deferred queue =
+     `VecDeque<(watermark, JoinSide, RecordBatch)>` (FIFO preserves per-side order). Each cycle:
+     candidates = deferred ++ new; if any still touch cold → re-defer all (+ ensure fetches issued);
+     else run ONE IVM cycle on all candidates and clear the queue. Cross-cycle reordering of the same
+     key's deltas is eventually-correct (IVM telescoping + the MV `Multiset` nets).
+  2. *Atomic two-sided promotion*: drain ready replies; `Some(blob)` → `promote_key` (decode both
+     sides + upsert + mark_promoted) + `DropGroup` the tier copy; `None` → `note_miss`, escalate at
+     `MAX_PROMOTION_FETCH_MISSES=32` with a new **LDB-3005** join error, else re-issue. `MAX_DEFERRED_
+     PROMOTION_ROWS=8192` gates `wants_input`.
+  3. *§5.2*: whole-cycle defer covers ALL per-cycle probes (term2/term1 `get`, `presence_old`
+     `contains_key`, the transition loop, first-sight pad) since every probed key comes from
+     `delta_a/delta_b` → `cold_keys_touched`. The cross-side `get` (left for a δB-only key) is safe
+     because demotion is atomic per join key across both sides. RED test: demote a matched key, then a
+     δB-only cycle touching it must defer+promote (not read `contains_key==false`).
+  4. *§5.3 realized as promote-all-before-catchup* (equivalent to the chosen tier-aware scan, reusing
+     the fetch path): replace the `right_was_seen` trigger with a **`left_catchup_done` flag** (set
+     after `emit_left_catchup`; ALSO set in `restore_side(Right)` so a seen-but-empty restored right
+     does not re-fire — preserves the existing resurrection test with NO checkpoint-format change). When
+     `first_right` (`left_outer && !left_catchup_done && right_info`) AND `cold_keys` non-empty: fetch
+     ALL cold keys + defer until fully resident, then catch-up scans complete left state. (Can't occur
+     until S4.5 wires demotion, but the flag refactor lands here so the trigger survives deferral.)
+  5. *Restructure*: extract `run_ivm_cycle(&mut self, left, right, first_right)` (current `process`
+     body minus schema resolution + first_right computation). `process`: resolve → compute first_right
+     → if promotion active, `process_with_promotion`; else `run_ivm_cycle`. Trait hooks added:
+     `watermark_hold`, `wants_input`, `has_pending_promotion`.
+  6. *Testing*: real tier (`StateTierStore::open` temp dir + `spawn_worker`) attached via
+     `attach_state_tier`; demote a key to the tier, then drive cycles to verify defer→fetch→promote→
+     replay + the §5.2/§5.3 RED cases.
 - **S4.4 — Checkpoint/recovery via cold-only partials (XL — the blocker-heavy slice).** Replace
   `encode_frame` with the `{left, right, cold_vnodes, deferred}` struct (B2); `checkpoint_by_vnode`
   ColdGroups for cold keys staging resident-only manifest (`snapshot_resident`, M4); extend
