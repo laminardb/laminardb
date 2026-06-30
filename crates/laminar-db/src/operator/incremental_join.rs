@@ -963,11 +963,10 @@ impl IncrementalJoinOperator {
         Ok((left, right))
     }
 
-    /// Demote one join key: capture its two-sided blob, then drop its rows from both hot stores via
-    /// negative upserts so `estimated_state_bytes` sheds the freed bytes. The caller persists the
-    /// blob to the tier BEFORE this drops the rows (write-before-drop — wired in S4.5).
-    fn demote_key(&mut self, key: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
-        let blob = self.encode_key_blob(key)?;
+    /// Drop a key's rows from both hot stores via negative upserts (so `estimated_state_bytes` sheds
+    /// the freed bytes) and mark it cold. The demotion driver calls this only AFTER the tier write
+    /// has succeeded (write-before-drop).
+    fn drop_demoted_key(&mut self, key: &[ScalarValue]) {
         for (row, w) in self.left_state.get(key) {
             self.left_state.upsert(key, &row, -w);
         }
@@ -975,6 +974,13 @@ impl IncrementalJoinOperator {
             self.right_state.upsert(key, &row, -w);
         }
         self.tier.mark_demoted(key);
+    }
+
+    /// Capture a key's two-sided blob, then drop it (no tier write — used by unit tests; the live
+    /// driver is `demote_cold_groups`, which writes before dropping).
+    fn demote_key(&mut self, key: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
+        let blob = self.encode_key_blob(key)?;
+        self.drop_demoted_key(key);
         Ok(blob)
     }
 
@@ -1310,6 +1316,10 @@ impl GraphOperator for IncrementalJoinOperator {
         // stores, so `side_checkpoint_bytes` (over `snapshot`) is already resident-only.
         let left = self.side_checkpoint_bytes(JoinSide::Left)?;
         let right = self.side_checkpoint_bytes(JoinSide::Right)?;
+        // The captured resident keys now match this checkpoint, so they are demotable next cycle.
+        // Without this they stay dirty forever and demotion never fires (intake throttles for good).
+        #[cfg(feature = "state-tier")]
+        self.tier.clear_dirty();
         #[cfg(feature = "state-tier")]
         let cold_vnodes = self.cold_vnodes_for_checkpoint()?;
         #[cfg(not(feature = "state-tier"))]
@@ -1406,6 +1416,59 @@ impl GraphOperator for IncrementalJoinOperator {
     #[cfg(feature = "state-tier")]
     fn has_pending_promotion(&self) -> bool {
         self.tier.has_pending()
+    }
+
+    // Shed idle clean join keys to the cold tier until `target_bytes` is freed. Write-before-drop:
+    // persist each key's two-sided blob and AWAIT the reply before dropping its hot rows, so a failed
+    // write leaves the key resident. Returns (keys demoted, bytes freed).
+    #[cfg(feature = "state-tier")]
+    async fn demote_cold_groups(
+        &mut self,
+        target_bytes: usize,
+        _vnode_count: u32,
+    ) -> (usize, usize) {
+        let Some(tier) = self.tier.tier_sender.clone() else {
+            return (0, 0);
+        };
+        if self.tier.codec.is_none() {
+            return (0, 0);
+        }
+        let mut count = 0usize;
+        let mut freed = 0usize;
+        for key in self.demotable_keys(256) {
+            if freed >= target_bytes {
+                break;
+            }
+            let coords = match &self.tier.codec {
+                Some(c) => (c.encode(&key), c.vnode(&key, self.tier.vnode_count)),
+                None => break,
+            };
+            let (Ok(group), Ok(vnode)) = coords else {
+                continue;
+            };
+            let Ok(blob) = self.encode_key_blob(&key) else {
+                continue;
+            };
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let req = TierRequest::DemoteGroup {
+                operator: self.tier.op_name.clone(),
+                vnode,
+                group,
+                bytes: blob.into(),
+                reply,
+            };
+            if tier.send(req).await.is_err() {
+                break; // worker gone
+            }
+            if !matches!(rx.await, Ok(Ok(()))) {
+                break; // write failed — leave the key resident
+            }
+            let before = self.estimated_state_bytes();
+            self.drop_demoted_key(&key);
+            freed += before.saturating_sub(self.estimated_state_bytes());
+            count += 1;
+        }
+        (count, freed)
     }
 
     // Cold keys ride durable cold-only partials: stage their keys per vnode; resident rides the
@@ -2574,5 +2637,61 @@ mod tests {
             !restored.take_tier_cold_vnodes().is_empty(),
             "cold vnode recorded"
         );
+    }
+
+    // ─── Demotion driver (A1-emit 3b-S4.5) ──────────────────────────────────────────────────────
+
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_demote_cold_groups_writes_then_drops() {
+        let (tier, _dir) = spawn_tier();
+        let mut op = IncrementalJoinOperator::new(config());
+        op.set_op_name("join");
+        op.attach_state_tier(tier.clone());
+        op.enable_delta_tracking();
+        op.process(
+            &[
+                vec![left_batch(&[(1, 10, 1), (2, 20, 1), (3, 30, 1)])],
+                vec![right_batch(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)])],
+            ],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        op.tier.clear_dirty();
+
+        let before = op.estimated_state_bytes();
+        let (count, freed) = op.demote_cold_groups(usize::MAX, op.tier.vnode_count).await;
+        assert_eq!(count, 3, "all clean keys demoted");
+        assert_eq!(freed, before, "freed bytes == the shed state");
+        assert_eq!(op.estimated_state_bytes(), 0, "hot stores emptied");
+        for k in [1, 2, 3] {
+            assert!(op.tier.is_cold(&[i64_scalar(k)]), "key {k} cold");
+        }
+
+        // Blobs are durable in the tier → touching a demoted key fetches it back and replays.
+        let out = op
+            .process(
+                &[vec![left_batch(&[(1, 10, -1), (1, 15, 1)])], vec![]],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.iter().all(|b| b.num_rows() == 0),
+            "deferred: key 1 cold"
+        );
+        let mut snap: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        snap.insert((1, 10, 100), 1);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            let out = op.process(&[vec![], vec![]], &[0, 0]).await.unwrap();
+            net_into(&mut snap, &out);
+            if !op.tier.has_pending() {
+                break;
+            }
+        }
+        assert_eq!(snap.get(&(1, 10, 100)), None, "stale row retracted");
+        assert_eq!(snap.get(&(1, 15, 100)), Some(&1));
     }
 }
