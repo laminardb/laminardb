@@ -4545,8 +4545,14 @@ mod tests {
         state.promote_group(&a_key, blob).unwrap();
         assert!(!state.cold_groups.contains_key(&a_key));
         let retractions = state.evict_idle(10_000).unwrap();
-        let rows: usize = retractions.iter().map(arrow::array::RecordBatch::num_rows).sum();
-        assert_eq!(rows, 1, "exactly one retraction for the aged-out cold group");
+        let rows: usize = retractions
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows, 1,
+            "exactly one retraction for the aged-out cold group"
+        );
         assert!(!state.groups.contains_key(&a_key));
         assert!(!state.last_emitted.contains_key(&a_key));
     }
@@ -4726,8 +4732,7 @@ mod tests {
             .unwrap()
         }
         fn row_of(state: &IncrementalAggState, name: &str) -> arrow::row::OwnedRow {
-            let cols: Vec<ArrayRef> =
-                vec![Arc::new(arrow::array::StringArray::from(vec![name]))];
+            let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![name]))];
             state
                 .row_converter
                 .convert_columns(&cols)
@@ -4806,8 +4811,14 @@ mod tests {
         let mut restored = agg(&ctx).await;
         restored.set_delta_enabled(true);
         restored.merge_groups(&combined).unwrap();
-        assert_eq!(value_of(&mut restored, "a"), ScalarValue::Float64(Some(1.0)));
-        assert_eq!(value_of(&mut restored, "b"), ScalarValue::Float64(Some(52.0)));
+        assert_eq!(
+            value_of(&mut restored, "a"),
+            ScalarValue::Float64(Some(1.0))
+        );
+        assert_eq!(
+            value_of(&mut restored, "b"),
+            ScalarValue::Float64(Some(52.0))
+        );
     }
 
     /// C2 Issue-1: a FULLY cold vnode (every resident group demoted — here the single group of a

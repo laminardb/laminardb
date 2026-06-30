@@ -2326,7 +2326,11 @@ mod promotion_tests {
             Some(6),
             "ingest_shuffle deferred row replayed onto the promoted slice: 1 + 5",
         );
-        assert_eq!(op.watermark_hold(), None, "nothing deferred after promotion");
+        assert_eq!(
+            op.watermark_hold(),
+            None,
+            "nothing deferred after promotion"
+        );
     }
 
     /// A checkpoint taken while a row is deferred for promotion must carry
