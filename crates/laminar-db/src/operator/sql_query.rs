@@ -694,6 +694,7 @@ impl SqlQueryOperator {
     }
 
     #[cfg(feature = "state-tier")]
+    #[allow(clippy::too_many_lines)] // one coherent promotion → defer → process → emit cycle
     async fn process_with_promotion(
         &mut self,
         pre_agg_batches: Vec<RecordBatch>,
@@ -738,6 +739,24 @@ impl SqlQueryOperator {
                     if let Some(p) = self.promotion.as_mut() {
                         p.issue_fetch_group(key, vnode, group);
                     }
+                }
+            }
+        }
+
+        // Promote-then-retract cold groups that aged past the idle TTL while demoted: `evict_idle`
+        // scans only resident groups, so without this their changelog row leaks past the TTL and the
+        // tier entry is never reclaimed. Once fetched + promoted, the normal `evict_idle` pass below
+        // retracts them. Idempotent — `issue_fetch_group` dedupes in-flight keys.
+        #[cfg(feature = "state-tier")]
+        {
+            let past_ttl = if let QueryState::Agg(ref agg) = self.state {
+                agg.cold_groups_past_idle_ttl(watermark, self.vnode_count)
+            } else {
+                Vec::new()
+            };
+            if let Some(p) = self.promotion.as_mut() {
+                for (key, vnode, group) in past_ttl {
+                    p.issue_fetch_group(key, vnode, group);
                 }
             }
         }
