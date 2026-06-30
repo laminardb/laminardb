@@ -697,6 +697,15 @@ pub(crate) enum VnodeCapture {
     Full(AggStateCheckpoint),
     /// Incremental delta against the previous epoch's partial for this vnode.
     Delta(AggVnodeDelta),
+    /// A re-base of a vnode that still holds demoted groups: the resident FULL plus the cold group
+    /// keys the coordinator re-fetches from the tier and folds in, so the new base is self-contained
+    /// (carries both resident and cold state) and the old base unreferences. `full` may be empty for a
+    /// fully-cold vnode. State-tier + delta-primary only.
+    #[cfg(feature = "state-tier")]
+    FullWithColdGroups {
+        full: AggStateCheckpoint,
+        group_keys: Vec<Vec<u8>>,
+    },
 }
 
 impl IncrementalAggState {
@@ -1779,20 +1788,24 @@ impl IncrementalAggState {
         {
             touched.insert(*v);
         }
+        // A fully-cold vnode (every resident group demoted — including a demoted global aggregate) is
+        // in none of the sets above, yet its chain must keep advancing: otherwise it stages nothing,
+        // the coordinator writes an empty `base_epoch=None` partial, and the chain base is orphaned at
+        // once. Seed it so it emits an empty delta below the bound and a cold-carrying re-base at it.
+        #[cfg(feature = "state-tier")]
+        for k in &self.cold_groups {
+            touched.insert(vnode_of(k));
+        }
 
         let mut out: std::collections::HashMap<u32, VnodeCapture> =
             std::collections::HashMap::with_capacity(touched.len());
         for v in touched {
-            // Defer a re-base while the vnode has demoted groups: a FULL captures only resident
-            // groups, so re-basing now would drop the cold ones from the chain. Keeping the chain
-            // on DELTA holds the old base (which carries them) alive until they are promoted back.
-            #[cfg(feature = "state-tier")]
-            let has_cold = self.cold_groups.iter().any(|k| vnode_of(k) == v);
-            #[cfg(not(feature = "state-tier"))]
-            let has_cold = false;
+            // A cold-bearing vnode re-bases at the bound like any other (no longer deferred forever):
+            // the re-base also carries its demoted groups, so the new base is self-contained and the
+            // old one unreferences — keeping the chain base inside the prune window.
             let force_full = match self.delta_chain_len.get(&v).copied() {
                 None => true, // no base yet (fresh / just-acquired)
-                Some(n) => n >= chain_max && !has_cold,
+                Some(n) => n >= chain_max,
             };
             if force_full {
                 let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
@@ -1812,16 +1825,38 @@ impl IncrementalAggState {
                                // A re-base carries the full dedup map; an empty one would re-emit every
                                // group after recovery.
                 let last_emitted = self.last_emitted_for_vnode(v, vnode_count, None)?;
-                out.insert(
-                    v,
-                    VnodeCapture::Full(AggStateCheckpoint {
-                        fingerprint,
-                        keys_ipc,
-                        acc_state_ipc,
-                        last_updated_ms,
-                        last_emitted,
-                    }),
-                );
+                let full = AggStateCheckpoint {
+                    fingerprint,
+                    keys_ipc,
+                    acc_state_ipc,
+                    last_updated_ms,
+                    last_emitted,
+                };
+                #[cfg(feature = "state-tier")]
+                let cap = {
+                    let group_keys: Vec<Vec<u8>> = self
+                        .cold_groups
+                        .iter()
+                        .filter(|k| vnode_of(k) == v)
+                        .map(|k| {
+                            // Resident and cold key sets must stay disjoint — the merge assumes it,
+                            // and an overlap would double-count on recovery (additive merge_groups).
+                            debug_assert!(
+                                !self.groups.contains_key(k),
+                                "cold group is also resident; merge would double-count"
+                            );
+                            k.as_ref().to_vec()
+                        })
+                        .collect();
+                    if group_keys.is_empty() {
+                        VnodeCapture::Full(full)
+                    } else {
+                        VnodeCapture::FullWithColdGroups { full, group_keys }
+                    }
+                };
+                #[cfg(not(feature = "state-tier"))]
+                let cap = VnodeCapture::Full(full);
+                out.insert(v, cap);
                 self.delta_chain_len.insert(v, 0);
             } else {
                 let delta = self.encode_delta_for_vnode(v)?;
@@ -2425,25 +2460,6 @@ impl IncrementalAggState {
                 (k.clone(), v, k.as_ref().to_vec())
             })
             .collect()
-    }
-
-    /// Cold groups whose vnode's delta chain has reached `chain_max` — its re-base is deferred
-    /// until they are promoted back. The caller promotes these proactively so the block
-    /// clears within the `max_retained` prune window. `(key, vnode, group_key_bytes)`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn cold_groups_pending_rebase(
-        &self,
-        chain_max: u32,
-        vnode_count: u32,
-    ) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>)> {
-        let mut out = Vec::new();
-        for k in &self.cold_groups {
-            let v = self.delta_vnode_of(k.as_ref(), vnode_count);
-            if self.delta_chain_len.get(&v).copied().unwrap_or(0) >= chain_max {
-                out.push((k.clone(), v, k.as_ref().to_vec()));
-            }
-        }
-        out
     }
 
     /// Distinct cold (demoted) group keys touched by `batch`, with tier coordinates
@@ -4539,6 +4555,10 @@ mod tests {
             VnodeCapture::Delta(d) => {
                 restored.apply_delta(d).unwrap();
             }
+            #[cfg(feature = "state-tier")]
+            VnodeCapture::FullWithColdGroups { .. } => {
+                panic!("no group is demoted in this test")
+            }
         }
         let value = restored
             .groups
@@ -4550,11 +4570,14 @@ mod tests {
         assert_eq!(value, ScalarValue::Float64(Some(6.0)));
     }
 
-    /// A vnode with a demoted group must DEFER its FULL re-base (emit a DELTA) so the re-base never
-    /// drops the cold group; once the group is promoted back, the next capture re-bases to a FULL.
+    /// C2: a vnode holding a demoted group re-bases at the chain bound like any other — but the
+    /// re-base CARRIES the cold group (`FullWithColdGroups`), so the new base is self-contained and
+    /// the old one unreferences. Recovering from the new base ALONE (the old base + deltas pruned)
+    /// must still reproduce the cold group's value. Before the fix the vnode deferred forever, the
+    /// base aged past the prune horizon, and recovery lost the group.
     #[cfg(feature = "state-tier")]
     #[tokio::test]
-    async fn cold_group_defers_full_rebase_until_promoted() {
+    async fn cold_bearing_vnode_rebases_with_groups_at_chain_bound() {
         const V: u32 = 1; // single vnode → vnode 0
 
         fn pre_agg_schema() -> SchemaRef {
@@ -4586,6 +4609,25 @@ mod tests {
             .unwrap()
             .unwrap()
         }
+        fn row_of(state: &IncrementalAggState, name: &str) -> arrow::row::OwnedRow {
+            let cols: Vec<ArrayRef> =
+                vec![Arc::new(arrow::array::StringArray::from(vec![name]))];
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
+        }
+        fn value_of(state: &mut IncrementalAggState, name: &str) -> ScalarValue {
+            state
+                .groups
+                .get_mut(&row_of(state, name))
+                .expect("group resident")
+                .accs[0]
+                .evaluate()
+                .unwrap()
+        }
 
         let ctx = laminar_sql::create_session_context();
         let schema = Arc::new(Schema::new(vec![
@@ -4607,34 +4649,145 @@ mod tests {
         let mut state = agg(&ctx).await;
         state.set_delta_enabled(true);
 
-        // cap0: FULL base (no prior base), chain_len[0] = 1.
+        // cap0: FULL base (no prior base). a=1, b=2.
         feed(&mut state, &[("a", 1.0), ("b", 2.0)], 1000);
         state.emit().unwrap();
-        let cap0 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
-        assert!(matches!(cap0.get(&0), Some(VnodeCapture::Full(_))));
+        let _ = state.checkpoint_delta_by_vnode(V, 1).unwrap();
 
-        // Demote one (now-clean) group, then capture at the chain bound: a re-base would drop it,
-        // so the vnode stays on DELTA instead.
-        let cold_key = state.groups.keys().next().cloned().unwrap();
-        let cp = state.encode_group(&cold_key).unwrap();
-        state.drop_demoted_group(&cold_key);
+        // Demote "a" (clean). Its tier blob `cp_a` carries a=1; "a" is never touched again, so its
+        // truth stays a=1 in the tier.
+        let a_key = row_of(&state, "a");
+        let cp_a = state.encode_group(&a_key).unwrap();
+        state.drop_demoted_group(&a_key);
+        assert!(state.cold_groups.iter().any(|k| *k == a_key));
+
+        // Drive "b"'s chain to the bound while "a" is cold. cap1: chain_len 0 → DELTA (below bound).
         feed(&mut state, &[("b", 20.0)], 2000);
+        state.emit().unwrap();
+        assert!(matches!(
+            state.checkpoint_delta_by_vnode(V, 1).unwrap().get(&0),
+            Some(VnodeCapture::Delta(_)),
+        ));
+
+        // cap2: chain_len 1 >= chain_max 1 AND a is cold → re-base CARRYING the cold group.
+        feed(&mut state, &[("b", 30.0)], 3000);
+        state.emit().unwrap();
+        let cap2 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        let (full, group_keys) = match cap2.get(&0) {
+            Some(VnodeCapture::FullWithColdGroups { full, group_keys }) => (full, group_keys),
+            other => panic!("expected FullWithColdGroups, got {}", other.is_some()),
+        };
+        assert_eq!(
+            group_keys,
+            &vec![a_key.as_ref().to_vec()],
+            "the cold group rides the re-base",
+        );
+
+        // Recover from the re-base ALONE (cap0 + cap1 pruned): the coordinator folds the tier blob
+        // into the resident FULL (append_disjoint over disjoint keys). a survives at 1, b at 52.
+        let mut combined = full.clone();
+        combined.append_disjoint(cp_a).unwrap();
+        let mut restored = agg(&ctx).await;
+        restored.set_delta_enabled(true);
+        restored.merge_groups(&combined).unwrap();
+        assert_eq!(value_of(&mut restored, "a"), ScalarValue::Float64(Some(1.0)));
+        assert_eq!(value_of(&mut restored, "b"), ScalarValue::Float64(Some(52.0)));
+    }
+
+    /// C2 Issue-1: a FULLY cold vnode (every resident group demoted — here the single group of a
+    /// global aggregate) must stay in the capture set so its chain keeps advancing. Otherwise it
+    /// stages nothing, the coordinator writes an empty `base_epoch=None` partial that orphans the
+    /// chain base immediately, and recovery loses the demoted state. Asserts the vnode is captured
+    /// every epoch and the re-base at the bound carries the cold group.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn fully_cold_global_aggregate_keeps_chain_alive_and_recovers() {
+        const V: u32 = 1;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new(
+                "__agg_input_1",
+                DataType::Float64,
+                true,
+            )]))
+        }
+        fn feed(state: &mut IncrementalAggState, vals: &[f64], ts: i64) {
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![Arc::new(arrow::array::Float64Array::from(vals.to_vec()))],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(ctx, "SELECT SUM(value) as total FROM events", true)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // cap0: FULL. The global group totals 6.
+        feed(&mut state, &[1.0, 2.0, 3.0], 1000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+
+        // Demote the single global group → the vnode is now FULLY cold (groups empty).
+        let g_key = global_aggregate_key();
+        let cp_g = state.encode_group(&g_key).unwrap();
+        state.drop_demoted_group(&g_key);
+        assert!(state.groups.is_empty(), "vnode 0 is fully cold");
+
+        // cap1: vnode 0 must still be captured (cold-seeded) — an empty DELTA that keeps the base
+        // referenced. Without the cold seed it would be absent → empty orphaning partial.
+        feed(&mut state, &[], 2000); // no-op feed; just advance emit/capture
         state.emit().unwrap();
         let cap1 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
         assert!(
             matches!(cap1.get(&0), Some(VnodeCapture::Delta(_))),
-            "re-base must be deferred (DELTA) while a group is cold",
+            "a fully-cold vnode must still emit a (no-op) delta to keep its chain alive",
         );
 
-        // Promote it back; the next capture re-bases to FULL again.
-        state.promote_group(&cold_key, cp).unwrap();
-        feed(&mut state, &[("b", 30.0)], 3000);
+        // cap2: at the bound → re-base carrying the cold global group, with an empty resident FULL.
         state.emit().unwrap();
         let cap2 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
-        assert!(
-            matches!(cap2.get(&0), Some(VnodeCapture::Full(_))),
-            "re-base resumes (FULL) once no group is cold",
-        );
+        let (full, group_keys) = match cap2.get(&0) {
+            Some(VnodeCapture::FullWithColdGroups { full, group_keys }) => (full, group_keys),
+            other => panic!("expected FullWithColdGroups, got {}", other.is_some()),
+        };
+        assert_eq!(group_keys, &vec![g_key.as_ref().to_vec()]);
+
+        // Recover from the re-base alone: empty resident folded with the tier blob == the cold group.
+        let mut combined = full.clone();
+        combined.append_disjoint(cp_g).unwrap();
+        let mut restored = agg(&ctx).await;
+        restored.set_delta_enabled(true);
+        restored.merge_groups(&combined).unwrap();
+        let value = restored
+            .groups
+            .get_mut(&g_key)
+            .expect("global group restored")
+            .accs[0]
+            .evaluate()
+            .unwrap();
+        assert_eq!(value, ScalarValue::Float64(Some(6.0)));
     }
 
     /// Regression for the cluster group-demotion rehydration panic (`last_emitted ⊋ groups`):

@@ -144,6 +144,11 @@ fn staged_request_bytes(
             // Cold-only — the demoted groups are on disk; no RAM.
             #[cfg(feature = "state-tier")]
             crate::checkpoint_coordinator::StagedSlice::ColdGroups { .. } => 0,
+            // Only the resident base is held in RAM; the demoted groups stream from disk.
+            #[cfg(feature = "state-tier")]
+            crate::checkpoint_coordinator::StagedSlice::FullWithColdGroups { resident, .. } => {
+                resident.len()
+            }
         })
         .sum();
     (ops + vnodes) as u64

@@ -38,6 +38,14 @@ pub(crate) enum StagedSlice {
     ColdGroups {
         group_keys: Vec<Vec<u8>>,
     },
+    // A delta-chain re-base of a vnode that still holds demoted groups: the resident FULL bytes plus
+    // the cold group keys, merged with the tier-fetched groups into ONE self-contained base. Always a
+    // full upload. `resident` may be an empty checkpoint for a fully-cold vnode.
+    #[cfg(feature = "state-tier")]
+    FullWithColdGroups {
+        resident: bytes::Bytes,
+        group_keys: Vec<Vec<u8>>,
+    },
 }
 
 pub(crate) type StagedVnodeStates = HashMap<u32, HashMap<String, StagedSlice>>;
@@ -63,9 +71,9 @@ impl UploadedSlice {
             (StagedSlice::Bytes(b), UploadedSlice::Bytes(prev)) => b == prev,
             // A delta never matches a prior full — it rides the delta-chain path, not the reference path.
             (StagedSlice::Bytes(_), UploadedSlice::Cold) | (StagedSlice::Delta { .. }, _) => false,
-            // A cold-groups slice re-fetches+merges from the tier — always force a full upload.
+            // A cold-groups / full-with-cold slice re-fetches+merges from the tier — always full upload.
             #[cfg(feature = "state-tier")]
-            (StagedSlice::ColdGroups { .. }, _) => false,
+            (StagedSlice::ColdGroups { .. } | StagedSlice::FullWithColdGroups { .. }, _) => false,
         }
     }
 }
@@ -583,6 +591,27 @@ impl CheckpointCoordinator {
         group_keys: &[Vec<u8>],
     ) -> Result<bytes::Bytes, DbError> {
         let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len());
+        for gk in group_keys {
+            parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
+        }
+        Ok(bytes::Bytes::from(
+            crate::aggregate_state::merge_serialized_agg_cps(&parts)?,
+        ))
+    }
+
+    /// Resolve a `FullWithColdGroups` re-base into ONE self-contained base: fold the resident FULL
+    /// bytes together with the tier-fetched demoted groups over disjoint keys. `resident` may be an
+    /// empty checkpoint (fully-cold vnode), in which case the merge yields the cold groups alone.
+    #[cfg(feature = "state-tier")]
+    async fn resolve_full_with_cold_groups(
+        &self,
+        operator: &str,
+        vnode: u32,
+        resident: &bytes::Bytes,
+        group_keys: &[Vec<u8>],
+    ) -> Result<bytes::Bytes, DbError> {
+        let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len() + 1);
+        parts.push(resident.clone());
         for gk in group_keys {
             parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
         }
@@ -1124,6 +1153,17 @@ impl CheckpointCoordinator {
                                 recorded.insert(name.clone(), UploadedSlice::Cold);
                             }
                             #[cfg(feature = "state-tier")]
+                            StagedSlice::FullWithColdGroups {
+                                resident,
+                                group_keys,
+                            } => {
+                                let bytes = self
+                                    .resolve_full_with_cold_groups(name, v, resident, group_keys)
+                                    .await?;
+                                operators.push((name.clone(), bytes.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Cold);
+                            }
+                            #[cfg(feature = "state-tier")]
                             StagedSlice::ColdGroups { group_keys } => {
                                 let bytes = self.resolve_cold_groups(name, v, group_keys).await?;
                                 operators.push((name.clone(), bytes.to_vec()));
@@ -1178,6 +1218,17 @@ impl CheckpointCoordinator {
                                 StagedSlice::Cold => {
                                     (self.fetch_cold_slice(name, v).await?, UploadedSlice::Cold)
                                 }
+                                #[cfg(feature = "state-tier")]
+                                StagedSlice::FullWithColdGroups {
+                                    resident,
+                                    group_keys,
+                                } => (
+                                    self.resolve_full_with_cold_groups(
+                                        name, v, resident, group_keys,
+                                    )
+                                    .await?,
+                                    UploadedSlice::Cold,
+                                ),
                                 #[cfg(feature = "state-tier")]
                                 StagedSlice::ColdGroups { group_keys } => (
                                     self.resolve_cold_groups(name, v, group_keys).await?,

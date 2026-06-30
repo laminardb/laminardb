@@ -742,21 +742,6 @@ impl SqlQueryOperator {
             }
         }
 
-        // Proactively fetch cold groups whose vnode re-base is deferred, so the block clears
-        // within the prune window rather than growing the chain unbounded.
-        if let Some(chain_max) = self.delta_chain_max {
-            let pending = if let QueryState::Agg(ref agg) = self.state {
-                agg.cold_groups_pending_rebase(chain_max, self.vnode_count)
-            } else {
-                Vec::new()
-            };
-            if let Some(p) = self.promotion.as_mut() {
-                for (key, vnode, group) in pending {
-                    p.issue_fetch_group(key, vnode, group);
-                }
-            }
-        }
-
         let mut candidates = self
             .promotion
             .as_mut()
@@ -1349,6 +1334,16 @@ impl GraphOperator for SqlQueryOperator {
                             )?),
                             tombstones: bytes::Bytes::from(d.tombstones_ipc),
                         },
+                        #[cfg(feature = "state-tier")]
+                        VnodeCapture::FullWithColdGroups { full, group_keys } => {
+                            StagedSlice::FullWithColdGroups {
+                                resident: bytes::Bytes::from(serialize_agg_cp(
+                                    &full,
+                                    &self.op_name,
+                                )?),
+                                group_keys,
+                            }
+                        }
                     };
                     out.insert(vnode, slice);
                 }
