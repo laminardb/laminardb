@@ -586,9 +586,15 @@ mod failures {
 
         // Graceful full-cluster restart, delta_primary still on.
         let (shared, cp_dirs) = harness.shutdown_keep_dirs().await;
-        let mut harness =
-            ClusterEngineHarness::spawn_with_dirs(N_NODES, VNODE_COUNT, shared, cp_dirs, Some(2), None)
-                .await;
+        let mut harness = ClusterEngineHarness::spawn_with_dirs(
+            N_NODES,
+            VNODE_COUNT,
+            shared,
+            cp_dirs,
+            Some(2),
+            None,
+        )
+        .await;
         for node in &harness.nodes {
             setup_query(&node.db).await;
         }
@@ -638,7 +644,8 @@ mod failures {
         use std::time::Instant;
 
         // chain_max=2 enables the delta chain (group demotion needs it); 2 KiB/node forces demotion.
-        let mut harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let mut harness =
+            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
         for node in &harness.nodes {
             setup_query(&node.db).await;
         }
@@ -724,7 +731,10 @@ mod failures {
             );
             sleep(Duration::from_millis(200)).await;
         }
-        assert!(demotes(&harness) > 0, "demote/promote path must be exercised");
+        assert!(
+            demotes(&harness) > 0,
+            "demote/promote path must be exercised"
+        );
         harness.shutdown().await;
     }
 
@@ -740,7 +750,8 @@ mod failures {
         use std::collections::HashMap;
         use std::time::Instant;
 
-        let mut harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let mut harness =
+            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
         let leader_idx = harness.leader_idx();
         let follower_idx = harness.follower_idxs()[0];
         for node in &harness.nodes {
@@ -861,7 +872,8 @@ mod failures {
         use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
         use laminar_core::state::NodeId;
 
-        let mut harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let mut harness =
+            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
         let leader_idx = harness.leader_idx(); // B: temporarily gains V
         let follower_idx = harness.follower_idxs()[0]; // A: holds V, demotes, loses then reacquires
         for node in &harness.nodes {
@@ -953,7 +965,10 @@ mod failures {
             .iter()
             .all(|n| n.vnode_registry.assignment_version() >= v_moved)
         {
-            assert!(Instant::now() < deadline, "nodes never adopted the A->B move");
+            assert!(
+                Instant::now() < deadline,
+                "nodes never adopted the A->B move"
+            );
             sleep(Duration::from_millis(100)).await;
         }
         assert!(
@@ -987,7 +1002,10 @@ mod failures {
             .iter()
             .all(|n| n.vnode_registry.assignment_version() >= v_back)
         {
-            assert!(Instant::now() < deadline, "nodes never adopted the B->A move-back");
+            assert!(
+                Instant::now() < deadline,
+                "nodes never adopted the B->A move-back"
+            );
             sleep(Duration::from_millis(100)).await;
         }
         assert!(

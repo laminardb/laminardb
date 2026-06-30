@@ -74,7 +74,15 @@ impl ClusterEngineHarness {
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs, None, None).await
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Like `spawn`, with incremental delta checkpoints (`chain_max`). Enabling delta makes the

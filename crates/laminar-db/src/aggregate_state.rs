@@ -4699,6 +4699,7 @@ mod tests {
     /// base aged past the prune horizon, and recovery lost the group.
     #[cfg(feature = "state-tier")]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one coherent rebase scenario with local scaffolding
     async fn cold_bearing_vnode_rebases_with_groups_at_chain_bound() {
         const V: u32 = 1; // single vnode → vnode 0
 
