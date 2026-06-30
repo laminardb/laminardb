@@ -1,10 +1,18 @@
 # Tier-backed IVM join state (A1-emit Stage 3b — Slice 4, XL)
 
-Status: **S4.1 implemented (2026-06-30)** — codec + two-sided per-key cold blob + cold/dirty tracking,
-all `cfg(state-tier)`, 6 unit tests green (15/15 in the join module). S4.0/S4.2–S4.6 unstarted. This is
-the spill-to-disk replacement for the in-memory changelog⋈changelog join's `JoinStateStore`. It is the
-last hardening item adjacent to the state-tier work; tracked under the A1-emit track, NOT the state-tier
-track. Default-OFF, `[LDB-1300]`-gated.
+Status: **S4.1–S4.6 COMPLETE (2026-06-30), default-OFF.** The IVM changelog⋈changelog join now spills
+cold join keys to the fjall cold tier, fetch-on-access promotes them, and they survive restart via
+cold-only partials. Commits `cad93bf0` (S4.1 codec+blob+tracking), `6ce0b36c` (S4.2 wiring), `073b5665`
+(S4.3 refactor prep), `ac0184c0` (S4.3 fetch-on-access), `708aa858` (S4.4 recovery), `5daac08c` (S4.5
+demotion driver), `c1926308` (S4.6 soaks). 22 join-module unit tests + 3 integration soaks green; all
+configs (base/cluster-only/state-tier) clippy `-D warnings` clean; agg state-tier suite unregressed.
+**S4.0 (interim loud ceiling) deferred** — superseded by real demotion (the join no longer throttles
+forever; it sheds idle keys to the tier). This is the spill-to-disk replacement for the in-memory
+changelog⋈changelog join's `JoinStateStore`; tracked under the A1-emit track. `[LDB-1300]`-gated.
+
+> **Remaining (acceptance/scope):** the soaks are deterministic functional gates, not endurance runs —
+> a long kill-9 EO-Kafka join soak + a Linux-NVMe p99 run are the cluster-default-ON gates (same as the
+> agg). S5 (multi-way) composes pairwise joins and is independent. Cluster opt-in remains unvalidated.
 
 > **Grounding sweep (2026-06-30, pre-S4.1).** A 6-surface verification against current code confirmed the
 > plan and folded these corrections in: (a) **no `scan_groups`** on `StateTierStore` — cold-key
