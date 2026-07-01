@@ -1007,6 +1007,26 @@ impl LaminarDB {
         }
     }
 
+    /// `true` if more than one node currently owns vnodes (a genuine multi-node cluster). A single-node
+    /// deployment — embedded (no registry) or a registry whose vnodes all map to one node — is `false`.
+    fn is_multi_node(&self) -> bool {
+        use laminar_core::state::NodeId;
+        self.vnode_registry.lock().as_ref().is_some_and(|r| {
+            let mut seen: Option<NodeId> = None;
+            for &n in r.snapshot().iter() {
+                if n == NodeId::UNASSIGNED {
+                    continue;
+                }
+                match seen {
+                    None => seen = Some(n),
+                    Some(s) if s != n => return true,
+                    _ => {}
+                }
+            }
+            false
+        })
+    }
+
     /// Create one MV of a decomposed multi-way join by parsing + handling it directly, bypassing the
     /// DDL persistence in `execute` (the chain is re-derived from the parent's stored N-way DDL on a
     /// cold restart, so persisting the intermediates would double-create them).
@@ -1059,6 +1079,23 @@ impl LaminarDB {
                 statement_type: "CREATE MATERIALIZED VIEW".to_string(),
                 object_name: name_str,
             }));
+        }
+
+        // The incremental changelog⋈changelog join is single-node only (its inputs are not
+        // key-shuffled). In a multi-node cluster each node would join only node-local slices → wrong
+        // results, so reject it (2-way or decomposed N-way) rather than build silently-wrong state.
+        if self.is_multi_node() {
+            let inc = self.incremental_mv_names();
+            if crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
+                || crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
+                    .is_some()
+            {
+                return Err(DbError::MaterializedView(format!(
+                    "[{}] incremental changelog join '{name_str}' is single-node only and cannot be \
+                     created in a multi-node cluster",
+                    laminar_core::error_codes::JOIN_CLUSTER_UNSUPPORTED
+                )));
+            }
         }
 
         // Single-statement N-way join → decompose into a left-deep chain of 2-way changelog-join MVs:

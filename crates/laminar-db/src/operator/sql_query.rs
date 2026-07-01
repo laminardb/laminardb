@@ -268,6 +268,9 @@ struct AggOpCheckpoint {
     agg: Option<AggStateCheckpoint>,
     deferred: Vec<(i64, Vec<u8>)>, // (ingest watermark, IPC-serialized pre-agg batch)
     cold_vnodes: Vec<u32>,         // absent from `agg`; replayed from durable partials on restart
+    // Per-vnode `-1`-weight retraction batches stashed at revoke but not yet emitted; persisted so a
+    // crash between revoke and the next emit still retracts the moved groups from the MV (ADR-007 Q4).
+    revoke_retractions: Vec<(u32, Vec<u8>)>,
 }
 
 /// Serialize a per-vnode aggregate checkpoint slice (full or a delta's changed-groups) to bytes.
@@ -312,6 +315,11 @@ pub(crate) struct SqlQueryOperator {
     // later re-acquire still merges into empty state (no double-count).
     #[cfg(feature = "cluster")]
     deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
+    // Per-vnode `-1`-weight retraction batches captured when a vnode is revoked, keyed by vnode.
+    // Prepended (retract-before-insert) to the next emit so the losing node's MV snapshot drops the
+    // moved groups; cancelled per-vnode on a same-cycle reacquire (ADR-007 Q4).
+    #[cfg(feature = "cluster")]
+    pending_revoke_retractions: rustc_hash::FxHashMap<u32, RecordBatch>,
     #[cfg(feature = "state-tier")]
     promotion: Option<AggPromotion>,
     // Held until `lazy_init` builds the aggregate state, then moved into `promotion`.
@@ -364,6 +372,8 @@ impl SqlQueryOperator {
             pending_restore_deltas: Vec::new(),
             #[cfg(feature = "cluster")]
             deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "cluster")]
+            pending_revoke_retractions: rustc_hash::FxHashMap::default(),
             #[cfg(feature = "state-tier")]
             promotion: None,
             #[cfg(feature = "state-tier")]
@@ -474,7 +484,13 @@ impl SqlQueryOperator {
                         .map(|c| c.registry.vnode_count())
                     {
                         let revoked = std::mem::take(&mut self.deferred_revoke_vnodes);
-                        agg_state.drop_vnodes(&revoked, vc);
+                        match agg_state.drop_vnodes(&revoked, vc) {
+                            Ok(r) => self.pending_revoke_retractions.extend(r),
+                            Err(e) => tracing::warn!(
+                                query = %self.op_name, error = %e,
+                                "deferred revoke retraction build failed; MV rows may be stale"
+                            ),
+                        }
                     }
                 }
                 if let Some(ttl) = self.idle_ttl_ms {
@@ -930,6 +946,20 @@ impl SqlQueryOperator {
             eviction
         };
 
+        // Retract-before-insert: moved-away groups' `-1` batches lead the emit so a distributed read
+        // never double-counts a rebalanced group (ADR-007 Q4).
+        #[cfg(feature = "cluster")]
+        let result = if self.pending_revoke_retractions.is_empty() {
+            result
+        } else {
+            let mut prefixed: Vec<RecordBatch> =
+                std::mem::take(&mut self.pending_revoke_retractions)
+                    .into_values()
+                    .collect();
+            prefixed.extend(result);
+            prefixed
+        };
+
         #[cfg(feature = "cluster")]
         return self.suppress_restoring_output(result, num_group_cols);
         #[cfg(not(feature = "cluster"))]
@@ -1229,13 +1259,31 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "state-tier"))]
         let cold_vnodes: Vec<u32> = Vec::new();
 
-        if agg.is_none() && deferred.is_empty() && cold_vnodes.is_empty() {
+        #[cfg(feature = "cluster")]
+        let revoke_retractions: Vec<(u32, Vec<u8>)> = self
+            .pending_revoke_retractions
+            .iter()
+            .map(|(v, batch)| {
+                laminar_core::serialization::serialize_batch_stream(batch)
+                    .map(|blob| (*v, blob))
+                    .map_err(|e| DbError::Pipeline(format!("revoke retraction checkpoint: {e}")))
+            })
+            .collect::<Result<_, DbError>>()?;
+        #[cfg(not(feature = "cluster"))]
+        let revoke_retractions: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        if agg.is_none()
+            && deferred.is_empty()
+            && cold_vnodes.is_empty()
+            && revoke_retractions.is_empty()
+        {
             return Ok(None);
         }
         let cp = AggOpCheckpoint {
             agg,
             deferred,
             cold_vnodes,
+            revoke_retractions,
         };
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
             .map(|v| v.to_vec())
@@ -1281,6 +1329,20 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(feature = "state-tier")]
         if !cp.cold_vnodes.is_empty() {
             self.pending_cold_rehydrate = cp.cold_vnodes;
+        }
+
+        #[cfg(feature = "cluster")]
+        for (v, blob) in cp.revoke_retractions {
+            let batch = laminar_core::serialization::deserialize_batch_stream(&blob)
+                .map_err(|e| DbError::Pipeline(format!("revoke retraction restore: {e}")))?;
+            self.pending_revoke_retractions.insert(v, batch);
+        }
+        #[cfg(not(feature = "cluster"))]
+        if !cp.revoke_retractions.is_empty() {
+            tracing::warn!(
+                query = %self.op_name, count = cp.revoke_retractions.len(),
+                "dropping checkpointed revoke retractions — this binary has no cluster support"
+            );
         }
 
         let Some(agg_cp) = cp.agg else {
@@ -1583,6 +1645,9 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.merge_groups(&cp)?;
+                // Same-cycle reacquire: `merge_groups` restored `last_emitted`, so a pending
+                // retraction would wrongly drop a still-resident group (Q4c).
+                self.pending_revoke_retractions.remove(&vnode);
                 // Whether this is a rebalance acquisition or a promotion
                 // from the cold tier, the vnode's state now lives in memory.
                 // `mark_vnode_hot` clears the cold flag (promotion only);
@@ -1662,6 +1727,9 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
+                // Same-cycle reacquire: `merge_groups` restored `last_emitted`, so emit is a no-op for
+                // these groups — a pending retraction would wrongly drop a still-resident group (Q4c).
+                self.pending_revoke_retractions.remove(&vnode);
                 #[cfg(feature = "state-tier")]
                 {
                     agg_state.mark_vnode_hot(vnode);
@@ -1712,7 +1780,13 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 if let Some(vc) = vnode_count {
-                    agg_state.drop_vnodes(revoked, vc);
+                    match agg_state.drop_vnodes(revoked, vc) {
+                        Ok(r) => self.pending_revoke_retractions.extend(r),
+                        Err(e) => tracing::warn!(
+                            query = %self.op_name, error = %e,
+                            "revoke retraction build failed; MV rows may be stale"
+                        ),
+                    }
                 }
             }
             // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until

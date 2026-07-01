@@ -2181,22 +2181,61 @@ impl IncrementalAggState {
     /// revoking rotation; revoked and acquired sets are disjoint per rotation, so it never races an
     /// acquire-merge.
     #[cfg(feature = "cluster")]
-    pub(crate) fn drop_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>, vnode_count: u32) {
+    /// Drop revoked vnodes' groups AND return per-vnode `-1`-weight retraction batches (built from
+    /// `last_emitted` before the purge) so the losing node's incremental MV snapshot drops the moved
+    /// groups — otherwise a distributed read double-counts them (ADR-007 Q4). Empty unless changelog.
+    pub(crate) fn drop_vnodes(
+        &mut self,
+        revoked: &rustc_hash::FxHashSet<u32>,
+        vnode_count: u32,
+    ) -> Result<ahash::AHashMap<u32, RecordBatch>, DbError> {
         if revoked.is_empty() {
-            return;
+            return Ok(ahash::AHashMap::new());
         }
         let global = self.num_group_cols == 0;
-        let in_revoked = |k: &arrow::row::OwnedRow| -> bool {
-            let v = if global {
+        let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
+            if global {
                 0
             } else {
                 #[allow(clippy::cast_possible_truncation)]
                 {
                     (laminar_core::state::key_hash(k.as_ref()) % u64::from(vnode_count)) as u32
                 }
-            };
-            revoked.contains(&v)
+            }
         };
+        let in_revoked = |k: &arrow::row::OwnedRow| -> bool { revoked.contains(&vnode_of(k)) };
+
+        // Build the retractions BEFORE purging, one batch per revoked vnode (keyed so a same-cycle
+        // reacquire can cancel its own vnode's retraction — see `apply_vnode_chain`).
+        let mut retractions: ahash::AHashMap<u32, RecordBatch> = ahash::AHashMap::new();
+        if self.emit_changelog {
+            let mut by_vnode: ahash::AHashMap<
+                u32,
+                (Vec<arrow::row::OwnedRow>, Vec<Vec<ScalarValue>>),
+            > = ahash::AHashMap::new();
+            for (k, vals) in &self.last_emitted {
+                let v = vnode_of(k);
+                if revoked.contains(&v) {
+                    let e = by_vnode.entry(v).or_default();
+                    e.0.push(k.clone());
+                    e.1.push(vals.clone());
+                }
+            }
+            for (v, (keys, vals)) in by_vnode {
+                let weights = vec![-1i64; keys.len()];
+                let batch = build_weighted_batch(
+                    &keys,
+                    &vals,
+                    &weights,
+                    &self.row_converter,
+                    self.num_group_cols,
+                    &self.agg_specs,
+                    &self.output_schema,
+                )?;
+                retractions.insert(v, batch);
+            }
+        }
+
         self.groups.retain(|k, _| !in_revoked(k));
         self.last_emitted.retain(|k, _| !in_revoked(k));
         self.dirty_keys.retain(|k| !in_revoked(k));
@@ -2216,6 +2255,7 @@ impl IncrementalAggState {
         }
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
+        Ok(retractions)
     }
 }
 
@@ -5349,7 +5389,17 @@ mod tests {
 
         // Revoke vy.
         let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
-        state.drop_vnodes(&revoked, VC);
+        let retractions = state.drop_vnodes(&revoked, VC).unwrap();
+        // The revoked vnode's still-materialized groups are retracted (-1) from the MV snapshot (Q4);
+        // the sibling vnode is untouched.
+        assert!(
+            retractions.contains_key(&vy),
+            "revoked vnode yields a retraction batch"
+        );
+        assert!(
+            !retractions.contains_key(&vx),
+            "sibling vnode is not retracted"
+        );
 
         // Every vy entry is gone.
         assert!(

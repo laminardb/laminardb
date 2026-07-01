@@ -1064,6 +1064,223 @@ mod failures {
 
         harness.shutdown().await;
     }
+
+    /// ADR-007 Q4: a rebalance MOVE (vnode A->B, no move-back) must RETRACT the moved groups from the
+    /// LOSING node's incremental MV snapshot. Otherwise A keeps materializing K forever while B also
+    /// materializes it, so a distributed (union) read double-counts K. Reads the union across both
+    /// nodes and asserts K appears exactly once at the full total, and that A dropped K locally.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebalance_move_retracts_moved_group_from_losing_node() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
+        use laminar_core::state::NodeId;
+
+        let mut harness =
+            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let leader_idx = harness.leader_idx(); // B: gains V
+        let follower_idx = harness.follower_idxs()[0]; // A: holds V, then loses it
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners = vec![
+            (
+                harness.nodes[leader_idx].instance_id,
+                harness.nodes[leader_idx].owned_vnodes(),
+            ),
+            (
+                harness.nodes[follower_idx].instance_id,
+                harness.nodes[follower_idx].owned_vnodes(),
+            ),
+        ];
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
+        let leader_keys = key_buckets[0].1.clone();
+        let follower_keys = key_buckets[1].1.clone();
+        let phase: Vec<i64> = leader_keys.iter().chain(&follower_keys).copied().collect();
+
+        let k: i64 = *follower_keys
+            .iter()
+            .find(|&&x| x != 0)
+            .expect("a non-zero follower key");
+        let v: u32 = super::cluster_harness::vnode_for_key(k, VNODE_COUNT);
+        assert!(
+            harness.nodes[follower_idx].owned_vnodes().contains(&v),
+            "precondition: A owns V={v} for K={k}",
+        );
+        let node_b = NodeId(harness.nodes[leader_idx].instance_id.0);
+        let store: Arc<AssignmentSnapshotStore> =
+            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
+
+        // Feed K (and siblings) then checkpoint so B can rehydrate V's aggregate state on acquire.
+        const ROUNDS: i64 = 3;
+        for _ in 0..ROUNDS {
+            harness.nodes[leader_idx]
+                .db
+                .source_untyped("src")
+                .expect("src")
+                .push_arrow(input_batch(&phase))
+                .expect("push round");
+            sleep(Duration::from_millis(150)).await;
+        }
+        harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint baseline");
+        sleep(Duration::from_millis(300)).await;
+
+        // Baseline: K materialized exactly once at ROUNDS*k*10 (on A, its owner) across the union.
+        let baseline = k * 10 * ROUNDS;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let rows = union_sums(&harness).await;
+            let n = rows.iter().filter(|(kk, _)| *kk == k).count();
+            let tot: i64 = rows.iter().filter(|(kk, _)| *kk == k).map(|(_, t)| t).sum();
+            if n == 1 && tot == baseline {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "baseline K wrong: rows={rows:?} want one row total {baseline}",
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        // MOVE V: A -> B (one way), preserving every other vnode->owner mapping.
+        let seed = store.load().await.unwrap().unwrap();
+        let mut vnodes: BTreeMap<u32, NodeId> = seed
+            .to_vnode_vec(VNODE_COUNT)
+            .into_iter()
+            .enumerate()
+            .map(|(i, owner)| (i as u32, owner))
+            .collect();
+        vnodes.insert(v, node_b);
+        let moved = seed.next(vnodes);
+        let v_moved = moved.version;
+        assert!(matches!(
+            store.save_if_version(&moved, seed.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness
+            .nodes
+            .iter()
+            .all(|n| n.vnode_registry.assignment_version() >= v_moved)
+        {
+            assert!(Instant::now() < deadline, "nodes never adopted A->B move");
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            harness.nodes[follower_idx]
+                .owned_vnodes()
+                .iter()
+                .all(|&x| x != v),
+            "A must drop V",
+        );
+        // Let A drain apply_revoked_vnodes (stash the retraction) and B stage the rehydrated chain.
+        sleep(Duration::from_millis(600)).await;
+
+        // Push another round: K routes to V's new owner (B), and A's retained vnodes still receive
+        // rows so A's operator advances its watermark and flushes the stashed retraction.
+        harness.nodes[leader_idx]
+            .db
+            .source_untyped("src")
+            .expect("src")
+            .push_arrow(input_batch(&phase))
+            .expect("push post-move round");
+
+        // K2 is a sibling follower key on a DIFFERENT vnode than V — one A keeps. It proves the
+        // retraction is surgical (only V's groups leave A), and since A never rehydrates, its total
+        // settles promptly (unlike a leader key on B, which races B's acquire-rehydrate cycle).
+        let k2: i64 = *follower_keys
+            .iter()
+            .find(|&&x| {
+                x != 0 && x != k && super::cluster_harness::vnode_for_key(x, VNODE_COUNT) != v
+            })
+            .expect("a second follower key on a vnode other than V");
+
+        // Settle everything together on one consistent snapshot: A dropped K (Q4 retraction), the
+        // union carries K once at the full rehydrated+new total, and A still owns K2 at its full
+        // total. Without the retraction, A keeps K and the union double-counts it.
+        let expected_k = k * 10 * (ROUNDS + 1);
+        let expected_k2 = k2 * 10 * (ROUNDS + 1);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let a_rows = read_mv_sums(&harness.nodes[follower_idx].db, "sums").await;
+            let a_has_k = a_rows.iter().any(|(kk, _)| *kk == k);
+            let a_has_k2 = a_rows.iter().any(|(kk, _)| *kk == k2);
+            let rows = union_sums(&harness).await;
+            let kn = rows.iter().filter(|(kk, _)| *kk == k).count();
+            let kt: i64 = rows.iter().filter(|(kk, _)| *kk == k).map(|(_, t)| t).sum();
+            let k2n = rows.iter().filter(|(kk, _)| *kk == k2).count();
+            let k2t: i64 = rows
+                .iter()
+                .filter(|(kk, _)| *kk == k2)
+                .map(|(_, t)| t)
+                .sum();
+            if !a_has_k && kn == 1 && kt == expected_k && a_has_k2 && k2n == 1 && k2t == expected_k2
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "after A->B move: A_has_K={a_has_k} K(rows={kn},tot={kt},want {expected_k}) \
+                 A_has_K2={a_has_k2} K2(rows={k2n},tot={k2t},want {expected_k2}); rows={rows:?}",
+            );
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        harness.shutdown().await;
+    }
+
+    /// [LDB-3006] An incremental changelog join is single-node only; creating one in a multi-node
+    /// cluster must be rejected at DDL rather than silently producing per-node-partitioned (wrong)
+    /// results. Covers both the two-way form and the single-statement multi-way decomposition.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incremental_join_rejected_in_multi_node_cluster() {
+        let harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
+        let leader = &harness.nodes[harness.leader_idx()].db;
+        leader
+            .execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
+            .await
+            .expect("src a");
+        leader
+            .execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
+            .await
+            .expect("src b");
+        leader
+            .execute(
+                "CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k",
+            )
+            .await
+            .expect("agg a");
+        leader
+            .execute(
+                "CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k",
+            )
+            .await
+            .expect("agg b");
+
+        let two_way = leader
+            .execute(
+                "CREATE MATERIALIZED VIEW j AS \
+                 SELECT a.k, a.ta, b.tb FROM agg_a a JOIN agg_b b ON a.k = b.k",
+            )
+            .await;
+        let err = format!(
+            "{:?}",
+            two_way.expect_err("two-way incremental join must be rejected in a cluster")
+        );
+        assert!(err.contains("LDB-3006"), "expected LDB-3006, got: {err}");
+
+        harness.shutdown().await;
+    }
 }
 
 mod rebalance {
