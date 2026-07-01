@@ -450,3 +450,95 @@ async fn scenario_incremental_agg_kafka_upsert() {
         "k2 latest should carry total=20, got {v2}"
     );
 }
+
+/// P4: a CREATE STREAM projecting an incremental MV forwards its netted changelog to a downstream
+/// capability-aware sink. Composes the stream consumer (P4) with the Kafka `ENVELOPE UPSERT` sink
+/// (P1b): the topic's latest-per-key equals the current aggregate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
+    let Some(brokers) = upsert_test_brokers() else {
+        eprintln!("skipping: Redpanda not reachable");
+        return;
+    };
+    let brokers = brokers.as_str();
+    let out_topic = unique("p4_stream_upsert_out");
+    create_topic(brokers, &out_topic, 1).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laminar_db::LaminarConfig {
+        storage_dir: Some(dir.path().to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            incremental_emit: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let db = LaminarDB::open_with_config(cfg).expect("open db");
+    db.execute("CREATE SOURCE events (k BIGINT, v BIGINT)")
+        .await
+        .expect("source");
+    db.execute("CREATE MATERIALIZED VIEW agg AS SELECT k, SUM(v) AS total FROM events GROUP BY k")
+        .await
+        .expect("mv");
+    // A stream over the incremental MV forwards its (netted) changelog downstream.
+    db.execute("CREATE STREAM s AS SELECT k, total FROM agg")
+        .await
+        .expect("stream over incremental MV");
+    let ddl_sink = format!(
+        "CREATE SINK out FROM s WITH (\
+             'connector' = 'kafka', \
+             'bootstrap.servers' = '{brokers}', \
+             'topic' = '{out_topic}', \
+             'format' = 'json', \
+             'key.column' = 'k', \
+             'envelope' = 'upsert')"
+    );
+    db.execute(&ddl_sink)
+        .await
+        .expect("upsert sink over the stream");
+    db.start().await.expect("start");
+
+    let src = db.source_untyped("events").expect("source handle");
+    src.push_arrow(kv_batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    src.push_arrow(kv_batch(&[1], &[5])).unwrap(); // k1: 10 -> 15
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let msgs = consume_keyed(
+        brokers,
+        &out_topic,
+        &unique("p4_verify"),
+        100,
+        Duration::from_secs(10),
+    )
+    .await;
+    db.shutdown().await.ok();
+    delete_topic(brokers, &out_topic).await;
+
+    let mut latest: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    for (k, v) in msgs {
+        if let Some(k) = k {
+            latest.insert(k, v);
+        }
+    }
+    let v1 = latest
+        .get("1")
+        .expect("key 1 present")
+        .clone()
+        .expect("k1 not tombstoned");
+    let v2 = latest
+        .get("2")
+        .expect("key 2 present")
+        .clone()
+        .expect("k2 not tombstoned");
+    assert!(
+        v1.contains("15"),
+        "k1 latest should carry total=15 via the stream, got {v1}"
+    );
+    assert!(
+        v2.contains("20"),
+        "k2 latest should carry total=20 via the stream, got {v2}"
+    );
+}
