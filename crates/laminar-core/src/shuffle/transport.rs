@@ -1,35 +1,25 @@
 //! Cross-node shuffle transport over Tonic gRPC client-streaming.
 //!
-//! Each sender opens a client-streaming `Shuffle` RPC per peer and pushes a
-//! forward-only stream of `ShuffleFrame`s; the receiver runs the
-//! `ShuffleTransport` service, attributes every stream to the peer announced in
-//! its leading `Hello`, and surfaces decoded [`ShuffleMessage`]s on a bounded
-//! crossfire MPSC queue. Backpressure is the HTTP/2 flow-control window plus
-//! that bounded queue. See [`super::message`] for the per-frame payloads and
-//! [`crate::serialization`] for the Arrow IPC (de)serialization of `VnodeData`.
+//! Each sender opens a client-streaming `Shuffle` RPC per peer; the receiver
+//! attributes every stream to the peer in its leading `Hello` and surfaces
+//! decoded [`ShuffleMessage`]s on a bounded crossfire queue. Backpressure is the
+//! HTTP/2 window plus that queue.
 //!
-//! The real gRPC path is compiled under the `cluster` feature (which
-//! pulls in `tonic`/`prost`). A default build keeps the same public API via a
-//! networking-free shim so the types referenced by `laminar-db`/`laminar-server`
-//! signatures still compile without the cluster dependencies.
+//! The gRPC path compiles under the `cluster` feature; a default build keeps the
+//! same public API via a networking-free shim.
 
 use super::message::ShuffleMessage;
 use crate::checkpoint::barrier::CheckpointBarrier;
 
-/// Bounded capacity for the inbound shuffle queue. One consumer per
-/// [`ShuffleReceiver`] (the cluster repartition dispatcher) drains it; a slow
-/// consumer parks the per-stream service handler on the bounded `send`, so
-/// backpressure flows back over HTTP/2 to the sender.
+/// Inbound shuffle queue capacity; a full queue parks the service handler so
+/// backpressure flows back over HTTP/2.
 const SHUFFLE_RECV_QUEUE: usize = 1024;
 
-/// Peer-local identifier on the wire. Matches `cluster::discovery::NodeId`'s
-/// inner type for seamless conversion.
+/// Peer identifier on the wire; matches `cluster::discovery::NodeId`'s inner type.
 pub type ShufflePeerId = u64;
 
-/// Gossip KV key used by [`ShuffleReceiver::bind_with_kv`] to publish the
-/// listener's socket address, and by [`ShuffleSender`] to discover peer
-/// addresses on first contact. Value: the bound socket address formatted via
-/// `SocketAddr::to_string()`.
+/// Gossip KV key under which a receiver publishes its listener address for peer
+/// discovery.
 #[cfg(feature = "cluster")]
 pub const SHUFFLE_ADDR_KEY: &str = "shuffle:addr";
 
@@ -50,11 +40,9 @@ pub(crate) mod shuffle_v1 {
 // Per-stage / per-barrier holdover shared by both builds.
 // ---------------------------------------------------------------------------
 
-/// Inbound-side holdover state lifted out of [`ShuffleReceiver`] so both the
-/// gRPC and default builds share the staging semantics that barrier alignment
-/// depends on: frames pulled for another stage are bucketed for that stage's own
-/// drainer, and barriers pulled mid-cycle are stashed (never dropped) for the
-/// aligning checkpoint.
+/// Inbound staging shared by both builds: frames for another stage are bucketed
+/// for that stage's drainer, and mid-cycle barriers are stashed (never dropped)
+/// for the aligning checkpoint.
 #[derive(Default)]
 struct Holdover {
     staged: parking_lot::Mutex<rustc_hash::FxHashMap<String, Vec<arrow_array::RecordBatch>>>,
@@ -91,25 +79,23 @@ mod grpc {
     use crate::cluster::control::ClusterKv;
     use crate::serialization::{BatchStreamDecoder, BatchStreamEncoder};
 
-    /// Outbound queue capacity per peer. Bounds per-peer buffering before the
-    /// HTTP/2 window applies its own backpressure.
+    /// Per-peer outbound queue capacity before the HTTP/2 window backpressures.
     const SHUFFLE_SEND_QUEUE: usize = 1024;
 
-    /// Inbound queue item flavor (kept as a `type` so the parked-behind-mutex
-    /// receiver field doesn't trip clippy's `type_complexity`).
+    /// Inbound queue alias (a `type` so the parked receiver field dodges
+    /// `type_complexity`).
     type InboundRx = AsyncRx<mpsc::Array<(ShufflePeerId, ShuffleMessage)>>;
     type InboundTx = MAsyncTx<mpsc::Array<(ShufflePeerId, ShuffleMessage)>>;
 
-    /// Map a `tonic::Status` / `tonic::transport::Error` (or any `Display`) into
-    /// `io::Error` so the public API keeps its `io::Result` shape.
+    /// Map any `Display` error into `io::Error` to keep the public `io::Result`
+    /// shape.
     fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
         io::Error::other(e.to_string())
     }
 
-    /// Encode a [`ShuffleMessage`] into the wire [`ShuffleFrame`]. The per-stage
-    /// [`BatchStreamEncoder`] writes the Arrow schema only on a stage's first
-    /// `VnodeData`; later batches are schema-less. Runs in the connection driver
-    /// task, off the Ring 0 compute thread.
+    /// Encode a [`ShuffleMessage`] into a wire [`ShuffleFrame`]. The per-stage
+    /// [`BatchStreamEncoder`] writes the schema only on a stage's first
+    /// `VnodeData`. Runs in the driver task, off the compute thread.
     fn encode_message(
         msg: &ShuffleMessage,
         encoders: &mut FxHashMap<String, BatchStreamEncoder>,
@@ -158,12 +144,11 @@ mod grpc {
         Ok(ShuffleFrame { kind: Some(kind) })
     }
 
-    /// One lazily-opened client-streaming call to a peer. The driver task pulls
-    /// [`ShuffleMessage`]s from `tx`'s queue, serializes them to wire frames, and
-    /// feeds the gRPC request stream; it flips `alive=false` on the first transport
-    /// error (or connect failure), so the next `send_to` purges this entry and
-    /// reconnects. Buffering messages (not frames) keeps the CPU-heavy Arrow IPC
-    /// serialization off the caller's (Ring 0 compute) thread.
+    /// One lazily-opened client-streaming call to a peer. The driver task
+    /// serializes queued messages and feeds the gRPC request stream, flipping
+    /// `alive=false` on the first transport/connect error so the next `send_to`
+    /// reconnects. Buffering messages (not frames) keeps Arrow IPC serialization
+    /// off the compute thread.
     struct PeerConn {
         tx: MAsyncTx<mpsc::Array<ShuffleMessage>>,
         alive: Arc<AtomicBool>,
@@ -172,9 +157,9 @@ mod grpc {
 
     impl PeerConn {
         fn is_alive(&self) -> bool {
-            // `is_finished()` also catches a driver cancelled without flipping `alive` — an
-            // in-process restart drops the compute runtime it ran on, leaving an `alive`
-            // zombie that fails every send yet never reconnects.
+            // `is_finished()` also catches a driver cancelled without flipping
+            // `alive` (an in-process restart drops its runtime), which would
+            // otherwise zombie: fails every send yet never reconnects.
             self.alive.load(Ordering::Acquire) && !self.driver.is_finished()
         }
     }
@@ -202,8 +187,7 @@ mod grpc {
     }
 
     impl ShuffleSender {
-        /// Empty sender. Peers are added via [`Self::register_peer`] or discovered
-        /// via the KV (in [`Self::with_kv`]) before any `send_to`.
+        /// Empty sender; peers arrive via [`Self::register_peer`] or KV discovery.
         #[must_use]
         pub fn new(local_id: ShufflePeerId) -> Self {
             Self {
@@ -214,8 +198,8 @@ mod grpc {
             }
         }
 
-        /// Sender that falls back to `kv` (key [`SHUFFLE_ADDR_KEY`] on the peer's
-        /// own state) when `send_to` targets a peer not previously registered.
+        /// Sender that falls back to `kv` discovery for peers not previously
+        /// registered.
         #[must_use]
         pub fn with_kv(local_id: ShufflePeerId, kv: Arc<dyn ClusterKv>) -> Self {
             let mut s = Self::new(local_id);
@@ -224,8 +208,7 @@ mod grpc {
         }
 
         /// Register (or update) a peer's shuffle address.
-        // Body is sync, but the signature stays async to match the contract
-        // callers `.await`.
+        // Sync body; async signature matches the contract callers `.await`.
         #[allow(clippy::unused_async)]
         pub async fn register_peer(&self, peer: ShufflePeerId, addr: SocketAddr) {
             self.peers.lock().insert(peer, addr);
@@ -238,8 +221,8 @@ mod grpc {
         /// endpoint cannot be built, or the per-peer stream has shut down.
         pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
             let conn = self.connection_for(peer).await?;
-            // The clone is cheap (`RecordBatch` is an Arc bump); the driver
-            // task serializes to Arrow IPC off this thread.
+            // Cheap clone (`RecordBatch` is an Arc bump); the driver serializes
+            // off-thread.
             conn.tx.send(msg.clone()).await.map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -248,17 +231,14 @@ mod grpc {
             })
         }
 
-        /// Ship `barrier` to every peer, BEST-EFFORT. A transiently unreachable peer
-        /// (e.g. a respawned node whose shuffle address hasn't propagated through gossip
-        /// yet) is logged and skipped so it can't block delivery to the others — a
-        /// fail-fast `?` would drop the barrier to every peer after the first failure,
-        /// including the leader still waiting on it, wedging the whole alignment. A
-        /// genuinely-down peer is handled by the align wait-set self-heal + the
-        /// convergence gate, not here.
+        /// Ship `barrier` to every peer, best-effort: an unreachable peer is
+        /// logged and skipped so one failure can't wedge alignment for the
+        /// others. A genuinely-down peer is handled by the align wait-set
+        /// self-heal, not here.
         ///
         /// # Errors
-        /// Returns the last `io::Error` only when NO peer could be reached (total fan-out
-        /// failure); a partial fan-out succeeds.
+        /// Returns the last `io::Error` only when NO peer could be reached; a
+        /// partial fan-out succeeds.
         pub async fn fan_out_barrier(
             &self,
             peers: &[ShufflePeerId],
@@ -288,8 +268,7 @@ mod grpc {
             }
         }
 
-        /// Resolve `peer`'s address from the KV (`SHUFFLE_ADDR_KEY` on the peer's
-        /// own state) and cache it. `None` when no KV, no entry, or unparseable.
+        /// Resolve and cache `peer`'s address from the KV; `None` when unavailable.
         async fn discover_peer(&self, peer: ShufflePeerId) -> Option<SocketAddr> {
             let kv = self.kv.as_ref()?;
             let raw = kv
@@ -312,8 +291,8 @@ mod grpc {
             // Purge a dead entry so we reopen the call below.
             self.pool.lock().retain(|p, c| *p != peer || c.is_alive());
 
-            // Re-resolve on reconnect (peers may restart on a new port); fall
-            // back to a statically registered address when there's no KV.
+            // Re-resolve on reconnect (peers may restart on a new port); fall back
+            // to a statically registered address when there's no KV.
             let addr = match self.discover_peer(peer).await {
                 Some(addr) => addr,
                 None => self.peers.lock().get(&peer).copied().ok_or_else(|| {
@@ -340,8 +319,8 @@ mod grpc {
     }
 
     /// Open a client-streaming `Shuffle` call to `addr`, sending `Hello(local_id)`
-    /// as the first frame. Connecting happens inside the driver task so this stays
-    /// non-blocking; a connect failure flips `alive` so the next `send_to` retries.
+    /// first. Connecting happens in the driver task (non-blocking); a connect
+    /// failure flips `alive` so the next `send_to` retries.
     fn open_call(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<PeerConn> {
         let endpoint = crate::cluster::control::tls::client_endpoint(&addr.to_string())
             .map_err(io_err)?
@@ -350,9 +329,8 @@ mod grpc {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_for_driver = Arc::clone(&alive);
 
-        // Request stream: a single `Hello` chained onto an unfold over the
-        // per-peer crossfire receiver (no `async-stream` dependency needed).
-        // The unfold serializes dequeued messages here, in the driver task.
+        // Request stream: a `Hello` chained onto an unfold over the per-peer
+        // receiver, serializing dequeued messages here in the driver task.
         let hello = ShuffleFrame {
             kind: Some(shuffle_frame::Kind::Hello(Hello { node_id: local_id })),
         };
@@ -364,8 +342,8 @@ mod grpc {
                 match encode_message(&msg, &mut encoders) {
                     Ok(frame) => Some((frame, (rx, encoders))),
                     Err(e) => {
-                        // An unencodable batch would desync the stage's IPC
-                        // stream; half-close so the peer reconnects fresh.
+                        // An unencodable batch would desync the IPC stream;
+                        // half-close so the peer reconnects fresh.
                         tracing::warn!(error = %e, "shuffle frame encode failed; closing stream");
                         None
                     }
@@ -379,8 +357,7 @@ mod grpc {
                 return;
             };
             let mut client = ShuffleTransportClient::<Channel>::new(channel);
-            // The call returns when the server responds to half-close or the
-            // transport breaks; either way the peer connection is finished.
+            // Returns on server half-close ack or transport break; either way done.
             let _ = client.shuffle(Request::new(outbound)).await;
             alive_for_driver.store(false, Ordering::Release);
         });
@@ -388,20 +365,16 @@ mod grpc {
         Ok(PeerConn { tx, alive, driver })
     }
 
-    /// Inbound side of the shuffle fabric: a Tonic `ShuffleTransport` server
-    /// surfacing every received frame, attributed to its sending peer, on the
-    /// bounded crossfire queue.
+    /// Inbound side of the shuffle fabric: a Tonic `ShuffleTransport` server that
+    /// surfaces every received frame, attributed to its peer, on the bounded queue.
     pub struct ShuffleReceiver {
         local_id: ShufflePeerId,
         local_addr: SocketAddr,
-        // crossfire's `AsyncRx` is `Send` but `!Sync` (it holds a
-        // `PhantomData<Cell<()>>`), yet `Arc<ShuffleReceiver>` must be `Sync` — it
-        // is embedded in DataFusion's `ClusterRepartitionExec`, whose
-        // `ExecutionPlan` impl requires `Send + Sync`. Park the receiver behind a
-        // `Mutex<Option<_>>` (which is `Sync` for any `Send` inner) and hand it out
-        // via a take/return guard so the single async consumer never holds the
-        // guard across `.await`. `rx_returned` wakes the next waiter; the guard
-        // restores the receiver on drop so a cancelled `recv` can't strand it.
+        // `AsyncRx` is `Send` but `!Sync`, yet `Arc<ShuffleReceiver>` must be
+        // `Sync` (it lives in DataFusion's `ClusterRepartitionExec`). Park it
+        // behind a `Mutex<Option<_>>` and hand it out via a take/return guard so
+        // the single consumer never holds the guard across `.await`; the guard
+        // restores it on drop so a cancelled `recv` can't strand it.
         rx: Mutex<Option<InboundRx>>,
         rx_returned: Arc<tokio::sync::Notify>,
         server: JoinHandle<()>,
@@ -426,8 +399,8 @@ mod grpc {
     }
 
     impl ShuffleReceiver {
-        /// Bind on `addr` and start serving. The bound address (with any ephemeral
-        /// port resolved) is exposed via [`Self::local_addr`].
+        /// Bind on `addr` and start serving; the resolved address is at
+        /// [`Self::local_addr`].
         ///
         /// # Errors
         /// Returns `io::Error` on bind failure.
@@ -438,9 +411,8 @@ mod grpc {
                 mpsc::bounded_async::<(ShufflePeerId, ShuffleMessage)>(SHUFFLE_RECV_QUEUE);
 
             let service = ShuffleService { tx };
-            // Accept loop as a stream of `Result<TcpStream, io::Error>` for
-            // `serve_with_incoming` — avoids the tokio-stream `net` feature.
-            // nodelay is set per accepted connection.
+            // Accept loop as a stream for `serve_with_incoming` (avoids
+            // tokio-stream's `net` feature); nodelay is set per connection.
             let incoming = futures::stream::unfold(listener, |listener| async move {
                 let item = match listener.accept().await {
                     Ok((stream, _)) => {
@@ -474,8 +446,7 @@ mod grpc {
             })
         }
 
-        /// Bind and publish the listener's address into `kv` under
-        /// [`SHUFFLE_ADDR_KEY`] for peer discovery.
+        /// Bind and publish the listener's address into `kv` for peer discovery.
         ///
         /// # Errors
         /// Returns `io::Error` on bind failure.
@@ -496,10 +467,9 @@ mod grpc {
             self.local_addr
         }
 
-        /// Await the next `(peer_id, msg)`. `None` once the server task has stopped
-        /// and every queued item is drained. Single-owner; concurrent callers
-        /// serialise via `rx_returned`. Cancellation-safe — a dropped `recv()`
-        /// future returns the receiver to its slot via the RAII guard.
+        /// Await the next `(peer_id, msg)`; `None` once the server stops and the
+        /// queue drains. Concurrent callers serialise via `rx_returned`;
+        /// cancellation-safe.
         pub async fn recv(&self) -> Option<(ShufflePeerId, ShuffleMessage)> {
             loop {
                 // Take the receiver out under a short lock dropped before `.await`.
@@ -518,8 +488,8 @@ mod grpc {
             }
         }
 
-        /// Drain every currently-available `(peer_id, msg)` without blocking. Empty
-        /// when the queue is empty or a `recv()` currently holds the receiver.
+        /// Drain every currently-available `(peer_id, msg)` without blocking;
+        /// empty if a `recv()` holds the receiver.
         #[must_use]
         pub fn drain_available(&self) -> Vec<(ShufflePeerId, ShuffleMessage)> {
             let mut out = Vec::new();
@@ -533,8 +503,7 @@ mod grpc {
         }
 
         /// Drain the inbound queue into `staged`: bucket `VnodeData` by stage,
-        /// stash `Barrier`s for the aligning checkpoint (never dropped — see
-        /// `Holdover`), discard `Hello`/`Close`.
+        /// stash `Barrier`s (never dropped), discard `Hello`/`Close`.
         fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<RecordBatch>>) {
             let slot = self.rx.lock();
             if let Some(rx) = slot.as_ref() {
@@ -552,9 +521,8 @@ mod grpc {
             }
         }
 
-        /// Non-blocking drain of the [`ShuffleMessage::VnodeData`] batches for
-        /// `stage`; other stages stay bucketed for their own drainer. Empty if the
-        /// queue is empty or a `recv()` holds it.
+        /// Non-blocking drain of the `VnodeData` batches for `stage`; other stages
+        /// stay bucketed for their own drainer.
         #[must_use]
         pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
             let mut staged = self.holdover.staged.lock();
@@ -562,9 +530,8 @@ mod grpc {
             staged.remove(stage).unwrap_or_default()
         }
 
-        /// Single lock-cycle drain of every staged stage whose key starts with
-        /// `prefix`, lifting those out and leaving operator stages untouched. Lets
-        /// the subscription router pull all `__sub::` batches in one pass.
+        /// Drain every staged stage whose key starts with `prefix` in one lock
+        /// cycle, leaving operator stages untouched.
         #[must_use]
         pub fn drain_staged_with_prefix(
             &self,
@@ -584,9 +551,7 @@ mod grpc {
             out
         }
 
-        /// Stage `batch` under `stage` for a later [`Self::drain_vnode_data_for`] /
-        /// [`Self::drain_all_staged`] — used when no operator for `stage` exists yet
-        /// at drain time.
+        /// Stage `batch` under `stage` for a later drain (no operator exists yet).
         pub fn stage_batch(&self, stage: String, batch: RecordBatch) {
             self.holdover
                 .staged
@@ -596,8 +561,7 @@ mod grpc {
                 .push(batch);
         }
 
-        /// Take the barriers stashed by [`Self::drain_vnode_data_for`] (peers that
-        /// fanned out before this node began aligning).
+        /// Take the barriers stashed by [`Self::drain_vnode_data_for`].
         #[must_use]
         pub fn drain_staged_barriers(&self) -> Vec<(ShufflePeerId, CheckpointBarrier)> {
             std::mem::take(&mut self.holdover.staged_barriers.lock())
@@ -638,8 +602,8 @@ mod grpc {
         }
     }
 
-    /// The `ShuffleTransport` service object: holds the producer end of the inbound
-    /// queue shared by every peer stream.
+    /// `ShuffleTransport` service: the producer end of the inbound queue shared by
+    /// every peer stream.
     struct ShuffleService {
         tx: InboundTx,
     }
@@ -655,10 +619,9 @@ mod grpc {
         }
     }
 
-    /// Read the leading `Hello`, then forward each decoded frame onto the bounded
-    /// inbound queue, returning a summary when the client half-closes. `VnodeData`
-    /// is decoded with per-stage [`BatchStreamDecoder`]s mirroring the sender's
-    /// per-stage encoders (schema on a stage's first chunk only).
+    /// Read the leading `Hello`, then forward each decoded frame onto the inbound
+    /// queue, returning a summary on half-close. `VnodeData` is decoded with
+    /// per-stage [`BatchStreamDecoder`]s mirroring the sender's encoders.
     async fn run_stream(
         tx: InboundTx,
         mut stream: tonic::Streaming<ShuffleFrame>,
@@ -731,10 +694,9 @@ mod grpc {
         Ok(ShuffleSummary { frames_received })
     }
 
-    /// Forward one decoded `stage` batch onto the inbound queue. If the batch
-    /// carries the `__laminar_vnode` metadata column, split it per vnode and emit
-    /// a slice each; otherwise emit it whole under `default_vnode`. Returns
-    /// `Ok(false)` when the inbound queue has closed (the caller stops reading).
+    /// Forward one decoded `stage` batch onto the inbound queue: split per vnode
+    /// when it carries the `__laminar_vnode` column, else emit whole under
+    /// `default_vnode`. `Ok(false)` when the queue has closed.
     async fn forward_vnode_batch(
         tx: &InboundTx,
         peer: ShufflePeerId,
@@ -808,10 +770,9 @@ pub use grpc::{ShuffleReceiver, ShuffleSender};
 // ===========================================================================
 // Default build: networking-free shim preserving the public API.
 //
-// The cluster shuffle is only exercised under `cluster`; a default
-// build references these types only in signatures. The shim keeps the inbound
-// crossfire queue + holdover staging so the surface compiles and behaves sanely
-// (local-only) without pulling in tonic.
+// A default build references these types only in signatures. The shim keeps the
+// inbound queue + holdover staging so the surface compiles and behaves locally
+// without pulling in tonic.
 // ===========================================================================
 
 #[cfg(not(feature = "cluster"))]
@@ -831,8 +792,8 @@ mod shim {
     type InboundRx = AsyncRx<mpsc::Array<(ShufflePeerId, ShuffleMessage)>>;
     type InboundTx = MAsyncTx<mpsc::Array<(ShufflePeerId, ShuffleMessage)>>;
 
-    /// Outbound shuffle handle. Without the cluster feature there is no peer
-    /// fabric, so sends to a non-local peer report the peer as unregistered.
+    /// Outbound shuffle handle; without the cluster feature there is no peer
+    /// fabric, so a non-local peer reports as unregistered.
     pub struct ShuffleSender {
         local_id: ShufflePeerId,
         peers: Mutex<FxHashMap<ShufflePeerId, SocketAddr>>,
@@ -903,10 +864,9 @@ mod shim {
         }
     }
 
-    /// Inbound shuffle handle. Holds the bounded crossfire queue + holdover so the
-    /// drain/stage API compiles and behaves locally without a network. The
-    /// receiver is parked behind a `Mutex<Option<_>>` for the same `Sync` reason as
-    /// the gRPC build.
+    /// Inbound shuffle handle: the bounded queue + holdover so the drain/stage API
+    /// works locally without a network. Parked behind a `Mutex<Option<_>>` for the
+    /// same `Sync` reason as the gRPC build.
     pub struct ShuffleReceiver {
         local_id: ShufflePeerId,
         local_addr: SocketAddr,
@@ -984,7 +944,7 @@ mod shim {
         }
 
         /// Non-blocking drain of the `VnodeData` batches for `stage`; other-stage
-        /// frames are bucketed and barriers stashed (never dropped).
+        /// frames are bucketed and barriers stashed.
         #[must_use]
         pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
             let mut staged = self.holdover.staged.lock();
@@ -1007,10 +967,9 @@ mod shim {
             staged.remove(stage).unwrap_or_default()
         }
 
-        /// Single lock-cycle drain of every staged stage whose key starts with
-        /// `prefix`; other-stage frames are bucketed and barriers stashed (never
-        /// dropped), matching [`Self::drain_vnode_data_for`]. Operator stages are
-        /// left in `staged`; only the matching entries are returned.
+        /// Drain every staged stage whose key starts with `prefix` in one lock
+        /// cycle; other-stage frames are bucketed and barriers stashed. Operator
+        /// stages stay in `staged`.
         #[must_use]
         pub fn drain_staged_with_prefix(
             &self,

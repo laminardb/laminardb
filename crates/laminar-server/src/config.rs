@@ -68,10 +68,8 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
-    // Collect all pipeline names
     let pipeline_names: HashSet<&str> = config.pipelines.iter().map(|p| p.name.as_str()).collect();
 
-    // Validate: sink must reference an existing pipeline
     for sink in &config.sinks {
         if !pipeline_names.contains(sink.pipeline.as_str()) {
             errors.push(format!(
@@ -81,7 +79,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // Validate: no duplicate names within a section
     let mut seen_sources = HashSet::new();
     for source in &config.sources {
         if !seen_sources.insert(&source.name) {
@@ -110,7 +107,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // Validate: bind address is parseable
     if config.server.bind.parse::<std::net::SocketAddr>().is_err() {
         errors.push(format!(
             "invalid server bind address: '{}'",
@@ -128,8 +124,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
         let pw = password.expose();
         if let Some(rest) = pw.strip_prefix("md5") {
-            // pg_authid-style pre-hash: 'md5' + lowercase-hex(md5(password ‖ user)).
-            // Strict shape so a typo isn't silently treated as plaintext.
+            // pg_authid-style pre-hash; strict shape so a typo isn't treated as plaintext.
             let valid =
                 rest.len() == 32 && rest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
             if !valid {
@@ -194,9 +189,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // Each CORS origin becomes an `Access-Control-Allow-Origin` header value;
-    // reject anything that isn't a valid HTTP header value (e.g. control
-    // characters) before it reaches the router.
+    // CORS origins become `Access-Control-Allow-Origin` values; reject invalid header values.
     if let Some(origins) = &config.server.console_cors_allowed_origins {
         for origin in origins {
             if origin.parse::<axum::http::HeaderValue>().is_err() {
@@ -208,7 +201,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
         if config.discovery.is_none() {
             errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
@@ -219,9 +211,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
         }
-        // Below 100ms the capture-quorum round-trip itself dominates
-        // the barrier; above it, the admission caps degrade cadence to
-        // upload speed instead of building an unbounded backlog.
+        // Below 100ms the capture-quorum round-trip itself dominates the barrier.
         if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(
                 "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 100ms",
@@ -229,16 +219,14 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             ));
         }
     }
-    // 0 would pause barrier admission permanently (staged >= cap is
-    // always true), silently wedging checkpointing.
+    // 0 would pause barrier admission permanently, silently wedging checkpointing.
     if config.checkpoint.max_staged_bytes == Some(0) {
         errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
     }
     if config.checkpoint.max_in_flight_epochs == Some(0) {
         errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
     }
-    // 0 makes claim_restart_slot prune every prior timestamp, so the restart-rate budget
-    // never trips — an unbounded auto-restart loop. None keeps the default window.
+    // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
         errors.push("supervision.window_secs must be > 0".to_string());
     }
@@ -254,17 +242,14 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// The `state_tier_dir` contract, validated once here so the embedded and
-/// cluster startup paths share it instead of each re-checking and drifting.
+/// Validate the `state_tier_dir` contract once, shared by embedded and cluster startup.
 fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
     if config.server.state_tier_dir.is_none() {
         return;
     }
     #[cfg(feature = "state-tier")]
     {
-        // The tier replays demoted state from [state] on restart, so a
-        // non-durable backend would lose it; demotion is budget-driven, so a
-        // dir without a budget never demotes.
+        // Cold tier needs a durable backend (survives restart) and a memory budget (drives demotion).
         if !config.state.is_durable() {
             errors.push(
                 "state_tier_dir requires a durable [state] backend (a local path or \
@@ -318,7 +303,7 @@ pub struct ServerConfig {
     /// `[ai]` — AI provider wiring and per-task default models.
     #[serde(default)]
     pub ai: AiSection,
-    /// `[models.<name>]` — the AI model registry (top-level, per the contract).
+    /// `[models.<name>]` — the AI model registry.
     #[serde(default)]
     pub models: std::collections::HashMap<String, ModelConfig>,
 }
@@ -345,8 +330,7 @@ pub struct ServerSection {
     /// PEM private key (PKCS#8 or RSA).
     #[serde(default)]
     pub pgwire_tls_key: Option<std::path::PathBuf>,
-    /// PEM CA bundle. Setting this requires every connecting client to
-    /// present a certificate chained to one of these roots (mTLS).
+    /// PEM CA bundle; requires every client to present a cert chained to these roots (mTLS).
     #[serde(default)]
     pub pgwire_tls_client_ca: Option<std::path::PathBuf>,
     /// Concurrent session cap; excess accepts close immediately.
@@ -355,33 +339,24 @@ pub struct ServerSection {
     /// Per-IP auth-failure cap in a 60s rolling window. 0 disables.
     #[serde(default = "default_pgwire_max_auth_failures_per_min")]
     pub pgwire_max_auth_failures_per_min: u32,
-    /// Minimum TLS protocol version: `"1.2"` (default) or `"1.3"`. Pinning
-    /// to `"1.3"` is the PCI-DSS / FedRAMP-High posture; rustls already
-    /// disables TLS 1.0/1.1 unconditionally.
+    /// Minimum TLS protocol version: `"1.2"` (default) or `"1.3"`.
     #[serde(default = "default_pgwire_tls_min_version")]
     pub pgwire_tls_min_version: String,
-    /// Bearer token gating the HTTP control-plane (console) API. `None`
-    /// leaves the HTTP API unauthenticated — loopback/dev only.
+    /// Bearer token gating the HTTP console API; `None` leaves it unauthenticated (loopback/dev only).
     #[serde(default)]
     pub console_token: Option<Secret>,
-    /// CORS allow-list of console origins. `None` falls back to the legacy
-    /// permissive policy (dev only); set this before exposing the console.
+    /// CORS allow-list of console origins; `None` falls back to a permissive policy (dev only).
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
-    /// Node-level cap on total operator state held in memory, in bytes.
-    /// Crossing it pauses source intake (backpressure, not failure) until
-    /// state drains below the budget. `None` = unlimited.
+    /// Cap on in-memory operator state (bytes); crossing it backpressures intake. `None` = unlimited.
     #[serde(default)]
     pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier. With a memory budget set,
-    /// operator state approaching the budget is demoted here instead of
-    /// backpressuring. Requires a `state-tier` build. `None` = no tier.
+    /// Local directory for the disk cold tier; state near the memory budget demotes here
+    /// instead of backpressuring. Requires a `state-tier` build. `None` = no tier.
     #[serde(default)]
     pub state_tier_dir: Option<std::path::PathBuf>,
-    /// Demote at GROUP granularity: shed individual idle aggregate groups rather than whole idle
-    /// vnodes. Requires the cold tier. Unset defaults ON for embedded single-node (kill-9-soaked)
-    /// and OFF for cluster (the cluster group path has open correctness gaps; it stays
-    /// vnode-granular). `Some(b)` forces it for either topology.
+    /// Demote at GROUP (not vnode) granularity. Requires the cold tier. Unset defaults ON for
+    /// embedded, OFF for cluster (its group path has open correctness gaps); `Some(b)` forces either.
     #[serde(default)]
     pub state_tier_group_demotion: Option<bool>,
 }
@@ -399,9 +374,8 @@ fn default_pgwire_tls_min_version() -> String {
 }
 
 impl ServerSection {
-    /// Effective group-demotion setting. Unset defaults to `embedded` — ON for embedded single-node
-    /// (kill-9-soaked), OFF for cluster (the cluster group path has open correctness gaps, so it
-    /// stays vnode-granular). Explicit config wins.
+    /// Effective group-demotion setting; unset defaults ON for embedded, OFF for cluster.
+    /// Explicit config wins.
     #[cfg(feature = "state-tier")]
     pub(crate) fn group_demotion(&self, embedded: bool) -> bool {
         self.state_tier_group_demotion.unwrap_or(embedded)
@@ -438,8 +412,8 @@ pub struct SupervisionSection {
     pub window_secs: Option<u64>,
     pub initial_backoff_ms: Option<u64>,
     pub max_backoff_secs: Option<u64>,
-    /// Cluster mode: on a fatal fault, rewind every node to the highest cluster-wide
-    /// committed epoch instead of a local-only restart. Default off.
+    /// Cluster: on a fatal fault, rewind every node to the highest committed epoch instead of a
+    /// local restart. Default off.
     #[serde(default)]
     pub coordinated_recovery: bool,
 }
@@ -582,8 +556,7 @@ fn default_ai_max_concurrency() -> usize {
     8
 }
 
-/// `[ai]` — provider wiring and per-task defaults. Models live in the top-level
-/// `[models.*]` tables, per the configuration contract.
+/// `[ai]` — provider wiring and per-task defaults; models live in the top-level `[models.*]` tables.
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct AiSection {
     /// `[ai.providers.<name>]` — transport endpoints.
@@ -611,8 +584,7 @@ pub struct ProviderConfig {
     /// Maximum concurrent requests issued per batch (remote).
     #[serde(default = "default_ai_max_concurrency")]
     pub max_concurrency: usize,
-    /// Steady requests-per-second cap (remote). When set, calls are paced by a
-    /// token bucket — bursts are shaped, not sent unbounded. Unset = no limit.
+    /// Steady requests-per-second cap (remote); paced by a token bucket. Unset = no limit.
     #[serde(default)]
     pub requests_per_second: Option<u32>,
     /// Model cache directory or `object_store` URI (local provider).
@@ -659,9 +631,6 @@ impl TaskSpec {
     }
 }
 
-/// Structural validation of the `[ai]` / `[models]` config — references resolve
-/// and required fields are present. Semantic checks (task names, label seam)
-/// happen when the registry is built.
 /// Control-plane mTLS is all-or-nothing: cert, key, client_ca, and server_name
 /// must be set together, and each path must exist.
 fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
@@ -701,6 +670,7 @@ fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
     }
 }
 
+/// Structural validation of `[ai]`/`[models]`; semantic checks happen when the registry is built.
 fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
     for (name, model) in &config.models {
         match model.kind.as_str() {
@@ -735,14 +705,11 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
     }
 
     for (name, provider) in &config.ai.providers {
-        // Mirror runtime kind resolution exactly (explicit `kind`, else the
-        // provider name) so validation can't disagree with how the provider is
-        // actually built — a `cache_dir` on a remote provider must not excuse a
-        // missing key.
+        // Mirror runtime kind resolution (explicit `kind`, else provider name) so validation
+        // matches how the provider is actually built.
         let kind = provider.kind.as_deref().unwrap_or(name.as_str());
         if kind == "local" {
-            // A local provider must carry a cache_dir, or no LocalProvider can be
-            // built and local models would fail at runtime — reject it now.
+            // Without a cache_dir no LocalProvider can be built.
             if provider.cache_dir.is_none() {
                 errors.push(format!(
                     "provider '{name}': local provider requires a 'cache_dir'"
@@ -1294,7 +1261,6 @@ state_memory_budget_bytes = 1073741824
 
     #[test]
     fn test_env_var_substitution_with_default() {
-        // Ensure the variable is NOT set
         std::env::remove_var("LAMINAR_TEST_UNSET_VAR");
         let input = "brokers = \"${LAMINAR_TEST_UNSET_VAR:-localhost:9092}\"";
         let result = substitute_env_vars(input).unwrap();

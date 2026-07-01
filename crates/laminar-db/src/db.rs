@@ -169,9 +169,8 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
-    /// Committed vnode state staged during rebalance adoption; operators drain
-    /// this each cycle to resume from the last committed epoch. Shared with
-    /// `OperatorGraph` via `ClusterShuffleConfig`.
+    /// Vnode state staged during rebalance adoption; operators drain it each cycle to resume
+    /// from the last committed epoch. Shared with `OperatorGraph` via `ClusterShuffleConfig`.
     #[cfg(feature = "cluster")]
     pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
     /// Vnodes lost on rebalance adoption; operators drain this each cycle and drop the stale
@@ -307,15 +306,12 @@ impl LaminarDB {
         >],
         target_partitions: Option<usize>,
     ) -> Result<Self, DbError> {
-        // One-time crossfire backoff tuning. No-op on multi-core; on single-core
-        // VMs this swaps spin-loops for yields (~2x channel throughput).
-        // Idempotent via an internal atomic — safe to call on every instance.
+        // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();
 
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
-        // Build a SessionContext with the LookupJoinExtensionPlanner wired
-        // into the physical planner so LookupJoinNode → LookupJoinExec works.
+        // Wire the LookupJoinExtensionPlanner so LookupJoinNode → LookupJoinExec.
         let ctx = {
             let mut session_config = laminar_sql::datafusion::base_session_config();
             if let Some(n) = target_partitions {
@@ -1604,9 +1600,8 @@ impl LaminarDB {
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
-        // An incremental MV is subscribable: the SUBSCRIBE wire stays plain rows — a Tail subscriber
-        // is seeded with the current snapshot below and receives the consolidated snapshot each cycle
-        // (`update_mv_stores`), not the raw `__weight` changelog. (Opt-in signed-diff is future work.)
+        // SUBSCRIBE to an incremental MV delivers consolidated snapshots (plain rows), not the
+        // raw `__weight` changelog.
 
         let attached = self.subscription_registry.subscriber_count(name);
         if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
@@ -1646,9 +1641,7 @@ impl LaminarDB {
                 ))
             })?;
 
-        // Seed a Tail subscriber with the current snapshot so it sees present state immediately
-        // instead of waiting for the next change — the snapshot-then-changelog contract, with the
-        // "changelog" delivered as subsequent consolidated snapshots (plain rows).
+        // Seed a Tail subscriber with the current snapshot so it sees present state at once.
         if matches!(start, crate::subscription::SubscribeStart::Tail) {
             if let Some(snap) = self.mv_store.read().to_record_batch(name) {
                 if snap.num_rows() > 0 {
@@ -2355,11 +2348,9 @@ impl LaminarDB {
             DbError::Checkpoint(format!("failed to read leader checkpoint response: {e}"))
         })?;
 
-        // The leader returns a `CheckpointResponse` body even when the
-        // checkpoint itself failed (HTTP 500 + `success: false`), so parse it so
-        // that structured failure reaches the follower. A body that isn't a
-        // `CheckpointResponse` (e.g. a 401 error payload) is an auth/transport
-        // failure — surface the status and body instead.
+        // The leader returns a `CheckpointResponse` body even on failure (HTTP 500 +
+        // `success: false`), so parse it to relay structured failure. A non-`CheckpointResponse`
+        // body (e.g. a 401 payload) is an auth/transport failure — surface status and body.
         match serde_json::from_str::<ForwardedCheckpointResponse>(&body) {
             Ok(response) => Ok(crate::checkpoint_coordinator::CheckpointResult {
                 success: response.success,

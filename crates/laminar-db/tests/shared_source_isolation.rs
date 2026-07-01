@@ -1,13 +1,13 @@
 //! Shared-source failure isolation, end to end.
 //!
-//! Two streams read one source. The aggregating one is forced to fault every cycle
-//! (a 1-byte operator state limit), the projection one is healthy. With
-//! `shared_source_isolation` on, the healthy sibling keeps producing; with it off,
-//! the shared-source domain faults as a whole and starves the healthy sibling.
+//! Two streams read one source: an aggregation forced to fault every cycle (1-byte
+//! state limit) and a healthy projection. With `shared_source_isolation` on the
+//! healthy sibling keeps producing; with it off the whole shared-source domain faults
+//! and starves it.
 //!
-//! Online replay of a *transient* fault is covered by the operator-graph unit test
+//! Transient-fault replay lives in the unit test
 //! `test_shared_source_isolation_replays_faulted_domain`; a state-limit fault is
-//! persistent by design, so this test validates the isolation (sibling-survives) half.
+//! persistent, so this covers only the sibling-survives half.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,14 +49,12 @@ fn make_batch(symbols: &[&str], prices: &[f64], ts_ms: &[i64]) -> RecordBatch {
     .unwrap()
 }
 
-/// Run the shared-source scenario and return how many rows the *healthy*
-/// projection stream emitted while the aggregation sibling faults every cycle.
+/// Rows the healthy projection emits while its aggregation sibling faults every cycle.
 async fn healthy_rows_with_isolation(isolation: bool) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let config = LaminarConfig {
         storage_dir: Some(dir.path().to_path_buf()),
-        // 1 byte: any aggregate state trips the limit and faults every cycle; a
-        // stateless projection stays under it.
+        // 1 byte trips on any aggregate state (faults every cycle) but not a stateless projection.
         max_state_bytes_per_operator: Some(1),
         shared_source_isolation: isolation,
         ..LaminarConfig::default()

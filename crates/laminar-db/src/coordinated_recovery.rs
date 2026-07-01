@@ -23,8 +23,8 @@ const SELF_RESTORE_ATTEMPTS: u32 = 3;
 /// Recovery generation, max-wins across leader change so a round keeps a stable id.
 const RECOVERY_GEN_KEY: &str = "control:recovery-gen";
 
-/// Per-process fault counter. Resets to 0 on restart, so the leader triggers on any
-/// change (not only an increase) to catch a re-fault after a restart.
+/// Per-process fault counter; resets to 0 on restart, so the leader triggers on any change
+/// (not just an increase) to catch a re-fault.
 static FAULT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Publish a fault so the leader drives a global restart; this node's monitor then
@@ -64,8 +64,7 @@ impl RecoveryMonitor {
                 continue;
             };
 
-            // Any node restores on a generation it hasn't applied; the leader also drives a
-            // new round when a fault report changes.
+            // Any node restores an unapplied generation; the leader also drives a new round.
             if let Some((epoch, gen)) = controller.observe_recover().await {
                 if gen > self.applied_gen {
                     self.restore(&db, &controller, epoch, gen).await;
@@ -77,9 +76,8 @@ impl RecoveryMonitor {
         }
     }
 
-    /// `true` when any node's fault sequence changed since we last handled it. A `0` report
-    /// is "no fault" (cleared after recovery); seeing it forgets the node, so a re-fault that
-    /// reuses a sequence (e.g. the counter reset by a full process restart) still triggers.
+    /// `true` when any node's fault sequence changed since last handled. A `0` report is
+    /// "no fault" and forgets the node, so a re-fault reusing a sequence still triggers.
     async fn take_new_fault(&mut self, controller: &ClusterController) -> bool {
         let mut triggered = false;
         for (node, seq) in controller.read_fault_reports().await {
@@ -113,8 +111,7 @@ impl RecoveryMonitor {
             "leader announced recovery"
         );
 
-        // Retry self-restore inline so the round (and the cleanup below) stays in the
-        // leader's control; the lingering announcement gives peers time to observe it.
+        // Retry self-restore inline so the round and its cleanup stay in the leader's control.
         let mut restored = false;
         for attempt in 1..=SELF_RESTORE_ATTEMPTS {
             if self.restore_and_ack(db, controller, target, gen_id).await {

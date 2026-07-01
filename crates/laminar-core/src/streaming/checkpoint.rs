@@ -14,9 +14,8 @@ pub struct StreamCheckpointConfig {
     /// Barrier-alignment timeout in milliseconds at fan-in operators.
     /// `None` = default (`30_000`).
     pub alignment_timeout_ms: Option<u64>,
-    /// Max epochs admitted between capture and restorable (the upload
-    /// backlog). `None` = default (4). Exactly-once pipelines are
-    /// capped at 1 regardless.
+    /// Max epochs admitted between capture and restorable. `None` = default (4).
+    /// Exactly-once pipelines are capped at 1 regardless.
     pub max_in_flight_epochs: Option<u64>,
     /// Cap on captured-state bytes held by in-flight epochs; admission
     /// pauses at the cap. `None` = default (512 MiB).
@@ -32,17 +31,14 @@ pub struct StreamCheckpointConfig {
     pub restorable_gate_poll_initial_ms: Option<u64>,
     /// Durability-gate poll backoff cap (ms). `None` = engine default (1000).
     pub restorable_gate_poll_max_ms: Option<u64>,
-    /// Enable incremental delta checkpoints (cluster-only) with this re-base chain bound.
-    /// `None` = off (whole-node manifest is the aggregate checkpoint). When set, the per-vnode delta
-    /// chain becomes the PRIMARY aggregate checkpoint via incremental per-vnode capture: aggregates skip the whole-node
-    /// manifest capture and recover from the chain, dropping per-cycle checkpoint cost to O(dirty).
-    /// Requires a durable (object-store) backend. Clamped `< max_retained` so the chain base never
-    /// ages out of the prune window. Default off.
+    /// Enable incremental delta checkpoints (cluster-only), bounding the re-base chain length.
+    /// `None` = off. When set, the per-vnode delta chain is the primary aggregate checkpoint,
+    /// dropping per-cycle cost to O(dirty). Requires a durable backend; clamped `< max_retained`
+    /// so the chain base never ages out of the prune window.
     pub delta_chain_max: Option<u32>,
-    /// Incremental emit for non-windowed running-state aggregate MVs. When on, a
-    /// terminal `GROUP BY` MV emits a dirty-only changelog into a keyed upsert store instead of
-    /// re-materializing every group each cycle (`SELECT * FROM mv` still returns the full
-    /// snapshot). Default ON.
+    /// Incremental emit for non-windowed aggregate MVs: emit a dirty-only changelog into a
+    /// keyed upsert store instead of re-materializing every group each cycle
+    /// (`SELECT * FROM mv` still returns the full snapshot). Default ON.
     pub incremental_emit: bool,
 }
 

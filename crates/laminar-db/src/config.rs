@@ -19,8 +19,7 @@ pub enum BackpressurePolicy {
     Fail,
 }
 
-/// String wrapper whose `Debug` redacts the value, for credentials held in
-/// [`LaminarConfig`].
+/// String wrapper whose `Debug` redacts the value, for credentials in [`LaminarConfig`].
 #[derive(Clone)]
 pub struct SecretString(String);
 
@@ -89,13 +88,11 @@ pub struct LaminarConfig {
     pub delivery_guarantee: DeliveryGuarantee,
     /// Per-operator state limit. At 80% warns, at 100% errors. `None` = unlimited.
     pub max_state_bytes_per_operator: Option<usize>,
-    /// Node-level cap on total operator state held in memory. Crossing it
-    /// pauses source intake (backpressure, not failure) until state drains
-    /// below the budget. `None` = unlimited.
+    /// Node-level cap on in-memory operator state; crossing it backpressures
+    /// source intake until state drains below it. `None` = unlimited.
     pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier. When set together with
-    /// `state_memory_budget_bytes`, operator state approaching the budget is
-    /// demoted here (off-heap) instead of backpressuring. `None` = no tier.
+    /// Local directory for the disk cold tier. With `state_memory_budget_bytes`,
+    /// state near the budget is demoted here instead of backpressuring. `None` = no tier.
     /// Requires the `state-tier` build feature; ignored otherwise.
     pub state_tier_dir: Option<PathBuf>,
     /// Demote at GROUP granularity: shed individual idle aggregate groups to the tier instead of

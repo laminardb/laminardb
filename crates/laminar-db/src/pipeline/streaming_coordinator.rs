@@ -25,10 +25,8 @@ use crate::error::DbError;
 type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 
-/// Message sent from a source task to the coordinator.
-///
-/// Each variant carries the [`SourceCheckpoint`] captured at production time,
-/// so the coordinator never checkpoints an offset for data it hasn't processed.
+/// Message from a source task to the coordinator; carries the [`SourceCheckpoint`]
+/// captured at production time so no offset is checkpointed for unprocessed data.
 enum SourceMsg {
     Batch {
         source_idx: usize,
@@ -49,9 +47,8 @@ struct SourceHandle {
     shutdown: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<()>,
     barrier_injector: CheckpointBarrierInjector,
-    /// Notifies the source of a committed `(epoch, checkpoint)` so it can ack to
-    /// its external system. The checkpoint is what was actually written to the manifest,
-    /// which may lag `self.offsets`. Empty for timer-driven commits.
+    /// Notifies the source of a committed `(epoch, checkpoint)` so it can ack upstream.
+    /// The checkpoint is what was written to the manifest (may lag); empty for timer commits.
     epoch_committed_tx: tokio::sync::watch::Sender<Option<(u64, SourceCheckpoint)>>,
 }
 
@@ -79,8 +76,8 @@ pub struct StreamingCoordinator {
     last_checkpoint: Instant,
     checkpoint_request_flags: Vec<Arc<AtomicBool>>,
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    /// Batches received from a source after it sent a barrier in the same drain cycle.
-    /// They belong to the next epoch and are deferred to the next cycle.
+    /// Batches from a source after its barrier this drain cycle; they belong to the
+    /// next epoch and are deferred to the next cycle.
     post_barrier_buf: Vec<SourceMsg>,
     pending_watermark_batches: Vec<(Arc<str>, RecordBatch)>,
     /// Sources that delivered a barrier this drain cycle; subsequent batches from
@@ -143,9 +140,8 @@ const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 /// Cap on awaiting a source task at shutdown before aborting it.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Throttled (~once/10s) WARN while barrier admission is paused at the
-/// staged-state cap — this check runs every coordinator tick, so an
-/// unthrottled warn would spam under a sustained upload backlog.
+/// Throttled WARN while barrier admission is paused at the staged-state cap; this
+/// runs every coordinator tick, so an unthrottled warn would spam under a backlog.
 fn warn_staged_cap_throttled(staged_bytes: u64, cap: u64) {
     static THROTTLE: crate::log_throttle::LogThrottle =
         crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
@@ -193,7 +189,6 @@ impl StreamingCoordinator {
         shutdown: Arc<tokio::sync::Notify>,
         control_rx: ControlMsgRx,
     ) -> Result<Self, DbError> {
-        // Validate delivery guarantee constraints.
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
                 if !src.supports_replay {
@@ -346,9 +341,9 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Bounded best-effort flush before close(). The `while` deadline (not the
-                // inner timeout) bounds an always-ready poll — timeout() polls the future
-                // first. Non-blocking send; unflushed rows resume from the committed offset.
+                // Bounded best-effort flush before close(): the `while` deadline bounds an
+                // always-ready poll (timeout() polls the future first). Unflushed rows resume
+                // from the committed offset.
                 let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
                 while Instant::now() < deadline {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -369,7 +364,7 @@ impl StreamingCoordinator {
                 }
 
                 // Drain EpochCommitted broadcasts before close so the final checkpoint
-                // epoch is acked to the broker. Loop until the sender is dropped.
+                // epoch is acked to the broker.
                 while let Ok(()) = epoch_committed_rx.changed().await {
                     let snapshot = epoch_committed_rx.borrow_and_update().clone();
                     if let Some((e, cp)) = snapshot {
@@ -471,7 +466,7 @@ impl StreamingCoordinator {
         let mut fault: Option<String> = None;
 
         loop {
-            // Step: Wait for data, shutdown, or idle timeout.
+            // Wait for data, shutdown, or idle timeout.
             let msg = tokio::select! {
                 biased;
                 () = self.shutdown.notified() => break,
@@ -902,10 +897,9 @@ impl StreamingCoordinator {
         }
     }
 
-    /// Current per-source committed offsets, keyed by source name. These reflect the
-    /// last successfully processed cycle, so they match the operator/sink state a
-    /// forced (non-barrier) checkpoint captures — without them such a checkpoint would
-    /// advance the recovery point with no source offset and replay from the start.
+    /// Per-source committed offsets keyed by source name, reflecting the last successful
+    /// cycle — so a forced (non-barrier) checkpoint records offsets instead of advancing
+    /// the recovery point with none and replaying from the start.
     fn current_source_offsets(&self) -> FxHashMap<String, SourceCheckpoint> {
         self.committed_offsets
             .iter()
@@ -1032,11 +1026,9 @@ impl StreamingCoordinator {
             return;
         }
 
-        // Give the callback a chance to run follower polling. On non-leaders this routes
-        // to `maybe_follower_checkpoint` so gossip PREPARE announcements are picked up
-        // even with no data-path events. The offsets also feed any drained
-        // `db.checkpoint()` request (e.g. the rebalance pre-rotation drain) so a forced
-        // checkpoint records source offsets instead of advancing the recovery point blind.
+        // Lets the callback run follower polling (routes to `maybe_follower_checkpoint` so
+        // gossip PREPARE is picked up with no data-path events). The offsets also feed a
+        // drained `db.checkpoint()` so a forced checkpoint records offsets, not a blind point.
         let offsets = self.current_source_offsets();
         if let Some(epoch) = callback.maybe_checkpoint(false, offsets).await {
             self.broadcast_epoch_committed(epoch, &FxHashMap::default());
@@ -1048,11 +1040,11 @@ impl StreamingCoordinator {
                 .checkpoint_interval
                 .is_some_and(|interval| self.last_checkpoint.elapsed() >= interval);
 
-        // Hold the interval while a rebalance is converging: a checkpoint started before
-        // a respawned node has adopted the assignment align-waits on its not-yet-flowing
-        // shuffle barrier and times out. The verdict is a local borrow, so don't bump
-        // `last_checkpoint` — the first post-convergence checkpoint fires immediately.
-        // Also hold during a coordinated restart (injecting would seal an epoch past N).
+        // Hold the interval while a rebalance is converging: a checkpoint started before a
+        // respawned node adopts the assignment align-waits on its not-yet-flowing shuffle
+        // barrier and times out. Don't bump `last_checkpoint`, so the first post-convergence
+        // checkpoint fires immediately. Also hold during a coordinated restart (injecting
+        // would seal an epoch past N).
         if interval_due
             && (callback.is_recovering() || !callback.assignment_ready_for_checkpoint().await)
         {

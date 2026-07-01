@@ -33,8 +33,7 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// Outcome of a barrier-aligned checkpoint attempt. `Skipped` is logged
-/// at debug; `Failed` keeps the retry warning.
+/// Outcome of a barrier-aligned checkpoint attempt.
 #[derive(Debug)]
 pub enum BarrierOutcome {
     /// Checkpoint committed at the given epoch.
@@ -146,11 +145,10 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
-    /// `true` when the cluster is converged enough for the leader to take a periodic
-    /// checkpoint (see the gate in `StreamingCoordinator::maybe_checkpoint`). The
-    /// cluster impl reads a watcher-published verdict locally — no gossip on the gate.
-    /// Default `true` (single-node). `fn -> impl Future` (not `async fn`) so
-    /// `trait_variant` keeps the default; `&mut self` keeps the future `Send`.
+    /// `true` when the cluster is converged enough for the leader to checkpoint; the
+    /// cluster impl reads a locally-published verdict, no gossip. Default `true`
+    /// (single-node). `impl Future` (not `async fn`) preserves the `trait_variant`
+    /// default; `&mut self` keeps the future `Send`.
     fn assignment_ready_for_checkpoint(
         &mut self,
     ) -> impl std::future::Future<Output = bool> + Send {
@@ -204,9 +202,8 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Shed idle vnode slices to the cold tier when state approaches the memory budget.
     ///
-    /// Runs in the maintenance phase; no-op without a tier or budget.
-    /// The default is a `ready` expression, not `async {}`, because `trait_variant`
-    /// rewrites the signature to `impl Future`.
+    /// Runs in the maintenance phase; no-op without a tier or budget. `ready` (not
+    /// `async {}`) preserves the `trait_variant` `impl Future` rewrite.
     fn maybe_demote_state(&mut self) -> impl std::future::Future<Output = ()> + Send {
         std::future::ready(())
     }
@@ -227,8 +224,7 @@ pub trait PipelineCallback: Send + 'static {
     }
 
     /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
-    /// re-initialises cleanly. Default no-op. The `ready` expression (not `async {}`) keeps
-    /// `trait_variant`'s `impl Future` rewrite.
+    /// re-initialises cleanly. Default no-op.
     fn close_sinks(&mut self) -> impl std::future::Future<Output = ()> + Send {
         std::future::ready(())
     }

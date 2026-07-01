@@ -1,35 +1,29 @@
 //! Per-vnode durable partial state (`epoch=N/vnode=V/partial.bin`).
 //!
-//! An empty `operators` map is valid — it seals the epoch without carrying state,
-//! which is correct for vnodes whose operators hold nothing.
+//! An empty `operators` map is valid: it seals the epoch carrying no state.
 
 use crate::error::DbError;
 
-/// One operator's incremental delta: the groups changed this epoch (columnar
-/// `AggStateCheckpoint` bytes) plus keys removed (tombstone IPC). Both empty = carry-forward.
+/// One operator's delta: changed groups + removed-key tombstones. Both empty = carry-forward.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct OpDelta {
     pub changed: Vec<u8>,
     pub tombstones_ipc: Vec<u8>,
 }
 
-/// Operator-state slices for one vnode at one epoch. One of three kinds:
+/// Operator-state slices for one vnode at one epoch, in one of three shapes:
 ///
 /// - FULL: `operators` non-empty, `base_epoch = None`, `deltas` empty.
-/// - REFERENCE: `operators`/`deltas` empty, `base_epoch = Some(N)` — byte-identical
-///   to the full partial at epoch N; the reader follows this one hop.
-/// - DELTA: `deltas` non-empty, `base_epoch = Some(parent)` — per-operator changes
-///   since `parent` (itself a FULL, REFERENCE, or DELTA); the reader walks parents back to a
-///   FULL collecting deltas, then replays FULL → deltas forward.
+/// - REFERENCE: `operators`/`deltas` empty, `base_epoch = Some(N)` — byte-identical to epoch N.
+/// - DELTA: `deltas` non-empty, `base_epoch = Some(parent)` — per-operator changes since `parent`.
 ///
-/// `base_epoch` doubles as the parent link. The writer re-bases (re-emits FULL) before the base
-/// leaves the prune window.
+/// `base_epoch` is the parent link; the reader walks it back to a FULL and replays deltas forward.
+/// The writer re-bases (re-emits FULL) before the base leaves the prune window.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct VnodePartial {
     /// Sealed epoch, for audit.
     pub checkpoint_id: u64,
-    /// `(operator_name, vnode-slice bytes)`: FULL operator slices. Empty for references; for a
-    /// delta partial, any operators that re-based FULL this epoch (per-operator chains).
+    /// `(operator_name, vnode-slice bytes)`: FULL slices; also operators that re-based this epoch.
     pub operators: Vec<(String, Vec<u8>)>,
     /// `Some(epoch)` = parent link (reference base, or delta parent).
     pub base_epoch: Option<u64>,

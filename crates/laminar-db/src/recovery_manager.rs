@@ -76,8 +76,7 @@ pub struct VnodeRehydration {
     /// Committed epoch the partials were read from. `None` when the backend
     /// has no committed epoch — every vnode starts fresh.
     pub epoch: Option<u64>,
-    /// vnode → recovery chain (decoded-as-bytes partials, oldest→newest): a FULL base followed by
-    /// any delta partials. A simple/reference vnode resolves to a single-element chain.
+    /// vnode → recovery chain (oldest→newest): a FULL base followed by any delta partials.
     pub restored: HashMap<u32, Vec<Bytes>>,
     /// Vnodes with no durable partial at `epoch`; resume from empty state.
     pub missing: Vec<u32>,
@@ -115,10 +114,8 @@ impl<'a> VnodeRehydrator<'a> {
 
     /// Read the latest committed partial for each vnode in `vnodes`.
     ///
-    /// Resolves the highest committed epoch once, then reads each vnode's
-    /// `partial.bin` at that epoch. A per-vnode failure is recorded in
-    /// [`VnodeRehydration::errors`] without aborting the rest. Returns an
-    /// empty report when the store has no committed epoch.
+    /// A per-vnode failure is recorded in [`VnodeRehydration::errors`] without
+    /// aborting the rest; an empty report means the store has no committed epoch.
     pub async fn rehydrate(&self, vnodes: &[u32]) -> VnodeRehydration {
         let mut report = VnodeRehydration::default();
         if vnodes.is_empty() {
@@ -197,13 +194,12 @@ impl<'a> VnodeRehydrator<'a> {
         let mut cur_epoch = epoch;
         loop {
             let Ok(p) = VnodePartial::decode(&bytes) else {
-                // Undecodable → pass through; the apply path skips it (prior behavior).
+                // Undecodable → pass through; the apply path skips it.
                 return Ok(Some(vec![bytes]));
             };
             if p.operators.is_empty() && p.deltas.is_empty() {
                 if let Some(base) = p.base_epoch {
-                    // base_epoch always points to an older epoch; a non-decreasing pointer
-                    // is corruption — bail rather than loop forever.
+                    // Non-decreasing base pointer is corruption — bail rather than loop forever.
                     if base >= cur_epoch {
                         return Ok(None);
                     }
@@ -246,7 +242,7 @@ impl<'a> VnodeRehydrator<'a> {
                 .await
                 .map_err(|e| e.to_string())?
             else {
-                break; // missing link → unresolved operators start fresh (conservative)
+                break; // missing link → unresolved operators start fresh
             };
             let Ok(pp) = VnodePartial::decode(&pbytes) else {
                 break;
@@ -408,8 +404,7 @@ impl<'a> RecoveryManager<'a> {
                     "[LDB-6010] sidecar state.bin missing — external operator states \
                      cannot be resolved; operators will start with empty state"
                 );
-                // Clear external flag so recovery doesn't attempt to
-                // dereference invalid offsets later
+                // Clear external flag so recovery won't dereference invalid offsets.
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
                         *op =
@@ -770,11 +765,10 @@ impl<'a> RecoveryManager<'a> {
             .any(|s| matches!(s, SinkCommitStatus::Pending))
     }
 
-    /// `true` when a checkpoint must be skipped for genuinely-uncommitted sinks: sinks are
-    /// `Pending` AND the decision marker does not confirm the epoch committed. A
-    /// pending-but-marker-committed epoch is NOT skipped — the sink committed but the
-    /// manifest wasn't updated before the fault, and rewinding the source behind it would
-    /// re-emit committed rows (duplicates); `reconcile_prepared_on_init` re-drives the commit.
+    /// `true` when a checkpoint must be skipped: sinks are `Pending` AND the decision marker
+    /// does not confirm the epoch committed. A pending-but-marker-committed epoch is NOT
+    /// skipped — rewinding the source behind a committed sink would re-emit committed rows;
+    /// `reconcile_prepared_on_init` re-drives the commit.
     async fn pending_uncommitted(
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
         manifest: &CheckpointManifest,
@@ -783,8 +777,7 @@ impl<'a> RecoveryManager<'a> {
             return false;
         }
         match decision_store {
-            // A read error can't confirm the commit, so treat as uncommitted (skip) — but
-            // surface it rather than silently rewinding past a maybe-committed checkpoint.
+            // A read error can't confirm the commit → treat as uncommitted (skip), but surface it.
             Some(ds) => match ds.is_committed(manifest.epoch).await {
                 Ok(committed) => !committed,
                 Err(e) => {
@@ -1090,9 +1083,6 @@ mod tests {
             .join("checkpoint_000002")
             .join("manifest.json");
         std::fs::write(&latest_manifest_path, "not valid json!!!").unwrap();
-
-        // Also corrupt latest.txt to point to the corrupt checkpoint
-        // (it already does from the save, but the manifest file is now corrupt)
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[], None).await.unwrap();

@@ -31,12 +31,9 @@ pub(crate) enum MvStorageMode {
     Aggregate,
     /// Non-aggregate queries: append with bounded retention.
     Append { max_batches: usize },
-    /// Incremental running-state aggregate: maintain a keyed snapshot from a
-    /// dirty-only `__weight` changelog. `key_cols` index the GROUP BY columns in the MV schema.
+    /// Incremental keyed snapshot from a dirty-only `__weight` changelog; `key_cols` index the GROUP BY columns.
     Upsert { key_cols: Vec<usize> },
-    /// Chained projection/filter over a changelog: a Z-set multiset keyed by the
-    /// full output row, tracking an integer multiplicity. Handles key-dropping projections that
-    /// produce duplicate rows; the snapshot emits each row by its multiplicity.
+    /// Chained projection/filter: Z-set multiset keyed by the full row; handles key-dropping dups.
     Multiset,
 }
 
@@ -48,8 +45,7 @@ impl MvStorageMode {
     }
 }
 
-/// Keyed running snapshot maintained from a `__weight` changelog. Stored rows omit
-/// the weight column, so the snapshot materializes directly into the plain MV schema.
+/// Keyed running snapshot from a `__weight` changelog; stored rows omit the weight column.
 struct UpsertState {
     key_cols: Vec<usize>,
     key_converter: RowConverter,
@@ -90,8 +86,8 @@ impl UpsertState {
             .map_err(|e| DbError::Storage(format!("upsert MV key conversion: {e}")))
     }
 
-    /// `+weight` upserts the row, `−weight` deletes the key. Retracts precede inserts within a
-    /// changelog batch, so a changed key (retract old, insert new) nets to the new row.
+    /// `+weight` upserts the row, `−weight` deletes the key. Retracts precede inserts in a
+    /// batch, so a changed key nets to the new row.
     fn apply(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -110,10 +106,7 @@ impl UpsertState {
             .filter(|&c| c != weight_idx)
             .collect();
 
-        // Resolve every row's mutation first — `ScalarValue::try_from_array` is the only fallible
-        // step, so extracting it all before touching `rows`/`approx_bytes` makes the batch
-        // all-or-nothing. Otherwise a mid-batch failure could leave a retract applied without its
-        // paired insert, silently diverging the snapshot from the changelog.
+        // Resolve all mutations before mutating state, so a fallible row leaves the batch all-or-nothing.
         let mut staged = Vec::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let key = keys.row(row_idx).owned();
@@ -191,8 +184,7 @@ impl UpsertState {
     }
 }
 
-/// Z-set multiset snapshot from a `__weight` changelog: keyed by the full output row with an
-/// integer multiplicity. Correct for chained projections/filters, including key-dropping ones.
+/// Z-set multiset from a `__weight` changelog: full output row keyed to an integer multiplicity.
 struct MultisetState {
     row_converter: RowConverter,
     counts: HashMap<OwnedRow, i64>,
@@ -295,9 +287,9 @@ pub(crate) struct MvEntry {
     schema: SchemaRef,
     mode: MvStorageMode,
     batches: VecDeque<RecordBatch>,
-    /// Set only in `Upsert` mode; carries the keyed running snapshot.
+    /// Present only in `Upsert` mode.
     upsert: Option<UpsertState>,
-    /// Set only in `Multiset` mode; carries the Z-set snapshot.
+    /// Present only in `Multiset` mode.
     multiset: Option<MultisetState>,
     approx_bytes: usize,
 }
@@ -346,8 +338,7 @@ impl MvEntry {
             }
             MvStorageMode::Upsert { .. } => {
                 if let Some(up) = self.upsert.as_mut() {
-                    // apply() is atomic, so a failure leaves the prior snapshot intact; surface it
-                    // to the caller (which logs the MV name) instead of swallowing.
+                    // apply() is atomic; on failure the prior snapshot stands, so surface the error.
                     up.apply(batch)?;
                     self.approx_bytes = up.approx_bytes;
                 }

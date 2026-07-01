@@ -22,34 +22,24 @@ pub struct ClusterController {
     barrier: BarrierCoordinator,
     snapshot: Option<Arc<AssignmentSnapshotStore>>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
-    /// Leader's checkpoint-convergence verdict, published off the hot path by the
-    /// snapshot watcher; the gate borrows it instead of a per-checkpoint gossip scan.
+    /// Leader's checkpoint-convergence verdict; the gate borrows it instead of a gossip scan.
     converged_for_checkpoint: watch::Sender<bool>,
-    /// Latest cluster-wide minimum watermark published by the leader
-    /// in a `Commit` announcement. `i64::MIN` means uninitialised
-    /// (no Commit observed yet). Operators consult this instead of
-    /// their local watermark so event-time decisions stay consistent
-    /// across the cluster.
+    /// Cluster-wide minimum watermark from the leader's `Commit`; operators read this instead
+    /// of their local watermark for consistent event-time. `i64::MIN` = uninitialised.
     cluster_min_watermark: Arc<AtomicI64>,
-    /// Set once this node begins graceful drain. While set, the node
-    /// excludes itself from [`Self::assignable_instances`] so the next
-    /// rotation sheds its vnodes elsewhere before it exits.
+    /// While draining, the node excludes itself from [`Self::assignable_instances`] so the
+    /// next rotation sheds its vnodes before it exits.
     draining: Arc<AtomicBool>,
     /// Held while a coordinated restart is in flight; the checkpoint gate consults it so
     /// no checkpoint is injected mid-recovery.
     recovering: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
-    /// Peers that recently failed a capture quorum (no ack within the
-    /// timeout), keyed by node id. Gossip failure detection can lag a
-    /// hard kill by tens of seconds; this is the leader's faster local
-    /// signal, consulted by the checkpoint durability gate to fail
-    /// doomed epochs instead of burning their full timeout. Entries
-    /// clear when the peer acks again, and expire after
-    /// [`UNRESPONSIVE_TTL`].
+    /// Peers that recently missed a capture quorum, keyed by node id. Gossip failure detection
+    /// can lag a hard kill by tens of seconds; the checkpoint gate consults this faster local
+    /// signal to fail doomed epochs. Cleared on re-ack, expires after [`UNRESPONSIVE_TTL`].
     unresponsive: Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, std::time::Instant>>>,
-    /// This node's own failure-domain locality (peers carry theirs in
-    /// `members_rx`; self is only known by id). Set once at startup.
+    /// This node's own failure-domain locality; peers carry theirs in `members_rx`.
     self_locality: parking_lot::RwLock<Locality>,
     /// Handler serving cross-node `RemoteScan`, shared with the query server.
     #[cfg(feature = "cluster")]
@@ -57,9 +47,8 @@ pub struct ClusterController {
     /// Pooled channels to peers for cross-node `RemoteScan`.
     #[cfg(feature = "cluster")]
     query_client_pool: super::query::QueryClientPool,
-    /// When wired, leadership is lease-fenced: [`Self::is_leader`] also requires
-    /// holding the durable lease. Set once at startup; absent in embedded /
-    /// static-discovery deployments, where leadership stays gossip-only.
+    /// When wired, leadership is lease-fenced: [`Self::is_leader`] also requires the durable
+    /// lease. Absent in embedded / static-discovery deployments (gossip-only leadership).
     #[cfg(feature = "cluster")]
     leader_lease: std::sync::OnceLock<watch::Receiver<Option<super::LeaderLease>>>,
 }
@@ -132,13 +121,8 @@ impl ClusterController {
         }
     }
 
-    /// Leader-side monotonic publish. The leader computes the
-    /// cluster-wide minimum watermark in `await_prepare_quorum`
-    /// (its own local watermark folded with every follower's ack)
-    /// and must mirror it into the controller atomic so its own
-    /// operators see the same value that followers pick up via
-    /// `observe_barrier` on the matching `Commit`. Never lowers the
-    /// published value — event-time progress is monotonic.
+    /// Mirror the leader's computed cluster-min watermark into the atomic so its own operators
+    /// match followers. Monotonic — never lowers the published value.
     pub fn publish_cluster_min_watermark(&self, wm: i64) {
         let mut cur = self.cluster_min_watermark.load(Ordering::Acquire);
         while wm > cur {
@@ -160,8 +144,7 @@ impl ClusterController {
         self.instance_id
     }
 
-    /// The cluster gossip KV, exposed so higher layers can advertise/discover
-    /// per-stream state alongside the control-plane keys.
+    /// The cluster gossip KV, for advertising/discovering per-stream state.
     #[must_use]
     pub fn kv(&self) -> &Arc<dyn ClusterKv> {
         &self.kv
@@ -176,24 +159,21 @@ impl ClusterController {
             .filter(|m| matches!(m.state, NodeState::Active))
             .map(|m| m.id)
             .collect();
-        // Include ourselves if we are active.
         if self.active.load(Ordering::SeqCst) {
             ids.push(self.instance_id);
         }
         leader_of(&ids)
     }
 
-    /// True if this node is the gossip-elected candidate (lowest active id),
-    /// ignoring the lease. The lease manager acquires only while this holds, so
-    /// the lease owner converges to the gossip candidate.
+    /// True if this node is the gossip-elected candidate (lowest active id), ignoring the
+    /// lease. The lease manager acquires only while this holds.
     #[must_use]
     pub fn is_gossip_leader(&self) -> bool {
         self.current_leader() == Some(self.instance_id)
     }
 
-    /// True if this node may act as leader — the single gate all leader-gated
-    /// work inherits. When a leader lease is wired it also requires holding an
-    /// unexpired lease (fences out a stale candidate); otherwise gossip-only.
+    /// True if this node may act as leader — the gate all leader-gated work inherits. With a
+    /// lease wired, also requires an unexpired lease; otherwise gossip-only.
     #[must_use]
     pub fn is_leader(&self) -> bool {
         if !self.is_gossip_leader() {
@@ -325,10 +305,8 @@ impl ClusterController {
         self.read_u64_map("control:recovered").await
     }
 
-    /// Node ids eligible to own vnodes: `Active` peers, plus self unless
-    /// this node is draining. Mirrors how [`Self::live_instances`] folds
-    /// self in, but filters non-`Active` peers (see [`assignable_node_ids`])
-    /// so Joining/Suspected/Draining/Left nodes never receive vnodes.
+    /// Node ids eligible to own vnodes: `Active` peers, plus self unless draining. Unlike
+    /// [`Self::live_instances`], non-`Active` peers are filtered so they never receive vnodes.
     #[must_use]
     pub fn assignable_instances(&self) -> Vec<NodeId> {
         let mut ids = assignable_node_ids(&self.members_rx.borrow());
@@ -371,9 +349,7 @@ impl ClusterController {
             .collect()
     }
 
-    /// Cloneable membership watch. Background tasks subscribe to
-    /// this to react to join/leave events (`changed().await`) without
-    /// polling [`Self::live_instances`] on a timer.
+    /// Cloneable membership watch for reacting to join/leave events without polling.
     #[must_use]
     pub fn members_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
         self.members_rx.clone()
@@ -460,11 +436,8 @@ impl ClusterController {
 
     /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
-    /// As a side effect, an `Aligned` or `Commit` announcement with a
-    /// populated `min_watermark_ms` updates the shared
-    /// cluster-min-watermark atomic so operators on this instance see
-    /// the cluster-wide minimum without a separate polling path
-    /// (`Aligned` carries it so a resuming pipeline sees fresh
+    /// Side effect: an `Aligned`/`Commit` with a populated `min_watermark_ms` advances the
+    /// shared cluster-min-watermark atomic (`Aligned` carries it so a resuming pipeline sees
     /// event-time progress before the upload-gated `Commit`).
     ///
     /// # Errors
@@ -477,8 +450,7 @@ impl ClusterController {
         if let Some(ref ann) = observed {
             if matches!(ann.phase, Phase::Commit | Phase::Aligned) {
                 if let Some(wm) = ann.min_watermark_ms {
-                    // Monotonic publish — never lower the watermark,
-                    // even if a stale announcement re-gossips.
+                    // Monotonic — never lower, even if a stale announcement re-gossips.
                     let mut cur = self.cluster_min_watermark.load(Ordering::Acquire);
                     while wm > cur {
                         match self.cluster_min_watermark.compare_exchange(

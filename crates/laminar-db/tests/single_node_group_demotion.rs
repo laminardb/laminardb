@@ -1,11 +1,9 @@
 #![cfg(feature = "state-tier")]
-//! Single-node v2 GROUP demotion + restart durability.
+//! Single-node GROUP demotion + restart durability.
 //!
-//! With `state_tier_group_demotion`, idle aggregate groups are demoted to the cold tier. The tier
-//! is wiped on restart, so demoted groups must reach the durable per-vnode partials: the coordinator
-//! writes them as a COLD-ONLY partial that recovery merges additively on top of the whole-node
-//! manifest's resident groups. This test proves a demoted group's count survives a checkpoint →
-//! restart (re-feeding it continues from the recovered count, rather than rebuilding from zero).
+//! The cold tier is wiped on restart, so demoted idle groups must reach the durable per-vnode
+//! partials — the coordinator writes them as a cold-only partial that recovery merges additively
+//! over the manifest's resident groups. Proves a demoted group's count survives checkpoint → restart.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -114,16 +112,14 @@ async fn single_node_group_demotion_survives_restart() {
         db.start().await.unwrap();
         let source = db.source_untyped("events").unwrap();
 
-        // Each key counted REPEATS times → counts > 1 so a recovered count is distinguishable from
-        // a from-scratch rebuild.
+        // Count each key REPEATS times so a recovered count is distinguishable from a rebuild.
         for _ in 0..REPEATS {
             source
                 .push_arrow(key_batch(&(0..KEYS).collect::<Vec<_>>()))
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(80)).await;
         }
-        // Drain the backlog so groups go idle+clean, then checkpoint to set the clean baseline and
-        // seed the per-vnode delta-tracking count.
+        // Drain so groups go idle+clean, then checkpoint to set the clean baseline.
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(db.checkpoint().await.unwrap().success);
 
@@ -150,15 +146,13 @@ async fn single_node_group_demotion_survives_restart() {
         db.close();
     }
 
-    // Reopen from the checkpoint — demoted groups recover from the cold-only partials, resident
-    // groups from the manifest.
+    // Reopen — demoted groups recover from cold-only partials, resident groups from the manifest.
     {
         let db = open(&ckpt, &state_dir, &tier_dir).await;
         db.start().await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        // Feed every key once more. A RECOVERED group continues from its count (→ REPEATS+1); a
-        // LOST/rebuilt group would restart at 1.
+        // Feed every key once more: a recovered group continues to REPEATS+1, a rebuilt one to 1.
         let source = db.source_untyped("events").unwrap();
         source
             .push_arrow(key_batch(&(0..KEYS).collect::<Vec<_>>()))
@@ -180,10 +174,8 @@ async fn single_node_group_demotion_survives_restart() {
     }
 }
 
-/// Group demotion must not change aggregate VALUES: the same deterministic workload run with
-/// demotion ON (tiny budget → demote/promote cycles) must produce a per-group count map identical
-/// to the no-demotion oracle. This is the exact-value correctness check the kill-9 soaks omit (they
-/// assert only progress / demote-promote counters), now in a deterministic, runnable form.
+/// Demotion must not change aggregate values: a workload run with demotion ON (tiny budget →
+/// demote/promote cycles) must produce a count map identical to the no-demotion oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn group_demotion_matches_no_demotion_oracle() {
     // Final count for key k: 4 for the first half (fed in the extra round), 3 for the second half.
@@ -215,10 +207,8 @@ async fn group_demotion_matches_no_demotion_oracle() {
                 assert!(Instant::now() < deadline, "group demotion never fired");
             }
         }
-        // Extra round over the first half — re-touching demoted groups promotes them back (async
-        // fetch-on-access, then the deferred batch re-processes) and bumps their count. Poll until
-        // key 0 settles at 4; if promotion genuinely lost the increment the deadline lapses and the
-        // diff below fails loudly.
+        // Extra round over the first half re-touches demoted groups → promotes them back and bumps
+        // their count. Poll until key 0 settles at 4, else the diff below fails.
         source
             .push_arrow(key_batch(&(0..KEYS / 2).collect::<Vec<_>>()))
             .unwrap();
