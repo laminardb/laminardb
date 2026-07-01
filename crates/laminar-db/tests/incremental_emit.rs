@@ -634,3 +634,171 @@ async fn incremental_join_rejects_duplicate_output_column() {
         "duplicate output column name must be rejected"
     );
 }
+
+/// A SINGLE-statement 3-way join `FROM a JOIN b JOIN c` is decomposed into a hidden intermediate MV +
+/// a rewritten 2-way final, producing the same result as the explicit chained-pairwise form.
+#[tokio::test]
+async fn single_statement_multiway_join_decomposes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
+        .await
+        .unwrap();
+    // ONE statement, three tables — decomposed into __ivm_abc_0 (= agg_a ⋈ agg_b) then abc (⋈ agg_c).
+    db.execute(
+        "CREATE MATERIALIZED VIEW abc AS \
+         SELECT a.k, a.ta, b.tb, c.tc \
+         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
+    )
+    .await
+    .expect("single-statement 3-way join accepted + decomposed");
+    db.start().await.unwrap();
+
+    let (sa, sb, sc) = (
+        db.source_untyped("ev_a").unwrap(),
+        db.source_untyped("ev_b").unwrap(),
+        db.source_untyped("ev_c").unwrap(),
+    );
+    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
+    sc.push_arrow(batch(&[1, 2], &[1000, 2000])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sa.push_arrow(batch(&[1], &[5])).unwrap();
+    sb.push_arrow(batch(&[2], &[50])).unwrap();
+    sc.push_arrow(batch(&[1], &[500])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    assert_eq!(
+        read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
+        vec![vec![1, 15, 100, 1500], vec![2, 20, 250, 2000]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// Dropping a single-statement multi-way join cascades to its hidden intermediate (upstream) MVs.
+#[tokio::test]
+async fn single_statement_multiway_drop_cascades_intermediate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    for (m, c) in [("agg_a", "ev_a"), ("agg_b", "ev_b"), ("agg_c", "ev_c")] {
+        db.execute(&format!(
+            "CREATE MATERIALIZED VIEW {m} AS SELECT k, SUM(v) AS t FROM {c} GROUP BY k"
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute(
+        "CREATE MATERIALIZED VIEW abc AS \
+         SELECT a.k, a.t AS at, b.t AS bt, c.t AS ct \
+         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    assert!(
+        db.execute("SELECT * FROM __ivm_abc_0").await.is_ok(),
+        "hidden intermediate exists before drop"
+    );
+    db.execute("DROP MATERIALIZED VIEW abc").await.unwrap();
+    assert!(
+        db.execute("SELECT * FROM __ivm_abc_0").await.is_err(),
+        "intermediate dropped with the parent"
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// A multi-way join whose participant is a non-incremental source is rejected (not decomposed).
+#[tokio::test]
+async fn single_statement_multiway_rejects_non_incremental_participant() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    // ev_c is a raw source (not incremental) -> the whole 3-way is rejected.
+    let bad = db
+        .execute(
+            "CREATE MATERIALIZED VIEW abc AS \
+             SELECT a.k, a.ta, b.tb FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN ev_c c ON b.k = c.k",
+        )
+        .await;
+    assert!(
+        bad.is_err(),
+        "a source participant in a multi-way join is rejected"
+    );
+}
+
+/// A STAR multi-way join: the third table joins the FIRST (agg_a), not the preceding one. The
+/// decomposition's own qualifier-aware ON analysis carries agg_a's key into the intermediate so the
+/// later step can reference it (analyze_joins' immediate-previous model could not).
+#[tokio::test]
+async fn single_statement_multiway_star_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
+        .await
+        .unwrap();
+    // Star: `JOIN agg_c c ON a.k = c.k` (references agg_a, two relations back), not `b.k = c.k`.
+    db.execute(
+        "CREATE MATERIALIZED VIEW abc AS \
+         SELECT a.k, a.ta, b.tb, c.tc \
+         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON a.k = c.k",
+    )
+    .await
+    .expect("star 3-way join accepted");
+    db.start().await.unwrap();
+
+    let (sa, sb, sc) = (
+        db.source_untyped("ev_a").unwrap(),
+        db.source_untyped("ev_b").unwrap(),
+        db.source_untyped("ev_c").unwrap(),
+    );
+    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
+    sc.push_arrow(batch(&[1, 2], &[1000, 2000])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sc.push_arrow(batch(&[2], &[500])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    assert_eq!(
+        read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
+        vec![vec![1, 10, 100, 1000], vec![2, 20, 200, 2500]]
+    );
+    db.shutdown().await.unwrap();
+}

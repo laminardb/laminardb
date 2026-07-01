@@ -1007,8 +1007,40 @@ impl LaminarDB {
         }
     }
 
+    /// Create one MV of a decomposed multi-way join by parsing + handling it directly, bypassing the
+    /// DDL persistence in `execute` (the chain is re-derived from the parent's stored N-way DDL on a
+    /// cold restart, so persisting the intermediates would double-create them).
+    async fn create_decomposed_mv(&self, create_sql: &str) -> Result<ExecuteResult, DbError> {
+        let statements = laminar_sql::parse_streaming_sql(create_sql)
+            .map_err(|e| DbError::MaterializedView(format!("multi-way decompose parse: {e}")))?;
+        let Some(StreamingStatement::CreateMaterializedView {
+            name,
+            query,
+            emit_clause,
+            or_replace,
+            if_not_exists,
+            query_sql,
+            ..
+        }) = statements.first()
+        else {
+            return Err(DbError::MaterializedView(
+                "multi-way decompose produced a non-CREATE-MV statement".into(),
+            ));
+        };
+        self.handle_create_materialized_view(
+            create_sql,
+            name,
+            query,
+            emit_clause.clone(),
+            *or_replace,
+            *if_not_exists,
+            query_sql,
+        )
+        .await
+    }
+
     /// Register a materialized view and wire it into the running pipeline.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) async fn handle_create_materialized_view(
         &self,
         sql: &str,
@@ -1027,6 +1059,30 @@ impl LaminarDB {
                 statement_type: "CREATE MATERIALIZED VIEW".to_string(),
                 object_name: name_str,
             }));
+        }
+
+        // Single-statement N-way join → decompose into a left-deep chain of 2-way changelog-join MVs:
+        // hidden `__ivm_{name}_*` intermediates plus a rewritten 2-way final registered under `name`,
+        // each created DIRECTLY (bypassing `execute`'s persistence). Only the original N-way DDL is
+        // persisted, so a cold restart re-decomposes deterministically; in-process the registry holds
+        // the 2-way form.
+        {
+            let inc = self.incremental_mv_names();
+            if let Some(plan) =
+                crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
+            {
+                for (iname, ibody) in plan.intermediates {
+                    Box::pin(self.create_decomposed_mv(&format!(
+                        "CREATE MATERIALIZED VIEW {iname} AS {ibody}"
+                    )))
+                    .await?;
+                }
+                return Box::pin(self.create_decomposed_mv(&format!(
+                    "CREATE MATERIALIZED VIEW {name_str} AS {}",
+                    plan.final_query
+                )))
+                .await;
+            }
         }
 
         let query_sql = query_sql.to_string();
@@ -1371,7 +1427,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        let dropped_names;
+        let mut dropped_names;
         {
             let mut registry = self.mv_registry.lock();
 
@@ -1392,6 +1448,30 @@ impl LaminarDB {
                     dropped_names = vec![];
                 }
                 Err(e) => return Err(DbError::MaterializedView(e.to_string())),
+            }
+        }
+
+        // Also drop the hidden intermediate MVs of a decomposed multi-way join. They are UPSTREAM of
+        // the parent (the parent reads them), so unregister_cascade — which follows downstream deps —
+        // never reaches them.
+        {
+            let prefix = format!(
+                "{}{name_str}_",
+                crate::sql_analysis::MULTIWAY_INTERMEDIATE_PREFIX
+            );
+            let intermediates: Vec<String> = self
+                .connector_manager
+                .lock()
+                .streams()
+                .iter()
+                .filter(|(n, _)| n.starts_with(&prefix))
+                .map(|(n, _)| n.clone())
+                .collect();
+            for it in intermediates {
+                let _ = self.mv_registry.lock().unregister(&it);
+                if !dropped_names.contains(&it) {
+                    dropped_names.push(it);
+                }
             }
         }
 

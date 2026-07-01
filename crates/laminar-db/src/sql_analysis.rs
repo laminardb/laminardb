@@ -1030,6 +1030,286 @@ pub(crate) fn detect_changelog_incremental_join(
     })
 }
 
+/// Reserved name prefix for the hidden intermediate MVs a single-statement N-way join decomposes into.
+pub(crate) const MULTIWAY_INTERMEDIATE_PREFIX: &str = "__ivm_";
+
+/// A single-statement N-way incremental join decomposed into a left-deep chain of 2-way changelog
+/// joins: the hidden `intermediates` (each `(name, SELECT-sql)`) are created first, then the original
+/// MV's body is replaced by `final_query` (a 2-way join over the last intermediate).
+pub(crate) struct MultiwayJoinPlan {
+    pub intermediates: Vec<(String, String)>,
+    pub final_query: String,
+}
+
+type QualCol = (String, String); // (qualifier, column)
+type EquiPair = (QualCol, QualCol);
+type JoinStep = (bool, Vec<EquiPair>); // (is_left, ON equi-pairs)
+type OrientedPair = (usize, String, String); // (earlier_rel_index, earlier_col, new_col)
+type FinalItem = (usize, String, Option<String>); // (rel_index, column, alias)
+
+fn qual_col(e: &Expr) -> Option<QualCol> {
+    match e {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((parts[0].value.clone(), parts[1].value.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Collect every `qual.col = qual.col` pair from a pure-equi ON conjunction; `false` if any conjunct
+/// is not an equality of two 2-part qualified columns.
+fn collect_equi_pairs(expr: &Expr, out: &mut Vec<EquiPair>) -> bool {
+    use sqlparser::ast::BinaryOperator;
+    match expr {
+        Expr::Nested(inner) => collect_equi_pairs(inner, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => collect_equi_pairs(left, out) && collect_equi_pairs(right, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match (qual_col(left), qual_col(right)) {
+            (Some(l), Some(r)) => {
+                out.push((l, r));
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn table_and_alias(factor: &sqlparser::ast::TableFactor) -> Option<(String, String)> {
+    let sqlparser::ast::TableFactor::Table { name, alias, .. } = factor else {
+        return None;
+    };
+    let table = name.to_string();
+    let al = alias
+        .as_ref()
+        .map_or_else(|| table.clone(), |a| a.name.value.clone());
+    Some((table, al))
+}
+
+/// Decompose a single-statement N-way (`>= 2` joins) all-incremental equi-join into a left-deep chain
+/// of 2-way changelog joins. Each hidden intermediate carries forward — via `{origin_alias}__{col}`
+/// aliases, so names never collide — only the columns that later steps or the final `SELECT` reference.
+/// Supports linear AND star/back-reference shapes (its own qualifier-aware ON analysis attributes each
+/// key to its origin relation). `None` for the single-join case (handled by the 2-way detector) or any
+/// unsupported shape (non-equi/unqualified ON, WHERE/GROUP/etc., RIGHT/FULL, wildcard/expr projection,
+/// a non-incremental participant, or an ON pair not joining the new table to an earlier one).
+#[allow(clippy::too_many_lines)]
+pub(crate) fn plan_multiway_incremental_join(
+    mv_name: &str,
+    sql: &str,
+    incremental_mvs: &FxHashSet<String>,
+) -> Option<MultiwayJoinPlan> {
+    use sqlparser::ast::JoinConstraint::On;
+    use sqlparser::ast::JoinOperator;
+
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let has_group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        sqlparser::ast::GroupByExpr::All(_) => false,
+    };
+    if select.distinct.is_some()
+        || has_group_by
+        || select.having.is_some()
+        || select.selection.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || query.with.is_some()
+        || select.from.len() != 1
+    {
+        return None;
+    }
+    let twj = &select.from[0];
+    if twj.joins.len() < 2 {
+        return None; // single join → the 2-way detector handles it
+    }
+
+    // Relations r[0] = base, r[i] = joins[i-1]'s table (with aliases); one (is_left, equi-pairs) per step.
+    let (t0, a0) = table_and_alias(&twj.relation)?;
+    let mut rels: Vec<(String, String)> = vec![(t0, a0)];
+    let mut steps: Vec<JoinStep> = Vec::new();
+    for join in &twj.joins {
+        let (table, alias) = table_and_alias(&join.relation)?;
+        let (is_left, on_expr) = match &join.join_operator {
+            JoinOperator::Inner(On(e)) | JoinOperator::Join(On(e)) => (false, e),
+            JoinOperator::Left(On(e)) | JoinOperator::LeftOuter(On(e)) => (true, e),
+            _ => return None,
+        };
+        let mut pairs = Vec::new();
+        if !collect_equi_pairs(on_expr, &mut pairs) {
+            return None;
+        }
+        rels.push((table, alias));
+        steps.push((is_left, pairs));
+    }
+    for (table, _) in &rels {
+        if !incremental_mvs.contains(table) {
+            return None;
+        }
+    }
+    let rel_of = |alias: &str| rels.iter().position(|(t, a)| a == alias || t == alias);
+
+    // Orient each step's pairs so exactly one side is the NEW table r[s] and the other is an earlier
+    // relation; keep `(earlier_rel_index, earlier_col, new_col)`.
+    let mut oriented: Vec<Vec<OrientedPair>> = Vec::with_capacity(steps.len());
+    for (s, (_is_left, pairs)) in steps.iter().enumerate() {
+        let new_idx = s + 1; // r[s+1] is the table joined at step s+1 (0-indexed step s)
+        let mut ov = Vec::with_capacity(pairs.len());
+        for ((la, lc), (ra, rc)) in pairs {
+            let li = rel_of(la)?;
+            let ri = rel_of(ra)?;
+            let (earlier, ecol, ncol) = if ri == new_idx && li < new_idx {
+                (li, lc.clone(), rc.clone())
+            } else if li == new_idx && ri < new_idx {
+                (ri, rc.clone(), lc.clone())
+            } else {
+                return None; // a pair not joining the new table to an earlier one
+            };
+            ov.push((earlier, ecol, ncol));
+        }
+        oriented.push(ov);
+    }
+
+    // Final SELECT: qualified columns only, each attributed to its origin relation.
+    let mut final_items: Vec<FinalItem> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(e) => (e, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            _ => return None,
+        };
+        let (q, c) = qual_col(expr)?;
+        final_items.push((rel_of(&q)?, c, alias));
+    }
+
+    // Liveness: a column of r[j] must be carried by intermediate I_s (covers r[0..=s]) iff j <= s and
+    // it is referenced by a later step's ON (as the earlier side) or by the final SELECT.
+    let n = twj.joins.len(); // steps 1..=n; I_n is the final MV
+    let name_of = |s: usize| -> String {
+        if s == n {
+            mv_name.to_string()
+        } else {
+            format!("{MULTIWAY_INTERMEDIATE_PREFIX}{mv_name}_{}", s - 1)
+        }
+    };
+    let carry_alias = |idx: usize, col: &str| format!("{}__{col}", rels[idx].1);
+    // Downstream references for I_s = earlier-side refs of steps s+1..=n ∪ final SELECT refs, kept when
+    // the origin relation index <= s.
+    let carried = |s: usize| -> Vec<(usize, String)> {
+        let mut set: Vec<(usize, String)> = Vec::new();
+        let push = |idx: usize, col: &str, set: &mut Vec<(usize, String)>| {
+            if idx <= s && !set.iter().any(|(i, c)| *i == idx && c == col) {
+                set.push((idx, col.to_string()));
+            }
+        };
+        for later in &oriented[s..] {
+            for (eidx, ecol, _ncol) in later {
+                push(*eidx, ecol, &mut set);
+            }
+        }
+        for (idx, col, _) in &final_items {
+            push(*idx, col, &mut set);
+        }
+        set.sort();
+        set
+    };
+
+    // Build each step's SQL. Left input of step s (1-indexed) is I_{s-1} (its name is name_of(s-1),
+    // whose columns are already `{alias}__{col}`), or r[0] for step 1.
+    let mut intermediates = Vec::new();
+    let mut final_query = String::new();
+    for s in 1..=n {
+        let (left_name, left_alias, left_is_base) = if s == 1 {
+            (rels[0].0.clone(), rels[0].1.clone(), true)
+        } else {
+            (name_of(s - 1), name_of(s - 1), false)
+        };
+        let (rtable, ralias) = &rels[s];
+        let is_left = steps[s - 1].0;
+        let join_kw = if is_left { "LEFT JOIN" } else { "JOIN" };
+
+        // Column reference into the left input for origin relation j (< s).
+        let left_ref = |j: usize, col: &str| -> String {
+            if left_is_base {
+                format!("{}.{col}", rels[j].1)
+            } else {
+                format!("{left_alias}.{}", carry_alias(j, col))
+            }
+        };
+
+        // ON clause.
+        let on = oriented[s - 1]
+            .iter()
+            .map(|(eidx, ecol, ncol)| format!("{} = {ralias}.{ncol}", left_ref(*eidx, ecol)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        // Projection.
+        let proj = if s == n {
+            final_items
+                .iter()
+                .map(|(idx, col, alias)| {
+                    let src = if *idx == s {
+                        format!("{ralias}.{col}")
+                    } else {
+                        left_ref(*idx, col)
+                    };
+                    // Keep the user's output name: an unaliased `a.k` stays `k`, not the rewritten src.
+                    let out = alias.clone().unwrap_or_else(|| col.clone());
+                    format!("{src} AS {out}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            carried(s)
+                .iter()
+                .map(|(idx, col)| {
+                    let out = carry_alias(*idx, col);
+                    let src = if *idx == s {
+                        format!("{ralias}.{col}")
+                    } else {
+                        left_ref(*idx, col)
+                    };
+                    format!("{src} AS {out}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let from = if left_is_base {
+            format!("{left_name} {left_alias}")
+        } else {
+            left_name.clone()
+        };
+        let body = format!("SELECT {proj} FROM {from} {join_kw} {rtable} {ralias} ON {on}");
+        if s == n {
+            final_query = body;
+        } else {
+            intermediates.push((name_of(s), body));
+        }
+    }
+    Some(MultiwayJoinPlan {
+        intermediates,
+        final_query,
+    })
+}
+
 /// `true` if the single join's ON clause is a pure conjunction of `col = col` equalities (or a
 /// `USING` list). Anything else (`>`, function, residual predicate) ⇒ the equi-key extractor would
 /// silently drop it, so the IVM join must reject the query.
