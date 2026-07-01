@@ -470,12 +470,11 @@ impl LaminarDB {
             laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
         };
 
-        // Terminality guard: a sink cannot consume an incremental MV's changelog.
-        if matches!(&create.from, laminar_sql::parser::SinkFrom::Table(_))
-            && self.is_incremental_mv(&input)
-        {
-            return Err(incremental_mv_consumer_error(&input, "a sink"));
-        }
+        // A sink CAN consume an incremental MV's changelog when its connector is upsert- or
+        // changelog-capable (e.g. Delta upsert collapses the Z-set via `collapse_changelog`). The
+        // capability is only known once the connector is built, so the check is enforced at pipeline
+        // start (`pipeline_lifecycle`), not here — a non-capable connector is rejected there with
+        // `[LDB-1300]` rather than silently dropping retractions.
 
         // Validate before mutating catalog/planner — no half-created sink on error.
         let resolved = self.prepare_connector(

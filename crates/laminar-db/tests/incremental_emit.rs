@@ -295,9 +295,10 @@ async fn chained_projection_over_incremental_is_correct_under_updates() {
 }
 
 /// Guard: chained aggregates AND simple projections/filters over an incremental MV are allowed
-/// (they net the changelog); a complex shape (join) and a sink are rejected.
+/// (they net the changelog); a complex shape (join) is rejected. Sinks are no longer rejected at
+/// DDL — capability is enforced at pipeline start (see `sink_from_incremental_mv_*`).
 #[tokio::test]
-async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
+async fn terminality_guard_allows_agg_and_projection_rejects_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
@@ -322,12 +323,6 @@ async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
         .await;
     assert!(join.is_err(), "join over incremental MV must be rejected");
 
-    // A sink consuming the raw changelog is rejected.
-    let sink = db
-        .execute("CREATE SINK out FROM agg INTO KAFKA (topic = 't', bootstrap_servers = 'x')")
-        .await;
-    assert!(sink.is_err(), "sink from incremental MV must be rejected");
-
     // Snapshot reads still work.
     db.start().await.unwrap();
     let source = db.source_untyped("events").unwrap();
@@ -335,6 +330,58 @@ async fn terminality_guard_allows_agg_and_projection_rejects_join_and_sink() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
     db.shutdown().await.unwrap();
+}
+
+/// A sink from an incremental MV is no longer rejected at DDL, but a connector that can neither
+/// upsert nor handle changelog records (the `files` sink) is rejected at pipeline start with
+/// `[LDB-1300]` — never silently dropping the changelog's retractions.
+#[cfg(feature = "files")]
+#[tokio::test]
+async fn sink_from_incremental_mv_rejects_noncapable_sink_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    // Guard relaxed: the sink DDL itself now succeeds over an incremental MV.
+    db.execute(&format!(
+        "CREATE SINK f FROM agg INTO FILES (path = '{}', format = 'json')",
+        out.display().to_string().replace('\\', "/")
+    ))
+    .await
+    .expect("CREATE SINK over an incremental MV now succeeds at DDL");
+    // Capability is enforced at start: the files sink can't consume a changelog.
+    let started = db.start().await;
+    let err = format!(
+        "{:?}",
+        started.expect_err("a non-capable sink over an incremental MV must be rejected at start")
+    );
+    assert!(err.contains("LDB-1300"), "expected LDB-1300, got: {err}");
+    db.shutdown().await.ok();
+}
+
+/// The capability check fires ONLY for incremental MVs: a full-emit (non-incremental) aggregate
+/// still feeds a plain append-only files sink, so the check does not over-reject.
+#[cfg(feature = "files")]
+#[tokio::test]
+async fn sink_from_nonincremental_mv_allows_noncapable_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), false)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.execute(&format!(
+        "CREATE SINK f FROM agg INTO FILES (path = '{}', format = 'json')",
+        out.display().to_string().replace('\\', "/")
+    ))
+    .await
+    .expect("CREATE SINK");
+    db.start()
+        .await
+        .expect("a full-emit aggregate feeding a plain sink must start fine");
+    db.shutdown().await.ok();
 }
 
 /// An inner `changelog ⋈ changelog` IVM join over TWO incremental MVs maintains a correct snapshot

@@ -1144,6 +1144,20 @@ impl LaminarDB {
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
             let caps = sink.capabilities();
+            // An incremental MV emits a Z-set changelog; a sink can only consume it if the connector
+            // upserts (collapses per key) or handles changelog/retraction records. A non-capable sink
+            // would silently drop retractions, so reject it loudly instead (`[LDB-1300]`).
+            if !(caps.changelog || caps.upsert)
+                && stream_regs.get(&reg.input).is_some_and(|r| r.incremental)
+            {
+                return Err(DbError::MaterializedView(format!(
+                    "[LDB-1300] sink '{name}' cannot consume the changelog of incremental \
+                     materialized view '{}': its connector supports neither upsert nor changelog \
+                     writes and would drop retractions. Route it to an upsert/changelog-capable sink \
+                     (e.g. Delta with write.mode='upsert') or set incremental_emit = false.",
+                    reg.input
+                )));
+            }
             let write_timeout =
                 match config
                     .get_parsed::<u64>("sink.write.timeout.ms")
