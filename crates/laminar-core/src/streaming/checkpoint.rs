@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// Configuration for streaming checkpoints.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StreamCheckpointConfig {
     /// Checkpoint interval in milliseconds. `None` = manual only.
     pub interval_ms: Option<u64>,
@@ -42,8 +42,27 @@ pub struct StreamCheckpointConfig {
     /// Incremental emit for non-windowed running-state aggregate MVs. When on, a
     /// terminal `GROUP BY` MV emits a dirty-only changelog into a keyed upsert store instead of
     /// re-materializing every group each cycle (`SELECT * FROM mv` still returns the full
-    /// snapshot). Default off.
+    /// snapshot). Default ON.
     pub incremental_emit: bool,
+}
+
+impl Default for StreamCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: None,
+            data_dir: None,
+            max_retained: None,
+            alignment_timeout_ms: None,
+            max_in_flight_epochs: None,
+            max_staged_bytes: None,
+            max_uncommitted_epochs: None,
+            uncommitted_epochs_backpressure: false,
+            restorable_gate_poll_initial_ms: None,
+            restorable_gate_poll_max_ms: None,
+            delta_chain_max: None,
+            incremental_emit: true,
+        }
+    }
 }
 
 /// Errors from checkpoint operations.

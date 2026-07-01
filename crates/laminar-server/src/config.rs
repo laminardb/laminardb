@@ -533,8 +533,8 @@ pub struct CheckpointSection {
     #[serde(default)]
     pub delta_chain_max: Option<u32>,
     /// Incremental emit for non-windowed running-state aggregate MVs: a dirty-only changelog into
-    /// a keyed upsert store instead of re-materializing every group each cycle. Default off.
-    #[serde(default)]
+    /// a keyed upsert store instead of re-materializing every group each cycle. Default ON.
+    #[serde(default = "default_incremental_emit")]
     pub incremental_emit: bool,
 }
 
@@ -552,7 +552,7 @@ impl Default for CheckpointSection {
             restorable_gate_poll_initial_ms: None,
             restorable_gate_poll_max_ms: None,
             delta_chain_max: None,
-            incremental_emit: false,
+            incremental_emit: default_incremental_emit(),
         }
     }
 }
@@ -934,6 +934,9 @@ fn default_checkpoint_url() -> String {
 }
 fn default_max_retained() -> usize {
     10
+}
+fn default_incremental_emit() -> bool {
+    true
 }
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)
