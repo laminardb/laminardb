@@ -114,6 +114,43 @@ pub async fn consume_json(
     out
 }
 
+/// Consume up to `expected` messages (including tombstones) from `topic`, returning `(key, value)`
+/// per message where `value` is `None` for a null-payload tombstone. Used to verify upsert-envelope
+/// output where a removed group is a keyed tombstone.
+pub async fn consume_keyed(
+    brokers: &str,
+    topic: &str,
+    group: &str,
+    expected: usize,
+    deadline: Duration,
+) -> Vec<(Option<String>, Option<String>)> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("consumer");
+    consumer.subscribe(&[topic]).expect("subscribe");
+
+    let mut out = Vec::new();
+    let start = Instant::now();
+    while out.len() < expected && start.elapsed() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
+            Ok(Ok(msg)) => {
+                let key = msg.key().map(|k| String::from_utf8_lossy(k).into_owned());
+                let val = msg
+                    .payload()
+                    .map(|p| String::from_utf8_lossy(p).into_owned());
+                out.push((key, val));
+            }
+            Ok(Err(e)) => eprintln!("consumer error: {e}"),
+            Err(_) => continue,
+        }
+    }
+    out
+}
+
 /// Run `docker compose -f tests/docker/compose.yml <args>` and ignore
 /// non-zero exit codes (useful for kill/restart that may race with the
 /// health-checker).
