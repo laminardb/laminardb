@@ -1,9 +1,20 @@
 # A1-emit Stage 3b — changelog ⋈ changelog incremental join (IVM)
 
-Status: **planned (2026-06-28)**, cold-start ready. Branch `feat/shuffle-barrier-after-kill-recovery`.
-Prereq DONE: tiered-state v2 group-granular KV (`docs/plans/tiered-state-v2-group-granularity.md`,
-Slices 1–6) gives the per-join-key spill substrate. Owner scope: **inner + LEFT + multi-way**,
-**hand-rolled IVM**, **tiered-state-backed**.
+Status: **ALL 5 SLICES DONE (2026-06-30/07-01), default-OFF.** Branch `feat/shuffle-barrier-after-kill-recovery`.
+S1 inner (`7b07ad6c`), S2 LEFT (`125790eb`), S3 checkpoint (folded into S1), S4 tier-backed
+(`cad93bf0`→`c1926308`, full plan `docs/plans/tier-backed-join-state.md`), **S5 multi-way**: chained
+pairwise validated + dup-name hazard fixed (`3274e8e2`), plus single-statement `A JOIN B JOIN C`
+decomposition into hidden `__ivm_*` 2-way MVs — linear AND star chains (`a74e4502`). Owner scope
+delivered: **inner + LEFT + multi-way**, **hand-rolled IVM**, **tiered-state-backed**.
+
+> **S5 design + remaining hardening:** `sql_analysis::plan_multiway_incremental_join` decomposes an
+> N-way join MV into a left-deep chain of 2-way changelog joins (its own qualifier-aware ON analysis →
+> supports star/back-reference, unlike `analyze_joins`; `{origin}__{col}` carry-forward aliases avoid
+> name collisions; backward liveness). `ddl.rs` creates the intermediates directly (not persisted; the
+> parent's N-way DDL re-decomposes deterministically on restart) + DROP-cascades + SHOW-hides them.
+> Follow-ups (default-OFF): 4-way (N is general, only 3-way tested), a LEFT step in the chain, a
+> restart+demotion single-statement soak, atomic unwind on mid-chain failure, OR REPLACE intermediate
+> cleanup, and reserving the `__ivm_` namespace.
 
 ## The IVM math (two-sided)
 
