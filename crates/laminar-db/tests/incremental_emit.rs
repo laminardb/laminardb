@@ -403,6 +403,35 @@ async fn sink_from_nonincremental_mv_allows_noncapable_sink() {
     db.shutdown().await.ok();
 }
 
+/// The capability check follows the changelog through a stream: a non-capable sink over a STREAM
+/// that projects an incremental MV is rejected at start too, not just a direct incremental-MV input.
+#[cfg(feature = "files")]
+#[tokio::test]
+async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.execute("CREATE STREAM s AS SELECT k, total FROM agg")
+        .await
+        .expect("stream over incremental MV");
+    db.execute(&format!(
+        "CREATE SINK f FROM s INTO FILES (path = '{}', format = 'json')",
+        out.display().to_string().replace('\\', "/")
+    ))
+    .await
+    .expect("CREATE SINK over the stream succeeds at DDL");
+    let started = db.start().await;
+    let err = format!(
+        "{:?}",
+        started.expect_err("a non-capable sink over a changelog stream must be rejected at start")
+    );
+    assert!(err.contains("LDB-1300"), "expected LDB-1300, got: {err}");
+    db.shutdown().await.ok();
+}
+
 /// An inner `changelog ⋈ changelog` IVM join over TWO incremental MVs maintains a correct snapshot
 /// under UPDATES on BOTH sides — the δA⋈B + A⋈δB netting drops stale joined rows.
 #[tokio::test]

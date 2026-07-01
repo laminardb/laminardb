@@ -1106,6 +1106,34 @@ impl LaminarDB {
             laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
                 crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
             );
+        // Names whose output carries a Z-set changelog: incremental MVs, plus any stream/view whose
+        // query reads a changelog-carrying name (a projection/filter forwards the changelog). A
+        // non-capable sink over one of these silently drops retractions, so it's rejected below.
+        let changelog_carrying: rustc_hash::FxHashSet<String> = {
+            let mut set: rustc_hash::FxHashSet<String> = stream_regs
+                .iter()
+                .filter(|(_, r)| r.incremental)
+                .map(|(n, _)| n.clone())
+                .collect();
+            loop {
+                let mut added = false;
+                for (name, reg) in &stream_regs {
+                    if !set.contains(name)
+                        && crate::sql_analysis::extract_table_references(&reg.query_sql)
+                            .iter()
+                            .any(|t| set.contains(t.as_str()))
+                    {
+                        set.insert(name.clone());
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+            set
+        };
+
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
@@ -1142,17 +1170,15 @@ impl LaminarDB {
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
             let caps = sink.capabilities();
-            // An incremental MV emits a Z-set changelog; a sink can only consume it if the connector
-            // upserts (collapses per key) or handles changelog/retraction records. A non-capable sink
-            // would silently drop retractions, so reject it loudly instead (`[LDB-1300]`).
-            if !(caps.changelog || caps.upsert)
-                && stream_regs.get(&reg.input).is_some_and(|r| r.incremental)
-            {
+            // A changelog input (an incremental MV, or a stream forwarding one's changelog) can only
+            // be consumed by a connector that upserts (collapses per key) or handles changelog
+            // records. A non-capable sink would silently drop retractions, so reject it loudly.
+            if !(caps.changelog || caps.upsert) && changelog_carrying.contains(&reg.input) {
                 return Err(DbError::MaterializedView(format!(
-                    "[LDB-1300] sink '{name}' cannot consume the changelog of incremental \
-                     materialized view '{}': its connector supports neither upsert nor changelog \
-                     writes and would drop retractions. Route it to an upsert/changelog-capable sink \
-                     (e.g. Delta with write.mode='upsert') or set incremental_emit = false.",
+                    "[LDB-1300] sink '{name}' cannot consume the changelog from '{}': its connector \
+                     supports neither upsert nor changelog writes and would drop retractions. Route \
+                     it to an upsert/changelog-capable sink (e.g. Delta with write.mode='upsert' or \
+                     Kafka with envelope='upsert') or set incremental_emit = false.",
                     reg.input
                 )));
             }
