@@ -544,3 +544,93 @@ async fn incremental_join_guard_allows_inner_left_rejects_right_and_source() {
         .await;
     assert!(src.is_err(), "changelog ⋈ source join is rejected");
 }
+
+/// Multi-way A⋈B⋈C as chained pairwise IVM joins (Stage 3b S5): an intermediate join MV is itself a
+/// changelog that feeds the next join. Updates on ALL THREE sides must net through the chain.
+#[tokio::test]
+async fn multiway_incremental_join_chained_pairwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
+        .await
+        .unwrap();
+    // Intermediate ab = agg_a ⋈ agg_b, then abc = ab ⋈ agg_c — the join MV `ab` feeds the next join.
+    db.execute(
+        "CREATE MATERIALIZED VIEW ab AS \
+         SELECT a.k, a.ta, b.tb FROM agg_a a JOIN agg_b b ON a.k = b.k",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW abc AS \
+         SELECT ab.k, ab.ta, ab.tb, c.tc FROM ab JOIN agg_c c ON ab.k = c.k",
+    )
+    .await
+    .expect("chained pairwise multi-way join allowed");
+    db.start().await.unwrap();
+
+    let (sa, sb, sc) = (
+        db.source_untyped("ev_a").unwrap(),
+        db.source_untyped("ev_b").unwrap(),
+        db.source_untyped("ev_c").unwrap(),
+    );
+    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
+    sc.push_arrow(batch(&[1, 2], &[1000, 2000])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // Update one column on each side: ta[k1] 10->15, tb[k2] 200->250, tc[k1] 1000->1500.
+    sa.push_arrow(batch(&[1], &[5])).unwrap();
+    sb.push_arrow(batch(&[2], &[50])).unwrap();
+    sc.push_arrow(batch(&[1], &[500])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    // Every update nets through the two-level chain; no stale rows.
+    assert_eq!(
+        read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
+        vec![vec![1, 15, 100, 1500], vec![2, 20, 250, 2000]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// A join projection with a duplicate OUTPUT column name (same-named column from both sides) must be
+/// rejected — otherwise the operator binds the join key and the projected column to different physical
+/// columns, and it compounds when the MV feeds a downstream join.
+#[tokio::test]
+async fn incremental_join_rejects_duplicate_output_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS t FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS t FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    // Both sides project `t` → duplicate output name → rejected.
+    let bad = db
+        .execute(
+            "CREATE MATERIALIZED VIEW dup AS \
+             SELECT a.t, b.t FROM agg_a a JOIN agg_b b ON a.k = b.k",
+        )
+        .await;
+    assert!(
+        bad.is_err(),
+        "duplicate output column name must be rejected"
+    );
+}

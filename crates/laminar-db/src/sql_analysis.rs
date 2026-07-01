@@ -897,6 +897,7 @@ pub(crate) struct IncrementalJoinConfig {
 
 /// Detect a single INNER or LEFT equi-join whose BOTH sides are incremental MVs (changelogs).
 /// Returns the join keys, output projection, and LEFT-outer flag; `None` for any other shape.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn detect_changelog_incremental_join(
     sql: &str,
     incremental_mvs: &FxHashSet<String>,
@@ -999,6 +1000,24 @@ pub(crate) fn detect_changelog_incremental_join(
             _ => return None,
         };
         projection.push(proj);
+    }
+
+    // Reject a duplicate OUTPUT column name (e.g. selecting the same-named column from both sides, or
+    // the join key from both sides). It would yield a duplicate-named MV schema; the operator resolves
+    // the join key by first occurrence but a projected column by last occurrence, silently binding them
+    // to different physical columns — and it compounds when this MV feeds a downstream join. Small list,
+    // so an O(n^2) scan is fine (and avoids a disallowed std HashSet).
+    let out_names: Vec<&str> = projection
+        .iter()
+        .map(|item| match item {
+            JoinProjItem::Qualified { column, alias, .. }
+            | JoinProjItem::Unqualified { column, alias } => alias.as_deref().unwrap_or(column),
+        })
+        .collect();
+    for (i, name) in out_names.iter().enumerate() {
+        if out_names[i + 1..].contains(name) {
+            return None;
+        }
     }
 
     Some(IncrementalJoinConfig {
