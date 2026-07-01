@@ -4,21 +4,10 @@
 //! `MongoDB` collections. Supports insert, upsert, replace, and CDC replay
 //! write modes, with optional time series collection support.
 //!
-//! # Architecture
-//!
-//! - **Ring 0**: No sink code — data arrives via SPSC channel (~5ns push)
-//! - **Ring 1**: Batch buffering, write dispatch, flush management
-//! - **Ring 2**: Connection pool, collection creation, write concern config
-//!
-//! # Batching
-//!
-//! Writes are buffered up to `batch_size` records and flushed when:
-//! - The batch is full
-//! - `flush_interval` has elapsed
-//! - A shutdown signal or epoch boundary is reached
-//!
-//! Insert mode uses `insert_many` for batch efficiency. Upsert, replace,
-//! and CDC replay modes issue individual operations per document.
+//! Writes are buffered up to `batch_size` records and flushed when the batch is
+//! full, `flush_interval` elapses, or a shutdown/epoch boundary is reached.
+//! Insert mode uses `insert_many`; upsert, replace, and CDC replay issue
+//! individual operations per document.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,32 +35,16 @@ use super::write_model::WriteMode;
 /// Writes Arrow `RecordBatch` records to a `MongoDB` collection using
 /// configurable write modes. Supports standard and time series collections.
 pub struct MongoDbSink {
-    /// Sink configuration.
     config: MongoDbSinkConfig,
-
-    /// Arrow schema for input batches.
     schema: SchemaRef,
-
-    /// Connector lifecycle state.
     state: ConnectorState,
-
-    /// Buffered records awaiting flush.
     buffer: Vec<RecordBatch>,
-
-    /// Total rows in buffer.
     buffered_rows: usize,
-
-    /// Last flush time.
     last_flush: Instant,
-
-    /// Sink metrics.
     metrics: MongoDbSinkMetrics,
 
-    /// `MongoDB` client (feature-gated).
     #[cfg(feature = "mongodb-cdc")]
     client: Option<mongodb::Client>,
-
-    /// Target collection handle (feature-gated).
     #[cfg(feature = "mongodb-cdc")]
     collection: Option<mongodb::Collection<mongodb::bson::Document>>,
 }

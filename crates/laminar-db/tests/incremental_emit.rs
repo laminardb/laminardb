@@ -611,7 +611,7 @@ async fn incremental_join_guard_allows_inner_left_rejects_right_and_source() {
     assert!(src.is_err(), "changelog ⋈ source join is rejected");
 }
 
-/// Multi-way A⋈B⋈C as chained pairwise IVM joins (Stage 3b S5): an intermediate join MV is itself a
+/// Multi-way A⋈B⋈C as chained pairwise IVM joins: an intermediate join MV is itself a
 /// changelog that feeds the next join. Updates on ALL THREE sides must net through the chain.
 #[tokio::test]
 async fn multiway_incremental_join_chained_pairwise() {

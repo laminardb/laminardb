@@ -341,12 +341,9 @@ mod failures {
         out
     }
 
-    /// A hard crash sheds the dead node's vnodes to the survivor,
-    /// which rehydrates their checkpointed state and takes over their
-    /// keys (rows in flight at the crash are lost — the at-least-once
-    /// failover window). Before dead-node rotation engaged, the
-    /// survivor kept only its own keys and the cluster could not
-    /// commit at all until the node returned.
+    /// A hard crash sheds the dead node's vnodes to the survivor, which rehydrates their
+    /// checkpointed state and takes over their keys. Rows in flight at the crash are lost —
+    /// the at-least-once failover window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn crash_sheds_vnodes_to_survivor() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
@@ -630,13 +627,11 @@ mod failures {
         harness.shutdown().await;
     }
 
-    /// Exact-value correctness under cluster GROUP demotion. A deterministic keyed SUM workload run
-    /// across a 2-node cluster with a tiny per-node budget (idle groups demote to the cold tier;
-    /// re-touched ones promote back) must produce the same per-key totals as the analytic
-    /// expectation. This is the exact-value guarantee the kill-9 soaks omit — they assert only
-    /// demote/promote counters + EO density, so a wrong-value regression (e.g. a demoted group
-    /// recreated with a fresh accumulator) would pass them. Keys span both owners so cross-node
-    /// shuffle exercises the demote↔promote path under checkpoint barrier alignment.
+    /// Exact-value correctness under cluster GROUP demotion: a deterministic keyed SUM across a
+    /// 2-node cluster with a tiny per-node budget (idle groups demote to cold, re-touched ones
+    /// promote back) must match the analytic per-key totals — the exact-value guarantee the kill-9
+    /// soaks omit, since they assert only demote/promote counters + EO density. Keys span both
+    /// owners so the demote↔promote path runs under cross-node shuffle + barrier alignment.
     #[cfg(feature = "state-tier")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cluster_group_demotion_preserves_aggregate_values() {
@@ -856,7 +851,7 @@ mod failures {
     }
 
     /// Lose-then-REACQUIRE of a vnode whose aggregate group was demoted to the cold tier must not
-    /// double-count on re-acquire (the `7528e24a` class) and must not lose the group. Node A
+    /// double-count on re-acquire and must not lose the group. Node A
     /// (follower) owns V, demotes idle groups and durably folds them into V's delta chain; V then
     /// moves to B (leader) and back to A. On revoke, `drop_vnodes` must purge A's resident AND cold
     /// tracking for V before the additive `merge_groups` rehydrates the chain — otherwise re-acquire
@@ -1065,7 +1060,7 @@ mod failures {
         harness.shutdown().await;
     }
 
-    /// ADR-007 Q4: a rebalance MOVE (vnode A->B, no move-back) must RETRACT the moved groups from the
+    /// A rebalance MOVE (vnode A->B, no move-back) must RETRACT the moved groups from the
     /// LOSING node's incremental MV snapshot. Otherwise A keeps materializing K forever while B also
     /// materializes it, so a distributed (union) read double-counts K. Reads the union across both
     /// nodes and asserts K appears exactly once at the full total, and that A dropped K locally.
@@ -1204,7 +1199,7 @@ mod failures {
             })
             .expect("a second follower key on a vnode other than V");
 
-        // Settle everything together on one consistent snapshot: A dropped K (Q4 retraction), the
+        // Settle everything together on one consistent snapshot: A dropped K (the retraction), the
         // union carries K once at the full rehydrated+new total, and A still owns K2 at its full
         // total. Without the retraction, A keeps K and the union double-counts it.
         let expected_k = k * 10 * (ROUNDS + 1);
@@ -1379,8 +1374,8 @@ mod rebalance {
             vnodes.insert(v, leader);
         }
 
-        // Phase 1: draining snapshot — the follower marks its lost vnodes draining
-        // but ownership (the registry version) does not change.
+        // Draining snapshot: the follower marks its lost vnodes draining, but ownership
+        // (the registry version) does not change.
         let pre_version = harness.nodes[follower_idx]
             .vnode_registry
             .assignment_version();
@@ -1406,7 +1401,7 @@ mod rebalance {
             "drain phase must not change ownership",
         );
 
-        // Phase 2: committed snapshot — ownership rotates and the drain clears.
+        // Committed snapshot: ownership rotates and the drain clears.
         let commit = drain.next(vnodes);
         let expected = commit.version;
         assert!(matches!(

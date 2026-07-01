@@ -23,27 +23,17 @@ const PRUNE_FULL_SCAN_EVERY: u64 = 32;
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
     instance_id: String,
-    /// Pre-encoded audit body for the `_COMMIT` CAS — derived once
-    /// from `instance_id` to avoid cloning a String into `Bytes` on
-    /// every commit attempt.
+    /// Pre-encoded `_COMMIT` audit body — avoids re-cloning `instance_id` per commit.
     committer_bytes: Bytes,
     vnode_capacity: u32,
-    /// Highest prune horizon already covered cleanly: later prunes list only
-    /// `epoch={N}/` prefixes in `[latest_pruned_epoch, before)` instead of the
-    /// whole store. `0` = no baseline yet; the first prune does one full
-    /// listing, then bounds every subsequent one.
+    /// Highest horizon already pruned; later prunes list only `[latest_pruned_epoch, before)`
+    /// instead of the whole store. `0` = no baseline yet, forcing one full listing first.
     latest_pruned_epoch: AtomicU64,
-    /// Prune-call counter driving the periodic full-scan re-baseline, which
-    /// bounds how long a straggler write below the cursor can leak.
+    /// Prune-call counter driving the periodic full-scan re-baseline that bounds
+    /// how long a straggler write below the cursor can leak.
     prune_passes: AtomicU64,
-    /// Authoritative vnode-assignment version known to this backend.
-    /// Split-brain fence: [`write_partial`](Self::write_partial) rejects
-    /// any caller whose `assignment_version` is strictly less than this
-    /// value. Updated via [`set_authoritative_version`](Self::set_authoritative_version)
-    /// whenever the host sees a newer `AssignmentSnapshot` rotate in.
-    ///
-    /// Default is `0`, which disables the fence — unconfigured
-    /// callers (most single-instance paths) are accepted unchanged.
+    /// Split-brain fence: writes stamped with an `assignment_version` below this are
+    /// rejected. `0` disables the fence, accepting unconfigured single-instance callers.
     authoritative_version: Arc<AtomicU64>,
 }
 
@@ -83,10 +73,8 @@ impl ObjectStoreBackend {
         self.vnode_capacity
     }
 
-    /// Shared handle to the authoritative version counter. Callers that
-    /// want to bump several objects (e.g. backend plus a future metric)
-    /// from a single owner can clone this handle instead of relaying
-    /// through [`StateBackend::set_authoritative_version`].
+    /// Shared handle to the authoritative version counter, cloneable by a
+    /// single owner that drives it without relaying through the trait method.
     #[must_use]
     pub fn authoritative_version_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.authoritative_version)
@@ -119,9 +107,8 @@ impl ObjectStoreBackend {
         OsPath::from(format!("epoch={epoch}/srcoff/{node_key}"))
     }
 
-    /// Parse `N` from a location whose first path segment is `epoch=N`.
+    /// Parse `N` from a location whose first path segment is `epoch=N`;
     /// `None` for any sibling object that doesn't follow the layout.
-    /// `str::split` always yields at least one segment.
     fn epoch_of_first_segment(loc: &str) -> Option<u64> {
         let first = loc.split('/').next().unwrap_or("");
         first.strip_prefix("epoch=")?.parse::<u64>().ok()
@@ -142,11 +129,8 @@ impl StateBackend for ObjectStoreBackend {
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         self.check_vnode(vnode)?;
-        // Split-brain fence. `authoritative_version == 0` means
-        // "unconfigured" — accept every write (matches the legacy
-        // single-instance behavior). Non-zero authoritative means we
-        // know of a specific assignment generation; writes stamped with
-        // an older generation are rejected.
+        // Split-brain fence: `authoritative == 0` accepts every write; otherwise
+        // reject writes stamped with an older assignment generation.
         let authoritative = self.authoritative_version.load(Ordering::Acquire);
         if authoritative > 0 && assignment_version < authoritative {
             return Err(StateBackendError::StaleVersion {
@@ -291,10 +275,7 @@ impl StateBackend for ObjectStoreBackend {
         use tokio_stream::StreamExt;
 
         let commit = Self::commit_path(epoch);
-        // Fast path: a marker already exists. Previously we returned
-        // `Ok(true)` blindly — that swallowed split-brain (two leaders
-        // racing, the loser silently agreed it had committed). Now we
-        // read the audit body and reject if the committer isn't us.
+        // Marker already exists: verify the committer is us, else it's split-brain.
         match self.store.head(&commit).await {
             Ok(_) => return self.verify_commit_marker(&commit).await,
             Err(object_store::Error::NotFound { .. }) => {}
@@ -336,9 +317,8 @@ impl StateBackend for ObjectStoreBackend {
         };
         match self.store.put_opts(&commit, payload, opts).await {
             Ok(_) => Ok(true),
-            // AlreadyExists means a peer raced us to the CAS. Don't
-            // silently agree — verify who actually wrote the marker
-            // so a stale leader doesn't keep driving the commit phase.
+            // A peer raced us to the CAS — verify who wrote the marker rather
+            // than agree blindly, so a stale leader can't keep driving commit.
             Err(object_store::Error::AlreadyExists { .. }) => {
                 self.verify_commit_marker(&commit).await
             }
@@ -478,11 +458,8 @@ impl StateBackend for ObjectStoreBackend {
 }
 
 impl ObjectStoreBackend {
-    /// Read the epoch's `_COMMIT` marker and compare its audit body
-    /// against this backend's `instance_id`. Match → `Ok(true)` (we
-    /// committed, a retry or observation is fine). Mismatch →
-    /// [`StateBackendError::SplitBrainCommit`] so the caller aborts
-    /// rather than double-committing downstream.
+    /// Compare the `_COMMIT` marker's audit body against our `instance_id`:
+    /// match → `Ok(true)`; mismatch → [`StateBackendError::SplitBrainCommit`].
     async fn verify_commit_marker(&self, commit: &OsPath) -> Result<bool, StateBackendError> {
         let res = self
             .store
@@ -605,11 +582,8 @@ mod tests {
         assert_eq!(descs, vec![(key.to_string(), Bytes::from_static(b"df"))]);
     }
 
-    /// Split-brain commit protection. Previously the CAS-create's
-    /// `AlreadyExists` branch was folded into the success branch, so a
-    /// stale leader racing a fresh one would happily agree it had also
-    /// committed the epoch. Now the loser reads the marker, sees a
-    /// mismatched audit body, and fails loud.
+    /// The CAS-create `AlreadyExists` branch must not silently agree it committed:
+    /// the loser reads the marker, sees a mismatched audit body, and fails loud.
     #[tokio::test]
     async fn epoch_complete_detects_split_brain_committer() {
         let dir = tempdir().unwrap();

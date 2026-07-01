@@ -1002,11 +1002,9 @@ pub(crate) fn detect_changelog_incremental_join(
         projection.push(proj);
     }
 
-    // Reject a duplicate OUTPUT column name (e.g. selecting the same-named column from both sides, or
-    // the join key from both sides). It would yield a duplicate-named MV schema; the operator resolves
-    // the join key by first occurrence but a projected column by last occurrence, silently binding them
-    // to different physical columns — and it compounds when this MV feeds a downstream join. Small list,
-    // so an O(n^2) scan is fine (and avoids a disallowed std HashSet).
+    // Reject a duplicate OUTPUT column name (same-named column, or the join key, from both sides): it
+    // yields a duplicate-named MV schema, and the operator resolves the join key by first occurrence
+    // but a projected column by last, silently binding them to different physical columns.
     let out_names: Vec<&str> = projection
         .iter()
         .map(|item| match item {

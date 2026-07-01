@@ -269,7 +269,7 @@ struct AggOpCheckpoint {
     deferred: Vec<(i64, Vec<u8>)>, // (ingest watermark, IPC-serialized pre-agg batch)
     cold_vnodes: Vec<u32>,         // absent from `agg`; replayed from durable partials on restart
     // Per-vnode `-1`-weight retraction batches stashed at revoke but not yet emitted; persisted so a
-    // crash between revoke and the next emit still retracts the moved groups from the MV (ADR-007 Q4).
+    // crash between revoke and the next emit still retracts the moved groups from the MV.
     revoke_retractions: Vec<(u32, Vec<u8>)>,
 }
 
@@ -317,7 +317,7 @@ pub(crate) struct SqlQueryOperator {
     deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
     // Per-vnode `-1`-weight retraction batches captured when a vnode is revoked, keyed by vnode.
     // Prepended (retract-before-insert) to the next emit so the losing node's MV snapshot drops the
-    // moved groups; cancelled per-vnode on a same-cycle reacquire (ADR-007 Q4).
+    // moved groups; cancelled per-vnode on a same-cycle reacquire.
     #[cfg(feature = "cluster")]
     pending_revoke_retractions: rustc_hash::FxHashMap<u32, RecordBatch>,
     #[cfg(feature = "state-tier")]
@@ -947,7 +947,7 @@ impl SqlQueryOperator {
         };
 
         // Retract-before-insert: moved-away groups' `-1` batches lead the emit so a distributed read
-        // never double-counts a rebalanced group (ADR-007 Q4).
+        // never double-counts a rebalanced group.
         #[cfg(feature = "cluster")]
         let result = if self.pending_revoke_retractions.is_empty() {
             result
@@ -1646,18 +1646,14 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.merge_groups(&cp)?;
                 // Same-cycle reacquire: `merge_groups` restored `last_emitted`, so a pending
-                // retraction would wrongly drop a still-resident group (Q4c).
+                // retraction would wrongly drop a still-resident group.
                 self.pending_revoke_retractions.remove(&vnode);
-                // Whether this is a rebalance acquisition or a promotion
-                // from the cold tier, the vnode's state now lives in memory.
-                // `mark_vnode_hot` clears the cold flag (promotion only);
-                // `mark_vnode_dirty` then protects *this* vnode from demotion
-                // until the next capture — without it a rebalance-acquired
-                // vnode (never cold) could be demoted against stale tier bytes.
+                // `mark_vnode_hot` clears the cold flag (promotion only); `mark_vnode_dirty` then
+                // blocks re-demotion until the next capture — else a rebalance-acquired vnode (never
+                // cold) could be demoted against stale tier bytes.
                 #[cfg(feature = "state-tier")]
                 {
                     agg_state.mark_vnode_hot(vnode);
-                    // mark_vnode_dirty prevents re-demotion until next capture.
                     agg_state.mark_vnode_dirty(vnode);
                 }
                 tracing::debug!(
@@ -1728,7 +1724,7 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
                 // Same-cycle reacquire: `merge_groups` restored `last_emitted`, so emit is a no-op for
-                // these groups — a pending retraction would wrongly drop a still-resident group (Q4c).
+                // these groups — a pending retraction would wrongly drop a still-resident group.
                 self.pending_revoke_retractions.remove(&vnode);
                 #[cfg(feature = "state-tier")]
                 {
@@ -2296,7 +2292,7 @@ mod promotion_tests {
         );
     }
 
-    /// C4: a demoted vnode the tier genuinely cannot produce (here: marked cold but its bytes were
+    /// A demoted vnode the tier genuinely cannot produce (here: marked cold but its bytes were
     /// never written) must ESCALATE to a hard error after a bounded number of promotion fetches —
     /// not retry forever, holding the watermark and backpressuring the source with no signal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2346,7 +2342,7 @@ mod promotion_tests {
         );
     }
 
-    /// C1 regression: a peer batch arriving via `ingest_shuffle` (the checkpoint barrier-alignment
+    /// A peer batch arriving via `ingest_shuffle` (the checkpoint barrier-alignment
     /// drain) for a DEMOTED vnode must DEFER for fetch-on-access promotion — exactly like the
     /// steady-state `process` path — not fold straight into `process_batch`, which would rebuild a
     /// fresh zeroed accumulator while the authoritative state sits in the tier (a silent lost-update

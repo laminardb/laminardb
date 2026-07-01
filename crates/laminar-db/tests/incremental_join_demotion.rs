@@ -1,8 +1,8 @@
 #![cfg(feature = "state-tier")]
-//! Single-node tier-backed IVM changelog⋈changelog join: demotion correctness + restart durability
-//! (A1-emit 3b-S4.6). Mirrors `single_node_group_demotion.rs` but exercises the two-sided join
-//! operator. The join's state (both side Z-sets) is the largest consumer, so a tiny memory budget
-//! reliably demotes its keys; an extra round re-touches them to drive fetch-on-access promotion.
+//! Single-node tier-backed IVM changelog⋈changelog join: demotion correctness + restart durability.
+//! Mirrors `single_node_group_demotion.rs` but exercises the two-sided join operator. The join's
+//! state (both side Z-sets) is the largest consumer, so a tiny memory budget reliably demotes its
+//! keys; an extra round re-touches them to drive fetch-on-access promotion.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -208,8 +208,8 @@ async fn incremental_join_demotion_matches_oracle() {
     );
 }
 
-/// §5.2 in the integrated path: a LEFT join where second-half keys never match (NULL-pad). Their
-/// cold blob encodes an absent right side, so demote→promote must keep them NULL-padded.
+/// A LEFT join where second-half keys never match (NULL-pad). Their cold blob encodes an absent
+/// right side, so demote→promote must keep them NULL-padded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn left_outer_incremental_join_demotion_matches_oracle() {
     let (oracle, _) = run(false, true).await;

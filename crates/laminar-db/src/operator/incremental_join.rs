@@ -33,8 +33,7 @@ use crate::sql_analysis::{IncrementalJoinConfig, JoinProjItem, JoinSide};
 #[cfg(feature = "state-tier")]
 use crate::state_tier::TierRequest;
 
-/// Indexed Z-set: `join_key -> { full_row -> multiplicity }`. The in-memory impl validates IVM
-/// correctness; a tier-backed impl over the group KV will replace it.
+/// Indexed Z-set: `join_key -> { full_row -> multiplicity }`.
 pub(crate) trait JoinStateStore: Send {
     /// Net `weight` into the Z-set for `key`; a row drops at multiplicity ≤ 0.
     fn upsert(&mut self, key: &[ScalarValue], row: &[ScalarValue], weight: i64);
@@ -192,7 +191,7 @@ pub(crate) struct IncrementalJoinOperator {
     out_cols: Option<Vec<(JoinSide, usize)>>,
     out_schema: Option<SchemaRef>,
     // LEFT join: set once the first-sight catch-up has run (or once a checkpoint with a seen right side
-    // is restored), so it fires exactly once and survives a deferred cycle (S4.3).
+    // is restored), so it fires exactly once and survives a deferred cycle.
     left_catchup_done: bool,
     #[cfg(feature = "state-tier")]
     tier: JoinTierState,
@@ -484,9 +483,9 @@ impl IncrementalJoinOperator {
     }
 }
 
-/// Whole-operator checkpoint: resident side Z-sets + the vnodes holding cold keys (rehydrated from
-/// durable cold-only partials on restart) + any promotion-deferred batches (a mid-promotion capture
-/// must carry them — the source already counts them consumed). Replaces the bare two-blob frame.
+/// Whole-operator checkpoint: resident side Z-sets, the vnodes holding cold keys (rehydrated from
+/// cold-only partials on restart), and promotion-deferred batches (a mid-promotion capture must carry
+/// them — the source already counts them consumed).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct JoinOpCheckpoint {
     left: Option<Vec<u8>>,
@@ -630,11 +629,8 @@ fn side_rows_to_ipc(info: &SideInfo, rows: &[(Vec<ScalarValue>, i64)]) -> Result
     batches_to_ipc(&info.schema, std::iter::once(&batch))
 }
 
-// ─── Tier-backed join state (A1-emit Stage 3b — Slice 4) ────────────────────────────────────────
-// S4.1 (this slice): the join-key codec, the two-sided per-key cold blob, and cold/dirty tracking,
-// all unit-tested. The demotion driver (S4.5), fetch-on-access promotion (S4.3), and cold-only-partial
-// recovery (S4.4) wire these into the `GraphOperator` tier hooks; until they do, the items below have
-// only test callers — hence the `allow(dead_code)` until the wiring slices land. Demotion unit = the
+// ─── Tier-backed join state ─────────────────────────────────────────────────────────────────────
+// The join-key codec, the two-sided per-key cold blob, and cold/dirty tracking. Demotion unit = the
 // join key (sides never co-partition onto a shared vnode).
 
 /// Reversible, NULL-safe, multi-column join-key encoding for the tier group key + a restart-stable
@@ -711,7 +707,7 @@ struct JoinTierState {
     // Last touch order per resident key, for idle-first demotion.
     touch_seq: FxHashMap<Vec<ScalarValue>, u64>,
     cold_keys: FxHashSet<Vec<ScalarValue>>,
-    // The cold-tier worker channel; the demotion driver (S4.5) and fetch-on-access (S4.3) use it.
+    // The cold-tier worker channel.
     tier_sender: Option<crate::state_tier::TierTx>,
     // Fetch-on-access: input batches awaiting cold-key promotion (tagged by side + watermark), and
     // the per-key in-flight fetches + consecutive-miss counters.
@@ -1029,7 +1025,7 @@ impl IncrementalJoinOperator {
 
     /// The cold join keys referenced by `batches` on `side`, projected through THAT side's key
     /// columns (not a leading-column slice — the join's keys are not leading and differ per side).
-    /// The fetch-on-access path (S4.3) defers a cycle whose batches touch any cold key.
+    /// The fetch-on-access path defers a cycle whose batches touch any cold key.
     fn cold_keys_touched(
         &self,
         side: JoinSide,
@@ -1097,7 +1093,7 @@ impl IncrementalJoinOperator {
     /// Fetch-on-access cycle: promote any ready cold keys (both sides atomically), then EITHER defer
     /// the whole cycle and fetch it (if any touched key is still cold) OR run one IVM cycle over
     /// deferred+new batches once every touched key is resident. Demotion is atomic per join key across
-    /// both sides, so deferring the whole cycle covers every per-cycle probe (§5.2). Fetch/recv are
+    /// both sides, so deferring the whole cycle covers every per-cycle probe. Fetch/recv are
     /// non-blocking (`try_send`/`try_recv`), so this never awaits.
     fn process_with_promotion(
         &mut self,
@@ -1146,7 +1142,7 @@ impl IncrementalJoinOperator {
             pending.push_back((rwm, JoinSide::Right, b.clone()));
         }
 
-        // 3. Cold keys touched by any pending batch (projected per side, §5.8).
+        // 3. Cold keys touched by any pending batch (projected per side).
         let left_pending: Vec<RecordBatch> = pending
             .iter()
             .filter(|(_, s, _)| *s == JoinSide::Left)
@@ -1159,7 +1155,7 @@ impl IncrementalJoinOperator {
             .collect();
         let mut touched = self.cold_keys_touched(JoinSide::Left, &left_pending)?;
         touched.extend(self.cold_keys_touched(JoinSide::Right, &right_pending)?);
-        // §5.3: the LEFT first-sight catch-up scans the WHOLE left side, so every cold key must be
+        // The LEFT first-sight catch-up scans the WHOLE left side, so every cold key must be
         // resident before it runs. Treat all cold keys as touched on that cycle.
         if first_right && !self.tier.cold_keys.is_empty() {
             touched.extend(self.tier.cold_keys.iter().cloned());
@@ -1183,7 +1179,7 @@ impl IncrementalJoinOperator {
     /// One IVM cycle over already-resolved schemas: `output = δA ⋈ B_new + A_old ⋈ δB`, plus the
     /// LEFT-join NULL-pad transitions and (when `first_right`) the first-sight catch-up. Mutates both
     /// side states in place. `process` resolves schemas + computes `first_right`; the fetch-on-access
-    /// path (S4.3) calls this only once any touched cold keys are resident.
+    /// path calls this only once any touched cold keys are resident.
     fn run_ivm_cycle(
         &mut self,
         left_batches: &[RecordBatch],
@@ -1296,7 +1292,7 @@ impl GraphOperator for IncrementalJoinOperator {
 
         // First sight of the right schema (LEFT join): back-fill NULL-pads for left state accumulated
         // while it was unknown. Gated on `left_catchup_done` (not "was right seen this cycle") so the
-        // trigger survives a deferred cycle (S4.3) and a checkpoint restore (set in `restore_side`).
+        // trigger survives a deferred cycle and a checkpoint restore (set in `restore_side`).
         let first_right = self.left_outer && !self.left_catchup_done && self.right_info.is_some();
 
         #[cfg(feature = "state-tier")]
@@ -1522,7 +1518,7 @@ impl GraphOperator for IncrementalJoinOperator {
 
     // Rehydrate cold keys from a cold-only partial (a merged join frame). Decode + upsert both sides
     // ADDITIVELY — cold keys are disjoint from the manifest's resident keys, so no double count.
-    // `restore_side` resolves a never-resident side's schema from the blob (m11). Single-node has no
+    // `restore_side` resolves a never-resident side's schema from the blob. Single-node has no
     // delta chain, so `deltas` is normally empty; applied additively if present.
     #[cfg(feature = "cluster")]
     fn apply_vnode_chain(
@@ -2064,7 +2060,7 @@ mod tests {
         assert_eq!(snap.len(), 2);
     }
 
-    // ─── Tier-backed join state (A1-emit 3b-S4.1) ───────────────────────────────────────────────
+    // ─── Tier-backed join state ─────────────────────────────────────────────────────────────────
 
     #[cfg(feature = "state-tier")]
     #[test]
@@ -2277,7 +2273,7 @@ mod tests {
         assert_eq!(op.tier.vnode_count, 8);
     }
 
-    // ─── Fetch-on-access against a real cold tier (A1-emit 3b-S4.3) ──────────────────────────────
+    // ─── Fetch-on-access against a real cold tier ───────────────────────────────────────────────
 
     #[cfg(feature = "state-tier")]
     fn spawn_tier() -> (crate::state_tier::TierTx, tempfile::TempDir) {
@@ -2291,7 +2287,7 @@ mod tests {
         (tier, dir)
     }
 
-    // Demote a key the way S4.5 will: capture its blob (dropping the hot rows) and persist it.
+    // Demote a key: capture its blob (dropping the hot rows) and persist it.
     #[cfg(feature = "state-tier")]
     async fn demote_to_tier(
         op: &mut IncrementalJoinOperator,
@@ -2374,7 +2370,7 @@ mod tests {
         assert_eq!(snap.get(&(2, 20, 200)), Some(&1), "untouched key intact");
     }
 
-    // §5.2: a δB-only cycle touching a cold key must defer (term2 = A_old ⋈ δB probes the LEFT side,
+    // A δB-only cycle touching a cold key must defer (term2 = A_old ⋈ δB probes the LEFT side,
     // which is cold) and only join after both sides are promoted atomically.
     #[cfg(feature = "state-tier")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2469,7 +2465,7 @@ mod tests {
         assert!(format!("{err}").contains("LDB-3005"), "got: {err}");
     }
 
-    // ─── Cold-only-partial recovery (A1-emit 3b-S4.4) ───────────────────────────────────────────
+    // ─── Cold-only-partial recovery ─────────────────────────────────────────────────────────────
 
     #[cfg(feature = "state-tier")]
     async fn fetch_group(
@@ -2639,7 +2635,7 @@ mod tests {
         );
     }
 
-    // ─── Demotion driver (A1-emit 3b-S4.5) ──────────────────────────────────────────────────────
+    // ─── Demotion driver ────────────────────────────────────────────────────────────────────────
 
     #[cfg(feature = "state-tier")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

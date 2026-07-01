@@ -292,11 +292,9 @@ impl LaminarDB {
         let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
             .rehydrate(&owned)
             .await;
-        // A per-vnode partial read can fail (transient object-store error) while report.epoch is
-        // still Some; `restored` then holds only the successes. Starting anyway would silently run
-        // the unreadable owned vnodes with EMPTY aggregate state while their source offsets are
-        // already staged — a permanent gap. Fail fast (the supervisor retries), mirroring
-        // rehydrate_cold_vnodes' lost>0 guard.
+        // A partial read can fail transiently while report.epoch is still Some, leaving only
+        // successes in `restored`. Starting then runs the unreadable owned vnodes with empty
+        // state over already-staged offsets — a permanent gap. Fail fast; the supervisor retries.
         if report.has_errors() {
             return Err(DbError::Checkpoint(
                 "[LDB-6032] one or more owned-vnode partials were unreadable on delta-primary \

@@ -150,7 +150,7 @@ async fn resume_after_disconnect() {
     let db = client.database("test_resume");
     let coll = db.collection::<mongodb::bson::Document>("docs");
 
-    // Phase 1: Insert 5 docs and capture resume token.
+    // Insert 5 docs and capture the resume token.
     let config = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
@@ -175,7 +175,7 @@ async fn resume_after_disconnect() {
     let checkpoint = source.checkpoint();
     source.close().await.unwrap();
 
-    // Phase 2: Insert 5 more docs, reopen from checkpoint.
+    // Insert 5 more docs, then reopen from the checkpoint.
     for i in 5..10 {
         coll.insert_one(doc! { "seq": i }).await.unwrap();
     }

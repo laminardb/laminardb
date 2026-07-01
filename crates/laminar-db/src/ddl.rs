@@ -1097,11 +1097,9 @@ impl LaminarDB {
             }
         }
 
-        // Single-statement N-way join → decompose into a left-deep chain of 2-way changelog-join MVs:
-        // hidden `__ivm_{name}_*` intermediates plus a rewritten 2-way final registered under `name`,
-        // each created DIRECTLY (bypassing `execute`'s persistence). Only the original N-way DDL is
-        // persisted, so a cold restart re-decomposes deterministically; in-process the registry holds
-        // the 2-way form.
+        // Single-statement N-way join → decompose into a left-deep chain of 2-way changelog-join MVs
+        // (hidden `__ivm_{name}_*` intermediates + a rewritten 2-way final under `name`), each created
+        // directly. Only the original N-way DDL is persisted, so a cold restart re-decomposes.
         {
             let inc = self.incremental_mv_names();
             if let Some(plan) =
@@ -1633,7 +1631,6 @@ pub(crate) struct ResolvedConnector {
     pub format_options: HashMap<String, String>,
 }
 
-/// Merge the `FROM <TYPE> (...)` and `WITH ('connector' = ...)` syntax into one result.
 /// Whether a `WITH (...)` clause names a connector, matched case-insensitively
 /// to stay consistent with `resolve_connector_info`.
 fn has_connector_key(with_options: &HashMap<String, String>) -> bool {

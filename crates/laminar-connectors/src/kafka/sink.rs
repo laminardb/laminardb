@@ -318,7 +318,6 @@ impl KafkaSink {
                 }
             }
         } else {
-            // For non-string columns, use the Arrow array formatter.
             use std::fmt::Write;
             let formatter = arrow_cast::display::ArrayFormatter::try_new(
                 array,
@@ -329,7 +328,6 @@ impl KafkaSink {
                     "failed to create array formatter for key column: {e}"
                 ))
             })?;
-            // Reusable string buffer for formatted values.
             let mut fmt_buf = String::with_capacity(64);
             for i in 0..num_rows {
                 if array.is_null(i) {
@@ -586,7 +584,6 @@ impl SinkConnector for KafkaSink {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
-        // Re-parse config if properties provided.
         if !config.properties().is_empty() {
             let parsed = KafkaSinkConfig::from_config(config)?;
             self.config = parsed;
@@ -607,13 +604,11 @@ impl SinkConnector for KafkaSink {
             "opening Kafka sink connector"
         );
 
-        // Build rdkafka producer.
         let rdkafka_config: ClientConfig = self.config.to_rdkafka_config();
         let producer: FutureProducer = rdkafka_config.create().map_err(|e| {
             ConnectorError::ConnectionFailed(format!("failed to create producer: {e}"))
         })?;
 
-        // Initialize transactions if exactly-once.
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             producer
                 .init_transactions(self.config.transaction_timeout)
@@ -622,10 +617,8 @@ impl SinkConnector for KafkaSink {
                 })?;
         }
 
-        // Create DLQ producer if configured. Inherits security settings
-        // (SASL, SSL) from the main producer config but is non-transactional.
-        // DLQ records bypass the exactly-once transaction to avoid coupling
-        // error routing with the main data path.
+        // DLQ producer is non-transactional: error routing bypasses the exactly-once
+        // transaction so it stays decoupled from the main data path.
         if self.config.dlq_topic.is_some() {
             let dlq_config = self.config.to_dlq_rdkafka_config();
             let dlq_producer: FutureProducer = dlq_config.create().map_err(|e| {
@@ -634,7 +627,6 @@ impl SinkConnector for KafkaSink {
             self.dlq_producer = Some(dlq_producer);
         }
 
-        // Initialize Schema Registry client if configured.
         if let Some(ref url) = self.config.schema_registry_url {
             if self.schema_registry.is_none() {
                 let sr = if let Some(ref ca_path) = self.config.schema_registry_ssl_ca_location {
@@ -650,10 +642,9 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Set SR compatibility level if configured.
-        // Schema registration is deferred to first write_batch() where the
-        // real pipeline output schema is known (the factory default is a
-        // placeholder that would pollute the registry and break compat checks).
+        // Schema registration is deferred to the first write_batch(), where the real pipeline
+        // output schema is known — the factory default is a placeholder that would pollute the
+        // registry and break compat checks.
         if self.config.format == Format::Avro {
             if let Some(ref sr) = self.schema_registry {
                 if let Some(ref compat) = self.config.schema_compatibility {
@@ -669,7 +660,6 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Query broker metadata for actual topic partition count.
         // Reset to fallback first so a reopened sink doesn't keep a stale count.
         self.topic_partition_count = FALLBACK_PARTITION_COUNT;
         match producer
@@ -734,13 +724,11 @@ impl SinkConnector for KafkaSink {
                 actual: "producer is None".into(),
             })?;
 
-        // Serialize the RecordBatch into per-row byte payloads.
         let payloads = self.serializer.serialize(batch).map_err(|e| {
             self.metrics.record_serialization_error();
             ConnectorError::Serde(e)
         })?;
 
-        // Extract keys if key column is configured.
         let keys = self.extract_keys(batch)?;
 
         let mut records_written: usize = 0;
@@ -762,8 +750,7 @@ impl SinkConnector for KafkaSink {
                 record = record.partition(p);
             }
 
-            // 500ms matches the old `send(record, 500ms)` contract: ride
-            // out transient QueueFull bursts before giving up.
+            // 500ms budget rides out transient QueueFull bursts before giving up.
             let fut = Self::enqueue_with_queue_retry(producer, record, Duration::from_millis(500))
                 .await?;
             delivery_futures.push((Instant::now(), fut));
@@ -999,11 +986,10 @@ impl SinkConnector for KafkaSink {
             .with_idempotent()
             .with_partitioned();
 
-        // Upsert envelope collapses a Z-set changelog to key-unique records + tombstones, so it can
-        // consume an incremental MV's changelog (append-only mode cannot — it drops retractions).
-        // `with_changelog` is load-bearing: it makes `prepare_for_sink` pass the raw weighted
-        // changelog through unchanged so `collapse_changelog` can see the retracts (else they're
-        // stripped before the sink and deletes never become tombstones).
+        // Upsert collapses a Z-set changelog to key-unique records + tombstones, so it can consume
+        // an incremental MV's changelog (append-only mode drops retractions). `with_changelog`
+        // keeps `prepare_for_sink` from stripping retracts before the sink, so deletes still become
+        // tombstones.
         if self.config.envelope == SinkEnvelope::Upsert {
             caps = caps.with_upsert().with_changelog();
         }

@@ -2183,7 +2183,7 @@ impl IncrementalAggState {
     #[cfg(feature = "cluster")]
     /// Drop revoked vnodes' groups AND return per-vnode `-1`-weight retraction batches (built from
     /// `last_emitted` before the purge) so the losing node's incremental MV snapshot drops the moved
-    /// groups — otherwise a distributed read double-counts them (ADR-007 Q4). Empty unless changelog.
+    /// groups — otherwise a distributed read double-counts them. Empty unless changelog.
     pub(crate) fn drop_vnodes(
         &mut self,
         revoked: &rustc_hash::FxHashSet<u32>,
@@ -4116,8 +4116,7 @@ mod tests {
 
     /// A changelog aggregate's delta chain must reproduce BOTH the group state and the
     /// `last_emitted` dedup map, so the first post-recovery emit re-emits nothing and a
-    /// later change emits identically. This is what let changelog aggs drop the force-FULL
-    /// gate (`changelog-delta-last-emitted`).
+    /// later change emits identically.
     #[cfg(feature = "cluster")]
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one coherent replay scenario with local scaffolding
@@ -4510,7 +4509,7 @@ mod tests {
         assert_eq!(state.demotable_groups(V, 256).len(), 2);
     }
 
-    /// C3 residual: a group demoted while within the idle TTL that later crosses the TTL while cold
+    /// A group demoted while within the idle TTL that later crosses the TTL while cold
     /// must be detected by `cold_groups_past_idle_ttl`, then promote-then-retracted so its changelog
     /// row does not leak past the TTL and its tier entry is reclaimed.
     #[cfg(feature = "state-tier")]
@@ -4732,7 +4731,7 @@ mod tests {
         assert_eq!(value, ScalarValue::Float64(Some(6.0)));
     }
 
-    /// C2: a vnode holding a demoted group re-bases at the chain bound like any other — but the
+    /// A vnode holding a demoted group re-bases at the chain bound like any other — but the
     /// re-base CARRIES the cold group (`FullWithColdGroups`), so the new base is self-contained and
     /// the old one unreferences. Recovering from the new base ALONE (the old base + deltas pruned)
     /// must still reproduce the cold group's value. Before the fix the vnode deferred forever, the
@@ -4862,7 +4861,7 @@ mod tests {
         );
     }
 
-    /// C2 Issue-1: a FULLY cold vnode (every resident group demoted — here the single group of a
+    /// A FULLY cold vnode (every resident group demoted — here the single group of a
     /// global aggregate) must stay in the capture set so its chain keeps advancing. Otherwise it
     /// stages nothing, the coordinator writes an empty `base_epoch=None` partial that orphans the
     /// chain base immediately, and recovery loses the demoted state. Asserts the vnode is captured
@@ -5390,7 +5389,7 @@ mod tests {
         // Revoke vy.
         let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
         let retractions = state.drop_vnodes(&revoked, VC).unwrap();
-        // The revoked vnode's still-materialized groups are retracted (-1) from the MV snapshot (Q4);
+        // The revoked vnode's still-materialized groups are retracted (-1) from the MV snapshot;
         // the sibling vnode is untouched.
         assert!(
             retractions.contains_key(&vy),
@@ -6733,7 +6732,7 @@ mod tests {
 
     /// Profiling (not a correctness test): measures the on-task whole-node
     /// `checkpoint_groups` capture cost vs group count — the cost an incremental
-    /// (dirty-only) capture would shrink (Track A1). Reports total time, ns/group,
+    /// (dirty-only) capture would shrink. Reports total time, ns/group,
     /// and serialized size, so the incremental win for a given dirty ratio is
     /// `ns/group * dirty_count`. `#[ignore]`d; run in release:
     /// `cargo test -p laminar-db --release profile_checkpoint_capture -- --ignored --nocapture`

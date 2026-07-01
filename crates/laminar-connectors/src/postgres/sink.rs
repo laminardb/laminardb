@@ -550,11 +550,8 @@ impl PostgresSink {
             }
         }
 
-        // Process inserts/updates first, then deletes.
-        // This handles the common CDC pattern where a key is inserted then
-        // later deleted within the same epoch. For the rare case where a key
-        // is deleted then re-inserted in the same batch, the upsert after
-        // delete produces the correct final state.
+        // Inserts/updates before deletes: a key inserted then deleted in the same epoch
+        // ends deleted; deleted then re-inserted ends at the upserted state.
         if !all_inserts.is_empty() {
             let insert_batch =
                 arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
@@ -677,7 +674,6 @@ impl PostgresSink {
 
 // ── SinkConnector implementation ────────────────────────────────────
 
-// When the postgres-sink feature is enabled, provide the real implementation.
 #[cfg(feature = "postgres-sink")]
 #[async_trait]
 impl SinkConnector for PostgresSink {
@@ -998,7 +994,6 @@ impl SinkConnector for PostgresSink {
     }
 }
 
-// When postgres-sink feature is NOT enabled, provide a stub that returns UnsupportedOperation.
 #[cfg(not(feature = "postgres-sink"))]
 #[async_trait]
 impl SinkConnector for PostgresSink {

@@ -362,7 +362,7 @@ fn upsert_test_brokers() -> Option<String> {
     kafka_brokers().map(String::from)
 }
 
-/// Phase 1b: an incremental aggregate MV feeding a Kafka `ENVELOPE UPSERT` sink emits one keyed
+/// An incremental aggregate MV feeding a Kafka `ENVELOPE UPSERT` sink emits one keyed
 /// record per group; the latest value per key on the topic equals the current aggregate, and an
 /// update (retract+insert) collapses to a single latest value — no lossy positive-only stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -451,9 +451,9 @@ async fn scenario_incremental_agg_kafka_upsert() {
     );
 }
 
-/// P4: a CREATE STREAM projecting an incremental MV forwards its netted changelog to a downstream
-/// capability-aware sink. Composes the stream consumer (P4) with the Kafka `ENVELOPE UPSERT` sink
-/// (P1b): the topic's latest-per-key equals the current aggregate.
+/// A CREATE STREAM projecting an incremental MV forwards its netted changelog to a downstream
+/// capability-aware sink. Composes the stream consumer with the Kafka `ENVELOPE UPSERT` sink:
+/// the topic's latest-per-key equals the current aggregate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
     let Some(brokers) = upsert_test_brokers() else {

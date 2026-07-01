@@ -352,7 +352,7 @@ mod exactly_once {
     async fn test_barrier_checkpoint_recovery_round_trip() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Phase 1: Run pipeline, trigger barrier checkpoint, persist.
+        // Run pipeline, trigger barrier checkpoint, persist.
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 5));
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
