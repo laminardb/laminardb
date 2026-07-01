@@ -448,3 +448,84 @@ async fn test_epoch_recovery_skips_replay() {
     assert_eq!(row.get::<_, &str>(0), "original");
     assert!((row.get::<_, f64>(1) - 1.0).abs() < f64::EPSILON);
 }
+
+// ── Z-set changelog collapse (incremental MV → upsert) ──────────────
+
+fn changelog_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("__weight", DataType::Int64, false),
+    ]))
+}
+
+fn make_changelog(ids: &[i64], names: &[&str], values: &[f64], weights: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        changelog_schema(),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+            Arc::new(Float64Array::from(values.to_vec())),
+            Arc::new(Int64Array::from(weights.to_vec())),
+        ],
+    )
+    .expect("changelog batch")
+}
+
+/// A Z-set (`__weight`) changelog from an incremental MV is collapsed per primary key before the
+/// UNNEST upsert: retract+insert nets to an update, and a key with only net-negative weight becomes
+/// a DELETE. Without the collapse the raw changelog has no `_op` and fails the split.
+#[tokio::test]
+async fn test_upsert_collapses_zset_changelog() {
+    let (_container, host, port) = start_pg().await;
+
+    let mut config = sink_config(&host, port, WriteMode::Upsert);
+    config.changelog_mode = true;
+    let mut sink = PostgresSink::new(changelog_schema(), config, None);
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open");
+
+    // Epoch 1: three groups appear.
+    sink.write_batch(&make_changelog(
+        &[1, 2, 3],
+        &["alice", "bob", "carol"],
+        &[10.0, 20.0, 30.0],
+        &[1, 1, 1],
+    ))
+    .await
+    .expect("write epoch 1");
+    sink.flush().await.expect("flush epoch 1");
+
+    // Epoch 2: id=1 updates (retract 10, insert 15); id=3 is removed (retract only).
+    sink.write_batch(&make_changelog(
+        &[1, 1, 3],
+        &["alice", "alice", "carol"],
+        &[10.0, 15.0, 30.0],
+        &[-1, 1, -1],
+    ))
+    .await
+    .expect("write epoch 2");
+    sink.flush().await.expect("flush epoch 2");
+
+    let pg = connect(&host, port).await;
+    let rows = pg
+        .query("SELECT id, value FROM public.test_events ORDER BY id", &[])
+        .await
+        .expect("select");
+    assert_eq!(
+        rows.len(),
+        2,
+        "id=3 deleted, id=1 updated in place, id=2 kept"
+    );
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert!(
+        (rows[0].get::<_, f64>(1) - 15.0).abs() < f64::EPSILON,
+        "id=1 collapsed to its latest value 15"
+    );
+    assert_eq!(rows[1].get::<_, i64>(0), 2);
+    assert!((rows[1].get::<_, f64>(1) - 20.0).abs() < f64::EPSILON);
+
+    sink.close().await.expect("close");
+}

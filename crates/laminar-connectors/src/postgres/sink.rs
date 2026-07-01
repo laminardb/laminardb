@@ -23,9 +23,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
+use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
+use laminar_core::changelog::WEIGHT_COLUMN;
 
 use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
@@ -515,10 +517,30 @@ impl PostgresSink {
         let mut total_rows: u64 = 0;
         let mut total_bytes: u64 = 0;
 
-        // Split each buffered batch into inserts/deletes.
+        // A Z-set changelog (incremental MV) carries `__weight` (no `_op`). Collapse the whole epoch
+        // per primary key into a cardinality-safe `{U,D}` batch that `split_changelog_batch`
+        // understands — otherwise the many retract+insert events per key fail the split (no `_op`) or
+        // violate ON CONFLICT cardinality. A CDC changelog (`_op`, no `__weight`) is split as before.
+        let is_zset = self
+            .buffer
+            .iter()
+            .any(|b| b.schema().index_of(WEIGHT_COLUMN).is_ok());
+        let split_input: Vec<RecordBatch> = if is_zset {
+            let schema = self.buffer[0].schema();
+            let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
+                .map_err(|e| ConnectorError::Internal(format!("concat changelog: {e}")))?;
+            vec![collapse_changelog(
+                &combined,
+                &self.config.primary_key_columns,
+            )?]
+        } else {
+            self.buffer.clone()
+        };
+
+        // Split each batch into inserts/deletes.
         let mut all_inserts = Vec::new();
         let mut all_deletes = Vec::new();
-        for batch in &self.buffer {
+        for batch in &split_input {
             let (ins, del) = Self::split_changelog_batch(batch)?;
             if ins.num_rows() > 0 {
                 all_inserts.push(ins);
