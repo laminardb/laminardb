@@ -1297,16 +1297,6 @@ impl LaminarDB {
         sources
     }
 
-    /// `true` if `name` is an incremental MV (emits a dirty-only `__weight` changelog into a
-    /// snapshot store). Consumers that can't net retractions are rejected at DDL.
-    pub(crate) fn is_incremental_mv(&self, name: &str) -> bool {
-        self.connector_manager
-            .lock()
-            .streams()
-            .get(name)
-            .is_some_and(|r| r.incremental)
-    }
-
     /// The first table reference in `query_sql` that is an incremental MV, if any.
     fn first_incremental_ref(&self, query_sql: &str) -> Option<String> {
         let refs = crate::sql_analysis::extract_table_references(query_sql);

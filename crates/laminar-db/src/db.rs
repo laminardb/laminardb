@@ -1604,10 +1604,9 @@ impl LaminarDB {
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
-        // An incremental MV emits a changelog, not a snapshot stream, so it can't be a SUBSCRIBE terminal.
-        if self.is_incremental_mv(name) {
-            return Err(crate::ddl::incremental_mv_consumer_error(name, "SUBSCRIBE"));
-        }
+        // An incremental MV is subscribable: the SUBSCRIBE wire stays plain rows — a Tail subscriber
+        // is seeded with the current snapshot below and receives the consolidated snapshot each cycle
+        // (`update_mv_stores`), not the raw `__weight` changelog. (Opt-in signed-diff is future work.)
 
         let attached = self.subscription_registry.subscriber_count(name);
         if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
@@ -1632,7 +1631,7 @@ impl LaminarDB {
             Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
         };
 
-        let (replay, rx) = self
+        let (mut replay, rx) = self
             .subscription_registry
             .subscribe(name, start)
             .map_err(|e| {
@@ -1646,6 +1645,17 @@ impl LaminarDB {
                     e.earliest_retained
                 ))
             })?;
+
+        // Seed a Tail subscriber with the current snapshot so it sees present state immediately
+        // instead of waiting for the next change — the snapshot-then-changelog contract, with the
+        // "changelog" delivered as subsequent consolidated snapshots (plain rows).
+        if matches!(start, crate::subscription::SubscribeStart::Tail) {
+            if let Some(snap) = self.mv_store.read().to_record_batch(name) {
+                if snap.num_rows() > 0 {
+                    replay.insert(0, crate::subscription::MvUpdate::Batch(snap));
+                }
+            }
+        }
         Ok(match filter {
             Some(phys) => crate::subscription::SubscriptionPortal::open_with_filter(
                 name, schema, replay, rx, phys,

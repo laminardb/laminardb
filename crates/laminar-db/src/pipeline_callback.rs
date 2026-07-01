@@ -1341,14 +1341,32 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let mut store = self.mv_store.write();
         let mut updates = 0u64;
         for (stream_name, batches) in results {
-            if store.has_mv(stream_name) {
-                for batch in batches {
-                    if batch.num_rows() > 0 {
-                        store.update(stream_name, batch);
-                        updates += 1;
+            if !store.has_mv(stream_name) {
+                continue;
+            }
+            // A changelog MV (batches carry `__weight`) must not put the raw Z-set changelog on the
+            // SUBSCRIBE wire — subscribers get plain rows. Apply to the store, then broadcast the
+            // consolidated snapshot instead (only when someone is listening). A full-emit MV keeps
+            // forwarding its per-cycle batch verbatim (that batch already IS its full state).
+            let changelog = batches.iter().any(|b| {
+                b.num_rows() > 0
+                    && b.schema()
+                        .index_of(laminar_core::changelog::WEIGHT_COLUMN)
+                        .is_ok()
+            });
+            for batch in batches {
+                if batch.num_rows() > 0 {
+                    store.update(stream_name, batch);
+                    updates += 1;
+                    if !changelog {
                         self.subscription_registry
                             .send_batch(stream_name, batch.clone());
                     }
+                }
+            }
+            if changelog && self.subscription_registry.subscriber_count(stream_name) > 0 {
+                if let Some(snap) = store.to_record_batch(stream_name) {
+                    self.subscription_registry.send_batch(stream_name, snap);
                 }
             }
         }

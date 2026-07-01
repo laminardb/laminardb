@@ -5,7 +5,9 @@
 //! 1. serves `SELECT * FROM mv` snapshots equal to a full recompute (the upsert store is
 //!    maintained from the operator's dirty-only changelog), and
 //! 2. survives checkpoint → restart with a correct snapshot, and
-//! 3. rejects streaming consumers (chained MV / sink / SUBSCRIBE) of its changelog.
+//! 3. feeds downstream consumers of its changelog — chained agg/projection MVs, capability-aware
+//!    sinks (upsert/changelog-capable), and SUBSCRIBE (plain consolidated snapshots) — while still
+//!    rejecting shapes it can't net (e.g. an arbitrary join, a non-capable sink).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -96,6 +98,23 @@ async fn read_query(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
         }
     }
     rows.sort();
+    rows
+}
+
+/// Parse a plain `agg` batch (`k, total, cnt`) into sorted `(k, total, cnt)` rows.
+fn rows_of(b: &RecordBatch) -> Vec<(i64, i64, i64)> {
+    let col = |i: usize| {
+        b.column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone()
+    };
+    let (ks, totals, cnts) = (col(0), col(1), col(2));
+    let mut rows: Vec<(i64, i64, i64)> = (0..b.num_rows())
+        .map(|r| (ks.value(r), totals.value(r), cnts.value(r)))
+        .collect();
+    rows.sort_unstable();
     rows
 }
 
@@ -978,5 +997,68 @@ async fn single_statement_multiway_left_step() {
             vec![Some(2), Some(20), Some(200), None],
         ]
     );
+    db.shutdown().await.unwrap();
+}
+
+/// SUBSCRIBE to an incremental MV is allowed (was `[LDB-1300]`) and delivers PLAIN rows: a Tail
+/// subscriber is seeded with the current snapshot, and a subsequent change arrives as a fresh
+/// consolidated snapshot — never the raw `__weight` changelog.
+#[tokio::test]
+async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
+    use laminar_db::subscription::{PortalFrame, SubscribeStart};
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Previously rejected; now returns a portal.
+    let mut portal = db
+        .open_subscription("agg", None, SubscribeStart::Tail)
+        .await
+        .expect("SUBSCRIBE to an incremental MV is now allowed");
+    // The wire schema is the plain MV schema — no `__weight`.
+    assert!(
+        portal.schema().index_of("__weight").is_err(),
+        "SUBSCRIBE wire schema must be plain rows"
+    );
+
+    // Seeded with the current snapshot (k1=10, k2=20), as plain rows.
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), portal.next_frame())
+        .await
+        .expect("a frame within the deadline")
+        .expect("a portal frame");
+    let PortalFrame::Batch(b) = frame else {
+        panic!("expected a Batch frame, got {frame:?}");
+    };
+    assert!(
+        b.schema().index_of("__weight").is_err(),
+        "snapshot batch must be plain rows (no __weight)"
+    );
+    assert_eq!(rows_of(&b), vec![(1, 10, 1), (2, 20, 1)], "seeded snapshot");
+
+    // A change arrives as a fresh consolidated snapshot (k1: 10 -> 15).
+    source.push_arrow(batch(&[1], &[5])).unwrap();
+    let mut saw_update = false;
+    for _ in 0..20 {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), portal.next_frame()).await {
+            Ok(Some(PortalFrame::Batch(b))) => {
+                if rows_of(&b).iter().any(|&(k, t, _)| k == 1 && t == 15) {
+                    saw_update = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {} // Barrier/Lagged — keep polling
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        saw_update,
+        "subscriber must receive the updated snapshot k1=15"
+    );
+    portal.close();
     db.shutdown().await.unwrap();
 }
