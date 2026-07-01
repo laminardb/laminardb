@@ -300,3 +300,153 @@ async fn incremental_join_demotion_survives_restart() {
         db.shutdown().await.unwrap();
     }
 }
+
+async fn open_multiway3(
+    ckpt: &std::path::Path,
+    state_dir: &std::path::Path,
+    tier_dir: &std::path::Path,
+) -> LaminarDB {
+    let store = Arc::new(LocalFileSystem::new_with_prefix(state_dir).unwrap());
+    let backend = Arc::new(ObjectStoreBackend::new(store, "node-0", VNODES));
+    let registry = Arc::new(VnodeRegistry::new(VNODES));
+    registry.set_assignment((0..VNODES).map(|_| NodeId(0)).collect::<Vec<_>>().into());
+    let db = LaminarDB::builder()
+        .storage_dir(ckpt)
+        .checkpoint(StreamCheckpointConfig {
+            interval_ms: None,
+            incremental_emit: true,
+            ..StreamCheckpointConfig::default()
+        })
+        .state_backend(backend)
+        .vnode_registry(registry)
+        .state_tier_dir(tier_dir)
+        .state_memory_budget_bytes(4096)
+        .state_tier_group_demotion(true)
+        .build()
+        .await
+        .unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    for (m, c) in [("agg_a", "ev_a"), ("agg_b", "ev_b"), ("agg_c", "ev_c")] {
+        db.execute(&format!(
+            "CREATE MATERIALIZED VIEW {m} AS SELECT k, SUM(v) AS t FROM {c} GROUP BY k"
+        ))
+        .await
+        .unwrap();
+    }
+    // Single-statement 3-way join (decomposed into __ivm_abc_0 + abc; both demote/recover).
+    db.execute(
+        "CREATE MATERIALIZED VIEW abc AS \
+         SELECT a.k, a.t AS ta, b.t AS tb, c.t AS tc \
+         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
+    )
+    .await
+    .unwrap();
+    db
+}
+
+async fn read_abc(db: &LaminarDB) -> BTreeMap<i64, (i64, i64, i64)> {
+    let result = db.execute("SELECT k, ta, tb, tc FROM abc").await.unwrap();
+    let ExecuteResult::Query(mut q) = result else {
+        panic!("expected Query");
+    };
+    tokio::task::yield_now().await;
+    let mut sub = q.subscribe_raw().unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let mut out = BTreeMap::new();
+    for _ in 0..8192 {
+        match sub.poll() {
+            Some(b) => {
+                let col = |i: usize| {
+                    b.column(i)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .clone()
+                };
+                let (k, ta, tb, tc) = (col(0), col(1), col(2), col(3));
+                for r in 0..b.num_rows() {
+                    out.insert(k.value(r), (ta.value(r), tb.value(r), tc.value(r)));
+                }
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// A SINGLE-statement 3-way join under demotion (both the hidden intermediate and the final join
+/// operator shed cold keys) survives checkpoint -> restart: a post-restart update nets correctly only
+/// if both operators' side Z-sets recovered from their cold-only partials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_statement_multiway_demotion_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ckpt = dir.path().join("ckpt");
+    let state_dir = dir.path().join("state");
+    let tier_dir = dir.path().join("tier");
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    {
+        let db = open_multiway3(&ckpt, &state_dir, &tier_dir).await;
+        db.start().await.unwrap();
+        let all: Vec<i64> = (0..KEYS).collect();
+        for _ in 0..3 {
+            db.source_untyped("ev_a")
+                .unwrap()
+                .push_arrow(kv_batch(&all, 1))
+                .unwrap();
+            db.source_untyped("ev_b")
+                .unwrap()
+                .push_arrow(kv_batch(&all, 10))
+                .unwrap();
+            db.source_untyped("ev_c")
+                .unwrap()
+                .push_arrow(kv_batch(&all, 100))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert!(db.checkpoint().await.unwrap().success);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while db.tier_metrics().demote_total == 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(Instant::now() < deadline, "demotion never fired");
+        }
+        assert!(db.checkpoint().await.unwrap().success); // write demoted keys to cold-only partials
+        let pre = read_abc(&db).await;
+        assert_eq!(pre.len() as i64, KEYS, "all keys joined pre-restart");
+        assert!(
+            pre.values().all(|&(a, b, c)| a == 3 && b == 30 && c == 300),
+            "every key is (3,30,300) pre-restart"
+        );
+        db.close();
+    }
+
+    {
+        let db = open_multiway3(&ckpt, &state_dir, &tier_dir).await;
+        db.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let all: Vec<i64> = (0..KEYS).collect();
+        db.source_untyped("ev_a")
+            .unwrap()
+            .push_arrow(kv_batch(&all, 1))
+            .unwrap(); // ta 3 -> 4
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut after = read_abc(&db).await;
+        while (0..KEYS).any(|k| after.get(&k) != Some(&(4, 30, 300))) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            after = read_abc(&db).await;
+        }
+        let lost: Vec<i64> = (0..KEYS)
+            .filter(|k| after.get(k) != Some(&(4, 30, 300)))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "keys lost/wrong after restart (want (4,30,300)): {:?}",
+            &lost[..lost.len().min(10)]
+        );
+        db.shutdown().await.unwrap();
+    }
+}

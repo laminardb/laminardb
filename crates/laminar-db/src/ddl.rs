@@ -1071,17 +1071,43 @@ impl LaminarDB {
             if let Some(plan) =
                 crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
             {
-                for (iname, ibody) in plan.intermediates {
-                    Box::pin(self.create_decomposed_mv(&format!(
-                        "CREATE MATERIALIZED VIEW {iname} AS {ibody}"
-                    )))
-                    .await?;
+                // OR REPLACE: drop the previous definition (its DROP cascade also removes the old
+                // hidden intermediates) before rebuilding the chain.
+                if or_replace {
+                    let _ = Box::pin(
+                        self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {name_str}")),
+                    )
+                    .await;
                 }
-                return Box::pin(self.create_decomposed_mv(&format!(
-                    "CREATE MATERIALIZED VIEW {name_str} AS {}",
-                    plan.final_query
-                )))
-                .await;
+                // Create the chain; on any failure, unwind the intermediates already created so CREATE
+                // stays all-or-nothing (no orphan `__ivm_*` MVs left behind).
+                let mut created: Vec<String> = Vec::new();
+                let outcome: Result<ExecuteResult, DbError> = 'chain: {
+                    for (iname, ibody) in &plan.intermediates {
+                        if let Err(e) = Box::pin(self.create_decomposed_mv(&format!(
+                            "CREATE MATERIALIZED VIEW {iname} AS {ibody}"
+                        )))
+                        .await
+                        {
+                            break 'chain Err(e);
+                        }
+                        created.push(iname.clone());
+                    }
+                    Box::pin(self.create_decomposed_mv(&format!(
+                        "CREATE MATERIALIZED VIEW {name_str} AS {}",
+                        plan.final_query
+                    )))
+                    .await
+                };
+                if outcome.is_err() {
+                    for iname in &created {
+                        let _ = Box::pin(
+                            self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {iname}")),
+                        )
+                        .await;
+                    }
+                }
+                return outcome;
             }
         }
 

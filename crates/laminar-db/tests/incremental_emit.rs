@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::{Array, Int64Array, RecordBatch};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{ExecuteResult, LaminarConfig, LaminarDB};
 
@@ -799,6 +799,137 @@ async fn single_statement_multiway_star_join() {
     assert_eq!(
         read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
         vec![vec![1, 10, 100, 1000], vec![2, 20, 200, 2500]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// Like `read_query` but tolerates NULLs (LEFT-join pads), returning `None` for a NULL cell.
+async fn read_query_nullable(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<Option<i64>>> {
+    let result = db.execute(sql).await.unwrap();
+    let ExecuteResult::Query(mut q) = result else {
+        panic!("expected Query result");
+    };
+    tokio::task::yield_now().await;
+    let mut sub = q.subscribe_raw().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut rows = Vec::new();
+    for _ in 0..4096 {
+        match sub.poll() {
+            Some(b) => {
+                for r in 0..b.num_rows() {
+                    let row: Vec<Option<i64>> = (0..ncols)
+                        .map(|c| {
+                            let col = b.column(c).as_any().downcast_ref::<Int64Array>().unwrap();
+                            (!col.is_null(r)).then(|| col.value(r))
+                        })
+                        .collect();
+                    rows.push(row);
+                }
+            }
+            None => break,
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// A single-statement 4-way join (2 hidden intermediates) nets correctly under updates on every side.
+#[tokio::test]
+async fn single_statement_multiway_4way_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c", "ev_d"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    for (m, c, col) in [
+        ("agg_a", "ev_a", "ta"),
+        ("agg_b", "ev_b", "tb"),
+        ("agg_c", "ev_c", "tc"),
+        ("agg_d", "ev_d", "td"),
+    ] {
+        db.execute(&format!(
+            "CREATE MATERIALIZED VIEW {m} AS SELECT k, SUM(v) AS {col} FROM {c} GROUP BY k"
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute(
+        "CREATE MATERIALIZED VIEW abcd AS \
+         SELECT a.k, a.ta, b.tb, c.tc, d.td \
+         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k JOIN agg_d d ON c.k = d.k",
+    )
+    .await
+    .expect("single-statement 4-way join accepted");
+    db.start().await.unwrap();
+
+    let src = |n: &str| db.source_untyped(n).unwrap();
+    src("ev_a").push_arrow(batch(&[1], &[10])).unwrap();
+    src("ev_b").push_arrow(batch(&[1], &[100])).unwrap();
+    src("ev_c").push_arrow(batch(&[1], &[1000])).unwrap();
+    src("ev_d").push_arrow(batch(&[1], &[10000])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    src("ev_d").push_arrow(batch(&[1], &[5000])).unwrap(); // td 10000 -> 15000
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    assert_eq!(
+        read_query(&db, "SELECT k, ta, tb, tc, td FROM abcd", 5).await,
+        vec![vec![1, 10, 100, 1000, 15000]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// A single-statement chain with a LEFT step: a key present up to the LEFT boundary but with no
+/// right match is NULL-padded through the decomposed final join.
+#[tokio::test]
+async fn single_statement_multiway_left_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    for s in ["ev_a", "ev_b", "ev_c"] {
+        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
+            .await
+            .unwrap();
+    }
+    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW abc AS \
+         SELECT a.k, a.ta, b.tb, c.tc \
+         FROM agg_a a JOIN agg_b b ON a.k = b.k LEFT JOIN agg_c c ON b.k = c.k",
+    )
+    .await
+    .expect("LEFT step in a multi-way chain accepted");
+    db.start().await.unwrap();
+
+    // Keys 1,2 on a+b; agg_c only for key 1 → key 2's tc is NULL.
+    db.source_untyped("ev_a")
+        .unwrap()
+        .push_arrow(batch(&[1, 2], &[10, 20]))
+        .unwrap();
+    db.source_untyped("ev_b")
+        .unwrap()
+        .push_arrow(batch(&[1, 2], &[100, 200]))
+        .unwrap();
+    db.source_untyped("ev_c")
+        .unwrap()
+        .push_arrow(batch(&[1], &[1000]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    assert_eq!(
+        read_query_nullable(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
+        vec![
+            vec![Some(1), Some(10), Some(100), Some(1000)],
+            vec![Some(2), Some(20), Some(200), None],
+        ]
     );
     db.shutdown().await.unwrap();
 }
