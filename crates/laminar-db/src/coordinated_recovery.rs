@@ -92,9 +92,9 @@ impl RecoveryMonitor {
     }
 
     /// Leader: fix `N`, announce, restore self (retrying), then wait for every live node to report
-    /// restored. Releases the fence on exit; clears the announcement only on full success (self
-    /// restored AND quorum met) so a failed round leaves the announcement live for stragglers/retry
-    /// rather than stranding a divergent node.
+    /// restored. Always releases the fence and retires the announcement on exit (so an incomplete
+    /// round can't leave a stale target for a later restart to replay); an incomplete round bumps
+    /// `coordinated_recovery_failures_total` and relies on a still-faulted node re-triggering.
     async fn drive_round(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
         let Some(target) = compute_target_epoch(db).await else {
             tracing::warn!("coordinated recovery: no committed epoch yet; skipping round");
@@ -132,22 +132,21 @@ impl RecoveryMonitor {
             false
         };
         controller.set_recovering(false);
+        // Always retire the announcement — a lingering target would be replayed by a later fresh
+        // restart (applied_gen resets to 0); a still-faulted straggler re-triggers a fresh round.
+        controller.clear_recover().await;
         if restored && quorum_met {
-            // Full success: retire the announcement so a later peer-restart can't replay it.
-            controller.clear_recover().await;
             tracing::warn!(
                 gen = gen_id,
                 "coordinated recovery complete; fence released"
             );
         } else {
-            // Leave the announcement live for a straggler/leader retry next tick; clearing it would
-            // strand a divergent node.
             if let Some(m) = db.engine_metrics.lock().clone() {
                 m.coordinated_recovery_failures_total.inc();
             }
             tracing::error!(
                 gen = gen_id,
-                "coordinated recovery round incomplete; leaving announcement live for retry"
+                "coordinated recovery round incomplete; announcement retired"
             );
         }
     }

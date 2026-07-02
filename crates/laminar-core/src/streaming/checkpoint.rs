@@ -104,5 +104,8 @@ mod tests {
         assert!(config.data_dir.is_none());
         assert!(config.max_retained.is_none());
         assert!(config.alignment_timeout_ms.is_none());
+        // Deliberate non-Default-derive values — guard against a silent revert.
+        assert!(config.incremental_emit);
+        assert!(!config.uncommitted_epochs_backpressure);
     }
 }

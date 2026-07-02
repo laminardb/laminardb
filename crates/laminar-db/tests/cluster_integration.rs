@@ -1274,6 +1274,31 @@ mod failures {
         );
         assert!(err.contains("LDB-3006"), "expected LDB-3006, got: {err}");
 
+        // Single-statement multi-way decomposition is also rejected: each hidden 2-way intermediate
+        // hits the same guard, so the CREATE fails (and the atomic unwind removes any intermediate).
+        leader
+            .execute("CREATE SOURCE ev_c (k BIGINT, v BIGINT)")
+            .await
+            .expect("src c");
+        leader
+            .execute(
+                "CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k",
+            )
+            .await
+            .expect("agg c");
+        let multi_way = leader
+            .execute(
+                "CREATE MATERIALIZED VIEW jm AS \
+                 SELECT a.k, a.ta, b.tb, c.tc FROM agg_a a \
+                 JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
+            )
+            .await;
+        let merr = format!(
+            "{:?}",
+            multi_way.expect_err("multi-way incremental join must be rejected in a cluster")
+        );
+        assert!(merr.contains("LDB-3006"), "expected LDB-3006, got: {merr}");
+
         harness.shutdown().await;
     }
 }

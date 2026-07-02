@@ -211,15 +211,15 @@ impl MongoDbSink {
             WriteMode::Upsert { key_fields } => key_fields.clone(),
             _ => return Ok(false),
         };
-        if self.buffer.is_empty()
-            || !self
-                .buffer
-                .iter()
-                .any(|b| b.schema().index_of(WEIGHT_COLUMN).is_ok())
-        {
+        // Gate on buffer[0] — it supplies the concat schema (concat requires all batches match it);
+        // `any` could pass on a later batch's weight while buffer[0] lacks it, failing the concat.
+        let Some(first) = self.buffer.first() else {
+            return Ok(false);
+        };
+        if first.schema().index_of(WEIGHT_COLUMN).is_err() {
             return Ok(false);
         }
-        let schema = self.buffer[0].schema();
+        let schema = first.schema();
         let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
             .map_err(|e| ConnectorError::Internal(format!("concat changelog: {e}")))?;
         self.buffer = vec![collapse_changelog(&combined, &key_fields)?];

@@ -1093,13 +1093,14 @@ impl IncrementalAggState {
     }
 
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
+        // Advance the demotion watermark even on empty (heartbeat) batches — before the early return
+        // — so demotable_groups' idle-TTL cutoff tracks the real watermark.
         #[cfg(feature = "state-tier")]
         {
             self.last_watermark_ms = self.last_watermark_ms.max(watermark_ms);
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
         }
 
         if self.num_group_cols == 0 {

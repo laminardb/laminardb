@@ -362,17 +362,16 @@ fn upsert_test_brokers() -> Option<String> {
     kafka_brokers().map(String::from)
 }
 
-/// An incremental aggregate MV feeding a Kafka `ENVELOPE UPSERT` sink emits one keyed
-/// record per group; the latest value per key on the topic equals the current aggregate, and an
-/// update (retract+insert) collapses to a single latest value — no lossy positive-only stream.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scenario_incremental_agg_kafka_upsert() {
-    let Some(brokers) = upsert_test_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
-        return;
-    };
-    let brokers = brokers.as_str();
-    let out_topic = unique("p1b_upsert_out");
+/// Shared ENVELOPE UPSERT scenario: build an incremental agg MV, optionally project it through
+/// `extra_stream_ddl`, sink `sink_from` to a topic, push k1=10/k2=20 then a k1 update, and assert
+/// the latest-per-key totals collapse to 15/20 (not a lossy positive-only stream).
+async fn run_upsert_scenario(
+    brokers: &str,
+    tag: &str,
+    extra_stream_ddl: Option<&str>,
+    sink_from: &str,
+) {
+    let out_topic = unique(&format!("{tag}_out"));
     create_topic(brokers, &out_topic, 1).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -392,8 +391,11 @@ async fn scenario_incremental_agg_kafka_upsert() {
     db.execute("CREATE MATERIALIZED VIEW agg AS SELECT k, SUM(v) AS total FROM events GROUP BY k")
         .await
         .expect("mv");
+    if let Some(ddl) = extra_stream_ddl {
+        db.execute(ddl).await.expect("extra stream ddl");
+    }
     let ddl_sink = format!(
-        "CREATE SINK out FROM agg WITH (\
+        "CREATE SINK out FROM {sink_from} WITH (\
              'connector' = 'kafka', \
              'bootstrap.servers' = '{brokers}', \
              'topic' = '{out_topic}', \
@@ -401,9 +403,7 @@ async fn scenario_incremental_agg_kafka_upsert() {
              'key.column' = 'k', \
              'envelope' = 'upsert')"
     );
-    db.execute(&ddl_sink)
-        .await
-        .expect("upsert sink over agg MV");
+    db.execute(&ddl_sink).await.expect("upsert sink");
     db.start().await.expect("start");
 
     let src = db.source_untyped("events").expect("source handle");
@@ -416,94 +416,7 @@ async fn scenario_incremental_agg_kafka_upsert() {
     let msgs = consume_keyed(
         brokers,
         &out_topic,
-        &unique("p1b_verify"),
-        100,
-        Duration::from_secs(10),
-    )
-    .await;
-    db.shutdown().await.ok();
-    delete_topic(brokers, &out_topic).await;
-
-    let mut latest: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
-    for (k, v) in msgs {
-        if let Some(k) = k {
-            latest.insert(k, v);
-        }
-    }
-    let v1 = latest
-        .get("1")
-        .expect("key 1 present on topic")
-        .clone()
-        .expect("k1 not tombstoned");
-    let v2 = latest
-        .get("2")
-        .expect("key 2 present on topic")
-        .clone()
-        .expect("k2 not tombstoned");
-    // Exact value: the k1 update collapses to 15, not 25 (positive-only) or a 150 substring match.
-    assert_eq!(json_i64(&v1, "total"), 15, "k1 latest total, got {v1}");
-    assert_eq!(json_i64(&v2, "total"), 20, "k2 latest total, got {v2}");
-}
-
-/// A CREATE STREAM projecting an incremental MV forwards its netted changelog to a downstream
-/// capability-aware sink. Composes the stream consumer with the Kafka `ENVELOPE UPSERT` sink:
-/// the topic's latest-per-key equals the current aggregate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
-    let Some(brokers) = upsert_test_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
-        return;
-    };
-    let brokers = brokers.as_str();
-    let out_topic = unique("p4_stream_upsert_out");
-    create_topic(brokers, &out_topic, 1).await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = laminar_db::LaminarConfig {
-        storage_dir: Some(dir.path().to_path_buf()),
-        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
-            interval_ms: None,
-            incremental_emit: true,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let db = LaminarDB::open_with_config(cfg).expect("open db");
-    db.execute("CREATE SOURCE events (k BIGINT, v BIGINT)")
-        .await
-        .expect("source");
-    db.execute("CREATE MATERIALIZED VIEW agg AS SELECT k, SUM(v) AS total FROM events GROUP BY k")
-        .await
-        .expect("mv");
-    // A stream over the incremental MV forwards its (netted) changelog downstream.
-    db.execute("CREATE STREAM s AS SELECT k, total FROM agg")
-        .await
-        .expect("stream over incremental MV");
-    let ddl_sink = format!(
-        "CREATE SINK out FROM s WITH (\
-             'connector' = 'kafka', \
-             'bootstrap.servers' = '{brokers}', \
-             'topic' = '{out_topic}', \
-             'format' = 'json', \
-             'key.column' = 'k', \
-             'envelope' = 'upsert')"
-    );
-    db.execute(&ddl_sink)
-        .await
-        .expect("upsert sink over the stream");
-    db.start().await.expect("start");
-
-    let src = db.source_untyped("events").expect("source handle");
-    src.push_arrow(kv_batch(&[1, 2], &[10, 20])).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    src.push_arrow(kv_batch(&[1], &[5])).unwrap(); // k1: 10 -> 15
-    tokio::time::sleep(Duration::from_millis(700)).await;
-
-    let msgs = consume_keyed(
-        brokers,
-        &out_topic,
-        &unique("p4_verify"),
+        &unique(&format!("{tag}_verify")),
         100,
         Duration::from_secs(10),
     )
@@ -528,15 +441,35 @@ async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
         .expect("key 2 present")
         .clone()
         .expect("k2 not tombstoned");
-    // Exact value via the stream: k1's update collapses to total=15 (not 25), no substring false-pass.
-    assert_eq!(
-        json_i64(&v1, "total"),
-        15,
-        "k1 latest total via stream, got {v1}"
-    );
-    assert_eq!(
-        json_i64(&v2, "total"),
-        20,
-        "k2 latest total via stream, got {v2}"
-    );
+    // Exact value: the k1 update collapses to 15, not 25 (positive-only) or a 150 substring match.
+    assert_eq!(json_i64(&v1, "total"), 15, "k1 latest total, got {v1}");
+    assert_eq!(json_i64(&v2, "total"), 20, "k2 latest total, got {v2}");
+}
+
+/// An incremental aggregate MV feeding a Kafka `ENVELOPE UPSERT` sink: latest-per-key equals the
+/// current aggregate, and an update (retract+insert) collapses to a single latest value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_incremental_agg_kafka_upsert() {
+    let Some(brokers) = upsert_test_brokers() else {
+        eprintln!("skipping: Redpanda not reachable");
+        return;
+    };
+    run_upsert_scenario(brokers.as_str(), "p1b_upsert", None, "agg").await;
+}
+
+/// A CREATE STREAM projecting the incremental MV forwards its netted changelog to the upsert sink;
+/// latest-per-key still equals the current aggregate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
+    let Some(brokers) = upsert_test_brokers() else {
+        eprintln!("skipping: Redpanda not reachable");
+        return;
+    };
+    run_upsert_scenario(
+        brokers.as_str(),
+        "p4_stream_upsert",
+        Some("CREATE STREAM s AS SELECT k, total FROM agg"),
+        "s",
+    )
+    .await;
 }

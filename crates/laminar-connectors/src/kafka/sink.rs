@@ -504,6 +504,17 @@ impl KafkaSink {
             ConnectorError::Serde(e)
         })?;
         let keys = self.extract_keys(&collapsed)?;
+        // Reject empty/NULL merge keys before producing ANY record: a compacted topic can't
+        // represent an unkeyed row, and a mid-loop bail would leave earlier rows already enqueued.
+        if let Some(kb) = keys.as_ref() {
+            for i in 0..payloads.len() {
+                if kb.key(i).is_empty() {
+                    return Err(ConnectorError::WriteError(format!(
+                        "upsert envelope: row {i} has an empty/NULL merge key"
+                    )));
+                }
+            }
+        }
 
         let producer = self
             .producer
@@ -516,15 +527,7 @@ impl KafkaSink {
         let flush_threshold = self.config.flush_batch_size;
         let mut delivery_futures = Vec::with_capacity(rows);
         for (i, payload) in payloads.iter().enumerate() {
-            let raw: &[u8] = keys.as_ref().map(|kb| kb.key(i)).unwrap_or_default();
-            if raw.is_empty() {
-                // A compacted topic can't represent an unkeyed record (upsert or tombstone); fail
-                // fast rather than silently emit a round-robin/broker-rejected message.
-                return Err(ConnectorError::WriteError(format!(
-                    "upsert envelope: row {i} has an empty/NULL merge key"
-                )));
-            }
-            let key: Option<&[u8]> = Some(raw);
+            let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i));
             let is_delete = ops.value(i) == "D";
             let partition = self.partitioner.partition(key, self.topic_partition_count);
             // No `.payload()` for a delete → null value = Kafka tombstone.

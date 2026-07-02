@@ -1213,7 +1213,13 @@ impl LaminarDB {
             });
         }
 
-        self.register_mv_provider(&name_str, schema, plan_window.is_some(), inc, has_aggregate)?;
+        self.register_mv_provider(
+            &name_str,
+            &schema,
+            plan_window.is_some(),
+            inc,
+            has_aggregate,
+        )?;
 
         // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
         if let Some(ref tx) = *self.control_tx.lock() {
@@ -1415,7 +1421,7 @@ impl LaminarDB {
     fn register_mv_provider(
         &self,
         name_str: &str,
-        schema: Arc<Schema>,
+        schema: &Arc<Schema>,
         has_window: bool,
         inc: IncEmit,
         has_aggregate: bool,
@@ -1447,7 +1453,7 @@ impl LaminarDB {
                 Arc::new(
                     laminar_sql::datafusion::distributed_scan::DistributedTableProvider::new(
                         name_str.to_string(),
-                        schema,
+                        schema.clone(),
                         Arc::new(mv_provider),
                         controller,
                     ),

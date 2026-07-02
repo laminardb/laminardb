@@ -1084,6 +1084,11 @@ fn table_and_alias(factor: &sqlparser::ast::TableFactor) -> Option<(String, Stri
     let sqlparser::ast::TableFactor::Table { name, alias, .. } = factor else {
         return None;
     };
+    // A compound (schema-qualified) name with no alias would emit a dotted alias
+    // (`FROM schema.tbl schema.tbl`) — invalid SQL. Reject, matching the 2-way enrich guard.
+    if alias.is_none() && name.0.len() > 1 {
+        return None;
+    }
     let table = name.to_string();
     let al = alias
         .as_ref()

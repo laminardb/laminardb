@@ -73,24 +73,24 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cross: false
             # Native ARM runner — no QEMU emulation, system libssl-dev is available
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,state-tier"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
             # vendored-openssl: musl has no system libssl-dev; compile from source
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,state-tier,vendored-openssl"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,state-tier"
           - os: macos-15  # Cross-compile Intel from ARM64 (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,state-tier"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,state-tier"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
