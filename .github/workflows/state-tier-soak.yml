@@ -1,0 +1,65 @@
+name: State-tier soak
+
+# Kill-9 group-demotion soak for the tiered aggregate state. Expensive and timing-sensitive, so it
+# runs weekly (and on demand) rather than on the per-PR critical path. The embedded variant is
+# Docker-free (built-in generator + local filesystem), so it needs no Kafka/MinIO services.
+on:
+  workflow_dispatch:
+    inputs:
+      kills:
+        description: "kill -9 rounds (LAMINAR_SOAK_KILLS)"
+        required: false
+        default: "4"
+      seconds:
+        description: "soak duration seconds (LAMINAR_SOAK_SECONDS)"
+        required: false
+        default: "120"
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  embedded-group-demotion:
+    name: Embedded kill-9 group-demotion soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: state-tier-soak
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+
+      # Default-ON embedded path: bound RAM via group demotion, validate kill-9 recovery of demoted
+      # groups from the cold-only per-vnode partials. The test self-configures embedded mode with
+      # group demotion ON + a local FS backend (built-in generator, no external services).
+      - name: Embedded kill-9 group-demotion soak
+        run: cargo test -p laminar-server --no-default-features --features state-tier --test cluster_soak embedded_kill9_group_demotion_soak -- --ignored --nocapture
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
+          LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}

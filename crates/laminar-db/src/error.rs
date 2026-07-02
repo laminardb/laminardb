@@ -80,6 +80,10 @@ pub enum DbError {
     /// `BackpressurePolicy::Fail` tripped; coordinator halts the pipeline.
     BackpressureFail(String),
 
+    /// A cross-node shuffle target isn't reachable yet (cluster formation).
+    /// Recoverable — `OperatorGraph::execute_single_operator` defers on it.
+    ShuffleNotReady(String),
+
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
     QueryPipeline {
@@ -174,12 +178,20 @@ impl DbError {
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
             Self::Connector(_) | Self::ConnectorOp(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
-            Self::Pipeline(_) | Self::BackpressureFail(_) => error_codes::PIPELINE_ERROR,
+            Self::Pipeline(_) | Self::BackpressureFail(_) | Self::ShuffleNotReady(_) => {
+                error_codes::PIPELINE_ERROR
+            }
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
             Self::Config(_) => error_codes::INVALID_CONFIG,
         }
+    }
+
+    /// `true` for [`Self::ShuffleNotReady`] — the operator defers instead of failing the cycle.
+    #[must_use]
+    pub fn is_shuffle_not_ready(&self) -> bool {
+        matches!(self, Self::ShuffleNotReady(_))
     }
 
     /// Whether this error is transient (retryable).
@@ -266,6 +278,9 @@ impl std::fmt::Display for DbError {
             }
             Self::BackpressureFail(msg) => {
                 write!(f, "[{}] Backpressure fail: {msg}", self.code())
+            }
+            Self::ShuffleNotReady(msg) => {
+                write!(f, "[{}] Shuffle target not ready: {msg}", self.code())
             }
             Self::QueryPipeline {
                 context,

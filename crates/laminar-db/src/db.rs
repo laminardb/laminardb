@@ -105,6 +105,10 @@ pub struct LaminarDB {
     /// Panic message when the compute thread exits unexpectedly (`Faulted`);
     /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
     pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Self-ref set by `enable_supervision`; empty `Weak` (default) disables auto-restart.
+    pub(crate) supervisor_self: Arc<parking_lot::Mutex<std::sync::Weak<LaminarDB>>>,
+    /// Auto-restart timestamps within the sliding window; bounds restart storms.
+    pub(crate) restart_history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
@@ -133,6 +137,13 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
+    /// When set, the next start restores to this cluster-agreed epoch instead of the
+    /// local latest (taken in `start_inner`).
+    #[cfg(feature = "cluster")]
+    pub(crate) recover_target_epoch: parking_lot::Mutex<Option<u64>>,
+    /// One-shot guard for the recovery-monitor spawn.
+    #[cfg(feature = "cluster")]
+    pub(crate) recovery_monitor_started: std::sync::atomic::AtomicBool,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
@@ -158,11 +169,14 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
-    /// Committed vnode state staged during rebalance adoption; operators drain
-    /// this each cycle to resume from the last committed epoch. Shared with
-    /// `OperatorGraph` via `ClusterShuffleConfig`.
+    /// Vnode state staged during rebalance adoption; operators drain it each cycle to resume
+    /// from the last committed epoch. Shared with `OperatorGraph` via `ClusterShuffleConfig`.
     #[cfg(feature = "cluster")]
     pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
+    /// Vnodes lost on rebalance adoption; operators drain this each cycle and drop the stale
+    /// in-memory state so a later re-acquire merges into empty state (no additive double-count).
+    #[cfg(feature = "cluster")]
+    pub(crate) pending_revoke_vnodes: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<u32>>>,
     /// Routes `db.checkpoint()` requests to the pipeline callback so operator
     /// state is captured. When `None`, the coordinator is driven directly
     /// (stateless / pre-start path).
@@ -226,10 +240,10 @@ pub(crate) use laminar_core::time::parse_duration_str;
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone)]
 pub struct RehydratedVnode {
-    /// Committed epoch the partial was read from.
+    /// Committed epoch the chain head was read from.
     pub epoch: u64,
-    /// `partial.bin` bytes at `epoch`.
-    pub bytes: bytes::Bytes,
+    /// Recovery chain (oldest→newest decoded-as-bytes partials): a FULL base plus any delta partials.
+    pub chain: Vec<bytes::Bytes>,
 }
 
 /// Summary of a single [`LaminarDB::adopt_assignment_snapshot`] call.
@@ -249,6 +263,15 @@ pub struct SnapshotAdoption {
 }
 
 impl LaminarDB {
+    /// Vnodes revoked by a rebalance and staged for operator-state drop on the next cycle; drained
+    /// once the compute thread applies the revoke. Observability/test hook.
+    #[cfg(feature = "cluster")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_revoke_vnode_count(&self) -> usize {
+        self.pending_revoke_vnodes.lock().len()
+    }
+
     /// Create an embedded in-memory database with default settings.
     ///
     /// # Errors
@@ -292,15 +315,12 @@ impl LaminarDB {
         >],
         target_partitions: Option<usize>,
     ) -> Result<Self, DbError> {
-        // One-time crossfire backoff tuning. No-op on multi-core; on single-core
-        // VMs this swaps spin-loops for yields (~2x channel throughput).
-        // Idempotent via an internal atomic — safe to call on every instance.
+        // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();
 
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
-        // Build a SessionContext with the LookupJoinExtensionPlanner wired
-        // into the physical planner so LookupJoinNode → LookupJoinExec works.
+        // Wire the LookupJoinExtensionPlanner so LookupJoinNode → LookupJoinExec.
         let ctx = {
             let mut session_config = laminar_sql::datafusion::base_session_config();
             if let Some(n) = target_partitions {
@@ -366,6 +386,8 @@ impl LaminarDB {
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
+            supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
+            restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
@@ -383,6 +405,10 @@ impl LaminarDB {
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            recover_target_epoch: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            recovery_monitor_started: std::sync::atomic::AtomicBool::new(false),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
@@ -399,6 +425,10 @@ impl LaminarDB {
             catalog_manifest_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            #[cfg(feature = "cluster")]
+            pending_revoke_vnodes: Arc::new(parking_lot::Mutex::new(
+                rustc_hash::FxHashSet::default(),
+            )),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             #[cfg(feature = "cluster")]
@@ -645,6 +675,16 @@ impl LaminarDB {
         // Rotation committed — drop the drain marks (revoked partitions are gone).
         registry.clear_draining();
         let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        // Vnodes lost this rotation: stage them so operators drop the stale in-memory state next
+        // cycle (a later re-acquire's additive merge would otherwise double-count). Disjoint from
+        // `newly_acquired` per rotation.
+        {
+            let new_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
+            let revoked: Vec<u32> = old_set.difference(&new_set).copied().collect();
+            if !revoked.is_empty() {
+                self.pending_revoke_vnodes.lock().extend(revoked);
+            }
+        }
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
         }
@@ -682,8 +722,8 @@ impl LaminarDB {
             }
             if let Some(epoch) = report.epoch {
                 let mut staged = self.rehydrated_vnode_state.lock();
-                for (vnode, bytes) in report.restored {
-                    staged.insert(vnode, RehydratedVnode { epoch, bytes });
+                for (vnode, chain) in report.restored {
+                    staged.insert(vnode, RehydratedVnode { epoch, chain });
                 }
             }
         } else if !newly_acquired.is_empty() {
@@ -1569,6 +1609,9 @@ impl LaminarDB {
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
+        // SUBSCRIBE to an incremental MV delivers consolidated snapshots (plain rows), not the
+        // raw `__weight` changelog.
+
         let attached = self.subscription_registry.subscriber_count(name);
         if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
             return Err(DbError::Pipeline(format!(
@@ -1592,7 +1635,7 @@ impl LaminarDB {
             Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
         };
 
-        let (replay, rx) = self
+        let (mut replay, rx) = self
             .subscription_registry
             .subscribe(name, start)
             .map_err(|e| {
@@ -1606,6 +1649,15 @@ impl LaminarDB {
                     e.earliest_retained
                 ))
             })?;
+
+        // Seed a Tail subscriber with the current snapshot so it sees present state at once.
+        if matches!(start, crate::subscription::SubscribeStart::Tail) {
+            if let Some(snap) = self.mv_store.read().to_record_batch(name) {
+                if snap.num_rows() > 0 {
+                    replay.insert(0, crate::subscription::MvUpdate::Batch(snap));
+                }
+            }
+        }
         Ok(match filter {
             Some(phys) => crate::subscription::SubscriptionPortal::open_with_filter(
                 name, schema, replay, rx, phys,
@@ -2305,11 +2357,9 @@ impl LaminarDB {
             DbError::Checkpoint(format!("failed to read leader checkpoint response: {e}"))
         })?;
 
-        // The leader returns a `CheckpointResponse` body even when the
-        // checkpoint itself failed (HTTP 500 + `success: false`), so parse it so
-        // that structured failure reaches the follower. A body that isn't a
-        // `CheckpointResponse` (e.g. a 401 error payload) is an auth/transport
-        // failure — surface the status and body instead.
+        // The leader returns a `CheckpointResponse` body even on failure (HTTP 500 +
+        // `success: false`), so parse it to relay structured failure. A non-`CheckpointResponse`
+        // body (e.g. a 401 payload) is an auth/transport failure — surface status and body.
         match serde_json::from_str::<ForwardedCheckpointResponse>(&body) {
             Ok(response) => Ok(crate::checkpoint_coordinator::CheckpointResult {
                 success: response.success,

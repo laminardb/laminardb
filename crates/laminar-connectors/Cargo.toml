@@ -11,7 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.27.0" }
+laminar-core = { path = "../laminar-core", version = "0.28.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
@@ -131,13 +131,13 @@ default = [
     "parquet-lookup",
 ]
 testing = []
-kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
+kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest", "changelog-collapse"]
 postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
-postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util"]
+postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util", "changelog-collapse"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # MongoDB CDC source and sink
-mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow-row"]
+mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow-row", "changelog-collapse"]
 # Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pure Arrow, just
 # pulls arrow-row). Kept separate from delta-lake so the helper compiles and
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.

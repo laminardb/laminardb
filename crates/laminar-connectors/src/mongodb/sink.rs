@@ -4,21 +4,10 @@
 //! `MongoDB` collections. Supports insert, upsert, replace, and CDC replay
 //! write modes, with optional time series collection support.
 //!
-//! # Architecture
-//!
-//! - **Ring 0**: No sink code — data arrives via SPSC channel (~5ns push)
-//! - **Ring 1**: Batch buffering, write dispatch, flush management
-//! - **Ring 2**: Connection pool, collection creation, write concern config
-//!
-//! # Batching
-//!
-//! Writes are buffered up to `batch_size` records and flushed when:
-//! - The batch is full
-//! - `flush_interval` has elapsed
-//! - A shutdown signal or epoch boundary is reached
-//!
-//! Insert mode uses `insert_many` for batch efficiency. Upsert, replace,
-//! and CDC replay modes issue individual operations per document.
+//! Writes are buffered up to `batch_size` records and flushed when the batch is
+//! full, `flush_interval` elapses, or a shutdown/epoch boundary is reached.
+//! Insert mode uses `insert_many`; upsert, replace, and CDC replay issue
+//! individual operations per document.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,9 +17,13 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use tracing::{debug, info};
 
+#[cfg(feature = "mongodb-cdc")]
+use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
+#[cfg(feature = "mongodb-cdc")]
+use laminar_core::changelog::WEIGHT_COLUMN;
 
 use super::config::MongoDbSinkConfig;
 use super::metrics::MongoDbSinkMetrics;
@@ -42,32 +35,16 @@ use super::write_model::WriteMode;
 /// Writes Arrow `RecordBatch` records to a `MongoDB` collection using
 /// configurable write modes. Supports standard and time series collections.
 pub struct MongoDbSink {
-    /// Sink configuration.
     config: MongoDbSinkConfig,
-
-    /// Arrow schema for input batches.
     schema: SchemaRef,
-
-    /// Connector lifecycle state.
     state: ConnectorState,
-
-    /// Buffered records awaiting flush.
     buffer: Vec<RecordBatch>,
-
-    /// Total rows in buffer.
     buffered_rows: usize,
-
-    /// Last flush time.
     last_flush: Instant,
-
-    /// Sink metrics.
     metrics: MongoDbSinkMetrics,
 
-    /// `MongoDB` client (feature-gated).
     #[cfg(feature = "mongodb-cdc")]
     client: Option<mongodb::Client>,
-
-    /// Target collection handle (feature-gated).
     #[cfg(feature = "mongodb-cdc")]
     collection: Option<mongodb::Collection<mongodb::bson::Document>>,
 }
@@ -200,9 +177,10 @@ impl MongoDbSink {
             self.write_cdc_docs(&docs).await?;
             (n, bytes)
         } else {
+            let collapsed = self.collapse_changelog_buffer_for_upsert()?;
             let (docs, bytes) = self.batches_to_bson_docs();
             let n = docs.len();
-            self.write_bson_docs(docs).await?;
+            self.write_bson_docs(docs, collapsed).await?;
             (n, bytes)
         };
 
@@ -220,6 +198,32 @@ impl MongoDbSink {
         self.clear_buffer();
 
         Ok(WriteResult::new(doc_count, byte_estimate))
+    }
+
+    /// Collapse a Z-set changelog buffer (an incremental MV: rows carry `__weight`) into a single
+    /// key-unique `{U,D}` batch before upsert, so retract+insert nets per key and a removed group
+    /// becomes a delete. No-op unless the write mode is upsert and the buffer is a Z-set changelog.
+    /// `Ok(true)` if the buffer was a Z-set changelog and got collapsed; `Ok(false)` for a plain
+    /// (non-changelog) upsert, so the caller doesn't interpret `_op` on rows we didn't produce.
+    #[cfg(feature = "mongodb-cdc")]
+    fn collapse_changelog_buffer_for_upsert(&mut self) -> Result<bool, ConnectorError> {
+        let key_fields = match &self.config.write_mode {
+            WriteMode::Upsert { key_fields } => key_fields.clone(),
+            _ => return Ok(false),
+        };
+        // Gate on buffer[0] — it supplies the concat schema (concat requires all batches match it);
+        // `any` could pass on a later batch's weight while buffer[0] lacks it, failing the concat.
+        let Some(first) = self.buffer.first() else {
+            return Ok(false);
+        };
+        if first.schema().index_of(WEIGHT_COLUMN).is_err() {
+            return Ok(false);
+        }
+        let schema = first.schema();
+        let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
+            .map_err(|e| ConnectorError::Internal(format!("concat changelog: {e}")))?;
+        self.buffer = vec![collapse_changelog(&combined, &key_fields)?];
+        Ok(true)
     }
 }
 
@@ -495,7 +499,9 @@ impl SinkConnector for MongoDbSink {
         let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(30)).with_idempotent();
 
         if matches!(self.config.write_mode, WriteMode::Upsert { .. }) {
-            caps = caps.with_upsert();
+            // with_changelog stops prepare_for_sink stripping __weight, so group deletes reach the
+            // collapse path as tombstones.
+            caps = caps.with_upsert().with_changelog();
         }
         if matches!(self.config.write_mode, WriteMode::CdcReplay) {
             caps = caps.with_changelog();
@@ -673,6 +679,7 @@ impl MongoDbSink {
     async fn write_bson_docs(
         &self,
         docs: Vec<mongodb::bson::Document>,
+        from_changelog: bool,
     ) -> Result<(), ConnectorError> {
         use mongodb::bson::{doc, Bson, Document};
 
@@ -699,7 +706,13 @@ impl MongoDbSink {
             }
 
             WriteMode::Upsert { ref key_fields } => {
-                for bson_doc in docs {
+                for mut bson_doc in docs {
+                    // Only a collapsed changelog carries a synthesized `_op` (U/D): route D to a
+                    // delete. A plain upsert keeps its columns verbatim (a user `_op` is not a delete).
+                    let is_delete = from_changelog && matches!(bson_doc.get_str("_op"), Ok("D"));
+                    if from_changelog {
+                        bson_doc.remove("_op");
+                    }
                     let mut filter = Document::new();
                     for key in key_fields {
                         if let Some(v) = bson_doc.get(key) {
@@ -712,17 +725,24 @@ impl MongoDbSink {
                              exist in the document"
                         )));
                     }
-                    let opts = mongodb::options::ReplaceOptions::builder()
-                        .upsert(Some(true))
-                        .build();
-                    collection
-                        .replace_one(filter, bson_doc)
-                        .with_options(opts)
-                        .await
-                        .map_err(|e| {
+                    if is_delete {
+                        collection.delete_one(filter).await.map_err(|e| {
                             self.metrics.record_error();
-                            ConnectorError::WriteError(format!("upsert: {e}"))
+                            ConnectorError::WriteError(format!("delete: {e}"))
                         })?;
+                    } else {
+                        let opts = mongodb::options::ReplaceOptions::builder()
+                            .upsert(Some(true))
+                            .build();
+                        collection
+                            .replace_one(filter, bson_doc)
+                            .with_options(opts)
+                            .await
+                            .map_err(|e| {
+                                self.metrics.record_error();
+                                ConnectorError::WriteError(format!("upsert: {e}"))
+                            })?;
+                    }
                 }
                 self.metrics.record_upserts(count);
             }

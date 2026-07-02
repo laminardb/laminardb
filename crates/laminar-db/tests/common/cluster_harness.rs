@@ -1,8 +1,6 @@
-//! Shared cluster harness for `cluster_e2e_*` tests. Each node gets
-//! its own checkpoint dir; all nodes share one state backend dir
-//! (matching production's single-bucket layout). Tests should issue
-//! DDL before [`ClusterEngineHarness::start_all`] so the pipeline
-//! activates with sources and MVs already registered.
+//! Shared cluster harness for `cluster_e2e_*` tests: per-node checkpoint dirs,
+//! one shared state backend dir (production's single-bucket layout). Issue DDL
+//! before [`ClusterEngineHarness::start_all`].
 
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
@@ -48,8 +46,7 @@ impl NodeRuntime {
     }
 }
 
-/// Two-or-more-node cluster of real LaminarDB engines glued to a
-/// `MiniCluster` for gossip + control.
+/// Two-or-more-node cluster of real LaminarDB engines on a `MiniCluster`.
 pub struct ClusterEngineHarness {
     /// Gossip + ClusterController layer.
     pub cluster: MiniCluster,
@@ -62,9 +59,8 @@ pub struct ClusterEngineHarness {
 }
 
 impl ClusterEngineHarness {
-    /// Spawn `n` nodes with `vnode_count` vnodes round-robin across
-    /// them. Returns after gossip converges; `db.start()` is
-    /// deferred to `start_all`.
+    /// Spawn `n` nodes with `vnode_count` vnodes round-robin. Returns after
+    /// gossip converges; `db.start()` is deferred to `start_all`.
     ///
     /// # Panics
     /// On convergence timeout, leader-election mismatch, or engine
@@ -74,15 +70,69 @@ impl ClusterEngineHarness {
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs).await
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            None,
+            None,
+        )
+        .await
     }
 
-    /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`.
+    /// Like `spawn`, with incremental delta checkpoints (`chain_max`); the
+    /// per-vnode chain becomes the primary aggregate checkpoint.
+    pub async fn spawn_delta(n: usize, vnode_count: u32, chain_max: u32) -> Self {
+        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
+        let checkpoint_dirs: Vec<TempDir> = (0..n)
+            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
+            .collect();
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            Some(chain_max),
+            None,
+        )
+        .await
+    }
+
+    /// Like `spawn_delta`, but also opens a per-node cold tier (`budget_bytes`)
+    /// with group demotion ON; demotion needs the delta chain (`chain_max`).
+    #[cfg(feature = "state-tier")]
+    pub async fn spawn_delta_tier(
+        n: usize,
+        vnode_count: u32,
+        chain_max: u32,
+        budget_bytes: usize,
+    ) -> Self {
+        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
+        let checkpoint_dirs: Vec<TempDir> = (0..n)
+            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
+            .collect();
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            Some(chain_max),
+            Some(budget_bytes),
+        )
+        .await
+    }
+
+    /// Like `spawn`, reusing dirs from `shutdown_keep_dirs`. `delta` is
+    /// `Some(chain_max)` for chain-primary delta checkpoints; `tier_budget` is
+    /// `Some(bytes)` to open a per-node cold tier with group demotion (needs `delta`).
     pub async fn spawn_with_dirs(
         n: usize,
         vnode_count: u32,
         shared_state_dir: TempDir,
         checkpoint_dirs: Vec<TempDir>,
+        delta: Option<u32>,
+        tier_budget: Option<usize>,
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
@@ -115,13 +165,11 @@ impl ClusterEngineHarness {
             .map(|nh| NodeId(nh.instance_id.0))
             .collect();
 
-        // Resolve the cluster-wide vnode assignment once; every node
-        // shares the same assignment and version.
+        // Resolve one cluster-wide vnode assignment; every node shares it.
         let (assignment, snapshot_version) =
             resolve_assignment(&snapshot_store, vnode_count, &peer_ids).await;
 
-        // Bind every node's receiver up front so we can cross-register
-        // addresses on the senders below.
+        // Bind receivers up front so senders can cross-register addresses below.
         let mut receivers: Vec<Arc<ShuffleReceiver>> = Vec::with_capacity(n);
         for nh in &cluster.nodes {
             let recv = ShuffleReceiver::bind(nh.instance_id.0, "127.0.0.1:0".parse().unwrap())
@@ -145,9 +193,8 @@ impl ClusterEngineHarness {
             }
             let sender = Arc::new(sender);
 
-            // No pre-call to `set_authoritative_version` — exercise
-            // the real production wiring that lifts the snapshot
-            // version into the fence on `db.start()`.
+            // No pre-call to `set_authoritative_version`: exercise the real
+            // wiring that lifts the snapshot version into the fence on `db.start()`.
             let state_backend: Arc<dyn StateBackend> = Arc::new(ObjectStoreBackend::new(
                 Arc::clone(&shared_store),
                 self_id.0.to_string(),
@@ -161,14 +208,19 @@ impl ClusterEngineHarness {
                 interval_ms: None, // manual only — tests drive checkpoint() explicitly
                 data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
+                delta_chain_max: delta,
+                // Cold tier only demotes changelog aggregates; incremental emit
+                // makes the tier test's GROUP BY one (no-op for non-tier callers).
+                incremental_emit: tier_budget.is_some(),
                 ..StreamCheckpointConfig::default()
             };
 
-            // Skip `.profile(Cluster)` — `ObjectStoreCheckpointStore`
-            // `block_on`s internally and panics inside a tokio runtime.
+            // Skip `.profile(Cluster)`: `ObjectStoreCheckpointStore` `block_on`s
+            // internally and panics inside a tokio runtime.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
 
-            let db = LaminarDB::builder()
+            #[cfg_attr(not(feature = "state-tier"), allow(unused_mut))]
+            let mut builder = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
                 .checkpoint(cp_cfg)
                 .cluster_controller(Arc::clone(&nh.controller))
@@ -179,11 +231,16 @@ impl ClusterEngineHarness {
                 .decision_store(Arc::clone(&decision_store))
                 .assignment_snapshot_store(Arc::clone(&snapshot_store))
                 // Mirror production: DataFusion partitions track vnode count.
-                .target_partitions(vnode_count as usize)
-                .build()
-                .await
-                .expect("LaminarDB::builder().build()");
-            let db = Arc::new(db);
+                .target_partitions(vnode_count as usize);
+            // Per-node cold tier (node-local, wiped on restart). Group demotion ON.
+            #[cfg(feature = "state-tier")]
+            if let Some(budget) = tier_budget {
+                builder = builder
+                    .state_tier_dir(checkpoint_dirs[idx].path().join("state-tier"))
+                    .state_memory_budget_bytes(budget)
+                    .state_tier_group_demotion(true);
+            }
+            let db = Arc::new(builder.build().await.expect("LaminarDB::builder().build()"));
 
             node_runtimes.push(NodeRuntime {
                 db,
@@ -233,11 +290,9 @@ impl ClusterEngineHarness {
             node.rebalance_tasks.push(watcher);
             node.rebalance_tasks.push(controller);
         }
-        // Wait until every controller's `live_instances` reports the
-        // full cluster. Discovery polls chitchat on its own cadence,
-        // so without this gate a coverage-instrumented run can fire
-        // a checkpoint before `members_rx` is populated and the
-        // leader skips the prepare quorum.
+        // Gate on every controller seeing full membership: discovery polls
+        // chitchat on its own cadence, so without this a checkpoint can fire
+        // before `members_rx` is populated and the leader skips the prepare quorum.
         let expected = self.cluster.nodes.len();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -303,8 +358,7 @@ impl ClusterEngineHarness {
     }
 }
 
-/// Load the shared assignment, or CAS-create one on first boot.
-/// Returns the assignment and its version.
+/// Load the shared assignment (with its version), or CAS-create one on first boot.
 async fn resolve_assignment(
     store: &AssignmentSnapshotStore,
     vnode_count: u32,
@@ -369,8 +423,7 @@ pub fn input_batch(keys: &[i64]) -> RecordBatch {
     .expect("input_batch")
 }
 
-/// Compute the vnode a `key` lands on under the same hashing used by
-/// `ClusterRepartitionExec`.
+/// Compute the vnode a `key` lands on, matching `ClusterRepartitionExec` hashing.
 #[must_use]
 pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
     use arrow::row::{RowConverter, SortField};
@@ -384,8 +437,7 @@ pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
     v
 }
 
-/// Pick `per_owner` keys from `0..1000` that land on each owner's
-/// vnodes.
+/// Pick `per_owner` keys from `0..1000` that land on each owner's vnodes.
 ///
 /// # Errors
 /// Returns `Err` when 1000 candidates aren't enough.
@@ -417,10 +469,9 @@ pub fn pick_keys_per_owner(
     ))
 }
 
-/// Latest persisted manifest epoch on this engine, or `0` when no
-/// checkpoint exists yet. Reads through the engine's own
-/// `CheckpointStore` so the result reflects what would be loaded on
-/// restart — the right signal for per-node epoch-drift assertions.
+/// Latest persisted manifest epoch on this engine, or `0` when none exists.
+/// Reads through the engine's own `CheckpointStore`, so the result reflects
+/// what a restart would load.
 pub async fn manifest_epoch(db: &LaminarDB) -> u64 {
     let store = match db.checkpoint_store() {
         Some(s) => s,
@@ -434,14 +485,11 @@ pub async fn manifest_epoch(db: &LaminarDB) -> u64 {
         .map_or(0, |m| m.epoch)
 }
 
-/// `SELECT key, total FROM <mv>` on a single engine, returning the
-/// materialized rows as `(key, total)` tuples sorted by key.
+/// `SELECT key, total FROM <mv>` on one engine, returning `(key, total)` rows
+/// sorted by key.
 ///
-/// Reads via the engine's `SessionContext` directly — same path
-/// DataFusion uses internally — so the call hits `MvTableProvider::scan`
-/// (a one-shot snapshot) instead of subscribing to the per-cycle stream.
-/// Snapshot reads are what the assertions want; the streaming-subscription
-/// path would require coordinating with cycle boundaries.
+/// Goes through the engine's `SessionContext` so it hits `MvTableProvider::scan`
+/// (a one-shot snapshot) rather than subscribing to the per-cycle stream.
 pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
     let sql = format!("SELECT key, total FROM {mv}");
     let df = db.session_context().sql(&sql).await.expect("plan SELECT");

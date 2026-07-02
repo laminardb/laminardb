@@ -41,6 +41,28 @@ pub(crate) enum TierRequest {
         vnode: u32,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
+    /// Store one demoted group (v2 group granularity).
+    DemoteGroup {
+        operator: Arc<str>,
+        vnode: u32,
+        group: Vec<u8>,
+        bytes: Bytes,
+        reply: oneshot::Sender<Result<(), DbError>>,
+    },
+    /// Fetch one demoted group for promotion (v2 group granularity).
+    FetchGroup {
+        operator: Arc<str>,
+        vnode: u32,
+        group: Vec<u8>,
+        reply: oneshot::Sender<Result<Option<Bytes>, DbError>>,
+    },
+    /// Drop one demoted group after promotion (v2 group granularity).
+    DropGroup {
+        operator: Arc<str>,
+        vnode: u32,
+        group: Vec<u8>,
+        reply: oneshot::Sender<Result<(), DbError>>,
+    },
 }
 
 /// Spawn the worker on `runtime` and return its request channel.
@@ -64,37 +86,62 @@ async fn run_worker(store: Arc<StateTierStore>, rx: TierRx) {
                 vnode,
                 bytes,
                 reply,
-            } => {
-                let res = tokio::task::spawn_blocking(move || {
-                    store.put(operator.as_ref(), vnode, &bytes)
-                })
-                .await
-                .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
-            }
+            } => dispatch(reply, move || store.put(operator.as_ref(), vnode, &bytes)).await,
             TierRequest::Fetch {
                 operator,
                 vnode,
                 reply,
-            } => {
-                let res = tokio::task::spawn_blocking(move || store.get(operator.as_ref(), vnode))
-                    .await
-                    .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
-                let _ = reply.send(res);
-            }
+            } => dispatch(reply, move || store.get(operator.as_ref(), vnode)).await,
             TierRequest::Drop {
                 operator,
                 vnode,
                 reply,
+            } => dispatch(reply, move || store.remove(operator.as_ref(), vnode)).await,
+            TierRequest::DemoteGroup {
+                operator,
+                vnode,
+                group,
+                bytes,
+                reply,
             } => {
-                let res =
-                    tokio::task::spawn_blocking(move || store.remove(operator.as_ref(), vnode))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(DbError::Storage(format!("state tier worker: {e}")))
-                        });
-                let _ = reply.send(res);
+                dispatch(reply, move || {
+                    store.put_group(operator.as_ref(), vnode, &group, &bytes)
+                })
+                .await;
+            }
+            TierRequest::FetchGroup {
+                operator,
+                vnode,
+                group,
+                reply,
+            } => {
+                dispatch(reply, move || {
+                    store.get_group(operator.as_ref(), vnode, &group)
+                })
+                .await;
+            }
+            TierRequest::DropGroup {
+                operator,
+                vnode,
+                group,
+                reply,
+            } => {
+                dispatch(reply, move || {
+                    store.remove_group(operator.as_ref(), vnode, &group)
+                })
+                .await;
             }
         }
     }
+}
+
+/// Run one blocking tier op off the async worker and reply, mapping a join error uniformly.
+async fn dispatch<T: Send + 'static>(
+    reply: oneshot::Sender<Result<T, DbError>>,
+    f: impl FnOnce() -> Result<T, DbError> + Send + 'static,
+) {
+    let res = tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(DbError::Storage(format!("state tier worker: {e}"))));
+    let _ = reply.send(res);
 }

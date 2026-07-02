@@ -6,7 +6,7 @@ mod registry;
 pub(crate) use portal::MAX_SUBSCRIBERS_PER_MV;
 pub use portal::{PortalFrame, SubscriptionPortal};
 pub use registry::SubscribeStart;
-pub(crate) use registry::SubscriptionRegistry;
+pub(crate) use registry::{MvUpdate, SubscriptionRegistry};
 
 /// Prefix tagging a shuffle stage as SUBSCRIBE output rather than an operator
 /// stage. Keeps subscription batches disjoint from operator shuffle stages so

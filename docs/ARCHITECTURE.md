@@ -219,6 +219,10 @@ let db = LaminarDB::builder()
 
 The production SQL execution path (`StreamExecutor`) holds state in internal FxHashMaps (per-group accumulators, window buffers) and checkpoints via JSON serialization. Each stateful operator (`SqlQuery`, `EowcQuery`, `CoreWindowState`, `IncrementalAggState`) implements its own `checkpoint()`/`restore()` methods.
 
+#### Tiered operator state (cold tier)
+
+Most streaming state is structurally bounded (windowed aggregates and tolerance-bounded joins evict below the watermark), but unbounded keyed aggregates can outgrow RAM. Behind the `state-tier` feature, a node-level memory budget (`state_memory_budget_bytes`) backpressures source intake as state grows, and an optional fjall-backed cold tier (`state_tier_dir`) demotes idle state to local disk, fetching it back on access. The tier is capacity-not-durability — wiped on restart; the durable truth stays in the object-store checkpoint partials, which recovery replays. Demotion happens at `(operator, vnode)`-slice granularity (v1) or per-group granularity (v2, `state_tier_group_demotion`). See ADR-005.
+
 ### Streaming Channels
 
 Source and Sink objects in the public streaming API (`laminar_core::streaming`) are backed by `crossfire::mpsc::Array<T>` channels (bounded, blocking sender + async receiver). Clone the `Source<T>` for multi-producer use. Internally, the `StreamingCoordinator` uses `tokio::sync::mpsc` for source-task → coordinator communication across runtimes, and subscribers receive updates via the subscription registry in `laminar_core::streaming::subscription`.

@@ -76,6 +76,13 @@ impl LaminarDB {
         let mut states = Vec::new();
         for view in registry.views() {
             let info = crate::handle::MaterializedViewInfo::from(view);
+            // Hidden intermediates of a decomposed multi-way join are not part of the user's catalog.
+            if info
+                .name
+                .starts_with(crate::sql_analysis::MULTIWAY_INTERMEDIATE_PREFIX)
+            {
+                continue;
+            }
             names.push(info.name);
             sqls.push(info.sql);
             states.push(info.state);

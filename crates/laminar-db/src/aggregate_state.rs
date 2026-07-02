@@ -491,6 +491,42 @@ impl AggStateCheckpoint {
     }
 }
 
+/// A chain-apply path skipped a changelog dedup entry whose group is not resident (the recovered
+/// chain did not materialize it — a rare rebalance/demote/promote race). Dropping it keeps
+/// `last_emitted ⊆ groups`; the key re-emits fresh if it reappears. Logged at powers of two.
+#[cfg(feature = "cluster")]
+fn note_orphan_last_emitted_dropped() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            dropped_total = n,
+            "[LDB] dropped orphan changelog dedup entry (group not materialized by recovered chain)"
+        );
+    }
+}
+
+/// Merge serialized per-group agg slices over DISJOINT keys into one (the coordinator's entry point
+/// for folding a vnode's cold/demoted groups into one cold-only `AggStateCheckpoint` at checkpoint).
+#[cfg(feature = "state-tier")]
+pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
+    let mut iter = slices.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| DbError::Pipeline("merge agg slices: empty".into()))?;
+    let mut merged = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(first)
+        .map_err(|e| DbError::Pipeline(format!("merge agg slices: decode: {e}")))?;
+    for s in iter {
+        let other = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(s)
+            .map_err(|e| DbError::Pipeline(format!("merge agg slices: decode: {e}")))?;
+        merged.append_disjoint(other)?;
+    }
+    rkyv::to_bytes::<rkyv::rancor::Error>(&merged)
+        .map(|v| v.to_vec())
+        .map_err(|e| DbError::Pipeline(format!("merge agg slices: encode: {e}")))
+}
+
 /// Minimum interval between full O(groups) size re-walks.
 const SIZE_REWALK_MIN_INTERVAL_MS: u64 = 2_000;
 
@@ -550,6 +586,10 @@ pub(crate) struct IncrementalAggState {
     // None = no per-vnode capture yet; dirty tracking is off.
     #[cfg(feature = "state-tier")]
     tier_vnode_count: Option<u32>,
+    // Highest watermark seen by `process_batch` — the reference for the idle-TTL demotion cutoff
+    // (a group already past the cutoff must be retracted by `evict_idle`, never demoted).
+    #[cfg(feature = "state-tier")]
+    last_watermark_ms: i64,
     // Vnodes touched since the last capture; demoting them would lose changes.
     #[cfg(feature = "state-tier")]
     dirty_vnodes: rustc_hash::FxHashSet<u32>,
@@ -559,6 +599,13 @@ pub(crate) struct IncrementalAggState {
     // Groups for these vnodes were dropped; captures stage a cold marker.
     #[cfg(feature = "state-tier")]
     cold_vnodes: rustc_hash::FxHashSet<u32>,
+    // Individual groups demoted to the tier: dropped from `groups`, their bytes resident only in
+    // the tier until promoted. A FULL re-base must stream these back.
+    #[cfg(feature = "state-tier")]
+    // Demoted groups → their `last_updated_ms` frozen at demotion (a cold group is never touched
+    // without first promoting it, so the stamp stays accurate). The stamp lets the idle-TTL pass
+    // detect a cold group that aged past the cutoff while demoted.
+    cold_groups: AHashMap<arrow::row::OwnedRow, i64>,
     // Delta-state tracking: keys mutated / removed since the last per-vnode capture,
     // bucketed by vnode. Populated only while `delta_vnode_count` is set (off by
     // default → zero cost).
@@ -567,6 +614,15 @@ pub(crate) struct IncrementalAggState {
     delta_vnode_count: Option<u32>,
     dirty_keys_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
     removed_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
+    // Changelog emission keys whose `last_emitted` changed since the last per-vnode
+    // capture (set in `emit_changelog_delta`). Removals reuse `removed_by_vnode`:
+    // eviction drops the group and its `last_emitted` together. Populated only while
+    // `delta_vnode_count` is set; lets changelog aggregates take the delta path.
+    last_emitted_dirty_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
+    // Deltas emitted since the last full capture, per vnode — bounds the chain so the full
+    // base never ages out of the prune window; cleared to a full re-base on restore/acquire.
+    #[cfg(feature = "cluster")]
+    delta_chain_len: AHashMap<u32, u32>,
 }
 
 impl IncrementalAggState {
@@ -629,12 +685,30 @@ pub(crate) struct GroupEntry {
     pub(crate) last_updated_ms: i64,
 }
 
-/// A per-vnode state delta (Lever 2): the groups changed since the chain base
+/// A per-vnode state delta: the groups changed since the chain base
 /// (columnar, same shape as a `FULL` slice) plus the keys removed (tombstones).
-#[cfg(all(test, feature = "cluster"))]
+#[cfg(feature = "cluster")]
 pub(crate) struct AggVnodeDelta {
     pub(crate) changed: AggStateCheckpoint,
     pub(crate) tombstones_ipc: Vec<u8>,
+}
+
+/// What a per-vnode capture emits for one vnode under delta-enabled checkpointing.
+#[cfg(feature = "cluster")]
+pub(crate) enum VnodeCapture {
+    /// Full columnar slice — the chain base (re-base).
+    Full(AggStateCheckpoint),
+    /// Incremental delta against the previous epoch's partial for this vnode.
+    Delta(AggVnodeDelta),
+    /// A re-base of a vnode that still holds demoted groups: the resident FULL plus the cold group
+    /// keys the coordinator re-fetches from the tier and folds in, so the new base is self-contained
+    /// (carries both resident and cold state) and the old base unreferences. `full` may be empty for a
+    /// fully-cold vnode. State-tier + delta-primary only.
+    #[cfg(feature = "state-tier")]
+    FullWithColdGroups {
+        full: AggStateCheckpoint,
+        group_keys: Vec<Vec<u8>>,
+    },
 }
 
 impl IncrementalAggState {
@@ -773,9 +847,15 @@ impl IncrementalAggState {
             clauses.where_clause,
         );
 
-        // Skip compilation when upstream has __weight: the compiled path omits
-        // it, which would shift column indices in process_batch.
-        let compiled_projection = if compile_ok && weight_col_idx.is_none() {
+        // The compiled pre-agg evaluates on the operator's routed input batch. For a changelog
+        // source it must carry the `__weight` column through (as the last column, at
+        // `weight_col_idx`); otherwise a chained aggregate would have to re-scan the source's
+        // per-cycle live provider, which desyncs from the routed changelog and mis-nets
+        // retractions. The unoptimized plan's input schema keeps every source column, so the
+        // compiled exprs and the appended `__weight` index the routed batch correctly.
+        let compiled_projection = if !compile_ok {
+            None
+        } else if weight_col_idx.is_none() {
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
                     Some(phys)
@@ -794,6 +874,24 @@ impl IncrementalAggState {
                 })
             } else {
                 None
+            }
+        } else if agg_info.where_predicate.is_none() {
+            // Changelog source, no WHERE: append the `__weight` passthrough. A WHERE over a
+            // changelog needs retraction-aware filtering — fall back to the cached plan.
+            match create_physical_expr(&datafusion_expr::col(WEIGHT_COLUMN), input_df_schema, props)
+            {
+                Ok(weight_expr) => {
+                    let mut exprs = compiled_exprs;
+                    let mut fields = proj_fields;
+                    exprs.push(weight_expr);
+                    fields.push(Field::new(WEIGHT_COLUMN, DataType::Int64, false));
+                    Some(CompiledProjection {
+                        exprs,
+                        filter: None,
+                        output_schema: Arc::new(Schema::new(fields)),
+                    })
+                }
+                Err(_) => None,
             }
         } else {
             None
@@ -866,20 +964,32 @@ impl IncrementalAggState {
             #[cfg(feature = "state-tier")]
             tier_vnode_count: None,
             #[cfg(feature = "state-tier")]
+            last_watermark_ms: i64::MIN,
+            #[cfg(feature = "state-tier")]
             dirty_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "state-tier")]
             dirty_all: false,
             #[cfg(feature = "state-tier")]
             cold_vnodes: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "state-tier")]
+            cold_groups: AHashMap::new(),
             #[cfg(feature = "cluster")]
             delta_enabled: false,
             delta_vnode_count: None,
             dirty_keys_by_vnode: AHashMap::new(),
             removed_by_vnode: AHashMap::new(),
+            last_emitted_dirty_by_vnode: AHashMap::new(),
+            #[cfg(feature = "cluster")]
+            delta_chain_len: AHashMap::new(),
         }))
     }
 
-    #[cfg(all(test, feature = "cluster"))]
+    #[cfg(feature = "cluster")]
+    pub(crate) fn delta_enabled(&self) -> bool {
+        self.delta_enabled
+    }
+
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_delta_enabled(&mut self, enabled: bool) {
         self.delta_enabled = enabled;
     }
@@ -893,6 +1003,18 @@ impl IncrementalAggState {
             {
                 (laminar_core::state::key_hash(key_bytes) % u64::from(count)) as u32
             }
+        }
+    }
+
+    /// Mark a changelog emission key dirty for the delta path. No-op unless delta
+    /// capture is enabled (`delta_vnode_count` set), so it costs nothing by default.
+    fn mark_last_emitted_dirty(&mut self, key: &arrow::row::OwnedRow) {
+        if let Some(count) = self.delta_vnode_count {
+            let v = self.delta_vnode_of(key.as_ref(), count);
+            self.last_emitted_dirty_by_vnode
+                .entry(v)
+                .or_default()
+                .insert(key.clone());
         }
     }
 
@@ -971,6 +1093,12 @@ impl IncrementalAggState {
     }
 
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
+        // Advance the demotion watermark even on empty (heartbeat) batches — before the early return
+        // — so demotable_groups' idle-TTL cutoff tracks the real watermark.
+        #[cfg(feature = "state-tier")]
+        {
+            self.last_watermark_ms = self.last_watermark_ms.max(watermark_ms);
+        }
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -1295,19 +1423,21 @@ impl IncrementalAggState {
                     insert_keys.push(key.clone());
                     insert_vals.push(current.clone());
                     self.last_emitted.insert(key.clone(), current);
+                    self.mark_last_emitted_dirty(key);
                 }
             } else {
                 insert_keys.push(key.clone());
                 insert_vals.push(current.clone());
                 self.last_emitted.insert(key.clone(), current);
+                self.mark_last_emitted_dirty(key);
             }
         }
         dirty.clear();
         self.dirty_keys = dirty;
 
         // Every remover (evict_idle, demote_vnode, restore/merge) drops the group from
-        // `last_emitted` too and evict_idle retracts, so no separate deletion pass is
-        // needed; the invariant below holds.
+        // `last_emitted` too and evict_idle retracts; the chain-apply paths (`apply_delta`,
+        // `merge_groups`) only admit an entry whose group is resident, so the invariant holds.
         debug_assert!(
             self.last_emitted
                 .keys()
@@ -1488,6 +1618,9 @@ impl IncrementalAggState {
         // The restored state is the new baseline — no pending delta entries.
         self.dirty_keys_by_vnode.clear();
         self.removed_by_vnode.clear();
+        self.last_emitted_dirty_by_vnode.clear();
+        #[cfg(feature = "cluster")]
+        self.delta_chain_len.clear();
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
         // All state is in memory; block demotion until the next capture re-baselines.
@@ -1609,14 +1742,175 @@ impl IncrementalAggState {
             self.delta_vnode_count = Some(vnode_count);
             self.dirty_keys_by_vnode.clear();
             self.removed_by_vnode.clear();
+            self.last_emitted_dirty_by_vnode.clear();
         }
 
         Ok(buckets)
     }
 
+    /// Per-vnode capture under delta checkpointing: each touched vnode emits a FULL re-base or an
+    /// incremental DELTA. Re-bases FULL when the vnode has no chain base (fresh / just-acquired) or
+    /// the chain reached `chain_max`. Changelog aggregates delta-encode `last_emitted` alongside the
+    /// groups, so the dedup map survives chain replay. Clears the per-vnode dirty sets; the next
+    /// delta measures against the state captured here.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    pub(crate) fn checkpoint_delta_by_vnode(
+        &mut self,
+        vnode_count: u32,
+        chain_max: u32,
+    ) -> Result<std::collections::HashMap<u32, VnodeCapture>, DbError> {
+        if vnode_count == 0 {
+            return Err(DbError::Pipeline("vnode_count must be > 0".to_string()));
+        }
+
+        let retractable = self.weight_col_idx.is_some();
+        let fingerprint = self.query_fingerprint();
+        let global = self.num_group_cols == 0;
+        let vnode_of = |row_key: &arrow::row::OwnedRow| -> u32 {
+            if global {
+                0
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    (laminar_core::state::key_hash(row_key.as_ref()) % u64::from(vnode_count))
+                        as u32
+                }
+            }
+        };
+
+        // Vnodes worth a capture this epoch: those holding groups (carry-forward keeps the chain
+        // live) plus those with pending removals (an emptied vnode still owes tombstones).
+        let mut touched: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for row_key in self.groups.keys() {
+            touched.insert(vnode_of(row_key));
+        }
+        for v in self
+            .dirty_keys_by_vnode
+            .keys()
+            .chain(self.removed_by_vnode.keys())
+        {
+            touched.insert(*v);
+        }
+        // A fully-cold vnode (every resident group demoted — including a demoted global aggregate) is
+        // in none of the sets above, yet its chain must keep advancing: otherwise it stages nothing,
+        // the coordinator writes an empty `base_epoch=None` partial, and the chain base is orphaned at
+        // once. Seed it so it emits an empty delta below the bound and a cold-carrying re-base at it.
+        #[cfg(feature = "state-tier")]
+        for k in self.cold_groups.keys() {
+            touched.insert(vnode_of(k));
+        }
+
+        let mut out: std::collections::HashMap<u32, VnodeCapture> =
+            std::collections::HashMap::with_capacity(touched.len());
+        for v in touched {
+            // A cold-bearing vnode re-bases at the bound like any other (no longer deferred forever):
+            // the re-base also carries its demoted groups, so the new base is self-contained and the
+            // old one unreferences — keeping the chain base inside the prune window.
+            let force_full = match self.delta_chain_len.get(&v).copied() {
+                None => true, // no base yet (fresh / just-acquired)
+                Some(n) => n >= chain_max,
+            };
+            if force_full {
+                let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
+                    .groups
+                    .iter_mut()
+                    .filter(|(k, _)| vnode_of(k) == v)
+                    .map(|(k, e)| (k.clone(), e))
+                    .collect();
+                let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
+                    &self.row_converter,
+                    self.num_group_cols,
+                    &self.agg_specs,
+                    retractable,
+                    &mut entries,
+                )?;
+                drop(entries); // release the &mut self.groups borrow before reading last_emitted
+                               // A re-base carries the full dedup map; an empty one would re-emit every
+                               // group after recovery.
+                let last_emitted = self.last_emitted_for_vnode(v, vnode_count, None)?;
+                let full = AggStateCheckpoint {
+                    fingerprint,
+                    keys_ipc,
+                    acc_state_ipc,
+                    last_updated_ms,
+                    last_emitted,
+                };
+                #[cfg(feature = "state-tier")]
+                let cap = {
+                    let group_keys: Vec<Vec<u8>> = self
+                        .cold_groups
+                        .keys()
+                        .filter(|k| vnode_of(k) == v)
+                        .map(|k| {
+                            // Resident and cold key sets must stay disjoint — the merge assumes it,
+                            // and an overlap would double-count on recovery (additive merge_groups).
+                            debug_assert!(
+                                !self.groups.contains_key(k),
+                                "cold group is also resident; merge would double-count"
+                            );
+                            k.as_ref().to_vec()
+                        })
+                        .collect();
+                    if group_keys.is_empty() {
+                        VnodeCapture::Full(full)
+                    } else {
+                        VnodeCapture::FullWithColdGroups { full, group_keys }
+                    }
+                };
+                #[cfg(not(feature = "state-tier"))]
+                let cap = VnodeCapture::Full(full);
+                out.insert(v, cap);
+                self.delta_chain_len.insert(v, 0);
+            } else {
+                let delta = self.encode_delta_for_vnode(v)?;
+                out.insert(v, VnodeCapture::Delta(delta));
+                *self.delta_chain_len.entry(v).or_insert(0) += 1;
+            }
+            self.dirty_keys_by_vnode.remove(&v);
+            self.removed_by_vnode.remove(&v);
+            self.last_emitted_dirty_by_vnode.remove(&v);
+        }
+
+        self.delta_vnode_count = Some(vnode_count);
+        Ok(out)
+    }
+
+    /// Build changelog `last_emitted` entries for one vnode (empty for non-changelog
+    /// aggs). `only` restricts to specific keys (the delta's dirty emission set);
+    /// `None` captures every entry for the vnode (a FULL re-base). Lets a recovered
+    /// chain reproduce the dedup map so the first post-recovery emit is exact.
+    #[cfg(feature = "cluster")]
+    fn last_emitted_for_vnode(
+        &self,
+        vnode: u32,
+        vnode_count: u32,
+        only: Option<&AHashSet<arrow::row::OwnedRow>>,
+    ) -> Result<Vec<EmittedCheckpoint>, DbError> {
+        if !self.emit_changelog {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (row_key, vals) in &self.last_emitted {
+            if self.delta_vnode_of(row_key.as_ref(), vnode_count) != vnode {
+                continue;
+            }
+            if only.is_some_and(|keys| !keys.contains(row_key)) {
+                continue;
+            }
+            let sv_key =
+                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+            out.push(EmittedCheckpoint {
+                key: scalars_to_ipc(&sv_key)?,
+                values: scalars_to_ipc(vals)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Encode the state delta for `vnode` from the dirty sets: changed groups via the
     /// columnar FULL encoding over the subset, removed keys as tombstones.
-    #[cfg(all(test, feature = "cluster"))]
+    #[cfg(feature = "cluster")]
     pub(crate) fn encode_delta_for_vnode(&mut self, vnode: u32) -> Result<AggVnodeDelta, DbError> {
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();
@@ -1639,6 +1933,7 @@ impl IncrementalAggState {
             retractable,
             &mut entries,
         )?;
+        drop(entries); // release the &mut self.groups borrow before reading last_emitted
 
         let removed: Vec<arrow::row::OwnedRow> = self
             .removed_by_vnode
@@ -1655,13 +1950,22 @@ impl IncrementalAggState {
             arrays_to_ipc(&arrays)?
         };
 
+        // Changed emission entries ride in `changed.last_emitted` (already serialized by
+        // `serialize_agg_cp`, so no wire change); removals are covered by the tombstones.
+        let vnode_count = self.delta_vnode_count.unwrap_or(1);
+        let last_emitted = self.last_emitted_for_vnode(
+            vnode,
+            vnode_count,
+            self.last_emitted_dirty_by_vnode.get(&vnode),
+        )?;
+
         Ok(AggVnodeDelta {
             changed: AggStateCheckpoint {
                 fingerprint,
                 keys_ipc,
                 acc_state_ipc,
                 last_updated_ms,
-                last_emitted: Vec::new(),
+                last_emitted,
             },
             tombstones_ipc,
         })
@@ -1669,7 +1973,7 @@ impl IncrementalAggState {
 
     /// Apply a delta onto live state: changed groups replace per key (the delta
     /// carries post-update state, never additively re-merged); tombstoned keys removed.
-    #[cfg(all(test, feature = "cluster"))]
+    #[cfg(feature = "cluster")]
     pub(crate) fn apply_delta(&mut self, delta: &AggVnodeDelta) -> Result<(), DbError> {
         let retractable = self.weight_col_idx.is_some();
         let per_group = decode_columnar_state_arrays(
@@ -1689,6 +1993,18 @@ impl IncrementalAggState {
                 },
             );
         }
+        // Changelog dedup map: REPLACE the changed emission entries (post-update values),
+        // mirroring the per-key REPLACE of group state. Only admit an entry whose group is
+        // resident — the map must stay a subset of `groups` (else the emit invariant trips).
+        if !delta.changed.last_emitted.is_empty() {
+            for (row_key, vals) in self.decode_last_emitted(&delta.changed.last_emitted)? {
+                if self.groups.contains_key(&row_key) {
+                    self.last_emitted.insert(row_key, vals);
+                } else {
+                    note_orphan_last_emitted_dropped();
+                }
+            }
+        }
         if !delta.tombstones_ipc.is_empty() {
             let batch =
                 laminar_core::serialization::deserialize_batch_stream(&delta.tombstones_ipc)
@@ -1698,11 +2014,32 @@ impl IncrementalAggState {
                 .convert_columns(batch.columns())
                 .map_err(|e| DbError::Pipeline(format!("tombstone row convert: {e}")))?;
             for i in 0..rows.num_rows() {
-                self.groups.remove(&rows.row(i).owned());
+                let key = rows.row(i).owned();
+                // Eviction drops the group and its emission together, so a tombstone
+                // clears both.
+                self.last_emitted.remove(&key);
+                self.groups.remove(&key);
             }
         }
         self.state_gen = self.state_gen.wrapping_add(1);
         Ok(())
+    }
+
+    /// Replay a recovered chain into live state: merge the FULL base, then apply each delta in
+    /// epoch order (oldest→newest). `apply_delta`'s REPLACE semantics make the ordered replay
+    /// reproduce the chain head exactly. The base must merge into empty vnode state (fresh restart
+    /// or a clean acquire), which the recovery path guarantees.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn apply_vnode_chain(
+        &mut self,
+        base: &AggStateCheckpoint,
+        deltas: &[AggVnodeDelta],
+    ) -> Result<usize, DbError> {
+        let merged = self.merge_groups(base)?;
+        for delta in deltas {
+            self.apply_delta(delta)?;
+        }
+        Ok(merged)
     }
 
     /// Fold a checkpoint's accumulator states into live state via `merge_batch`.
@@ -1776,14 +2113,146 @@ impl IncrementalAggState {
         }
 
         for (row_key, vals) in self.decode_last_emitted(&checkpoint.last_emitted)? {
-            self.last_emitted.entry(row_key).or_insert(vals);
+            // Keep the dedup map a subset of resident groups (see `apply_delta`): a base whose
+            // `last_emitted` names a group its `keys_ipc` did not carry would orphan the entry.
+            if self.groups.contains_key(&row_key) {
+                self.last_emitted.entry(row_key).or_insert(vals);
+            } else {
+                note_orphan_last_emitted_dropped();
+            }
         }
+        // `delta_chain_len` is NOT reset here: a rehydration merge does not by itself mean this node
+        // must re-base. Re-basing is tied to vnode ACQUISITION (`reset_acquired_vnodes`, driven by the
+        // owned-set diff at capture) so the chain matches the coordinator's per-vnode parent epoch.
+        // Resetting blindly here would also clobber a sibling vnode that still holds cold groups,
+        // forcing it to re-base FULL and silently drop its demoted groups (the rehydration panic).
 
         self.state_gen = self.state_gen.wrapping_add(1);
         self.size_cache.invalidate();
         // No dirty_all: callers mark only the merged vnode dirty, so other
         // clean vnodes remain demotable.
         Ok(merged)
+    }
+
+    /// Re-base delta tracking for vnodes this node just ACQUIRED (owned-set grew): a just-acquired
+    /// vnode has no parent epoch to chain a delta onto, so its next capture must re-upload FULL.
+    /// This is the ONLY place the chain is reset on ownership change — owned-and-demoted vnodes are
+    /// never "acquired", so their `has_cold` re-base deferral stays intact (no cold-group drop), and
+    /// the reset reaches a re-acquired vnode even when it has no durable state to rehydrate (which
+    /// would otherwise emit a parentless delta — LDB-6025). Stale cold-group tracking for an
+    /// acquired vnode is dropped too: the rehydrated chain is authoritative and any prior owner's
+    /// node-local tier bytes are gone.
+    ///
+    /// Complements (does not duplicate) `drop_vnodes`: that handles the REVOCATION transition
+    /// (clearing all state for a lost vnode); this handles the ACQUISITION transition, whose
+    /// load-bearing work is the `delta_chain_len` re-base — after a restart `prev_owned` is empty, so
+    /// every owned vnode reads as newly-acquired and must re-base FULL (no parent epoch here). The
+    /// `cold_groups` retain below is now defense-in-depth only: `drop_vnodes` already clears a vnode's
+    /// cold tracking at revocation, and a restart starts with `cold_groups` empty, so on every
+    /// reachable path it is a no-op by the time a vnode is re-acquired.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn reset_acquired_vnodes(&mut self, acquired: &rustc_hash::FxHashSet<u32>) {
+        if acquired.is_empty() {
+            return;
+        }
+        for v in acquired {
+            self.delta_chain_len.remove(v);
+        }
+        #[cfg(feature = "state-tier")]
+        if let Some(count) = self.delta_vnode_count {
+            let global = self.num_group_cols == 0;
+            self.cold_groups.retain(|k, _| {
+                let v = if global {
+                    0
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        (laminar_core::state::key_hash(k.as_ref()) % u64::from(count)) as u32
+                    }
+                };
+                !acquired.contains(&v)
+            });
+        }
+    }
+
+    /// Drop in-memory state for revoked (lost) vnodes and return per-vnode `-1`-weight retraction
+    /// batches (from `last_emitted` before the purge) so the losing node's MV snapshot drops the
+    /// moved groups (empty unless changelog). Without the purge a later re-acquire's additive
+    /// `merge_groups` double-counts the stale leftover. Runs on the compute thread; revoked and
+    /// acquired sets are disjoint per rotation, so it never races an acquire-merge.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn drop_vnodes(
+        &mut self,
+        revoked: &rustc_hash::FxHashSet<u32>,
+        vnode_count: u32,
+    ) -> Result<ahash::AHashMap<u32, RecordBatch>, DbError> {
+        if revoked.is_empty() {
+            return Ok(ahash::AHashMap::new());
+        }
+        let global = self.num_group_cols == 0;
+        let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
+            if global {
+                0
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    (laminar_core::state::key_hash(k.as_ref()) % u64::from(vnode_count)) as u32
+                }
+            }
+        };
+        let in_revoked = |k: &arrow::row::OwnedRow| -> bool { revoked.contains(&vnode_of(k)) };
+
+        // Build the retractions BEFORE purging, one batch per revoked vnode (keyed so a same-cycle
+        // reacquire can cancel its own vnode's retraction — see `apply_vnode_chain`).
+        let mut retractions: ahash::AHashMap<u32, RecordBatch> = ahash::AHashMap::new();
+        if self.emit_changelog {
+            let mut by_vnode: ahash::AHashMap<
+                u32,
+                (Vec<arrow::row::OwnedRow>, Vec<Vec<ScalarValue>>),
+            > = ahash::AHashMap::new();
+            for (k, vals) in &self.last_emitted {
+                let v = vnode_of(k);
+                if revoked.contains(&v) {
+                    let e = by_vnode.entry(v).or_default();
+                    e.0.push(k.clone());
+                    e.1.push(vals.clone());
+                }
+            }
+            for (v, (keys, vals)) in by_vnode {
+                let weights = vec![-1i64; keys.len()];
+                let batch = build_weighted_batch(
+                    &keys,
+                    &vals,
+                    &weights,
+                    &self.row_converter,
+                    self.num_group_cols,
+                    &self.agg_specs,
+                    &self.output_schema,
+                )?;
+                retractions.insert(v, batch);
+            }
+        }
+
+        self.groups.retain(|k, _| !in_revoked(k));
+        self.last_emitted.retain(|k, _| !in_revoked(k));
+        self.dirty_keys.retain(|k| !in_revoked(k));
+        for v in revoked {
+            self.dirty_keys_by_vnode.remove(v);
+            self.removed_by_vnode.remove(v);
+            self.last_emitted_dirty_by_vnode.remove(v);
+            self.delta_chain_len.remove(v);
+        }
+        #[cfg(feature = "state-tier")]
+        {
+            self.cold_groups.retain(|k, _| !in_revoked(k));
+            for v in revoked {
+                self.cold_vnodes.remove(v);
+                self.dirty_vnodes.remove(v);
+            }
+        }
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
+        Ok(retractions)
     }
 }
 
@@ -1846,11 +2315,354 @@ impl IncrementalAggState {
     pub(crate) fn mark_vnode_dirty(&mut self, vnode: u32) {
         self.dirty_vnodes.insert(vnode);
     }
+
+    /// Groups demoted to the tier.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cold_groups(&self) -> &AHashMap<arrow::row::OwnedRow, i64> {
+        &self.cold_groups
+    }
+
+    /// Cold (demoted) group tier keys bucketed by vnode — `vnode -> [group_key_bytes]`, matching the
+    /// `(vnode, group_key)` the demotion wrote. The checkpoint coordinator fetches these and writes a
+    /// cold-only partial per vnode; recovery merges them additively on top of the manifest's resident.
+    #[cfg(feature = "state-tier")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    pub(crate) fn cold_groups_by_vnode(
+        &self,
+        vnode_count: u32,
+    ) -> std::collections::HashMap<u32, Vec<Vec<u8>>> {
+        let mut out: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for k in self.cold_groups.keys() {
+            let v = self.delta_vnode_of(k.as_ref(), vnode_count);
+            out.entry(v).or_default().push(k.as_ref().to_vec());
+        }
+        out
+    }
+
+    /// Whether `key` can be demoted now: changelog mode, delta tracking on this `vnode_count`,
+    /// the group resident, and clean (untouched since the last capture, so its tier bytes match a
+    /// restorable checkpoint). Mirrors `can_demote` at group granularity.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn can_demote_group(&self, key: &arrow::row::OwnedRow, vnode_count: u32) -> bool {
+        self.emit_changelog
+            && self.delta_enabled
+            && !self.dirty_all
+            && self.delta_vnode_count == Some(vnode_count)
+            && self.groups.contains_key(key)
+            && !self.is_group_dirty(key, vnode_count)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_group_dirty(&self, key: &arrow::row::OwnedRow, vnode_count: u32) -> bool {
+        let v = self.delta_vnode_of(key.as_ref(), vnode_count);
+        self.dirty_keys_by_vnode
+            .get(&v)
+            .is_some_and(|s| s.contains(key))
+            || self
+                .removed_by_vnode
+                .get(&v)
+                .is_some_and(|s| s.contains(key))
+    }
+
+    /// Serialize one resident group's state (columnar, same shape as a delta's changed-groups,
+    /// carrying the group's `last_emitted` dedup entry) for a tier write. The caller writes the
+    /// bytes to the tier, then calls `drop_demoted_group` — write-before-drop, like `demote_vnode`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn encode_group(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+    ) -> Result<AggStateCheckpoint, DbError> {
+        let fingerprint = self.query_fingerprint();
+        let retractable = self.weight_col_idx.is_some();
+        let Some(entry) = self.groups.get_mut(key) else {
+            return Err(DbError::Pipeline(
+                "encode_group: group not resident".to_string(),
+            ));
+        };
+        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = vec![(key.clone(), entry)];
+        let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
+            &self.row_converter,
+            self.num_group_cols,
+            &self.agg_specs,
+            retractable,
+            &mut entries,
+        )?;
+        drop(entries); // release the &mut self.groups borrow before reading last_emitted
+        let last_emitted = self.last_emitted_for_single(key)?;
+        Ok(AggStateCheckpoint {
+            fingerprint,
+            keys_ipc,
+            acc_state_ipc,
+            last_updated_ms,
+            last_emitted,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn last_emitted_for_single(
+        &self,
+        key: &arrow::row::OwnedRow,
+    ) -> Result<Vec<EmittedCheckpoint>, DbError> {
+        if !self.emit_changelog {
+            return Ok(Vec::new());
+        }
+        let Some(vals) = self.last_emitted.get(key) else {
+            return Ok(Vec::new());
+        };
+        let sv_key = row_to_scalar_key_with_types(&self.row_converter, key, &self.group_types)?;
+        Ok(vec![EmittedCheckpoint {
+            key: scalars_to_ipc(&sv_key)?,
+            values: scalars_to_ipc(vals)?,
+        }])
+    }
+
+    /// Drop a demoted group from live state after its tier write is confirmed. Tracked in
+    /// `cold_groups` so a FULL re-base streams it back.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn drop_demoted_group(&mut self, key: &arrow::row::OwnedRow) {
+        // Freeze the group's idle timestamp so the idle-TTL pass can later retract it while cold.
+        let last_updated_ms = self.groups.get(key).map_or(i64::MIN, |e| e.last_updated_ms);
+        self.groups.remove(key);
+        self.last_emitted.remove(key);
+        self.cold_groups.insert(key.clone(), last_updated_ms);
+        self.state_gen = self.state_gen.wrapping_add(1);
+        self.size_cache.invalidate();
+    }
+
+    /// Rehydrate a demoted group from its tier bytes (decoded to `cp`) back into live state.
+    /// Reuses `apply_delta`'s per-key REPLACE; clears the cold marker.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn promote_group(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+        cp: AggStateCheckpoint,
+    ) -> Result<(), DbError> {
+        self.apply_delta(&AggVnodeDelta {
+            changed: cp,
+            tombstones_ipc: Vec::new(),
+        })?;
+        self.cold_groups.remove(key);
+        // Mark the promoted group dirty so the next capture carries it in `keys_ipc` (not just the
+        // `only=None` last_emitted over-capture): a consumer then materializes its group alongside
+        // the dedup entry instead of orphaning it. Also blocks immediate re-demotion until capture.
+        if let Some(count) = self.delta_vnode_count {
+            let v = self.delta_vnode_of(key.as_ref(), count);
+            self.dirty_keys_by_vnode
+                .entry(v)
+                .or_default()
+                .insert(key.clone());
+            self.mark_last_emitted_dirty(key);
+        }
+        self.size_cache.invalidate();
+        Ok(())
+    }
+
+    /// Up to `max` resident groups eligible for demotion, idle-first (oldest `last_updated_ms`):
+    /// changelog mode, delta tracking on this `vnode_count`, and clean (untouched since the last
+    /// capture). `(key, vnode, group_key_bytes)`. Empty when demotion is unsafe.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn demotable_groups(
+        &self,
+        vnode_count: u32,
+        max: usize,
+    ) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>)> {
+        if !self.emit_changelog
+            || !self.delta_enabled
+            || self.dirty_all
+            || self.delta_vnode_count != Some(vnode_count)
+        {
+            return Vec::new();
+        }
+        // With an idle TTL, a group already past the eviction cutoff must be RETRACTED by
+        // `evict_idle`, not demoted: a demoted group is dropped from `groups`, so `evict_idle` can no
+        // longer see it → the downstream changelog row leaks past the TTL and its cold-tier entry is
+        // never reclaimed. Only demote groups that are idle but still within the TTL window.
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff = self
+            .idle_ttl_ms
+            .map(|ttl| self.last_watermark_ms.saturating_sub(ttl as i64));
+        let mut cand: Vec<(i64, &arrow::row::OwnedRow)> = self
+            .groups
+            .iter()
+            .filter(|(k, _)| !self.is_group_dirty(k, vnode_count))
+            .filter(|(_, e)| cutoff.is_none_or(|c| e.last_updated_ms >= c))
+            .map(|(k, e)| (e.last_updated_ms, k))
+            .collect();
+        cand.sort_by_key(|(ts, _)| *ts);
+        cand.into_iter()
+            .take(max)
+            .map(|(_, k)| {
+                let v = self.delta_vnode_of(k.as_ref(), vnode_count);
+                (k.clone(), v, k.as_ref().to_vec())
+            })
+            .collect()
+    }
+
+    /// Cold (demoted) groups whose frozen `last_updated_ms` fell past the idle-TTL cutoff, as tier
+    /// coordinates `(key, vnode, group_key_bytes)`. `evict_idle` only scans resident groups, so a
+    /// group demoted while within TTL that later crosses it would leak its changelog row and never
+    /// reclaim its tier entry. The caller `FetchGroup`s these back; once promoted (which restores
+    /// `last_emitted`), the next `evict_idle` retracts them and the resolution's `DropGroup` reclaims
+    /// the tier. Empty without an idle TTL or outside changelog mode.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn cold_groups_past_idle_ttl(
+        &self,
+        watermark: i64,
+        vnode_count: u32,
+    ) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>)> {
+        let Some(ttl) = self.idle_ttl_ms else {
+            return Vec::new();
+        };
+        if !self.emit_changelog {
+            return Vec::new();
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff = watermark.saturating_sub(ttl as i64);
+        self.cold_groups
+            .iter()
+            .filter(|(_, &lu)| lu < cutoff)
+            .map(|(k, _)| {
+                let v = self.delta_vnode_of(k.as_ref(), vnode_count);
+                (k.clone(), v, k.as_ref().to_vec())
+            })
+            .collect()
+    }
+
+    /// Distinct cold (demoted) group keys touched by `batch`, with tier coordinates
+    /// `(key, vnode, group_key_bytes)`. Empty when no group is cold. The caller fetches each and
+    /// defers the batch until they rehydrate (fetch-on-access promotion). `group_key_bytes` and
+    /// `vnode` match what `drop_demoted_group`'s caller wrote, so the tier keys line up.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cold_groups_touched(
+        &self,
+        batch: &RecordBatch,
+        vnode_count: u32,
+    ) -> Result<Vec<(arrow::row::OwnedRow, u32, Vec<u8>)>, DbError> {
+        if self.cold_groups.is_empty() || batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+        // Global aggregate (no GROUP BY): the single group lives at the empty key (vnode 0). If it
+        // was demoted, defer this batch so `process_with_promotion` fetches it back — otherwise
+        // `process_batch_no_groups` rebuilds a fresh zeroed accumulator and double-counts on capture.
+        if self.num_group_cols == 0 {
+            let key = global_aggregate_key();
+            if !self.cold_groups.contains_key(&key) {
+                return Ok(Vec::new());
+            }
+            let vnode = self.delta_vnode_of(key.as_ref(), vnode_count);
+            let bytes = key.as_ref().to_vec();
+            return Ok(vec![(key, vnode, bytes)]);
+        }
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("cold-group row conversion: {e}")))?;
+        let mut seen: AHashSet<arrow::row::OwnedRow> = AHashSet::new();
+        let mut out = Vec::new();
+        for i in 0..batch.num_rows() {
+            let owned = rows.row(i).owned();
+            if self.cold_groups.contains_key(&owned) && seen.insert(owned.clone()) {
+                let vnode = self.delta_vnode_of(owned.as_ref(), vnode_count);
+                let group_bytes = owned.as_ref().to_vec();
+                out.push((owned, vnode, group_bytes));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Profiler: isolates the per-cycle cost of a non-windowed running-state aggregate at high
+    // group cardinality — #1 full re-emit (`emit_running_state`) vs #2 checkpoint capture
+    // (`checkpoint_groups`) vs the incremental baseline (folding ONE changed row). Run release:
+    //   cargo test -p laminar-db --lib --release profile_agg_emit_vs_capture -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "profiler — run with --release --ignored --nocapture"]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    async fn profile_agg_emit_vs_capture() {
+        use std::time::Instant;
+
+        fn pre_agg_batch(n: usize) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]));
+            let names: Vec<String> = (0..n).map(|i| format!("g{i}")).collect();
+            let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(arrow::array::StringArray::from(name_refs)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap()
+        }
+
+        println!("\n--- non-windowed running-state aggregate, per-cycle cost ---");
+        for &n in &[10_000usize, 100_000, 1_000_000] {
+            let ctx = laminar_sql::create_session_context();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("value", DataType::Float64, true),
+            ]));
+            let dummy = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                    Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                ],
+            )
+            .unwrap();
+            let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
+            ctx.register_table("events", Arc::new(mem)).unwrap();
+            let mut state = IncrementalAggState::try_from_sql(
+                &ctx,
+                "SELECT name, SUM(value) AS total FROM events GROUP BY name",
+                false, // non-windowed running-state → the full re-emit path
+            )
+            .await
+            .unwrap()
+            .expect("agg state");
+
+            state.process_batch(&pre_agg_batch(n), i64::MIN).unwrap();
+            assert_eq!(state.groups.len(), n);
+
+            // #1 — full re-emit of all N groups (what a non-windowed running-state MV does
+            // every cycle, regardless of how many groups actually changed).
+            let t = Instant::now();
+            let out = state.emit_running_state().unwrap();
+            let emit_us = t.elapsed().as_micros();
+            let emitted: usize = out.iter().map(arrow_array::RecordBatch::num_rows).sum();
+
+            // #2 — O(groups) checkpoint capture (inline on the pipeline task).
+            let t = Instant::now();
+            let _cp = state.checkpoint_groups().unwrap();
+            let capture_us = t.elapsed().as_micros();
+
+            // Baseline — the real incremental work for a cycle touching ONE group.
+            let t = Instant::now();
+            state.process_batch(&pre_agg_batch(1), i64::MIN).unwrap();
+            let process_one_us = t.elapsed().as_micros().max(1);
+
+            println!(
+                "N={n:>9}  emit={emit_us:>8}us ({:>4}ns/grp, {emitted} rows)  \
+                 capture={capture_us:>8}us ({:>4}ns/grp)  process_1row={process_one_us:>4}us  \
+                 emit/process1={:>6.0}x",
+                (emit_us * 1000) / n as u128,
+                (capture_us * 1000) / n as u128,
+                emit_us as f64 / process_one_us as f64,
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_try_from_sql_rejects_post_aggregate_projection() {
@@ -3183,6 +3995,1448 @@ mod tests {
         );
     }
 
+    /// FULL base + an ordered chain of deltas, replayed via `apply_vnode_chain`, reproduces the
+    /// producer exactly — and a chain re-bases to FULL once it reaches `chain_max`.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn delta_chain_replay_reproduces_full_baseline() {
+        use std::collections::BTreeMap;
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        fn group_vals(state: &mut IncrementalAggState) -> BTreeMap<Vec<u8>, String> {
+            state
+                .groups
+                .iter_mut()
+                .map(|(k, v)| {
+                    (
+                        k.as_ref().to_vec(),
+                        format!("{:?}", v.accs[0].evaluate().unwrap()),
+                    )
+                })
+                .collect()
+        }
+        // Non-changelog agg: `checkpoint_delta_by_vnode` emits deltas (a changelog agg re-bases FULL).
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+        #[allow(clippy::disallowed_types)] // matches checkpoint_delta_by_vnode's return type
+        fn delta_for_vnode0(cap: std::collections::HashMap<u32, VnodeCapture>) -> AggVnodeDelta {
+            match cap.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c) {
+                Some(VnodeCapture::Delta(d)) => d,
+                _ => panic!("expected a DELTA for vnode 0"),
+            }
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut producer = agg(&ctx).await;
+        producer.set_delta_enabled(true);
+
+        // Epoch 0: seed a,b,c — first capture re-bases FULL and opens the delta window.
+        feed(&mut producer, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
+        let cap0 = producer.checkpoint_delta_by_vnode(V, 8).unwrap();
+        let Some(VnodeCapture::Full(base)) =
+            cap0.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c)
+        else {
+            panic!("first capture must be FULL");
+        };
+
+        // Epoch 1: change a → DELTA. Epoch 2: change b + add e → DELTA.
+        feed(&mut producer, &[("a", 10.0)], 2000);
+        let d1 = delta_for_vnode0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
+        feed(&mut producer, &[("b", 20.0), ("e", 5.0)], 3000);
+        let d2 = delta_for_vnode0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
+
+        // Replay FULL base + ordered deltas into a fresh consumer.
+        let mut consumer = agg(&ctx).await;
+        consumer.apply_vnode_chain(&base, &[d1, d2]).unwrap();
+        assert_eq!(
+            group_vals(&mut consumer),
+            group_vals(&mut producer),
+            "FULL base + ordered delta chain must reproduce the producer state",
+        );
+
+        // chain_max = 1: the chain re-bases to FULL on the next capture.
+        feed(&mut producer, &[("a", 11.0)], 4000);
+        let rebased = producer.checkpoint_delta_by_vnode(V, 1).unwrap();
+        assert!(
+            matches!(rebased.get(&0), Some(VnodeCapture::Full(_))),
+            "a chain at the bound must re-base to FULL",
+        );
+    }
+
+    /// A changelog aggregate's delta chain must reproduce BOTH the group state and the
+    /// `last_emitted` dedup map, so the first post-recovery emit re-emits nothing and a
+    /// later change emits identically.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one coherent replay scenario with local scaffolding
+    async fn delta_chain_replay_reproduces_changelog_last_emitted() {
+        use std::collections::BTreeMap;
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        // (groups, last_emitted) as comparable string maps.
+        fn snapshot(
+            state: &mut IncrementalAggState,
+        ) -> (BTreeMap<Vec<u8>, String>, BTreeMap<Vec<u8>, String>) {
+            let groups = state
+                .groups
+                .iter_mut()
+                .map(|(k, v)| {
+                    (
+                        k.as_ref().to_vec(),
+                        format!("{:?}", v.accs[0].evaluate().unwrap()),
+                    )
+                })
+                .collect();
+            let emitted = state
+                .last_emitted
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_vec(), format!("{v:?}")))
+                .collect();
+            (groups, emitted)
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true, // emit_changelog
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+        #[allow(clippy::disallowed_types)]
+        fn delta0(cap: std::collections::HashMap<u32, VnodeCapture>) -> AggVnodeDelta {
+            match cap.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c) {
+                Some(VnodeCapture::Delta(d)) => d,
+                _ => panic!("expected a DELTA for vnode 0"),
+            }
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut producer = agg(&ctx).await;
+        producer.set_delta_enabled(true);
+
+        // Epoch 0: seed + emit a,b,c, then FULL re-base (must carry last_emitted).
+        feed(&mut producer, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
+        producer.emit().unwrap();
+        let Some(VnodeCapture::Full(base)) = producer
+            .checkpoint_delta_by_vnode(V, 8)
+            .unwrap()
+            .into_iter()
+            .find(|(v, _)| *v == 0)
+            .map(|(_, c)| c)
+        else {
+            panic!("first capture must be FULL");
+        };
+        assert!(
+            !base.last_emitted.is_empty(),
+            "a changelog FULL re-base must carry the dedup map",
+        );
+
+        // Epoch 1: change a, emit → DELTA carries a's updated last_emitted.
+        feed(&mut producer, &[("a", 10.0)], 2000);
+        producer.emit().unwrap();
+        let d1 = delta0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
+
+        // Epoch 2: change b + add d, emit → DELTA.
+        feed(&mut producer, &[("b", 20.0), ("d", 4.0)], 3000);
+        producer.emit().unwrap();
+        let d2 = delta0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
+
+        // Replay FULL base + ordered deltas into a fresh consumer.
+        let mut consumer = agg(&ctx).await;
+        consumer.set_delta_enabled(true);
+        consumer.apply_vnode_chain(&base, &[d1, d2]).unwrap();
+
+        let (pg, pe) = snapshot(&mut producer);
+        let (cg, ce) = snapshot(&mut consumer);
+        assert_eq!(cg, pg, "groups must match after chain replay");
+        assert_eq!(
+            ce, pe,
+            "last_emitted dedup map must match after chain replay"
+        );
+
+        // No new input → the recovered dedup map must re-emit NOTHING (no duplicates).
+        let drained: usize = consumer
+            .emit()
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            drained, 0,
+            "recovered changelog state must not re-emit unchanged groups"
+        );
+
+        // A genuine change emits identically on both.
+        feed(&mut producer, &[("a", 100.0)], 4000);
+        feed(&mut consumer, &[("a", 100.0)], 4000);
+        let pr: usize = producer
+            .emit()
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        let cr: usize = consumer
+            .emit()
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            cr, pr,
+            "post-recovery emit must produce identical changelog output"
+        );
+    }
+
+    /// A clean changelog group encodes, drops into `cold_groups`, and promotes back exactly
+    /// (group state + `last_emitted` dedup) so it re-emits nothing; a dirty group is not demotable.
+    #[cfg(feature = "state-tier")]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn demote_then_promote_group_round_trips() {
+        use std::collections::BTreeMap;
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        fn snapshot(
+            state: &mut IncrementalAggState,
+        ) -> (BTreeMap<Vec<u8>, String>, BTreeMap<Vec<u8>, String>) {
+            let groups = state
+                .groups
+                .iter_mut()
+                .map(|(k, v)| {
+                    (
+                        k.as_ref().to_vec(),
+                        format!("{:?}", v.accs[0].evaluate().unwrap()),
+                    )
+                })
+                .collect();
+            let emitted = state
+                .last_emitted
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_vec(), format!("{v:?}")))
+                .collect();
+            (groups, emitted)
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true, // emit_changelog
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // Seed + emit + capture → groups clean, delta_vnode_count = Some(V).
+        feed(&mut state, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 8).unwrap();
+
+        let before = snapshot(&mut state);
+        let keys: Vec<arrow::row::OwnedRow> = state.groups.keys().cloned().collect();
+        assert_eq!(keys.len(), 3);
+
+        // Each clean group encodes then drops (the caller writes the bytes to the tier between).
+        let mut demoted: Vec<(arrow::row::OwnedRow, AggStateCheckpoint)> = Vec::new();
+        for k in &keys {
+            assert!(
+                state.can_demote_group(k, V),
+                "a clean group must be demotable"
+            );
+            let cp = state.encode_group(k).unwrap();
+            state.drop_demoted_group(k);
+            demoted.push((k.clone(), cp));
+        }
+        assert!(state.groups.is_empty(), "all groups demoted out of memory");
+        assert_eq!(state.cold_groups().len(), 3);
+
+        // cold_groups_touched detects a demoted key in an incoming batch (fetch-on-access
+        // promotion): a row for the cold "a" is reported; a never-seen key is not.
+        let probe = RecordBatch::try_new(
+            pre_agg_schema(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "never"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let touched = state.cold_groups_touched(&probe, V).unwrap();
+        assert_eq!(touched.len(), 1, "only the demoted key 'a' is cold");
+        assert!(
+            state.cold_groups().contains_key(&touched[0].0),
+            "reported key is one of the cold groups",
+        );
+
+        // Promote them back; live state must match exactly and re-emit nothing.
+        for (k, cp) in demoted {
+            state.promote_group(&k, cp).unwrap();
+        }
+        assert!(state.cold_groups().is_empty());
+        assert_eq!(
+            snapshot(&mut state),
+            before,
+            "promote must restore group state + last_emitted",
+        );
+        let drained: usize = state
+            .emit()
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(drained, 0, "promoted changelog groups must not re-emit");
+
+        // A group changed since the last capture is dirty → not demotable.
+        feed(&mut state, &[("a", 10.0)], 2000);
+        let dirty = state
+            .groups
+            .keys()
+            .find(|k| state.is_group_dirty(k, V))
+            .cloned()
+            .expect("the changed group is dirty");
+        assert!(
+            !state.can_demote_group(&dirty, V),
+            "a dirty group must not be demotable",
+        );
+    }
+
+    /// With an idle TTL set, a clean group already past the eviction cutoff must NOT be a demotion
+    /// candidate — `evict_idle` has to retract it (a demoted group is dropped from `groups`, so
+    /// eviction can no longer see it → the changelog row leaks past the TTL and its cold-tier entry
+    /// is never reclaimed). Only groups idle-but-within the TTL window are demotable.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn demotable_groups_excludes_groups_past_idle_ttl() {
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true, // emit_changelog
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.set_delta_enabled(true);
+        state.idle_ttl_ms = Some(5_000);
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let feed = |state: &mut IncrementalAggState, name: &str, ts: i64| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&pre_agg_schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![name])),
+                    Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        };
+
+        // "old" last touched at wm=1_000; "fresh" at wm=10_000 → current watermark = 10_000.
+        feed(&mut state, "old", 1_000);
+        feed(&mut state, "fresh", 10_000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 8).unwrap();
+
+        let old_key: Vec<u8> = state
+            .groups
+            .iter()
+            .find(|(_, e)| e.last_updated_ms == 1_000)
+            .map(|(k, _)| k.as_ref().to_vec())
+            .expect("the 'old' group is resident");
+
+        // cutoff = 10_000 - 5_000 = 5_000 → "old" (1_000) is excluded, "fresh" (10_000) demotable.
+        let demotable: Vec<Vec<u8>> = state
+            .demotable_groups(V, 256)
+            .into_iter()
+            .map(|(_, _, g)| g)
+            .collect();
+        assert_eq!(demotable.len(), 1, "only the within-TTL group is demotable");
+        assert!(
+            !demotable.contains(&old_key),
+            "a group past the idle-TTL cutoff must be retracted by evict_idle, not demoted",
+        );
+
+        // The exclusion is TTL-gated: with no idle TTL, both clean groups are demotable.
+        state.idle_ttl_ms = None;
+        assert_eq!(state.demotable_groups(V, 256).len(), 2);
+    }
+
+    /// A group demoted while within the idle TTL that later crosses the TTL while cold
+    /// must be detected by `cold_groups_past_idle_ttl`, then promote-then-retracted so its changelog
+    /// row does not leak past the TTL and its tier entry is reclaimed.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn cold_group_past_idle_ttl_is_detected_then_retracted() {
+        const V: u32 = 1;
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.set_delta_enabled(true);
+        state.idle_ttl_ms = Some(5_000);
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let feed = |state: &mut IncrementalAggState, name: &str, ts: i64| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&pre_agg_schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![name])),
+                    Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        };
+
+        // Emit "a" (so it has a changelog dedup row), checkpoint to mark it clean, then demote it
+        // while it is within the TTL (frozen last_updated_ms = 1_000).
+        feed(&mut state, "a", 1_000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 8).unwrap();
+        let a_key = state.groups.keys().next().cloned().unwrap();
+        assert!(state.last_emitted.contains_key(&a_key), "a was emitted");
+        let blob = state.encode_group(&a_key).unwrap();
+        state.drop_demoted_group(&a_key);
+
+        // Within the TTL window (watermark 4_000 → cutoff -1_000): not yet detected.
+        assert!(state.cold_groups_past_idle_ttl(4_000, V).is_empty());
+
+        // Past the TTL (watermark 10_000 → cutoff 5_000 > frozen 1_000): detected for promotion.
+        let past = state.cold_groups_past_idle_ttl(10_000, V);
+        assert_eq!(past.len(), 1);
+        assert_eq!(past[0].0, a_key);
+
+        // Promote it back, then evict_idle at the same watermark retracts it exactly once and clears
+        // both the resident group and its dedup row; the cold entry was already cleared by promotion.
+        state.promote_group(&a_key, blob).unwrap();
+        assert!(!state.cold_groups.contains_key(&a_key));
+        let retractions = state.evict_idle(10_000).unwrap();
+        let rows: usize = retractions
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows, 1,
+            "exactly one retraction for the aged-out cold group"
+        );
+        assert!(!state.groups.contains_key(&a_key));
+        assert!(!state.last_emitted.contains_key(&a_key));
+    }
+
+    /// A group-demoted GLOBAL aggregate (no GROUP BY) must still be reported by
+    /// `cold_groups_touched` so the batch defers for fetch-on-access promotion — otherwise
+    /// `process_batch_no_groups` rebuilds a fresh zeroed accumulator and double-counts on capture.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn global_aggregate_cold_group_is_rehydrated() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state =
+            IncrementalAggState::try_from_sql(&ctx, "SELECT SUM(value) as total FROM events", true)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            state.num_group_cols, 0,
+            "global aggregate has no group columns"
+        );
+
+        let key = global_aggregate_key();
+        let probe = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![5.0]))],
+        )
+        .unwrap();
+
+        // No cold groups → nothing to promote.
+        assert!(state.cold_groups_touched(&probe, 1).unwrap().is_empty());
+
+        // Simulate the single global group demoted to the tier.
+        state.cold_groups.insert(key.clone(), 0);
+
+        // The fix: the demoted global group is reported so the batch defers for promotion. Before
+        // the fix `cold_groups_touched` short-circuited on `num_group_cols == 0` and returned empty,
+        // so `process_batch_no_groups` rebuilt a zeroed accumulator and double-counted on capture.
+        let touched = state.cold_groups_touched(&probe, 1).unwrap();
+        assert_eq!(
+            touched.len(),
+            1,
+            "the demoted global group is reported for promotion"
+        );
+        assert_eq!(touched[0].0, key);
+        assert_eq!(touched[0].1, 0, "the global group maps to vnode 0");
+    }
+
+    /// A global (no-GROUP-BY) changelog aggregate with delta checkpoints must capture without
+    /// panicking on the empty group key (`row_to_scalar_key_with_types` on the global sentinel),
+    /// and the captured slice must restore to the same value.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn global_changelog_delta_checkpoint_roundtrips() {
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(ctx, "SELECT SUM(value) as total FROM events", true)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let pre = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_1",
+            DataType::Float64,
+            true,
+        )]));
+        let feed = |state: &mut IncrementalAggState, vals: Vec<f64>, ts: i64| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&pre),
+                vec![Arc::new(arrow::array::Float64Array::from(vals))],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        };
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+        feed(&mut state, vec![1.0, 2.0, 3.0], 1000);
+        state.emit().unwrap();
+
+        // Before the fix this panicked: the empty global key hit convert_rows on a 0-field converter.
+        let caps = state.checkpoint_delta_by_vnode(1, 8).unwrap();
+        assert!(
+            caps.contains_key(&0),
+            "the global group is captured under vnode 0"
+        );
+
+        // Restore into a fresh aggregate; the single global group must total 6.0.
+        let mut restored = agg(&ctx).await;
+        match caps.get(&0).expect("vnode-0 capture") {
+            VnodeCapture::Full(cp) => {
+                restored.merge_groups(cp).unwrap();
+            }
+            VnodeCapture::Delta(d) => {
+                restored.apply_delta(d).unwrap();
+            }
+            #[cfg(feature = "state-tier")]
+            VnodeCapture::FullWithColdGroups { .. } => {
+                panic!("no group is demoted in this test")
+            }
+        }
+        let value = restored
+            .groups
+            .get_mut(&global_aggregate_key())
+            .expect("global group restored")
+            .accs[0]
+            .evaluate()
+            .unwrap();
+        assert_eq!(value, ScalarValue::Float64(Some(6.0)));
+    }
+
+    /// A vnode holding a demoted group re-bases at the chain bound like any other — but the
+    /// re-base CARRIES the cold group (`FullWithColdGroups`), so the new base is self-contained and
+    /// the old one unreferences. Recovering from the new base ALONE (the old base + deltas pruned)
+    /// must still reproduce the cold group's value. Before the fix the vnode deferred forever, the
+    /// base aged past the prune horizon, and recovery lost the group.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one coherent rebase scenario with local scaffolding
+    async fn cold_bearing_vnode_rebases_with_groups_at_chain_bound() {
+        const V: u32 = 1; // single vnode → vnode 0
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+        fn row_of(state: &IncrementalAggState, name: &str) -> arrow::row::OwnedRow {
+            let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![name]))];
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
+        }
+        fn value_of(state: &mut IncrementalAggState, name: &str) -> ScalarValue {
+            state
+                .groups
+                .get_mut(&row_of(state, name))
+                .expect("group resident")
+                .accs[0]
+                .evaluate()
+                .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // cap0: FULL base (no prior base). a=1, b=2.
+        feed(&mut state, &[("a", 1.0), ("b", 2.0)], 1000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+
+        // Demote "a" (clean). Its tier blob `cp_a` carries a=1; "a" is never touched again, so its
+        // truth stays a=1 in the tier.
+        let a_key = row_of(&state, "a");
+        let cp_a = state.encode_group(&a_key).unwrap();
+        state.drop_demoted_group(&a_key);
+        assert!(state.cold_groups.contains_key(&a_key));
+
+        // Drive "b"'s chain to the bound while "a" is cold. cap1: chain_len 0 → DELTA (below bound).
+        feed(&mut state, &[("b", 20.0)], 2000);
+        state.emit().unwrap();
+        assert!(matches!(
+            state.checkpoint_delta_by_vnode(V, 1).unwrap().get(&0),
+            Some(VnodeCapture::Delta(_)),
+        ));
+
+        // cap2: chain_len 1 >= chain_max 1 AND a is cold → re-base CARRYING the cold group.
+        feed(&mut state, &[("b", 30.0)], 3000);
+        state.emit().unwrap();
+        let cap2 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        let (full, group_keys) = match cap2.get(&0) {
+            Some(VnodeCapture::FullWithColdGroups { full, group_keys }) => (full, group_keys),
+            other => panic!("expected FullWithColdGroups, got {}", other.is_some()),
+        };
+        assert_eq!(
+            group_keys,
+            &vec![a_key.as_ref().to_vec()],
+            "the cold group rides the re-base",
+        );
+
+        // Recover from the re-base ALONE (cap0 + cap1 pruned): the coordinator folds the tier blob
+        // into the resident FULL (append_disjoint over disjoint keys). a survives at 1, b at 52.
+        let mut combined = full.clone();
+        combined.append_disjoint(cp_a).unwrap();
+        let mut restored = agg(&ctx).await;
+        restored.set_delta_enabled(true);
+        restored.merge_groups(&combined).unwrap();
+        assert_eq!(
+            value_of(&mut restored, "a"),
+            ScalarValue::Float64(Some(1.0))
+        );
+        assert_eq!(
+            value_of(&mut restored, "b"),
+            ScalarValue::Float64(Some(52.0))
+        );
+    }
+
+    /// A FULLY cold vnode (every resident group demoted — here the single group of a
+    /// global aggregate) must stay in the capture set so its chain keeps advancing. Otherwise it
+    /// stages nothing, the coordinator writes an empty `base_epoch=None` partial that orphans the
+    /// chain base immediately, and recovery loses the demoted state. Asserts the vnode is captured
+    /// every epoch and the re-base at the bound carries the cold group.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    async fn fully_cold_global_aggregate_keeps_chain_alive_and_recovers() {
+        const V: u32 = 1;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new(
+                "__agg_input_1",
+                DataType::Float64,
+                true,
+            )]))
+        }
+        fn feed(state: &mut IncrementalAggState, vals: &[f64], ts: i64) {
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![Arc::new(arrow::array::Float64Array::from(vals.to_vec()))],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(ctx, "SELECT SUM(value) as total FROM events", true)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // cap0: FULL. The global group totals 6.
+        feed(&mut state, &[1.0, 2.0, 3.0], 1000);
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+
+        // Demote the single global group → the vnode is now FULLY cold (groups empty).
+        let g_key = global_aggregate_key();
+        let cp_g = state.encode_group(&g_key).unwrap();
+        state.drop_demoted_group(&g_key);
+        assert!(state.groups.is_empty(), "vnode 0 is fully cold");
+
+        // cap1: vnode 0 must still be captured (cold-seeded) — an empty DELTA that keeps the base
+        // referenced. Without the cold seed it would be absent → empty orphaning partial.
+        feed(&mut state, &[], 2000); // no-op feed; just advance emit/capture
+        state.emit().unwrap();
+        let cap1 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        assert!(
+            matches!(cap1.get(&0), Some(VnodeCapture::Delta(_))),
+            "a fully-cold vnode must still emit a (no-op) delta to keep its chain alive",
+        );
+
+        // cap2: at the bound → re-base carrying the cold global group, with an empty resident FULL.
+        state.emit().unwrap();
+        let cap2 = state.checkpoint_delta_by_vnode(V, 1).unwrap();
+        let (full, group_keys) = match cap2.get(&0) {
+            Some(VnodeCapture::FullWithColdGroups { full, group_keys }) => (full, group_keys),
+            other => panic!("expected FullWithColdGroups, got {}", other.is_some()),
+        };
+        assert_eq!(group_keys, &vec![g_key.as_ref().to_vec()]);
+
+        // Recover from the re-base alone: empty resident folded with the tier blob == the cold group.
+        let mut combined = full.clone();
+        combined.append_disjoint(cp_g).unwrap();
+        let mut restored = agg(&ctx).await;
+        restored.set_delta_enabled(true);
+        restored.merge_groups(&combined).unwrap();
+        let value = restored
+            .groups
+            .get_mut(&g_key)
+            .expect("global group restored")
+            .accs[0]
+            .evaluate()
+            .unwrap();
+        assert_eq!(value, ScalarValue::Float64(Some(6.0)));
+    }
+
+    /// Regression for the cluster group-demotion rehydration panic (`last_emitted ⊋ groups`):
+    /// the FULL re-base deferral for a vnode holding a cold group must survive a rehydration merge
+    /// of a DIFFERENT vnode. `merge_groups` used to clear the whole `delta_chain_len` map, so after
+    /// a rebalance acquired one vnode, any sibling vnode still holding a demoted group hit the
+    /// `None => true` arm and re-based FULL — dropping the cold group from the durable base. A
+    /// recovering owner then replayed a delta carrying that group's `last_emitted` with no matching
+    /// `groups` entry and tripped the `emit_changelog_delta` invariant.
+    #[cfg(feature = "state-tier")]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one coherent rehydration scenario with local scaffolding
+    async fn cold_group_deferral_survives_sibling_vnode_merge() {
+        use arrow::array::ArrayRef;
+        use std::collections::BTreeMap;
+        const VC: u32 = 8;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+        #[allow(clippy::disallowed_types)]
+        fn full_of(
+            cap: &mut std::collections::HashMap<u32, VnodeCapture>,
+            v: u32,
+        ) -> AggStateCheckpoint {
+            match cap.remove(&v) {
+                Some(VnodeCapture::Full(cp)) => cp,
+                other => panic!("expected a FULL for vnode {v}, got {}", other.is_some()),
+            }
+        }
+        #[allow(clippy::disallowed_types)]
+        fn delta_of(
+            cap: &mut std::collections::HashMap<u32, VnodeCapture>,
+            v: u32,
+        ) -> AggVnodeDelta {
+            match cap.remove(&v) {
+                Some(VnodeCapture::Delta(d)) => d,
+                _ => panic!("expected a DELTA for vnode {v}"),
+            }
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        // Bucket a string key to a vnode exactly as the capture path does (row-encode → hash).
+        let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
+            let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
+        };
+        let vnode_of = |state: &IncrementalAggState, key: &str| {
+            state.delta_vnode_of(row_of(state, key).as_ref(), VC)
+        };
+
+        // Two keys in one vnode Y (resident + cold) and one key in a different vnode X.
+        let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+        let mut by_v: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for c in &cands {
+            by_v.entry(vnode_of(&state, c)).or_default().push(c.clone());
+        }
+        let y = *by_v
+            .iter()
+            .find(|(_, ks)| ks.len() >= 2)
+            .map(|(v, _)| v)
+            .expect("a vnode with >=2 candidate keys");
+        let x = *by_v
+            .keys()
+            .find(|v| **v != y)
+            .expect("a second distinct vnode");
+        let (y_res, y_cold) = (by_v[&y][0].clone(), by_v[&y][1].clone());
+        let x_trig = by_v[&x][0].clone();
+
+        // Seed all three, emit, capture FULL bases (delta_vnode_count := VC, chain_len[X]=[Y]=0).
+        feed(
+            &mut state,
+            &[(&y_res, 1.0), (&y_cold, 2.0), (&x_trig, 3.0)],
+            1000,
+        );
+        state.emit().unwrap();
+        let mut cap0 = state.checkpoint_delta_by_vnode(VC, 8).unwrap();
+        let base_x = full_of(&mut cap0, x);
+        let base_y = full_of(&mut cap0, y);
+
+        // Demote the clean cold group in Y.
+        let y_cold_row = row_of(&state, &y_cold);
+        assert!(
+            state.can_demote_group(&y_cold_row, VC),
+            "clean group is demotable"
+        );
+        state.encode_group(&y_cold_row).unwrap(); // write-before-drop (bytes go to the tier)
+        state.drop_demoted_group(&y_cold_row);
+        assert!(state.cold_groups().contains_key(&y_cold_row));
+
+        // Rehydrate the DIFFERENT vnode X (a rebalance acquire) — the global-clear trigger.
+        state.merge_groups(&base_x).unwrap();
+
+        // Y still holds a cold group → its re-base must STILL be deferred (DELTA), not FULL.
+        feed(&mut state, &[(&y_res, 5.0)], 2000); // keep Y touched + dirty
+        state.emit().unwrap();
+        let mut cap1 = state.checkpoint_delta_by_vnode(VC, 8).unwrap();
+        assert!(
+            matches!(cap1.get(&y), Some(VnodeCapture::Delta(_))),
+            "deferral must survive a sibling-vnode merge (else Y re-bases FULL, dropping the cold group)",
+        );
+
+        // The cold group is still recoverable: replay the original FULL base + Y's delta into a
+        // fresh owner; the demoted group must be resident and the invariant must hold.
+        let d1 = delta_of(&mut cap1, y);
+        let mut owner = agg(&ctx).await;
+        owner.set_delta_enabled(true);
+        owner.apply_vnode_chain(&base_y, &[d1]).unwrap();
+        assert!(
+            owner.groups.contains_key(&y_cold_row),
+            "the demoted group must survive rehydration",
+        );
+        assert!(
+            owner
+                .last_emitted
+                .keys()
+                .all(|k| owner.groups.contains_key(k)),
+            "last_emitted must remain a subset of groups after rehydration",
+        );
+    }
+
+    /// `reset_acquired_vnodes` re-bases ONLY the acquired vnodes' delta chains (next capture FULL)
+    /// and drops their stale cold tracking, while a still-owned vnode holding a cold group keeps its
+    /// `has_cold` deferral (DELTA). This is the ownership-driven hook that replaced clearing the
+    /// chain inside `merge_groups`, fixing both the rehydration panic and the parentless-delta stall.
+    #[cfg(feature = "state-tier")]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn reset_acquired_vnodes_rebases_acquired_keeps_cold_deferral() {
+        use arrow::array::ArrayRef;
+        const VC: u32 = 8;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
+            let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
+        };
+        let vnode_of = |state: &IncrementalAggState, key: &str| {
+            state.delta_vnode_of(row_of(state, key).as_ref(), VC)
+        };
+
+        let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+        let mut by_v: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for c in &cands {
+            by_v.entry(vnode_of(&state, c)).or_default().push(c.clone());
+        }
+        let y = *by_v
+            .iter()
+            .find(|(_, ks)| ks.len() >= 2)
+            .map(|(v, _)| v)
+            .unwrap();
+        let x = *by_v.keys().find(|v| **v != y).unwrap();
+        let (y_res, y_cold) = (by_v[&y][0].clone(), by_v[&y][1].clone());
+        let x_key = by_v[&x][0].clone();
+
+        feed(
+            &mut state,
+            &[(&y_res, 1.0), (&y_cold, 2.0), (&x_key, 3.0)],
+            1000,
+        );
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(VC, 8).unwrap(); // chain_len[X]=[Y]=0
+
+        let y_cold_row = row_of(&state, &y_cold);
+        state.encode_group(&y_cold_row).unwrap();
+        state.drop_demoted_group(&y_cold_row);
+        assert!(state.cold_groups().contains_key(&y_cold_row));
+
+        // Acquire X (a DIFFERENT vnode): X re-bases FULL, Y's cold deferral is untouched.
+        let acquired_x: rustc_hash::FxHashSet<u32> = [x].into_iter().collect();
+        state.reset_acquired_vnodes(&acquired_x);
+        feed(&mut state, &[(&y_res, 5.0), (&x_key, 7.0)], 2000);
+        state.emit().unwrap();
+        let cap1 = state.checkpoint_delta_by_vnode(VC, 8).unwrap();
+        assert!(
+            matches!(cap1.get(&y), Some(VnodeCapture::Delta(_))),
+            "an owned cold vnode keeps deferring (DELTA) when a SIBLING vnode is acquired",
+        );
+        assert!(
+            matches!(cap1.get(&x), Some(VnodeCapture::Full(_))),
+            "the acquired vnode re-bases FULL",
+        );
+        assert!(
+            state.cold_groups().contains_key(&y_cold_row),
+            "Y's cold group is untouched"
+        );
+
+        // Now acquire Y itself: its chain re-bases and its stale cold tracking is dropped.
+        let acquired_y: rustc_hash::FxHashSet<u32> = [y].into_iter().collect();
+        state.reset_acquired_vnodes(&acquired_y);
+        assert!(
+            !state.cold_groups().contains_key(&y_cold_row),
+            "acquiring Y drops its stale cold-group tracking",
+        );
+        feed(&mut state, &[(&y_res, 9.0)], 3000);
+        state.emit().unwrap();
+        let cap2 = state.checkpoint_delta_by_vnode(VC, 8).unwrap();
+        assert!(
+            matches!(cap2.get(&y), Some(VnodeCapture::Full(_))),
+            "after acquisition (no cold groups) Y re-bases FULL — no parentless delta",
+        );
+    }
+
+    /// `drop_vnodes` purges ALL state for a revoked vnode — resident groups, `last_emitted`, the
+    /// per-vnode delta maps, the chain length, and (state-tier) its cold-group tracking — while a
+    /// sibling vnode is untouched and `last_emitted ⊆ groups` still holds. This is what stops a
+    /// later re-acquire's additive `merge_groups` from double-counting on stale leftovers.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn drop_vnodes_purges_revoked_keeps_sibling() {
+        use arrow::array::ArrayRef;
+        const VC: u32 = 8;
+
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut state = agg(&ctx).await;
+        state.set_delta_enabled(true);
+
+        let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
+            let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
+            state
+                .row_converter
+                .convert_columns(&cols)
+                .unwrap()
+                .row(0)
+                .owned()
+        };
+        let vnode_of = |state: &IncrementalAggState, key: &str| {
+            state.delta_vnode_of(row_of(state, key).as_ref(), VC)
+        };
+
+        // A vnode `y` with two keys (one stays resident, one is demoted), and a distinct vnode `x`.
+        let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+        let mut by_v: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for c in &cands {
+            by_v.entry(vnode_of(&state, c)).or_default().push(c.clone());
+        }
+        let vy = *by_v
+            .iter()
+            .find(|(_, ks)| ks.len() >= 2)
+            .map(|(v, _)| v)
+            .expect("a vnode with two keys");
+        let vx = *by_v
+            .keys()
+            .find(|v| **v != vy)
+            .expect("a second distinct vnode");
+        let (y_res, y_cold) = (by_v[&vy][0].clone(), by_v[&vy][1].clone());
+        let x_key = by_v[&vx][0].clone();
+
+        feed(
+            &mut state,
+            &[(&y_res, 1.0), (&y_cold, 2.0), (&x_key, 3.0)],
+            1000,
+        );
+        state.emit().unwrap();
+        let _ = state.checkpoint_delta_by_vnode(VC, 8).unwrap(); // chain_len[vx]=[vy]=0
+
+        let y_cold_row = row_of(&state, &y_cold);
+        #[cfg(feature = "state-tier")]
+        {
+            state.encode_group(&y_cold_row).unwrap();
+            state.drop_demoted_group(&y_cold_row);
+            assert!(state.cold_groups().contains_key(&y_cold_row));
+        }
+
+        // Re-dirty both vnodes so the per-vnode delta maps are populated at drop time.
+        feed(&mut state, &[(&y_res, 5.0), (&x_key, 7.0)], 2000);
+
+        let y_res_row = row_of(&state, &y_res);
+        let x_row = row_of(&state, &x_key);
+        assert!(
+            state.groups.contains_key(&y_res_row),
+            "precondition: y resident"
+        );
+        assert!(
+            state.groups.contains_key(&x_row),
+            "precondition: x resident"
+        );
+
+        // Revoke vy.
+        let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
+        let retractions = state.drop_vnodes(&revoked, VC).unwrap();
+        // The revoked vnode's still-materialized groups are retracted (-1) from the MV snapshot;
+        // the sibling vnode is untouched.
+        assert!(
+            retractions.contains_key(&vy),
+            "revoked vnode yields a retraction batch"
+        );
+        assert!(
+            !retractions.contains_key(&vx),
+            "sibling vnode is not retracted"
+        );
+
+        // Every vy entry is gone.
+        assert!(
+            !state.groups.contains_key(&y_res_row),
+            "revoked resident group dropped"
+        );
+        assert!(
+            !state.groups.contains_key(&y_cold_row),
+            "revoked cold key absent from groups"
+        );
+        assert!(
+            !state.last_emitted.contains_key(&y_res_row),
+            "revoked last_emitted dropped"
+        );
+        assert!(!state.dirty_keys_by_vnode.contains_key(&vy));
+        assert!(!state.removed_by_vnode.contains_key(&vy));
+        assert!(!state.last_emitted_dirty_by_vnode.contains_key(&vy));
+        assert!(!state.delta_chain_len.contains_key(&vy));
+        #[cfg(feature = "state-tier")]
+        {
+            assert!(
+                !state.cold_groups().contains_key(&y_cold_row),
+                "revoked cold tracking dropped"
+            );
+            assert!(!state.cold_vnodes().contains(&vy));
+        }
+
+        // The sibling vnode is untouched.
+        assert!(
+            state.groups.contains_key(&x_row),
+            "sibling resident group kept"
+        );
+        assert!(
+            state.delta_chain_len.contains_key(&vx),
+            "sibling chain kept"
+        );
+
+        // Invariant preserved: the dedup map stays a subset of resident groups.
+        for k in state.last_emitted.keys() {
+            assert!(
+                state.groups.contains_key(k),
+                "last_emitted must remain a subset of groups",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_size_estimate_throttled_cache_and_invalidate() {
         let (_, mut state) =
@@ -4470,7 +6724,7 @@ mod tests {
 
     /// Profiling (not a correctness test): measures the on-task whole-node
     /// `checkpoint_groups` capture cost vs group count — the cost an incremental
-    /// (dirty-only) capture would shrink (Track A1). Reports total time, ns/group,
+    /// (dirty-only) capture would shrink. Reports total time, ns/group,
     /// and serialized size, so the incremental win for a given dirty ratio is
     /// `ns/group * dirty_count`. `#[ignore]`d; run in release:
     /// `cargo test -p laminar-db --release profile_checkpoint_capture -- --ignored --nocapture`

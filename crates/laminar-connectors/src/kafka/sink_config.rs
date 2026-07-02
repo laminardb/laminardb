@@ -66,8 +66,11 @@ pub struct KafkaSinkConfig {
     pub max_in_flight: usize,
     /// Maximum time to wait for delivery confirmation.
     pub delivery_timeout: Duration,
-    /// Key column name for partitioning.
+    /// Key column name for partitioning. In `envelope = upsert` mode this is the merge key
+    /// (the group identity), and is required.
     pub key_column: Option<String>,
+    /// How an updating (changelog) input is encoded to the topic (`append` vs `upsert`).
+    pub envelope: SinkEnvelope,
     /// Partitioning strategy.
     pub partitioner: PartitionStrategy,
     /// Maximum time to wait before sending a batch (milliseconds).
@@ -84,6 +87,18 @@ pub struct KafkaSinkConfig {
     pub flush_batch_size: usize,
     /// Additional rdkafka client properties (pass-through).
     pub kafka_properties: HashMap<String, String>,
+}
+
+/// How the sink encodes an updating (changelog) input to Kafka.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SinkEnvelope {
+    /// Append-only: rows are produced as-is. A changelog's retractions are stripped upstream
+    /// (`prepare_for_sink`), so this cannot faithfully carry an aggregate's deletes.
+    #[default]
+    Append,
+    /// Upsert: the Z-set changelog is collapsed per key each batch — a live group becomes a keyed
+    /// record, a removed group a null-value tombstone. Consume via a log-compacted topic.
+    Upsert,
 }
 
 impl std::fmt::Debug for KafkaSinkConfig {
@@ -131,6 +146,7 @@ impl Default for KafkaSinkConfig {
             max_in_flight: 5,
             delivery_timeout: Duration::from_secs(120),
             key_column: None,
+            envelope: SinkEnvelope::default(),
             partitioner: PartitionStrategy::KeyHash,
             linger_ms: 5,
             batch_size: 16_384,
@@ -244,6 +260,30 @@ impl KafkaSinkConfig {
 
         cfg.key_column = config.get("key.column").map(String::from);
 
+        cfg.envelope = match config
+            .get("envelope")
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("append") => SinkEnvelope::Append,
+            Some("upsert") => SinkEnvelope::Upsert,
+            Some(other) => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unknown envelope '{other}' (expected 'append' or 'upsert')"
+                )));
+            }
+        };
+        if cfg.envelope == SinkEnvelope::Upsert
+            && cfg
+                .key_column
+                .as_deref()
+                .is_none_or(|k| k.trim().is_empty())
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "envelope = 'upsert' requires a non-empty 'key.column' (the merge key)".into(),
+            ));
+        }
+
         if let Some(p) = config.get("partitioner") {
             cfg.partitioner = p.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
@@ -277,6 +317,15 @@ impl KafkaSinkConfig {
         }
 
         cfg.dlq_topic = config.get("dlq.topic").map(String::from);
+        if cfg.dlq_topic.is_some() && cfg.envelope == SinkEnvelope::Upsert {
+            // Upsert failures poison the epoch; a lone tombstone in a DLQ would corrupt the
+            // compacted topic. Reject rather than silently ignore the DLQ.
+            return Err(ConnectorError::ConfigurationError(
+                "'dlq.topic' is not supported with envelope = 'upsert' (upsert failures poison the \
+                 epoch instead of routing to a DLQ)"
+                    .into(),
+            ));
+        }
 
         if let Some(v) = config.get("flush.batch.size") {
             cfg.flush_batch_size = v.parse().map_err(|_| {

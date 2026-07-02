@@ -19,8 +19,7 @@ pub enum BackpressurePolicy {
     Fail,
 }
 
-/// String wrapper whose `Debug` redacts the value, for credentials held in
-/// [`LaminarConfig`].
+/// String wrapper whose `Debug` redacts the value, for credentials in [`LaminarConfig`].
 #[derive(Clone)]
 pub struct SecretString(String);
 
@@ -40,6 +39,30 @@ impl SecretString {
 impl std::fmt::Debug for SecretString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("\"[REDACTED]\"")
+    }
+}
+
+/// Auto-restart policy for the fault supervisor (see `LaminarDB::enable_supervision`).
+#[derive(Debug, Clone)]
+pub struct RestartPolicy {
+    /// Max restarts within `window` before the pipeline is left hard-faulted.
+    pub max_restarts: usize,
+    /// Sliding window over which `max_restarts` is counted.
+    pub window: std::time::Duration,
+    /// Backoff before the first restart in a window.
+    pub initial_backoff: std::time::Duration,
+    /// Cap on the exponential backoff.
+    pub max_backoff: std::time::Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            window: std::time::Duration::from_secs(60),
+            initial_backoff: std::time::Duration::from_millis(500),
+            max_backoff: std::time::Duration::from_secs(30),
+        }
     }
 }
 
@@ -65,15 +88,16 @@ pub struct LaminarConfig {
     pub delivery_guarantee: DeliveryGuarantee,
     /// Per-operator state limit. At 80% warns, at 100% errors. `None` = unlimited.
     pub max_state_bytes_per_operator: Option<usize>,
-    /// Node-level cap on total operator state held in memory. Crossing it
-    /// pauses source intake (backpressure, not failure) until state drains
-    /// below the budget. `None` = unlimited.
+    /// Node-level cap on in-memory operator state; crossing it backpressures
+    /// source intake until state drains below it. `None` = unlimited.
     pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier. When set together with
-    /// `state_memory_budget_bytes`, operator state approaching the budget is
-    /// demoted here (off-heap) instead of backpressuring. `None` = no tier.
+    /// Local directory for the disk cold tier. With `state_memory_budget_bytes`,
+    /// state near the budget is demoted here instead of backpressuring. `None` = no tier.
     /// Requires the `state-tier` build feature; ignored otherwise.
     pub state_tier_dir: Option<PathBuf>,
+    /// Demote at GROUP granularity: shed individual idle aggregate groups to the tier instead of
+    /// only whole idle vnodes. Requires the `state-tier` feature and delta checkpoints; else a no-op.
+    pub state_tier_group_demotion: bool,
 
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
@@ -89,6 +113,14 @@ pub struct LaminarConfig {
     pub pipeline_max_input_buf_bytes: Option<usize>,
     /// Backpressure policy. See [`BackpressurePolicy`].
     pub pipeline_backpressure_policy: BackpressurePolicy,
+    /// Auto-restart policy applied when supervision is enabled.
+    pub restart_policy: RestartPolicy,
+    /// Cluster mode: on a fatal fault, the leader rewinds every node to the highest
+    /// cluster-wide committed epoch instead of a local-only restart. Default off.
+    pub coordinated_recovery: bool,
+    /// Isolate queries that share a source into independent failure domains.
+    /// Default off; when off, shared-source queries fault and recover together.
+    pub shared_source_isolation: bool,
 }
 
 impl Default for LaminarConfig {
@@ -105,6 +137,7 @@ impl Default for LaminarConfig {
             max_state_bytes_per_operator: None,
             state_memory_budget_bytes: None,
             state_tier_dir: None,
+            state_tier_group_demotion: false,
             pipeline_channel_capacity: None,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,
@@ -112,6 +145,9 @@ impl Default for LaminarConfig {
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
             pipeline_backpressure_policy: BackpressurePolicy::default(),
+            restart_policy: RestartPolicy::default(),
+            coordinated_recovery: false,
+            shared_source_isolation: false,
         }
     }
 }

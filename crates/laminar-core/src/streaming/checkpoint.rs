@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// Configuration for streaming checkpoints.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StreamCheckpointConfig {
     /// Checkpoint interval in milliseconds. `None` = manual only.
     pub interval_ms: Option<u64>,
@@ -14,9 +14,8 @@ pub struct StreamCheckpointConfig {
     /// Barrier-alignment timeout in milliseconds at fan-in operators.
     /// `None` = default (`30_000`).
     pub alignment_timeout_ms: Option<u64>,
-    /// Max epochs admitted between capture and restorable (the upload
-    /// backlog). `None` = default (4). Exactly-once pipelines are
-    /// capped at 1 regardless.
+    /// Max epochs admitted between capture and restorable. `None` = default (4).
+    /// Exactly-once pipelines are capped at 1 regardless.
     pub max_in_flight_epochs: Option<u64>,
     /// Cap on captured-state bytes held by in-flight epochs; admission
     /// pauses at the cap. `None` = default (512 MiB).
@@ -32,6 +31,34 @@ pub struct StreamCheckpointConfig {
     pub restorable_gate_poll_initial_ms: Option<u64>,
     /// Durability-gate poll backoff cap (ms). `None` = engine default (1000).
     pub restorable_gate_poll_max_ms: Option<u64>,
+    /// Enable incremental delta checkpoints (cluster-only), bounding the re-base chain length.
+    /// `None` = off. When set, the per-vnode delta chain is the primary aggregate checkpoint,
+    /// dropping per-cycle cost to O(dirty). Requires a durable backend; clamped `< max_retained`
+    /// so the chain base never ages out of the prune window.
+    pub delta_chain_max: Option<u32>,
+    /// Incremental emit for non-windowed aggregate MVs: emit a dirty-only changelog into a
+    /// keyed upsert store instead of re-materializing every group each cycle
+    /// (`SELECT * FROM mv` still returns the full snapshot). Default ON.
+    pub incremental_emit: bool,
+}
+
+impl Default for StreamCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: None,
+            data_dir: None,
+            max_retained: None,
+            alignment_timeout_ms: None,
+            max_in_flight_epochs: None,
+            max_staged_bytes: None,
+            max_uncommitted_epochs: None,
+            uncommitted_epochs_backpressure: false,
+            restorable_gate_poll_initial_ms: None,
+            restorable_gate_poll_max_ms: None,
+            delta_chain_max: None,
+            incremental_emit: true,
+        }
+    }
 }
 
 /// Errors from checkpoint operations.
@@ -77,5 +104,8 @@ mod tests {
         assert!(config.data_dir.is_none());
         assert!(config.max_retained.is_none());
         assert!(config.alignment_timeout_ms.is_none());
+        // Deliberate non-Default-derive values — guard against a silent revert.
+        assert!(config.incremental_emit);
+        assert!(!config.uncommitted_epochs_backpressure);
     }
 }

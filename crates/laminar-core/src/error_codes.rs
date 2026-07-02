@@ -71,6 +71,13 @@ pub const JOIN_TIME_BOUND_MISSING: &str = "LDB-3002";
 pub const TEMPORAL_JOIN_NO_PK: &str = "LDB-3003";
 /// Unsupported join type for streaming queries.
 pub const JOIN_TYPE_UNSUPPORTED: &str = "LDB-3004";
+/// Tier-backed join: a demoted cold join key could not be fetched back (the cold
+/// tier lost it). The operator escalates rather than wedging behind the hold.
+pub const JOIN_STATE_FETCH_MISS: &str = "LDB-3005";
+/// Incremental changelog⋈changelog join in a multi-node cluster. The operator is
+/// single-node only (inputs are not key-shuffled), so it is rejected when >1 node
+/// owns vnodes — it would join only node-local slices and produce wrong results.
+pub const JOIN_CLUSTER_UNSUPPORTED: &str = "LDB-3006";
 
 // ── Serialization / State (LDB-4xxx) ──
 

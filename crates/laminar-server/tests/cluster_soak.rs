@@ -1,18 +1,11 @@
 //! Three-node real-binary checkpoint soak with `kill -9` fault injection.
 //!
-//! Spawns three `laminardb` processes in cluster mode (real gRPC control
-//! plane — the path the in-process `cluster_integration` suites do NOT
-//! cover) against a shared checkpoint store, runs tight-cadence
-//! checkpoints, and repeatedly hard-kills the current leader and a
-//! follower mid-epoch, verifying after every fault that:
+//! Spawns three `laminardb` processes in cluster mode (real gRPC control plane) against a shared
+//! checkpoint store, runs tight-cadence checkpoints, and repeatedly hard-kills the leader and a
+//! follower mid-epoch. After every fault it asserts the survivors keep committing, epochs never
+//! regress (abandonment leaves gaps, never reuse), and the restarted node rejoins and resumes.
 //!
-//! - the survivors keep committing (cluster-wide `checkpoint_epoch`
-//!   advances within a bounded window),
-//! - epochs never regress on any node (abandonment leaves gaps, never
-//!   reuse),
-//! - the restarted node rejoins and resumes committing.
-//!
-//! Ignored by default — it spawns processes and runs for minutes:
+//! Ignored by default — spawns processes and runs for minutes:
 //!
 //! ```text
 //! cargo test -p laminar-server --test cluster_soak -- --ignored --nocapture
@@ -21,26 +14,22 @@
 //! Environment knobs:
 //! - `LAMINAR_SOAK_SECONDS`      total soak duration (default 90)
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; floor 100)
-//! - `LAMINAR_SOAK_CHECKPOINT_URL`  e.g. `s3://bucket/soak` for MinIO/S3
-//!   (default: shared `file://` dir).
-//! - `LAMINAR_SOAK_STATE_URL`  the `[state]` backend (vnode partials +
-//!   durability gate); also takes `s3://` (default: shared `file://`).
-//! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` /
-//!   `_REGION`  forwarded into both storage maps.
-//! - `LAMINAR_SOAK_KAFKA_BROKERS`  e.g. `127.0.0.1:19092` (the compose
-//!   Redpanda). Adds a per-node exactly-once Kafka sink to the
-//!   workload, and after the fault rounds diffs each topic
-//!   (read_committed) against the generator's deterministic output:
-//!   every seq must appear exactly once, no gaps, no duplicates —
-//!   the exactly-once proof under kill -9.
-//! - `LAMINAR_SOAK_STATE_TIER`  any value: enable the disk cold tier
-//!   (build with `--features state-tier`). Adds a small memory budget
-//!   and an `EMIT CHANGES` aggregation so state is demoted under load,
-//!   then asserts demotion AND promotion counters moved across the
-//!   kill -9 rounds. Knobs (tier mode only): `LAMINAR_SOAK_BUDGET_BYTES`
-//!   (default 256 KiB), `LAMINAR_SOAK_VNODES` (256), `LAMINAR_SOAK_RPS`
-//!   (400), `LAMINAR_SOAK_GROUPS` (2000 — the agg key-space size),
-//!   `LAMINAR_SOAK_SPAN` (12 — consecutive rows per agg key).
+//! - `LAMINAR_SOAK_CHECKPOINT_URL`  e.g. `s3://bucket/soak` (default: shared `file://` dir)
+//! - `LAMINAR_SOAK_STATE_URL`  the `[state]` backend — vnode partials + durability gate
+//!   (default: shared `file://`)
+//! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  forwarded into both
+//!   storage maps
+//! - `LAMINAR_SOAK_KAFKA_BROKERS`  adds a per-node exactly-once Kafka sink, then diffs each topic
+//!   (read_committed) against the generator output: every seq exactly once, no gaps, no dups
+//! - `LAMINAR_SOAK_STATE_TIER`  enable the disk cold tier (build `--features state-tier`); adds a
+//!   memory budget + `EMIT CHANGES` agg so state demotes, then asserts demote/promote counters
+//!   moved. Knobs: `LAMINAR_SOAK_BUDGET_BYTES` (256 KiB), `_VNODES` (256), `_RPS` (400),
+//!   `_GROUPS` (2000 — agg key-space), `_SPAN` (12 — consecutive rows per agg key)
+//! - `LAMINAR_SOAK_CHANGELOG_AGG`  add an `EMIT CHANGES` agg exercising the changelog
+//!   `last_emitted` delta path; pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` (else it captures FULL)
+//! - `LAMINAR_SOAK_COORD_RECOVERY`  set `[supervision] coordinated_recovery`
+//! - `LAMINAR_SOAK_FAULT_INJECT_MS`  arm a one-shot cycle fault this many ms in;
+//!   `LAMINAR_SOAK_FAULT_INJECT_NODE` (default 1 = follower; 0 = leader) picks which
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
@@ -65,6 +54,8 @@ struct Node {
     log_path: PathBuf,
     child: Option<Child>,
     http_port: u16,
+    /// `LAMINAR_FAULT_INJECT_AFTER_MS` for this node, when armed (recovery soak).
+    fault_inject_ms: Option<u64>,
 }
 
 impl Node {
@@ -74,18 +65,26 @@ impl Node {
             .append(true)
             .open(&self.log_path)
             .expect("node log file");
-        let child = Command::new(env!("CARGO_BIN_EXE_laminardb"))
-            .arg("--config")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_laminardb"));
+        cmd.arg("--config")
             .arg(&self.config_path)
             .env(
                 "RUST_LOG",
                 "laminardb=info,laminar_server=info,laminar_db=info,laminar_core=info",
             )
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("spawn laminardb");
-        self.child = Some(child);
+            .stderr(Stdio::from(log));
+        // take() arms only the first spawn (no re-arm on restart); env_remove stops a stray
+        // inherited value from arming other nodes.
+        match self.fault_inject_ms.take() {
+            Some(ms) => {
+                cmd.env("LAMINAR_FAULT_INJECT_AFTER_MS", ms.to_string());
+            }
+            None => {
+                cmd.env_remove("LAMINAR_FAULT_INJECT_AFTER_MS");
+            }
+        }
+        self.child = Some(cmd.spawn().expect("spawn laminardb"));
     }
 
     /// `kill -9` equivalent: no shutdown hooks, no final checkpoint.
@@ -96,8 +95,7 @@ impl Node {
         }
     }
 
-    /// Scrape one gauge/counter from `/metrics`. `None` while the node
-    /// is down or still booting.
+    /// Scrape one gauge/counter from `/metrics`; `None` while the node is down or booting.
     fn metric(&self, name: &str) -> Option<f64> {
         let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
@@ -116,10 +114,7 @@ impl Node {
         self.metric("laminardb_checkpoint_epoch")
     }
 
-    /// Committed checkpoints — the REAL progress signal.
-    /// `checkpoint_epoch` advances on aborted epochs too (abandonment
-    /// churns ids), so asserting on it only proves the control loop is
-    /// alive, not that the cluster can actually complete a checkpoint.
+    /// Committed checkpoints — the real progress signal (`checkpoint_epoch` also advances on aborts).
     fn commits(&self) -> Option<f64> {
         self.metric("laminardb_checkpoints_completed_total")
     }
@@ -131,16 +126,15 @@ impl Drop for Node {
     }
 }
 
-/// Per-node sink topic. Unique per test process so reruns against a
-/// long-lived broker never diff a previous run's records.
+/// Per-node sink topic, unique per test process so reruns don't diff a prior run's records.
 fn eo_topic(id: usize) -> String {
     format!("soak-eo-n{id}-{}", std::process::id())
 }
 
 fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -> PathBuf {
     let depth = env_u64("LAMINAR_SOAK_DEPTH", 4);
-    // A/B the durability-gate poll cadence: `LAMINAR_SOAK_GATE_POLL_MS` sets the
-    // initial (and, unless `_MAX_MS` overrides, the cap). Unset = engine default.
+    // `LAMINAR_SOAK_GATE_POLL_MS` sets the durability-gate poll initial (and cap, unless
+    // `_MAX_MS` overrides). Unset = engine default.
     let gate_poll = std::env::var("LAMINAR_SOAK_GATE_POLL_MS").map_or(String::new(), |ms| {
         let initial: u64 = ms
             .parse()
@@ -151,11 +145,8 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         });
         format!("restorable_gate_poll_initial_ms = {initial}\nrestorable_gate_poll_max_ms = {max}")
     });
-    // Vnode partials go through the [state] backend, NOT [checkpoint] -
-    // without a SHARED state store each node writes partials to its own
-    // local default and the leader durability gate (which lists the
-    // full registry) can never seal an epoch. The first soak runs
-    // missed this and masked it by asserting on epoch churn.
+    // Vnode partials go through [state], not [checkpoint]: without a SHARED state store the leader
+    // durability gate (which lists the full registry) can never seal an epoch.
     let state_url = std::env::var("LAMINAR_SOAK_STATE_URL").unwrap_or_else(|_| {
         let shared = dir.join("state");
         std::fs::create_dir_all(&shared).unwrap();
@@ -170,13 +161,8 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Optional disk cold tier (Phase 5 soak). A tiny budget forces
-    // demotion under load, a larger vnode ring keeps most vnodes clean
-    // each capture interval (only clean vnodes are demotable), and the
-    // `soak_agg` pipeline below gives the tier demotable per-vnode state
-    // (the pass-through `soak_stream` has none). Bounded key space (mod
-    // GROUPS) means demoted keys are revisited, driving promotion too.
-    // Gated on the env var so default runs are byte-identical.
+    // Cold tier: a tiny budget forces demotion, a larger vnode ring keeps vnodes clean (only
+    // clean vnodes are demotable).
     let tier = std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok();
     let rps = env_u64("LAMINAR_SOAK_RPS", if tier { 400 } else { 200 });
     let vnodes = env_u64("LAMINAR_SOAK_VNODES", if tier { 256 } else { 64 });
@@ -190,6 +176,10 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
             .replace('\\', "/");
         server_extra =
             format!("state_tier_dir = \"{tier_dir}\"\nstate_memory_budget_bytes = {budget}\n");
+        // Shed idle GROUPS, not whole vnodes; needs delta on (pair with LAMINAR_SOAK_DELTA_CHAIN_MAX).
+        if std::env::var("LAMINAR_SOAK_STATE_TIER_GROUP").is_ok() {
+            server_extra.push_str("state_tier_group_demotion = true\n");
+        }
     }
 
     let mut storage = String::new();
@@ -207,13 +197,22 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         storage.push_str("allow_http = \"true\"\n");
     }
 
-    // Discovery strategy: gossip (chitchat phi-accrual failure detection) by
-    // default; `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
+    // Discovery: gossip (phi-accrual failure detection) by default;
+    // `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
     let discovery = std::env::var("LAMINAR_SOAK_DISCOVERY").unwrap_or_else(|_| "gossip".into());
     assert!(
         matches!(discovery.as_str(), "gossip" | "static"),
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
+
+    // `LAMINAR_SOAK_DELTA_CHAIN_MAX=N` enables delta checkpoints plus a non-changelog agg
+    // so kill -9 exercises the delta write + chain-recovery path.
+    let delta_chain_max = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").ok().map(|v| {
+        v.parse::<u32>()
+            .expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32")
+    });
+    // Enabling delta also makes the chain the primary aggregate checkpoint.
+    let delta_line = delta_chain_max.map_or(String::new(), |n| format!("delta_chain_max = {n}"));
 
     let mut toml = format!(
         r#"
@@ -247,6 +246,7 @@ interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = {depth}
 {gate_poll}
+{delta_line}
 
 [checkpoint.storage]
 {storage}
@@ -267,16 +267,40 @@ sql = "SELECT seq, ts_ms, value FROM gen"
         url = checkpoint_url,
     );
 
-    // Demotable per-vnode aggregate state for the cold tier: an EMIT
-    // CHANGES agg over a SLOW-CYCLING bounded key space. Only changelog
-    // aggs are demotable, and demotion only sheds vnodes that are CLEAN
-    // (untouched since the last capture) — so the key must idle long
-    // enough for whole vnodes to fall quiet. `(seq / SPAN) % GROUPS`
-    // writes each key in a burst of SPAN consecutive rows, then moves
-    // on; a key (and its vnode) is then idle for a full GROUPS*SPAN-row
-    // cycle (→ demotable) before the cycle returns to it (→ promotable).
-    // A plain `seq % GROUPS` instead scatters every key across the ring
-    // every cycle, so no vnode is ever idle and demotion just thrashes.
+    // Non-changelog agg over a slow-cycling key space: per-vnode state accrues as delta partials,
+    // so kill -9 + rebalance exercises delta write/chain-recovery. `LAMINAR_SOAK_AGG=1` adds it
+    // without delta, to isolate the shuffle path from the delta path.
+    if delta_chain_max.is_some() || std::env::var("LAMINAR_SOAK_AGG").is_ok() {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_delta_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups}"
+"#,
+        ));
+    }
+
+    // Changelog agg (EMIT CHANGES) under delta capture — exercises the `last_emitted` delta path
+    // (changelog aggs used to force-FULL every epoch). Pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX`.
+    if std::env::var("LAMINAR_SOAK_CHANGELOG_AGG").is_ok() {
+        let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+        let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+        toml.push_str(&format!(
+            r#"
+[[pipeline]]
+name = "soak_changelog_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+"#,
+        ));
+    }
+
+    // Demotable per-vnode state for the cold tier: an EMIT CHANGES agg over a slow-cycling key
+    // space. Only changelog aggs demote, and only CLEAN vnodes (untouched since last capture) — so
+    // keys must idle. `(seq / SPAN) % GROUPS` bursts SPAN rows per key then moves on, leaving each
+    // vnode idle a full cycle (demotable) before returning (promotable); plain `seq % GROUPS`
+    // scatters keys every cycle so no vnode idles and demotion just thrashes.
     if tier {
         let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
         let span = env_u64("LAMINAR_SOAK_SPAN", 12);
@@ -289,9 +313,8 @@ sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (s
         ));
     }
 
-    // Optional exactly-once Kafka sink: each node writes its own topic
-    // (its generator is an independent seq stream), so each topic must
-    // be a dense 0..=max with no duplicates under read_committed.
+    // Exactly-once Kafka sink: each node writes its own topic (independent seq stream), so each
+    // topic must be dense 0..=max with no duplicates under read_committed.
     if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
         toml.push_str(&format!(
             r#"
@@ -311,19 +334,18 @@ format = "json"
         ));
     }
 
+    if std::env::var("LAMINAR_SOAK_COORD_RECOVERY").is_ok() {
+        toml.push_str("\n[supervision]\ncoordinated_recovery = true\n");
+    }
+
     let path = dir.join(format!("node{id}.toml"));
     std::fs::write(&path, toml).unwrap();
     path
 }
 
-/// Diff each node's sink topic against the generator's deterministic
-/// output. The generator emits seq 0,1,2,… and the pipeline is a
-/// pass-through, so under exactly-once the topic (read_committed) must
-/// be DENSE: every seq from 0 to the max committed exactly once.
-/// A gap = lost rows (offsets advanced past uncommitted output); a
-/// duplicate = replayed rows leaked outside a transaction. Records
-/// from transactions still open when the writer was killed are
-/// invisible under read_committed — that's the abort path working.
+/// Diff each node's sink topic against the deterministic generator: under exactly-once each topic
+/// (read_committed) must be dense 0..=max — a gap = lost rows, a duplicate = leaked replay.
+/// Transactions still open at the kill are invisible under read_committed (the abort path working).
 fn verify_exactly_once_output(brokers: &str) {
     use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
@@ -338,9 +360,8 @@ fn verify_exactly_once_output(brokers: &str) {
             .set("isolation.level", "read_committed")
             .create()
             .expect("diff consumer");
-        // Assign every partition from broker metadata — hard-coding
-        // partition 0 silently misses data if the broker auto-creates
-        // the topic with more than one partition.
+        // Assign every partition from metadata — hard-coding partition 0 misses data if the broker
+        // auto-creates the topic with more than one partition.
         let metadata = consumer
             .fetch_metadata(Some(&topic), Duration::from_secs(10))
             .expect("topic metadata");
@@ -362,8 +383,7 @@ fn verify_exactly_once_output(brokers: &str) {
         }
         consumer.assign(&tpl).expect("assign");
 
-        // Read until the topic goes idle (the LSO stops a
-        // read_committed consumer ahead of any still-open transaction).
+        // Read until idle (the LSO stops a read_committed consumer ahead of any open transaction).
         let mut seqs: Vec<i64> = Vec::new();
         let mut idle = 0u32;
         while idle < 5 {
@@ -433,19 +453,14 @@ fn cluster_epoch(nodes: &[Node]) -> f64 {
     nodes.iter().filter_map(Node::epoch).fold(0.0, f64::max)
 }
 
-/// Total commits across live nodes (per-node counters; a killed node's
-/// contribution drops out, so progress is always asserted relative to
-/// a fresh reading, never an absolute floor).
+/// Total commits across live nodes; a killed node drops out, so progress is asserted relative to a
+/// fresh reading, never an absolute floor.
 fn cluster_commits(nodes: &[Node]) -> f64 {
     nodes.iter().filter_map(Node::commits).sum()
 }
 
-/// Assert the cluster COMMITS two more checkpoints within `window`
-/// (sink 2PC + recovery point both key off commits — epoch numbers
-/// also advance on aborts, so they prove nothing). Returns the new
-/// epoch floor for logging. Leadership is a NodeId-hash order, not
-/// spawn order, so rounds kill nodes round-robin — over the soak both
-/// leader and followers get hit.
+/// Assert the cluster commits two more checkpoints within `window`, returning the new epoch floor.
+/// Commits (not epoch numbers, which also advance on aborts) are the real progress signal.
 fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) -> f64 {
     let target = cluster_commits(nodes) + 2.0;
     wait_for(
@@ -460,6 +475,188 @@ fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) ->
         "{label}: cluster epoch regressed: {new_epoch} < previous floor {floor}",
     );
     new_epoch
+}
+
+/// EMBEDDED single-node config: tiny budget + slow-cycling `EMIT CHANGES` agg drive group
+/// demote→promote; cold groups survive kill -9 via the cold-only partials.
+fn write_embedded_config(dir: &Path, id: usize, interval_ms: u64) -> PathBuf {
+    let data_dir = dir.join(format!("node{id}-data"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let state_shared = dir.join("state");
+    std::fs::create_dir_all(&state_shared).unwrap();
+    let ckpt_shared = dir.join("checkpoints");
+    std::fs::create_dir_all(&ckpt_shared).unwrap();
+    let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+
+    let http = BASE_PORT + id as u16;
+    let budget = env_u64("LAMINAR_SOAK_BUDGET_BYTES", 8192);
+    let vnodes = env_u64("LAMINAR_SOAK_VNODES", 64);
+    let rps = env_u64("LAMINAR_SOAK_RPS", 400);
+    let groups = env_u64("LAMINAR_SOAK_GROUPS", 600);
+    let span = env_u64("LAMINAR_SOAK_SPAN", 12);
+    let tier_dir = fwd(&data_dir.join("tier"));
+
+    // No delta_chain_max: single-node group demotion uses delta DIRTY-tracking, not the primary
+    // chain, so the whole-node manifest stays authoritative and demoted groups fold into cold-only
+    // partials the additive rehydrate merges back.
+    // `backend = "local"` builds an ObjectStoreBackend over local FS AND supplies the
+    // local_storage_dir the Embedded profile requires; object_store/file:// has neither.
+    let toml = format!(
+        r#"
+node_id = "n{id}"
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:{http}"
+state_tier_dir = "{tier_dir}"
+state_memory_budget_bytes = {budget}
+state_tier_group_demotion = true
+
+[state]
+backend = "local"
+path = "{state_path}"
+instance_id = "n{id}"
+vnode_capacity = {vnodes}
+
+[checkpoint]
+url = "file:///{ckpt_url}"
+interval = "{interval_ms}ms"
+max_retained = 5
+
+[[source]]
+name = "gen"
+connector = "generator"
+properties = {{ "rows.per.second" = "{rps}", "batch.max.size" = "256" }}
+
+[[pipeline]]
+name = "soak_agg"
+sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+"#,
+        state_path = fwd(&state_shared),
+        ckpt_url = fwd(&ckpt_shared),
+    );
+    let path = dir.join(format!("node{id}-embedded.toml"));
+    std::fs::write(&path, toml).unwrap();
+    path
+}
+
+/// Single-node EMBEDDED group-demotion recovery under kill -9: demote idle groups, hard-kill, then
+/// recover from the cold-only partials — what the single-node cluster soak can't (gate stalls).
+#[test]
+#[ignore = "spawns a real laminardb process; run with --ignored --features state-tier"]
+fn embedded_kill9_group_demotion_soak() {
+    let soak_secs = env_u64("LAMINAR_SOAK_SECONDS", 75);
+    let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 300).max(100);
+    let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = std::env::temp_dir().join(format!("soak-embed-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    eprintln!("soak: embedded node logs in {}", log_dir.display());
+
+    let mut node = Node {
+        id: 0,
+        config_path: write_embedded_config(dir.path(), 0, interval_ms),
+        log_path: log_dir.join("node0.log"),
+        child: None,
+        http_port: BASE_PORT,
+        fault_inject_ms: None,
+    };
+
+    node.spawn();
+    wait_for(
+        "embedded node to commit a checkpoint",
+        Duration::from_secs(30),
+        || node.commits().unwrap_or(0.0) >= 1.0,
+    );
+    eprintln!("soak: embedded node up");
+
+    // Wait for demotion AND a following checkpoint (captures cold-only partials) so the first kill
+    // actually exercises cold-group recovery.
+    wait_for("group demotion to fire", Duration::from_secs(60), || {
+        node.metric("laminardb_state_tier_demote_total")
+            .unwrap_or(0.0)
+            > 0.0
+    });
+    let after_demote = node.commits().unwrap_or(0.0);
+    wait_for(
+        "a checkpoint after demotion (captures cold-only partials)",
+        Duration::from_secs(30),
+        || node.commits().unwrap_or(0.0) >= after_demote + 1.0,
+    );
+    eprintln!(
+        "soak: demotion fired (demotes={}), cold groups captured",
+        node.metric("laminardb_state_tier_demote_total")
+            .unwrap_or(0.0)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(soak_secs);
+    let mut kills = 0u64;
+    let mut round = 0u64;
+    let mut max_resident = 0.0f64;
+    while Instant::now() < deadline {
+        round += 1;
+        if kills < max_kills {
+            eprintln!("soak round {round}: kill -9 embedded node");
+            node.kill9();
+            kills += 1;
+            node.spawn();
+            // Must recover from checkpoint (cold groups from cold-only partials) and resume —
+            // the single-node cluster path stalls here; embedded must not.
+            assert_progress(
+                std::slice::from_ref(&node),
+                0.0,
+                Duration::from_secs(60),
+                "progress after kill",
+            );
+        } else {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        eprintln!(
+            "soak round {round}: demotes={} fetches={} resident_bytes={} state_bytes={}",
+            node.metric("laminardb_state_tier_demote_total")
+                .unwrap_or(0.0),
+            node.metric("laminardb_state_tier_fetch_total")
+                .unwrap_or(0.0),
+            node.metric("laminardb_state_tier_bytes").unwrap_or(0.0),
+            node.metric("laminardb_state_bytes").unwrap_or(0.0),
+        );
+        max_resident = max_resident.max(node.metric("laminardb_state_bytes").unwrap_or(0.0));
+    }
+
+    let demotes = node
+        .metric("laminardb_state_tier_demote_total")
+        .unwrap_or(0.0);
+    let fetches = node
+        .metric("laminardb_state_tier_fetch_total")
+        .unwrap_or(0.0);
+    eprintln!(
+        "soak: completed {round} rounds ({kills} kills); demotes={demotes} fetches={fetches}"
+    );
+    // demote→promote survived the kill rounds: a row hitting a cold group after restart promotes it
+    // back, which only works if recovery rebuilt it from the cold-only partial (not silently from zero).
+    assert!(
+        demotes > 0.0,
+        "embedded: group demotion never fired: demotes={demotes}"
+    );
+    assert!(
+        fetches > 0.0,
+        "embedded: demoted groups never promoted across kills — recovery may have lost them: fetches={fetches}"
+    );
+    // Bounded-RAM gate (opt-in): demotion must keep resident agg state below the full key-space.
+    // LAMINAR_SOAK_MAX_RESIDENT_BYTES asserts a ceiling (meaningful only when GROUPS >> budget).
+    eprintln!("soak: max resident agg state across rounds: {max_resident} B");
+    if let Ok(v) = std::env::var("LAMINAR_SOAK_MAX_RESIDENT_BYTES") {
+        let ceiling: f64 = v
+            .parse()
+            .expect("LAMINAR_SOAK_MAX_RESIDENT_BYTES must be a number");
+        assert!(
+            max_resident <= ceiling,
+            "embedded: resident agg state {max_resident} B exceeded the {ceiling} B ceiling — \
+             group demotion is not bounding RAM"
+        );
+    }
+    node.kill9();
 }
 
 #[test]
@@ -477,12 +674,17 @@ fn three_node_kill9_soak() {
     );
     let url = std::env::var("LAMINAR_SOAK_CHECKPOINT_URL").unwrap_or(default_url);
 
-    // Node logs go under target/ (not the tempdir) so they survive a
-    // failed run for post-mortem; the path is printed up front.
+    // Node logs under target/ (not the tempdir) so they survive a failed run for post-mortem.
     let log_dir =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{}", std::process::id()));
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("soak: node logs in {}", log_dir.display());
+
+    // Recovery soak: arm a one-shot fault on a single node (default 1 = follower, 0 = leader).
+    let fault_inject_ms = std::env::var("LAMINAR_SOAK_FAULT_INJECT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let fault_inject_node = env_u64("LAMINAR_SOAK_FAULT_INJECT_NODE", 1) as usize;
 
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
@@ -491,6 +693,7 @@ fn three_node_kill9_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
+            fault_inject_ms: fault_inject_ms.filter(|_| id == fault_inject_node),
         })
         .collect();
     for n in &mut nodes {
@@ -499,8 +702,7 @@ fn three_node_kill9_soak() {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    // Cluster forms and commits its first epochs; on boot failure dump
-    // the node logs so the cause is visible in test output.
+    // On boot failure dump the node log tails so the cause is visible in test output.
     let boot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_for(
             "all nodes serving /metrics",
@@ -519,15 +721,13 @@ fn three_node_kill9_soak() {
         }
         panic!("soak: cluster failed to boot — node log tails above");
     }
-    // First epochs: a pre-join epoch can burn one full 30s gate
-    // timeout before the cluster converges, so allow for it.
+    // A pre-join epoch can burn a full 30s gate timeout before convergence, so allow for it.
     let mut floor = assert_progress(&nodes, 0.0, Duration::from_secs(90), "startup");
     eprintln!("soak: cluster up, epoch {floor}");
 
-    // Cap on kill rounds. `LAMINAR_SOAK_KILLS=0` runs a steady, no-fault
-    // soak — the right vehicle to observe *effective* demotion/promotion,
-    // since rebalance rehydration (every kill) sets `dirty_all` and refuses
-    // demotion until the next capture. Default: kill for the whole window.
+    // `LAMINAR_SOAK_KILLS=0` runs a steady no-fault soak — the vehicle for observing *effective*
+    // demotion, since rebalance rehydration (every kill) sets `dirty_all` and refuses demotion
+    // until the next capture. Default: kill for the whole window.
     let max_kills = env_u64("LAMINAR_SOAK_KILLS", u64::MAX);
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
     let mut round = 0u32;
@@ -535,9 +735,8 @@ fn three_node_kill9_soak() {
     while Instant::now() < deadline {
         round += 1;
         if kills < max_kills {
-            // kill -9 a node mid-epoch (no drain, no final checkpoint —
-            // the cadence guarantees an epoch is in flight). Round-robin:
-            // over the soak this hits the leader and every follower.
+            // kill -9 a node mid-epoch (cadence guarantees an epoch is in flight). Round-robin over
+            // the soak hits the leader and every follower.
             let victim = (kills as usize) % NODES;
             kills += 1;
             eprintln!("soak round {round}: kill -9 node {victim}");
@@ -563,15 +762,13 @@ fn three_node_kill9_soak() {
                 "progress after rejoin",
             );
         } else {
-            // No-fault steady state: just confirm the cluster keeps
-            // committing, then pace the loop so demotion has clean windows.
+            // No-fault steady state: confirm progress, then pace the loop so demotion gets clean windows.
             floor = assert_progress(&nodes, floor, Duration::from_secs(90), "steady progress");
             std::thread::sleep(Duration::from_secs(5));
         }
 
-        // Per-round tier snapshot: demotion/promotion evolve across the
-        // run, and the final scrape can land just after a rebalance wiped
-        // a node's tier — logging each round captures the peak.
+        // Per-round tier snapshot: the final scrape can land just after a rebalance wiped a node's
+        // tier, so logging each round captures the peak.
         if std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok() {
             let s = |m: &str| -> f64 { nodes.iter().filter_map(|n| n.metric(m)).sum() };
             eprintln!(
@@ -588,8 +785,8 @@ fn three_node_kill9_soak() {
 
     eprintln!("soak: completed {round} rounds ({kills} kills), final epoch {floor}");
 
-    // Durability-gate poll wait vs whole checkpoint (leader-only metric; sum across
-    // nodes picks it up). avg = histogram sum/count.
+    // Durability-gate poll wait vs whole checkpoint (leader-only metric; sum picks it up).
+    // avg = histogram sum/count.
     {
         let m = |n: &str| -> f64 { nodes.iter().filter_map(|x| x.metric(n)).sum() };
         let gw_sum = m("laminardb_checkpoint_restorable_gate_wait_seconds_sum");
@@ -607,12 +804,10 @@ fn three_node_kill9_soak() {
         }
     }
 
-    // Tier validation: scrape while every node is still live (the Kafka
-    // diff below kills them all). Demotions prove the budget→demote
-    // trigger fired on clean vnodes after a committed capture; fetches
-    // prove a row hit a cold vnode and promotion read it back. Both must
-    // survive the kill -9 rounds (restart rehydrates demoted vnodes from
-    // durable partials, not from the wiped tier).
+    // Tier validation: scrape while every node is still live (the Kafka diff below kills them all).
+    // Demotions prove the budget→demote trigger fired on clean vnodes; fetches prove a row hit a
+    // cold vnode and promotion read it back. Both must survive the kills (restart rehydrates
+    // demoted vnodes from durable partials, not the wiped tier).
     if std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok() {
         let sum = |name: &str| -> f64 { nodes.iter().filter_map(|n| n.metric(name)).sum() };
         let demotes = sum("laminardb_state_tier_demote_total");
@@ -624,10 +819,8 @@ fn three_node_kill9_soak() {
             "soak: tier demotes={demotes} fetches={fetches} resident_bytes={resident} \
              slices={slices} in_memory_state_bytes={state}"
         );
-        // `demotes` (state_tier_demote_total) counts *effective* demotions —
-        // slices that actually left memory — and resident_bytes/slices show
-        // what the cold tier still holds. Both >0 with fetches >0 proves the
-        // demote→promote cycle ran end-to-end.
+        // `demotes` counts *effective* demotions (slices that actually left memory); with
+        // fetches >0 this proves the demote→promote cycle ran end-to-end.
         assert!(
             demotes > 0.0,
             "tier enabled but no demotions — set LAMINAR_SOAK_BUDGET_BYTES below \
@@ -641,10 +834,23 @@ fn three_node_kill9_soak() {
         );
     }
 
+    // Recovery proof: with a fault injected and no kill-9 churn (which would reset the per-node
+    // metric on restart), the cluster must have applied the leader-coordinated round.
+    if fault_inject_ms.is_some() && max_kills == 0 {
+        let recoveries: f64 = nodes
+            .iter()
+            .filter_map(|n| n.metric("laminardb_coordinated_recoveries_total"))
+            .sum();
+        assert!(
+            recoveries >= 1.0,
+            "fault injected but no coordinated recovery recorded across the cluster",
+        );
+        eprintln!("soak: coordinated recoveries applied = {recoveries}");
+    }
+
     if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
-        // Let in-flight epochs commit, then stop every writer so the
-        // diff reads a stable topic (transactions open at the kill are
-        // aborted and invisible under read_committed).
+        // Let in-flight epochs commit, then stop every writer so the diff reads a stable topic
+        // (transactions open at the kill abort, invisible under read_committed).
         std::thread::sleep(Duration::from_secs(5));
         for n in &mut nodes {
             n.kill9();
@@ -653,12 +859,10 @@ fn three_node_kill9_soak() {
     }
 }
 
-// ── Graceful-rotation soak (B2) ─────────────────────────────────────────────
+// ── Graceful-rotation soak ─────────────────────────────────────────────
 
-/// Node config for the graceful-rotation soak: a shared vnode-partitioned Kafka
-/// source, a pass-through pipeline, and a per-node exactly-once Kafka sink (the
-/// exactly-once sink is what makes a rotation run the pre-rotation drain). Seeds
-/// `n_seeds` nodes — the joiner discovers the cluster via gossip on these seeds.
+/// Node config for the graceful-rotation soak: shared Kafka source, pass-through pipeline, per-node
+/// exactly-once sink (the EO sink forces the pre-rotation drain). Seeds `n_seeds` nodes for gossip.
 fn write_graceful_config(
     dir: &Path,
     id: usize,
@@ -681,6 +885,22 @@ fn write_graceful_config(
         .collect();
     let data_dir = dir.join(format!("node{id}-data"));
     std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Optional delta checkpoints + a non-changelog agg to exercise delta write/chain-recovery
+    // across the graceful rotation (see `write_config`).
+    let (delta_line, delta_agg) = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").map_or_else(
+        |_| (String::new(), String::new()),
+        |v| {
+            let n: u32 = v.parse().expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32");
+            let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
+            (
+                format!("delta_chain_max = {n}"),
+                format!(
+                    "\n[[pipeline]]\nname = \"soak_delta_agg\"\nsql = \"SELECT seq % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM kin GROUP BY seq % {groups}\"\n"
+                ),
+            )
+        },
+    );
 
     let toml = format!(
         r#"
@@ -711,6 +931,7 @@ url = "{url}"
 interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = 4
+{delta_line}
 
 [[source]]
 name = "kin"
@@ -729,7 +950,7 @@ nullable = false
 [[pipeline]]
 name = "passthrough"
 sql = "SELECT seq FROM kin"
-
+{delta_agg}
 [[sink]]
 name = "kout"
 pipeline = "passthrough"
@@ -772,9 +993,8 @@ fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
     });
 }
 
-/// Produce `{"seq": n}` for `n in 0..count`, keyed by `seq` (spreads across
-/// partitions), paced near `rps` so the cluster is still consuming during the
-/// mid-run rotation. Blocks until all are produced and flushed.
+/// Produce `{"seq": n}` for `n in 0..count`, keyed by `seq`, paced near `rps` so the cluster is
+/// still consuming during the mid-run rotation. Blocks until all are produced and flushed.
 fn produce_seq(brokers: &str, topic: &str, count: i64, rps: u64) {
     use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
     let producer: BaseProducer = rdkafka::ClientConfig::new()
@@ -870,11 +1090,8 @@ fn collect_output_seqs(brokers: &str, n_nodes: usize) -> (Vec<i64>, Vec<usize>) 
     (all, per_topic)
 }
 
-/// B2 end-to-end: a shared Kafka source is consumed across the cluster; adding a
-/// node mid-run triggers a GRACEFUL vnode rotation (the exactly-once sink makes it
-/// run the pre-rotation drain). The union of all output topics must then be a
-/// dense `0..=TOTAL-1` with no duplicates — proving the rotation handed off each
-/// partition at a clean cut.
+/// End-to-end graceful rotation (a node joins mid-run; the EO sink forces the pre-rotation drain).
+/// Output topics must union to a dense `0..=TOTAL-1`, proving each partition handed off cleanly.
 #[test]
 #[ignore = "spawns 4 real laminardb processes; needs LAMINAR_SOAK_KAFKA_BROKERS; run with --ignored"]
 fn graceful_rotation_kafka_soak() {
@@ -905,8 +1122,8 @@ fn graceful_rotation_kafka_soak() {
             config_path: write_graceful_config(
                 dir.path(),
                 id,
-                // Seed only the initial set so formation completes before node 3
-                // exists; node 3 joins the running cluster via gossip on these seeds.
+                // Seed only the initial set so formation completes before node 3 exists;
+                // it joins the running cluster via gossip on these seeds.
                 INITIAL,
                 interval_ms,
                 &url,
@@ -916,6 +1133,7 @@ fn graceful_rotation_kafka_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
+            fault_inject_ms: None,
         })
         .collect();
 
@@ -931,8 +1149,8 @@ fn graceful_rotation_kafka_soak() {
     assert_progress(&nodes[..INITIAL], 0.0, Duration::from_secs(90), "startup");
     eprintln!("soak: 3 nodes up; producing {total} records");
 
-    // Modest rate so records are still flowing after the rotation settles —
-    // otherwise the backlog drains before node 3 acquires its partitions.
+    // Modest rate so records still flow after the rotation settles — else the backlog drains
+    // before node 3 acquires its partitions.
     let (pb, pt) = (brokers.clone(), input.clone());
     let producer = std::thread::spawn(move || produce_seq(&pb, &pt, total, 400));
 
@@ -942,8 +1160,8 @@ fn graceful_rotation_kafka_soak() {
     wait_for("node 3 serving /metrics", Duration::from_secs(60), || {
         nodes[3].epoch().is_some()
     });
-    // Let the two-phase drain + reassignment settle; production continues meanwhile
-    // so node 3 consumes fresh records on its newly-acquired partitions.
+    // Let the two-phase drain + reassignment settle; production continues so node 3 consumes
+    // fresh records on its newly-acquired partitions.
     std::thread::sleep(Duration::from_secs(15));
 
     producer.join().expect("producer thread");
@@ -956,8 +1174,7 @@ fn graceful_rotation_kafka_soak() {
         s.len() >= total as usize
     });
 
-    // The wait above already saw every input committed, so read the diff against
-    // the live, settled cluster — killing first races the diff into phantom reads.
+    // Read the diff against the live, settled cluster — killing first races it into phantom reads.
     std::thread::sleep(Duration::from_secs(5));
     let (mut seqs, per_topic) = collect_output_seqs(&brokers, ALL);
     let count = seqs.len();

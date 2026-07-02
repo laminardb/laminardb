@@ -138,6 +138,12 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("[coordination] section changed — requires restart".to_string());
     }
+    // Restart policy / coordinated recovery is captured once at startup (to_policy /
+    // enable_supervision), so a live edit needs a restart rather than being silently dropped.
+    if old.supervision != new.supervision {
+        diff.warnings
+            .push("[supervision] section changed — requires restart".to_string());
+    }
     if old.node_id != new.node_id {
         diff.warnings
             .push("node_id changed — requires restart".to_string());
@@ -419,6 +425,7 @@ mod tests {
             server: ServerSection::default(),
             state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
             sources: vec![],
             lookups: vec![],
             pipelines: vec![],

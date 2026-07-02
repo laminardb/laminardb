@@ -10,7 +10,7 @@ use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Why a barrier checkpoint was deliberately skipped, as opposed to
 /// attempted-and-failed.
@@ -33,8 +33,7 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// Outcome of a barrier-aligned checkpoint attempt. `Skipped` is logged
-/// at debug; `Failed` keeps the retry warning.
+/// Outcome of a barrier-aligned checkpoint attempt.
 #[derive(Debug)]
 pub enum BarrierOutcome {
     /// Checkpoint committed at the given epoch.
@@ -45,6 +44,41 @@ pub enum BarrierOutcome {
     Skipped(SkipReason),
     /// Attempted and failed; retry on the next interval.
     Failed,
+}
+
+/// How a failed `execute_cycle` should be handled by the coordinator.
+#[derive(Debug, thiserror::Error)]
+pub enum CycleError {
+    /// Non-deferrable error: `ExactlyOnce` recovers from checkpoint, `AtLeastOnce` drops it.
+    #[error("{0}")]
+    Fatal(String),
+    /// `backpressure_policy=Fail` (shutdown already signaled); stop, don't recover.
+    #[error("{0}")]
+    Halt(String),
+}
+
+/// Result of a pipeline cycle. Per-domain failure isolation lets healthy failure domains
+/// commit and advance while a faulted domain's sources are held back for replay.
+pub struct CycleOutcome {
+    /// Output of the domains that succeeded this cycle.
+    pub results: FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    /// At least one failure domain faulted (it may have no *local* source, e.g. a cluster
+    /// follower reading a remote shuffle), so this can be set with `failed_sources` empty.
+    pub any_failed: bool,
+    /// Names of sources whose domain faulted; the coordinator must not commit their offsets.
+    pub failed_sources: FxHashSet<Arc<str>>,
+}
+
+impl CycleOutcome {
+    /// A fully-successful cycle: every domain committed.
+    #[must_use]
+    pub fn clean(results: FxHashMap<Arc<str>, Vec<RecordBatch>>) -> Self {
+        Self {
+            results,
+            any_failed: false,
+            failed_sources: FxHashSet::default(),
+        }
+    }
 }
 
 /// A registered source with its name and config.
@@ -65,12 +99,14 @@ pub struct SourceRegistration {
 /// Trait exists for test seam; production impl is `ConnectorPipelineCallback`.
 #[trait_variant::make(Send)]
 pub trait PipelineCallback: Send + 'static {
-    /// Execute a SQL cycle over the accumulated source batches.
+    /// Execute a SQL cycle over the accumulated source batches. `Err` is a whole-cycle
+    /// failure (all domains, or a backpressure halt); per-domain faults surface in
+    /// [`CycleOutcome`] so healthy domains still commit.
     async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String>;
+    ) -> Result<CycleOutcome, CycleError>;
 
     /// Push cycle results to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
@@ -97,6 +133,28 @@ pub trait PipelineCallback: Send + 'static {
         true
     }
 
+    /// `true` while a coordinated restart is in flight; the checkpoint gate holds and the
+    /// shutdown drain skips its final checkpoint. Default `false`.
+    fn is_recovering(&self) -> bool {
+        false
+    }
+
+    /// `true` if a fatal cycle error should fault for recovery rather than drop-and-continue
+    /// (exactly-once, or coordinated recovery). Default `false` (at-least-once drops).
+    fn fault_on_cycle_error(&self) -> bool {
+        false
+    }
+
+    /// `true` when the cluster is converged enough for the leader to checkpoint; the
+    /// cluster impl reads a locally-published verdict, no gossip. Default `true`
+    /// (single-node). `impl Future` (not `async fn`) preserves the `trait_variant`
+    /// default; `&mut self` keeps the future `Send`.
+    fn assignment_ready_for_checkpoint(
+        &mut self,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 
@@ -120,6 +178,9 @@ pub trait PipelineCallback: Send + 'static {
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);
 
+    /// Count a fatal cycle error that was dropped-and-continued (at-least-once only).
+    fn note_cycle_error(&self) {}
+
     /// Poll table sources for incremental CDC changes.
     async fn poll_tables(&mut self);
 
@@ -141,9 +202,8 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Shed idle vnode slices to the cold tier when state approaches the memory budget.
     ///
-    /// Runs in the maintenance phase; no-op without a tier or budget.
-    /// The default is a `ready` expression, not `async {}`, because `trait_variant`
-    /// rewrites the signature to `impl Future`.
+    /// Runs in the maintenance phase; no-op without a tier or budget. `ready` (not
+    /// `async {}`) preserves the `trait_variant` `impl Future` rewrite.
     fn maybe_demote_state(&mut self) -> impl std::future::Future<Output = ()> + Send {
         std::future::ready(())
     }
@@ -161,6 +221,12 @@ pub trait PipelineCallback: Send + 'static {
     /// Next checkpoint ID when managed externally.
     fn next_checkpoint_id(&self) -> Option<u64> {
         None
+    }
+
+    /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
+    /// re-initialises cleanly. Default no-op.
+    fn close_sinks(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
     }
 
     /// Register the local source barrier injectors.

@@ -8,9 +8,11 @@ pub mod callback;
 pub mod config;
 pub mod streaming_coordinator;
 
-pub use callback::{BarrierOutcome, PipelineCallback, SkipReason, SourceRegistration};
+pub use callback::{
+    BarrierOutcome, CycleError, CycleOutcome, PipelineCallback, SkipReason, SourceRegistration,
+};
 pub use config::PipelineConfig;
-pub use streaming_coordinator::StreamingCoordinator;
+pub use streaming_coordinator::{ExitReason, StreamingCoordinator};
 
 use arrow::datatypes::SchemaRef;
 use laminar_sql::parser::EmitClause;
@@ -34,6 +36,9 @@ pub enum ControlMsg {
         order_config: Option<OrderOperatorConfig>,
         /// Per-step join configs (left-deep).
         join_config: Option<Vec<JoinOperatorConfig>>,
+        /// Emit a dirty-only changelog (terminal non-windowed agg MV under
+        /// `incremental_emit`); the MV store for this name is created in `Upsert` mode.
+        incremental: bool,
     },
     /// Remove a streaming query from the running pipeline.
     DropStream {

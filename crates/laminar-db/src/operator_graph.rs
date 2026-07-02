@@ -101,16 +101,56 @@ pub(crate) trait GraphOperator: Send {
         Ok(())
     }
 
+    /// Replay one operator's recovery chain for a vnode: a FULL base then ordered deltas.
+    #[cfg(feature = "cluster")]
+    fn apply_vnode_chain(
+        &mut self,
+        _vnode: u32,
+        _base: &[u8],
+        _deltas: &[(&[u8], &[u8])],
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Drop in-memory state for vnodes this node lost on a rebalance, before any later re-acquire
+    /// merges rehydrated state on top of it (the agg merge is additive → double-count). Default
+    /// no-op; only vnode-sharded aggregates act on it.
+    #[cfg(feature = "cluster")]
+    fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) {}
+
     /// Wire the cold-tier channel for vnode promotion. Only vnode-sharded
     /// aggregates use it; others ignore it.
     #[cfg(feature = "state-tier")]
     fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
+
+    /// Enable agg delta dirty-tracking for single-node group demotion (no delta chain). Only
+    /// aggregate operators act on it.
+    #[cfg(feature = "state-tier")]
+    fn enable_group_delta_tracking(&mut self) {}
+
+    /// Demote idle resident groups to the cold tier until `target_bytes` is freed; encodes,
+    /// tier-writes and drops each off the compute path. Returns `(groups_demoted, bytes_freed)`.
+    #[cfg(feature = "state-tier")]
+    async fn demote_cold_groups(
+        &mut self,
+        _target_bytes: usize,
+        _vnode_count: u32,
+    ) -> (usize, usize) {
+        (0, 0)
+    }
 
     /// Vnodes this operator had demoted at the restored checkpoint; must be
     /// replayed from durable partials since the cold tier is wiped on restart.
     #[cfg(feature = "state-tier")]
     fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// Promotion work pending (fetched cold groups/vnodes awaiting apply, or batches deferred until
+    /// a fetch resolves) that needs a cycle to drain even with no new input. Default `false`.
+    #[cfg(feature = "state-tier")]
+    fn has_pending_promotion(&self) -> bool {
+        false
     }
 }
 
@@ -255,11 +295,94 @@ impl GraphOperator for SqlFilterOperator {
     }
 }
 
+/// Enriches an incremental MV's changelog with a static dimension, preserving `__weight`. Re-creates
+/// the physical plan each cycle so the hash join's `OnceAsync` build side doesn't freeze on cycle-1 temp.
+struct ChangelogEnrichOperator {
+    join_sql: String,
+    ctx: SessionContext,
+    handle: Option<LiveSourceHandle>,
+    logical: Option<datafusion_expr::LogicalPlan>,
+}
+
+impl ChangelogEnrichOperator {
+    fn new(ctx: SessionContext, join_sql: String) -> Self {
+        Self {
+            join_sql,
+            ctx,
+            handle: None,
+            logical: None,
+        }
+    }
+}
+
+#[async_trait]
+impl GraphOperator for ChangelogEnrichOperator {
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let batches = inputs.first().cloned().unwrap_or_default();
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
+        if self.handle.is_none() {
+            let provider = LiveSourceProvider::new(batches[0].schema());
+            self.handle = Some(provider.handle());
+            let tmp = crate::sql_analysis::CHANGELOG_ENRICH_TMP;
+            let _ = self.ctx.deregister_table(tmp);
+            self.ctx
+                .register_table(tmp, Arc::new(provider))
+                .map_err(|e| DbError::Pipeline(format!("changelog-enrich register temp: {e}")))?;
+            let logical = self
+                .ctx
+                .sql(&self.join_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline("changelog-enrich", &e))?
+                .logical_plan()
+                .clone();
+            self.logical = Some(logical);
+        }
+        self.handle.as_ref().unwrap().swap(batches);
+        // Fresh physical plan each cycle resets the hash join's cached build side.
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(self.logical.as_ref().unwrap())
+            .await
+            .map_err(|e| DbError::query_pipeline("changelog-enrich", &e))?;
+        datafusion::physical_plan::collect(physical, self.ctx.task_ctx())
+            .await
+            .map_err(|e| DbError::query_pipeline("changelog-enrich", &e))
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Ok(())
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)] // distinct independent flags, not a state enum
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     topo_order: Vec<usize>,
     topo_dirty: bool,
+    // Failure domain (connected component) per node; a fatal error is isolated to its domain.
+    node_domain: Vec<usize>,
+    domain_count: usize,
+    // When set, `compute_node_domains` cuts at source nodes so shared-source queries become
+    // distinct domains. Off: shared-source queries fuse into one domain.
+    shared_source_isolation: bool,
+    // Per-operator cap on the preserved input a faulted domain replays from. Past it, replay
+    // is abandoned and the input dropped (EO recovery).
+    max_replay_buffer_bytes: usize,
+    // Local source names whose domain faulted this cycle; drained by `take_cycle_failures`.
+    cycle_failed_sources: FxHashSet<Arc<str>>,
+    cycle_any_failed: bool,
     source_map: FxHashMap<Arc<str>, usize>,
     source_list: Vec<(Arc<str>, usize)>,
     source_node_ids: FxHashSet<usize>,
@@ -292,10 +415,19 @@ pub(crate) struct OperatorGraph {
     main_runtime_handle: Option<tokio::runtime::Handle>,
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
+    // Incremental MV names (changelog producers); routes a `changelog ⋈ static dim` join to the
+    // ChangelogEnrich operator. Kept current as incremental MVs are added.
+    incremental_tables: FxHashSet<String>,
+    // Static reference/dimension table names — valid right sides of a changelog enrich join.
+    reference_tables: FxHashSet<String>,
     // Plan-time errors from add_query (returns ()); surfaced by take_build_errors at start.
     build_errors: Vec<DbError>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
+    // `Some(chain_max)` enables incremental delta checkpoints on aggregate operators; the delta
+    // chain then becomes the PRIMARY agg checkpoint (skip the whole-node manifest, recover from the chain).
+    #[cfg(feature = "cluster")]
+    delta_chain_max: Option<u32>,
     // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
@@ -304,9 +436,16 @@ pub(crate) struct OperatorGraph {
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     rehydrated_vnode_state:
         Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
+    // Staged set of vnodes lost on rebalance; drained at the top of each cycle to drop their state.
+    #[cfg(feature = "cluster")]
+    pending_revoke_vnodes: Option<Arc<parking_lot::Mutex<FxHashSet<u32>>>>,
     // Stored so DDL-added operators also receive the tier channel.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
+    // Single-node group demotion: enable the agg delta dirty-tracking (no delta chain) so idle
+    // groups are demotable; the coordinator writes demoted groups to cold-only durable partials.
+    #[cfg(feature = "state-tier")]
+    group_delta_tracking: bool,
 }
 
 impl OperatorGraph {
@@ -316,6 +455,12 @@ impl OperatorGraph {
             edges: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
+            node_domain: Vec::new(),
+            domain_count: 0,
+            shared_source_isolation: false,
+            max_replay_buffer_bytes: usize::MAX,
+            cycle_failed_sources: FxHashSet::default(),
+            cycle_any_failed: false,
             source_map: FxHashMap::default(),
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
@@ -335,11 +480,17 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
+            delta_chain_max: None,
+            #[cfg(feature = "cluster")]
             vnode_count: None,
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
+            #[cfg(feature = "cluster")]
+            pending_revoke_vnodes: None,
             #[cfg(feature = "state-tier")]
             state_tier: None,
+            #[cfg(feature = "state-tier")]
+            group_delta_tracking: false,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -351,8 +502,23 @@ impl OperatorGraph {
             ai_runtime: None,
             main_runtime_handle: None,
             partial_lookup_tables: FxHashMap::default(),
+            incremental_tables: FxHashSet::default(),
+            reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
         }
+    }
+
+    /// Register the static reference/dimension table names (valid right sides of a changelog
+    /// enrich join).
+    pub fn set_reference_tables(&mut self, tables: FxHashSet<String>) {
+        self.reference_tables = tables;
+    }
+
+    /// Seed the incremental-MV (changelog producer) set before operators are built, so a
+    /// `changelog ⋈ static dim` consumer detects its source regardless of build order. Kept
+    /// current by `add_query` as MVs are hot-added.
+    pub fn set_incremental_tables(&mut self, tables: FxHashSet<String>) {
+        self.incremental_tables = tables;
     }
 
     /// Install the AI subsystem and main runtime handle for inference workers.
@@ -389,6 +555,11 @@ impl OperatorGraph {
 
     pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
         self.max_state_bytes = limit;
+    }
+
+    pub fn set_shared_source_isolation(&mut self, on: bool, max_replay_buffer_bytes: usize) {
+        self.shared_source_isolation = on;
+        self.max_replay_buffer_bytes = max_replay_buffer_bytes;
     }
 
     pub fn set_max_input_buf_batches(&mut self, cap: usize) {
@@ -450,6 +621,15 @@ impl OperatorGraph {
         })
     }
 
+    /// Any operator has promotion work pending — the coordinator must keep cycling to drain it even
+    /// when no input is arriving (single-node; cluster already cycles every idle tick).
+    #[cfg(feature = "state-tier")]
+    pub fn has_pending_promotion(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| !n.removed && n.operator.has_pending_promotion())
+    }
+
     /// Estimated state bytes per operator; cheap (operators maintain a counter).
     pub(crate) fn state_bytes_per_operator(&self) -> impl Iterator<Item = (&Arc<str>, usize)> {
         self.nodes
@@ -474,6 +654,12 @@ impl OperatorGraph {
         self.cluster_shuffle = Some(config);
     }
 
+    /// Enable incremental delta checkpoints on aggregate operators with `chain_max` as the bound.
+    #[cfg(feature = "cluster")]
+    pub fn set_delta_chain_max(&mut self, chain_max: u32) {
+        self.delta_chain_max = Some(chain_max);
+    }
+
     /// Set the vnode count for the single-node tier path (no shuffle config).
     /// Must stay stable across restarts; demoted partials are keyed by vnode.
     #[cfg(feature = "state-tier")]
@@ -496,6 +682,16 @@ impl OperatorGraph {
         self.state_tier = Some(tier);
     }
 
+    /// Single-node group demotion: enable agg delta dirty-tracking on built operators and
+    /// remember it so operators built later (DDL hot-add) pick it up. No `delta_chain_max`.
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn enable_group_delta_tracking(&mut self) {
+        self.group_delta_tracking = true;
+        for node in &mut self.nodes {
+            node.operator.enable_group_delta_tracking();
+        }
+    }
+
     /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
     #[cfg(feature = "cluster")]
     pub(crate) fn cluster_shuffle_config(
@@ -512,6 +708,35 @@ impl OperatorGraph {
         staged: Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>,
     ) {
         self.rehydrated_vnode_state = Some(staged);
+    }
+
+    /// Share the staged revoked-vnode set; drained at the top of each cycle to drop lost state.
+    #[cfg(feature = "cluster")]
+    pub fn set_revoke_handle(&mut self, staged: Arc<parking_lot::Mutex<FxHashSet<u32>>>) {
+        self.pending_revoke_vnodes = Some(staged);
+    }
+
+    /// Drop in-memory state for vnodes lost since the last cycle, before `apply_rehydrated_vnodes`
+    /// merges any re-acquired ones — so a lose-then-reacquire merges into empty state. Disjoint from
+    /// the rehydrated set per rotation; the ordering is defensive against rapid cross-rotation churn.
+    #[cfg(feature = "cluster")]
+    fn apply_revoked_vnodes(&mut self) {
+        let Some(handle) = self.pending_revoke_vnodes.as_ref() else {
+            return;
+        };
+        let revoked: FxHashSet<u32> = {
+            let mut guard = handle.lock();
+            if guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            node.operator.drop_owned_vnodes(&revoked);
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -551,39 +776,68 @@ impl OperatorGraph {
         }
 
         for (vnode, rehydrated) in drained {
-            match crate::vnode_partial::VnodePartial::decode(&rehydrated.bytes) {
-                Ok(partial) => {
-                    for (op_name, bytes) in &partial.operators {
-                        if let Some(node) = self
-                            .nodes
-                            .iter_mut()
-                            .find(|n| !n.removed && &*n.name == op_name.as_str())
-                        {
-                            if let Err(e) = node.operator.apply_vnode_state(vnode, bytes) {
-                                tracing::warn!(
-                                    operator = %op_name, vnode, error = %e,
-                                    "failed to apply rehydrated vnode state"
-                                );
-                            }
-                        } else {
-                            tracing::debug!(
-                                operator = %op_name, vnode,
-                                "no live operator for rehydrated slice (topology drift)"
-                            );
-                        }
+            let chain: Vec<crate::vnode_partial::VnodePartial> = rehydrated
+                .chain
+                .iter()
+                .filter_map(|b| crate::vnode_partial::VnodePartial::decode(b).ok())
+                .collect();
+            // A dropped link would leave a gapped chain → silently stale state on apply.
+            // Skip the vnode loudly instead (matches the state-tier rehydration path).
+            if chain.len() != rehydrated.chain.len() {
+                tracing::error!(
+                    vnode,
+                    "[LDB-6031] rehydration chain link decode failed; skipping vnode"
+                );
+                continue;
+            }
+            // Every operator present anywhere in the chain (full or delta), resolved independently.
+            let mut op_names: Vec<String> = Vec::new();
+            for p in &chain {
+                for (n, _) in &p.operators {
+                    if !op_names.iter().any(|o| o == n) {
+                        op_names.push(n.clone());
                     }
-                    tracing::info!(
-                        vnode,
-                        epoch = rehydrated.epoch,
-                        operators = partial.operators.len(),
-                        "applied rehydrated vnode state"
+                }
+                for (n, _) in &p.deltas {
+                    if !op_names.iter().any(|o| o == n) {
+                        op_names.push(n.clone());
+                    }
+                }
+            }
+            let mut applied = 0usize;
+            for op_name in &op_names {
+                let Some((base, deltas)) =
+                    crate::recovery_manager::resolve_op_chain(&chain, op_name)
+                else {
+                    continue; // no FULL base for this operator in the chain → start fresh
+                };
+                if let Some(node) = self
+                    .nodes
+                    .iter_mut()
+                    .find(|n| !n.removed && &*n.name == op_name.as_str())
+                {
+                    if let Err(e) = node.operator.apply_vnode_chain(vnode, base, &deltas) {
+                        tracing::warn!(
+                            operator = %op_name, vnode, error = %e,
+                            "failed to apply rehydrated vnode chain"
+                        );
+                    } else {
+                        applied += 1;
+                    }
+                } else {
+                    tracing::debug!(
+                        operator = %op_name, vnode,
+                        "no live operator for rehydrated slice (topology drift)"
                     );
                 }
-                Err(e) => tracing::warn!(
-                    vnode, error = %e,
-                    "rehydrated partial decode failed — vnode resumes from current state"
-                ),
             }
+            tracing::info!(
+                vnode,
+                epoch = rehydrated.epoch,
+                operators = applied,
+                links = chain.len(),
+                "applied rehydrated vnode chain"
+            );
             registry.mark_active(&[vnode]);
         }
     }
@@ -823,9 +1077,17 @@ impl OperatorGraph {
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         stream_join_detection: Option<&StreamJoinDetection>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
+        incremental_join_config: Option<&crate::sql_analysis::IncrementalJoinConfig>,
         table_refs: &FxHashSet<String>,
     ) -> bool {
-        if let Some(tpc) = temporal_probe_config {
+        if let Some(ijc) = incremental_join_config {
+            // Both sides are incremental MV producers — wire left → port 0, right → 1.
+            let left_id = self.find_node(&ijc.left_table).expect("source ensured");
+            let right_id = self.find_node(&ijc.right_table).expect("source ensured");
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+            true
+        } else if let Some(tpc) = temporal_probe_config {
             let left_id = self.find_node(&tpc.left_table).expect("source ensured");
             let right_id = self.find_node(&tpc.right_table).expect("source ensured");
             self.add_edge(left_id, node_id, 0);
@@ -915,8 +1177,15 @@ impl OperatorGraph {
         order_config: Option<OrderOperatorConfig>,
         idle_ttl_ms: Option<u64>,
         join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
+        incremental: bool,
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
+
+        // Record changelog producers so a later `changelog ⋈ static dim` consumer routes to the
+        // ChangelogEnrich operator.
+        if incremental {
+            self.incremental_tables.insert(name.clone());
+        }
 
         let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
         if ai_calls.len() > 1 {
@@ -946,6 +1215,28 @@ impl OperatorGraph {
             return;
         }
 
+        // `changelog ⋈ static dim`: detected first so it wins over the generic processing-time
+        // equi-join — a changelog left makes this a retraction-aware enrich, not a stream join.
+        let changelog_enrich_config = if self.incremental_tables.is_empty() {
+            None
+        } else {
+            crate::sql_analysis::detect_changelog_enrich_query(
+                &sql,
+                &self.incremental_tables,
+                &self.reference_tables,
+            )
+        };
+        let enrich = changelog_enrich_config.is_some();
+
+        // `changelog ⋈ changelog` two-sided IVM join — both sides incremental MVs. Like enrich, it
+        // wins over the generic stream join (a changelog left/right makes it retraction-aware).
+        let incremental_join_config = if enrich || self.incremental_tables.len() < 2 {
+            None
+        } else {
+            crate::sql_analysis::detect_changelog_incremental_join(&sql, &self.incremental_tables)
+        };
+        let inc_join = incremental_join_config.is_some();
+
         // TemporalProbe is parsed off the token stream (not the sqlparser AST), so it
         // never appears in join_config and always needs its own detector pass.
         let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
@@ -959,34 +1250,38 @@ impl OperatorGraph {
             })
         });
 
-        let (temporal_probe_config, temporal_probe_projection_sql) =
-            detect_temporal_probe_query(&sql);
-        let (asof_config, projection_sql) =
-            if temporal_probe_config.is_none() && needs_specialized_detection {
-                detect_asof_query(&sql)
-            } else {
-                (None, None)
-            };
-        let (temporal_config, temporal_projection_sql) =
-            if temporal_probe_config.is_none() && needs_specialized_detection {
-                detect_temporal_query(&sql)
-            } else {
-                (None, None)
-            };
-        let stream_join_detection =
-            if temporal_probe_config.is_none() && needs_specialized_detection {
-                // Interval join first; falls back to processing-time equi-join.
-                detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
-            } else {
-                None
-            };
+        let (temporal_probe_config, temporal_probe_projection_sql) = if enrich || inc_join {
+            (None, None)
+        } else {
+            detect_temporal_probe_query(&sql)
+        };
+        let specialized =
+            !enrich && !inc_join && temporal_probe_config.is_none() && needs_specialized_detection;
+        let (asof_config, projection_sql) = if specialized {
+            detect_asof_query(&sql)
+        } else {
+            (None, None)
+        };
+        let (temporal_config, temporal_projection_sql) = if specialized {
+            detect_temporal_query(&sql)
+        } else {
+            (None, None)
+        };
+        let stream_join_detection = if specialized {
+            // Interval join first; falls back to processing-time equi-join.
+            detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
+        } else {
+            None
+        };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
         let stream_join_projection_sql = stream_join_detection
             .as_ref()
             .map(|d| d.projection_sql.clone());
 
-        // Lookup-enrich: only when no other specialized join matched.
-        let (lookup_enrich_config, lookup_projection_sql) = if temporal_probe_config.is_none()
+        // Lookup-enrich: only when no other specialized join (incl. changelog-enrich) matched.
+        let (lookup_enrich_config, lookup_projection_sql) = if !enrich
+            && !inc_join
+            && temporal_probe_config.is_none()
             && asof_config.is_none()
             && temporal_config.is_none()
             && stream_join_config.is_none()
@@ -1024,6 +1319,11 @@ impl OperatorGraph {
         if let Some(cfg) = &lookup_enrich_config {
             table_refs.remove(&cfg.table_name);
         }
+        // ChangelogEnrich: only the changelog (left) is a graph input; the dimension is read from
+        // the context, not wired as an edge.
+        if let Some(cfg) = &changelog_enrich_config {
+            table_refs.retain(|t| t == &cfg.changelog_table);
+        }
 
         if let Some(ref tc) = temporal_config {
             self.temporal_configs.push(tc.clone());
@@ -1041,11 +1341,15 @@ impl OperatorGraph {
             lookup_enrich_config,
             projection_sql.as_deref(),
             idle_ttl_ms,
+            incremental,
+            changelog_enrich_config,
+            incremental_join_config.clone(),
         );
 
         let input_port_count = if asof_config.is_some()
             || stream_join_config.is_some()
             || temporal_probe_config.is_some()
+            || inc_join
         {
             2
         } else {
@@ -1067,6 +1371,7 @@ impl OperatorGraph {
             stream_join_config.as_ref(),
             stream_join_detection.as_ref(),
             temporal_config.as_ref(),
+            incremental_join_config.as_ref(),
             &table_refs,
         );
         if depends {
@@ -1191,7 +1496,8 @@ impl OperatorGraph {
 
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
         let node_id = self.place_operator_node(name, operator, 1);
-        let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
+        let depends =
+            self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -1222,7 +1528,8 @@ impl OperatorGraph {
         table_refs.insert(plan.source_table.clone());
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
         let node_id = self.place_operator_node(name, operator, 1);
-        let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
+        let depends =
+            self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -1244,8 +1551,39 @@ impl OperatorGraph {
         lookup_enrich_config: Option<crate::operator::lookup_enrich::LookupEnrichConfig>,
         projection_sql: Option<&str>,
         idle_ttl_ms: Option<u64>,
+        incremental: bool,
+        changelog_enrich_config: Option<crate::sql_analysis::ChangelogEnrichConfig>,
+        incremental_join_config: Option<crate::sql_analysis::IncrementalJoinConfig>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
+
+        // `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join emitting a joined
+        // changelog into the join MV's `Multiset` store.
+        if let Some(cfg) = incremental_join_config {
+            #[cfg_attr(not(feature = "state-tier"), allow(unused_mut))]
+            let mut op = operator::incremental_join::IncrementalJoinOperator::new(cfg);
+            #[cfg(feature = "state-tier")]
+            if let Some(tier) = self.state_tier.clone() {
+                op.set_op_name(name);
+                op.attach_state_tier(tier);
+                if let Some(vnode_count) = self.vnode_count {
+                    op.set_vnode_count(vnode_count);
+                }
+                if self.group_delta_tracking {
+                    op.enable_delta_tracking();
+                }
+            }
+            return Box::new(op);
+        }
+
+        // `changelog ⋈ static dim` — consume the changelog, join against the dimension (in the
+        // graph context), preserve `__weight` → joined changelog.
+        if let Some(cfg) = changelog_enrich_config {
+            return Box::new(ChangelogEnrichOperator::new(
+                self.ctx.clone(),
+                cfg.projection_sql,
+            ));
+        }
 
         // Falls through to the DataFusion lookup path if the registry/handle is absent.
         if let Some(cfg) = lookup_enrich_config {
@@ -1378,7 +1716,10 @@ impl OperatorGraph {
             ));
         }
 
-        let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
+        // `EMIT CHANGES` is an explicit changelog; `incremental` drives the same dirty-only emit
+        // internally for a terminal running-state aggregate MV.
+        let emit_changelog =
+            incremental || emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
         #[cfg_attr(
             not(any(feature = "cluster", feature = "state-tier")),
@@ -1395,6 +1736,11 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
+            // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
+            // Enabling delta also makes the chain the primary agg checkpoint.
+            if let Some(chain_max) = self.delta_chain_max {
+                op.enable_delta_checkpoints(chain_max);
+            }
         }
         #[cfg(feature = "state-tier")]
         if let Some(tier) = self.state_tier.clone() {
@@ -1402,6 +1748,9 @@ impl OperatorGraph {
             // Single-node path has no shuffle config to read the count from.
             if let Some(vnode_count) = self.vnode_count {
                 op.set_vnode_count(vnode_count);
+            }
+            if self.group_delta_tracking {
+                op.enable_delta_tracking();
             }
         }
         Box::new(op)
@@ -1506,6 +1855,8 @@ impl OperatorGraph {
             }
         }
 
+        self.compute_node_domains();
+
         self.source_list.clear();
         self.source_list
             .extend(self.source_map.iter().map(|(k, v)| (Arc::clone(k), *v)));
@@ -1515,6 +1866,74 @@ impl OperatorGraph {
             .extend(self.output_map.values().copied());
 
         self.topo_dirty = false;
+    }
+
+    /// Partition into failure domains (connected components) via union-find over undirected
+    /// edges. Queries sharing a source node join one domain so they recover together —
+    /// re-seeking a shared source for one would re-feed the other.
+    fn compute_node_domains(&mut self) {
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        let n = self.nodes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        for edge in &self.edges {
+            if self.nodes[edge.source].removed || self.nodes[edge.target].removed {
+                continue;
+            }
+            // Cut at source nodes so two queries reading one source don't fuse into a single domain.
+            // Sources have no incoming edges, so skipping their outgoing edges leaves each isolated.
+            if self.shared_source_isolation && self.source_node_ids.contains(&edge.source) {
+                continue;
+            }
+            let a = find(&mut parent, edge.source);
+            let b = find(&mut parent, edge.target);
+            if a != b {
+                parent[a] = b;
+            }
+        }
+
+        self.node_domain.clear();
+        self.node_domain.resize(n, usize::MAX);
+        let mut root_to_domain: FxHashMap<usize, usize> = FxHashMap::default();
+        for i in 0..n {
+            if self.nodes[i].removed {
+                continue;
+            }
+            // Under isolation, sources are shared infrastructure, not a failure domain: a
+            // consumer fault holds the source back, but the source itself never faults.
+            // Leaving them unassigned (MAX) keeps `domain_count` equal to the number of
+            // query domains, so the all-domains-failed check below stays exact.
+            if self.shared_source_isolation && self.source_node_ids.contains(&i) {
+                continue;
+            }
+            let root = find(&mut parent, i);
+            let next = root_to_domain.len();
+            self.node_domain[i] = *root_to_domain.entry(root).or_insert(next);
+        }
+        // When isolation is off this includes inert source-only domains, so
+        // `failed_domains.len() == domain_count` is a conservative "all domains failed" test.
+        self.domain_count = root_to_domain.len();
+    }
+
+    // A source is held back when its own domain faulted (isolation off / source unioned into a
+    // consumer's domain) or, under isolation, when any domain it feeds faulted — the source is
+    // cut out of every consumer's domain, so check its direct targets.
+    fn source_feeds_failed_domain(&self, source_node: usize, failed: &FxHashSet<usize>) -> bool {
+        if failed.contains(&self.node_domain[source_node]) {
+            return true;
+        }
+        self.shared_source_isolation
+            && self.nodes[source_node]
+                .output_routes
+                .iter()
+                .any(|&(target, _)| failed.contains(&self.node_domain[target]))
     }
 
     fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -1591,18 +2010,32 @@ impl OperatorGraph {
                 b
             }
             Err(e) => {
-                if accept && self.depends_on_stream.contains(&node_id) {
-                    // Upstream not ready; preserve input for retry next cycle.
+                // Defer (preserve input, keep the cycle alive) when the upstream
+                // isn't ready, OR when a cross-node shuffle target isn't reachable
+                // yet (cluster formation): aborting the whole cycle would also drop
+                // co-located streams (e.g. a pass-through exactly-once sink) whose
+                // source rows the generator has already advanced past — an EO gap.
+                if accept && (self.depends_on_stream.contains(&node_id) || e.is_shuffle_not_ready())
+                {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
-                        "Query deferred (upstream not ready); batches preserved for retry"
+                        "Query deferred (upstream/shuffle not ready); batches preserved for retry"
                     );
                     return Ok(());
                 }
                 if !accept {
+                    return Err(e);
+                }
+                // Under shared-source isolation, keep the faulted operator's input so the next cycle
+                // replays it with new arrivals; returns Err to isolate the domain. Bounded by `max_replay_buffer_bytes`.
+                if self.shared_source_isolation
+                    && input_bytes.iter().sum::<usize>() <= self.max_replay_buffer_bytes
+                {
+                    self.input_bufs[node_id] = inputs;
+                    self.input_buf_bytes[node_id] = input_bytes;
                     return Err(e);
                 }
                 for v in &mut inputs {
@@ -1731,7 +2164,10 @@ impl OperatorGraph {
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         #[cfg(feature = "cluster")]
-        self.apply_rehydrated_vnodes();
+        {
+            self.apply_revoked_vnodes();
+            self.apply_rehydrated_vnodes();
+        }
 
         if self.topo_dirty {
             self.compute_topo_order();
@@ -1744,10 +2180,20 @@ impl OperatorGraph {
         let cycle_start = std::time::Instant::now();
         let topo_len = self.topo_order.len();
 
+        self.cycle_failed_sources.clear();
+        self.cycle_any_failed = false;
+        let mut failed_domains: FxHashSet<usize> = FxHashSet::default();
+        let mut first_error: Option<DbError> = None;
+
         for i in 0..topo_len {
             let node_id = self.topo_order[i];
 
             if self.nodes[node_id].removed {
+                continue;
+            }
+
+            // Skip a faulted domain; downstream nodes share it, so this cascades.
+            if failed_domains.contains(&self.node_domain[node_id]) {
                 continue;
             }
 
@@ -1774,7 +2220,14 @@ impl OperatorGraph {
                     );
 
                     if let Err(e) = self
-                        .run_one_deferred_operator(i, topo_len, current_watermark, &mut results)
+                        .run_one_deferred_operator(
+                            i,
+                            topo_len,
+                            current_watermark,
+                            &mut results,
+                            &mut failed_domains,
+                            &mut first_error,
+                        )
                         .await
                     {
                         self.finish_cycle();
@@ -1789,8 +2242,17 @@ impl OperatorGraph {
                 .execute_single_operator(node_id, current_watermark, &mut results)
                 .await
             {
-                self.finish_cycle();
-                return Err(e);
+                let domain = self.node_domain[node_id];
+                tracing::warn!(
+                    query = %self.nodes[node_id].name,
+                    error = %e,
+                    domain,
+                    "[LDB-3023] operator faulted; isolating its failure domain"
+                );
+                failed_domains.insert(domain);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
 
@@ -1801,7 +2263,31 @@ impl OperatorGraph {
 
         self.sample_buffer_stats();
 
+        if !failed_domains.is_empty() {
+            self.cycle_any_failed = true;
+            let failed_names: Vec<Arc<str>> = self
+                .source_list
+                .iter()
+                .filter(|(_, node_id)| self.source_feeds_failed_domain(*node_id, &failed_domains))
+                .map(|(name, _)| Arc::clone(name))
+                .collect();
+            self.cycle_failed_sources.extend(failed_names);
+            // All domains failed → whole-cycle `Err` (keeps the single-query contract).
+            if failed_domains.len() == self.domain_count {
+                return Err(first_error.expect("failed_domains non-empty implies an error"));
+            }
+        }
+
         Ok(results)
+    }
+
+    /// `(any domain faulted, local source names whose domain faulted)` from the last
+    /// `execute_cycle`, draining the set. The coordinator holds back these sources' offsets.
+    pub fn take_cycle_failures(&mut self) -> (bool, FxHashSet<Arc<str>>) {
+        (
+            self.cycle_any_failed,
+            std::mem::take(&mut self.cycle_failed_sources),
+        )
     }
 
     fn prime_sources(
@@ -1829,12 +2315,16 @@ impl OperatorGraph {
     }
 
     /// Round-robin one deferred operator so a budget overrun can't starve the tail.
+    /// Skips and records failed domains exactly like the main loop; only a backpressure
+    /// `Fail` returns `Err` (whole-cycle halt).
     async fn run_one_deferred_operator(
         &mut self,
         i: usize,
         topo_len: usize,
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        failed_domains: &mut FxHashSet<usize>,
+        first_error: &mut Option<DbError>,
     ) -> Result<(), DbError> {
         let deferred_count = topo_len - i;
         let start = self.deferred_scan_offset % deferred_count;
@@ -1842,6 +2332,9 @@ impl OperatorGraph {
             let j = i + (start + offset) % deferred_count;
             let deferred_id = self.topo_order[j];
             if self.nodes[deferred_id].removed {
+                continue;
+            }
+            if failed_domains.contains(&self.node_domain[deferred_id]) {
                 continue;
             }
             let has_input = self.input_bufs[deferred_id]
@@ -1860,8 +2353,22 @@ impl OperatorGraph {
                 }
                 GateDecision::Run => {}
             }
-            self.execute_single_operator(deferred_id, current_watermark, results)
-                .await?;
+            if let Err(e) = self
+                .execute_single_operator(deferred_id, current_watermark, results)
+                .await
+            {
+                let domain = self.node_domain[deferred_id];
+                tracing::warn!(
+                    query = %self.nodes[deferred_id].name,
+                    error = %e,
+                    domain,
+                    "[LDB-3023] deferred operator faulted; isolating its failure domain"
+                );
+                failed_domains.insert(domain);
+                if first_error.is_none() {
+                    *first_error = Some(e);
+                }
+            }
             self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
             break;
         }
@@ -2125,6 +2632,39 @@ impl OperatorGraph {
         demoted
     }
 
+    /// Demote idle resident groups across all operators until `target_bytes` is freed. Each operator
+    /// encodes, tier-writes and drops its own idle groups off the compute path; returns the count demoted.
+    #[cfg(feature = "state-tier")]
+    pub(crate) async fn demote_cold_groups(&mut self, target_bytes: usize) -> u64 {
+        let Some(vnode_count) = self.vnode_count else {
+            return 0;
+        };
+        let mut total = 0u64;
+        // Hold the budget across operators: each gets only what's left, so the total freed never
+        // exceeds target_bytes. Iteration order sets demotion priority (earlier operators first).
+        let mut remaining = target_bytes;
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            if remaining == 0 {
+                break;
+            }
+            let (n, freed) = node
+                .operator
+                .demote_cold_groups(remaining, vnode_count)
+                .await;
+            total += n as u64;
+            remaining = remaining.saturating_sub(freed);
+        }
+        if total > 0 {
+            if let Some(ref prom) = self.prom {
+                prom.state_tier_demote_total.inc_by(total);
+            }
+        }
+        total
+    }
+
     /// Whether the named operator could demote `vnode` right now (no tier I/O performed).
     #[cfg(feature = "state-tier")]
     pub(crate) fn can_demote(&self, operator: &str, vnode: u32) -> bool {
@@ -2154,21 +2694,22 @@ impl OperatorGraph {
         out
     }
 
-    /// Apply one operator's slice of a vnode partial (cold-vnode rehydration on restart).
-    /// Targets a single operator to avoid double-applying slices recovered from the manifest.
+    /// Replay one operator's recovery chain (FULL base + ordered deltas) for a vnode (cold-vnode
+    /// rehydration on restart). Targets a single operator to avoid double-applying manifest slices.
     #[cfg(feature = "state-tier")]
-    pub(crate) fn apply_vnode_slice(
+    pub(crate) fn apply_vnode_chain(
         &mut self,
         operator: &str,
         vnode: u32,
-        bytes: &[u8],
+        base: &[u8],
+        deltas: &[(&[u8], &[u8])],
     ) -> Result<(), DbError> {
         match self
             .nodes
             .iter_mut()
             .find(|n| !n.removed && &*n.name == operator)
         {
-            Some(node) => node.operator.apply_vnode_state(vnode, bytes),
+            Some(node) => node.operator.apply_vnode_chain(vnode, base, deltas),
             None => Ok(()),
         }
     }
@@ -2375,6 +2916,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert_eq!(graph.nodes.len(), 2); // source "trades" + query "q1"
@@ -2396,6 +2938,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q2".to_string(),
@@ -2405,6 +2948,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // source "trades" + query "q1" + query "q2" = 3 nodes
@@ -2428,6 +2972,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q1".to_string(),
@@ -2437,6 +2982,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         graph.compute_topo_order();
@@ -2471,6 +3017,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(graph.output_map.contains_key("q1"));
 
@@ -2493,6 +3040,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let batch = test_batch();
@@ -2510,7 +3058,7 @@ mod tests {
         assert_eq!(total_rows, 1);
     }
 
-    // --- AI routing (B5.3b) ---
+    // --- AI routing ---
 
     struct PosProvider;
 
@@ -2594,6 +3142,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph
             .take_build_errors()
@@ -2638,6 +3187,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(
             graph.take_build_errors().is_err(),
@@ -2711,6 +3261,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph
             .take_build_errors()
@@ -2757,6 +3308,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let source_batches = FxHashMap::default();
@@ -2785,6 +3337,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q2".to_string(),
@@ -2794,6 +3347,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let batch = test_batch();
@@ -2820,6 +3374,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // No state yet → None
         let cp = graph.snapshot_state().unwrap();
@@ -2840,6 +3395,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let mut src = FxHashMap::default();
         src.insert(Arc::from("trades"), vec![test_batch()]);
@@ -2859,6 +3415,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(g2.restore_from_bytes(&bytes).unwrap(), 1);
 
@@ -2911,6 +3468,332 @@ mod tests {
         graph
     }
 
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn apply_revoked_vnodes_drains_handle() {
+        let mut graph = test_graph();
+        let handle = Arc::new(parking_lot::Mutex::new(
+            [1u32, 2, 3].into_iter().collect::<FxHashSet<u32>>(),
+        ));
+        graph.set_revoke_handle(Arc::clone(&handle));
+        graph.apply_revoked_vnodes();
+        assert!(
+            handle.lock().is_empty(),
+            "the revoke handle is drained after apply_revoked_vnodes",
+        );
+    }
+
+    #[test]
+    fn test_node_domains_disjoint_queries_separate() {
+        let mut graph = test_graph();
+        graph.register_source_schema("trades_a".to_string(), test_schema());
+        graph.register_source_schema("trades_b".to_string(), test_schema());
+        graph.add_query(
+            "qa".to_string(),
+            "SELECT symbol FROM trades_a".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.add_query(
+            "qb".to_string(),
+            "SELECT symbol FROM trades_b".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.compute_topo_order();
+
+        assert_eq!(
+            graph.domain_count, 2,
+            "disjoint-source queries are separate domains"
+        );
+        let a = graph.source_map.get("trades_a").copied().unwrap();
+        let b = graph.source_map.get("trades_b").copied().unwrap();
+        assert_ne!(graph.node_domain[a], graph.node_domain[b]);
+    }
+
+    #[test]
+    fn test_node_domains_shared_source_joined() {
+        let mut graph = test_graph();
+        graph.register_source_schema("trades".to_string(), test_schema());
+        graph.add_query(
+            "qa".to_string(),
+            "SELECT symbol FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.add_query(
+            "qb".to_string(),
+            "SELECT price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.compute_topo_order();
+
+        assert_eq!(
+            graph.domain_count, 1,
+            "queries sharing a source recover together"
+        );
+    }
+
+    #[test]
+    fn test_node_domains_shared_source_isolated() {
+        let mut graph = test_graph();
+        graph.set_shared_source_isolation(true, usize::MAX);
+        graph.register_source_schema("trades".to_string(), test_schema());
+        graph.add_query(
+            "qa".to_string(),
+            "SELECT symbol FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.add_query(
+            "qb".to_string(),
+            "SELECT price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.compute_topo_order();
+
+        assert_eq!(
+            graph.domain_count, 2,
+            "isolation splits shared-source queries into separate domains"
+        );
+        let qa = graph.find_node("qa").unwrap();
+        let qb = graph.find_node("qb").unwrap();
+        assert_ne!(graph.node_domain[qa], graph.node_domain[qb]);
+        let src = graph.source_map.get("trades").copied().unwrap();
+        assert_eq!(
+            graph.node_domain[src],
+            usize::MAX,
+            "an isolated source is not a failure domain of its own"
+        );
+    }
+
+    // A fault in one query sharing a source must not sink a sibling reading the same source: the
+    // healthy query still emits, and the shared source is held back because it feeds the faulted domain.
+    #[tokio::test]
+    async fn test_execute_cycle_isolates_shared_source_sibling() {
+        let mut graph = test_graph();
+        graph.set_shared_source_isolation(true, usize::MAX);
+        graph.set_max_state_bytes(Some(1));
+        graph.register_source_schema("trades".to_string(), test_schema());
+        graph.add_query(
+            "agg".to_string(),
+            "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.add_query(
+            "healthy".to_string(),
+            "SELECT symbol, price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![test_batch()]);
+
+        let results = graph
+            .execute_cycle(&source, i64::MAX, None)
+            .await
+            .expect("the healthy sibling keeps the cycle Ok though they share a source");
+
+        assert_eq!(
+            total_rows(&results, "healthy"),
+            2,
+            "healthy sibling emitted despite sharing the faulted source"
+        );
+        assert_eq!(
+            total_rows(&results, "agg"),
+            0,
+            "faulted domain emitted nothing"
+        );
+
+        let (any_failed, failed_sources) = graph.take_cycle_failures();
+        assert!(any_failed);
+        assert!(
+            failed_sources.contains(&Arc::from("trades")),
+            "the shared source is held back: it feeds the faulted domain"
+        );
+    }
+
+    // A transient fault in one shared-source query replays from the preserved input on the next
+    // cycle (cycle-1 rows + cycle-2 rows), while the healthy sibling only sees new rows.
+    #[tokio::test]
+    async fn test_shared_source_isolation_replays_faulted_domain() {
+        struct ReplayTestOp {
+            fail_once: bool,
+            has_failed: bool,
+        }
+        #[async_trait]
+        impl GraphOperator for ReplayTestOp {
+            async fn process(
+                &mut self,
+                inputs: &[Vec<RecordBatch>],
+                _watermarks: &[i64],
+            ) -> Result<Vec<RecordBatch>, DbError> {
+                if self.fail_once && !self.has_failed {
+                    self.has_failed = true;
+                    return Err(DbError::Pipeline("transient fault".into()));
+                }
+                Ok(inputs.first().cloned().unwrap_or_default())
+            }
+            fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+                Ok(None)
+            }
+            fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+                Ok(())
+            }
+        }
+
+        let mut graph = test_graph();
+        graph.set_shared_source_isolation(true, usize::MAX);
+        let src = graph.ensure_source_node("trades");
+        let a = graph.place_operator_node(
+            "a",
+            Box::new(ReplayTestOp {
+                fail_once: true,
+                has_failed: false,
+            }),
+            1,
+        );
+        graph.add_edge(src, a, 0);
+        graph.output_map.insert(Arc::from("a"), a);
+        let b = graph.place_operator_node(
+            "b",
+            Box::new(ReplayTestOp {
+                fail_once: false,
+                has_failed: false,
+            }),
+            1,
+        );
+        graph.add_edge(src, b, 0);
+        graph.output_map.insert(Arc::from("b"), b);
+        graph.topo_dirty = true;
+
+        let mut cycle1 = FxHashMap::default();
+        cycle1.insert(Arc::from("trades"), vec![test_batch()]);
+        let r1 = graph
+            .execute_cycle(&cycle1, i64::MAX, None)
+            .await
+            .expect("healthy sibling keeps cycle 1 Ok");
+        assert_eq!(total_rows(&r1, "b"), 2, "healthy sibling emitted cycle 1");
+        assert_eq!(
+            total_rows(&r1, "a"),
+            0,
+            "faulted op emitted nothing cycle 1"
+        );
+        let (_, failed) = graph.take_cycle_failures();
+        assert!(failed.contains(&Arc::from("trades")));
+
+        let mut cycle2 = FxHashMap::default();
+        cycle2.insert(Arc::from("trades"), vec![test_batch()]);
+        let r2 = graph
+            .execute_cycle(&cycle2, i64::MAX, None)
+            .await
+            .expect("cycle 2 Ok");
+        assert_eq!(
+            total_rows(&r2, "a"),
+            4,
+            "faulted op replays preserved cycle-1 rows plus new cycle-2 rows"
+        );
+        assert_eq!(
+            total_rows(&r2, "b"),
+            2,
+            "healthy sibling sees only new rows (no replay)"
+        );
+        let (any_failed2, _) = graph.take_cycle_failures();
+        assert!(!any_failed2, "no fault on the replay cycle");
+    }
+
+    // A fatal error in one disjoint query (the aggregate trips the state-size limit) must not
+    // sink the sibling query: the healthy domain still produces output, and only the faulted
+    // domain's source is held back from committing.
+    #[tokio::test]
+    async fn test_execute_cycle_isolates_failed_domain() {
+        let mut graph = test_graph();
+        graph.set_max_state_bytes(Some(1));
+        graph.register_source_schema("trades_a".to_string(), test_schema());
+        graph.register_source_schema("trades_b".to_string(), test_schema());
+        graph.add_query(
+            "agg".to_string(),
+            "SELECT symbol, SUM(price) AS total FROM trades_a GROUP BY symbol".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        graph.add_query(
+            "filtered".to_string(),
+            "SELECT symbol, price FROM trades_b WHERE price > 100".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades_a"), vec![test_batch()]);
+        source.insert(Arc::from("trades_b"), vec![test_batch()]);
+
+        let results = graph
+            .execute_cycle(&source, i64::MAX, None)
+            .await
+            .expect("a healthy sibling domain keeps the cycle Ok");
+
+        assert_eq!(
+            total_rows(&results, "filtered"),
+            2,
+            "healthy domain emitted"
+        );
+        assert_eq!(
+            total_rows(&results, "agg"),
+            0,
+            "faulted domain emitted nothing"
+        );
+
+        let (any_failed, failed_sources) = graph.take_cycle_failures();
+        assert!(any_failed);
+        assert!(failed_sources.contains(&Arc::from("trades_a")));
+        assert!(!failed_sources.contains(&Arc::from("trades_b")));
+    }
+
     #[tokio::test]
     async fn test_og_compiled_projection() {
         // Non-aggregate projection-only query should compile to PhysicalExpr
@@ -2923,6 +3806,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -2951,6 +3835,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -2972,6 +3857,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3020,6 +3906,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "step2".to_string(),
@@ -3029,6 +3916,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3053,6 +3941,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "low".to_string(),
@@ -3062,6 +3951,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // C selects from both A and B — this will use cached plan (multi-source)
         graph.add_query(
@@ -3073,6 +3963,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3099,6 +3990,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q2".to_string(),
@@ -3108,6 +4000,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3141,6 +4034,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
         }
 
@@ -3178,6 +4072,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3204,6 +4099,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3229,6 +4125,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Need one cycle to lazy-init state before restore will take effect
@@ -3255,6 +4152,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let mut source = FxHashMap::default();
@@ -3288,6 +4186,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "q1".to_string(),
@@ -3297,6 +4196,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // "q1" should NOT be in source_map (it was replaced with a real query)
@@ -3347,6 +4247,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Cycle 1: inject both sides, watermark=102k (only offset=0 resolves)
@@ -3400,6 +4301,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // Push some data into the source buffer
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -3420,6 +4322,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // Fill source buffer to 50% of cap
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -3440,6 +4343,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // Overfill the buffer beyond cap — pressure clamps at 1.0.
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -3470,6 +4374,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "downstream".to_string(),
@@ -3479,6 +4384,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Find the downstream node id and pre-fill its input buffer at cap,
@@ -3524,6 +4430,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Now register `derived` — this replaces the placeholder.
@@ -3535,6 +4442,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let derived_id = *graph.output_map.get("derived").unwrap();
@@ -3557,6 +4465,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Pre-fill sink's input at cap. Because sink has no downstream, sink
@@ -3643,6 +4552,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let batch = test_batch(); // AAPL + GOOG
@@ -3698,6 +4608,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // source + 2 filter nodes + join operator = 4
@@ -3763,6 +4674,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "consumer".to_string(),
@@ -3772,6 +4684,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let consumer_id = *graph.output_map.get("consumer").unwrap();
         prefill_port(&mut graph, consumer_id, 0, vec![test_batch(); cap]);
@@ -3845,6 +4758,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         graph.add_query(
             "consumer".to_string(),
@@ -3854,6 +4768,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let consumer_id = *graph.output_map.get("consumer").unwrap();
         prefill_port(&mut graph, consumer_id, 0, vec![test_batch()]);

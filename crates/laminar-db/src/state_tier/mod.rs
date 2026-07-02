@@ -82,16 +82,23 @@ impl StateTierStore {
         k
     }
 
-    /// Store a demoted slice. No fsync — the tier is rebuildable from checkpoint partials.
-    pub(crate) fn put(&self, operator: &str, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
-        let key = Self::key(operator, vnode);
+    /// Per-group key: the vnode key plus a NUL and the group-key bytes. A strict extension of
+    /// `key(operator, vnode)`, so vnode-blob and per-group entries never collide.
+    fn group_key(operator: &str, vnode: u32, group: &[u8]) -> Vec<u8> {
+        let mut k = Self::key(operator, vnode);
+        k.push(0);
+        k.extend_from_slice(group);
+        k
+    }
+
+    fn put_key(&self, key: &[u8], bytes: &[u8]) -> Result<(), DbError> {
         let old_len = self
             .slices
-            .get(&key)
+            .get(key)
             .map_err(|e| DbError::Storage(format!("state tier read-before-put: {e}")))?
             .map(|o| o.len());
         self.slices
-            .insert(&key, bytes)
+            .insert(key, bytes)
             .map_err(|e| DbError::Storage(format!("state tier put: {e}")))?;
         #[allow(clippy::cast_possible_wrap)]
         let new_total = (key.len() + bytes.len()) as i64;
@@ -103,18 +110,15 @@ impl StateTierStore {
             self.logical_bytes.fetch_add(new_total, Ordering::Relaxed);
             self.logical_slices.fetch_add(1, Ordering::Relaxed);
         }
-        // `state_tier_demote_total` is incremented by the graph, not here — a write
-        // may still be rolled back if the vnode turns out dirty.
         self.publish_gauges();
         Ok(())
     }
 
-    /// Fetch a slice for promotion. `None` if not resident.
-    pub(crate) fn get(&self, operator: &str, vnode: u32) -> Result<Option<Bytes>, DbError> {
+    fn get_key(&self, key: &[u8]) -> Result<Option<Bytes>, DbError> {
         let start = std::time::Instant::now();
         let v = self
             .slices
-            .get(Self::key(operator, vnode))
+            .get(key)
             .map_err(|e| DbError::Storage(format!("state tier get: {e}")))?;
         if let Some(ref m) = self.metrics {
             m.state_tier_fetch_total.inc();
@@ -124,16 +128,14 @@ impl StateTierStore {
         Ok(v.map(|v| Bytes::copy_from_slice(&v)))
     }
 
-    /// Remove a slice after promotion or vnode release.
-    pub(crate) fn remove(&self, operator: &str, vnode: u32) -> Result<(), DbError> {
-        let key = Self::key(operator, vnode);
+    fn remove_key(&self, key: &[u8]) -> Result<(), DbError> {
         let old = self
             .slices
-            .get(&key)
+            .get(key)
             .map_err(|e| DbError::Storage(format!("state tier read-before-remove: {e}")))?;
         if let Some(old) = old {
             self.slices
-                .remove(&key)
+                .remove(key)
                 .map_err(|e| DbError::Storage(format!("state tier remove: {e}")))?;
             #[allow(clippy::cast_possible_wrap)]
             self.logical_bytes
@@ -142,6 +144,54 @@ impl StateTierStore {
             self.publish_gauges();
         }
         Ok(())
+    }
+
+    /// Store a demoted slice. No fsync — the tier is rebuildable from checkpoint partials.
+    pub(crate) fn put(&self, operator: &str, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
+        // `state_tier_demote_total` is incremented by the graph, not here — a write
+        // may still be rolled back if the vnode turns out dirty.
+        self.put_key(&Self::key(operator, vnode), bytes)
+    }
+
+    /// Fetch a slice for promotion. `None` if not resident.
+    pub(crate) fn get(&self, operator: &str, vnode: u32) -> Result<Option<Bytes>, DbError> {
+        self.get_key(&Self::key(operator, vnode))
+    }
+
+    /// Remove a slice after promotion or vnode release.
+    pub(crate) fn remove(&self, operator: &str, vnode: u32) -> Result<(), DbError> {
+        self.remove_key(&Self::key(operator, vnode))
+    }
+
+    /// Store a single demoted group. `group` is the group-key bytes.
+    pub(crate) fn put_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        self.put_key(&Self::group_key(operator, vnode, group), bytes)
+    }
+
+    /// Fetch one demoted group for promotion. `None` if not resident.
+    pub(crate) fn get_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> Result<Option<Bytes>, DbError> {
+        self.get_key(&Self::group_key(operator, vnode, group))
+    }
+
+    /// Remove one demoted group after promotion or eviction.
+    pub(crate) fn remove_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> Result<(), DbError> {
+        self.remove_key(&Self::group_key(operator, vnode, group))
     }
 
     pub(crate) fn logical_bytes(&self) -> i64 {

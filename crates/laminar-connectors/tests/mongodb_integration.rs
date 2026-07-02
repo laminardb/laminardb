@@ -150,7 +150,7 @@ async fn resume_after_disconnect() {
     let db = client.database("test_resume");
     let coll = db.collection::<mongodb::bson::Document>("docs");
 
-    // Phase 1: Insert 5 docs and capture resume token.
+    // Insert 5 docs and capture the resume token.
     let config = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
@@ -175,7 +175,7 @@ async fn resume_after_disconnect() {
     let checkpoint = source.checkpoint();
     source.close().await.unwrap();
 
-    // Phase 2: Insert 5 more docs, reopen from checkpoint.
+    // Insert 5 more docs, then reopen from the checkpoint.
     for i in 5..10 {
         coll.insert_one(doc! { "seq": i }).await.unwrap();
     }
@@ -265,6 +265,91 @@ async fn sink_upsert() {
         .collection::<mongodb::bson::Document>("out");
     let count = coll.count_documents(doc! {}).await.unwrap();
     assert_eq!(count, 2);
+
+    sink.close().await.unwrap();
+}
+
+/// A Z-set (`__weight`) changelog from an incremental MV is collapsed per key before the upsert:
+/// retract+insert nets to a `replace_one`, and a key with only net-negative weight becomes a
+/// `delete_one` (tombstone).
+#[tokio::test(flavor = "multi_thread")]
+async fn sink_upsert_collapses_zset_changelog() {
+    fn changelog(ids: &[&str], names: &[&str], values: &[i64], weights: &[i64]) -> RecordBatch {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("__weight", arrow_schema::DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(Int64Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(weights.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    let (_container, uri) = start_mongo().await;
+    let mut config = MongoDbSinkConfig::new(&uri, "test_sink_zset", "out");
+    config.write_mode = WriteMode::Upsert {
+        key_fields: vec!["_id".to_string()],
+    };
+    // Build with the changelog schema so write_batch accepts `__weight`; the collapse strips it.
+    let schema = changelog(&["x"], &["x"], &[0], &[1]).schema();
+    let mut sink = MongoDbSink::new(schema, config, None);
+    sink.open(&ConnectorConfig::new("mongodb-sink"))
+        .await
+        .unwrap();
+
+    // Epoch 1: three groups appear.
+    sink.write_batch(&changelog(
+        &["1", "2", "3"],
+        &["Alice", "Bob", "Carol"],
+        &[10, 20, 30],
+        &[1, 1, 1],
+    ))
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    // Epoch 2: _id=1 updates (retract 10, insert 15); _id=3 is removed (retract only).
+    sink.write_batch(&changelog(
+        &["1", "1", "3"],
+        &["Alice", "Alice", "Carol"],
+        &[10, 15, 30],
+        &[-1, 1, -1],
+    ))
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let coll = client
+        .database("test_sink_zset")
+        .collection::<mongodb::bson::Document>("out");
+    let count = coll.count_documents(doc! {}).await.unwrap();
+    assert_eq!(
+        count, 2,
+        "_id=3 deleted, _id=1 updated in place, _id=2 kept"
+    );
+    let d1 = coll
+        .find_one(doc! {"_id": "1"})
+        .await
+        .unwrap()
+        .expect("_id=1 present");
+    assert_eq!(
+        d1.get_i64("value").unwrap(),
+        15,
+        "_id=1 collapsed to its latest value 15"
+    );
+    assert!(
+        coll.find_one(doc! {"_id": "3"}).await.unwrap().is_none(),
+        "_id=3 tombstoned"
+    );
 
     sink.close().await.unwrap();
 }

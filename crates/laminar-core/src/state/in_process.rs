@@ -204,6 +204,12 @@ mod tests {
         assert!(b.read_partial(2, 8).await.unwrap().is_none());
     }
 
+    #[test]
+    fn in_process_backend_is_not_durable() {
+        // Partials live in memory only — cluster startup rejects this backend.
+        assert!(!InProcessBackend::new(4).is_durable());
+    }
+
     #[tokio::test]
     async fn epoch_complete_requires_every_vnode() {
         let b = InProcessBackend::new(4);

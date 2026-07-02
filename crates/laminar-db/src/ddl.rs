@@ -20,6 +20,16 @@ enum ConnectorKind {
     Sink,
 }
 
+/// Incremental-emit store decision for a non-windowed MV.
+enum IncEmit {
+    /// Keyed running aggregate → keyed upsert snapshot (key = GROUP BY column indices).
+    Upsert(Vec<usize>),
+    /// Projection/filter over a changelog → Z-set multiset snapshot.
+    Multiset,
+    /// Full-emit (not incremental): replace-all aggregate or append.
+    None,
+}
+
 /// Reject object names in the reserved `laminar` namespace, which is owned by
 /// the system catalog (`laminar.models`, `laminar.ai_calls`).
 fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
@@ -30,6 +40,15 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
         )));
     }
     Ok(())
+}
+
+/// Terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
+pub(crate) fn incremental_mv_consumer_error(mv: &str, consumer: &str) -> DbError {
+    DbError::MaterializedView(format!(
+        "[LDB-1300] {consumer} cannot consume incremental materialized view '{mv}': it emits a \
+         dirty-only changelog, not a full snapshot. Read it with `SELECT * FROM {mv}` (snapshot), \
+         or recreate '{mv}' without `incremental_emit`."
+    ))
 }
 
 /// Parsed `WITH (...)` clause of a `CREATE TABLE`.
@@ -451,6 +470,12 @@ impl LaminarDB {
             laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
         };
 
+        // A sink CAN consume an incremental MV's changelog when its connector is upsert- or
+        // changelog-capable (e.g. Delta upsert collapses the Z-set via `collapse_changelog`). The
+        // capability is only known once the connector is built, so the check is enforced at pipeline
+        // start (`pipeline_lifecycle`), not here — a non-capable connector is rejected there with
+        // `[LDB-1300]` rather than silently dropping retractions.
+
         // Validate before mutating catalog/planner — no half-created sink on error.
         let resolved = self.prepare_connector(
             create.connector_type.as_ref(),
@@ -726,6 +751,10 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
+        // A stream over an incremental MV must net the changelog — an aggregate or a simple
+        // projection/filter; a complex shape (e.g. a join) is rejected.
+        self.reject_unsupported_reading_incremental_mv(query_sql, "a stream")
+            .await?;
         self.catalog.register_stream(&name_str)?;
 
         if let Some(bytes) = retention_bytes {
@@ -768,6 +797,7 @@ impl LaminarDB {
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
+                incremental: false,
             });
         }
 
@@ -802,6 +832,7 @@ impl LaminarDB {
                 window_config: plan_window,
                 order_config: plan_order,
                 join_config: plan_joins,
+                incremental: false,
             })
             .map_err(|e| {
                 self.catalog.drop_stream(&name_str);
@@ -975,8 +1006,60 @@ impl LaminarDB {
         }
     }
 
+    /// `true` if more than one node currently owns vnodes (a genuine multi-node cluster). A single-node
+    /// deployment — embedded (no registry) or a registry whose vnodes all map to one node — is `false`.
+    fn is_multi_node(&self) -> bool {
+        use laminar_core::state::NodeId;
+        self.vnode_registry.lock().as_ref().is_some_and(|r| {
+            let mut seen: Option<NodeId> = None;
+            for &n in r.snapshot().iter() {
+                if n == NodeId::UNASSIGNED {
+                    continue;
+                }
+                match seen {
+                    None => seen = Some(n),
+                    Some(s) if s != n => return true,
+                    _ => {}
+                }
+            }
+            false
+        })
+    }
+
+    /// Create one MV of a decomposed multi-way join by parsing + handling it directly, bypassing the
+    /// DDL persistence in `execute` (the chain is re-derived from the parent's stored N-way DDL on a
+    /// cold restart, so persisting the intermediates would double-create them).
+    async fn create_decomposed_mv(&self, create_sql: &str) -> Result<ExecuteResult, DbError> {
+        let statements = laminar_sql::parse_streaming_sql(create_sql)
+            .map_err(|e| DbError::MaterializedView(format!("multi-way decompose parse: {e}")))?;
+        let Some(StreamingStatement::CreateMaterializedView {
+            name,
+            query,
+            emit_clause,
+            or_replace,
+            if_not_exists,
+            query_sql,
+            ..
+        }) = statements.first()
+        else {
+            return Err(DbError::MaterializedView(
+                "multi-way decompose produced a non-CREATE-MV statement".into(),
+            ));
+        };
+        self.handle_create_materialized_view(
+            create_sql,
+            name,
+            query,
+            emit_clause.clone(),
+            *or_replace,
+            *if_not_exists,
+            query_sql,
+        )
+        .await
+    }
+
     /// Register a materialized view and wire it into the running pipeline.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) async fn handle_create_materialized_view(
         &self,
         sql: &str,
@@ -997,7 +1080,78 @@ impl LaminarDB {
             }));
         }
 
+        // The incremental changelog⋈changelog join is single-node only (its inputs are not
+        // key-shuffled). In a multi-node cluster each node would join only node-local slices → wrong
+        // results, so reject it (2-way or decomposed N-way) rather than build silently-wrong state.
+        if self.is_multi_node() {
+            let inc = self.incremental_mv_names();
+            if crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
+                || crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
+                    .is_some()
+            {
+                return Err(DbError::MaterializedView(format!(
+                    "[{}] incremental changelog join '{name_str}' is single-node only and cannot be \
+                     created in a multi-node cluster",
+                    laminar_core::error_codes::JOIN_CLUSTER_UNSUPPORTED
+                )));
+            }
+        }
+
+        // Single-statement N-way join → decompose into a left-deep chain of 2-way changelog-join MVs
+        // (hidden `__ivm_{name}_*` intermediates + a rewritten 2-way final under `name`), each created
+        // directly. Only the original N-way DDL is persisted, so a cold restart re-decomposes.
+        {
+            let inc = self.incremental_mv_names();
+            if let Some(plan) =
+                crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
+            {
+                // OR REPLACE: drop the previous definition (its DROP cascade also removes the old
+                // hidden intermediates) before rebuilding the chain.
+                if or_replace {
+                    let _ = Box::pin(
+                        self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {name_str}")),
+                    )
+                    .await;
+                }
+                // Create the chain; on any failure, unwind the intermediates already created so CREATE
+                // stays all-or-nothing (no orphan `__ivm_*` MVs left behind).
+                let mut created: Vec<String> = Vec::new();
+                let outcome: Result<ExecuteResult, DbError> = 'chain: {
+                    for (iname, ibody) in &plan.intermediates {
+                        if let Err(e) = Box::pin(self.create_decomposed_mv(&format!(
+                            "CREATE MATERIALIZED VIEW {iname} AS {ibody}"
+                        )))
+                        .await
+                        {
+                            break 'chain Err(e);
+                        }
+                        created.push(iname.clone());
+                    }
+                    Box::pin(self.create_decomposed_mv(&format!(
+                        "CREATE MATERIALIZED VIEW {name_str} AS {}",
+                        plan.final_query
+                    )))
+                    .await
+                };
+                if outcome.is_err() {
+                    // Leaf-first: a later intermediate reads an earlier one, so dropping in reverse
+                    // creation order clears each before its dependency (no HasDependents no-op).
+                    for iname in created.iter().rev() {
+                        let _ = Box::pin(
+                            self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {iname}")),
+                        )
+                        .await;
+                    }
+                }
+                return outcome;
+            }
+        }
+
         let query_sql = query_sql.to_string();
+        // A chained MV over an incremental MV must net the changelog — an aggregate or a simple
+        // projection/filter; a complex shape (e.g. a join) is rejected.
+        self.reject_unsupported_reading_incremental_mv(&query_sql, "a materialized view")
+            .await?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
         let sources = self.collect_mv_sources(&query_sql, &name_str);
 
@@ -1039,6 +1193,13 @@ impl LaminarDB {
             }
         };
 
+        // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
+        // so the operator and MV store agree (keyed upsert for aggregates, Z-set for proj/filter).
+        let (inc, has_aggregate) = self
+            .incremental_emit_mode(&query_sql, plan_window.is_some())
+            .await;
+        let incremental = !matches!(inc, IncEmit::None);
+
         {
             let mut mgr = self.connector_manager.lock();
             mgr.register_stream(crate::connector_manager::StreamRegistration {
@@ -1048,11 +1209,17 @@ impl LaminarDB {
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
+                incremental,
             });
         }
 
-        self.register_mv_provider(&name_str, schema, &query_sql, plan_window.is_some())
-            .await?;
+        self.register_mv_provider(
+            &name_str,
+            &schema,
+            plan_window.is_some(),
+            inc,
+            has_aggregate,
+        )?;
 
         // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
         if let Some(ref tx) = *self.control_tx.lock() {
@@ -1063,6 +1230,7 @@ impl LaminarDB {
                 window_config: plan_window,
                 order_config: plan_order,
                 join_config: plan_joins,
+                incremental,
             })
             .map_err(|e| {
                 let _ = self.ctx.deregister_table(&name_str);
@@ -1134,31 +1302,144 @@ impl LaminarDB {
         sources
     }
 
+    /// The first table reference in `query_sql` that is an incremental MV, if any.
+    fn first_incremental_ref(&self, query_sql: &str) -> Option<String> {
+        let refs = crate::sql_analysis::extract_table_references(query_sql);
+        let mgr = self.connector_manager.lock();
+        refs.iter()
+            .find(|r| mgr.streams().get(r.as_str()).is_some_and(|s| s.incremental))
+            .cloned()
+    }
+
+    /// All registered incremental MV (changelog producer) names.
+    fn incremental_mv_names(&self) -> rustc_hash::FxHashSet<String> {
+        self.connector_manager
+            .lock()
+            .streams()
+            .iter()
+            .filter(|(_, r)| r.incremental)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Static (reference/dimension) table names — valid right sides for a changelog enrich join.
+    fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
+        self.table_store.read().table_names().into_iter().collect()
+    }
+
+    /// A query reading an incremental MV must net the retraction changelog — an aggregate or a
+    /// simple projection/filter; complex shapes (e.g. joins) mishandle retractions and are rejected.
+    async fn reject_unsupported_reading_incremental_mv(
+        &self,
+        query_sql: &str,
+        consumer: &str,
+    ) -> Result<(), DbError> {
+        let Some(mv) = self.first_incremental_ref(query_sql) else {
+            return Ok(());
+        };
+        // Allowed: aggregate, simple projection/filter, `changelog ⋈ static dim` enrich, or
+        // `changelog ⋈ changelog` INNER or LEFT-outer IVM join. RIGHT/FULL, non-equi ON residuals,
+        // and other complex shapes are rejected.
+        let inc = self.incremental_mv_names();
+        let supported = crate::sql_analysis::detect_changelog_enrich_query(
+            query_sql,
+            &inc,
+            &self.static_table_names(),
+        )
+        .is_some()
+            || crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
+            || self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
+                let plan = df.logical_plan();
+                crate::aggregate_state::find_aggregate(plan).is_some()
+                    || crate::sql_analysis::extract_projection_filter(plan).is_some()
+            });
+        if supported {
+            Ok(())
+        } else {
+            Err(incremental_mv_consumer_error(&mv, consumer))
+        }
+    }
+
+    /// Store decision for a non-windowed MV: keyed `Upsert` for a keyed aggregate, `Multiset` for a
+    /// projection/filter over a changelog, `None` (full-emit) otherwise (incl. global aggregates).
+    /// Returns the store mode and whether the query is an aggregate (threaded to
+    /// `register_mv_provider` so it needn't re-plan to pick `Aggregate` vs append storage).
+    async fn incremental_emit_mode(&self, query_sql: &str, has_window: bool) -> (IncEmit, bool) {
+        if has_window {
+            return (IncEmit::None, false);
+        }
+        let flag = self
+            .config
+            .checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.incremental_emit);
+        let reads_incremental = self.first_incremental_ref(query_sql).is_some();
+        let Some(df) = self.ctx.sql(query_sql).await.ok() else {
+            return (IncEmit::None, false);
+        };
+        let plan = df.logical_plan();
+        if let Some(agg) = crate::aggregate_state::find_aggregate(plan) {
+            let n = agg.group_exprs.len();
+            // Keyed aggregate → upsert (terminal under the flag, or chained over an incremental
+            // MV). A global aggregate (no GROUP BY) is single-row → full-emit.
+            let inc = if n > 0 && (flag || reads_incremental) {
+                IncEmit::Upsert((0..n).collect())
+            } else {
+                IncEmit::None
+            };
+            return (inc, true);
+        }
+        // Projection/filter over an incremental MV's changelog → Z-set multiset snapshot.
+        if reads_incremental && crate::sql_analysis::extract_projection_filter(plan).is_some() {
+            return (IncEmit::Multiset, false);
+        }
+        // `changelog ⋈ static dim` enrich join → Z-set multiset snapshot.
+        if reads_incremental
+            && crate::sql_analysis::detect_changelog_enrich_query(
+                query_sql,
+                &self.incremental_mv_names(),
+                &self.static_table_names(),
+            )
+            .is_some()
+        {
+            return (IncEmit::Multiset, false);
+        }
+        // `changelog ⋈ changelog` inner IVM join → Z-set multiset snapshot.
+        if reads_incremental
+            && crate::sql_analysis::detect_changelog_incremental_join(
+                query_sql,
+                &self.incremental_mv_names(),
+            )
+            .is_some()
+        {
+            return (IncEmit::Multiset, false);
+        }
+        (IncEmit::None, false)
+    }
+
     /// Cluster mode wraps the provider to union peer vnode slices on read.
-    async fn register_mv_provider(
+    fn register_mv_provider(
         &self,
         name_str: &str,
-        schema: Arc<Schema>,
-        query_sql: &str,
+        schema: &Arc<Schema>,
         has_window: bool,
+        inc: IncEmit,
+        has_aggregate: bool,
     ) -> Result<(), DbError> {
         use crate::mv_store::MvStorageMode;
 
-        // Non-windowed aggs emit all groups every cycle (replace-all); windowed aggs emit
-        // only closing windows (append) so previous windows aren't overwritten.
-        let has_aggregate =
-            self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
-                crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
-            });
-        let mode = if has_aggregate && !has_window {
-            MvStorageMode::Aggregate
-        } else {
-            MvStorageMode::append_default()
+        // Incremental MVs maintain a snapshot from a dirty-only changelog. Otherwise: non-windowed
+        // aggs replace-all every cycle; windowed aggs append (preserving prior windows), as do non-aggregates.
+        let mode = match inc {
+            IncEmit::Upsert(key_cols) => MvStorageMode::Upsert { key_cols },
+            IncEmit::Multiset => MvStorageMode::Multiset,
+            IncEmit::None if has_aggregate && !has_window => MvStorageMode::Aggregate,
+            IncEmit::None => MvStorageMode::append_default(),
         };
 
         self.mv_store
             .write()
-            .create_mv(name_str, schema.clone(), mode);
+            .create_mv(name_str, schema.clone(), mode)?;
 
         let mv_provider = crate::table_provider::MvTableProvider::new(
             name_str.to_string(),
@@ -1172,7 +1453,7 @@ impl LaminarDB {
                 Arc::new(
                     laminar_sql::datafusion::distributed_scan::DistributedTableProvider::new(
                         name_str.to_string(),
-                        schema,
+                        schema.clone(),
                         Arc::new(mv_provider),
                         controller,
                     ),
@@ -1199,7 +1480,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
-        let dropped_names;
+        let mut dropped_names;
         {
             let mut registry = self.mv_registry.lock();
 
@@ -1220,6 +1501,38 @@ impl LaminarDB {
                     dropped_names = vec![];
                 }
                 Err(e) => return Err(DbError::MaterializedView(e.to_string())),
+            }
+        }
+
+        // Also drop the hidden intermediate MVs of a decomposed multi-way join. They are UPSTREAM of
+        // the parent (the parent reads them), so unregister_cascade — which follows downstream deps —
+        // never reaches them.
+        {
+            let prefix = format!(
+                "{}{name_str}_",
+                crate::sql_analysis::MULTIWAY_INTERMEDIATE_PREFIX
+            );
+            // Numeric-suffix only: a bare starts_with would also sweep a name-prefix sibling
+            // (dropping `sales` would hit `__ivm_sales_daily_0`).
+            let mut intermediates: Vec<(u64, String)> = self
+                .connector_manager
+                .lock()
+                .streams()
+                .keys()
+                .filter_map(|n| {
+                    n.strip_prefix(&prefix)
+                        .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|rest| rest.parse::<u64>().ok())
+                        .map(|k| (k, n.clone()))
+                })
+                .collect();
+            // I_k reads I_{k-1}; drop highest suffix first so unregister never hits a live dependent.
+            intermediates.sort_unstable_by_key(|&(k, _)| std::cmp::Reverse(k));
+            for (_, it) in intermediates {
+                let _ = self.mv_registry.lock().unregister(&it);
+                if !dropped_names.contains(&it) {
+                    dropped_names.push(it);
+                }
             }
         }
 
@@ -1329,7 +1642,6 @@ pub(crate) struct ResolvedConnector {
     pub format_options: HashMap<String, String>,
 }
 
-/// Merge the `FROM <TYPE> (...)` and `WITH ('connector' = ...)` syntax into one result.
 /// Whether a `WITH (...)` clause names a connector, matched case-insensitively
 /// to stay consistent with `resolve_connector_info`.
 fn has_connector_key(with_options: &HashMap<String, String>) -> bool {

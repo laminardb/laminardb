@@ -23,9 +23,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
+use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
+use laminar_core::changelog::WEIGHT_COLUMN;
 
 use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
@@ -515,10 +517,30 @@ impl PostgresSink {
         let mut total_rows: u64 = 0;
         let mut total_bytes: u64 = 0;
 
-        // Split each buffered batch into inserts/deletes.
+        // A Z-set changelog (incremental MV) carries `__weight` (no `_op`). Collapse the whole epoch
+        // per primary key into a cardinality-safe `{U,D}` batch that `split_changelog_batch`
+        // understands — otherwise the many retract+insert events per key fail the split (no `_op`) or
+        // violate ON CONFLICT cardinality. A CDC changelog (`_op`, no `__weight`) is split as before.
+        let is_zset = self
+            .buffer
+            .iter()
+            .any(|b| b.schema().index_of(WEIGHT_COLUMN).is_ok());
+        let split_input: Vec<RecordBatch> = if is_zset {
+            let schema = self.buffer[0].schema();
+            let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
+                .map_err(|e| ConnectorError::Internal(format!("concat changelog: {e}")))?;
+            vec![collapse_changelog(
+                &combined,
+                &self.config.primary_key_columns,
+            )?]
+        } else {
+            self.buffer.clone()
+        };
+
+        // Split each batch into inserts/deletes.
         let mut all_inserts = Vec::new();
         let mut all_deletes = Vec::new();
-        for batch in &self.buffer {
+        for batch in &split_input {
             let (ins, del) = Self::split_changelog_batch(batch)?;
             if ins.num_rows() > 0 {
                 all_inserts.push(ins);
@@ -528,11 +550,8 @@ impl PostgresSink {
             }
         }
 
-        // Process inserts/updates first, then deletes.
-        // This handles the common CDC pattern where a key is inserted then
-        // later deleted within the same epoch. For the rare case where a key
-        // is deleted then re-inserted in the same batch, the upsert after
-        // delete produces the correct final state.
+        // Inserts/updates before deletes: a key inserted then deleted in the same epoch
+        // ends deleted; deleted then re-inserted ends at the upserted state.
         if !all_inserts.is_empty() {
             let insert_batch =
                 arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
@@ -655,7 +674,6 @@ impl PostgresSink {
 
 // ── SinkConnector implementation ────────────────────────────────────
 
-// When the postgres-sink feature is enabled, provide the real implementation.
 #[cfg(feature = "postgres-sink")]
 #[async_trait]
 impl SinkConnector for PostgresSink {
@@ -976,7 +994,6 @@ impl SinkConnector for PostgresSink {
     }
 }
 
-// When postgres-sink feature is NOT enabled, provide a stub that returns UnsupportedOperation.
 #[cfg(not(feature = "postgres-sink"))]
 #[async_trait]
 impl SinkConnector for PostgresSink {

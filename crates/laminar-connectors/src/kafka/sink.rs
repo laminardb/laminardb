@@ -12,6 +12,7 @@ use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
 use rdkafka::ClientConfig;
 use tracing::{debug, info, warn};
 
+use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
@@ -22,7 +23,7 @@ use super::partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 use super::schema_registry::SchemaRegistryClient;
-use super::sink_config::{KafkaSinkConfig, PartitionStrategy};
+use super::sink_config::{KafkaSinkConfig, PartitionStrategy, SinkEnvelope};
 use super::sink_metrics::KafkaSinkMetrics;
 use crate::connector::DeliveryGuarantee;
 
@@ -317,7 +318,6 @@ impl KafkaSink {
                 }
             }
         } else {
-            // For non-string columns, use the Arrow array formatter.
             use std::fmt::Write;
             let formatter = arrow_cast::display::ArrayFormatter::try_new(
                 array,
@@ -328,7 +328,6 @@ impl KafkaSink {
                     "failed to create array formatter for key column: {e}"
                 ))
             })?;
-            // Reusable string buffer for formatted values.
             let mut fmt_buf = String::with_capacity(64);
             for i in 0..num_rows {
                 if array.is_null(i) {
@@ -462,6 +461,132 @@ impl KafkaSink {
             .await
             .expect("producer_blocking: blocking task panicked")
     }
+
+    /// Upsert-envelope produce: collapse the Z-set changelog to one record per merge key, then
+    /// emit a keyed value for a live group (`_op = U`) or a null-value tombstone for a removed group
+    /// (`_op = D`). The topic must be log-compacted and keyed on the merge key for the tombstones to
+    /// GC and for the latest-per-key state to be recoverable from offset 0.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)] // matches write_batch
+    async fn write_upsert_batch(
+        &mut self,
+        batch: &arrow_array::RecordBatch,
+    ) -> Result<WriteResult, ConnectorError> {
+        let key_col = self.config.key_column.clone().ok_or_else(|| {
+            ConnectorError::ConfigurationError("envelope = 'upsert' requires 'key.column'".into())
+        })?;
+        let collapsed = collapse_changelog(batch, std::slice::from_ref(&key_col))?;
+        let rows = collapsed.num_rows();
+        if rows == 0 {
+            return Ok(WriteResult::new(0, 0));
+        }
+        let op_idx = collapsed
+            .schema()
+            .index_of("_op")
+            .map_err(|_| ConnectorError::Internal("collapsed changelog missing _op".into()))?;
+        let ops = collapsed
+            .column(op_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ConnectorError::Internal("_op column is not Utf8".into()))?
+            .clone();
+
+        // The value is the collapsed row without the `_op` tag — i.e. the plain MV row.
+        let value_idxs: Vec<usize> = (0..collapsed.num_columns())
+            .filter(|&i| i != op_idx)
+            .collect();
+        let value_batch = collapsed
+            .project(&value_idxs)
+            .map_err(|e| ConnectorError::Internal(format!("project value columns: {e}")))?;
+
+        self.ensure_schema_ready(&value_batch.schema()).await?;
+        let payloads = self.serializer.serialize(&value_batch).map_err(|e| {
+            self.metrics.record_serialization_error();
+            ConnectorError::Serde(e)
+        })?;
+        let keys = self.extract_keys(&collapsed)?;
+        // Reject empty/NULL merge keys before producing ANY record: a compacted topic can't
+        // represent an unkeyed row, and a mid-loop bail would leave earlier rows already enqueued.
+        if let Some(kb) = keys.as_ref() {
+            for i in 0..payloads.len() {
+                if kb.key(i).is_empty() {
+                    return Err(ConnectorError::WriteError(format!(
+                        "upsert envelope: row {i} has an empty/NULL merge key"
+                    )));
+                }
+            }
+        }
+
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "producer initialized".into(),
+                actual: "producer is None".into(),
+            })?;
+
+        let flush_threshold = self.config.flush_batch_size;
+        let mut delivery_futures = Vec::with_capacity(rows);
+        for (i, payload) in payloads.iter().enumerate() {
+            let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i));
+            let is_delete = ops.value(i) == "D";
+            let partition = self.partitioner.partition(key, self.topic_partition_count);
+            // No `.payload()` for a delete → null value = Kafka tombstone.
+            let mut record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(&self.config.topic);
+            if let Some(k) = key {
+                record = record.key(k);
+            }
+            if !is_delete {
+                record = record.payload(payload.as_slice());
+            }
+            if let Some(p) = partition {
+                record = record.partition(p);
+            }
+            let fut = Self::enqueue_with_queue_retry(producer, record, Duration::from_millis(500))
+                .await?;
+            delivery_futures.push((Instant::now(), fut, is_delete, i));
+            if flush_threshold > 0 && (i + 1) % flush_threshold == 0 {
+                Self::flush_producer_async(producer, self.config.delivery_timeout)
+                    .await
+                    .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
+            }
+        }
+
+        let mut records_written: usize = 0;
+        let mut bytes_written: u64 = 0;
+        let mut failed: usize = 0;
+        let mut first_error: Option<String> = None;
+        for (send_time, future, is_delete, i) in delivery_futures {
+            match future.await {
+                Ok(Ok(_)) => {
+                    self.metrics
+                        .record_produce_latency(send_time.elapsed().as_micros() as u64);
+                    records_written += 1;
+                    if !is_delete {
+                        bytes_written += payloads[i].len() as u64;
+                    }
+                }
+                Ok(Err((err, _))) => {
+                    failed += 1;
+                    first_error.get_or_insert_with(|| err.to_string());
+                }
+                Err(_canceled) => {
+                    failed += 1;
+                    first_error
+                        .get_or_insert_with(|| "delivery canceled — producer dropped".into());
+                }
+            }
+        }
+        self.metrics
+            .record_write(records_written as u64, bytes_written);
+        if failed > 0 {
+            self.metrics.record_error();
+            return Err(ConnectorError::WriteError(format!(
+                "Kafka upsert produce: {failed}/{rows} records failed, first error: {}",
+                first_error.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        Ok(WriteResult::new(records_written, bytes_written))
+    }
 }
 
 #[async_trait]
@@ -470,7 +595,6 @@ impl SinkConnector for KafkaSink {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
-        // Re-parse config if properties provided.
         if !config.properties().is_empty() {
             let parsed = KafkaSinkConfig::from_config(config)?;
             self.config = parsed;
@@ -491,13 +615,11 @@ impl SinkConnector for KafkaSink {
             "opening Kafka sink connector"
         );
 
-        // Build rdkafka producer.
         let rdkafka_config: ClientConfig = self.config.to_rdkafka_config();
         let producer: FutureProducer = rdkafka_config.create().map_err(|e| {
             ConnectorError::ConnectionFailed(format!("failed to create producer: {e}"))
         })?;
 
-        // Initialize transactions if exactly-once.
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             producer
                 .init_transactions(self.config.transaction_timeout)
@@ -506,10 +628,8 @@ impl SinkConnector for KafkaSink {
                 })?;
         }
 
-        // Create DLQ producer if configured. Inherits security settings
-        // (SASL, SSL) from the main producer config but is non-transactional.
-        // DLQ records bypass the exactly-once transaction to avoid coupling
-        // error routing with the main data path.
+        // DLQ producer is non-transactional: error routing bypasses the exactly-once
+        // transaction so it stays decoupled from the main data path.
         if self.config.dlq_topic.is_some() {
             let dlq_config = self.config.to_dlq_rdkafka_config();
             let dlq_producer: FutureProducer = dlq_config.create().map_err(|e| {
@@ -518,7 +638,6 @@ impl SinkConnector for KafkaSink {
             self.dlq_producer = Some(dlq_producer);
         }
 
-        // Initialize Schema Registry client if configured.
         if let Some(ref url) = self.config.schema_registry_url {
             if self.schema_registry.is_none() {
                 let sr = if let Some(ref ca_path) = self.config.schema_registry_ssl_ca_location {
@@ -534,10 +653,9 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Set SR compatibility level if configured.
-        // Schema registration is deferred to first write_batch() where the
-        // real pipeline output schema is known (the factory default is a
-        // placeholder that would pollute the registry and break compat checks).
+        // Schema registration is deferred to the first write_batch(), where the real pipeline
+        // output schema is known — the factory default is a placeholder that would pollute the
+        // registry and break compat checks.
         if self.config.format == Format::Avro {
             if let Some(ref sr) = self.schema_registry {
                 if let Some(ref compat) = self.config.schema_compatibility {
@@ -553,7 +671,6 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Query broker metadata for actual topic partition count.
         // Reset to fallback first so a reopened sink doesn't keep a stale count.
         self.topic_partition_count = FALLBACK_PARTITION_COUNT;
         match producer
@@ -602,6 +719,12 @@ impl SinkConnector for KafkaSink {
             });
         }
 
+        // Upsert envelope: collapse the Z-set changelog per merge key and produce keyed records
+        // (live groups) + null-value tombstones (removed groups). See `write_upsert_batch`.
+        if self.config.envelope == SinkEnvelope::Upsert {
+            return self.write_upsert_batch(batch).await;
+        }
+
         self.ensure_schema_ready(&batch.schema()).await?;
 
         let producer = self
@@ -612,13 +735,11 @@ impl SinkConnector for KafkaSink {
                 actual: "producer is None".into(),
             })?;
 
-        // Serialize the RecordBatch into per-row byte payloads.
         let payloads = self.serializer.serialize(batch).map_err(|e| {
             self.metrics.record_serialization_error();
             ConnectorError::Serde(e)
         })?;
 
-        // Extract keys if key column is configured.
         let keys = self.extract_keys(batch)?;
 
         let mut records_written: usize = 0;
@@ -640,8 +761,7 @@ impl SinkConnector for KafkaSink {
                 record = record.partition(p);
             }
 
-            // 500ms matches the old `send(record, 500ms)` contract: ride
-            // out transient QueueFull bursts before giving up.
+            // 500ms budget rides out transient QueueFull bursts before giving up.
             let fut = Self::enqueue_with_queue_retry(producer, record, Duration::from_millis(500))
                 .await?;
             delivery_futures.push((Instant::now(), fut));
@@ -876,6 +996,14 @@ impl SinkConnector for KafkaSink {
         let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(10))
             .with_idempotent()
             .with_partitioned();
+
+        // Upsert collapses a Z-set changelog to key-unique records + tombstones, so it can consume
+        // an incremental MV's changelog (append-only mode drops retractions). `with_changelog`
+        // keeps `prepare_for_sink` from stripping retracts before the sink, so deletes still become
+        // tombstones.
+        if self.config.envelope == SinkEnvelope::Upsert {
+            caps = caps.with_upsert().with_changelog();
+        }
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             // The single open transaction holds all rows since the last

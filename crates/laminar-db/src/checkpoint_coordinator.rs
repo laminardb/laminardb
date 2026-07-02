@@ -18,14 +18,48 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
 
-/// One operator's staged slice for one vnode of the next checkpoint.
+/// Which operator's blob codec a cold-group partial uses, dispatching the tier merge.
+#[cfg(feature = "state-tier")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateCodec {
+    Agg,
+    Join,
+}
+
+/// Merge tier-fetched cold-group blobs into one cold-only partial, per operator codec.
+#[cfg(feature = "state-tier")]
+fn merge_cold_groups(codec: StateCodec, parts: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
+    match codec {
+        StateCodec::Agg => crate::aggregate_state::merge_serialized_agg_cps(parts),
+        StateCodec::Join => crate::operator::incremental_join::merge_serialized_join_frames(parts),
+    }
+}
+
 #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum StagedSlice {
     Bytes(bytes::Bytes),
-    // No bytes; the coordinator emits a reference partial or fetches from the tier on a forced
-    // full re-upload.
+    // No bytes; a reference partial, or fetched from the tier on a forced full re-upload.
     Cold,
+    // Changed-group columnar bytes + tombstone IPC, chained to this vnode's previous partial.
+    Delta {
+        changed: bytes::Bytes,
+        tombstones: bytes::Bytes,
+    },
+    // Demoted groups by tier key, fetched into a cold-only partial; recovery merges additively.
+    #[cfg(feature = "state-tier")]
+    ColdGroups {
+        group_keys: Vec<Vec<u8>>,
+        codec: StateCodec,
+    },
+    // Re-base of a vnode holding demoted groups: resident FULL bytes merged with tier-fetched
+    // groups into one self-contained base. `resident` may be empty for a fully-cold vnode.
+    #[cfg(feature = "state-tier")]
+    FullWithColdGroups {
+        resident: bytes::Bytes,
+        group_keys: Vec<Vec<u8>>,
+        codec: StateCodec,
+    },
 }
 
 pub(crate) type StagedVnodeStates = HashMap<u32, HashMap<String, StagedSlice>>;
@@ -42,14 +76,17 @@ pub(crate) enum UploadedSlice {
 impl UploadedSlice {
     /// Returns true if `staged` proves the slice unchanged since this upload.
     ///
-    /// `Cold` staged means unchanged (demotion contract: byte-identical to the recorded upload).
-    /// Fresh bytes against a `Cold` record are conservatively "changed" — the cold bytes are
-    /// unavailable for comparison, so the slice re-uploads full.
+    /// `Cold` staged means unchanged; fresh bytes against a `Cold` record re-upload full (the
+    /// cold bytes are unavailable to compare).
     fn matches(&self, staged: &StagedSlice) -> bool {
         match (staged, self) {
             (StagedSlice::Cold, _) => true,
             (StagedSlice::Bytes(b), UploadedSlice::Bytes(prev)) => b == prev,
-            (StagedSlice::Bytes(_), UploadedSlice::Cold) => false,
+            // A delta never matches a prior full — it rides the delta-chain path, not the reference path.
+            (StagedSlice::Bytes(_), UploadedSlice::Cold) | (StagedSlice::Delta { .. }, _) => false,
+            // A cold-groups / full-with-cold slice re-fetches+merges from the tier — always full upload.
+            #[cfg(feature = "state-tier")]
+            (StagedSlice::ColdGroups { .. } | StagedSlice::FullWithColdGroups { .. }, _) => false,
         }
     }
 }
@@ -81,11 +118,9 @@ pub struct CheckpointConfig {
     pub quorum_timeout: Duration,
     /// Max wait for every vnode's partial to land before the epoch is declared restorable.
     ///
-    /// Followers upload asynchronously after the capture ack, so the durability gate polls
-    /// rather than checking once. Expiry aborts the epoch.
+    /// The gate polls (followers upload asynchronously after the capture ack); expiry aborts.
     pub restorable_gate_timeout: Duration,
     /// Durability-gate poll: first interval, backing off exponentially to the cap.
-    /// Tighten on a low-latency store to cut poll quantization.
     pub restorable_gate_poll_initial: Duration,
     /// Durability-gate poll backoff cap.
     pub restorable_gate_poll_max: Duration,
@@ -93,13 +128,9 @@ pub struct CheckpointConfig {
     pub max_in_flight_epochs: u64,
     /// Cap on in-flight captured-state bytes. At the cap, barrier admission pauses.
     pub max_staged_bytes: u64,
-    /// Sealed-but-uncommitted epochs (designated-committer lag) past which a loud
-    /// warning fires — the committer is falling behind and descriptors/data are
-    /// accumulating in object storage (prune is held to avoid losing them).
+    /// Sealed-but-uncommitted epochs (committer lag) past which a warning fires.
     pub max_uncommitted_epochs: u64,
-    /// When true, exceeding `max_uncommitted_epochs` fails the checkpoint
-    /// (back-pressuring the pipeline) instead of only warning — bounds storage
-    /// growth at the cost of halting progress until the committer catches up.
+    /// When true, exceeding `max_uncommitted_epochs` fails the checkpoint instead of only warning.
     pub uncommitted_epochs_backpressure: bool,
     /// How often the decoupled committer task polls for newly sealed epochs.
     pub coordinated_committer_poll: Duration,
@@ -315,9 +346,8 @@ pub struct CheckpointCoordinator {
     // Empty in single-instance mode (the partial is a durability marker only).
     #[allow(clippy::disallowed_types)] // matches the graph snapshot shape
     pending_vnode_states: StagedVnodeStates,
-    // Per-sink commit descriptors from `pre_commit` for the in-flight checkpoint,
-    // persisted to the state backend in `write_vnode_partials`. Only coordinated
-    // sinks contribute; empty otherwise.
+    // Per-sink commit descriptors from `pre_commit`, persisted in `write_vnode_partials`.
+    // Only coordinated sinks contribute; empty otherwise.
     #[allow(clippy::disallowed_types)]
     pending_sink_descriptors: std::collections::HashMap<String, Vec<u8>>,
     // Descriptor keys actually written this epoch — the gate requires exactly
@@ -330,6 +360,9 @@ pub struct CheckpointCoordinator {
     #[allow(clippy::disallowed_types)]
     last_vnode_uploads:
         std::collections::HashMap<u32, (u64, std::collections::HashMap<String, UploadedSlice>)>,
+    // Epoch of the previous partial written per vnode — the parent link a delta partial chains to.
+    #[allow(clippy::disallowed_types)]
+    last_partial_epoch: std::collections::HashMap<u32, u64>,
     // Channel to fetch demoted slice bytes back from the tier on a forced full re-upload.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
@@ -402,6 +435,7 @@ impl CheckpointCoordinator {
             epoch_descriptor_keys: Vec::new(),
             coordinated_commit_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_vnode_uploads: std::collections::HashMap::new(),
+            last_partial_epoch: std::collections::HashMap::new(),
             #[cfg(feature = "state-tier")]
             state_tier: None,
             #[cfg(feature = "cluster")]
@@ -466,6 +500,9 @@ impl CheckpointCoordinator {
         self.rotation_epoch_floor = self.allocator.peek().0;
         // Drop bases for shed vnodes; the new owner builds its own from a full upload.
         self.last_vnode_uploads.retain(|v, _| vnodes.contains(v));
+        // Drop parent links for shed vnodes so a newly-acquired vnode has no stale parent — it must
+        // re-base FULL before any delta chains to it.
+        self.last_partial_epoch.retain(|v, _| vnodes.contains(v));
         self.vnode_set = vnodes;
     }
 
@@ -512,6 +549,77 @@ impl CheckpointCoordinator {
             "cold slice staged without state-tier support \
              (operator={operator}, vnode={vnode})"
         )))
+    }
+
+    /// Fetch one demoted GROUP's bytes from the cold tier. A miss fails the epoch — silently
+    /// dropping a demoted group would break recovery.
+    #[cfg(feature = "state-tier")]
+    async fn fetch_cold_group(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group: &[u8],
+    ) -> Result<bytes::Bytes, DbError> {
+        let Some(ref tier) = self.state_tier else {
+            return Err(DbError::Checkpoint(format!(
+                "cold group staged but no state tier is wired (operator={operator}, vnode={vnode})"
+            )));
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tier.send(crate::state_tier::TierRequest::FetchGroup {
+            operator: Arc::from(operator),
+            vnode,
+            group: group.to_vec(),
+            reply,
+        })
+        .await
+        .map_err(|_| DbError::Checkpoint("state tier worker is gone".to_string()))?;
+        match rx
+            .await
+            .map_err(|_| DbError::Checkpoint("state tier worker dropped the reply".to_string()))??
+        {
+            Some(bytes) => Ok(bytes),
+            None => Err(DbError::Checkpoint(format!(
+                "demoted group missing from the state tier (operator={operator}, vnode={vnode}) — \
+                 failing the epoch rather than dropping it from recovery truth"
+            ))),
+        }
+    }
+
+    /// Resolve a `ColdGroups` slice into one cold-only checkpoint: fetch each demoted group and
+    /// merge over disjoint keys. Recovery applies it additively over the resident groups.
+    #[cfg(feature = "state-tier")]
+    async fn resolve_cold_groups(
+        &self,
+        operator: &str,
+        vnode: u32,
+        group_keys: &[Vec<u8>],
+        codec: StateCodec,
+    ) -> Result<bytes::Bytes, DbError> {
+        let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len());
+        for gk in group_keys {
+            parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
+        }
+        Ok(bytes::Bytes::from(merge_cold_groups(codec, &parts)?))
+    }
+
+    /// Resolve a `FullWithColdGroups` re-base into one self-contained base: fold the resident FULL
+    /// bytes with the tier-fetched demoted groups over disjoint keys. `resident` may be empty.
+    #[cfg(feature = "state-tier")]
+    async fn resolve_full_with_cold_groups(
+        &self,
+        operator: &str,
+        vnode: u32,
+        resident: &bytes::Bytes,
+        group_keys: &[Vec<u8>],
+        codec: StateCodec,
+    ) -> Result<bytes::Bytes, DbError> {
+        let mut parts: Vec<bytes::Bytes> = Vec::with_capacity(group_keys.len() + 1);
+        parts.push(resident.clone());
+        for gk in group_keys {
+            parts.push(self.fetch_cold_group(operator, vnode, gk).await?);
+        }
+        Ok(bytes::Bytes::from(merge_cold_groups(codec, &parts)?))
     }
 
     /// Vnodes with memory-resident slices, as `(vnode, bytes)`, largest first.
@@ -617,13 +725,10 @@ impl CheckpointCoordinator {
         self.config.coordinated_committer_poll
     }
 
-    /// Persist this node's source offsets for `epoch` to the shared state backend,
-    /// keyed per node, so a node that acquires one of its partitions on a later
-    /// rotation can resume from the committed cut (see
-    /// [`acquired_source_offsets`](Self::acquired_source_offsets)) instead of
-    /// `auto.offset.reset`. Written pre-seal so a sealed epoch always carries it;
-    /// a write error fails the epoch. No-op outside a real cluster assignment
-    /// (version 0) or without a backend.
+    /// Persist this node's source offsets for `epoch`, keyed per node, so a node that acquires a
+    /// partition on a later rotation resumes from the committed cut (see
+    /// [`acquired_source_offsets`](Self::acquired_source_offsets)) rather than `auto.offset.reset`.
+    /// Written pre-seal; a write error fails the epoch. No-op without a cluster assignment or backend.
     async fn persist_source_offset_handoff(
         &self,
         epoch: u64,
@@ -652,15 +757,10 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    /// The global source-offset map for the latest sealed epoch, unioned from
-    /// every node's blob in the shared state backend (opaque connector key/value
-    /// strings). Staged onto the vnode registry during a rotation so an acquiring
-    /// source resumes its newly-owned partitions from the previous owner's sealed
-    /// position. The engine does not interpret the keys — the source filters to
-    /// the partitions it owns. An empty backend or no committed epoch yields an empty
-    /// map (nothing to hand off); a backend read FAILURE is propagated so the caller
-    /// defers the rotation rather than letting an exactly-once source silently fall
-    /// back to its startup offset and re-emit.
+    /// The global source-offset map for the latest sealed epoch, unioned from every node's blob
+    /// (opaque connector key/values). An acquiring source resumes its newly-owned partitions from
+    /// the previous owner's sealed position. Empty backend / no committed epoch yields an empty map;
+    /// a read FAILURE is propagated so the caller defers the rotation rather than re-emitting.
     #[cfg(feature = "cluster")]
     pub(crate) async fn acquired_source_offsets(&self) -> Result<HashMap<String, String>, DbError> {
         let mut merged = HashMap::new();
@@ -909,10 +1009,8 @@ impl CheckpointCoordinator {
         0
     }
 
-    /// Commit-descriptor keys this node produced this epoch — the gate requires
-    /// exactly these. Other nodes' descriptors are covered transitively: each
-    /// node writes its descriptors before its vnode partials, so the partial
-    /// gate implies them.
+    /// Commit-descriptor keys this node produced this epoch — the gate requires exactly these.
+    /// Other nodes' are covered transitively: each writes descriptors before its partials.
     fn self_descriptor_keys(&self) -> Vec<String> {
         self.epoch_descriptor_keys.clone()
     }
@@ -975,6 +1073,7 @@ impl CheckpointCoordinator {
     /// are forced back to full before their base ages out of the prune window. All writes run
     /// concurrently. Bases are recorded only after every write in an epoch lands, so a partially
     /// failed epoch re-uploads full on the next attempt.
+    #[allow(clippy::too_many_lines)] // cohesive per-vnode classify→write→record; async self-borrow resists splitting
     async fn write_vnode_partials(
         &mut self,
         epoch: u64,
@@ -994,67 +1093,164 @@ impl CheckpointCoordinator {
         let max_ref_age = (self.config.max_retained as u64).max(1);
 
         // Classify each vnode as reference or full. A staged `Cold` slice counts as unchanged;
-        // on a forced full upload the cold bytes are fetched back from the tier.
-        // A fetch failure fails the epoch: silently dropping a demoted slice breaks recovery.
+        // a forced full upload fetches the cold bytes back (a fetch miss fails the epoch).
         let mut full_uploads: Vec<(u32, std::collections::HashMap<String, UploadedSlice>)> =
             Vec::new();
         let mut emptied: Vec<u32> = Vec::new();
         let mut reference_count: u64 = 0;
         let mut encoded: Vec<(u32, bytes::Bytes)> = Vec::with_capacity(self.vnode_set.len());
+        let mut written: Vec<u32> = Vec::with_capacity(self.vnode_set.len());
         for &v in &self.vnode_set {
             let ops = self.pending_vnode_states.get(&v);
-            let base = ops.filter(|ops| !ops.is_empty()).and_then(|ops| {
-                self.last_vnode_uploads
-                    .get(&v)
-                    .filter(|(base, last)| {
-                        epoch.saturating_sub(*base) < max_ref_age
-                            && last.len() == ops.len()
-                            && ops
-                                .iter()
-                                .all(|(n, s)| last.get(n).is_some_and(|prev| prev.matches(s)))
-                    })
-                    .map(|(base, _)| *base)
-            });
-            let partial = if let Some(base_epoch) = base {
-                reference_count += 1;
-                crate::vnode_partial::VnodePartial {
-                    checkpoint_id,
-                    operators: Vec::new(),
-                    base_epoch: Some(base_epoch),
-                }
-            } else {
-                let mut resolved: Vec<(String, Vec<u8>)> = Vec::new();
+            // A delta partial chains to the previous epoch this vnode was written.
+            let parent_epoch = self.last_partial_epoch.get(&v).copied();
+            let has_delta =
+                ops.is_some_and(|ops| ops.values().any(|s| matches!(s, StagedSlice::Delta { .. })));
+
+            let partial = if has_delta {
+                // DELTA partial: deltas chain to the parent; re-based (full) ops ride in `operators`
+                // and reset their base. Recovery resolves each operator's chain independently.
+                let Some(parent) = parent_epoch else {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6025] delta partial for vnode {v} has no parent epoch (epoch={epoch}); \
+                         a just-acquired vnode must re-base FULL first"
+                    )));
+                };
+                let mut operators: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut deltas: Vec<(String, crate::vnode_partial::OpDelta)> = Vec::new();
                 let mut recorded: std::collections::HashMap<String, UploadedSlice> =
                     std::collections::HashMap::new();
                 if let Some(ops) = ops {
                     for (name, slice) in ops {
-                        let bytes = match slice {
-                            StagedSlice::Bytes(b) => b.clone(),
-                            StagedSlice::Cold => self.fetch_cold_slice(name, v).await?,
-                        };
-                        resolved.push((name.clone(), bytes.to_vec()));
-                        // Cold slices contribute bytes to this upload but stay pinned in the tier.
-                        recorded.insert(
-                            name.clone(),
-                            match slice {
-                                StagedSlice::Bytes(b) => UploadedSlice::Bytes(b.clone()),
-                                StagedSlice::Cold => UploadedSlice::Cold,
-                            },
-                        );
+                        match slice {
+                            StagedSlice::Delta {
+                                changed,
+                                tombstones,
+                            } => deltas.push((
+                                name.clone(),
+                                crate::vnode_partial::OpDelta {
+                                    changed: changed.to_vec(),
+                                    tombstones_ipc: tombstones.to_vec(),
+                                },
+                            )),
+                            StagedSlice::Bytes(b) => {
+                                operators.push((name.clone(), b.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Bytes(b.clone()));
+                            }
+                            StagedSlice::Cold => {
+                                let bytes = self.fetch_cold_slice(name, v).await?;
+                                operators.push((name.clone(), bytes.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Cold);
+                            }
+                            #[cfg(feature = "state-tier")]
+                            StagedSlice::FullWithColdGroups {
+                                resident,
+                                group_keys,
+                                codec,
+                            } => {
+                                let bytes = self
+                                    .resolve_full_with_cold_groups(
+                                        name, v, resident, group_keys, *codec,
+                                    )
+                                    .await?;
+                                operators.push((name.clone(), bytes.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Cold);
+                            }
+                            #[cfg(feature = "state-tier")]
+                            StagedSlice::ColdGroups { group_keys, codec } => {
+                                let bytes = self
+                                    .resolve_cold_groups(name, v, group_keys, *codec)
+                                    .await?;
+                                operators.push((name.clone(), bytes.to_vec()));
+                                recorded.insert(name.clone(), UploadedSlice::Cold);
+                            }
+                        }
                     }
                 }
-                if recorded.is_empty() {
-                    emptied.push(v);
-                } else {
+                if !recorded.is_empty() {
                     full_uploads.push((v, recorded));
                 }
                 crate::vnode_partial::VnodePartial {
                     checkpoint_id,
-                    operators: resolved,
-                    base_epoch: None,
+                    operators,
+                    base_epoch: Some(parent),
+                    deltas,
+                }
+            } else {
+                let base = ops.filter(|ops| !ops.is_empty()).and_then(|ops| {
+                    self.last_vnode_uploads
+                        .get(&v)
+                        .filter(|(base, last)| {
+                            epoch.saturating_sub(*base) < max_ref_age
+                                && last.len() == ops.len()
+                                && ops
+                                    .iter()
+                                    .all(|(n, s)| last.get(n).is_some_and(|prev| prev.matches(s)))
+                        })
+                        .map(|(base, _)| *base)
+                });
+                if let Some(base_epoch) = base {
+                    reference_count += 1;
+                    crate::vnode_partial::VnodePartial {
+                        checkpoint_id,
+                        operators: Vec::new(),
+                        base_epoch: Some(base_epoch),
+                        deltas: Vec::new(),
+                    }
+                } else {
+                    let mut resolved: Vec<(String, Vec<u8>)> = Vec::new();
+                    let mut recorded: std::collections::HashMap<String, UploadedSlice> =
+                        std::collections::HashMap::new();
+                    if let Some(ops) = ops {
+                        for (name, slice) in ops {
+                            // Cold slices/groups contribute bytes but stay pinned in the tier
+                            // (recorded `Cold`). A `ColdGroups` partial is cold-only.
+                            let (bytes, rec) = match slice {
+                                StagedSlice::Bytes(b) => {
+                                    (b.clone(), UploadedSlice::Bytes(b.clone()))
+                                }
+                                StagedSlice::Cold => {
+                                    (self.fetch_cold_slice(name, v).await?, UploadedSlice::Cold)
+                                }
+                                #[cfg(feature = "state-tier")]
+                                StagedSlice::FullWithColdGroups {
+                                    resident,
+                                    group_keys,
+                                    codec,
+                                } => (
+                                    self.resolve_full_with_cold_groups(
+                                        name, v, resident, group_keys, *codec,
+                                    )
+                                    .await?,
+                                    UploadedSlice::Cold,
+                                ),
+                                #[cfg(feature = "state-tier")]
+                                StagedSlice::ColdGroups { group_keys, codec } => (
+                                    self.resolve_cold_groups(name, v, group_keys, *codec)
+                                        .await?,
+                                    UploadedSlice::Cold,
+                                ),
+                                StagedSlice::Delta { .. } => unreachable!("delta routed above"),
+                            };
+                            resolved.push((name.clone(), bytes.to_vec()));
+                            recorded.insert(name.clone(), rec);
+                        }
+                    }
+                    if recorded.is_empty() {
+                        emptied.push(v);
+                    } else {
+                        full_uploads.push((v, recorded));
+                    }
+                    crate::vnode_partial::VnodePartial {
+                        checkpoint_id,
+                        operators: resolved,
+                        base_epoch: None,
+                        deltas: Vec::new(),
+                    }
                 }
             };
             encoded.push((v, bytes::Bytes::from(partial.encode()?)));
+            written.push(v);
         }
 
         let writes = encoded.into_iter().map(|(v, payload)| {
@@ -1072,6 +1268,11 @@ impl CheckpointCoordinator {
         });
         futures::future::try_join_all(writes).await?;
 
+        // Record the parent link only after every write lands, so a partially failed epoch is not
+        // chained from on the next attempt.
+        for v in written {
+            self.last_partial_epoch.insert(v, epoch);
+        }
         for (v, ops) in full_uploads {
             self.last_vnode_uploads.insert(v, (epoch, ops));
         }
@@ -1556,10 +1757,8 @@ impl CheckpointCoordinator {
     fn initial_sink_commit_statuses(&self) -> HashMap<String, SinkCommitStatus> {
         self.sinks
             .iter()
-            // Coordinated sinks commit asynchronously via the designated committer
-            // (guarded by catalog idempotency), so they are never manifest-tracked
-            // — otherwise their Pending status would make recovery skip every
-            // checkpoint on nodes that don't run the per-sink commit.
+            // Coordinated sinks commit asynchronously via the designated committer, so they are
+            // never manifest-tracked — else their Pending status would make recovery skip epochs.
             .filter(|s| s.exactly_once && !s.coordinated_commit)
             .map(|s| (s.name.clone(), SinkCommitStatus::Pending))
             .collect()
@@ -2218,9 +2417,7 @@ impl CheckpointCoordinator {
                      cap {cap} bytes — checkpoint rejected"
                 );
                 error!(checkpoint_id, epoch, sidecar_bytes, cap, "{msg}");
-                // `fail_epoch` also rolls the pre-committed sinks back —
-                // previously this path returned without a rollback,
-                // leaving the epoch's transactions open.
+                // `fail_epoch` also rolls the pre-committed sinks back, closing their transactions.
                 return Ok(self.fail_epoch(checkpoint_id, epoch, start, msg).await);
             }
             let warn_threshold = cap * 4 / 5; // 80%
@@ -2468,7 +2665,9 @@ impl CheckpointCoordinator {
 
         let mgr = RecoveryManager::new(&*self.store);
         // Sources are restored by the pipeline lifecycle; pass empty slices here.
-        let result = mgr.recover(&[], &self.sinks, &[]).await?;
+        let result = mgr
+            .recover(&[], &self.sinks, &[], self.decision_store.as_deref())
+            .await?;
 
         if let Some(ref recovered) = result {
             // Monotonic: the committed epoch may predate a Pending manifest that seeded ids.
@@ -2476,6 +2675,40 @@ impl CheckpointCoordinator {
                 .advance_to(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
             let (epoch, checkpoint_id) = self.allocator.peek();
             info!(epoch, checkpoint_id, "coordinator epoch set after recovery");
+        }
+
+        Ok(result)
+    }
+
+    /// Recover to a coordinated cluster target epoch instead of the local latest.
+    ///
+    /// # Errors
+    /// Returns `DbError::Checkpoint` if the store read fails.
+    pub async fn recover_to_epoch(
+        &mut self,
+        target_epoch: u64,
+    ) -> Result<Option<crate::recovery_manager::RecoveredState>, DbError> {
+        use crate::recovery_manager::RecoveryManager;
+
+        let mgr = RecoveryManager::new(&*self.store);
+        let result = mgr
+            .recover_to_epoch(
+                target_epoch,
+                &[],
+                &self.sinks,
+                &[],
+                self.decision_store.as_deref(),
+            )
+            .await?;
+
+        if let Some(ref recovered) = result {
+            self.allocator
+                .advance_to(recovered.epoch() + 1, recovered.manifest.checkpoint_id + 1);
+            let (epoch, checkpoint_id) = self.allocator.peek();
+            info!(
+                epoch,
+                checkpoint_id, "coordinator epoch set after coordinated recovery"
+            );
         }
 
         Ok(result)

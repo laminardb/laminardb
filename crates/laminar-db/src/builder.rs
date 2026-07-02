@@ -259,6 +259,15 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Demote at group granularity (v2): shed individual idle aggregate groups rather than only
+    /// whole idle vnodes. Skew-proof; default off until soak-validated.
+    #[cfg(feature = "state-tier")]
+    #[must_use]
+    pub fn state_tier_group_demotion(mut self, enabled: bool) -> Self {
+        self.config.state_tier_group_demotion = enabled;
+        self
+    }
+
     /// Set checkpoint configuration.
     #[must_use]
     pub fn checkpoint(mut self, config: StreamCheckpointConfig) -> Self {
@@ -369,6 +378,21 @@ impl LaminarDbBuilder {
         policy: crate::config::BackpressurePolicy,
     ) -> Self {
         self.config.pipeline_backpressure_policy = policy;
+        self
+    }
+
+    /// Auto-restart policy used when supervision is enabled.
+    #[must_use]
+    pub fn restart_policy(mut self, policy: crate::config::RestartPolicy) -> Self {
+        self.config.restart_policy = policy;
+        self
+    }
+
+    /// Enable leader-coordinated recovery (cluster mode). The embedder must also call
+    /// [`LaminarDB::enable_coordinated_recovery`] after building.
+    #[must_use]
+    pub fn coordinated_recovery(mut self, enabled: bool) -> Self {
+        self.config.coordinated_recovery = enabled;
         self
     }
 

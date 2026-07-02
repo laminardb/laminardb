@@ -281,7 +281,7 @@ pub async fn start_cluster(
 ) -> Result<ClusterHandle, ClusterStartupError> {
     let node_id_str = cluster_cfg.node_id.as_str().to_string();
     // Use xxhash3 (deterministic across Rust versions) for the numeric NodeId.
-    // DefaultHasher is explicitly unstable across compiler versions (C4 fix).
+    // DefaultHasher is explicitly unstable across compiler versions.
     let node_id_num = {
         let h = xxhash_rust::xxh3::xxh3_64(node_id_str.as_bytes());
         // Avoid the UNASSIGNED sentinel (0)
@@ -302,7 +302,7 @@ pub async fn start_cluster(
         8080
     };
 
-    // Extract the host part from bind address, handling IPv6 (W16 fix).
+    // Extract the host part from bind address, handling IPv6.
     // Examples: "127.0.0.1:8080" → "127.0.0.1", "[::1]:8080" → "[::1]"
     let bind_host = if let Some(bracket_end) = bind_addr.rfind(']') {
         // IPv6: "[::1]:8080" — take up to and including ']'
@@ -456,6 +456,9 @@ pub async fn start_cluster(
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
         builder = builder.state_tier_dir(dir);
+        // Cluster group demotion defaults OFF (vnode-granular is the default; the cluster group
+        // path has open correctness gaps). Explicit `[server] state_tier_group_demotion = true` opts in.
+        builder = builder.state_tier_group_demotion(config.server.group_demotion(false));
     }
 
     if let Some(path) = config.state.local_storage_dir() {
@@ -554,12 +557,8 @@ pub async fn start_cluster(
         builder = builder.decision_store(decision_store);
     }
 
-    // Install the assignment snapshot store so the rebalance
-    // control plane can rotate it when membership changes. Snapshot
-    // store resolution happened earlier inside
-    // `resolve_vnode_assignment`; hand the same instance to the
-    // builder here so snapshot watcher + rebalance controller use
-    // the identical backing object.
+    // Hand the builder the same snapshot store resolved in `resolve_vnode_assignment`
+    // so the snapshot watcher and rebalance controller share one backing object.
     if let Some(snap_store) = snapshot_store.clone() {
         builder = builder.assignment_snapshot_store(snap_store);
     }
@@ -584,12 +583,12 @@ pub async fn start_cluster(
     .await;
 
     // Streaming aggregates go through the row-shuffle bridge driven by
-    // `IncrementalAggState`; the DataFusion-native aggregate-rewrite
-    // path was removed — see commit history.
+    // `IncrementalAggState`; the DataFusion-native aggregate-rewrite path was removed.
     builder = builder
         .shuffle_sender(Arc::clone(&shuffle_sender))
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
-        .target_partitions(1);
+        .target_partitions(1)
+        .coordinated_recovery(config.supervision.coordinated_recovery);
 
     let db = builder
         .build()
@@ -644,6 +643,10 @@ pub async fn start_cluster(
             }
             _ => None,
         };
+
+    // No-op unless [supervision] coordinated_recovery is on. Before start() so an early
+    // fault is observed.
+    db.enable_coordinated_recovery();
 
     db.start()
         .await
