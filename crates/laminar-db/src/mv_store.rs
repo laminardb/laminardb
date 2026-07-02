@@ -59,6 +59,23 @@ enum Mutation {
     Remove(OwnedRow),
 }
 
+/// Split a `__weight` changelog batch into its Int64 weight column and the non-weight column indices.
+fn weight_and_plain_cols(batch: &RecordBatch) -> Result<(&Int64Array, Vec<usize>), DbError> {
+    let weight_idx = batch
+        .schema()
+        .index_of(WEIGHT_COLUMN)
+        .map_err(|e| DbError::Storage(format!("MV changelog missing weight: {e}")))?;
+    let weights = batch
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DbError::Storage("MV weight column not Int64".into()))?;
+    let plain_cols = (0..batch.num_columns())
+        .filter(|&c| c != weight_idx)
+        .collect();
+    Ok((weights, plain_cols))
+}
+
 impl UpsertState {
     fn new(schema: &SchemaRef, key_cols: &[usize]) -> Result<Self, DbError> {
         let sort_fields: Vec<SortField> = key_cols
@@ -92,25 +109,15 @@ impl UpsertState {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let weight_idx = batch
-            .schema()
-            .index_of(WEIGHT_COLUMN)
-            .map_err(|e| DbError::Storage(format!("upsert MV changelog missing weight: {e}")))?;
-        let weights = batch
-            .column(weight_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DbError::Storage("upsert MV weight column not Int64".into()))?;
+        let (weights, plain_cols) = weight_and_plain_cols(batch)?;
         let keys = self.keys(batch)?;
-        let plain_cols: Vec<usize> = (0..batch.num_columns())
-            .filter(|&c| c != weight_idx)
-            .collect();
 
         // Resolve all mutations before mutating state, so a fallible row leaves the batch all-or-nothing.
         let mut staged = Vec::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let key = keys.row(row_idx).owned();
-            if weights.value(row_idx) > 0 {
+            let w = weights.value(row_idx);
+            if w > 0 {
                 let mut vals = Vec::with_capacity(plain_cols.len());
                 for &c in &plain_cols {
                     vals.push(
@@ -119,9 +126,10 @@ impl UpsertState {
                     );
                 }
                 staged.push(Mutation::Insert(key, vals));
-            } else {
+            } else if w < 0 {
                 staged.push(Mutation::Remove(key));
             }
+            // w == 0 is a net-zero changelog row: no-op, matching MultisetState::apply.
         }
         // All rows validated — apply in order (preserves net retract-before-insert per key).
         for m in staged {
@@ -172,9 +180,19 @@ impl UpsertState {
         if self.rows.is_empty() {
             return RecordBatch::new_empty(schema.clone());
         }
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        for c in 0..schema.fields().len() {
-            match ScalarValue::iter_to_array(self.rows.values().map(|r| r[c].clone())) {
+        // One pass over the row map assembling all columns, rather than one full map scan per column.
+        let ncols = schema.fields().len();
+        let mut columns: Vec<Vec<ScalarValue>> = (0..ncols)
+            .map(|_| Vec::with_capacity(self.rows.len()))
+            .collect();
+        for row in self.rows.values() {
+            for (c, col) in columns.iter_mut().enumerate() {
+                col.push(row[c].clone());
+            }
+        }
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(ncols);
+        for col in columns {
+            match ScalarValue::iter_to_array(col) {
                 Ok(a) => arrays.push(a),
                 Err(_) => return RecordBatch::new_empty(schema.clone()),
             }
@@ -212,18 +230,10 @@ impl MultisetState {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let weight_idx = batch
-            .schema()
-            .index_of(WEIGHT_COLUMN)
-            .map_err(|e| DbError::Storage(format!("multiset MV changelog missing weight: {e}")))?;
-        let weights = batch
-            .column(weight_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DbError::Storage("multiset MV weight column not Int64".into()))?;
-        let plain_cols: Vec<ArrayRef> = (0..batch.num_columns())
-            .filter(|&c| c != weight_idx)
-            .map(|c| Arc::clone(batch.column(c)))
+        let (weights, plain_indices) = weight_and_plain_cols(batch)?;
+        let plain_cols: Vec<ArrayRef> = plain_indices
+            .iter()
+            .map(|&c| Arc::clone(batch.column(c)))
             .collect();
         let rows = self
             .row_converter

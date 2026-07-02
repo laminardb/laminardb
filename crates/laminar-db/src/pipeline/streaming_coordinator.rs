@@ -731,11 +731,21 @@ impl StreamingCoordinator {
                     }
                     Err(e) => {
                         self.discard_pending_offsets();
-                        tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
-                        if callback.fault_on_cycle_error() {
-                            fault = Some(
-                                "SQL cycle error during shutdown drain (exactly-once)".to_string(),
-                            );
+                        match e {
+                            // Shutdown already signaled; restarting would just re-trip it.
+                            CycleError::Halt(msg) => {
+                                tracing::warn!(reason = %msg, "[LDB-3022] cycle halted during shutdown drain");
+                            }
+                            CycleError::Fatal(msg) if callback.fault_on_cycle_error() => {
+                                tracing::error!(error = %msg, "[LDB-3020] fatal SQL cycle error during shutdown drain; faulting for recovery");
+                                fault = Some(
+                                    "SQL cycle error during shutdown drain (exactly-once)"
+                                        .to_string(),
+                                );
+                            }
+                            CycleError::Fatal(msg) => {
+                                tracing::warn!(error = %msg, "[LDB-3020] SQL cycle error during shutdown drain");
+                            }
                         }
                     }
                 }
@@ -774,11 +784,21 @@ impl StreamingCoordinator {
                         }
                         Err(e) => {
                             self.discard_pending_offsets();
-                            tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
-                            if callback.fault_on_cycle_error() {
-                                fault = Some(
-                                    "SQL cycle error during final drain (exactly-once)".to_string(),
-                                );
+                            match e {
+                                // Shutdown already signaled; restarting would just re-trip it.
+                                CycleError::Halt(msg) => {
+                                    tracing::warn!(reason = %msg, "[LDB-3022] cycle halted during final drain");
+                                }
+                                CycleError::Fatal(msg) if callback.fault_on_cycle_error() => {
+                                    tracing::error!(error = %msg, "[LDB-3020] fatal SQL cycle error during final drain; faulting for recovery");
+                                    fault = Some(
+                                        "SQL cycle error during final drain (exactly-once)"
+                                            .to_string(),
+                                    );
+                                }
+                                CycleError::Fatal(msg) => {
+                                    tracing::warn!(error = %msg, "[LDB-3020] SQL cycle error during final drain");
+                                }
                             }
                         }
                     }

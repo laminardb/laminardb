@@ -34,18 +34,6 @@ use crate::sql_analysis::{IncrementalJoinConfig, JoinProjItem, JoinSide};
 use crate::state_tier::TierRequest;
 
 /// Indexed Z-set: `join_key -> { full_row -> multiplicity }`.
-pub(crate) trait JoinStateStore: Send {
-    /// Net `weight` into the Z-set for `key`; a row drops at multiplicity ≤ 0.
-    fn upsert(&mut self, key: &[ScalarValue], row: &[ScalarValue], weight: i64);
-    /// Every `(row, multiplicity)` currently held for `key`.
-    fn get(&self, key: &[ScalarValue]) -> Vec<(Vec<ScalarValue>, i64)>;
-    /// Whether any row is held for `key` (i.e. a left-join match count > 0).
-    fn contains_key(&self, key: &[ScalarValue]) -> bool;
-    /// All `(full_row, multiplicity)` entries, for checkpointing and left-join catch-up.
-    fn snapshot(&self) -> Vec<(Vec<ScalarValue>, i64)>;
-    fn estimated_bytes(&self) -> usize;
-}
-
 #[derive(Default)]
 pub(crate) struct InMemoryJoinState {
     rows: FxHashMap<Vec<ScalarValue>, FxHashMap<Box<[ScalarValue]>, i64>>,
@@ -56,7 +44,8 @@ fn scalars_bytes(vals: &[ScalarValue]) -> usize {
     vals.iter().map(ScalarValue::size).sum()
 }
 
-impl JoinStateStore for InMemoryJoinState {
+impl InMemoryJoinState {
+    /// Net `weight` into the Z-set for `key`; a row drops at multiplicity ≤ 0.
     fn upsert(&mut self, key: &[ScalarValue], row: &[ScalarValue], weight: i64) {
         if weight == 0 {
             return;
@@ -90,11 +79,23 @@ impl JoinStateStore for InMemoryJoinState {
         }
     }
 
+    /// Owned snapshot of the Z-set for `key`; use [`Self::rows_for`] unless mutating the set mid-scan.
     fn get(&self, key: &[ScalarValue]) -> Vec<(Vec<ScalarValue>, i64)> {
         match self.rows.get(key) {
             Some(inner) => inner.iter().map(|(r, &w)| (r.to_vec(), w)).collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Borrowing view of the Z-set for `key` — `(row, multiplicity)` with no per-probe clone.
+    fn rows_for<'a>(
+        &'a self,
+        key: &[ScalarValue],
+    ) -> impl Iterator<Item = (&'a [ScalarValue], i64)> + 'a {
+        self.rows
+            .get(key)
+            .into_iter()
+            .flat_map(|inner| inner.iter().map(|(r, &w)| (r.as_ref(), w)))
     }
 
     fn contains_key(&self, key: &[ScalarValue]) -> bool {
@@ -111,6 +112,7 @@ impl JoinStateStore for InMemoryJoinState {
         out
     }
 
+    /// Loose: key columns are counted in both `row` and `key`. Only gates the demotion threshold.
     fn estimated_bytes(&self) -> usize {
         self.bytes
     }
@@ -182,8 +184,8 @@ pub(crate) struct IncrementalJoinOperator {
     right_keys: Vec<String>,
     projection: Vec<JoinProjItem>,
     left_outer: bool,
-    left_state: Box<dyn JoinStateStore>,
-    right_state: Box<dyn JoinStateStore>,
+    left_state: InMemoryJoinState,
+    right_state: InMemoryJoinState,
     left_info: Option<SideInfo>,
     right_info: Option<SideInfo>,
     // Flattened output columns `(side, plain_position)` + cached output schema; resolved once both
@@ -204,8 +206,8 @@ impl IncrementalJoinOperator {
             right_keys: config.right_keys,
             projection: config.projection,
             left_outer: config.left_outer,
-            left_state: Box::new(InMemoryJoinState::default()),
-            right_state: Box::new(InMemoryJoinState::default()),
+            left_state: InMemoryJoinState::default(),
+            right_state: InMemoryJoinState::default(),
             left_info: None,
             right_info: None,
             out_cols: None,
@@ -351,7 +353,7 @@ impl IncrementalJoinOperator {
             JoinSide::Right => &self.left_state,
         };
         for d in deltas {
-            for (other_row, other_w) in build.get(&d.key) {
+            for (other_row, other_w) in build.rows_for(&d.key) {
                 let w = d.weight * other_w;
                 if w == 0 {
                     continue;
@@ -359,10 +361,10 @@ impl IncrementalJoinOperator {
                 let proj: Vec<ScalarValue> = resolved
                     .iter()
                     .map(|&(side, pos)| {
-                        let row = if side == delta_side {
+                        let row: &[ScalarValue] = if side == delta_side {
                             &d.row
                         } else {
-                            &other_row
+                            other_row
                         };
                         row[pos].clone()
                     })

@@ -79,7 +79,8 @@ impl ClusterController {
             kv,
             snapshot,
             members_rx,
-            converged_for_checkpoint: watch::channel(true).0,
+            // Start not-converged: a new leader must not checkpoint until it publishes convergence.
+            converged_for_checkpoint: watch::channel(false).0,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
             recovering: Arc::new(AtomicBool::new(false)),
@@ -485,12 +486,19 @@ impl ClusterController {
             .await;
     }
 
-    /// The leader's active recovery target `(epoch, generation)`, if a round is in flight.
+    /// Active recovery target `(epoch, gen)`, highest gen across all node slots (not just the current
+    /// leader's) so a straggler still observes a round whose leader changed. Non-`epoch:gen` values
+    /// (e.g. bare `control:recovery-gen`) are skipped.
     pub async fn observe_recover(&self) -> Option<(u64, u64)> {
-        let leader = self.current_leader()?;
-        let raw = self.kv.read_from(leader, "control:recover").await?;
-        let (epoch, gen) = raw.split_once(':')?;
-        Some((epoch.parse().ok()?, gen.parse().ok()?))
+        self.kv
+            .scan("control:recover")
+            .await
+            .into_iter()
+            .filter_map(|(_, raw)| {
+                let (epoch, gen) = raw.split_once(':')?;
+                Some((epoch.parse::<u64>().ok()?, gen.parse::<u64>().ok()?))
+            })
+            .max_by_key(|&(_, gen)| gen)
     }
 
     /// Clear the recovery announcement at round end, so a peer that restarts later (its

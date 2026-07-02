@@ -454,8 +454,14 @@ impl SqlQueryOperator {
     async fn lazy_init(&mut self) -> Result<(), DbError> {
         match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
+                #[cfg(feature = "cluster")]
+                let mut base_restored = true;
                 if let Some(ref cp) = self.pending_restore {
                     if let Err(e) = agg_state.restore_groups(cp) {
+                        #[cfg(feature = "cluster")]
+                        {
+                            base_restored = false;
+                        }
                         tracing::warn!(
                             query = %self.op_name,
                             error = %e,
@@ -464,15 +470,24 @@ impl SqlQueryOperator {
                     }
                 }
                 self.pending_restore = None;
-                // Replay any deltas stashed during restart, now that the base is restored.
+                // Replay stashed restart deltas only if the base restored — deltas carry just the
+                // changed groups, so replaying onto an empty base would drop every unchanged group.
                 #[cfg(feature = "cluster")]
-                for delta in self.pending_restore_deltas.drain(..) {
-                    if let Err(e) = agg_state.apply_delta(&delta) {
-                        tracing::warn!(
-                            query = %self.op_name, error = %e,
-                            "failed to replay restart delta — vnode may be stale"
-                        );
+                if base_restored {
+                    for delta in self.pending_restore_deltas.drain(..) {
+                        if let Err(e) = agg_state.apply_delta(&delta) {
+                            tracing::warn!(
+                                query = %self.op_name, error = %e,
+                                "failed to replay restart delta — vnode may be stale"
+                            );
+                        }
                     }
+                } else if !self.pending_restore_deltas.is_empty() {
+                    tracing::warn!(
+                        query = %self.op_name, count = self.pending_restore_deltas.len(),
+                        "skipping restart delta replay — base restore failed; discarding stale deltas"
+                    );
+                    self.pending_restore_deltas.clear();
                 }
                 // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
                 // so a later re-acquire merges into empty state instead of double-counting.
@@ -818,7 +833,6 @@ impl SqlQueryOperator {
         // scans only resident groups, so without this their changelog row leaks past the TTL and the
         // tier entry is never reclaimed. Once fetched + promoted, the normal `evict_idle` pass below
         // retracts them. Idempotent — `issue_fetch_group` dedupes in-flight keys.
-        #[cfg(feature = "state-tier")]
         {
             let past_ttl = if let QueryState::Agg(ref agg) = self.state {
                 agg.cold_groups_past_idle_ttl(watermark, self.vnode_count)
@@ -1739,17 +1753,28 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Uninit => {
                 // Restart before the agg is built: fold the base into the pending restore and stash
                 // the deltas; `lazy_init` replays them after `restore_groups`.
-                match self.pending_restore {
+                let accepted = match self.pending_restore {
                     Some(ref mut existing) if existing.fingerprint == base_cp.fingerprint => {
                         existing.append_disjoint(base_cp)?;
+                        true
                     }
-                    Some(_) => tracing::warn!(
-                        query = %self.op_name, vnode,
-                        "pending restore fingerprint mismatch — dropping rehydrated chain base"
-                    ),
-                    None => self.pending_restore = Some(base_cp),
+                    Some(_) => {
+                        tracing::warn!(
+                            query = %self.op_name, vnode,
+                            "pending restore fingerprint mismatch — dropping rehydrated chain base and its deltas"
+                        );
+                        false
+                    }
+                    None => {
+                        self.pending_restore = Some(base_cp);
+                        true
+                    }
+                };
+                // Only stash deltas whose base was accepted; deltas without their base would rebuild
+                // partial state.
+                if accepted {
+                    self.pending_restore_deltas.extend(delta_objs);
                 }
-                self.pending_restore_deltas.extend(delta_objs);
             }
             _ => tracing::warn!(
                 query = %self.op_name, vnode,

@@ -9,7 +9,7 @@ use laminar_db::LaminarDB;
 
 mod common;
 use common::{
-    compose, consume_json, consume_keyed, create_topic, delete_topic, kafka_brokers,
+    compose, consume_json, consume_keyed, create_topic, delete_topic, json_i64, kafka_brokers,
     produce_json_seq, wait_for_broker,
 };
 
@@ -441,14 +441,9 @@ async fn scenario_incremental_agg_kafka_upsert() {
         .expect("key 2 present on topic")
         .clone()
         .expect("k2 not tombstoned");
-    assert!(
-        v1.contains("15"),
-        "k1 latest should carry total=15, got {v1}"
-    );
-    assert!(
-        v2.contains("20"),
-        "k2 latest should carry total=20, got {v2}"
-    );
+    // Exact value: the k1 update collapses to 15, not 25 (positive-only) or a 150 substring match.
+    assert_eq!(json_i64(&v1, "total"), 15, "k1 latest total, got {v1}");
+    assert_eq!(json_i64(&v2, "total"), 20, "k2 latest total, got {v2}");
 }
 
 /// A CREATE STREAM projecting an incremental MV forwards its netted changelog to a downstream
@@ -533,12 +528,15 @@ async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
         .expect("key 2 present")
         .clone()
         .expect("k2 not tombstoned");
-    assert!(
-        v1.contains("15"),
-        "k1 latest should carry total=15 via the stream, got {v1}"
+    // Exact value via the stream: k1's update collapses to total=15 (not 25), no substring false-pass.
+    assert_eq!(
+        json_i64(&v1, "total"),
+        15,
+        "k1 latest total via stream, got {v1}"
     );
-    assert!(
-        v2.contains("20"),
-        "k2 latest should carry total=20 via the stream, got {v2}"
+    assert_eq!(
+        json_i64(&v2, "total"),
+        20,
+        "k2 latest total via stream, got {v2}"
     );
 }

@@ -466,7 +466,7 @@ impl KafkaSink {
     /// emit a keyed value for a live group (`_op = U`) or a null-value tombstone for a removed group
     /// (`_op = D`). The topic must be log-compacted and keyed on the merge key for the tombstones to
     /// GC and for the latest-per-key state to be recoverable from offset 0.
-    #[allow(clippy::cast_possible_truncation)] // micros->u64 latency, matches write_batch
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)] // matches write_batch
     async fn write_upsert_batch(
         &mut self,
         batch: &arrow_array::RecordBatch,
@@ -516,7 +516,15 @@ impl KafkaSink {
         let flush_threshold = self.config.flush_batch_size;
         let mut delivery_futures = Vec::with_capacity(rows);
         for (i, payload) in payloads.iter().enumerate() {
-            let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
+            let raw: &[u8] = keys.as_ref().map(|kb| kb.key(i)).unwrap_or_default();
+            if raw.is_empty() {
+                // A compacted topic can't represent an unkeyed record (upsert or tombstone); fail
+                // fast rather than silently emit a round-robin/broker-rejected message.
+                return Err(ConnectorError::WriteError(format!(
+                    "upsert envelope: row {i} has an empty/NULL merge key"
+                )));
+            }
+            let key: Option<&[u8]> = Some(raw);
             let is_delete = ops.value(i) == "D";
             let partition = self.partitioner.partition(key, self.topic_partition_count);
             // No `.payload()` for a delete → null value = Kafka tombstone.

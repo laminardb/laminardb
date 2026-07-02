@@ -151,6 +151,14 @@ pub async fn consume_keyed(
     out
 }
 
+/// Integer field from a JSON payload (panics if absent/non-integer) — for exact-value oracles.
+pub fn json_i64(payload: &str, field: &str) -> i64 {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|j| j.get(field).and_then(serde_json::Value::as_i64))
+        .unwrap_or_else(|| panic!("payload missing integer field '{field}': {payload}"))
+}
+
 /// Run `docker compose -f tests/docker/compose.yml <args>` and ignore
 /// non-zero exit codes (useful for kill/restart that may race with the
 /// health-checker).

@@ -177,10 +177,10 @@ impl MongoDbSink {
             self.write_cdc_docs(&docs).await?;
             (n, bytes)
         } else {
-            self.collapse_changelog_buffer_for_upsert()?;
+            let collapsed = self.collapse_changelog_buffer_for_upsert()?;
             let (docs, bytes) = self.batches_to_bson_docs();
             let n = docs.len();
-            self.write_bson_docs(docs).await?;
+            self.write_bson_docs(docs, collapsed).await?;
             (n, bytes)
         };
 
@@ -203,11 +203,13 @@ impl MongoDbSink {
     /// Collapse a Z-set changelog buffer (an incremental MV: rows carry `__weight`) into a single
     /// key-unique `{U,D}` batch before upsert, so retract+insert nets per key and a removed group
     /// becomes a delete. No-op unless the write mode is upsert and the buffer is a Z-set changelog.
+    /// `Ok(true)` if the buffer was a Z-set changelog and got collapsed; `Ok(false)` for a plain
+    /// (non-changelog) upsert, so the caller doesn't interpret `_op` on rows we didn't produce.
     #[cfg(feature = "mongodb-cdc")]
-    fn collapse_changelog_buffer_for_upsert(&mut self) -> Result<(), ConnectorError> {
+    fn collapse_changelog_buffer_for_upsert(&mut self) -> Result<bool, ConnectorError> {
         let key_fields = match &self.config.write_mode {
             WriteMode::Upsert { key_fields } => key_fields.clone(),
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
         if self.buffer.is_empty()
             || !self
@@ -215,13 +217,13 @@ impl MongoDbSink {
                 .iter()
                 .any(|b| b.schema().index_of(WEIGHT_COLUMN).is_ok())
         {
-            return Ok(());
+            return Ok(false);
         }
         let schema = self.buffer[0].schema();
         let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
             .map_err(|e| ConnectorError::Internal(format!("concat changelog: {e}")))?;
         self.buffer = vec![collapse_changelog(&combined, &key_fields)?];
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -497,7 +499,9 @@ impl SinkConnector for MongoDbSink {
         let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(30)).with_idempotent();
 
         if matches!(self.config.write_mode, WriteMode::Upsert { .. }) {
-            caps = caps.with_upsert();
+            // with_changelog stops prepare_for_sink stripping __weight, so group deletes reach the
+            // collapse path as tombstones.
+            caps = caps.with_upsert().with_changelog();
         }
         if matches!(self.config.write_mode, WriteMode::CdcReplay) {
             caps = caps.with_changelog();
@@ -675,6 +679,7 @@ impl MongoDbSink {
     async fn write_bson_docs(
         &self,
         docs: Vec<mongodb::bson::Document>,
+        from_changelog: bool,
     ) -> Result<(), ConnectorError> {
         use mongodb::bson::{doc, Bson, Document};
 
@@ -702,10 +707,12 @@ impl MongoDbSink {
 
             WriteMode::Upsert { ref key_fields } => {
                 for mut bson_doc in docs {
-                    // A collapsed changelog carries `_op` (U/D); route D to a delete, else upsert.
-                    // A plain upsert has no `_op` and is treated as an upsert.
-                    let is_delete = matches!(bson_doc.get_str("_op"), Ok("D"));
-                    bson_doc.remove("_op");
+                    // Only a collapsed changelog carries a synthesized `_op` (U/D): route D to a
+                    // delete. A plain upsert keeps its columns verbatim (a user `_op` is not a delete).
+                    let is_delete = from_changelog && matches!(bson_doc.get_str("_op"), Ok("D"));
+                    if from_changelog {
+                        bson_doc.remove("_op");
+                    }
                     let mut filter = Document::new();
                     for key in key_fields {
                         if let Some(v) = bson_doc.get(key) {

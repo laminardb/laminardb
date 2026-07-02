@@ -1340,6 +1340,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
         let mut store = self.mv_store.write();
         let mut updates = 0u64;
+        // Snapshot broadcast is deferred past the write lock (rematerialize is O(rows) and would
+        // otherwise block SELECT readers on the store-wide lock).
+        let mut changelog_broadcasts: Vec<Arc<str>> = Vec::new();
         for (stream_name, batches) in results {
             if !store.has_mv(stream_name) {
                 continue;
@@ -1365,9 +1368,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
             if changelog && self.subscription_registry.subscriber_count(stream_name) > 0 {
-                if let Some(snap) = store.to_record_batch(stream_name) {
-                    self.subscription_registry.send_batch(stream_name, snap);
-                }
+                changelog_broadcasts.push(Arc::clone(stream_name));
             }
         }
         if updates > 0 {
@@ -1376,6 +1377,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             let bytes = store.total_bytes() as u64;
             #[allow(clippy::cast_possible_wrap)]
             self.prom.mv_bytes_stored.set(bytes as i64);
+        }
+        drop(store);
+
+        if !changelog_broadcasts.is_empty() {
+            let store = self.mv_store.read();
+            for stream_name in changelog_broadcasts {
+                if let Some(snap) = store.to_record_batch(&stream_name) {
+                    self.subscription_registry.send_batch(&stream_name, snap);
+                }
+            }
         }
     }
 

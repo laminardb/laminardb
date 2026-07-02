@@ -141,6 +141,8 @@ pub struct EngineMetrics {
     pub pipeline_restarts_total: IntCounter,
     /// Leader-coordinated global restart-to-epoch rounds this node applied (cluster mode).
     pub coordinated_recoveries_total: IntCounter,
+    /// Leader-coordinated recovery rounds abandoned (self-restore failed or restore quorum timed out).
+    pub coordinated_recovery_failures_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -478,6 +480,11 @@ impl EngineMetrics {
             coordinated_recoveries_total: reg!(IntCounter::new(
                 "coordinated_recoveries_total",
                 "Leader-coordinated global restart-to-epoch rounds applied by this node"
+            )
+            .unwrap()),
+            coordinated_recovery_failures_total: reg!(IntCounter::new(
+                "coordinated_recovery_failures_total",
+                "Leader-coordinated recovery rounds abandoned (self-restore failed or quorum timed out)"
             )
             .unwrap()),
         }

@@ -2174,16 +2174,12 @@ impl IncrementalAggState {
         }
     }
 
-    /// Drop all in-memory state for vnodes this node lost on a rebalance (revoked). Without this the
-    /// stale leftover survives, and a later re-acquire's `merge_groups` (additive) double-counts on
-    /// top of it. Mirrors `demote_vnode`'s key bucketing but over a set, and clears the per-vnode
-    /// delta and cold tracking for the revoked vnodes too. Runs on the compute thread at the
-    /// revoking rotation; revoked and acquired sets are disjoint per rotation, so it never races an
-    /// acquire-merge.
+    /// Drop in-memory state for revoked (lost) vnodes and return per-vnode `-1`-weight retraction
+    /// batches (from `last_emitted` before the purge) so the losing node's MV snapshot drops the
+    /// moved groups (empty unless changelog). Without the purge a later re-acquire's additive
+    /// `merge_groups` double-counts the stale leftover. Runs on the compute thread; revoked and
+    /// acquired sets are disjoint per rotation, so it never races an acquire-merge.
     #[cfg(feature = "cluster")]
-    /// Drop revoked vnodes' groups AND return per-vnode `-1`-weight retraction batches (built from
-    /// `last_emitted` before the purge) so the losing node's incremental MV snapshot drops the moved
-    /// groups — otherwise a distributed read double-counts them. Empty unless changelog.
     pub(crate) fn drop_vnodes(
         &mut self,
         revoked: &rustc_hash::FxHashSet<u32>,
@@ -2378,17 +2374,12 @@ impl IncrementalAggState {
     ) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();
-        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
-            .groups
-            .iter_mut()
-            .filter(|(k, _)| *k == key)
-            .map(|(k, v)| (k.clone(), v))
-            .collect();
-        if entries.is_empty() {
+        let Some(entry) = self.groups.get_mut(key) else {
             return Err(DbError::Pipeline(
                 "encode_group: group not resident".to_string(),
             ));
-        }
+        };
+        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = vec![(key.clone(), entry)];
         let (keys_ipc, acc_state_ipc, last_updated_ms) = encode_groups_columnar(
             &self.row_converter,
             self.num_group_cols,

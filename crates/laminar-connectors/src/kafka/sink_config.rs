@@ -273,9 +273,14 @@ impl KafkaSinkConfig {
                 )));
             }
         };
-        if cfg.envelope == SinkEnvelope::Upsert && cfg.key_column.is_none() {
+        if cfg.envelope == SinkEnvelope::Upsert
+            && cfg
+                .key_column
+                .as_deref()
+                .is_none_or(|k| k.trim().is_empty())
+        {
             return Err(ConnectorError::ConfigurationError(
-                "envelope = 'upsert' requires 'key.column' (the merge key)".into(),
+                "envelope = 'upsert' requires a non-empty 'key.column' (the merge key)".into(),
             ));
         }
 
@@ -312,6 +317,15 @@ impl KafkaSinkConfig {
         }
 
         cfg.dlq_topic = config.get("dlq.topic").map(String::from);
+        if cfg.dlq_topic.is_some() && cfg.envelope == SinkEnvelope::Upsert {
+            // Upsert failures poison the epoch; a lone tombstone in a DLQ would corrupt the
+            // compacted topic. Reject rather than silently ignore the DLQ.
+            return Err(ConnectorError::ConfigurationError(
+                "'dlq.topic' is not supported with envelope = 'upsert' (upsert failures poison the \
+                 epoch instead of routing to a DLQ)"
+                    .into(),
+            ));
+        }
 
         if let Some(v) = config.get("flush.batch.size") {
             cfg.flush_batch_size = v.parse().map_err(|_| {

@@ -91,9 +91,10 @@ impl RecoveryMonitor {
         triggered
     }
 
-    /// Leader: fix `N`, announce, restore self (retrying), then wait for every live node to
-    /// report restored. Always releases the fence and clears the announcement on exit — so a
-    /// failed round can't leave a stale generation for a later peer-restart to replay.
+    /// Leader: fix `N`, announce, restore self (retrying), then wait for every live node to report
+    /// restored. Releases the fence on exit; clears the announcement only on full success (self
+    /// restored AND quorum met) so a failed round leaves the announcement live for stragglers/retry
+    /// rather than stranding a divergent node.
     async fn drive_round(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
         let Some(target) = compute_target_epoch(db).await else {
             tracing::warn!("coordinated recovery: no committed epoch yet; skipping round");
@@ -124,17 +125,31 @@ impl RecoveryMonitor {
                 "leader self-restore failed; retrying"
             );
         }
-        if restored {
-            wait_restore_quorum(controller, gen_id, &participants, RESTORE_QUORUM_TIMEOUT).await;
+        let quorum_met = if restored {
+            wait_restore_quorum(controller, gen_id, &participants, RESTORE_QUORUM_TIMEOUT).await
+        } else {
+            tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
+            false
+        };
+        controller.set_recovering(false);
+        if restored && quorum_met {
+            // Full success: retire the announcement so a later peer-restart can't replay it.
+            controller.clear_recover().await;
             tracing::warn!(
                 gen = gen_id,
                 "coordinated recovery complete; fence released"
             );
         } else {
-            tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
+            // Leave the announcement live for a straggler/leader retry next tick; clearing it would
+            // strand a divergent node.
+            if let Some(m) = db.engine_metrics.lock().clone() {
+                m.coordinated_recovery_failures_total.inc();
+            }
+            tracing::error!(
+                gen = gen_id,
+                "coordinated recovery round incomplete; leaving announcement live for retry"
+            );
         }
-        controller.set_recovering(false);
-        controller.clear_recover().await;
     }
 
     /// Observe-path restore (a follower acting on the leader's announcement): fence the
@@ -244,12 +259,13 @@ async fn write_recovery_gen(controller: &ClusterController, gen_id: u64) {
 /// Wait until every still-live `participant` reports restored-to-`gen_id`, or the deadline.
 /// Only the round's original participants are awaited: one that left membership can't ack
 /// (don't burn the timeout on it), and one that joined later recovers on its own observe.
+/// Returns `true` if every pending participant acked, `false` on timeout.
 async fn wait_restore_quorum(
     controller: &ClusterController,
     gen_id: u64,
     participants: &FxHashSet<NodeId>,
     timeout: Duration,
-) {
+) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let live: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
@@ -266,11 +282,11 @@ async fn wait_restore_quorum(
             .filter(|n| live.contains(n) && !acked.contains(n))
             .collect();
         if pending.is_empty() {
-            return;
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::error!(gen = gen_id, missing = ?pending, "restore quorum timed out");
-            return;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

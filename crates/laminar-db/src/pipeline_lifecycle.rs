@@ -122,8 +122,8 @@ fn backoff_for_attempt(
     max: std::time::Duration,
     attempt: usize,
 ) -> std::time::Duration {
-    let factor = 1u32.checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX).min(20));
-    initial.saturating_mul(factor.unwrap_or(u32::MAX)).min(max)
+    let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(20);
+    initial.saturating_mul(1u32 << shift).min(max)
 }
 
 /// Restart on a dedicated thread: `start()` is `!Send`, so `block_on` drives it while its
@@ -163,14 +163,15 @@ async fn attempt_supervised_restart(
         );
         return;
     };
-    if let Some(ref m) = metrics {
-        m.pipeline_restarts_total.inc();
-    }
     let backoff = backoff_for_attempt(policy.initial_backoff, policy.max_backoff, attempt);
     tokio::time::sleep(backoff).await;
-    // A concurrent stop/shutdown moves the state out of Faulted; don't fight it.
+    // A concurrent stop/shutdown moves the state out of Faulted; don't fight it — and don't count a
+    // restart that won't happen, so a benign stop during backoff doesn't inflate the metric.
     if !matches!(DbState::load(&db.state), DbState::Faulted) {
         return;
+    }
+    if let Some(ref m) = metrics {
+        m.pipeline_restarts_total.inc();
     }
     // Capture the reason before start() clears `last_fault`, so it survives in the log.
     let fault = db.last_fault().unwrap_or_else(|| "unknown".to_string());

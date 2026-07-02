@@ -1134,7 +1134,9 @@ impl LaminarDB {
                     .await
                 };
                 if outcome.is_err() {
-                    for iname in &created {
+                    // Leaf-first: a later intermediate reads an earlier one, so dropping in reverse
+                    // creation order clears each before its dependency (no HasDependents no-op).
+                    for iname in created.iter().rev() {
                         let _ = Box::pin(
                             self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {iname}")),
                         )
@@ -1193,7 +1195,7 @@ impl LaminarDB {
 
         // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
         // so the operator and MV store agree (keyed upsert for aggregates, Z-set for proj/filter).
-        let inc = self
+        let (inc, has_aggregate) = self
             .incremental_emit_mode(&query_sql, plan_window.is_some())
             .await;
         let incremental = !matches!(inc, IncEmit::None);
@@ -1211,8 +1213,7 @@ impl LaminarDB {
             });
         }
 
-        self.register_mv_provider(&name_str, schema, &query_sql, plan_window.is_some(), inc)
-            .await?;
+        self.register_mv_provider(&name_str, schema, plan_window.is_some(), inc, has_aggregate)?;
 
         // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
         if let Some(ref tx) = *self.control_tx.lock() {
@@ -1331,7 +1332,8 @@ impl LaminarDB {
             return Ok(());
         };
         // Allowed: aggregate, simple projection/filter, `changelog ⋈ static dim` enrich, or
-        // `changelog ⋈ changelog` inner IVM join. Other complex shapes (LEFT/outer, etc.) are rejected.
+        // `changelog ⋈ changelog` INNER or LEFT-outer IVM join. RIGHT/FULL, non-equi ON residuals,
+        // and other complex shapes are rejected.
         let inc = self.incremental_mv_names();
         let supported = crate::sql_analysis::detect_changelog_enrich_query(
             query_sql,
@@ -1354,9 +1356,11 @@ impl LaminarDB {
 
     /// Store decision for a non-windowed MV: keyed `Upsert` for a keyed aggregate, `Multiset` for a
     /// projection/filter over a changelog, `None` (full-emit) otherwise (incl. global aggregates).
-    async fn incremental_emit_mode(&self, query_sql: &str, has_window: bool) -> IncEmit {
+    /// Returns the store mode and whether the query is an aggregate (threaded to
+    /// `register_mv_provider` so it needn't re-plan to pick `Aggregate` vs append storage).
+    async fn incremental_emit_mode(&self, query_sql: &str, has_window: bool) -> (IncEmit, bool) {
         if has_window {
-            return IncEmit::None;
+            return (IncEmit::None, false);
         }
         let flag = self
             .config
@@ -1365,22 +1369,23 @@ impl LaminarDB {
             .is_some_and(|cp| cp.incremental_emit);
         let reads_incremental = self.first_incremental_ref(query_sql).is_some();
         let Some(df) = self.ctx.sql(query_sql).await.ok() else {
-            return IncEmit::None;
+            return (IncEmit::None, false);
         };
         let plan = df.logical_plan();
         if let Some(agg) = crate::aggregate_state::find_aggregate(plan) {
             let n = agg.group_exprs.len();
             // Keyed aggregate → upsert (terminal under the flag, or chained over an incremental
             // MV). A global aggregate (no GROUP BY) is single-row → full-emit.
-            return if n > 0 && (flag || reads_incremental) {
+            let inc = if n > 0 && (flag || reads_incremental) {
                 IncEmit::Upsert((0..n).collect())
             } else {
                 IncEmit::None
             };
+            return (inc, true);
         }
         // Projection/filter over an incremental MV's changelog → Z-set multiset snapshot.
         if reads_incremental && crate::sql_analysis::extract_projection_filter(plan).is_some() {
-            return IncEmit::Multiset;
+            return (IncEmit::Multiset, false);
         }
         // `changelog ⋈ static dim` enrich join → Z-set multiset snapshot.
         if reads_incremental
@@ -1391,7 +1396,7 @@ impl LaminarDB {
             )
             .is_some()
         {
-            return IncEmit::Multiset;
+            return (IncEmit::Multiset, false);
         }
         // `changelog ⋈ changelog` inner IVM join → Z-set multiset snapshot.
         if reads_incremental
@@ -1401,19 +1406,19 @@ impl LaminarDB {
             )
             .is_some()
         {
-            return IncEmit::Multiset;
+            return (IncEmit::Multiset, false);
         }
-        IncEmit::None
+        (IncEmit::None, false)
     }
 
     /// Cluster mode wraps the provider to union peer vnode slices on read.
-    async fn register_mv_provider(
+    fn register_mv_provider(
         &self,
         name_str: &str,
         schema: Arc<Schema>,
-        query_sql: &str,
         has_window: bool,
         inc: IncEmit,
+        has_aggregate: bool,
     ) -> Result<(), DbError> {
         use crate::mv_store::MvStorageMode;
 
@@ -1422,16 +1427,8 @@ impl LaminarDB {
         let mode = match inc {
             IncEmit::Upsert(key_cols) => MvStorageMode::Upsert { key_cols },
             IncEmit::Multiset => MvStorageMode::Multiset,
-            IncEmit::None => {
-                let has_aggregate = self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
-                    crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
-                });
-                if has_aggregate && !has_window {
-                    MvStorageMode::Aggregate
-                } else {
-                    MvStorageMode::append_default()
-                }
-            }
+            IncEmit::None if has_aggregate && !has_window => MvStorageMode::Aggregate,
+            IncEmit::None => MvStorageMode::append_default(),
         };
 
         self.mv_store
@@ -1509,15 +1506,23 @@ impl LaminarDB {
                 "{}{name_str}_",
                 crate::sql_analysis::MULTIWAY_INTERMEDIATE_PREFIX
             );
-            let intermediates: Vec<String> = self
+            // Numeric-suffix only: a bare starts_with would also sweep a name-prefix sibling
+            // (dropping `sales` would hit `__ivm_sales_daily_0`).
+            let mut intermediates: Vec<(u64, String)> = self
                 .connector_manager
                 .lock()
                 .streams()
-                .iter()
-                .filter(|(n, _)| n.starts_with(&prefix))
-                .map(|(n, _)| n.clone())
+                .keys()
+                .filter_map(|n| {
+                    n.strip_prefix(&prefix)
+                        .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|rest| rest.parse::<u64>().ok())
+                        .map(|k| (k, n.clone()))
+                })
                 .collect();
-            for it in intermediates {
+            // I_k reads I_{k-1}; drop highest suffix first so unregister never hits a live dependent.
+            intermediates.sort_unstable_by_key(|&(k, _)| std::cmp::Reverse(k));
+            for (_, it) in intermediates {
                 let _ = self.mv_registry.lock().unregister(&it);
                 if !dropped_names.contains(&it) {
                     dropped_names.push(it);
