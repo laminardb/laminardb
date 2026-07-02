@@ -973,8 +973,16 @@ mod failures {
                 .all(|&x| x != v),
             "A must drop V",
         );
-        // Let A run cycles so apply_revoked_vnodes drains pending_revoke (drop_vnodes purges V).
-        sleep(Duration::from_millis(600)).await;
+        // Poll (don't fixed-sleep) until A's compute thread drains the staged revoke — apply_revoked_vnodes
+        // empties pending_revoke while dropping V's state — so the reacquire exercises drop-then-rehydrate.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.nodes[follower_idx].db.pending_revoke_vnode_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "A never drained the pending revoke of V",
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
 
         // (2) REACQUIRE: move V back B -> A (exercises the revoked-state-drop-then-rehydrate path).
         let seed2 = store.load().await.unwrap().unwrap();

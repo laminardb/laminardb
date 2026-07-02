@@ -263,6 +263,15 @@ pub struct SnapshotAdoption {
 }
 
 impl LaminarDB {
+    /// Vnodes revoked by a rebalance and staged for operator-state drop on the next cycle; drained
+    /// once the compute thread applies the revoke. Observability/test hook.
+    #[cfg(feature = "cluster")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_revoke_vnode_count(&self) -> usize {
+        self.pending_revoke_vnodes.lock().len()
+    }
+
     /// Create an embedded in-memory database with default settings.
     ///
     /// # Errors
