@@ -705,9 +705,12 @@ impl SinkConnector for PostgresSink {
         if !config.properties().is_empty() {
             self.config = PostgresSinkConfig::from_config(config)?;
         }
+        // Validate unconditionally — `from_config` above is skipped when `properties` is empty
+        // (pre-set config), so this is the only place the invariants (incl. EO+append, CN-6) are
+        // guaranteed to run on the config actually in effect.
+        self.config.validate()?;
 
-        // Validate changelog requires upsert. (EO+append is rejected in `PostgresSinkConfig::validate`,
-        // run via `from_config` above.)
+        // Validate changelog requires upsert.
         if self.config.changelog_mode && self.config.write_mode != WriteMode::Upsert {
             return Err(ConnectorError::ConfigurationError(
                 "changelog mode requires write.mode = 'upsert'".into(),

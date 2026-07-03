@@ -205,6 +205,21 @@ impl StreamingCoordinator {
             }
         }
 
+        // A source that releases an upstream resource only on durable commit (e.g. a PostgreSQL
+        // replication slot, whose WAL advances via notify_epoch_committed) needs checkpointing —
+        // otherwise that resource grows without bound (CN-1). Reject the combination up front.
+        if config.checkpoint_interval.is_none() {
+            for src in &sources {
+                if src.connector.requires_checkpointing_for_progress() {
+                    return Err(DbError::Config(format!(
+                        "[LDB-5034] source '{}' requires checkpointing to be enabled: its upstream \
+                         resource (e.g. a replication slot) is only released at a durable checkpoint",
+                        src.name
+                    )));
+                }
+            }
+        }
+
         if config.channel_capacity == 0 {
             return Err(DbError::Config(
                 "[LDB-0010] channel_capacity must be > 0".into(),

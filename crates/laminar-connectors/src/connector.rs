@@ -447,6 +447,18 @@ pub trait SourceConnector: Send {
     ) -> Result<(), ConnectorError> {
         Ok(())
     }
+
+    /// `true` if this source releases an upstream resource only when an epoch is durably
+    /// committed (via [`SourceConnector::notify_epoch_committed`]), so running it without
+    /// checkpointing lets that resource grow without bound. A `PostgreSQL` logical replication slot
+    /// is the canonical case: its WAL is reclaimed only as the confirmed-flush LSN advances, which
+    /// happens on commit — with checkpointing off the slot never advances and the source database's
+    /// WAL fills. The pipeline rejects such a source when checkpointing is disabled.
+    ///
+    /// Default `false` (Kafka, files, etc. self-manage retention or tolerate a static offset).
+    fn requires_checkpointing_for_progress(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for sink connectors that write data to external systems.

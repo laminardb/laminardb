@@ -873,6 +873,13 @@ impl SourceConnector for PostgresCdcSource {
         Ok(())
     }
 
+    fn requires_checkpointing_for_progress(&self) -> bool {
+        // The replication slot's WAL is reclaimed only as the confirmed-flush LSN advances, which
+        // now happens on durable commit (CN-1). Without checkpointing the slot never advances and
+        // the source database's WAL fills without bound, so the pipeline rejects this combination.
+        true
+    }
+
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
@@ -1085,6 +1092,13 @@ mod tests {
         assert!(src.confirmed_flush_lsn.is_zero());
         assert_eq!(src.event_buffer.len(), 0);
         assert_eq!(src.schema().fields().len(), 6);
+    }
+
+    #[test]
+    fn test_requires_checkpointing_for_progress() {
+        // The replication slot's WAL only advances on durable commit, so the pipeline must reject a
+        // CDC source without checkpointing (or its WAL grows without bound) (CN-1).
+        assert!(default_source().requires_checkpointing_for_progress());
     }
 
     #[test]
