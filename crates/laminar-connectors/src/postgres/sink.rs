@@ -27,7 +27,6 @@ use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use laminar_core::changelog::WEIGHT_COLUMN;
 
 use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
@@ -228,31 +227,52 @@ impl PostgresSink {
         }
     }
 
-    /// Builds the DELETE SQL for changelog deletes.
+    /// Builds the DELETE SQL for changelog deletes. One array parameter is bound per primary-key
+    /// column (`$1`, `$2`, …), each holding that column's values for the batch's deleted keys.
     ///
     /// ```sql
+    /// -- single PK
     /// DELETE FROM public.events WHERE id = ANY($1::int8[])
+    /// -- composite PK: match tuple-wise via UNNEST, not the cross-product
+    /// DELETE FROM public.events AS t USING UNNEST($1::int8[], $2::text[]) AS k(id, name)
+    ///   WHERE t.id = k.id AND t.name = k.name
     /// ```
     #[must_use]
     pub fn build_delete_sql(schema: &SchemaRef, config: &PostgresSinkConfig) -> String {
-        let pk_conditions: Vec<String> = config
-            .primary_key_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                let dt = schema
-                    .field_with_name(col)
-                    .map_or(DataType::Utf8, |f| f.data_type().clone());
-                let pg_type = arrow_type_to_pg_sql(&dt);
-                format!("{col} = ANY(${}::{}[])", i + 1, pg_type)
-            })
-            .collect();
+        let pg_type = |col: &str| {
+            let dt = schema
+                .field_with_name(col)
+                .map_or(DataType::Utf8, |f| f.data_type().clone());
+            arrow_type_to_pg_sql(&dt)
+        };
+        let pk = &config.primary_key_columns;
 
-        format!(
-            "DELETE FROM {} WHERE {}",
-            config.qualified_table_name(),
-            pk_conditions.join(" AND "),
-        )
+        // A single PK column can use a plain ANY(); a composite PK must match keys tuple-wise, or
+        // `col1 = ANY($1) AND col2 = ANY($2)` deletes the cross-product — e.g. deleting (1,'a') and
+        // (2,'b') would also delete (1,'b') and (2,'a') (CN-2). UNNEST zips the arrays positionally.
+        if pk.len() <= 1 {
+            let col = pk.first().map_or("", String::as_str);
+            format!(
+                "DELETE FROM {} WHERE {col} = ANY($1::{}[])",
+                config.qualified_table_name(),
+                pg_type(col),
+            )
+        } else {
+            let unnest_args: Vec<String> = pk
+                .iter()
+                .enumerate()
+                .map(|(i, col)| format!("${}::{}[]", i + 1, pg_type(col)))
+                .collect();
+            let match_conds: Vec<String> =
+                pk.iter().map(|col| format!("t.{col} = k.{col}")).collect();
+            format!(
+                "DELETE FROM {} AS t USING UNNEST({}) AS k({}) WHERE {}",
+                config.qualified_table_name(),
+                unnest_args.join(", "),
+                pk.join(", "),
+                match_conds.join(" AND "),
+            )
+        }
     }
 
     /// Builds CREATE TABLE DDL from the Arrow schema.
@@ -507,7 +527,8 @@ impl PostgresSink {
         Ok(WriteResult::new(rows as usize, byte_estimate))
     }
 
-    /// Flushes changelog batches: deletes first, then upserts.
+    /// Flushes changelog batches per primary key: one collapsed terminal op each, then upserts
+    /// before deletes.
     #[cfg(feature = "postgres-sink")]
     #[allow(clippy::cast_possible_truncation)]
     async fn flush_changelog(
@@ -517,15 +538,18 @@ impl PostgresSink {
         let mut total_rows: u64 = 0;
         let mut total_bytes: u64 = 0;
 
-        // A Z-set changelog (incremental MV) carries `__weight` (no `_op`). Collapse the whole epoch
-        // per primary key into a cardinality-safe `{U,D}` batch that `split_changelog_batch`
-        // understands — otherwise the many retract+insert events per key fail the split (no `_op`) or
-        // violate ON CONFLICT cardinality. A CDC changelog (`_op`, no `__weight`) is split as before.
-        let is_zset = self
-            .buffer
-            .iter()
-            .any(|b| b.schema().index_of(WEIGHT_COLUMN).is_ok());
-        let split_input: Vec<RecordBatch> = if is_zset {
+        if self.buffer.is_empty() {
+            return Ok(WriteResult::new(0, 0));
+        }
+
+        // Collapse the whole epoch per primary key into a cardinality-safe `{U,D}` batch that
+        // `split_changelog_batch` understands. A Z-set changelog (`__weight`, no `_op`) MUST be
+        // collapsed or its many retract+insert events per key fail the split / violate ON CONFLICT
+        // cardinality. A CDC changelog (`_op`) MUST be collapsed too: otherwise a delete-then-
+        // reinsert of a key in one epoch splits into both bins and, applied upserts-then-deletes,
+        // wrongly ends deleted (CN-3). `collapse_changelog` keeps the last arrival per key and
+        // normalizes `_op`, so each key contributes exactly one terminal U or D.
+        let split_input: Vec<RecordBatch> = {
             let schema = self.buffer[0].schema();
             let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
                 .map_err(|e| ConnectorError::Internal(format!("concat changelog: {e}")))?;
@@ -533,8 +557,6 @@ impl PostgresSink {
                 &combined,
                 &self.config.primary_key_columns,
             )?]
-        } else {
-            self.buffer.clone()
         };
 
         // Split each batch into inserts/deletes.
@@ -684,7 +706,8 @@ impl SinkConnector for PostgresSink {
             self.config = PostgresSinkConfig::from_config(config)?;
         }
 
-        // Validate changelog requires upsert.
+        // Validate changelog requires upsert. (EO+append is rejected in `PostgresSinkConfig::validate`,
+        // run via `from_config` above.)
         if self.config.changelog_mode && self.config.write_mode != WriteMode::Upsert {
             return Err(ConnectorError::ConfigurationError(
                 "changelog mode requires write.mode = 'upsert'".into(),
@@ -1357,9 +1380,14 @@ mod tests {
         config.primary_key_columns = vec!["id".to_string(), "name".to_string()];
         let sql = PostgresSink::build_delete_sql(&schema, &config);
 
-        assert!(sql.contains("id = ANY($1::int8[])"));
-        assert!(sql.contains("name = ANY($2::text[])"));
-        assert!(sql.contains(" AND "));
+        // Composite PK must match tuple-wise (UNNEST zips $1/$2 positionally), NOT the
+        // cross-product `id = ANY($1) AND name = ANY($2)` which over-deletes (CN-2).
+        assert_eq!(
+            sql,
+            "DELETE FROM public.events AS t USING UNNEST($1::int8[], $2::text[]) AS k(id, name) \
+             WHERE t.id = k.id AND t.name = k.name"
+        );
+        assert!(!sql.contains("id = ANY($1::int8[]) AND name = ANY"));
     }
 
     #[test]

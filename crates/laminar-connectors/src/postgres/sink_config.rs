@@ -221,6 +221,17 @@ impl PostgresSinkConfig {
                 "upsert mode requires 'primary.key' to be set".into(),
             ));
         }
+        // Exactly-once append (COPY) is not idempotent: a replay under a fresh epoch id re-inserts
+        // every row. Only upsert is PK-idempotent under replay, so reject EO+append (CN-6).
+        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && self.write_mode == WriteMode::Append
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "exactly-once delivery requires write.mode = 'upsert' (append/COPY is not \
+                 idempotent under replay)"
+                    .into(),
+            ));
+        }
         if self.batch_size == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "batch.size must be > 0".into(),
@@ -308,6 +319,27 @@ mod tests {
         assert_eq!(cfg.schema_name, "public");
         assert_eq!(cfg.write_mode, WriteMode::Append);
         assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
+    }
+
+    #[test]
+    fn test_exactly_once_append_rejected() {
+        // write.mode defaults to append; EO+append is not idempotent under replay (CN-6).
+        let mut pairs = required_pairs();
+        pairs.push(("delivery.guarantee", "exactly_once"));
+        let err = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(
+            err.to_string().contains("upsert"),
+            "EO+append must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_exactly_once_upsert_accepted() {
+        let mut pairs = required_pairs();
+        pairs.push(("delivery.guarantee", "exactly_once"));
+        pairs.push(("write.mode", "upsert"));
+        pairs.push(("primary.key", "id"));
+        assert!(PostgresSinkConfig::from_config(&make_config(&pairs)).is_ok());
     }
 
     #[test]

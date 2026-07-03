@@ -103,6 +103,11 @@ pub struct PostgresCdcSource {
     /// durably-checkpointed positions (prevents at-least-once violation).
     #[cfg(feature = "postgres-cdc")]
     confirmed_lsn_tx: Option<tokio::sync::watch::Sender<u64>>,
+
+    /// WAL payloads retained across polls when a decode error interrupted processing mid-batch,
+    /// so the undecoded remainder isn't dropped (CN-7). Drained first on the next poll.
+    #[cfg(feature = "postgres-cdc")]
+    pending_payloads: VecDeque<WalPayload>,
 }
 
 /// In-progress transaction state.
@@ -171,6 +176,8 @@ impl PostgresCdcSource {
             reader_shutdown: None,
             #[cfg(feature = "postgres-cdc")]
             confirmed_lsn_tx: None,
+            #[cfg(feature = "postgres-cdc")]
+            pending_payloads: VecDeque::new(),
         }
     }
 
@@ -730,10 +737,12 @@ impl SourceConnector for PostgresCdcSource {
         #[cfg(feature = "postgres-cdc")]
         {
             let high_watermark = self.config.backpressure_high_watermark();
-            let mut payloads = Vec::new();
+            // Start with any payloads retained from a prior poll's decode error so they are
+            // re-processed in order and not dropped (CN-7).
+            let mut payloads: Vec<WalPayload> = self.pending_payloads.drain(..).collect();
             let mut reader_closed = false;
 
-            if self.event_buffer.len() < high_watermark {
+            if self.event_buffer.len() + payloads.len() < high_watermark {
                 if let Some(ref mut rx) = self.wal_rx {
                     while payloads.len() + self.event_buffer.len() < max_records
                         && self.event_buffer.len() + payloads.len() < high_watermark
@@ -756,8 +765,15 @@ impl SourceConnector for PostgresCdcSource {
                 );
             }
 
-            for payload in payloads {
-                self.process_wal_payload(payload)?;
+            // Process in order; on a decode error, retain the undecoded remainder for the next poll
+            // rather than dropping it — otherwise write_lsn later advances past those changes and
+            // they are silently lost (CN-7).
+            let mut it = payloads.into_iter();
+            while let Some(payload) = it.next() {
+                if let Err(e) = self.process_wal_payload(payload) {
+                    self.pending_payloads.extend(it);
+                    return Err(e);
+                }
             }
             if reader_closed && self.event_buffer.is_empty() {
                 self.state = ConnectorState::Failed;
@@ -802,21 +818,14 @@ impl SourceConnector for PostgresCdcSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut cp = SourceCheckpoint::new(0);
-        // polled_lsn = latest position drained into a batch. The PG
-        // slot is only advanced here (not in poll_batch) to prevent
-        // data loss on crash.
+        // polled_lsn = latest position drained into a batch — the resumable point recorded in the
+        // manifest. The PG slot is NOT advanced here: doing so per poll lets PG reclaim WAL for
+        // data that is only in-pipeline, so a crash loses an LSN range recovery still needs.
+        // Slot feedback is deferred to notify_epoch_committed (durable-commit only) (CN-1).
         cp.set_offset("lsn", self.polled_lsn.to_string());
         cp.set_offset("write_lsn", self.write_lsn.to_string());
         cp.set_metadata("slot_name", &self.config.slot_name);
         cp.set_metadata("publication", &self.config.publication);
-
-        // Feed polled LSN to reader task so PG can reclaim WAL.
-        // watch::Sender::send is &self, so this works from checkpoint().
-        #[cfg(feature = "postgres-cdc")]
-        if let Some(ref tx) = self.confirmed_lsn_tx {
-            let _ = tx.send(self.polled_lsn.as_u64());
-        }
-
         cp
     }
 
@@ -832,6 +841,33 @@ impl SourceConnector for PostgresCdcSource {
         if let Some(write_lsn_str) = checkpoint.get_offset("write_lsn") {
             if let Ok(lsn) = write_lsn_str.parse::<Lsn>() {
                 self.write_lsn = lsn;
+            }
+        }
+        Ok(())
+    }
+
+    async fn notify_epoch_committed(
+        &mut self,
+        _epoch: u64,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        // Advance the PG replication slot ONLY after the epoch is durably committed (manifest
+        // persisted + sinks committed), so PG never reclaims WAL for data still in-pipeline (CN-1).
+        // The checkpoint carries the exact LSN persisted for this epoch; a timer-driven empty
+        // checkpoint has no "lsn" offset and is a no-op.
+        #[cfg(feature = "postgres-cdc")]
+        if let Some(lsn_str) = checkpoint.get_offset("lsn") {
+            match lsn_str.parse::<Lsn>() {
+                Ok(lsn) => {
+                    if let Some(ref tx) = self.confirmed_lsn_tx {
+                        let _ = tx.send(lsn.as_u64());
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    lsn = %lsn_str,
+                    error = %e,
+                    "notify_epoch_committed: unparseable committed LSN; slot not advanced"
+                ),
             }
         }
         Ok(())

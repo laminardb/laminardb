@@ -776,6 +776,7 @@ impl SinkConnector for KafkaSink {
         // Phase 2: await each delivery report. Outer Err = oneshot canceled
         // (producer dropped); inner Err = Kafka delivery error.
         let mut failed: usize = 0;
+        let mut dlq_failed: usize = 0;
         let mut first_error: Option<String> = None;
         for (i, (send_time, future)) in delivery_futures.into_iter().enumerate() {
             let err_msg = match future.await {
@@ -800,6 +801,10 @@ impl SinkConnector for KafkaSink {
                 let key: Option<&[u8]> =
                     keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
                 if let Err(dlq_err) = self.route_to_dlq(&payloads[i], key, &err_msg).await {
+                    // The DLQ send failed too (often correlated — the broker is down), so the
+                    // record exists nowhere. Count it so the epoch is poisoned rather than
+                    // committed around a lost record (CN-5).
+                    dlq_failed += 1;
                     warn!(
                         original_error = %err_msg,
                         dlq_error = %dlq_err,
@@ -819,11 +824,13 @@ impl SinkConnector for KafkaSink {
             "wrote batch to Kafka"
         );
 
-        // With DLQ, failures are already routed — report success. Without,
-        // surface the aggregate so the sink task can poison the epoch.
-        if failed > 0 && self.dlq_producer.is_none() {
+        // A failed record is tolerated only if it was durably re-routed: no DLQ configured means
+        // every failure must poison the epoch; with a DLQ, only failures whose DLQ send ALSO
+        // failed (record lost) escalate (CN-5). Otherwise the sink task poisons the epoch.
+        if failed > 0 && (self.dlq_producer.is_none() || dlq_failed > 0) {
             return Err(ConnectorError::WriteError(format!(
-                "Kafka produce: {failed}/{} records failed, first error: {}",
+                "Kafka produce: {failed}/{} records failed ({dlq_failed} also failed DLQ routing), \
+                 first error: {}",
                 payloads.len(),
                 first_error.unwrap_or_else(|| "unknown".into())
             )));

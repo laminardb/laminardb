@@ -131,6 +131,10 @@ pub struct KafkaSource {
     poll_meta_offsets: Vec<i64>,
     poll_meta_timestamps: Vec<Option<i64>>,
     poll_meta_headers: Vec<Option<String>>,
+    /// This poll's (topic, partition, offset) triples, folded into `offsets` only after the batch
+    /// deserializes — so a decode failure / poison-pill escalation doesn't advance offsets past the
+    /// lost batch (CN-4). Reused across polls.
+    poll_staged_offsets: Vec<(Arc<str>, i32, i64)>,
 }
 
 impl KafkaSource {
@@ -239,6 +243,7 @@ impl KafkaSource {
             poll_meta_offsets: Vec::new(),
             poll_meta_timestamps: Vec::new(),
             poll_meta_headers: Vec::new(),
+            poll_staged_offsets: Vec::new(),
         }
     }
 
@@ -1280,9 +1285,11 @@ impl SourceConnector for KafkaSource {
 
         let limit = max_records.min(self.config.max_poll_records);
 
-        // Reuse struct-level buffers — clear without freeing capacity.
+        // Reuse struct-level buffers — clear without freeing capacity. Clearing staged offsets
+        // here also discards any left by a prior poll whose batch failed to deserialize (CN-4).
         self.poll_payload_buf.clear();
         self.poll_payload_offsets.clear();
+        self.poll_staged_offsets.clear();
         self.poll_meta_partitions.clear();
         self.poll_meta_offsets.clear();
         self.poll_meta_timestamps.clear();
@@ -1304,7 +1311,10 @@ impl SourceConnector for KafkaSource {
                     self.poll_payload_buf.extend_from_slice(&kp.data);
                     self.poll_payload_offsets.push((start, kp.data.len()));
 
-                    self.offsets.update_arc(&kp.topic, kp.partition, kp.offset);
+                    // Stage the offset; it is folded into `self.offsets` only after this batch
+                    // deserializes (CN-4), so an escalated decode failure can't advance past it.
+                    self.poll_staged_offsets
+                        .push((Arc::clone(&kp.topic), kp.partition, kp.offset));
 
                     if include_metadata {
                         self.poll_meta_partitions.push(kp.partition);
@@ -1370,10 +1380,11 @@ impl SourceConnector for KafkaSource {
             }
         }
 
-        // Update the offset snapshot used by `post_rebalance` for seek-on-assign.
-        // No broker commit happens here — that's driven exclusively by
-        // `notify_epoch_committed` against the TPL captured at checkpoint time.
-        if had_revoke || !self.poll_payload_offsets.is_empty() {
+        // A rebalance revoke purged self.offsets above; mirror it to the seek-on-assign snapshot
+        // now. This poll's own offsets are folded and mirrored only after the batch deserializes
+        // (below), so a decode failure doesn't leave the snapshot pointing past a lost batch (CN-4).
+        // No broker commit happens here — that's driven exclusively by `notify_epoch_committed`.
+        if had_revoke {
             lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
         }
 
@@ -1557,6 +1568,19 @@ impl SourceConnector for KafkaSource {
                 (batch, Some(good_idx))
             }
         };
+
+        // Deserialization succeeded — every Ok path reaches here; the two escalation errors above
+        // returned first. Fold this poll's staged offsets into the committed tracker only now, so a
+        // decode failure never advances offsets past the lost batch (CN-4). Poison pills isolated
+        // below the error-rate threshold are intentionally dropped, so advancing past them is
+        // correct. update_arc is monotonic, so fold order is irrelevant.
+        if !self.poll_staged_offsets.is_empty() {
+            for (topic, partition, offset) in &self.poll_staged_offsets {
+                self.offsets.update_arc(topic, *partition, *offset);
+            }
+            self.poll_staged_offsets.clear();
+            lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
+        }
 
         // If poison pill fallback filtered records, also filter metadata
         // vectors so their lengths match the deserialized batch row count.
