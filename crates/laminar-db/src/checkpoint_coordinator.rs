@@ -893,26 +893,44 @@ impl CheckpointCoordinator {
         result
     }
 
-    /// Inner pre-commit loop (no timeout). Fires all exactly-once sinks concurrently
-    /// and collects commit descriptors from coordinated-commit sinks.
+    /// Inner pre-commit loop (no timeout). Flushes every sink so a checkpoint never records
+    /// offsets past rows still buffered in an at-least-once sink (CP-5); exactly-once sinks
+    /// additionally prepare their transaction, and coordinated-commit sinks return a descriptor.
+    /// (`commit`/`rollback` remain exactly-once-only — an ALO sink is durable after its flush.)
     async fn pre_commit_sinks_inner(
         &self,
         epoch: u64,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>, DbError> {
-        let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
+        let futures = self.sinks.iter().map(|sink| {
             let handle = sink.handle.clone();
             let name = sink.name.clone();
             let coordinated = sink.coordinated_commit;
+            let exactly_once = sink.exactly_once;
             async move {
-                match handle.pre_commit(epoch).await {
-                    Ok(descriptor) => {
-                        debug!(sink = %name, epoch, "sink pre-committed");
-                        // Only coordinated sinks contribute a descriptor for the committer.
-                        Ok(descriptor.filter(|_| coordinated).map(|d| (name, d)))
+                if exactly_once {
+                    // 2PC phase 1: flush + prepare; coordinated sinks return a descriptor.
+                    match handle.pre_commit(epoch).await {
+                        Ok(descriptor) => {
+                            debug!(sink = %name, epoch, "sink pre-committed");
+                            Ok(descriptor.filter(|_| coordinated).map(|d| (name, d)))
+                        }
+                        Err(e) => Err(DbError::Checkpoint(format!(
+                            "sink '{name}' pre-commit failed: {e}"
+                        ))),
                     }
-                    Err(e) => Err(DbError::Checkpoint(format!(
-                        "sink '{name}' pre-commit failed: {e}"
-                    ))),
+                } else {
+                    // At-least-once: a plain buffer flush, NOT pre_commit — ALO sinks never got
+                    // begin_epoch, and some (Postgres) reject a pre_commit for an epoch they didn't
+                    // open. This lands buffered rows before the manifest seals offsets (CP-5).
+                    match handle.flush().await {
+                        Ok(()) => {
+                            debug!(sink = %name, epoch, "at-least-once sink flushed");
+                            Ok(None)
+                        }
+                        Err(e) => Err(DbError::Checkpoint(format!(
+                            "sink '{name}' flush failed: {e}"
+                        ))),
+                    }
                 }
             }
         });
@@ -1448,11 +1466,14 @@ impl CheckpointCoordinator {
                 return;
             }
         };
-        let has_pending = last
+        // Both Pending (crash before the commit decision) and Failed (partial commit recorded
+        // after the decision, see the post-commit path) are resolved here — re-driven when a
+        // marker is present, rolled back when it is absent (CP-3).
+        let has_unresolved = last
             .sink_commit_statuses
             .values()
-            .any(|s| matches!(s, SinkCommitStatus::Pending));
-        if !has_pending {
+            .any(|s| matches!(s, SinkCommitStatus::Pending | SinkCommitStatus::Failed(_)));
+        if !has_unresolved {
             return;
         }
 
@@ -2175,6 +2196,9 @@ impl CheckpointCoordinator {
             .values()
             .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
         if has_failures {
+            // No commit marker is written for a partial commit (CP-3c), so recovery replays this
+            // epoch. Roll back to abort the failed sink's open transaction — otherwise the next
+            // begin_epoch on that producer errors and it goes non-transactional until restart.
             error!(
                 epoch,
                 checkpoint_id, "follower sink commit partially failed — rolling back",
@@ -2496,8 +2520,14 @@ impl CheckpointCoordinator {
             return Ok(self.fail_epoch(checkpoint_id, epoch, start, gate_err).await);
         }
 
-        // Write the commit marker before sink commits; recovery uses this to distinguish a
-        // committed epoch from a crash mid-flight. Leader-gated in cluster mode.
+        // The commit marker is recorded AFTER sink commits (see the success path below), not
+        // before. A Kafka producer transaction is not resumable across a restart
+        // (init_transactions fences it), so a marker-before-commit crash would restore the
+        // manifest as committed while the sink output was lost. Recording it only once every
+        // sink commit succeeds turns that loss window into a dedup-able replay window: a crash
+        // before the commit decision replays the epoch, and a txn aborted before it committed is
+        // invisible. (A crash in the narrow gap between a sink committing and its Committed status
+        // persisting can replay an already-visible commit → a duplicate, never a loss.) (CP-3)
         let is_decision_leader = {
             #[cfg(feature = "cluster")]
             {
@@ -2510,19 +2540,6 @@ impl CheckpointCoordinator {
                 true
             }
         };
-        if is_decision_leader {
-            if let Some(ds) = self.decision_store.as_ref() {
-                if let Err(e) = ds.record_committed(epoch).await {
-                    error!(
-                        checkpoint_id, epoch, error = %e,
-                        "[LDB-6038] cannot record commit marker — aborting epoch",
-                    );
-                    return Ok(self
-                        .fail_epoch(checkpoint_id, epoch, start, format!("commit marker: {e}"))
-                        .await);
-                }
-            }
-        }
 
         #[cfg(feature = "cluster")]
         self.announce_if_leader(
@@ -2553,14 +2570,17 @@ impl CheckpointCoordinator {
         }
 
         if has_failures {
-            // The commit decision is durable; don't roll back. Failed statuses are re-driven
-            // by `reconcile_prepared_on_init` on restart.
+            // No commit marker is written for a partial commit (it is recorded only on full
+            // success, below), so recovery does not treat this epoch as committed. Don't roll
+            // back inline: the sinks that DID commit are durable, and a live rollback would abort
+            // their next epoch. The per-sink statuses persisted above let `reconcile_prepared_on_init`
+            // resolve the rest on restart (roll back the uncommitted sinks).
             self.checkpoints_failed += 1;
             error!(
                 checkpoint_id,
                 epoch,
-                "sink commit partially failed after the commit decision — \
-                 statuses recorded for recovery-time re-drive"
+                "sink commit partially failed — no commit marker written; \
+                 statuses recorded for recovery-time reconcile"
             );
             self.phase = CheckpointPhase::Idle;
             let duration = start.elapsed();
@@ -2574,6 +2594,23 @@ impl CheckpointCoordinator {
                 duration,
                 error: Some("partial sink commit failure".into()),
             });
+        }
+
+        // Every sink committed and their Committed statuses are persisted (above), so recovery
+        // restores this epoch whether or not the marker below lands. Record the marker anyway: it
+        // is the fast-path commit decision reconcile/recovery consult. Must precede begin_epoch.
+        if is_decision_leader {
+            if let Some(ds) = self.decision_store.as_ref() {
+                if let Err(e) = ds.record_committed(epoch).await {
+                    error!(
+                        checkpoint_id, epoch, error = %e,
+                        "[LDB-6038] sinks committed but marker write failed — recovery restores from the persisted Committed statuses",
+                    );
+                    return Ok(self
+                        .fail_epoch(checkpoint_id, epoch, start, format!("commit marker: {e}"))
+                        .await);
+                }
+            }
         }
 
         self.phase = CheckpointPhase::Idle;

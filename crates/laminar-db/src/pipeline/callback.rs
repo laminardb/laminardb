@@ -145,6 +145,13 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// Take a pending exactly-once sink failure, if any. A poisoned sink epoch aborts its
+    /// transaction; escalating to a pipeline fault (like a cycle error) is the only path that
+    /// replays the dropped rows, so the coordinator polls this and faults for recovery (CP-4).
+    fn take_sink_fault(&mut self) -> Option<String> {
+        None
+    }
+
     /// `true` when the cluster is converged enough for the leader to checkpoint; the
     /// cluster impl reads a locally-published verdict, no gossip. Default `true`
     /// (single-node). `impl Future` (not `async fn`) preserves the `trait_variant`

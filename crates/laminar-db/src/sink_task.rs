@@ -65,7 +65,8 @@ pub(crate) enum SinkCommand {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
-    #[cfg(test)]
+    /// Flush buffered rows without transaction semantics — used to durably land an
+    /// at-least-once sink's buffer at checkpoint (CP-5).
     Flush {
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
@@ -210,7 +211,8 @@ impl SinkTaskHandle {
             .map_err(|_| self.ack_dropped_err("begin-epoch"))?
     }
 
-    #[cfg(test)]
+    /// Flush the sink's buffer (no transaction). Drives an at-least-once sink's durable landing
+    /// at checkpoint so the manifest never seals offsets past still-buffered rows (CP-5).
     pub async fn flush(&self) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
@@ -416,8 +418,8 @@ async fn handle_sink_command(
             }
             ack.send(result);
         }
-        #[cfg(test)]
         SinkCommand::Flush { ack } => {
+            // No poison/epoch gate: a plain buffer drain for at-least-once sinks (CP-5).
             let result = inner.sink.flush().await;
             ack.send(result);
         }

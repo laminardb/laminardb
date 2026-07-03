@@ -324,39 +324,84 @@ impl MvEntry {
         })
     }
 
-    fn update(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+    /// Apply one cycle's worth of output batches. `Aggregate` replaces its whole result set
+    /// once here — a non-incremental GROUP BY MV whose output exceeds one `DataFusion` batch
+    /// (>8192 rows, or >1 partition in cluster) arrives as several batches, so clearing
+    /// per-batch would keep only the last chunk (EX-1). Empty batches are skipped, and an
+    /// all-empty cycle leaves the prior snapshot untouched.
+    fn update_cycle(&mut self, batches: &[RecordBatch]) -> Result<(), DbError> {
         match &self.mode {
             MvStorageMode::Aggregate => {
+                // Don't clear on an all-empty cycle — no recompute happened, keep the snapshot.
+                if batches.iter().all(|b| b.num_rows() == 0) {
+                    return Ok(());
+                }
                 self.batches.clear();
-                self.approx_bytes = batch.get_array_memory_size();
-                self.batches.push_back(batch.clone());
+                self.approx_bytes = 0;
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.approx_bytes += batch.get_array_memory_size();
+                    self.batches.push_back(batch.clone());
+                }
             }
             MvStorageMode::Append { max_batches } => {
-                self.approx_bytes += batch.get_array_memory_size();
-                self.batches.push_back(batch.clone());
-                while self.batches.len() > 1
-                    && (self.batches.len() > *max_batches || self.approx_bytes > DEFAULT_MAX_BYTES)
-                {
-                    if let Some(evicted) = self.batches.pop_front() {
-                        self.approx_bytes = self
-                            .approx_bytes
-                            .saturating_sub(evicted.get_array_memory_size());
-                    } else {
-                        break;
+                let max_batches = *max_batches;
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.approx_bytes += batch.get_array_memory_size();
+                    self.batches.push_back(batch.clone());
+                    while self.batches.len() > 1
+                        && (self.batches.len() > max_batches
+                            || self.approx_bytes > DEFAULT_MAX_BYTES)
+                    {
+                        if let Some(evicted) = self.batches.pop_front() {
+                            self.approx_bytes = self
+                                .approx_bytes
+                                .saturating_sub(evicted.get_array_memory_size());
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
             MvStorageMode::Upsert { .. } => {
                 if let Some(up) = self.upsert.as_mut() {
-                    // apply() is atomic; on failure the prior snapshot stands, so surface the error.
-                    up.apply(batch)?;
+                    // apply() is atomic (a failed batch leaves the prior snapshot); attempt every
+                    // batch so one bad batch can't drop later batches' deltas, and surface the first.
+                    let mut first_err = None;
+                    for batch in batches {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        if let Err(e) = up.apply(batch) {
+                            first_err.get_or_insert(e);
+                        }
+                    }
                     self.approx_bytes = up.approx_bytes;
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
                 }
             }
             MvStorageMode::Multiset => {
                 if let Some(ms) = self.multiset.as_mut() {
-                    ms.apply(batch)?;
+                    let mut first_err = None;
+                    for batch in batches {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        if let Err(e) = ms.apply(batch) {
+                            first_err.get_or_insert(e);
+                        }
+                    }
                     self.approx_bytes = ms.approx_bytes;
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -422,9 +467,10 @@ impl MvStore {
         self.entries.contains_key(name)
     }
 
-    pub fn update(&mut self, name: &str, batch: &RecordBatch) {
+    /// Apply one cycle's output batches to an MV (see `MvEntry::update_cycle`).
+    pub fn update_cycle(&mut self, name: &str, batches: &[RecordBatch]) {
         if let Some(entry) = self.entries.get_mut(name) {
-            if let Err(e) = entry.update(batch) {
+            if let Err(e) = entry.update_cycle(batches) {
                 tracing::error!(
                     mv = %name,
                     error = %e,
@@ -432,6 +478,11 @@ impl MvStore {
                 );
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn update(&mut self, name: &str, batch: &RecordBatch) {
+        self.update_cycle(name, std::slice::from_ref(batch));
     }
 
     pub fn to_record_batch(&self, name: &str) -> Option<RecordBatch> {
@@ -639,6 +690,30 @@ mod tests {
 
         store.update("agg", &make_batch(&[2, 3], &["b", "c"], &[2.0, 3.0]));
         assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn aggregate_keeps_all_batches_of_a_multi_batch_cycle() {
+        let mut store = MvStore::new();
+        store
+            .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+            .unwrap();
+
+        // A non-incremental GROUP BY MV whose output spans several DataFusion batches must
+        // retain every chunk within the cycle, not just the last (EX-1).
+        store.update_cycle(
+            "agg",
+            &[
+                make_batch(&[1, 2], &["a", "b"], &[1.0, 2.0]),
+                make_batch(&[3, 4], &["c", "d"], &[3.0, 4.0]),
+                make_batch(&[5], &["e"], &[5.0]),
+            ],
+        );
+        assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 5);
+
+        // The next cycle replaces the whole result set.
+        store.update_cycle("agg", &[make_batch(&[9], &["z"], &[9.0])]);
+        assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 1);
     }
 
     #[test]

@@ -1859,6 +1859,191 @@ async fn pre_commit_failure_abandons_without_connector_rollback() {
     );
 }
 
+/// Records flush/commit counts. Its `pre_commit` rejects at-least-once use (like Postgres, which
+/// asserts the epoch was opened by `begin_epoch`), so a checkpoint that wrongly routes an ALO sink
+/// through `pre_commit` instead of a plain flush fails the test (guards CP-5 / B-1).
+struct RecordingSink {
+    flush_count: Arc<std::sync::atomic::AtomicU64>,
+    commit_count: Arc<std::sync::atomic::AtomicU64>,
+    exactly_once: bool,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for RecordingSink {
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::array::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn flush(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.flush_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn pre_commit(
+        &mut self,
+        _epoch: u64,
+    ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
+        if !self.exactly_once {
+            return Err(laminar_connectors::error::ConnectorError::TransactionError(
+                "pre_commit called on an at-least-once sink (no begin_epoch)".into(),
+            ));
+        }
+        self.flush_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    }
+
+    async fn commit_epoch(
+        &mut self,
+        _epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.commit_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+        let caps =
+            laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5));
+        if self.exactly_once {
+            caps.with_exactly_once().with_two_phase_commit()
+        } else {
+            caps
+        }
+    }
+}
+
+fn spawn_recording_sink(
+    name: &str,
+    exactly_once: bool,
+    schema: arrow::datatypes::SchemaRef,
+) -> (
+    crate::sink_task::SinkTaskHandle,
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let flush_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let commit_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sink = RecordingSink {
+        flush_count: Arc::clone(&flush_count),
+        commit_count: Arc::clone(&commit_count),
+        exactly_once,
+        schema,
+    };
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: name.into(),
+        sink_id: Arc::from(name),
+        connector: Box::new(sink),
+        exactly_once,
+        coordinated_commit: false,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+    });
+    // The tests below drive no writes, so no SinkEvents are emitted; dropping the receiver is
+    // harmless (event sends are best-effort).
+    (handle, flush_count, commit_count)
+}
+
+/// CP-5: an at-least-once sink must be flushed at checkpoint, or the manifest records offsets
+/// past rows still buffered in the sink.
+#[tokio::test]
+async fn at_least_once_sink_flushed_at_checkpoint() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (handle, flush_count, _commit_count) = spawn_recording_sink("alo_sink", false, schema);
+    coord.register_sink("alo_sink", handle, false, false);
+    coord.begin_initial_epoch().await.unwrap();
+
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    // Succeeds only because the ALO sink is flushed, not pre_committed (its pre_commit errors).
+    assert!(
+        result.success,
+        "checkpoint should succeed: {:?}",
+        result.error
+    );
+    assert!(
+        flush_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "an at-least-once sink must be flushed at checkpoint (CP-5)"
+    );
+}
+
+/// CP-3a / CP-2: reconcile runs after sinks are registered and re-drives a Failed sink status
+/// when the commit marker is present (previously it ignored Failed and, at the old call site,
+/// had no sinks to drive at all).
+#[tokio::test]
+async fn reconcile_redrives_failed_sink_when_marker_present() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
+    use object_store::local::LocalFileSystem;
+
+    let ckpt_dir = tempfile::tempdir().unwrap();
+    let decision_dir = tempfile::tempdir().unwrap();
+    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
+
+    // A partial commit recorded a Failed status after the commit decision.
+    let mut manifest = CheckpointManifest::new(42, 7);
+    manifest
+        .sink_commit_statuses
+        .insert("eo_sink".into(), SinkCommitStatus::Failed("partial".into()));
+    store.save_with_state(&manifest, None).await.unwrap();
+
+    let decision_os: Arc<dyn object_store::ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+    let decision_store =
+        Arc::new(laminar_core::checkpoint_decision::CheckpointDecisionStore::new(decision_os));
+    decision_store.record_committed(7).await.unwrap();
+
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    coord.set_decision_store(decision_store);
+
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (handle, _flush_count, commit_count) = spawn_recording_sink("eo_sink", true, schema);
+    coord.register_sink("eo_sink", handle, true, false);
+
+    coord.reconcile_prepared_on_init().await;
+
+    assert_eq!(
+        commit_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "reconcile must re-drive a Failed sink status when the commit marker is present (CP-3a)"
+    );
+}
+
 /// Writes fail (poisoning the epoch); `rollback_epoch` hangs
 /// forever. The poisoned epoch is what makes the live abandon take
 /// the forced connector-rollback path that can hang.

@@ -1092,6 +1092,20 @@ impl IncrementalJoinOperator {
         Ok(())
     }
 
+    /// Restore only the previously-deferred batches (`pending[..prior_len]`) and return the error.
+    /// This cycle's new input (`pending[prior_len..]`) is the operator graph's to replay or drop,
+    /// so re-deferring it here too would double-count it on an isolated replay (EX-3).
+    fn defer_prior_and_fail(
+        &mut self,
+        mut pending: VecDeque<(i64, JoinSide, RecordBatch)>,
+        prior_len: usize,
+        err: DbError,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        pending.truncate(prior_len);
+        self.tier.defer_all(pending);
+        Err(err)
+    }
+
     /// Fetch-on-access cycle: promote any ready cold keys (both sides atomically), then EITHER defer
     /// the whole cycle and fetch it (if any touched key is still cold) OR run one IVM cycle over
     /// deferred+new batches once every touched key is resident. Demotion is atomic per join key across
@@ -1137,6 +1151,7 @@ impl IncrementalJoinOperator {
         let lwm = watermarks.first().copied().unwrap_or(0);
         let rwm = watermarks.get(1).copied().unwrap_or(0);
         let mut pending = self.tier.take_deferred();
+        let prior_len = pending.len();
         for b in new_left {
             pending.push_back((lwm, JoinSide::Left, b.clone()));
         }
@@ -1155,8 +1170,18 @@ impl IncrementalJoinOperator {
             .filter(|(_, s, _)| *s == JoinSide::Right)
             .map(|(_, _, b)| b.clone())
             .collect();
-        let mut touched = self.cold_keys_touched(JoinSide::Left, &left_pending)?;
-        touched.extend(self.cold_keys_touched(JoinSide::Right, &right_pending)?);
+        // `take_deferred` emptied the queue. On any error below, restore ONLY the previously-
+        // deferred batches (indices < prior_len): this cycle's new input is owned by the operator
+        // graph (replayed under shared-source isolation, dropped with the failed cycle otherwise),
+        // so re-deferring it here as well would double-count it on an isolated replay (EX-3).
+        let mut touched = match self.cold_keys_touched(JoinSide::Left, &left_pending) {
+            Ok(t) => t,
+            Err(e) => return self.defer_prior_and_fail(pending, prior_len, e),
+        };
+        match self.cold_keys_touched(JoinSide::Right, &right_pending) {
+            Ok(t) => touched.extend(t),
+            Err(e) => return self.defer_prior_and_fail(pending, prior_len, e),
+        }
         // The LEFT first-sight catch-up scans the WHOLE left side, so every cold key must be
         // resident before it runs. Treat all cold keys as touched on that cycle.
         if first_right && !self.tier.cold_keys.is_empty() {
@@ -1166,8 +1191,12 @@ impl IncrementalJoinOperator {
         // 4. Any touched key still cold → fetch it + defer the whole cycle (process nothing).
         if !touched.is_empty() {
             for key in &touched {
-                self.fetch_cold_key(key)?;
+                if let Err(e) = self.fetch_cold_key(key) {
+                    return self.defer_prior_and_fail(pending, prior_len, e);
+                }
             }
+            // Normal defer (Ok): the graph clears this cycle's input, so re-deferring the whole
+            // set (prior + new) is correct and does not double-count.
             self.tier.defer_all(pending);
             return Ok(Vec::new());
         }

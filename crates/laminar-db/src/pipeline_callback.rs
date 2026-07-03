@@ -277,6 +277,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     /// Set when a sink write times out; suppresses the next checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
+    /// Set when an exactly-once sink fails (poisoned epoch); the coordinator polls it via
+    /// `take_sink_fault` and faults for recovery so the dropped rows are replayed (CP-4).
+    pub(crate) sink_fault: Option<String>,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -1142,19 +1145,39 @@ impl ConnectorPipelineCallback {
     }
 
     fn drain_sink_events(&mut self) {
+        // A poisoned sink epoch aborts its transaction. Under any exactly-once contract this
+        // must fault the pipeline so recovery replays the dropped rows (CP-4) — nothing else
+        // does. Under pure at-least-once, at least suppress the next checkpoint so offsets
+        // don't advance past the dropped batch (CP-6).
+        let escalate = self.exactly_once_sinks
+            || self.delivery_guarantee
+                == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+            || self.coordinated_recovery;
         while let Ok(event) = self.sink_event_rx.try_recv() {
             tracing::debug!(?event, "sink event");
-            match &event {
-                crate::sink_task::SinkEvent::WriteError { .. } => {
+            let reason = match &event {
+                crate::sink_task::SinkEvent::WriteError {
+                    sink_id,
+                    epoch,
+                    error,
+                    ..
+                } => {
                     self.prom.sink_write_failures.inc();
+                    format!("sink '{sink_id}' write error at epoch {epoch}: {error}")
                 }
-                crate::sink_task::SinkEvent::WriteTimeout { .. } => {
-                    self.sink_timed_out = true;
+                crate::sink_task::SinkEvent::WriteTimeout { sink_id, epoch, .. } => {
                     self.prom.sink_write_timeouts.inc();
+                    format!("sink '{sink_id}' write timeout at epoch {epoch}")
                 }
-                crate::sink_task::SinkEvent::ChannelClosed { .. } => {
+                crate::sink_task::SinkEvent::ChannelClosed { sink_id } => {
                     self.prom.sink_task_channel_closed.inc();
+                    format!("sink '{sink_id}' task channel closed")
                 }
+            };
+            if escalate {
+                self.sink_fault.get_or_insert(reason);
+            } else {
+                self.sink_timed_out = true;
             }
         }
     }
@@ -1357,13 +1380,20 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         .index_of(laminar_core::changelog::WEIGHT_COLUMN)
                         .is_ok()
             });
-            for batch in batches {
-                if batch.num_rows() > 0 {
-                    store.update(stream_name, batch);
-                    updates += 1;
-                    if !changelog {
-                        self.subscription_registry
-                            .send_batch(stream_name, batch.clone());
+            // Apply the whole cycle's output in one call: an Aggregate-mode MV replaces its
+            // result set per cycle, so a per-batch update would keep only the last chunk of a
+            // multi-batch (>8192-row) output (EX-1).
+            #[allow(clippy::cast_possible_truncation)]
+            let row_batches = batches.iter().filter(|b| b.num_rows() > 0).count() as u64;
+            if row_batches > 0 {
+                store.update_cycle(stream_name, batches);
+                updates += row_batches;
+                if !changelog {
+                    for batch in batches {
+                        if batch.num_rows() > 0 {
+                            self.subscription_registry
+                                .send_batch(stream_name, batch.clone());
+                        }
                     }
                 }
             }
@@ -1606,6 +1636,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce || self.coordinated_recovery
     }
 
+    fn take_sink_fault(&mut self) -> Option<String> {
+        self.sink_fault.take()
+    }
+
     #[cfg(feature = "cluster")]
     async fn assignment_ready_for_checkpoint(&mut self) -> bool {
         // Local borrow of the verdict the snapshot watcher computes off the hot path
@@ -1706,6 +1740,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         self.sync_sinks_and_drain_events().await;
+
+        // A pending exactly-once sink fault means the coordinator is about to fault for recovery;
+        // don't seal offsets past the dropped rows (CP-4). Leave the flag set for `take_sink_fault`.
+        if self.sink_fault.is_some() {
+            return None;
+        }
 
         // Skip after a sink timeout so offsets don't advance past the dropped batch.
         if !force && self.sink_timed_out {
@@ -1829,6 +1869,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         self.sync_sinks_and_drain_events().await;
+
+        // A pending exactly-once sink fault means the coordinator is about to fault for recovery;
+        // don't seal this epoch past the dropped rows (CP-4). Leave the flag for `take_sink_fault`.
+        if self.sink_fault.is_some() {
+            return BarrierOutcome::Failed;
+        }
 
         // Clear after one suppression; the timer path is unreachable under barrier checkpointing.
         if self.sink_timed_out {

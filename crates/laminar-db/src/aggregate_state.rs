@@ -1362,6 +1362,7 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         // Without idle_ttl_ms, last_emitted never shrinks; warn periodically.
         if self.idle_ttl_ms.is_none() && self.last_emitted.len() > 10_000 {
@@ -1385,21 +1386,31 @@ impl IncrementalAggState {
         let mut insert_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut insert_vals: Vec<Vec<ScalarValue>> = Vec::new();
 
-        // Only touched groups can differ from `last_emitted`. Take the set so the loop
-        // can borrow `groups`/`last_emitted`; restore it cleared to reuse the allocation.
+        // Only touched groups can differ from `last_emitted`. Take the set so the loop can
+        // borrow `groups`/`last_emitted`. On any error before the output batch is built, the
+        // whole set is restored and `last_emitted` is left untouched — its mutations are
+        // deferred to the commit step below — so a mid-emit failure neither silently drops
+        // pending groups nor drifts downstream from a partially-applied emit (EX-3).
         let mut dirty = std::mem::take(&mut self.dirty_keys);
+        let mut eval_err: Option<DbError> = None;
         for key in &dirty {
             // A dirty key absent from `groups` was removed by `evict_idle`, which
             // already emitted its retraction; skip it.
             let Some(entry) = self.groups.get_mut(key) else {
                 continue;
             };
-            let current: Vec<ScalarValue> = entry
+            let current: Vec<ScalarValue> = match entry
                 .accs
                 .iter_mut()
                 .map(|a| a.evaluate())
                 .collect::<Result<_, _>>()
-                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
+            {
+                Ok(current) => current,
+                Err(e) => {
+                    eval_err = Some(DbError::Pipeline(format!("accumulator evaluate: {e}")));
+                    break;
+                }
+            };
 
             if let Some(old) = self.last_emitted.get(key) {
                 // ScalarValue::eq treats NaN != NaN; short-circuit to avoid
@@ -1421,32 +1432,23 @@ impl IncrementalAggState {
                     retract_keys.push(key.clone());
                     retract_vals.push(old.clone());
                     insert_keys.push(key.clone());
-                    insert_vals.push(current.clone());
-                    self.last_emitted.insert(key.clone(), current);
-                    self.mark_last_emitted_dirty(key);
+                    insert_vals.push(current);
                 }
             } else {
                 insert_keys.push(key.clone());
-                insert_vals.push(current.clone());
-                self.last_emitted.insert(key.clone(), current);
-                self.mark_last_emitted_dirty(key);
+                insert_vals.push(current);
             }
         }
-        dirty.clear();
-        self.dirty_keys = dirty;
+        if let Some(e) = eval_err {
+            self.dirty_keys = dirty;
+            return Err(e);
+        }
 
-        // Every remover (evict_idle, demote_vnode, restore/merge) drops the group from
-        // `last_emitted` too and evict_idle retracts; the chain-apply paths (`apply_delta`,
-        // `merge_groups`) only admit an entry whose group is resident, so the invariant holds.
-        debug_assert!(
-            self.last_emitted
-                .keys()
-                .all(|k| self.groups.contains_key(k)),
-            "last_emitted must be a subset of groups"
-        );
-
-        let total = retract_keys.len() + insert_keys.len();
+        let retract_count = retract_keys.len();
+        let total = retract_count + insert_keys.len();
         if total == 0 {
+            dirty.clear();
+            self.dirty_keys = dirty;
             return Ok(Vec::new());
         }
 
@@ -1465,7 +1467,7 @@ impl IncrementalAggState {
             weights.push(1i64);
         }
 
-        let batch = build_weighted_batch(
+        let batch = match build_weighted_batch(
             &all_keys,
             &all_vals,
             &weights,
@@ -1473,7 +1475,34 @@ impl IncrementalAggState {
             self.num_group_cols,
             &self.agg_specs,
             &self.output_schema,
-        )?;
+        ) {
+            Ok(batch) => batch,
+            Err(e) => {
+                self.dirty_keys = dirty;
+                return Err(e);
+            }
+        };
+
+        // Commit: advance `last_emitted` only now that the output batch is built. The insert half
+        // of `all_keys`/`all_vals` (after the retracts) is exactly the changed/new groups' new
+        // values, so derive the update from it rather than keeping a parallel Vec.
+        for (key, current) in all_keys.into_iter().zip(all_vals).skip(retract_count) {
+            self.mark_last_emitted_dirty(&key);
+            self.last_emitted.insert(key, current);
+        }
+        dirty.clear();
+        self.dirty_keys = dirty;
+
+        // Every remover (evict_idle, demote_vnode, restore/merge) drops the group from
+        // `last_emitted` too and evict_idle retracts; the chain-apply paths (`apply_delta`,
+        // `merge_groups`) only admit an entry whose group is resident, so the invariant holds.
+        debug_assert!(
+            self.last_emitted
+                .keys()
+                .all(|k| self.groups.contains_key(k)),
+            "last_emitted must be a subset of groups"
+        );
+
         Ok(vec![batch])
     }
 

@@ -497,7 +497,7 @@ impl StreamingCoordinator {
             };
 
             self.source_batches_buf.clear();
-            self.barrier_seen.clear();
+            self.reset_barrier_seen_for_cycle();
             self.discard_pending_offsets();
             barriers_buf.clear();
             let mut cycle_events: u64 = 0;
@@ -643,6 +643,20 @@ impl StreamingCoordinator {
             #[allow(clippy::cast_possible_truncation)]
             if (bg_start.elapsed().as_nanos() as u64) < bg_budget {
                 self.maybe_checkpoint(&mut callback).await;
+            }
+
+            // An exactly-once sink write failure poisons the epoch and aborts its transaction but
+            // never faulted the pipeline, so the next checkpoint would seal offsets past the
+            // dropped rows. Escalate to a fault so recovery replays them (CP-4). Barriers and the
+            // periodic checkpoint above drain sink events, so the flag is current here.
+            if let Some(reason) = callback.take_sink_fault() {
+                self.discard_pending_offsets();
+                tracing::error!(
+                    reason = %reason,
+                    "[LDB-3024] exactly-once sink failure; faulting for recovery"
+                );
+                fault = Some(reason);
+                break;
             }
 
             #[allow(clippy::cast_possible_truncation)]
@@ -970,6 +984,19 @@ impl StreamingCoordinator {
         }
     }
 
+    /// Reset per-cycle barrier tracking at cycle start. While a multi-source barrier is
+    /// still aligning, re-arm deferral for sources that already passed it: `barrier_seen`
+    /// is per-cycle, so without this a post-barrier (epoch N+1) batch re-drained from
+    /// `post_barrier_buf` folds into epoch-N state while the manifest records that source's
+    /// offset at-barrier → duplicates on recovery (CP-1).
+    fn reset_barrier_seen_for_cycle(&mut self) {
+        self.barrier_seen.clear();
+        if self.pending_barrier.active {
+            self.barrier_seen
+                .extend(self.pending_barrier.sources_aligned.iter().copied());
+        }
+    }
+
     /// Handle a barrier from a source.
     async fn handle_barrier(
         &mut self,
@@ -1132,6 +1159,8 @@ mod tests {
         cycle_errors: Arc<AtomicU64>,
         /// Whether a fatal cycle error should fault (exactly-once) vs drop-and-continue.
         fault_on_error: bool,
+        /// Returned once by `take_sink_fault` to simulate an exactly-once sink failure.
+        sink_fault: Option<String>,
     }
 
     impl MockCallback {
@@ -1144,6 +1173,7 @@ mod tests {
                 fatal_at_cycle: None,
                 cycle_errors: Arc::new(AtomicU64::new(0)),
                 fault_on_error: false,
+                sink_fault: None,
             }
         }
     }
@@ -1176,6 +1206,10 @@ mod tests {
 
         fn fault_on_cycle_error(&self) -> bool {
             self.fault_on_error
+        }
+
+        fn take_sink_fault(&mut self) -> Option<String> {
+            self.sink_fault.take()
         }
 
         fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
@@ -1367,6 +1401,120 @@ mod tests {
             errors.load(Ordering::SeqCst),
             1,
             "at-least-once must drop-and-continue and count the error"
+        );
+        drop(tx);
+    }
+
+    /// CP-1: while a multi-source barrier is mid-alignment, a source that already passed the
+    /// barrier must keep deferring its post-barrier (epoch N+1) batches across cycles — else
+    /// they fold into epoch-N state while the manifest records that source's offset at-barrier,
+    /// duplicating them on recovery.
+    #[tokio::test]
+    async fn aligned_source_post_barrier_batch_defers_across_cycles() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::ExactlyOnce,
+            Some(Duration::from_secs(60)),
+        );
+        coordinator.source_names = vec![Arc::from("src0"), Arc::from("src1")];
+        coordinator.committed_offsets = vec![None, None];
+        coordinator.pending_offsets = vec![None, None];
+
+        let mut callback = MockCallback::new();
+
+        // Source 0 passed its barrier for the in-flight checkpoint; source 1 has not, so
+        // alignment spans cycles and source 0's post-barrier batch is queued for replay.
+        coordinator.pending_barrier.reset(7, 2);
+        coordinator.pending_barrier.sources_aligned.insert(0);
+        coordinator.post_barrier_buf.push(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(99),
+            checkpoint: SourceCheckpoint::new(8),
+        });
+
+        // Next cycle start + post_barrier_buf replay.
+        coordinator.source_batches_buf.clear();
+        coordinator.reset_barrier_seen_for_cycle();
+        let deferred = std::mem::take(&mut coordinator.post_barrier_buf);
+        let mut barriers = Vec::new();
+        let mut events = 0u64;
+        for msg in deferred {
+            coordinator.process_msg(msg, &mut callback, &mut barriers, &mut events);
+        }
+
+        assert!(
+            coordinator.source_batches_buf.is_empty(),
+            "aligned source's post-barrier batch must not fold into the pending epoch"
+        );
+        assert_eq!(
+            coordinator.post_barrier_buf.len(),
+            1,
+            "aligned source's post-barrier batch must stay deferred"
+        );
+        assert!(
+            coordinator.pending_offsets[0].is_none(),
+            "deferred batch must not stage its offset"
+        );
+
+        // A batch from the not-yet-aligned source 1 folds normally.
+        coordinator.process_msg(
+            SourceMsg::Batch {
+                source_idx: 1,
+                batch: int_batch(5),
+                checkpoint: SourceCheckpoint::new(8),
+            },
+            &mut callback,
+            &mut barriers,
+            &mut events,
+        );
+        assert_eq!(
+            coordinator.source_batches_buf.get("src1").map(Vec::len),
+            Some(1),
+            "not-yet-aligned source's batch must fold into the pending epoch"
+        );
+    }
+
+    /// CP-4: an exactly-once sink failure poisons the epoch and aborts its transaction; the
+    /// coordinator must fault for recovery (via `take_sink_fault`) rather than continue and seal
+    /// offsets past the dropped rows on the next checkpoint.
+    #[tokio::test]
+    async fn exactly_once_sink_fault_faults_pipeline() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        let coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::ExactlyOnce,
+            Some(Duration::from_secs(60)),
+        );
+
+        let mut callback = MockCallback::new();
+        callback.sink_fault = Some("sink 's' write error at epoch 1".to_string());
+
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: SourceCheckpoint::new(1),
+        })
+        .await
+        .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(5), coordinator.run(callback))
+            .await
+            .expect("run() must return after a sink fault");
+
+        assert!(
+            matches!(exit, ExitReason::Fault(_)),
+            "an exactly-once sink fault must fault the pipeline, got {exit:?}"
         );
         drop(tx);
     }

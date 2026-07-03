@@ -618,8 +618,6 @@ impl LaminarDB {
             };
             coord.set_decision_store(ds);
 
-            coord.reconcile_prepared_on_init().await;
-
             *self.coordinator.lock().await = Some(coord);
         }
 
@@ -1488,6 +1486,11 @@ impl LaminarDB {
         {
             let guard = self.coordinator.lock().await;
             if let Some(ref coord) = *guard {
+                // Reconcile after sinks are registered and state is recovered: at the old call
+                // site the coordinator's sink set was empty, so marker-committed Pending epochs
+                // were never re-driven and unmarked Pending epochs never rolled back (CP-2).
+                // Must precede begin_initial_epoch, which opens the next epoch on those sinks.
+                coord.reconcile_prepared_on_init().await;
                 coord.begin_initial_epoch().await?;
             }
         }
@@ -2030,6 +2033,7 @@ impl LaminarDB {
             serialization_timeout: std::time::Duration::from_secs(120),
             sink_event_rx,
             sink_timed_out: false,
+            sink_fault: None,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
             #[cfg(feature = "cluster")]
             converged_rx: callback_controller.as_ref().map(|cc| cc.converged_watch()),

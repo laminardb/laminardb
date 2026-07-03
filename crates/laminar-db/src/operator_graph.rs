@@ -1994,6 +1994,10 @@ impl OperatorGraph {
             )
             .await;
 
+        // Advancing the output watermark is only valid if `process` actually consumed the input.
+        // Snapshot the prior value so a deferral (below) — which preserves the input for replay —
+        // can pin it back, or downstream windows close past the buffered-but-unemitted rows (EX-2).
+        let prev_output_watermark = self.output_watermarks[node_id];
         self.propagate_operator_watermark(node_id, &watermarks, current_watermark);
 
         let batches = match output_result {
@@ -2019,6 +2023,9 @@ impl OperatorGraph {
                 {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
+                    // Input is held for replay, so its rows haven't been emitted — freeze the
+                    // output watermark instead of leaving it advanced (EX-2).
+                    self.output_watermarks[node_id] = prev_output_watermark;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
@@ -2036,6 +2043,8 @@ impl OperatorGraph {
                 {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
+                    // Preserved for replay → the advanced watermark is not yet valid (EX-2).
+                    self.output_watermarks[node_id] = prev_output_watermark;
                     return Err(e);
                 }
                 for v in &mut inputs {

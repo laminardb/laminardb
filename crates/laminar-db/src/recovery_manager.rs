@@ -754,26 +754,31 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
-    /// Returns `true` if any exactly-once sink has `Pending` commit status.
+    /// Returns `true` if any exactly-once sink has a non-`Committed` status (`Pending` or
+    /// `Failed`).
     ///
-    /// A Pending sink means the manifest was persisted before commit finished;
-    /// recovering from it advances source offsets past data the sink never wrote.
-    fn has_pending_sinks(manifest: &CheckpointManifest) -> bool {
+    /// Such a status means the manifest was persisted before commit finished (`Pending`) or a
+    /// sink's commit did not succeed (`Failed`); recovering from it advances source offsets past
+    /// data the sink never wrote. The commit marker is written only once every sink commits (see
+    /// `checkpoint_inner`), so a non-`Committed` status paired with a missing marker means the
+    /// epoch did not fully commit and must be replayed.
+    fn has_uncommitted_sinks(manifest: &CheckpointManifest) -> bool {
         manifest
             .sink_commit_statuses
             .values()
-            .any(|s| matches!(s, SinkCommitStatus::Pending))
+            .any(|s| matches!(s, SinkCommitStatus::Pending | SinkCommitStatus::Failed(_)))
     }
 
-    /// `true` when a checkpoint must be skipped: sinks are `Pending` AND the decision marker
-    /// does not confirm the epoch committed. A pending-but-marker-committed epoch is NOT
-    /// skipped — rewinding the source behind a committed sink would re-emit committed rows;
-    /// `reconcile_prepared_on_init` re-drives the commit.
+    /// `true` when a checkpoint must be skipped: a sink is uncommitted (`Pending`/`Failed`) AND
+    /// the decision marker does not confirm the epoch committed. An uncommitted-but-marked epoch
+    /// is NOT skipped — rewinding the source behind a committed sink would re-emit committed rows;
+    /// `reconcile_prepared_on_init` re-drives the commit. An all-`Committed` manifest is never
+    /// skipped even without a marker (the sinks did commit; the marker write may have raced a crash).
     async fn pending_uncommitted(
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
         manifest: &CheckpointManifest,
     ) -> bool {
-        if !Self::has_pending_sinks(manifest) {
+        if !Self::has_uncommitted_sinks(manifest) {
             return false;
         }
         match decision_store {
@@ -1296,6 +1301,36 @@ mod tests {
             state.epoch(),
             1,
             "recovery must skip checkpoint with Pending sinks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_skips_failed_sinks_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Epoch 1: fully committed checkpoint (good).
+        let mut m1 = CheckpointManifest::new(1, 1);
+        m1.sink_commit_statuses
+            .insert("delta_sink".into(), SinkCommitStatus::Committed);
+        store.save(&m1).await.unwrap();
+
+        // Epoch 2: a sink's commit failed, so (marker-after-commit) no commit marker was written.
+        // Recovery must replay from epoch 1, not seal offsets past the failed sink's output (CP-3).
+        let mut m2 = CheckpointManifest::new(2, 2);
+        m2.sink_commit_statuses.insert(
+            "delta_sink".into(),
+            SinkCommitStatus::Failed("commit timed out".into()),
+        );
+        store.save(&m2).await.unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[], None).await.unwrap();
+        let state = result.expect("should recover from epoch 1 fallback");
+        assert_eq!(
+            state.epoch(),
+            1,
+            "recovery must skip a checkpoint with a Failed sink and no commit marker"
         );
     }
 
