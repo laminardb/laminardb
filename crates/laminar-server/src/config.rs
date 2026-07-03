@@ -244,6 +244,17 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 
 /// Validate the `state_tier_dir` contract once, shared by embedded and cluster startup.
 fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
+    // Group demotion needs the cold tier; enabling it without a tier dir demotes nothing.
+    if config.server.state_tier_group_demotion == Some(true)
+        && config.server.state_tier_dir.is_none()
+    {
+        errors.push(
+            "state_tier_group_demotion is set but state_tier_dir is not — group demotion needs a \
+             cold tier to shed groups to, so without state_tier_dir it does nothing; set \
+             state_tier_dir (with state_memory_budget_bytes) or remove state_tier_group_demotion"
+                .to_string(),
+        );
+    }
     if config.server.state_tier_dir.is_none() {
         return;
     }

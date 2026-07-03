@@ -107,6 +107,7 @@ impl LaminarDB {
                     fetch_total: m.state_tier_fetch_total.get(),
                     resident_bytes: m.state_tier_bytes.get(),
                     resident_slices: m.state_tier_slices.get(),
+                    overlap_total: m.state_tier_overlap_total.get(),
                 }
             })
     }

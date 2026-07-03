@@ -733,6 +733,131 @@ mod failures {
         harness.shutdown().await;
     }
 
+    /// Non-chain group demotion (no delta chain — the whole-node manifest is authoritative and
+    /// demoted groups fold into cold-only partials) must recover EXACT values across a full cluster
+    /// restart. A resident∩cold overlap at capture would double-count here (additive merge).
+    #[cfg(feature = "state-tier")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_group_demotion_nonchain_survives_restart() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+        use tempfile::TempDir;
+
+        let shared = tempfile::tempdir().expect("shared state dir");
+        let cp_dirs: Vec<TempDir> = (0..N_NODES)
+            .map(|_| tempfile::tempdir().expect("cp dir"))
+            .collect();
+        let mut harness = ClusterEngineHarness::spawn_with_dirs(
+            N_NODES,
+            VNODE_COUNT,
+            shared,
+            cp_dirs,
+            None,
+            Some(2048),
+        )
+        .await;
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        let owners: Vec<_> = harness
+            .nodes
+            .iter()
+            .map(|n| (n.instance_id, n.owned_vnodes()))
+            .collect();
+        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
+        let all_keys: Vec<i64> = key_buckets
+            .iter()
+            .flat_map(|(_, ks)| ks.iter().copied())
+            .collect();
+        let leader = harness.leader_idx();
+        let demotes = |h: &ClusterEngineHarness| -> u64 {
+            h.nodes
+                .iter()
+                .map(|n| n.db.tier_metrics().demote_total)
+                .sum()
+        };
+
+        for _ in 0..3 {
+            harness.nodes[leader]
+                .db
+                .source_untyped("src")
+                .expect("src")
+                .push_arrow(input_batch(&all_keys))
+                .expect("push");
+            sleep(Duration::from_millis(150)).await;
+        }
+        harness.nodes[leader]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while demotes(&harness) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "non-chain group demotion never fired"
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
+        // Checkpoint AGAIN so the demoted groups are captured into durable cold-only partials.
+        harness.nodes[leader]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint2");
+        let expected: HashMap<i64, i64> = all_keys.iter().map(|&k| (k, k * 10 * 3)).collect();
+
+        // Graceful full-cluster restart (tier wiped; recover from the durable manifest + partials).
+        let (shared, cp_dirs) = harness.shutdown_keep_dirs().await;
+        let mut harness = ClusterEngineHarness::spawn_with_dirs(
+            N_NODES,
+            VNODE_COUNT,
+            shared,
+            cp_dirs,
+            None,
+            Some(2048),
+        )
+        .await;
+        for node in &harness.nodes {
+            setup_query(&node.db).await;
+        }
+        harness.start_all().await;
+
+        // No re-feed: the recovered values must equal the pre-restart totals — never doubled.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let got: HashMap<i64, i64> = union_sums(&harness)
+                .await
+                .into_iter()
+                .filter(|(k, _)| expected.contains_key(k))
+                .collect();
+            let bad: Vec<(i64, i64, i64)> = expected
+                .iter()
+                .filter(|(k, &e)| got.get(k).copied() != Some(e))
+                .map(|(k, &e)| (*k, e, got.get(k).copied().unwrap_or(-1)))
+                .take(10)
+                .collect();
+            if bad.is_empty() && got.len() == expected.len() {
+                break;
+            }
+            if Instant::now() > deadline {
+                let overlap: u64 = harness
+                    .nodes
+                    .iter()
+                    .map(|n| n.db.tier_metrics().overlap_total)
+                    .sum();
+                panic!(
+                    "non-chain cluster demotion recovered wrong values (overlap_total={overlap}) \
+                     [(key, expected, got)]: {bad:?}",
+                );
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+        harness.shutdown().await;
+    }
+
     /// A crashed node's DEMOTED groups must survive failover. With the cold tier on, the follower
     /// demotes idle groups — their durable home is the per-vnode delta chain, NOT the node-local tier
     /// (which dies with the process). When the follower crashes, the survivor acquires its vnodes and
