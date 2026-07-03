@@ -1838,19 +1838,13 @@ impl IncrementalAggState {
                 };
                 #[cfg(feature = "state-tier")]
                 let cap = {
+                    // `heal_resident_cold_overlap` (run before capture) keeps the resident and cold
+                    // key sets disjoint, so the re-base and cold groups never share a key.
                     let group_keys: Vec<Vec<u8>> = self
                         .cold_groups
                         .keys()
                         .filter(|k| vnode_of(k) == v)
-                        .map(|k| {
-                            // Resident and cold key sets must stay disjoint — the merge assumes it,
-                            // and an overlap would double-count on recovery (additive merge_groups).
-                            debug_assert!(
-                                !self.groups.contains_key(k),
-                                "cold group is also resident; merge would double-count"
-                            );
-                            k.as_ref().to_vec()
-                        })
+                        .map(|k| k.as_ref().to_vec())
                         .collect();
                     if group_keys.is_empty() {
                         VnodeCapture::Full(full)
@@ -2320,6 +2314,25 @@ impl IncrementalAggState {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cold_groups(&self) -> &AHashMap<arrow::row::OwnedRow, i64> {
         &self.cold_groups
+    }
+
+    /// Drop any group that is both resident and cold, returning how many. A group in both sets is
+    /// merged twice on recovery (additive `merge_groups`); the resident copy is authoritative. The
+    /// return feeds `state_tier_overlap_total` — must be 0 in a correct run. Runs before capture.
+    pub(crate) fn heal_resident_cold_overlap(&mut self) -> u64 {
+        if self.cold_groups.is_empty() {
+            return 0;
+        }
+        let overlapping: Vec<arrow::row::OwnedRow> = self
+            .cold_groups
+            .keys()
+            .filter(|k| self.groups.contains_key(k))
+            .cloned()
+            .collect();
+        for k in &overlapping {
+            self.cold_groups.remove(k);
+        }
+        overlapping.len() as u64
     }
 
     /// Cold (demoted) group tier keys bucketed by vnode — `vnode -> [group_key_bytes]`, matching the

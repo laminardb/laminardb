@@ -1458,10 +1458,26 @@ impl GraphOperator for SqlQueryOperator {
         // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
         // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
         let newly_acquired = self.take_newly_acquired();
+        // Cloned so the overlap counter can be bumped while `agg_state` is borrowed below.
+        #[cfg(feature = "state-tier")]
+        let prom = self.prom.clone();
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Ok(None);
         };
         agg_state.reset_acquired_vnodes(&newly_acquired);
+
+        // Keep resident and cold group sets disjoint before capture (both capture paths); an overlap
+        // would double-count on recovery.
+        #[cfg(feature = "state-tier")]
+        {
+            let overlaps = agg_state.heal_resident_cold_overlap();
+            if overlaps > 0 {
+                if let Some(ref p) = prom {
+                    p.state_tier_overlap_total.inc_by(overlaps);
+                }
+                tracing::warn!(overlaps, query = %self.op_name, "healed resident∩cold overlap before capture");
+            }
+        }
 
         // Incremental delta capture: each touched vnode emits a FULL re-base or a DELTA.
         if let Some(chain_max) = self.delta_chain_max {
@@ -2583,6 +2599,71 @@ mod promotion_tests {
             inserts(&out).get("a"),
             Some(&6),
             "rehydrated demoted state: original 1 + new 5"
+        );
+    }
+
+    /// Group demote→promote must not inflate the changelog: feed one row per round for a
+    /// slow-cycling key, checkpoint, demote it, then re-touch it next round to promote it back. The
+    /// emitted `total` must track the number of rows fed, never exceed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_group_demotion_never_double_counts_changelog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
+        );
+        let tier_tx = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::clone(&store),
+            64,
+        );
+        let mut op = build_op(tier_tx).await;
+        // Cluster group-demotion path: the per-vnode delta chain is the primary checkpoint
+        // (chain_max=2, so re-bases with cold groups happen), plus group dirty-tracking.
+        op.enable_delta_checkpoints(2);
+        op.enable_delta_tracking();
+
+        let rounds: i64 = 8;
+        let mut wm = 0i64;
+        let mut demoted_total = 0u64;
+        let mut max_emitted = 0i64;
+        let record = |out: &[RecordBatch], max: &mut i64| {
+            if let Some(&t) = inserts(out).get("a") {
+                *max = (*max).max(t);
+            }
+        };
+
+        for _ in 1..=rounds {
+            wm += 10;
+            // Feed one row for "a"; if "a" was demoted last round this defers + triggers promotion.
+            let out = op
+                .process(&[vec![events_batch(&["a"], &[1])]], &[wm])
+                .await
+                .unwrap();
+            record(&out, &mut max_emitted);
+            // Drain idle cycles until the promotion (if any) resolves and "a" re-emits.
+            for _ in 0..200 {
+                if op.watermark_hold().is_none() && !op.has_pending_promotion() {
+                    break;
+                }
+                wm += 1;
+                let out = op.process(&[vec![]], &[wm]).await.unwrap();
+                record(&out, &mut max_emitted);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // Mark the group clean (delta baseline), then demote it to the cold tier.
+            op.checkpoint_by_vnode(VNODES).unwrap();
+            let (n, _) = op.demote_cold_groups(usize::MAX, VNODES).await;
+            demoted_total += n as u64;
+        }
+
+        assert!(
+            demoted_total > 0,
+            "group demotion never fired — the test would be vacuous"
+        );
+        assert_eq!(
+            max_emitted, rounds,
+            "cluster group demotion emitted a changelog total ({max_emitted}) different from the \
+             true running count ({rounds}) — a value > {rounds} is the soak's double-count",
         );
     }
 }

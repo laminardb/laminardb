@@ -77,6 +77,8 @@ pub struct TierMetrics {
     pub resident_bytes: i64,
     /// Slices currently resident in the tier.
     pub resident_slices: i64,
+    /// Groups found resident AND cold at capture (disjoint-set invariant broken). Must be 0.
+    pub overlap_total: u64,
 }
 
 /// Metrics for a single registered source.
