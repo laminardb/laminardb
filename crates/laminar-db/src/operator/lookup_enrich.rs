@@ -569,6 +569,10 @@ impl LookupEnrichOperator {
             for &v in &vnodes {
                 let owner = cfg.registry.owner(v);
                 if owner.is_unassigned() {
+                    // Must NOT defer: this operator has already drained completed async lookups this
+                    // cycle (removed from self.pending, pushed to `enriched`), so deferring would
+                    // discard them. Fault instead — under exactly-once recovery restores self.pending
+                    // and re-fetches. (Formation/rebalance transient; a full replay is acceptable.)
                     return Err(DbError::Pipeline(format!(
                         "lookup-enrich: shuffle vnode {v} is unassigned — refusing to drop rows"
                     )));
@@ -594,10 +598,16 @@ impl LookupEnrichOperator {
             }
         }
 
-        // Fail on send error so offsets don't advance past undelivered rows.
+        // Send the staged frames. A send failure must NOT defer (this operator already drained
+        // completed async results this cycle — deferring would drop them) and must NOT be replayed
+        // locally (re-sending would double-count on peers that already folded). ShufflePartialSend
+        // faults for a rewind-all domain replay under exactly-once, and drops the cycle under
+        // at-least-once, but never double-counts (CL-1).
         for (peer, msg) in outbound {
             cfg.sender.send_to(peer, &msg).await.map_err(|e| {
-                DbError::Pipeline(format!("lookup-enrich: shuffle send to peer {peer}: {e}"))
+                DbError::ShufflePartialSend(format!(
+                    "lookup-enrich: shuffle send to peer {peer}: {e}"
+                ))
             })?;
         }
 

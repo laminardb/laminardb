@@ -82,6 +82,12 @@ mod grpc {
     /// Per-peer outbound queue capacity before the HTTP/2 window backpressures.
     const SHUFFLE_SEND_QUEUE: usize = 1024;
 
+    /// gRPC encode/decode message-size cap for shuffle frames, both directions. tonic defaults to
+    /// 4 MiB, which breaks the stream on any larger `VnodeData` frame — and a mid-stream break
+    /// silently drops the queued frames (CL-2/CL-3). Sized above the 64 MiB per-`VnodeData` payload
+    /// cap (`super::message::MAX_PAYLOAD_BYTES`) plus IPC schema/framing overhead.
+    const MAX_SHUFFLE_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+
     /// Inbound queue alias (a `type` so the parked receiver field dodges
     /// `type_complexity`).
     type InboundRx = AsyncRx<mpsc::Array<(ShufflePeerId, ShuffleMessage)>>;
@@ -356,7 +362,9 @@ mod grpc {
                 alive_for_driver.store(false, Ordering::Release);
                 return;
             };
-            let mut client = ShuffleTransportClient::<Channel>::new(channel);
+            let mut client = ShuffleTransportClient::<Channel>::new(channel)
+                .max_decoding_message_size(MAX_SHUFFLE_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_SHUFFLE_MESSAGE_BYTES);
             // Returns on server half-close ack or transport break; either way done.
             let _ = client.shuffle(Request::new(outbound)).await;
             alive_for_driver.store(false, Ordering::Release);
@@ -431,7 +439,11 @@ mod grpc {
                     .tls_config(tls.clone())
                     .map_err(|e| io::Error::other(format!("cluster shuffle TLS config: {e}")))?;
             }
-            let router = builder.add_service(ShuffleTransportServer::new(service));
+            let router = builder.add_service(
+                ShuffleTransportServer::new(service)
+                    .max_decoding_message_size(MAX_SHUFFLE_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_SHUFFLE_MESSAGE_BYTES),
+            );
             let server = tokio::spawn(async move {
                 let _ = router.serve_with_incoming(incoming).await;
             });

@@ -753,7 +753,9 @@ impl OperatorGraph {
             _ => return,
         };
 
-        // Ownership may have changed again since staging; only drain what we own now.
+        // Ownership may have changed again since staging; evict chains for vnodes we no longer own
+        // (stale after an acquire→lose, which would otherwise resurrect retracted state — CL-7),
+        // then drain the rest (all currently owned).
         let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
             let mut guard = staged_arc.lock();
             if guard.is_empty() {
@@ -762,14 +764,8 @@ impl OperatorGraph {
             let owned: FxHashSet<u32> = laminar_core::state::owned_vnodes(&registry, self_id)
                 .into_iter()
                 .collect();
-            let keys: Vec<u32> = guard
-                .keys()
-                .copied()
-                .filter(|v| owned.contains(v))
-                .collect();
-            keys.into_iter()
-                .filter_map(|v| guard.remove(&v).map(|r| (v, r)))
-                .collect()
+            guard.retain(|v, _| owned.contains(v));
+            guard.drain().collect()
         };
         if drained.is_empty() {
             return;
@@ -2019,7 +2015,12 @@ impl OperatorGraph {
                 // yet (cluster formation): aborting the whole cycle would also drop
                 // co-located streams (e.g. a pass-through exactly-once sink) whose
                 // source rows the generator has already advanced past — an EO gap.
-                if accept && (self.depends_on_stream.contains(&node_id) || e.is_shuffle_not_ready())
+                // A must-not-replay error (a partial shuffle send) must NOT take the defer branch
+                // even for a `depends_on_stream` node — replaying re-sends to peers that already
+                // folded this cycle's rows (double-count). Let it fall through to fault/drop (CL-1).
+                if accept
+                    && !e.must_not_replay()
+                    && (self.depends_on_stream.contains(&node_id) || e.is_shuffle_not_ready())
                 {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
@@ -2038,7 +2039,11 @@ impl OperatorGraph {
                 }
                 // Under shared-source isolation, keep the faulted operator's input so the next cycle
                 // replays it with new arrivals; returns Err to isolate the domain. Bounded by `max_replay_buffer_bytes`.
+                // A must-not-replay error (a partial shuffle send) is excluded: replaying it would
+                // re-send to peers that already folded this cycle's rows → double-count. Let it fall
+                // through to clear the input so the domain drops the cycle instead (CL-1).
                 if self.shared_source_isolation
+                    && !e.must_not_replay()
                     && input_bytes.iter().sum::<usize>() <= self.max_replay_buffer_bytes
                 {
                     self.input_bufs[node_id] = inputs;

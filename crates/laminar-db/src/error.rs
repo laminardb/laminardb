@@ -84,6 +84,12 @@ pub enum DbError {
     /// Recoverable — `OperatorGraph::execute_single_operator` defers on it.
     ShuffleNotReady(String),
 
+    /// A cross-node shuffle send failed AFTER some peers already received this cycle's rows (a
+    /// partial send). Unlike [`Self::ShuffleNotReady`], this must NOT be replayed locally — a retry
+    /// would re-send to the peers that already folded (double-count). Under exactly-once /
+    /// coordinated recovery it faults for a rewind-all domain replay; otherwise the cycle is dropped.
+    ShufflePartialSend(String),
+
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
     QueryPipeline {
@@ -178,9 +184,10 @@ impl DbError {
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
             Self::Connector(_) | Self::ConnectorOp(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
-            Self::Pipeline(_) | Self::BackpressureFail(_) | Self::ShuffleNotReady(_) => {
-                error_codes::PIPELINE_ERROR
-            }
+            Self::Pipeline(_)
+            | Self::BackpressureFail(_)
+            | Self::ShuffleNotReady(_)
+            | Self::ShufflePartialSend(_) => error_codes::PIPELINE_ERROR,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
@@ -192,6 +199,14 @@ impl DbError {
     #[must_use]
     pub fn is_shuffle_not_ready(&self) -> bool {
         matches!(self, Self::ShuffleNotReady(_))
+    }
+
+    /// `true` for errors whose input must NOT be preserved for local replay (a retry would
+    /// duplicate already-emitted effects) — currently a partial shuffle send. The operator graph
+    /// drops the input instead of holding it under shared-source isolation.
+    #[must_use]
+    pub fn must_not_replay(&self) -> bool {
+        matches!(self, Self::ShufflePartialSend(_))
     }
 
     /// Whether this error is transient (retryable).
@@ -281,6 +296,9 @@ impl std::fmt::Display for DbError {
             }
             Self::ShuffleNotReady(msg) => {
                 write!(f, "[{}] Shuffle target not ready: {msg}", self.code())
+            }
+            Self::ShufflePartialSend(msg) => {
+                write!(f, "[{}] Shuffle partial send: {msg}", self.code())
             }
             Self::QueryPipeline {
                 context,

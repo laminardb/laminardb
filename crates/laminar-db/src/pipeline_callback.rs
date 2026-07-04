@@ -819,10 +819,16 @@ impl ConnectorPipelineCallback {
         has_cluster_shuffle: bool,
         controller: &laminar_core::cluster::control::ClusterController,
         epoch: u64,
+        quorum_timeout: std::time::Duration,
     ) {
         use laminar_core::cluster::control::Phase;
 
-        const RESUME_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        // The gate must outlast the leader's quorum wait: a slow-but-successful alignment that lands
+        // `Aligned` AFTER the follower resumes would let it fold epoch-N+1 shuffle rows into a peer
+        // still capturing epoch-N. Derive the gate from quorum_timeout (default 3s → 10s) so a
+        // user-raised quorum_timeout can never invert the gate > quorum relation (CL-6).
+        let resume_gate_timeout = std::time::Duration::from_secs(10)
+            .max(quorum_timeout + std::time::Duration::from_secs(5));
 
         if !has_cluster_shuffle {
             return;
@@ -834,7 +840,7 @@ impl ConnectorPipelineCallback {
                         || (a.epoch == epoch
                             && matches!(a.phase, Phase::Aligned | Phase::Commit | Phase::Abort))
                 },
-                RESUME_GATE_TIMEOUT,
+                resume_gate_timeout,
             )
             .await;
         if released.is_none() {
@@ -913,7 +919,8 @@ impl ConnectorPipelineCallback {
             tail.await;
         } else {
             tokio::spawn(tail);
-            Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
+            Self::wait_for_aligned_resume(has_shuffle, &controller, epoch, self.quorum_timeout)
+                .await;
         }
         self.prom
             .checkpoint_pipeline_stall_duration
@@ -969,7 +976,8 @@ impl ConnectorPipelineCallback {
             tail.await;
         } else {
             tokio::spawn(tail);
-            Self::wait_for_aligned_resume(has_shuffle, &controller, epoch).await;
+            Self::wait_for_aligned_resume(has_shuffle, &controller, epoch, self.quorum_timeout)
+                .await;
         }
         self.prom
             .checkpoint_pipeline_stall_duration
@@ -1937,7 +1945,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             #[cfg(feature = "cluster")]
             if let (Some((epoch, _)), Some(cc)) = (leader_ids, self.cluster_controller.clone()) {
                 let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-                Self::wait_for_aligned_resume(has_shuffle, &cc, epoch).await;
+                Self::wait_for_aligned_resume(has_shuffle, &cc, epoch, self.quorum_timeout).await;
             }
         }
         self.prom
@@ -2561,7 +2569,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            ConnectorPipelineCallback::wait_for_aligned_resume(true, &controller, 3),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                true,
+                &controller,
+                3,
+                std::time::Duration::from_secs(3),
+            ),
         )
         .await
         .expect("gate must release on Aligned");
@@ -2591,7 +2604,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            ConnectorPipelineCallback::wait_for_aligned_resume(true, &controller, 3),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                true,
+                &controller,
+                3,
+                std::time::Duration::from_secs(3),
+            ),
         )
         .await
         .expect("gate must release when a newer epoch is announced");
@@ -2605,7 +2623,12 @@ mod tests {
         let (_kv, controller, _leader_id, _members_tx) = gate_controller();
         tokio::time::timeout(
             Duration::from_millis(100),
-            ConnectorPipelineCallback::wait_for_aligned_resume(false, &controller, 3),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                false,
+                &controller,
+                3,
+                std::time::Duration::from_secs(3),
+            ),
         )
         .await
         .expect("gate must be a no-op without a cluster shuffle");

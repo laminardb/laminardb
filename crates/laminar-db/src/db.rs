@@ -703,6 +703,16 @@ impl LaminarDB {
             rehydration_epoch: None,
         };
 
+        // Drop staged rehydration chains for vnodes no longer owned. Otherwise an
+        // acquire→lose→re-acquire whose re-acquire finds no fresh committed chain would drain the
+        // stale pre-loss chain and resurrect retracted state, and the map would grow unbounded (CL-7).
+        {
+            let owned_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
+            self.rehydrated_vnode_state
+                .lock()
+                .retain(|v, _| owned_set.contains(v));
+        }
+
         // Clone the Arc before the await so the lock guard drops first.
         let backend = self.state_backend.lock().clone();
         if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {

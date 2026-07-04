@@ -1071,6 +1071,10 @@ async fn shuffle_pre_agg_batches(
     let vnode_count = cfg.registry.vnode_count();
     let mut local: Vec<RecordBatch> = Vec::new();
 
+    // Phase 1: slice every batch and STAGE all outbound frames without sending. A vnode that is
+    // unassigned defers the whole cycle here, before any peer received data — so a retry cannot
+    // double-fold on peers that already got their slice (all-or-nothing staging, CL-1).
+    let mut outbound: Vec<(u64, ShuffleMessage)> = Vec::new();
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
@@ -1078,7 +1082,7 @@ async fn shuffle_pre_agg_batches(
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
         for &v in &row_vn {
             if cfg.registry.owner(v).is_unassigned() {
-                // Formation/rebalance transient — defer (recoverable), don't drop.
+                // Formation/rebalance transient — defer (recoverable), don't drop. Nothing sent yet.
                 return Err(DbError::ShuffleNotReady(format!(
                     "[{op_name}] row-shuffle: vnode {v} is unassigned"
                 )));
@@ -1095,16 +1099,34 @@ async fn shuffle_pre_agg_batches(
         for (_v, slice) in local_slices {
             local.push(slice);
         }
-
         for (owner, slice) in remote_slices {
-            let msg = ShuffleMessage::VnodeData(op_name.to_string(), 0, slice);
-            // Unreachable peer during formation: `ShuffleNotReady` defers (recoverable).
-            cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
-                DbError::ShuffleNotReady(format!(
-                    "[{op_name}] row-shuffle send_to peer {}: {e}",
-                    owner.0
-                ))
-            })?;
+            outbound.push((
+                owner.0,
+                ShuffleMessage::VnodeData(op_name.to_string(), 0, slice),
+            ));
+        }
+    }
+
+    // Phase 2: send the staged frames. Before the first send lands, a failure is a formation
+    // transient → defer (retry is safe, nothing sent). AFTER a send lands, a failure is a partial
+    // send: deferring would re-send to peers that already folded, so fault instead — a Pipeline
+    // error trips `fault_on_cycle_error` → coordinated recovery rewinds every node and replays
+    // (CL-1/CL-2). ALO without coordinated recovery drops the cycle rather than double-counting.
+    let mut sent_any = false;
+    for (peer, msg) in outbound {
+        match cfg.sender.send_to(peer, &msg).await {
+            Ok(()) => sent_any = true,
+            Err(e) if !sent_any => {
+                return Err(DbError::ShuffleNotReady(format!(
+                    "[{op_name}] row-shuffle send_to peer {peer}: {e}"
+                )));
+            }
+            Err(e) => {
+                return Err(DbError::ShufflePartialSend(format!(
+                    "[{op_name}] row-shuffle to peer {peer} after prior sends landed; \
+                     faulting for domain replay: {e}"
+                )));
+            }
         }
     }
 
@@ -1675,12 +1697,15 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.merge_groups(&cp)?;
-                // Same-cycle reacquire: `merge_groups` restored `last_emitted`, so a pending
-                // retraction would wrongly drop a still-resident group.
-                self.pending_revoke_retractions.remove(&vnode);
-                // `mark_vnode_hot` clears the cold flag (promotion only); `mark_vnode_dirty` then
-                // blocks re-demotion until the next capture — else a rebalance-acquired vnode (never
-                // cold) could be demoted against stale tier bytes.
+                // NOTE: this method serves BOTH state-tier promotion (`drain_ready` → here) and the
+                // rebalance rehydration path (via `apply_vnode_chain`). It must NOT force-emit or
+                // cancel a revoke retraction — a promotion needs its restored `last_emitted` intact
+                // (demotion emitted no retraction). Those steps run only for genuine rebalance
+                // gainers, in `force_reemit_if_gainer` called from `apply_vnode_chain` (CL-4).
+                //
+                // `mark_vnode_hot` clears the cold flag (promotion); `mark_vnode_dirty` then blocks
+                // re-demotion until the next capture — else a rebalance-acquired vnode (never cold)
+                // could be demoted against stale tier bytes.
                 #[cfg(feature = "state-tier")]
                 {
                     agg_state.mark_vnode_hot(vnode);
@@ -1721,7 +1746,23 @@ impl GraphOperator for SqlQueryOperator {
     ) -> Result<(), DbError> {
         // No deltas → the base alone is the recovered state (full / reference / simple acquire).
         if deltas.is_empty() {
-            return self.apply_vnode_state(vnode, base);
+            self.apply_vnode_state(vnode, base)?;
+            // Rebalance gainer force-emit (this path is reached ONLY by rebalance rehydration, never
+            // by state-tier promotion, which calls apply_vnode_state directly): a same-cycle reacquire
+            // keeps its restored last_emitted (cancel the retraction), a genuine gainer force-emits the
+            // merged groups so they don't vanish from the MV (CL-4).
+            if self.pending_revoke_retractions.remove(&vnode).is_none() {
+                if let Some(vc) = self
+                    .cluster_shuffle
+                    .as_ref()
+                    .map(|c| c.registry.vnode_count())
+                {
+                    if let QueryState::Agg(ref mut agg_state) = self.state {
+                        agg_state.force_reemit_acquired_vnode(vnode, vc);
+                    }
+                }
+            }
+            return Ok(());
         }
         // Deserialize the chain before touching `self.state` (avoids borrowing `self` twice).
         let base_cp: AggStateCheckpoint =
@@ -1753,9 +1794,18 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
-                // Same-cycle reacquire: `merge_groups` restored `last_emitted`, so emit is a no-op for
-                // these groups — a pending retraction would wrongly drop a still-resident group.
-                self.pending_revoke_retractions.remove(&vnode);
+                // Same-cycle reacquire keeps the restored `last_emitted` and cancels its retraction;
+                // a genuine gainer (no pending retraction) force-emits the merged groups instead, or
+                // the restored `last_emitted` suppresses its first emit and the group vanishes (CL-4).
+                if self.pending_revoke_retractions.remove(&vnode).is_none() {
+                    if let Some(vc) = self
+                        .cluster_shuffle
+                        .as_ref()
+                        .map(|c| c.registry.vnode_count())
+                    {
+                        agg_state.force_reemit_acquired_vnode(vnode, vc);
+                    }
+                }
                 #[cfg(feature = "state-tier")]
                 {
                     agg_state.mark_vnode_hot(vnode);

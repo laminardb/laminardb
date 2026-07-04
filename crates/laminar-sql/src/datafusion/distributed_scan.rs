@@ -284,6 +284,11 @@ impl ExecutionPlan for DistributedScanExec {
         let projection = self.projection.clone();
         let filter_sql = self.filter_sql.clone();
         let schema = Arc::clone(&self.schema);
+        // Default: an unreachable peer FAILS the scan (a partial SELECT silently drops a shard's
+        // rows — a correctness hazard, CL-8). Availability-preferring deployments can opt into
+        // partial results (e.g. dashboards that tolerate a brief gap during a node restart).
+        let allow_partial = std::env::var("LAMINAR_ALLOW_PARTIAL_DISTRIBUTED_SCAN")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let remote = futures::stream::iter(self.peers.clone())
             .map(move |peer| {
                 let pool = Arc::clone(&pool);
@@ -303,9 +308,10 @@ impl ExecutionPlan for DistributedScanExec {
                             schema,
                             chunks.map(|batch| batch.map_err(DataFusionError::Execution)),
                         )) as SendableRecordBatchStream,
-                        // Peer unreachable (down/pruned): skip rather than fail the
-                        // scan, but count + log so the partial result isn't silent.
-                        Ok(None) => {
+                        // Peer unreachable (down/restarting/pruned): by default FAIL the scan rather
+                        // than silently return a partial result — dropping a shard's rows from a
+                        // SELECT is a correctness hazard (CL-8). Opt-in partial mode omits the slice.
+                        Ok(None) if allow_partial => {
                             peers_skipped.add(1);
                             tracing::warn!(
                                 peer = peer.0,
@@ -315,6 +321,22 @@ impl ExecutionPlan for DistributedScanExec {
                             Box::pin(RecordBatchStreamAdapter::new(
                                 schema,
                                 futures::stream::empty::<Result<RecordBatch>>(),
+                            )) as SendableRecordBatchStream
+                        }
+                        Ok(None) => {
+                            peers_skipped.add(1);
+                            let msg = format!(
+                                "distributed scan of '{table}': peer {} unreachable — refusing to \
+                                 return a partial result (set LAMINAR_ALLOW_PARTIAL_DISTRIBUTED_SCAN=1 \
+                                 to allow)",
+                                peer.0
+                            );
+                            tracing::warn!(peer = peer.0, table = %table, "{msg}");
+                            Box::pin(RecordBatchStreamAdapter::new(
+                                schema,
+                                futures::stream::once(async move {
+                                    Err::<RecordBatch, _>(DataFusionError::Execution(msg))
+                                }),
                             )) as SendableRecordBatchStream
                         }
                         // Couldn't even open the stream: surface as a one-item
