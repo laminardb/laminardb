@@ -725,8 +725,9 @@ impl CheckpointCoordinator {
         self.config.coordinated_committer_poll
     }
 
-    /// Persist this node's offsets for `epoch`, keyed by source name, so a partition acquired on a
-    /// later rotation resumes from the committed cut, not `auto.offset.reset`.
+    /// Persist this node's source offsets for `epoch`, keyed per node, so a node that acquires a
+    /// partition on a later rotation resumes from the committed cut (see
+    /// [`acquired_source_offsets`](Self::acquired_source_offsets)) rather than `auto.offset.reset`.
     /// Written pre-seal; a write error fails the epoch. No-op without a cluster assignment or backend.
     async fn persist_source_offset_handoff(
         &self,
@@ -739,15 +740,14 @@ impl CheckpointCoordinator {
         let Some(ref backend) = self.state_backend else {
             return Ok(());
         };
-        let per_source: HashMap<&String, &HashMap<String, String>> = source_offsets
-            .iter()
-            .filter(|(_, cp)| !cp.offsets.is_empty())
-            .map(|(name, cp)| (name, &cp.offsets))
+        let flat: HashMap<String, String> = source_offsets
+            .values()
+            .flat_map(|cp| cp.offsets.iter().map(|(k, v)| (k.clone(), v.clone())))
             .collect();
-        if per_source.is_empty() {
+        if flat.is_empty() {
             return Ok(());
         }
-        let bytes = serde_json::to_vec(&per_source)
+        let bytes = serde_json::to_vec(&flat)
             .map_err(|e| DbError::Checkpoint(format!("source-offset handoff encode: {e}")))?;
         let node_key = format!("node-{}", self.self_node_id());
         backend
@@ -757,32 +757,45 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    /// The newest durably-committed epoch (the decision cut): the decision marker lands after the
-    /// state seal, so a killed leader can leave the seal ahead — resume off the decision cut.
+    /// The global source-offset map for the latest sealed epoch, unioned from every node's blob
+    /// (opaque connector key/values). An acquiring source resumes its newly-owned partitions from
+    /// the previous owner's sealed position. Empty backend / no committed epoch yields an empty map;
+    /// a read FAILURE is propagated so the caller defers the rotation rather than re-emitting.
+    /// The newest epoch that is BOTH state-sealed (`_COMMIT`) and sink/decision-committed. The seal
+    /// (`latest_committed_epoch`) is written before the decision marker (`highest_committed`), so a
+    /// leader that dies between them leaves the seal one epoch ahead — its sink output was rolled
+    /// back. Recovery and re-acquire resume off this cut so a re-acquired partition never resumes
+    /// past a rolled-back window (the leader-kill under-count). Equal to the seal in steady state
+    /// and on a follower kill, so this is a no-op there.
     #[cfg(feature = "cluster")]
     pub(crate) async fn durable_committed_epoch(&self) -> Result<Option<u64>, DbError> {
-        if let Some(ref ds) = self.decision_store {
-            return ds.highest_committed().await.map_err(|e| {
-                DbError::Checkpoint(format!("durable epoch: highest_committed failed: {e}"))
-            });
-        }
-        // No decision store (e.g. non-2PC) → the state seal is the truth.
-        match self.state_backend {
-            Some(ref backend) => backend.latest_committed_epoch().await.map_err(|e| {
-                DbError::Checkpoint(format!("durable epoch: latest_committed_epoch failed: {e}"))
-            }),
-            None => Ok(None),
-        }
+        let Some(ref backend) = self.state_backend else {
+            return Ok(None);
+        };
+        let sealed = backend.latest_committed_epoch().await.map_err(|e| {
+            DbError::Checkpoint(format!("durable epoch: latest_committed_epoch failed: {e}"))
+        })?;
+        let Some(ref ds) = self.decision_store else {
+            return Ok(sealed); // no 2PC decision store → the seal is the truth
+        };
+        let decided = ds.highest_committed().await.map_err(|e| {
+            DbError::Checkpoint(format!("durable epoch: highest_committed failed: {e}"))
+        })?;
+        Ok(match (sealed, decided) {
+            (Some(s), Some(d)) => Some(s.min(d)),
+            // Sealed but nothing decision-committed (or nothing sealed) → nothing durable.
+            (Some(_), None) | (None, _) => None,
+        })
     }
 
-    /// Every node's sealed handoff at `epoch`, unioned per source. Recovery passes the epoch it
-    /// restored to (not the latest), so a re-acquired partition can't skip past it.
+    /// Every node's sealed source-offset handoff blobs at `epoch`, unioned. Recovery passes the
+    /// epoch it restored to (not the latest), so a re-acquired partition can't skip past it.
     #[cfg(feature = "cluster")]
     pub(crate) async fn source_offsets_at(
         &self,
         epoch: u64,
-    ) -> Result<HashMap<String, HashMap<String, String>>, DbError> {
-        let mut merged: HashMap<String, HashMap<String, String>> = HashMap::new();
+    ) -> Result<HashMap<String, String>, DbError> {
+        let mut merged = HashMap::new();
         let Some(ref backend) = self.state_backend else {
             return Ok(merged);
         };
@@ -792,12 +805,8 @@ impl CheckpointCoordinator {
             ))
         })?;
         for blob in blobs {
-            match serde_json::from_slice::<HashMap<String, HashMap<String, String>>>(&blob) {
-                Ok(m) => {
-                    for (src, offsets) in m {
-                        merged.entry(src).or_default().extend(offsets);
-                    }
-                }
+            match serde_json::from_slice::<HashMap<String, String>>(&blob) {
+                Ok(m) => merged.extend(m),
                 Err(e) => warn!(error = %e, "source offset handoff: skipping undecodable blob"),
             }
         }

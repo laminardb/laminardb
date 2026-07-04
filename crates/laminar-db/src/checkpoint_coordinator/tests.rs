@@ -1040,13 +1040,10 @@ async fn source_offset_handoff_round_trip() {
     }
     assert!(backend.epoch_complete(5, &[0, 1, 2, 3], &[]).await.unwrap());
 
-    // A node acquiring events-0 on rotation recovers the committed offset for its source.
+    // A node acquiring events-0 on rotation recovers the committed offset.
     let epoch = coord.durable_committed_epoch().await.unwrap().unwrap();
     let acquired = coord.source_offsets_at(epoch).await.unwrap();
-    assert_eq!(
-        acquired.get("kafka").and_then(|m| m.get("events-0")),
-        Some(&"100".to_string())
-    );
+    assert_eq!(acquired.get("events-0"), Some(&"100".to_string()));
 }
 
 /// Recovery must read the handoff at the epoch it restored to, not the latest, or a coordinated
@@ -1089,14 +1086,13 @@ async fn source_offsets_at_reads_the_requested_epoch() {
     }
 
     // With no decision store the durable cut is the seal (newest); an epoch-scoped read pins a cut.
-    let events0 = |m: &HashMap<String, HashMap<String, String>>| m["kafka"]["events-0"].clone();
     let durable = coord.durable_committed_epoch().await.unwrap().unwrap();
-    assert_eq!(
-        events0(&coord.source_offsets_at(durable).await.unwrap()),
-        "200"
-    );
-    assert_eq!(events0(&coord.source_offsets_at(5).await.unwrap()), "100");
-    assert_eq!(events0(&coord.source_offsets_at(8).await.unwrap()), "200");
+    let latest = coord.source_offsets_at(durable).await.unwrap();
+    assert_eq!(latest.get("events-0"), Some(&"200".to_string()));
+    let at5 = coord.source_offsets_at(5).await.unwrap();
+    assert_eq!(at5.get("events-0"), Some(&"100".to_string()));
+    let at8 = coord.source_offsets_at(8).await.unwrap();
+    assert_eq!(at8.get("events-0"), Some(&"200".to_string()));
 }
 
 /// A leader that seals epoch E but dies before recording the decision leaves the seal one epoch

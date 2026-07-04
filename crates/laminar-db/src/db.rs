@@ -643,8 +643,10 @@ impl LaminarDB {
             })
             .collect();
 
-        // Resume offsets and rehydrate state at the same durable cut so they agree: a killed leader
-        // can seal an epoch it never sink-committed. A read failure defers the rotation.
+        // Resume acquired partitions from the durably-committed cut (state seal AND sink decision),
+        // and rehydrate their aggregate base at the SAME cut below, so the two agree even when a
+        // killed leader sealed an epoch it never sink-committed. Staged before the version bump; a
+        // read failure defers the rotation (EO must not fall back to startup and re-emit).
         let mut durable_epoch: Option<u64> = None;
         if !newly_acquired.is_empty() {
             if let Some(coord) = guard.as_ref() {
@@ -664,10 +666,7 @@ impl LaminarDB {
                 };
                 if let Some(epoch) = durable_epoch {
                     match coord.source_offsets_at(epoch).await {
-                        // Kafka's re-assign seek is scoped to owned partitions, so flattening
-                        // every source's slice into the registry here is inert for the rest.
-                        Ok(per_source) => registry
-                            .stage_resume_offsets(per_source.into_values().flatten().collect()),
+                        Ok(offsets) => registry.stage_resume_offsets(offsets),
                         Err(e) => {
                             tracing::warn!(
                                 error = %e, version = snapshot.version,
@@ -735,7 +734,8 @@ impl LaminarDB {
         // Clone the Arc before the await so the lock guard drops first.
         let backend = self.state_backend.lock().clone();
         if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {
-            // Rehydrate the base at the same durable cut as the offsets; none → start fresh.
+            // Rehydrate the base at the same durable cut the offsets resumed from (a killed leader
+            // can seal an epoch past the sink-committed cut). No durable epoch → start fresh.
             let report = match durable_epoch {
                 Some(epoch) => {
                     crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
