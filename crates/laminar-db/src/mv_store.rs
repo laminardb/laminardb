@@ -176,9 +176,9 @@ impl UpsertState {
         Ok(())
     }
 
-    fn to_record_batch(&self, schema: &SchemaRef) -> RecordBatch {
+    fn to_record_batch(&self, schema: &SchemaRef) -> Result<RecordBatch, DbError> {
         if self.rows.is_empty() {
-            return RecordBatch::new_empty(schema.clone());
+            return Ok(RecordBatch::new_empty(schema.clone()));
         }
         // One pass over the row map assembling all columns, rather than one full map scan per column.
         let ncols = schema.fields().len();
@@ -192,13 +192,13 @@ impl UpsertState {
         }
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(ncols);
         for col in columns {
-            match ScalarValue::iter_to_array(col) {
-                Ok(a) => arrays.push(a),
-                Err(_) => return RecordBatch::new_empty(schema.clone()),
-            }
+            arrays.push(
+                ScalarValue::iter_to_array(col)
+                    .map_err(|e| DbError::Storage(format!("upsert MV column build: {e}")))?,
+            );
         }
         RecordBatch::try_new(schema.clone(), arrays)
-            .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone()))
+            .map_err(|e| DbError::Storage(format!("upsert MV batch assembly: {e}")))
     }
 }
 
@@ -274,9 +274,9 @@ impl MultisetState {
         Ok(())
     }
 
-    fn to_record_batch(&self, schema: &SchemaRef) -> RecordBatch {
+    fn to_record_batch(&self, schema: &SchemaRef) -> Result<RecordBatch, DbError> {
         if self.counts.is_empty() {
-            return RecordBatch::new_empty(schema.clone());
+            return Ok(RecordBatch::new_empty(schema.clone()));
         }
         let mut rows: Vec<arrow::row::Row> = Vec::new();
         for (key, &count) in &self.counts {
@@ -284,11 +284,12 @@ impl MultisetState {
                 rows.push(key.row());
             }
         }
-        match self.row_converter.convert_rows(rows.iter().copied()) {
-            Ok(arrays) => RecordBatch::try_new(schema.clone(), arrays)
-                .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone())),
-            Err(_) => RecordBatch::new_empty(schema.clone()),
-        }
+        let arrays = self
+            .row_converter
+            .convert_rows(rows.iter().copied())
+            .map_err(|e| DbError::Storage(format!("multiset MV row conversion: {e}")))?;
+        RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| DbError::Storage(format!("multiset MV batch assembly: {e}")))
     }
 }
 
@@ -408,7 +409,7 @@ impl MvEntry {
         Ok(())
     }
 
-    fn to_record_batch(&self) -> RecordBatch {
+    fn to_record_batch(&self) -> Result<RecordBatch, DbError> {
         if let Some(up) = self.upsert.as_ref() {
             return up.to_record_batch(&self.schema);
         }
@@ -416,11 +417,11 @@ impl MvEntry {
             return ms.to_record_batch(&self.schema);
         }
         if self.batches.is_empty() {
-            return RecordBatch::new_empty(self.schema.clone());
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
         let refs: Vec<&RecordBatch> = self.batches.iter().collect();
         arrow::compute::concat_batches(&self.schema, refs.iter().copied())
-            .unwrap_or_else(|_| RecordBatch::new_empty(self.schema.clone()))
+            .map_err(|e| DbError::Storage(format!("MV batch concat: {e}")))
     }
 }
 
@@ -485,8 +486,11 @@ impl MvStore {
         self.update_cycle(name, std::slice::from_ref(batch));
     }
 
-    pub fn to_record_batch(&self, name: &str) -> Option<RecordBatch> {
-        self.entries.get(name).map(MvEntry::to_record_batch)
+    pub fn to_record_batch(&self, name: &str) -> Result<Option<RecordBatch>, DbError> {
+        self.entries
+            .get(name)
+            .map(MvEntry::to_record_batch)
+            .transpose()
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -498,8 +502,13 @@ impl MvStore {
         let mut out = HashMap::new();
         for (name, entry) in &self.entries {
             let bytes = if entry.upsert.is_some() || entry.multiset.is_some() {
-                // Upsert/Multiset keep no batches; serialize the materialized snapshot.
-                let batch = entry.to_record_batch();
+                // Upsert/Multiset keep no batches; serialize the materialized snapshot. A conversion
+                // error propagates (fails the checkpoint) rather than silently omitting the MV, which
+                // recovery would then restore as empty — silent data loss. Name the MV so a
+                // deterministic fault (which would stall every checkpoint) is diagnosable. [HP-8]
+                let batch = entry.to_record_batch().map_err(|e| {
+                    DbError::Checkpoint(format!("MV '{name}' checkpoint snapshot failed: {e}"))
+                })?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -648,7 +657,7 @@ mod tests {
     /// `(k, total)` snapshot rows sorted by key, for order-independent assertions.
     fn snapshot_rows(store: &MvStore, name: &str) -> Vec<(i64, i64)> {
         use arrow::array::Int64Array;
-        let batch = store.to_record_batch(name).unwrap();
+        let batch = store.to_record_batch(name).unwrap().unwrap();
         let ks = batch
             .column(0)
             .as_any()
@@ -686,10 +695,10 @@ mod tests {
             .unwrap();
 
         store.update("agg", &make_batch(&[1], &["a"], &[1.0]));
-        assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 1);
+        assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 1);
 
         store.update("agg", &make_batch(&[2, 3], &["b", "c"], &[2.0, 3.0]));
-        assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 2);
+        assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 2);
     }
 
     #[test]
@@ -709,11 +718,11 @@ mod tests {
                 make_batch(&[5], &["e"], &[5.0]),
             ],
         );
-        assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 5);
+        assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 5);
 
         // The next cycle replaces the whole result set.
         store.update_cycle("agg", &[make_batch(&[9], &["z"], &[9.0])]);
-        assert_eq!(store.to_record_batch("agg").unwrap().num_rows(), 1);
+        assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 1);
     }
 
     #[test]
@@ -731,7 +740,7 @@ mod tests {
             store.update("app", &make_batch(&[i], &["x"], &[f64::from(i)]));
         }
 
-        let result = store.to_record_batch("app").unwrap();
+        let result = store.to_record_batch("app").unwrap().unwrap();
         assert_eq!(result.num_rows(), 3);
 
         // Batch 0 evicted, should start at 1
@@ -749,7 +758,7 @@ mod tests {
         store
             .create_mv("empty", test_schema(), MvStorageMode::Aggregate)
             .unwrap();
-        let result = store.to_record_batch("empty").unwrap();
+        let result = store.to_record_batch("empty").unwrap().unwrap();
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.schema(), test_schema());
     }
@@ -757,7 +766,7 @@ mod tests {
     #[test]
     fn nonexistent_returns_none() {
         let store = MvStore::new();
-        assert!(store.to_record_batch("nope").is_none());
+        assert!(store.to_record_batch("nope").unwrap().is_none());
     }
 
     #[test]
@@ -781,7 +790,10 @@ mod tests {
             let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
             assert!(store2.restore_from_ipc(name, bytes).unwrap());
         }
-        assert_eq!(store2.to_record_batch("agg").unwrap().num_rows(), 2);
+        assert_eq!(
+            store2.to_record_batch("agg").unwrap().unwrap().num_rows(),
+            2
+        );
     }
 
     #[test]
@@ -798,12 +810,12 @@ mod tests {
             .create_mv("mv1", test_schema(), MvStorageMode::Aggregate)
             .unwrap();
         store.update("mv1", &make_batch(&[1], &["a"], &[1.0]));
-        assert_eq!(store.to_record_batch("mv1").unwrap().num_rows(), 1);
+        assert_eq!(store.to_record_batch("mv1").unwrap().unwrap().num_rows(), 1);
 
         store
             .create_mv("mv1", test_schema(), MvStorageMode::append_default())
             .unwrap();
-        assert_eq!(store.to_record_batch("mv1").unwrap().num_rows(), 0);
+        assert_eq!(store.to_record_batch("mv1").unwrap().unwrap().num_rows(), 0);
     }
 
     #[test]
@@ -957,7 +969,7 @@ mod tests {
     /// `v` snapshot values sorted (with multiplicity).
     fn multiset_values(store: &MvStore, name: &str) -> Vec<i64> {
         use arrow::array::Int64Array;
-        let batch = store.to_record_batch(name).unwrap();
+        let batch = store.to_record_batch(name).unwrap().unwrap();
         let vs = batch
             .column(0)
             .as_any()

@@ -1662,7 +1662,7 @@ impl LaminarDB {
 
         // Seed a Tail subscriber with the current snapshot so it sees present state at once.
         if matches!(start, crate::subscription::SubscribeStart::Tail) {
-            if let Some(snap) = self.mv_store.read().to_record_batch(name) {
+            if let Some(snap) = self.mv_store.read().to_record_batch(name)? {
                 if snap.num_rows() > 0 {
                     replay.insert(0, crate::subscription::MvUpdate::Batch(snap));
                 }
@@ -2454,16 +2454,22 @@ impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
         projection: Option<Vec<usize>>,
         filter_sql: Option<String>,
     ) -> Result<arrow::array::RecordBatch, String> {
-        let batch = self
-            .mv_store
-            .upgrade()
-            .and_then(|s| s.read().to_record_batch(table_name))
-            .or_else(|| {
-                self.table_store
-                    .upgrade()
-                    .and_then(|s| s.read().to_record_batch(table_name))
-            })
-            .ok_or_else(|| format!("table '{table_name}' not found"))?;
+        // A materialization error surfaces as a scan failure rather than a missing-table fallthrough.
+        let from_mv = match self.mv_store.upgrade() {
+            Some(s) => s
+                .read()
+                .to_record_batch(table_name)
+                .map_err(|e| e.to_string())?,
+            None => None,
+        };
+        let batch = if let Some(b) = from_mv {
+            b
+        } else {
+            self.table_store
+                .upgrade()
+                .and_then(|s| s.read().to_record_batch(table_name))
+                .ok_or_else(|| format!("table '{table_name}' not found"))?
+        };
 
         // Apply before projecting (predicate may reference dropped columns);
         // on any failure skip — the coordinator re-applies it.

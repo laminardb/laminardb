@@ -1461,8 +1461,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if !changelog_broadcasts.is_empty() {
             let store = self.mv_store.read();
             for stream_name in changelog_broadcasts {
-                if let Some(snap) = store.to_record_batch(&stream_name) {
-                    self.subscription_registry.send_batch(&stream_name, snap);
+                match store.to_record_batch(&stream_name) {
+                    Ok(Some(snap)) => self.subscription_registry.send_batch(&stream_name, snap),
+                    Ok(None) => {}
+                    // On the pipeline task with no caller to fail; log rather than silently skip. [HP-8]
+                    Err(e) => tracing::error!(
+                        mv = %stream_name, error = %e,
+                        "MV snapshot for subscribers failed"
+                    ),
                 }
             }
         }

@@ -11,6 +11,33 @@ Two findings likely explain the known "EO-Kafka soak flaky on baseline" mystery:
 
 ---
 
+## Implementation status (updated 2026-07-04, branch `feat/perf-correctness-audit-2026-07-03`)
+
+Phases 1–3 (correctness) landed in full; Phases 4–5 landed their **correctness** items —
+the remaining Phase 4/5 findings are pure performance whose acceptance gate is `cargo bench`
+/ long soaks that don't run on the dev box, so they're deferred with the fix approach recorded
+here (each finding's **Fix:** below stands).
+
+- **Phase 1 — DONE** (`e8baedb1`): CP-1..6, EX-1..3.
+- **Phase 2 — DONE** (`014a729c` + `cebe91c8`): CN-1..7.
+- **Phase 3 — DONE** (`904d408b`): CL-1,3,4,6,7,8. Deferred: CL-2 (full seq/ack contract —
+  needs the multi-node soak), CL-5 (per-node watermark idleness — premature-close data-loss
+  risk without a soak), CL-9 (perf nits).
+- **Phase 4 — correctness DONE** (`e0080251`): ST-1 (P0, gates delta-checkpoint enablement),
+  ST-2, ST-7. Deferred as benchmark/soak-gated perf: **CK-1, ST-3, ST-4, ST-5, ST-6, ST-8**
+  (ST-6's "demote while an epoch is in flight" also needs a soak — it relaxes the invariant
+  ST-2 relies on).
+- **Phase 5 — correctness DONE**: HP-8's silent error→empty conversion (SELECT returned zero
+  rows / checkpoint silently omitted the MV on a conversion failure) now propagates. Deferred
+  as benchmark-gated perf: **HP-1, HP-2, HP-3, HP-4 (already an intentional re-plan), HP-5,
+  HP-6, HP-7, HP-9, HP-10, and HP-8's SELECT-under-lock priority inversion** (ArcSwap snapshot).
+
+Every landed change was validated by base/cluster/state-tier lib builds, the lib test suites,
+`clippy -D warnings` on all three configs, and adversarial review passes. Remaining gates are
+the soaks/benchmarks called out per finding.
+
+---
+
 ## Phase 1 — Exactly-once / at-least-once protocol holes (single node)
 
 Small, surgical fixes; each independently testable. Do these first.

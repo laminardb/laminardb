@@ -190,10 +190,13 @@ impl TableProvider for MvTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Propagate a materialization error instead of returning an empty batch — a silent empty
+        // result would look like a legitimately empty MV to the SQL caller. [HP-8]
         let batch = self
             .mv_store
             .read()
             .to_record_batch(&self.mv_name)
+            .map_err(|e| DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name)))?
             .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
 
         let schema = batch.schema();
