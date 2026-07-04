@@ -93,6 +93,15 @@ struct AggPromotion {
     vnode_fetch_misses: FxHashMap<u32, u32>,
     group_fetch_misses: FxHashMap<arrow::row::OwnedRow, u32>,
     max_deferred_rows: usize,
+    // A `Closed` reply means the tier worker task is gone: every future fetch fails at the send, so
+    // the deferred batch can never drain and the watermark hold pins forever. Distinct from a miss
+    // (which re-fetches); escalate at once rather than wedge. [ST-7]
+    worker_dead: bool,
+    // Tier copies of just-promoted slices/groups whose drop is deferred until no checkpoint is in
+    // flight. Dropping mid-tail would race the coordinator's fetch of a staged cold group and fail
+    // the epoch; released by `release_drops` once idle. [ST-2]
+    pending_slice_drops: Vec<u32>,
+    pending_group_drops: Vec<(u32, Vec<u8>)>,
 }
 
 #[cfg(feature = "state-tier")]
@@ -115,6 +124,24 @@ impl AggPromotion {
             vnode_fetch_misses: FxHashMap::default(),
             group_fetch_misses: FxHashMap::default(),
             max_deferred_rows: MAX_DEFERRED_PROMOTION_ROWS,
+            worker_dead: false,
+            pending_slice_drops: Vec::new(),
+            pending_group_drops: Vec::new(),
+        }
+    }
+
+    fn worker_dead(&self) -> bool {
+        self.worker_dead
+    }
+
+    /// Issue the tier drops queued during promotion. Called only when no checkpoint is in flight, so
+    /// a drop can't race the coordinator's fetch of a staged cold group. [ST-2]
+    fn release_drops(&mut self) {
+        for vnode in std::mem::take(&mut self.pending_slice_drops) {
+            self.drop_slice(vnode);
+        }
+        for (vnode, group) in std::mem::take(&mut self.pending_group_drops) {
+            self.drop_group(vnode, group);
         }
     }
 
@@ -154,10 +181,13 @@ impl AggPromotion {
                 Err(oneshot::error::TryRecvError::Empty) => {
                     still.insert(vnode, rx);
                 }
-                Err(oneshot::error::TryRecvError::Closed) => tracing::warn!(
-                    operator = %self.op_name, vnode,
-                    "cold-tier worker dropped a promotion fetch"
-                ),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    tracing::warn!(
+                        operator = %self.op_name, vnode,
+                        "cold-tier worker dropped a promotion fetch"
+                    );
+                    self.worker_dead = true;
+                }
             }
         }
         self.inflight = still;
@@ -174,8 +204,15 @@ impl AggPromotion {
             vnode,
             reply,
         };
-        if self.tier.try_send(req).is_ok() {
-            self.inflight.insert(vnode, rx);
+        match self.tier.try_send(req) {
+            Ok(()) => {
+                self.inflight.insert(vnode, rx);
+            }
+            // Disconnected = the worker task is gone; flag it so promotion escalates rather than
+            // silently dropping the fetch (a worker that dies with nothing in flight is otherwise
+            // never seen by `drain_ready`). A full channel just retries next cycle. [ST-7]
+            Err(crossfire::TrySendError::Disconnected(_)) => self.worker_dead = true,
+            Err(crossfire::TrySendError::Full(_)) => {}
         }
     }
 
@@ -203,10 +240,13 @@ impl AggPromotion {
                 Err(oneshot::error::TryRecvError::Empty) => {
                     still.insert(key, (vnode, group, rx));
                 }
-                Err(oneshot::error::TryRecvError::Closed) => tracing::warn!(
-                    operator = %self.op_name, vnode,
-                    "cold-tier worker dropped a group promotion fetch"
-                ),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    tracing::warn!(
+                        operator = %self.op_name, vnode,
+                        "cold-tier worker dropped a group promotion fetch"
+                    );
+                    self.worker_dead = true;
+                }
             }
         }
         self.inflight_groups = still;
@@ -224,8 +264,12 @@ impl AggPromotion {
             group: group.clone(),
             reply,
         };
-        if self.tier.try_send(req).is_ok() {
-            self.inflight_groups.insert(key, (vnode, group, rx));
+        match self.tier.try_send(req) {
+            Ok(()) => {
+                self.inflight_groups.insert(key, (vnode, group, rx));
+            }
+            Err(crossfire::TrySendError::Disconnected(_)) => self.worker_dead = true,
+            Err(crossfire::TrySendError::Full(_)) => {}
         }
     }
 
@@ -777,7 +821,7 @@ impl SqlQueryOperator {
                     self.apply_vnode_state(vnode, &bytes)?;
                     if let Some(p) = self.promotion.as_mut() {
                         p.clear_vnode_miss(vnode);
-                        p.drop_slice(vnode);
+                        p.pending_slice_drops.push(vnode);
                     }
                 }
                 None => {
@@ -809,7 +853,7 @@ impl SqlQueryOperator {
                     self.apply_group_state(&key, &bytes)?;
                     if let Some(p) = self.promotion.as_mut() {
                         p.clear_group_miss(&key);
-                        p.drop_group(vnode, group);
+                        p.pending_group_drops.push((vnode, group));
                     }
                 }
                 None => {
@@ -827,6 +871,20 @@ impl SqlQueryOperator {
                     }
                 }
             }
+        }
+
+        // A dead tier worker can never resolve the deferred fetches above; escalate instead of
+        // pinning the watermark hold forever. [ST-7]
+        if self
+            .promotion
+            .as_ref()
+            .is_some_and(AggPromotion::worker_dead)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[state-tier] cold-tier worker died (operator={}) — failing rather than wedging \
+                 promotion behind the watermark hold",
+                self.op_name
+            )));
         }
 
         // Promote-then-retract cold groups that aged past the idle TTL while demoted: `evict_idle`
@@ -1685,6 +1743,13 @@ impl GraphOperator for SqlQueryOperator {
             .is_some_and(AggPromotion::has_pending)
     }
 
+    #[cfg(feature = "state-tier")]
+    fn release_tier_drops(&mut self) {
+        if let Some(p) = self.promotion.as_mut() {
+            p.release_drops();
+        }
+    }
+
     #[cfg(feature = "cluster")]
     fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
         let cp: AggStateCheckpoint =
@@ -1879,6 +1944,13 @@ impl GraphOperator for SqlQueryOperator {
             // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until
             // `lazy_init` folds them in, else they'd survive to a later re-acquire and double-count.
             _ => self.deferred_revoke_vnodes.extend(revoked.iter().copied()),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn force_full_rebase(&mut self) {
+        if let QueryState::Agg(ref mut agg_state) = self.state {
+            agg_state.force_full_rebase();
         }
     }
 }

@@ -623,6 +623,12 @@ pub(crate) struct IncrementalAggState {
     // base never ages out of the prune window; cleared to a full re-base on restore/acquire.
     #[cfg(feature = "cluster")]
     delta_chain_len: AHashMap<u32, u32>,
+    // Vnodes a failed checkpoint epoch must re-base FULL on the next capture. The failed epoch
+    // already cleared its dirty sets, so a plain delta would skip those changes; these are also
+    // re-armed into `touched` because an emptied vnode otherwise falls out of it and its lost
+    // tombstone resurrects the deleted groups on recovery. [ST-1]
+    #[cfg(feature = "cluster")]
+    force_rebase_vnodes: rustc_hash::FxHashSet<u32>,
 }
 
 impl IncrementalAggState {
@@ -981,6 +987,8 @@ impl IncrementalAggState {
             last_emitted_dirty_by_vnode: AHashMap::new(),
             #[cfg(feature = "cluster")]
             delta_chain_len: AHashMap::new(),
+            #[cfg(feature = "cluster")]
+            force_rebase_vnodes: rustc_hash::FxHashSet::default(),
         }))
     }
 
@@ -1829,6 +1837,12 @@ impl IncrementalAggState {
         for k in self.cold_groups.keys() {
             touched.insert(vnode_of(k));
         }
+        // Re-visit vnodes a failed epoch must re-base FULL even if they emptied since (and so fell
+        // out of the sets above): their `delta_chain_len` was dropped by `force_full_rebase`, so
+        // each re-bases FULL below, re-establishing a durable base the failed epoch didn't. [ST-1]
+        for v in self.force_rebase_vnodes.drain() {
+            touched.insert(v);
+        }
 
         let mut out: std::collections::HashMap<u32, VnodeCapture> =
             std::collections::HashMap::with_capacity(touched.len());
@@ -2173,6 +2187,20 @@ impl IncrementalAggState {
     /// `cold_groups` retain below is now defense-in-depth only: `drop_vnodes` already clears a vnode's
     /// cold tracking at revocation, and a restart starts with `cold_groups` empty, so on every
     /// reachable path it is a no-op by the time a vnode is re-acquired.
+    /// Force every chained vnode's next delta capture to re-base FULL after a checkpoint epoch
+    /// failed. Capture is destructive — it clears the per-vnode dirty sets and advances the chain
+    /// before the epoch is durable — so a failed epoch leaves the operator's chain ahead of the
+    /// coordinator's parent link; the next plain delta would skip the failed epoch's changes and
+    /// resurrect its tombstones. Dropping the chain lengths makes the next capture read live state
+    /// wholesale; the vnodes are also re-armed so an emptied one is re-visited (see the `touched`
+    /// seed in `checkpoint_delta_by_vnode`). Safe when delta is off (the maps are empty). [ST-1]
+    #[cfg(feature = "cluster")]
+    pub(crate) fn force_full_rebase(&mut self) {
+        self.force_rebase_vnodes
+            .extend(self.delta_chain_len.keys().copied());
+        self.delta_chain_len.clear();
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn reset_acquired_vnodes(&mut self, acquired: &rustc_hash::FxHashSet<u32>) {
         if acquired.is_empty() {
@@ -4255,6 +4283,89 @@ mod tests {
         assert!(
             matches!(rebased.get(&0), Some(VnodeCapture::Full(_))),
             "a chain at the bound must re-base to FULL",
+        );
+    }
+
+    /// After a failed epoch, `force_full_rebase` makes the next capture re-base FULL for every
+    /// chained vnode even below `chain_max`: the failed epoch cleared the dirty sets at capture, so
+    /// a plain delta would silently skip its changes and resurrect its tombstones. [ST-1]
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn force_full_rebase_recaptures_full_after_failed_epoch() {
+        const V: u32 = 1; // single vnode → every key lands in vnode 0
+        fn pre_agg_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("__agg_input_1", DataType::Float64, true),
+            ]))
+        }
+        fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                pre_agg_schema(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(arrow::array::Float64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            state.process_batch(&batch, ts).unwrap();
+        }
+        async fn agg(ctx: &SessionContext) -> IncrementalAggState {
+            IncrementalAggState::try_from_sql(
+                ctx,
+                "SELECT name, SUM(value) as total FROM events GROUP BY name",
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+            .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+
+        let mut producer = agg(&ctx).await;
+        producer.set_delta_enabled(true);
+
+        // Epoch 0 → FULL base; epoch 1 (well below chain_max=8) → DELTA.
+        feed(&mut producer, &[("a", 1.0), ("b", 2.0)], 1000);
+        assert!(matches!(
+            producer.checkpoint_delta_by_vnode(V, 8).unwrap().get(&0),
+            Some(VnodeCapture::Full(_))
+        ));
+        feed(&mut producer, &[("a", 10.0)], 2000);
+        assert!(
+            matches!(
+                producer.checkpoint_delta_by_vnode(V, 8).unwrap().get(&0),
+                Some(VnodeCapture::Delta(_))
+            ),
+            "below the chain bound, a normal capture is a DELTA",
+        );
+
+        // Simulate the failed epoch's recovery hook: the next capture must re-base FULL.
+        producer.force_full_rebase();
+        feed(&mut producer, &[("b", 20.0)], 3000);
+        assert!(
+            matches!(
+                producer.checkpoint_delta_by_vnode(V, 8).unwrap().get(&0),
+                Some(VnodeCapture::Full(_))
+            ),
+            "force_full_rebase must re-base the next capture FULL, not chain a gapped delta",
         );
     }
 

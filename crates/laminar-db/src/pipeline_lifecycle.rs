@@ -1967,9 +1967,20 @@ impl LaminarDB {
             match guard.as_ref() {
                 Some(coord) => {
                     let cfg = coord.config();
+                    // Delta checkpoints chain each epoch onto the prior durable one; capture is
+                    // destructive, so a pipelined epoch would bake in the gap of a not-yet-known
+                    // failure before it can be re-based. Serialize them (depth 1) so a failure is
+                    // observed before the next capture. [ST-1]
+                    let delta_enabled = self
+                        .config
+                        .checkpoint
+                        .as_ref()
+                        .and_then(|c| c.delta_chain_max)
+                        .is_some();
                     let depth = if has_exactly_once_sink
                         || pipeline_config.delivery_guarantee
                             == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+                        || delta_enabled
                     {
                         1
                     } else {
@@ -2055,6 +2066,8 @@ impl LaminarDB {
             checkpoint_complete_tx,
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
             staged_bytes: Arc::clone(&staged_bytes),
+            #[cfg(feature = "cluster")]
+            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch_allocator,
             #[cfg(feature = "cluster")]
             quorum_timeout: ckpt_quorum_timeout,

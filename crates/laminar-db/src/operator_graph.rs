@@ -118,6 +118,13 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) {}
 
+    /// Force the next delta capture to re-base FULL after a checkpoint epoch failed. Destructive
+    /// capture cleared the operator's dirty sets before the epoch was durable, so a plain delta
+    /// would silently skip the failed epoch. Default no-op; only delta-checkpointed aggregates act
+    /// on it. [ST-1]
+    #[cfg(feature = "cluster")]
+    fn force_full_rebase(&mut self) {}
+
     /// Wire the cold-tier channel for vnode promotion. Only vnode-sharded
     /// aggregates use it; others ignore it.
     #[cfg(feature = "state-tier")]
@@ -152,6 +159,12 @@ pub(crate) trait GraphOperator: Send {
     fn has_pending_promotion(&self) -> bool {
         false
     }
+
+    /// Issue the tier drops of keys promoted since the last release. Called only when no checkpoint
+    /// is in flight: a drop mid-tail could race the coordinator's fetch of a staged cold group and
+    /// fail the epoch, so promotion queues drops and this releases them. Default no-op. [ST-2]
+    #[cfg(feature = "state-tier")]
+    fn release_tier_drops(&mut self) {}
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -2626,6 +2639,18 @@ impl OperatorGraph {
         Ok(out)
     }
 
+    /// Force every operator's next delta capture to re-base FULL. Called before the next capture
+    /// after a checkpoint epoch failed, so no operator's chain silently outruns the coordinator's
+    /// parent link (which the failed epoch did not advance). [ST-1]
+    #[cfg(feature = "cluster")]
+    pub(crate) fn force_full_rebase(&mut self) {
+        for node in &mut self.nodes {
+            if !node.removed {
+                node.operator.force_full_rebase();
+            }
+        }
+    }
+
     /// Drop one vnode's state after its cold-tier write is confirmed.
     /// Returns `false` if the operator refuses (vnode modified since last capture).
     #[cfg(feature = "state-tier")]
@@ -2677,6 +2702,17 @@ impl OperatorGraph {
             }
         }
         total
+    }
+
+    /// Release every operator's queued tier drops (promoted keys' now-redundant cold copies). Called
+    /// only when no checkpoint is in flight so a drop can't race a staged cold-group fetch. [ST-2]
+    #[cfg(feature = "state-tier")]
+    pub(crate) fn release_tier_drops(&mut self) {
+        for node in &mut self.nodes {
+            if !node.removed {
+                node.operator.release_tier_drops();
+            }
+        }
     }
 
     /// Whether the named operator could demote `vnode` right now (no tier I/O performed).
