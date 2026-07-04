@@ -324,41 +324,29 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// A source's recovery offsets: its manifest offsets, plus any partitions the (per-node
-    /// incomplete) manifest lacked — e.g. re-acquired from a killed peer — filled from the cluster
-    /// handoff union, scoped to this source's topics. Residual partitions in neither fall to the
-    /// committed default in `open()`, never a reprocess-from-zero.
+    /// A source's recovery offsets: manifest offsets plus a partition the (per-node incomplete)
+    /// manifest lacked — re-acquired from a killed peer — filled from this source's handoff slice.
+    /// Partitions in neither fall to the committed default in `open()`.
     #[cfg(feature = "cluster")]
     fn recovery_source_checkpoint(
         source: &str,
         manifest_cp: Option<&laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint>,
-        handoff: &HashMap<String, String>,
+        handoff: &HashMap<String, HashMap<String, String>>,
         epoch: u64,
     ) -> Option<laminar_connectors::checkpoint::SourceCheckpoint> {
         use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
         let mut cp = manifest_cp
             .cloned()
             .unwrap_or_else(|| ConnectorCheckpoint::with_offsets(epoch, HashMap::new()));
-        let topics: std::collections::HashSet<String> = cp
-            .offsets
-            .keys()
-            .filter_map(|k| k.rsplit_once('-').map(|(t, _)| t.to_string()))
-            .collect();
-        let fill: Vec<(String, String)> = handoff
-            .iter()
-            .filter(|(k, _)| {
-                k.rsplit_once('-')
-                    .is_some_and(|(t, _)| topics.contains(t) && !cp.offsets.contains_key(*k))
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if !fill.is_empty() {
-            tracing::info!(
-                source,
-                filled = fill.len(),
-                "recovery filled partitions from handoff"
-            );
-            cp.offsets.extend(fill);
+        if let Some(src_handoff) = handoff.get(source) {
+            let before = cp.offsets.len();
+            for (k, v) in src_handoff {
+                cp.offsets.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            let filled = cp.offsets.len() - before;
+            if filled > 0 {
+                tracing::info!(source, filled, "recovery filled partitions from handoff");
+            }
         }
         if cp.offsets.is_empty() {
             return None;
