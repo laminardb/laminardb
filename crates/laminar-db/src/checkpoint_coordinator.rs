@@ -761,21 +761,31 @@ impl CheckpointCoordinator {
     /// (opaque connector key/values). An acquiring source resumes its newly-owned partitions from
     /// the previous owner's sealed position. Empty backend / no committed epoch yields an empty map;
     /// a read FAILURE is propagated so the caller defers the rotation rather than re-emitting.
+    /// The newest epoch that is BOTH state-sealed (`_COMMIT`) and sink/decision-committed. The seal
+    /// (`latest_committed_epoch`) is written before the decision marker (`highest_committed`), so a
+    /// leader that dies between them leaves the seal one epoch ahead — its sink output was rolled
+    /// back. Recovery and re-acquire resume off this cut so a re-acquired partition never resumes
+    /// past a rolled-back window (the leader-kill under-count). Equal to the seal in steady state
+    /// and on a follower kill, so this is a no-op there.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn acquired_source_offsets(&self) -> Result<HashMap<String, String>, DbError> {
+    pub(crate) async fn durable_committed_epoch(&self) -> Result<Option<u64>, DbError> {
         let Some(ref backend) = self.state_backend else {
-            return Ok(HashMap::new());
+            return Ok(None);
         };
-        let epoch = match backend.latest_committed_epoch().await {
-            Ok(Some(e)) => e,
-            Ok(None) => return Ok(HashMap::new()),
-            Err(e) => {
-                return Err(DbError::Checkpoint(format!(
-                    "source-offset handoff: latest_committed_epoch failed: {e}"
-                )))
-            }
+        let sealed = backend.latest_committed_epoch().await.map_err(|e| {
+            DbError::Checkpoint(format!("durable epoch: latest_committed_epoch failed: {e}"))
+        })?;
+        let Some(ref ds) = self.decision_store else {
+            return Ok(sealed); // no 2PC decision store → the seal is the truth
         };
-        self.source_offsets_at(epoch).await
+        let decided = ds.highest_committed().await.map_err(|e| {
+            DbError::Checkpoint(format!("durable epoch: highest_committed failed: {e}"))
+        })?;
+        Ok(match (sealed, decided) {
+            (Some(s), Some(d)) => Some(s.min(d)),
+            // Sealed but nothing decision-committed (or nothing sealed) → nothing durable.
+            (Some(_), None) | (None, _) => None,
+        })
     }
 
     /// Every node's sealed source-offset handoff blobs at `epoch`, unioned. Recovery passes the
