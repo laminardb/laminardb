@@ -1041,8 +1041,7 @@ async fn source_offset_handoff_round_trip() {
     assert!(backend.epoch_complete(5, &[0, 1, 2, 3], &[]).await.unwrap());
 
     // A node acquiring events-0 on rotation recovers the committed offset.
-    let epoch = coord.durable_committed_epoch().await.unwrap().unwrap();
-    let acquired = coord.source_offsets_at(epoch).await.unwrap();
+    let acquired = coord.acquired_source_offsets().await.unwrap();
     assert_eq!(acquired.get("events-0"), Some(&"100".to_string()));
 }
 
@@ -1085,48 +1084,13 @@ async fn source_offsets_at_reads_the_requested_epoch() {
         assert!(backend.epoch_complete(e, &[0, 1, 2, 3], &[]).await.unwrap());
     }
 
-    // With no decision store the durable cut is the seal (newest); an epoch-scoped read pins a cut.
-    let durable = coord.durable_committed_epoch().await.unwrap().unwrap();
-    let latest = coord.source_offsets_at(durable).await.unwrap();
+    // Latest picks the newest; an epoch-scoped read pins the exact recovered cut.
+    let latest = coord.acquired_source_offsets().await.unwrap();
     assert_eq!(latest.get("events-0"), Some(&"200".to_string()));
     let at5 = coord.source_offsets_at(5).await.unwrap();
     assert_eq!(at5.get("events-0"), Some(&"100".to_string()));
     let at8 = coord.source_offsets_at(8).await.unwrap();
     assert_eq!(at8.get("events-0"), Some(&"200".to_string()));
-}
-
-/// A leader that seals epoch E but dies before recording the decision leaves the seal one epoch
-/// ahead of the decision cut. `durable_committed_epoch` must return the decision cut (E-1), so a
-/// re-acquire never resumes past the rolled-back sink window.
-#[tokio::test]
-async fn durable_committed_epoch_clamps_to_decision() {
-    use bytes::Bytes;
-    use laminar_core::checkpoint_decision::CheckpointDecisionStore;
-    use laminar_core::state::{InProcessBackend, StateBackend};
-    let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
-    let backend = Arc::new(InProcessBackend::new(4));
-    coord.set_state_backend(backend.clone());
-    let decision_os: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    let decision = Arc::new(CheckpointDecisionStore::new(decision_os));
-    coord.set_decision_store(decision.clone());
-
-    // Seal epochs 5 and 6 (state committed), but record the decision only through 5 — i.e. the
-    // leader died after sealing 6 but before its sink decision.
-    for e in [5u64, 6] {
-        for v in 0u32..4 {
-            backend
-                .write_partial(v, e, 1, Bytes::from_static(b"x"))
-                .await
-                .unwrap();
-        }
-        assert!(backend.epoch_complete(e, &[0, 1, 2, 3], &[]).await.unwrap());
-    }
-    decision.record_committed(5).await.unwrap();
-
-    // Seal cut is 6, decision cut is 5 → durable must clamp to 5.
-    assert_eq!(coord.durable_committed_epoch().await.unwrap(), Some(5));
 }
 
 /// Followers ack at capture and upload partials

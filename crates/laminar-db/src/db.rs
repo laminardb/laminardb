@@ -643,41 +643,23 @@ impl LaminarDB {
             })
             .collect();
 
-        // Resume acquired partitions from the durably-committed cut (state seal AND sink decision),
-        // and rehydrate their aggregate base at the SAME cut below, so the two agree even when a
-        // killed leader sealed an epoch it never sink-committed. Staged before the version bump; a
-        // read failure defers the rotation (EO must not fall back to startup and re-emit).
-        let mut durable_epoch: Option<u64> = None;
+        // Stage the sealed source offsets before the version bump (acquiring source
+        // resumes from the previous owner's cut). A handoff-read failure defers the
+        // rotation — exactly-once must not fall back to startup and re-emit.
         if !newly_acquired.is_empty() {
             if let Some(coord) = guard.as_ref() {
-                durable_epoch = match coord.durable_committed_epoch().await {
-                    Ok(epoch) => epoch,
+                match coord.acquired_source_offsets().await {
+                    Ok(offsets) => registry.stage_resume_offsets(offsets),
                     Err(e) => {
                         tracing::warn!(
                             error = %e, version = snapshot.version,
-                            "durable-epoch read failed; deferring rotation"
+                            "source-offset handoff read failed; deferring rotation"
                         );
                         return SnapshotAdoption {
                             adopted: false,
                             version: snapshot.version,
                             ..SnapshotAdoption::default()
                         };
-                    }
-                };
-                if let Some(epoch) = durable_epoch {
-                    match coord.source_offsets_at(epoch).await {
-                        Ok(offsets) => registry.stage_resume_offsets(offsets),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e, version = snapshot.version,
-                                "source-offset handoff read failed; deferring rotation"
-                            );
-                            return SnapshotAdoption {
-                                adopted: false,
-                                version: snapshot.version,
-                                ..SnapshotAdoption::default()
-                            };
-                        }
                     }
                 }
             }
@@ -734,16 +716,9 @@ impl LaminarDB {
         // Clone the Arc before the await so the lock guard drops first.
         let backend = self.state_backend.lock().clone();
         if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {
-            // Rehydrate the base at the same durable cut the offsets resumed from (a killed leader
-            // can seal an epoch past the sink-committed cut). No durable epoch → start fresh.
-            let report = match durable_epoch {
-                Some(epoch) => {
-                    crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-                        .rehydrate_at(&newly_acquired, epoch)
-                        .await
-                }
-                None => crate::recovery_manager::VnodeRehydration::default(),
-            };
+            let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+                .rehydrate(&newly_acquired)
+                .await;
             adoption.rehydrated = report.restored.len();
             adoption.rehydration_epoch = report.epoch;
             // No durable state → serve immediately; don't gate emission forever.

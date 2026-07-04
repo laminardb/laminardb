@@ -117,9 +117,11 @@ impl<'a> VnodeRehydrator<'a> {
     /// A per-vnode failure is recorded in [`VnodeRehydration::errors`] without
     /// aborting the rest; an empty report means the store has no committed epoch.
     pub async fn rehydrate(&self, vnodes: &[u32]) -> VnodeRehydration {
+        let mut report = VnodeRehydration::default();
         if vnodes.is_empty() {
-            return VnodeRehydration::default();
+            return report;
         }
+
         let epoch = match self.backend.latest_committed_epoch().await {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
@@ -127,10 +129,8 @@ impl<'a> VnodeRehydrator<'a> {
                     vnodes = ?vnodes,
                     "rehydrate: no committed epoch on backend — vnodes start fresh"
                 );
-                return VnodeRehydration {
-                    missing: vnodes.to_vec(),
-                    ..Default::default()
-                };
+                report.missing = vnodes.to_vec();
+                return report;
             }
             Err(e) => {
                 warn!(
@@ -138,25 +138,11 @@ impl<'a> VnodeRehydrator<'a> {
                     "[LDB-6050] rehydrate: latest_committed_epoch failed — \
                      vnodes start fresh"
                 );
-                return VnodeRehydration {
-                    missing: vnodes.to_vec(),
-                    ..Default::default()
-                };
+                report.missing = vnodes.to_vec();
+                return report;
             }
         };
-        self.rehydrate_at(vnodes, epoch).await
-    }
-
-    /// Rehydrate each vnode's chain at a SPECIFIC committed `epoch`. Recovery/re-acquire pin the
-    /// durably-committed cut (min of seal and decision) so state and offsets agree.
-    pub async fn rehydrate_at(&self, vnodes: &[u32], epoch: u64) -> VnodeRehydration {
-        if vnodes.is_empty() {
-            return VnodeRehydration::default();
-        }
-        let mut report = VnodeRehydration {
-            epoch: Some(epoch),
-            ..Default::default()
-        };
+        report.epoch = Some(epoch);
 
         for &vnode in vnodes {
             match self.collect_chain(vnode, epoch).await {
