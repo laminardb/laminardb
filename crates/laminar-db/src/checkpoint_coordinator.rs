@@ -763,18 +763,31 @@ impl CheckpointCoordinator {
     /// a read FAILURE is propagated so the caller defers the rotation rather than re-emitting.
     #[cfg(feature = "cluster")]
     pub(crate) async fn acquired_source_offsets(&self) -> Result<HashMap<String, String>, DbError> {
-        let mut merged = HashMap::new();
         let Some(ref backend) = self.state_backend else {
-            return Ok(merged);
+            return Ok(HashMap::new());
         };
         let epoch = match backend.latest_committed_epoch().await {
             Ok(Some(e)) => e,
-            Ok(None) => return Ok(merged),
+            Ok(None) => return Ok(HashMap::new()),
             Err(e) => {
                 return Err(DbError::Checkpoint(format!(
                     "source-offset handoff: latest_committed_epoch failed: {e}"
                 )))
             }
+        };
+        self.source_offsets_at(epoch).await
+    }
+
+    /// Every node's sealed source-offset handoff blobs at `epoch`, unioned. Recovery passes the
+    /// epoch it restored to (not the latest), so a re-acquired partition can't skip past it.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn source_offsets_at(
+        &self,
+        epoch: u64,
+    ) -> Result<HashMap<String, String>, DbError> {
+        let mut merged = HashMap::new();
+        let Some(ref backend) = self.state_backend else {
+            return Ok(merged);
         };
         let blobs = backend.read_source_offsets(epoch).await.map_err(|e| {
             DbError::Checkpoint(format!(

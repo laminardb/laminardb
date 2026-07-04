@@ -324,6 +324,48 @@ impl LaminarDB {
         Ok(())
     }
 
+    /// A source's recovery offsets: its manifest offsets, plus any partitions the (per-node
+    /// incomplete) manifest lacked — e.g. re-acquired from a killed peer — filled from the cluster
+    /// handoff union, scoped to this source's topics. Residual partitions in neither fall to the
+    /// committed default in `open()`, never a reprocess-from-zero.
+    #[cfg(feature = "cluster")]
+    fn recovery_source_checkpoint(
+        source: &str,
+        manifest_cp: Option<&laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint>,
+        handoff: &HashMap<String, String>,
+        epoch: u64,
+    ) -> Option<laminar_connectors::checkpoint::SourceCheckpoint> {
+        use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
+        let mut cp = manifest_cp
+            .cloned()
+            .unwrap_or_else(|| ConnectorCheckpoint::with_offsets(epoch, HashMap::new()));
+        let topics: std::collections::HashSet<String> = cp
+            .offsets
+            .keys()
+            .filter_map(|k| k.rsplit_once('-').map(|(t, _)| t.to_string()))
+            .collect();
+        let fill: Vec<(String, String)> = handoff
+            .iter()
+            .filter(|(k, _)| {
+                k.rsplit_once('-')
+                    .is_some_and(|(t, _)| topics.contains(t) && !cp.offsets.contains_key(*k))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !fill.is_empty() {
+            tracing::info!(
+                source,
+                filled = fill.len(),
+                "recovery filled partitions from handoff"
+            );
+            cp.offsets.extend(fill);
+        }
+        if cp.offsets.is_empty() {
+            return None;
+        }
+        Some(crate::checkpoint_coordinator::connector_to_source_checkpoint(&cp))
+    }
+
     /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
@@ -1344,18 +1386,37 @@ impl LaminarDB {
                                 }
                             }
                         }
+                        // The manifest is per-node incomplete (first-writer-wins), so a partition
+                        // re-acquired from a killed peer is absent; the handoff union at the
+                        // recovered epoch fills it. A read failure fails recovery closed.
+                        #[cfg(feature = "cluster")]
+                        let handoff =
+                            coord
+                                .source_offsets_at(recovered.epoch())
+                                .await
+                                .map_err(|e| {
+                                    DbError::Checkpoint(format!(
+                                    "[LDB-6033] recovery source-offset handoff read failed: {e}"
+                                ))
+                                })?;
                         for src in &mut sources {
                             if !src.supports_replay {
                                 continue;
                             }
-                            if let Some(cp) = recovered.manifest.source_offsets.get(&src.name) {
-                                let restored =
-                                    crate::checkpoint_coordinator::connector_to_source_checkpoint(
-                                        cp,
-                                    );
+                            let manifest_cp = recovered.manifest.source_offsets.get(&src.name);
+                            #[cfg(feature = "cluster")]
+                            let restored = Self::recovery_source_checkpoint(
+                                &src.name,
+                                manifest_cp,
+                                &handoff,
+                                recovered.epoch(),
+                            );
+                            #[cfg(not(feature = "cluster"))]
+                            let restored = manifest_cp
+                                .map(crate::checkpoint_coordinator::connector_to_source_checkpoint);
+                            if let Some(restored) = restored {
                                 tracing::info!(
                                     source = %src.name,
-                                    offsets = cp.offsets.len(),
                                     "attaching checkpoint offsets for source recovery"
                                 );
                                 src.restore_checkpoint = Some(restored);

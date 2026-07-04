@@ -1045,6 +1045,54 @@ async fn source_offset_handoff_round_trip() {
     assert_eq!(acquired.get("events-0"), Some(&"100".to_string()));
 }
 
+/// Recovery must read the handoff at the epoch it restored to, not the latest, or a coordinated
+/// recovery to an earlier epoch would resume re-acquired partitions past what it recovered.
+#[tokio::test]
+async fn source_offsets_at_reads_the_requested_epoch() {
+    use bytes::Bytes;
+    use laminar_core::state::{InProcessBackend, StateBackend};
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(4));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(1);
+
+    let handoff = |off: &str| {
+        HashMap::from([(
+            "kafka".to_string(),
+            ConnectorCheckpoint::with_offsets(
+                0,
+                HashMap::from([("events-0".to_string(), off.to_string())]),
+            ),
+        )])
+    };
+    coord
+        .persist_source_offset_handoff(5, &handoff("100"))
+        .await
+        .unwrap();
+    coord
+        .persist_source_offset_handoff(8, &handoff("200"))
+        .await
+        .unwrap();
+    for e in [5u64, 8] {
+        for v in 0u32..4 {
+            backend
+                .write_partial(v, e, 1, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        assert!(backend.epoch_complete(e, &[0, 1, 2, 3], &[]).await.unwrap());
+    }
+
+    // Latest picks the newest; an epoch-scoped read pins the exact recovered cut.
+    let latest = coord.acquired_source_offsets().await.unwrap();
+    assert_eq!(latest.get("events-0"), Some(&"200".to_string()));
+    let at5 = coord.source_offsets_at(5).await.unwrap();
+    assert_eq!(at5.get("events-0"), Some(&"100".to_string()));
+    let at8 = coord.source_offsets_at(8).await.unwrap();
+    assert_eq!(at8.get("events-0"), Some(&"200".to_string()));
+}
+
 /// Followers ack at capture and upload partials
 /// asynchronously, so the leader's restorable gate must *wait* for
 /// late partials rather than failing on the first check.
