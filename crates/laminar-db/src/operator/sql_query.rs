@@ -348,6 +348,11 @@ pub(crate) struct SqlQueryOperator {
     // delta chain is the PRIMARY agg checkpoint; whole-node capture is skipped, partials recover.
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
+    // Per-vnode partials are the authoritative agg checkpoint (cluster + durable backend). The
+    // whole-node manifest copy is skipped: it holds only this node's slices, so a node restarting
+    // while owning vnodes would recover another writer's manifest and silently lose its groups.
+    #[cfg(feature = "cluster")]
+    vnode_partials_authoritative: bool,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
@@ -410,6 +415,8 @@ impl SqlQueryOperator {
             #[cfg(feature = "cluster")]
             delta_chain_max: None,
             #[cfg(feature = "cluster")]
+            vnode_partials_authoritative: false,
+            #[cfg(feature = "cluster")]
             pending_restore_deltas: Vec::new(),
             #[cfg(feature = "cluster")]
             deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
@@ -454,11 +461,18 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Whether the whole-node aggregate capture should be skipped — true once incremental delta
-    /// checkpoints are enabled, since the per-vnode chain is then the authoritative agg checkpoint.
+    /// Mark per-vnode partials as the authoritative agg checkpoint (cluster + durable backend);
+    /// whole-node capture into the manifest is skipped.
+    #[cfg(feature = "cluster")]
+    pub fn set_vnode_partials_authoritative(&mut self) {
+        self.vnode_partials_authoritative = true;
+    }
+
+    /// Whether the whole-node aggregate capture should be skipped — true when delta checkpoints
+    /// or authoritative per-vnode partials make the chain the primary agg checkpoint.
     #[cfg(feature = "cluster")]
     fn skip_whole_node_agg(&self) -> bool {
-        self.delta_chain_max.is_some()
+        self.delta_chain_max.is_some() || self.vnode_partials_authoritative
     }
     #[cfg(not(feature = "cluster"))]
     #[allow(clippy::unused_self)] // mirrors the cluster variant's `&self` signature
@@ -2022,6 +2036,62 @@ mod delta_primary_tests {
         assert!(
             op.checkpoint().unwrap().is_none(),
             "delta-enabled aggregate must skip the whole-node capture (chain is primary)"
+        );
+    }
+
+    // Authoritative per-vnode partials (cluster + durable backend, delta off) must also skip the
+    // whole-node capture — the manifest copy is per-node-incomplete and traps boot recovery.
+    #[tokio::test]
+    async fn authoritative_partials_skip_whole_node_agg_capture() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let batch = |keys: &[&str], vals: &[i64]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(keys.to_vec())),
+                    Arc::new(Int64Array::from(vals.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        let ctx = laminar_sql::create_session_context();
+        let mem = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![batch(&["seed"], &[0])]],
+        )
+        .unwrap();
+        ctx.register_table("events", Arc::new(mem)).unwrap();
+        let mut op = SqlQueryOperator::new(
+            "out",
+            "SELECT key, SUM(val) AS total FROM events GROUP BY key",
+            ctx,
+            None,
+            false,
+            None,
+        );
+        let registry = Arc::new(VnodeRegistry::new(8));
+        registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        op.attach_cluster_shuffle(ClusterShuffleConfig {
+            registry,
+            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+            receiver,
+            self_id: NodeId(1),
+        });
+        op.set_vnode_partials_authoritative();
+        op.process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
+            .await
+            .unwrap();
+        assert!(
+            op.checkpoint().unwrap().is_none(),
+            "authoritative-partials aggregate must skip the whole-node capture"
         );
     }
 

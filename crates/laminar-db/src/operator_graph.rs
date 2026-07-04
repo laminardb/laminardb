@@ -438,6 +438,10 @@ pub(crate) struct OperatorGraph {
     // chain then becomes the PRIMARY agg checkpoint (skip the whole-node manifest, recover from the chain).
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
+    // Per-vnode partials are the authoritative agg checkpoint (cluster + durable backend);
+    // whole-node capture into the per-node-incomplete manifest is skipped.
+    #[cfg(feature = "cluster")]
+    vnode_partials_authoritative: bool,
     // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
@@ -491,6 +495,8 @@ impl OperatorGraph {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             delta_chain_max: None,
+            #[cfg(feature = "cluster")]
+            vnode_partials_authoritative: false,
             #[cfg(feature = "cluster")]
             vnode_count: None,
             #[cfg(feature = "cluster")]
@@ -668,6 +674,12 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     pub fn set_delta_chain_max(&mut self, chain_max: u32) {
         self.delta_chain_max = Some(chain_max);
+    }
+
+    /// Per-vnode partials are the authoritative agg checkpoint; skip the whole-node manifest copy.
+    #[cfg(feature = "cluster")]
+    pub fn set_vnode_partials_authoritative(&mut self) {
+        self.vnode_partials_authoritative = true;
     }
 
     /// Set the vnode count for the single-node tier path (no shuffle config).
@@ -1746,6 +1758,9 @@ impl OperatorGraph {
             // Enabling delta also makes the chain the primary agg checkpoint.
             if let Some(chain_max) = self.delta_chain_max {
                 op.enable_delta_checkpoints(chain_max);
+            }
+            if self.vnode_partials_authoritative {
+                op.set_vnode_partials_authoritative();
             }
         }
         #[cfg(feature = "state-tier")]

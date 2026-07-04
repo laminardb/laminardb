@@ -117,11 +117,9 @@ impl<'a> VnodeRehydrator<'a> {
     /// A per-vnode failure is recorded in [`VnodeRehydration::errors`] without
     /// aborting the rest; an empty report means the store has no committed epoch.
     pub async fn rehydrate(&self, vnodes: &[u32]) -> VnodeRehydration {
-        let mut report = VnodeRehydration::default();
         if vnodes.is_empty() {
-            return report;
+            return VnodeRehydration::default();
         }
-
         let epoch = match self.backend.latest_committed_epoch().await {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
@@ -129,8 +127,10 @@ impl<'a> VnodeRehydrator<'a> {
                     vnodes = ?vnodes,
                     "rehydrate: no committed epoch on backend — vnodes start fresh"
                 );
-                report.missing = vnodes.to_vec();
-                return report;
+                return VnodeRehydration {
+                    missing: vnodes.to_vec(),
+                    ..VnodeRehydration::default()
+                };
             }
             Err(e) => {
                 warn!(
@@ -138,10 +138,22 @@ impl<'a> VnodeRehydrator<'a> {
                     "[LDB-6050] rehydrate: latest_committed_epoch failed — \
                      vnodes start fresh"
                 );
-                report.missing = vnodes.to_vec();
-                return report;
+                return VnodeRehydration {
+                    missing: vnodes.to_vec(),
+                    ..VnodeRehydration::default()
+                };
             }
         };
+        self.rehydrate_at(vnodes, epoch).await
+    }
+
+    /// Read each vnode's partial chain pinned at `epoch` (a committed cut chosen by the caller),
+    /// so boot recovery restores state at the same epoch its source offsets resume from.
+    pub async fn rehydrate_at(&self, vnodes: &[u32], epoch: u64) -> VnodeRehydration {
+        let mut report = VnodeRehydration::default();
+        if vnodes.is_empty() {
+            return report;
+        }
         report.epoch = Some(epoch);
 
         for &vnode in vnodes {
@@ -1399,6 +1411,26 @@ mod rehydration_tests {
             report.restored.get(&0).map(|c| &c[0][..]),
             Some(&b"new"[..])
         );
+    }
+
+    /// Boot recovery pins the read to the recovered manifest's epoch so state and source offsets
+    /// resume from one cut, even when a later epoch sealed.
+    #[tokio::test]
+    async fn rehydrate_at_pins_the_requested_epoch() {
+        let backend = InProcessBackend::new(4);
+        seal_epoch(&backend, 3, &[0, 1], b"old").await;
+        seal_epoch(&backend, 9, &[0, 1], b"new").await;
+
+        let report = VnodeRehydrator::new(&backend)
+            .rehydrate_at(&[0, 1], 3)
+            .await;
+
+        assert_eq!(report.epoch, Some(3));
+        assert_eq!(
+            report.restored.get(&0).map(|c| &c[0][..]),
+            Some(&b"old"[..])
+        );
+        assert!(!report.has_errors());
     }
 
     /// A reference partial resolves (one hop) to the

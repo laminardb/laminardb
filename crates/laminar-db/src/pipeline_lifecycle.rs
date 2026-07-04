@@ -260,10 +260,12 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Under `delta_primary` the manifest carries no aggregate state; stage each owned vnode's
-    /// delta chain so the first cycle rebuilds aggregates. A missing backend is fatal (offsets staged).
+    /// The cluster manifest carries no aggregate state (per-vnode partials are authoritative);
+    /// stage each boot-owned vnode's chain at `epoch` — the recovered cut the source offsets
+    /// resume from — so the first cycle rebuilds aggregates. A missing backend is fatal
+    /// (offsets staged, state absent).
     #[cfg(feature = "cluster")]
-    async fn stage_owned_vnodes_for_delta_primary(&self) -> Result<(), DbError> {
+    async fn stage_owned_vnodes_from_chains(&self, epoch: u64) -> Result<(), DbError> {
         let Some(self_id) = self
             .cluster_controller
             .lock()
@@ -278,49 +280,42 @@ impl LaminarDB {
         };
         tracing::info!(
             owned = owned.len(),
-            "A1-capture: delta-primary recovery rehydrating owned vnodes"
+            epoch,
+            "cluster recovery: rehydrating boot-owned vnodes from chains"
         );
         if owned.is_empty() {
             return Ok(());
         }
         let Some(backend) = self.state_backend.lock().clone() else {
             return Err(DbError::Checkpoint(
-                "[LDB-6031] delta_primary recovery requires a durable state backend but none is \
+                "[LDB-6031] cluster recovery requires a durable state backend but none is \
                  wired — refusing to start with staged source offsets and empty aggregate state"
                     .to_string(),
             ));
         };
         let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-            .rehydrate(&owned)
+            .rehydrate_at(&owned, epoch)
             .await;
         // A partial read can fail transiently while report.epoch is still Some, leaving only
         // successes in `restored`. Starting then runs the unreadable owned vnodes with empty
         // state over already-staged offsets — a permanent gap. Fail fast; the supervisor retries.
         if report.has_errors() {
             return Err(DbError::Checkpoint(
-                "[LDB-6032] one or more owned-vnode partials were unreadable on delta-primary \
+                "[LDB-6032] one or more owned-vnode partials were unreadable on cluster \
                  recovery (see [LDB-6051] above) — refusing to start with staged source offsets \
                  and lost aggregate state"
                     .to_string(),
             ));
         }
-        if let Some(epoch) = report.epoch {
-            let mut staged = self.rehydrated_vnode_state.lock();
-            for (vnode, chain) in report.restored {
-                staged.insert(vnode, crate::db::RehydratedVnode { epoch, chain });
-            }
-            tracing::info!(
-                staged = staged.len(),
-                epoch,
-                "A1-capture: staged owned vnodes for delta-primary aggregate recovery"
-            );
-        } else {
-            tracing::warn!(
-                owned = owned.len(),
-                "A1-capture: delta-primary recovery found no committed epoch — \
-                 aggregates start empty (no durable partials yet)"
-            );
+        let mut staged = self.rehydrated_vnode_state.lock();
+        for (vnode, chain) in report.restored {
+            staged.insert(vnode, crate::db::RehydratedVnode { epoch, chain });
         }
+        tracing::info!(
+            staged = staged.len(),
+            epoch,
+            "cluster recovery: staged boot-owned vnodes for aggregate recovery"
+        );
         Ok(())
     }
 
@@ -791,6 +786,16 @@ impl LaminarDB {
                 });
                 graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
                 graph.set_revoke_handle(Arc::clone(&self.pending_revoke_vnodes));
+                // With a durable backend, per-vnode partials are the authoritative agg checkpoint.
+                // The whole-node manifest copy holds only ONE node's slices (first-writer-wins), so
+                // a node restarting while owning vnodes could recover another writer's manifest and
+                // silently lose its groups (the seed/leader-kill under-count).
+                if self.state_backend.lock().is_some() {
+                    graph.set_vnode_partials_authoritative();
+                    tracing::info!(
+                        "cluster agg: per-vnode partials authoritative (no manifest copy)"
+                    );
+                }
                 // Incremental delta checkpoints (opt-in). Clamp the chain bound below the prune
                 // window so a chain base never ages out before the chain head.
                 if let Some(cp) = self.config.checkpoint.as_ref() {
@@ -1493,17 +1498,14 @@ impl LaminarDB {
                             }
                         }
 
-                        // With delta enabled the manifest holds no aggregate state; rebuild
-                        // aggregates from each owned vnode's delta chain instead.
+                        // The cluster manifest holds no aggregate state (per-vnode partials are
+                        // authoritative — the manifest is per-node-incomplete); rebuild aggregates
+                        // from each boot-owned vnode's chain at the recovered cut, the same epoch
+                        // the source offsets resume from.
                         #[cfg(feature = "cluster")]
-                        if !graph_restore_failed
-                            && self
-                                .config
-                                .checkpoint
-                                .as_ref()
-                                .is_some_and(|cp| cp.delta_chain_max.is_some())
-                        {
-                            self.stage_owned_vnodes_for_delta_primary().await?;
+                        if !graph_restore_failed && self.state_backend.lock().is_some() {
+                            self.stage_owned_vnodes_from_chains(recovered.epoch())
+                                .await?;
                         }
 
                         if !graph_restore_failed {
