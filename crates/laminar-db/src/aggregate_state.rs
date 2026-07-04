@@ -623,10 +623,8 @@ pub(crate) struct IncrementalAggState {
     // base never ages out of the prune window; cleared to a full re-base on restore/acquire.
     #[cfg(feature = "cluster")]
     delta_chain_len: AHashMap<u32, u32>,
-    // Vnodes a failed checkpoint epoch must re-base FULL on the next capture. The failed epoch
-    // already cleared its dirty sets, so a plain delta would skip those changes; these are also
-    // re-armed into `touched` because an emptied vnode otherwise falls out of it and its lost
-    // tombstone resurrects the deleted groups on recovery. [ST-1]
+    // Vnodes a failed epoch must re-base FULL next capture; re-armed into `touched` so an emptied
+    // vnode (which otherwise drops out of it) doesn't resurrect its dropped groups on recovery.
     #[cfg(feature = "cluster")]
     force_rebase_vnodes: rustc_hash::FxHashSet<u32>,
 }
@@ -1837,9 +1835,8 @@ impl IncrementalAggState {
         for k in self.cold_groups.keys() {
             touched.insert(vnode_of(k));
         }
-        // Re-visit vnodes a failed epoch must re-base FULL even if they emptied since (and so fell
-        // out of the sets above): their `delta_chain_len` was dropped by `force_full_rebase`, so
-        // each re-bases FULL below, re-establishing a durable base the failed epoch didn't. [ST-1]
+        // Re-visit vnodes a failed epoch must re-base — even emptied ones that fell out of the sets
+        // above; `force_full_rebase` dropped their chain len, so each re-bases FULL below.
         for v in self.force_rebase_vnodes.drain() {
             touched.insert(v);
         }
@@ -2187,20 +2184,6 @@ impl IncrementalAggState {
     /// `cold_groups` retain below is now defense-in-depth only: `drop_vnodes` already clears a vnode's
     /// cold tracking at revocation, and a restart starts with `cold_groups` empty, so on every
     /// reachable path it is a no-op by the time a vnode is re-acquired.
-    /// Force every chained vnode's next delta capture to re-base FULL after a checkpoint epoch
-    /// failed. Capture is destructive — it clears the per-vnode dirty sets and advances the chain
-    /// before the epoch is durable — so a failed epoch leaves the operator's chain ahead of the
-    /// coordinator's parent link; the next plain delta would skip the failed epoch's changes and
-    /// resurrect its tombstones. Dropping the chain lengths makes the next capture read live state
-    /// wholesale; the vnodes are also re-armed so an emptied one is re-visited (see the `touched`
-    /// seed in `checkpoint_delta_by_vnode`). Safe when delta is off (the maps are empty). [ST-1]
-    #[cfg(feature = "cluster")]
-    pub(crate) fn force_full_rebase(&mut self) {
-        self.force_rebase_vnodes
-            .extend(self.delta_chain_len.keys().copied());
-        self.delta_chain_len.clear();
-    }
-
     #[cfg(feature = "cluster")]
     pub(crate) fn reset_acquired_vnodes(&mut self, acquired: &rustc_hash::FxHashSet<u32>) {
         if acquired.is_empty() {
@@ -2224,6 +2207,16 @@ impl IncrementalAggState {
                 !acquired.contains(&v)
             });
         }
+    }
+
+    /// Force every chained vnode's next delta capture to re-base FULL after a failed epoch, whose
+    /// destructive capture cleared the dirty sets before durability. Re-arms emptied vnodes via
+    /// `force_rebase_vnodes`; no-op when delta is off.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn force_full_rebase(&mut self) {
+        self.force_rebase_vnodes
+            .extend(self.delta_chain_len.keys().copied());
+        self.delta_chain_len.clear();
     }
 
     /// Force the groups of a rebalance-ACQUIRED vnode to re-emit once. `merge_groups` restored their
@@ -4286,9 +4279,8 @@ mod tests {
         );
     }
 
-    /// After a failed epoch, `force_full_rebase` makes the next capture re-base FULL for every
-    /// chained vnode even below `chain_max`: the failed epoch cleared the dirty sets at capture, so
-    /// a plain delta would silently skip its changes and resurrect its tombstones. [ST-1]
+    /// `force_full_rebase` makes the next capture re-base FULL even below `chain_max`, so a failed
+    /// epoch's dirty-set clear can't silently drop its changes.
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn force_full_rebase_recaptures_full_after_failed_epoch() {

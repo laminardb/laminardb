@@ -719,13 +719,11 @@ struct JoinTierState {
     // Vnodes whose cold keys must be rehydrated from durable cold-only partials; set on restore,
     // drained by `take_tier_cold_vnodes`.
     pending_cold_rehydrate: Vec<u32>,
-    // A `Closed` fetch reply means the tier worker task is gone: every re-fetch then fails at the
-    // send, so the deferred batch can never drain and the watermark hold pins forever. Distinct from
-    // a miss (which re-fetches); escalate at once. [ST-7]
+    // `Closed`/disconnected reply = the tier worker died; escalate at once rather than wedge
+    // (a miss just re-fetches).
     worker_dead: bool,
-    // Tier copies of just-promoted keys whose drop is deferred until no checkpoint is in flight:
-    // dropping mid-tail would race the coordinator's fetch of a staged cold group and fail the
-    // epoch. Released by `release_drops` once idle. [ST-2]
+    // Drops of just-promoted keys' tier copies, deferred until no checkpoint is in flight (a drop
+    // mid-tail would race a staged cold-group fetch).
     pending_drops: Vec<(u32, Vec<u8>)>,
 }
 
@@ -777,9 +775,8 @@ impl JoinTierState {
             Ok(()) => {
                 self.inflight.insert(key.to_vec(), rx);
             }
-            // A disconnected channel means the worker task is gone (a full channel just retries next
-            // cycle); flag it so promotion escalates rather than silently dropping the fetch. Without
-            // this, a worker that dies with nothing in flight is never seen by `drain_ready`. [ST-7]
+            // Disconnected = worker gone (Full just retries); flag it so promotion escalates. A
+            // worker that dies with nothing in flight is otherwise never seen by `drain_ready`.
             Err(crossfire::TrySendError::Disconnected(_)) => self.worker_dead = true,
             Err(crossfire::TrySendError::Full(_)) => {}
         }
@@ -850,8 +847,8 @@ impl JoinTierState {
         });
     }
 
-    /// Issue the drops queued during promotion. Called only when no checkpoint is in flight, so a
-    /// drop can't race the coordinator's fetch of a staged cold group. [ST-2]
+    /// Issue the queued promotion drops; called only with no checkpoint in flight so a drop can't
+    /// race a staged cold-group fetch.
     fn release_drops(&mut self) {
         for (vnode, group) in std::mem::take(&mut self.pending_drops) {
             self.drop_group(vnode, group);
@@ -1161,7 +1158,7 @@ impl IncrementalJoinOperator {
                         codec.vnode(&key, self.tier.vnode_count)?,
                     )
                 };
-                // Queue the drop; released only when no checkpoint is in flight (ST-2).
+                // Queue the drop; released only when no checkpoint is in flight.
                 self.tier.pending_drops.push((coords.1, coords.0));
             } else {
                 let misses = self.tier.note_miss(&key);
@@ -1176,10 +1173,8 @@ impl IncrementalJoinOperator {
             }
         }
 
-        // A dead tier worker can never resolve the deferred fetches; escalate instead of silently
-        // pinning the watermark hold forever. Under exactly-once / coordinated-recovery this faults
-        // → recovery rebuilds the operator with a fresh worker; under at-least-once it surfaces the
-        // failure loudly each cycle (the operator's domain is isolated) rather than wedging silently. [ST-7]
+        // A dead worker can't resolve the deferred fetches; escalate rather than pin the watermark.
+        // EO/coordinated-recovery faults → restart; ALO surfaces it loudly (isolated) not silently.
         if self.tier.worker_dead {
             return Err(DbError::Checkpoint(format!(
                 "[{}] incremental join '{}': cold-tier worker died",

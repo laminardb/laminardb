@@ -93,13 +93,11 @@ struct AggPromotion {
     vnode_fetch_misses: FxHashMap<u32, u32>,
     group_fetch_misses: FxHashMap<arrow::row::OwnedRow, u32>,
     max_deferred_rows: usize,
-    // A `Closed` reply means the tier worker task is gone: every future fetch fails at the send, so
-    // the deferred batch can never drain and the watermark hold pins forever. Distinct from a miss
-    // (which re-fetches); escalate at once rather than wedge. [ST-7]
+    // `Closed`/disconnected reply = the tier worker died; escalate at once rather than wedge
+    // (a miss just re-fetches).
     worker_dead: bool,
-    // Tier copies of just-promoted slices/groups whose drop is deferred until no checkpoint is in
-    // flight. Dropping mid-tail would race the coordinator's fetch of a staged cold group and fail
-    // the epoch; released by `release_drops` once idle. [ST-2]
+    // Drops of just-promoted slices/groups, deferred until no checkpoint is in flight (a drop
+    // mid-tail would race a staged cold-group fetch).
     pending_slice_drops: Vec<u32>,
     pending_group_drops: Vec<(u32, Vec<u8>)>,
 }
@@ -134,8 +132,8 @@ impl AggPromotion {
         self.worker_dead
     }
 
-    /// Issue the tier drops queued during promotion. Called only when no checkpoint is in flight, so
-    /// a drop can't race the coordinator's fetch of a staged cold group. [ST-2]
+    /// Issue the queued promotion drops; called only with no checkpoint in flight so a drop can't
+    /// race a staged cold-group fetch.
     fn release_drops(&mut self) {
         for vnode in std::mem::take(&mut self.pending_slice_drops) {
             self.drop_slice(vnode);
@@ -208,9 +206,8 @@ impl AggPromotion {
             Ok(()) => {
                 self.inflight.insert(vnode, rx);
             }
-            // Disconnected = the worker task is gone; flag it so promotion escalates rather than
-            // silently dropping the fetch (a worker that dies with nothing in flight is otherwise
-            // never seen by `drain_ready`). A full channel just retries next cycle. [ST-7]
+            // Disconnected = worker gone (Full just retries); flag it so promotion escalates. A
+            // worker that dies with nothing in flight is otherwise never seen by `drain_ready`.
             Err(crossfire::TrySendError::Disconnected(_)) => self.worker_dead = true,
             Err(crossfire::TrySendError::Full(_)) => {}
         }
@@ -873,8 +870,7 @@ impl SqlQueryOperator {
             }
         }
 
-        // A dead tier worker can never resolve the deferred fetches above; escalate instead of
-        // pinning the watermark hold forever. [ST-7]
+        // A dead worker can't resolve the deferred fetches; escalate rather than pin the watermark.
         if self
             .promotion
             .as_ref()

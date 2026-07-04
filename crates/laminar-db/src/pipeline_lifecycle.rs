@@ -1967,10 +1967,8 @@ impl LaminarDB {
             match guard.as_ref() {
                 Some(coord) => {
                     let cfg = coord.config();
-                    // Delta checkpoints chain each epoch onto the prior durable one; capture is
-                    // destructive, so a pipelined epoch would bake in the gap of a not-yet-known
-                    // failure before it can be re-based. Serialize them (depth 1) so a failure is
-                    // observed before the next capture. [ST-1]
+                    // Delta epochs chain onto the prior durable one and capture is destructive, so a
+                    // pipelined epoch bakes in a not-yet-known failure's gap. Serialize (depth 1).
                     let delta_enabled = self
                         .config
                         .checkpoint

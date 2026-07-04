@@ -318,10 +318,8 @@ pub(crate) struct ConnectorPipelineCallback {
     /// In-flight epoch count; the coordinator gates new barriers against `max_in_flight_epochs`.
     pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) staged_bytes: Arc<std::sync::atomic::AtomicU64>,
-    /// Set by a checkpoint tail (which cannot touch the graph) when its epoch fails; the next
-    /// capture consumes it to force every operator to re-base FULL. Delta capture is destructive,
-    /// so a failed epoch must not be chained past. Only meaningful when delta checkpoints run,
-    /// which force `max_in_flight_epochs == 1` so the failure is seen before the next capture. [ST-1]
+    /// Set by a checkpoint tail on epoch failure; the next capture consumes it to force a FULL
+    /// re-base. Delta checkpoints run with `max_in_flight_epochs == 1` so the flag is seen in time.
     #[cfg(feature = "cluster")]
     pub(crate) delta_rebase_needed: Arc<std::sync::atomic::AtomicBool>,
     /// Lock-free id allocator shared with the coordinator so barrier admission doesn't
@@ -620,8 +618,7 @@ impl ConnectorPipelineCallback {
         match &result {
             Ok(r) if r.success => self.last_checkpoint = std::time::Instant::now(),
             _ => {
-                // A failed or errored forced checkpoint already ran the destructive delta capture;
-                // force the next capture to re-base FULL so the chain doesn't skip this epoch. [ST-1]
+                // Forced checkpoint failed after its destructive capture; force the next FULL.
                 #[cfg(feature = "cluster")]
                 self.delta_rebase_needed
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -835,8 +832,7 @@ impl ConnectorPipelineCallback {
             if committed {
                 let _ = complete_tx.send((epoch, fan_out)).await;
             } else {
-                // The follower captured (and destructively cleared) its delta state at 723; an
-                // aborted epoch must re-base FULL next capture, like the leader path. [ST-1]
+                // Follower already captured destructively; an aborted epoch must re-base FULL next.
                 delta_rebase_needed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -1152,8 +1148,7 @@ impl ConnectorPipelineCallback {
     fn capture_vnode_states(&mut self) -> crate::checkpoint_coordinator::StagedVnodeStates {
         #[cfg(feature = "cluster")]
         {
-            // A prior epoch failed after its destructive capture; re-base FULL before this capture
-            // so no operator's delta chain outruns the coordinator's parent link. [ST-1]
+            // A prior epoch failed post-capture; re-base FULL so no delta chain outruns the parent.
             if self
                 .delta_rebase_needed
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -1464,7 +1459,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 match store.to_record_batch(&stream_name) {
                     Ok(Some(snap)) => self.subscription_registry.send_batch(&stream_name, snap),
                     Ok(None) => {}
-                    // On the pipeline task with no caller to fail; log rather than silently skip. [HP-8]
+                    // On the pipeline task with no caller to fail; log rather than silently skip.
                     Err(e) => tracing::error!(
                         mv = %stream_name, error = %e,
                         "MV snapshot for subscribers failed"
@@ -1857,9 +1852,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
             let coordinator_clone = Arc::clone(&self.coordinator);
             let tx = self.checkpoint_complete_tx.clone();
-            // This single-node/at-least-once timer path also runs the destructive delta capture at
-            // `capture_vnode_states` above (leader is true when there's no controller), so a failed
-            // epoch here must force the next capture to re-base FULL like the barrier tails do. [ST-1]
+            // Single-node/ALO timer path also ran the destructive delta capture above, so a failed
+            // epoch here must force the next capture FULL (like the barrier tails).
             #[cfg(feature = "cluster")]
             let delta_rebase_needed = Arc::clone(&self.delta_rebase_needed);
             tokio::spawn(async move {
@@ -2127,10 +2121,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let Some(tier) = self.state_tier.clone() else {
             return;
         };
-        // Require no checkpoint in flight for BOTH releasing queued drops and demoting: a clean
-        // vnode's resident state then equals the coordinator's durable bytes, and a drop can't race
-        // its staged cold-group fetch mid-tail. Checked before the budget gate so a tier configured
-        // without a memory budget still releases its queued drops (else they leak). [ST-2]
+        // No checkpoint in flight: a clean vnode then matches the durable bytes and a drop can't
+        // race the staged cold-group fetch. Before the budget gate so a budgetless tier still releases.
         if self.checkpoint_in_flight.load(Ordering::Acquire) != 0 {
             return;
         }

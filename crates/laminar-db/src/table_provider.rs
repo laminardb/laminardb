@@ -190,8 +190,7 @@ impl TableProvider for MvTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        // Propagate a materialization error instead of returning an empty batch — a silent empty
-        // result would look like a legitimately empty MV to the SQL caller. [HP-8]
+        // Propagate a materialization error; an empty batch would look like a legitimately empty MV.
         let batch = self
             .mv_store
             .read()

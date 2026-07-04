@@ -502,10 +502,8 @@ impl MvStore {
         let mut out = HashMap::new();
         for (name, entry) in &self.entries {
             let bytes = if entry.upsert.is_some() || entry.multiset.is_some() {
-                // Upsert/Multiset keep no batches; serialize the materialized snapshot. A conversion
-                // error propagates (fails the checkpoint) rather than silently omitting the MV, which
-                // recovery would then restore as empty — silent data loss. Name the MV so a
-                // deterministic fault (which would stall every checkpoint) is diagnosable. [HP-8]
+                // Upsert/Multiset serialize a snapshot; propagate a failure (naming the MV) rather
+                // than silently omitting it — recovery would restore the MV empty.
                 let batch = entry.to_record_batch().map_err(|e| {
                     DbError::Checkpoint(format!("MV '{name}' checkpoint snapshot failed: {e}"))
                 })?;
