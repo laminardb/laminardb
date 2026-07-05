@@ -1509,11 +1509,24 @@ impl LaminarDB {
                         }
 
                         if !graph_restore_failed {
+                            // The manifest's MV rows are one writer's slice: restoring keyed rows
+                            // on a cluster node plants ghost keys the distributed union double
+                            // counts; adopt's force-emit rebuilds them. Append MVs keep restoring.
+                            #[cfg(feature = "cluster")]
+                            let skip_keyed = self.cluster_controller.lock().is_some()
+                                && self.state_backend.lock().is_some();
+                            #[cfg(not(feature = "cluster"))]
+                            let skip_keyed = false;
                             let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
                             let mut store = self.mv_store.write();
                             let mut restored = 0usize;
+                            let mut skipped = 0usize;
                             for (key, op) in &recovered.manifest.operator_states {
                                 if let Some(name) = key.strip_prefix(prefix) {
+                                    if skip_keyed && store.is_keyed_changelog(name) {
+                                        skipped += 1;
+                                        continue;
+                                    }
                                     if let Some(bytes) = op.decode_inline() {
                                         match store.restore_from_ipc(name, &bytes) {
                                             Ok(true) => restored += 1,
@@ -1525,8 +1538,12 @@ impl LaminarDB {
                                     }
                                 }
                             }
-                            if restored > 0 {
-                                tracing::info!(mvs = restored, "Restored MV state from checkpoint");
+                            if restored > 0 || skipped > 0 {
+                                tracing::info!(
+                                    mvs = restored,
+                                    skipped_keyed = skipped,
+                                    "Restored MV state from checkpoint"
+                                );
                             }
                         }
                         tracing::info!(

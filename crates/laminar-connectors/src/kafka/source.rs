@@ -464,8 +464,6 @@ impl KafkaSource {
                             }
                         }
 
-                        // Newly-acquired partitions resume from local offset, else the
-                        // previous owner's staged handoff offset, else the startup default.
                         let offsets = lock_or_recover(&reassign_snapshot).clone();
                         let resume = OffsetTracker::from_offset_map(&registry.resume_offsets());
                         let mut to_add = TopicPartitionList::new();
@@ -476,12 +474,18 @@ impl KafkaSource {
                                 if current_set.contains(&(topic.to_string(), p)) {
                                     continue; // kept — leave untouched
                                 }
-                                let offset = match offsets
-                                    .get(topic.as_ref(), p)
-                                    .or_else(|| resume.get(topic.as_ref(), p))
+                                let offset = if let Some(o) =
+                                    acquired_resume_offset(&resume, &offsets, topic.as_ref(), p)
                                 {
-                                    Some(o) => rdkafka::Offset::Offset(o + 1),
-                                    None => reassign_default_offset,
+                                    rdkafka::Offset::Offset(o + 1)
+                                } else {
+                                    warn!(
+                                        topic = topic.as_ref(),
+                                        partition = p,
+                                        "acquired partition has no handoff or local offset; \
+                                         falling back to the startup default"
+                                    );
+                                    reassign_default_offset
                                 };
                                 let _ = to_add.add_partition_offset(topic.as_ref(), p, offset);
                             }
@@ -513,6 +517,8 @@ impl KafkaSource {
                             }
                             // Revoked partitions are gone; their drain pauses no longer apply.
                             drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
+                            // A stale stint position must not shadow the handoff on re-acquire.
+                            lock_or_recover(&reassign_snapshot).retain_assigned(&owned_set);
                             last_drain_gen = registry.draining_generation();
                             last_assignment_version = version;
                         }
@@ -839,6 +845,19 @@ fn build_vnode_assignment_tpl(
         }
     }
     tpl
+}
+
+/// Acquired-partition resume: the staged handoff (the sealed cut rehydrated state was read at)
+/// outranks the stale local snapshot; local remains the first-rotation fallback.
+fn acquired_resume_offset(
+    handoff: &OffsetTracker,
+    local: &OffsetTracker,
+    topic: &str,
+    partition: i32,
+) -> Option<i64> {
+    handoff
+        .get(topic, partition)
+        .or_else(|| local.get(topic, partition))
 }
 
 /// rdkafka start position for a partition that has no checkpointed offset under
@@ -1853,6 +1872,27 @@ mod tests {
         assert_eq!(source.state(), ConnectorState::Created);
         assert!(source.consumer.is_none());
         assert_eq!(source.offsets().partition_count(), 0);
+    }
+
+    // A stale local position skips or double-folds against rehydrated state.
+    #[test]
+    fn acquired_resume_prefers_handoff_over_local() {
+        let map = |off: &str| {
+            std::collections::HashMap::from([("events-0".to_string(), off.to_string())])
+        };
+        let handoff = OffsetTracker::from_offset_map(&map("100"));
+        let local = OffsetTracker::from_offset_map(&map("250"));
+        let empty = OffsetTracker::new();
+
+        assert_eq!(
+            acquired_resume_offset(&handoff, &local, "events", 0),
+            Some(100)
+        );
+        assert_eq!(
+            acquired_resume_offset(&empty, &local, "events", 0),
+            Some(250)
+        );
+        assert_eq!(acquired_resume_offset(&empty, &empty, "events", 0), None);
     }
 
     #[test]

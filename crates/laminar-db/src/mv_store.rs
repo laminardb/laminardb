@@ -522,6 +522,13 @@ impl MvStore {
         Ok(out)
     }
 
+    /// Whether `name` is a keyed changelog snapshot (Upsert/Multiset), rebuilt from emission.
+    pub fn is_keyed_changelog(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|e| e.upsert.is_some() || e.multiset.is_some())
+    }
+
     /// Restore a single MV from checkpoint IPC bytes; `Ok(false)` if not registered.
     pub fn restore_from_ipc(&mut self, name: &str, bytes: &[u8]) -> Result<bool, DbError> {
         let Some(entry) = self.entries.get_mut(name) else {
