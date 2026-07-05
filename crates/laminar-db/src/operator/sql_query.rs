@@ -2511,6 +2511,110 @@ mod delta_primary_tests {
              otherwise suppress them and the MV row stays stale)"
         );
     }
+
+    // The soak signature: chains for MANY vnodes applied while Uninit fold into ONE concatenated
+    // pending baseline; every donor group must survive the fold (partial folds = one-burst loss).
+    #[tokio::test]
+    async fn uninit_chain_fold_restores_every_vnode_group() {
+        async fn changelog_op() -> SqlQueryOperator {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("val", DataType::Int64, false),
+            ]));
+            let seed = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["seed"])),
+                    Arc::new(Int64Array::from(vec![0_i64])),
+                ],
+            )
+            .unwrap();
+            let ctx = laminar_sql::create_session_context();
+            let mem =
+                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                    .unwrap();
+            ctx.register_table("events", Arc::new(mem)).unwrap();
+            let mut op = SqlQueryOperator::new(
+                "out",
+                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
+                ctx,
+                None,
+                true,
+                None,
+            );
+            let registry = Arc::new(VnodeRegistry::new(8));
+            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
+            let receiver = Arc::new(
+                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            op.attach_cluster_shuffle(ClusterShuffleConfig {
+                registry,
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                receiver,
+                self_id: NodeId(1),
+            });
+            op
+        }
+        const GROUPS: usize = 500;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let keys: Vec<String> = (0..GROUPS).map(|k| format!("k{k}")).collect();
+        #[allow(clippy::cast_possible_wrap)]
+        let vals: Vec<i64> = (0..GROUPS as i64).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(
+                    keys.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+
+        let mut donor = changelog_op().await;
+        let emitted: usize = donor
+            .process(&[vec![batch]], &[i64::MIN])
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(emitted, GROUPS);
+        let slices = donor
+            .checkpoint_by_vnode(8)
+            .unwrap()
+            .expect("per-vnode slices");
+
+        let mut subject = changelog_op().await;
+        let mut applied = 0usize;
+        for (v, s) in &slices {
+            if let crate::checkpoint_coordinator::StagedSlice::Bytes(b) = s {
+                subject.apply_vnode_chain(*v, b, &[]).unwrap();
+                applied += 1;
+            }
+        }
+        assert!(
+            applied >= 7,
+            "expected slices for ~all 8 vnodes, got {applied}"
+        );
+        let reemitted: usize = subject
+            .process(&[], &[i64::MIN])
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            reemitted, GROUPS,
+            "the Uninit fold must restore and force-emit EVERY donor group across all vnodes; \
+             a partial fold is the soak's one-burst loss"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "state-tier"))]
