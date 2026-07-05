@@ -1,4 +1,32 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–11)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–12)
+
+## Revision 12 — the in-flight shuffle window; rejoin triggers the coordinated rewind
+
+Rev-11 soak (§E16): 0/5, and the notier per-group delta histogram decoded the residual —
+quantized at ±3 (−3×326 over, +3/6/9×546 under), affecting ~872 groups > the 806-group vnode
+share. 3 = the killed node's 3 re-acquired partitions × 1 record each per 12-record round-robin
+burst: **the miscounted unit is the killed node's partition slice of every group**, i.e. the
+in-flight cross-node shuffle window between the last seal and the kill:
+
+- **+3 over**: the restarted node replays its partitions from the sealed cut and re-shuffles the
+  window; survivors' surviving in-memory state already folded the pre-kill sends → double-fold.
+- **−3/6/9 under**: records survivors consumed in the window and shuffled TO the dead node died
+  with its memory; their offsets moved on, nobody re-sends → per-boundary loss for its groups.
+
+This is the audit's "shuffle no-delivery-contract" P0 made concrete. Exactness requires the
+cluster-wide rewind to the sealed cut that coordinated recovery already implements; the missing
+piece was the **trigger** — a kill-9'd process cannot report a fault at death and its restart
+resets the fault sequence. Fix (`5bb05bd5`): `LaminarDB::report_rejoin_fault` (no-op unless
+`coordinated_recovery` on) called by `start_cluster` when a boot finds an existing assignment
+snapshot → the leader announces → every node `recover_to_epoch(seal)` → the window replays
+consistently on all nodes (the rev-5 boot staging is load-bearing inside the round's restore).
+
+**HARNESS REQUIREMENT: emit `[supervision] coordinated_recovery = true` in the cluster server
+TOML** (docker_compose.rs emits no `[supervision]` today) — without it the trigger no-ops.
+Soak expectations: seed logs "reported local fault for coordinated cluster recovery" on rejoin;
+leader logs "leader announced recovery" + "coordinated recovery complete"; all nodes rewind; the
+±3 histogram collapses. Alternative long-term fix if rewind latency is unacceptable: offset-tagged
+shuffle slices + receiver dedup (new protocol; parked).
 
 ## Revision 11 — the reader-spawn race: a missed rebind freezes the share
 
