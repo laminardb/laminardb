@@ -1,4 +1,28 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–9)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–10)
+
+## Revision 10 — rev-9 reverted; instrumentation for a decisive next run
+
+Rev-9 soak (§E14): follower held 0 ✅; seed REGRESSED (901/859/677/866, over 2→8) — the
+deferred-revoke cancel reverted (`a802374c`); **368060c6 (rev 8) remains the code high-water mark.**
+The regression falsifies the flap model: under it the cancel was strictly state-preserving, so the
+soak's dominant path differs from the unit-reproducible deferred-revoke inversion (that defect stays
+real — its correct fix likely needs a per-vnode purge of the earlier fold, not a blanket cancel —
+but it is not the soak's mechanism). Rather than a sixth blind fix, `8b275c3b` adds cold-path
+instrumentation at the audit's discriminating points.
+
+**Decision tree for the next seed-kill run (grep the seed's logs):**
+1. `applied rehydrated vnode chain … groups=G` per vnode at each re-acquire —
+   G≈0 → the chain content is short (write side: partials/reference/delta capture);
+   G≈full (~50/vnode) but finals half → post-apply loss (fold drop or emission).
+2. `rehydration_epoch` at restart-1 vs restart-2 — equal → sealing wedged between the kills →
+   state-behind-offsets at restart-2 is the mechanism.
+3. `source-offset handoff staged for acquire epoch=E` vs the same adopt's `rehydration_epoch` —
+   any skew → the two seal reads diverged inside one adopt.
+4. WARNs: `lazy_init fold: deferred revoke intersects re-acquired vnodes` (the flap IS live);
+   `rehydration chain has no FULL base`; `no live operator for rehydrated slice`;
+   `acquired partition has no handoff or local offset`.
+5. `acquired partition resume offset` per partition — compare the replay start against the
+   rehydrated epoch's expected cut; `from_handoff=false` = the local-snapshot fallback fired.
 
 **Status:** implemented (2026-07-05), soak-gated. Fixes the cluster kill-9 aggregate under-count the
 external per-group state-tier soak surfaced (harness doc §E5–E9). Branch
