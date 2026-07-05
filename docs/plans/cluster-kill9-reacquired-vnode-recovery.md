@@ -1,8 +1,28 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–7)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–8)
 
 **Status:** implemented (2026-07-05), soak-gated. Fixes the cluster kill-9 aggregate under-count the
 external per-group state-tier soak surfaced (harness doc §E5–E9). Branch
 `fix/cluster-source-offset-handoff-recovery`.
+
+## Revision 8 — acquired partitions resume from the handoff, not the local snapshot
+
+Rev-7 soak (§E12): follower 69 (over=10/under=6), seed 677–1117 mostly loss. Root cause found in the
+vnode re-assign path (`kafka/source.rs`): an acquired partition resumed from the **local offset
+snapshot first**, staged handoff second. The local snapshot is always stale for an acquired
+partition — `restore()`'s recovered-manifest cut on a restart, or a pre-revoke position from an
+earlier ownership stint whose operator state was dropped at revocation. Behind the seal it
+double-folds replayed records (the follower's over residual); ahead of the seal it skips records in
+neither the rehydrated state nor the replay (the seed's pure loss: its delayed shed races its
+rejoin, so the revoke→re-acquire flap leaves the local snapshot ahead of the sealed cut). This also
+explains the saga: fix #2 "fixed" the follower by making the local fallback coincidentally correct,
+and every revision that shifted the restore cut nicked it again.
+
+Fix (`c0f2bf8d`): `acquired_resume_offset` — handoff first, local as first-rotation fallback, WARN
+on the silent startup-default fallback; prune revoked partitions from the local snapshot on
+unassign (`retain_assigned`) so a stale stint position can't shadow a later handoff; skip the
+manifest restore of keyed changelog MVs on cluster nodes (one writer's slice → ghost keys the
+unfiltered distributed union double-counts; adopt's force-emit rebuilds them — Append MVs keep the
+restore).
 
 ## Revision 7 — restarts boot unassigned; ownership only via adopt
 
