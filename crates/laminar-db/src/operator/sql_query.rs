@@ -350,17 +350,15 @@ pub(crate) struct SqlQueryOperator {
     // delta chain is the PRIMARY agg checkpoint; whole-node capture is skipped, partials recover.
     #[cfg(feature = "cluster")]
     delta_chain_max: Option<u32>,
-    // Per-vnode partials are the authoritative agg checkpoint (cluster + durable backend). The
-    // whole-node manifest copy is skipped: it holds only this node's slices, so a node restarting
-    // while owning vnodes would recover another writer's manifest and silently lose its groups.
+    // Per-vnode partials are the authoritative agg checkpoint; the whole-node manifest copy is
+    // skipped (one node's slices — recovery from another writer's manifest loses groups).
     #[cfg(feature = "cluster")]
     vnode_partials_authoritative: bool,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
-    // Vnodes whose chain landed while Uninit: `restore_groups` clears dirty and restores
-    // `last_emitted`, which suppresses their first emit — the MV row stays stale until new input.
-    // `lazy_init` force-re-emits them after the fold (the Uninit twin of the Agg-arm force-emit).
+    // Vnodes whose chain landed while Uninit: the fold restores `last_emitted` (suppressing
+    // their first emit), so `lazy_init` force-re-emits them — the Uninit twin of the Agg arm.
     #[cfg(feature = "cluster")]
     pending_restore_reemit: rustc_hash::FxHashSet<u32>,
     // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
@@ -553,11 +551,9 @@ impl SqlQueryOperator {
                     );
                     self.pending_restore_deltas.clear();
                 }
-                // Chains folded while Uninit: `restore_groups` restored `last_emitted` with dirty
-                // cleared, but this process's MV snapshot came from the (per-node-incomplete)
-                // manifest — without a forced emit the restored groups stay stale in the MV until
-                // new input. Skip vnodes with a deferred revoke: the drop below needs their
-                // `last_emitted` intact to build retractions.
+                // Chains folded while Uninit re-emit here, or the restored `last_emitted` leaves
+                // their MV rows stale until new input. Skip deferred-revoke vnodes: the drop
+                // below needs their `last_emitted` intact to build retractions.
                 #[cfg(feature = "cluster")]
                 {
                     let reemit = std::mem::take(&mut self.pending_restore_reemit);
@@ -2387,9 +2383,8 @@ mod delta_primary_tests {
         );
     }
 
-    // A chain applied while Uninit (boot recovery: chains drain before the first process) folds via
-    // `restore_groups`, which restores `last_emitted` with dirty cleared — without the deferred
-    // force-emit the restored groups never reach the MV until new input (the seed-kill staleness).
+    // A chain applied while Uninit folds via `restore_groups`, which restores `last_emitted` —
+    // without the deferred force-emit the groups never reach the MV until new input.
     #[tokio::test]
     async fn uninit_chain_restore_reemits_groups_after_init() {
         async fn changelog_op() -> SqlQueryOperator {

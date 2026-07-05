@@ -653,11 +653,9 @@ pub async fn start_cluster(
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
     info!("Pipeline started");
 
-    // A restart boots unassigned (see `resolve_vnode_assignment`); re-acquire the stored
-    // assignment through the standard adopt path — offsets and chains at the sealed cut,
-    // Restoring gate, force re-emit. Re-load each attempt so a shed that raced the boot
-    // wins. Bounded retry: a deferred adoption (handoff read failure) must not strand a
-    // static-discovery node, which has no snapshot watcher to re-drive it.
+    // Re-acquire the stored assignment through the standard adopt path (a restart boots
+    // unassigned). Re-load each attempt so a shed that raced the boot wins; bounded retry so a
+    // deferred adoption can't strand a static-discovery node (no snapshot watcher there).
     if let Some(snap_store) = snapshot_store.clone() {
         for attempt in 0u32..5 {
             match snap_store.load().await {
@@ -813,12 +811,9 @@ async fn resolve_vnode_assignment(
     };
     let snapshot_store = Arc::new(AssignmentSnapshotStore::new(store));
 
-    // A snapshot already exists → this is a restart or a joiner. Boot owning NOTHING
-    // (version 0, all vnodes unassigned): the stored snapshot may be stale (a shed can
-    // race the restart), and acting on assumed ownership skips the adopt protocol's
-    // consistent cut (offsets+chains at the seal, Restoring gate, force re-emit).
-    // `start_cluster` explicitly adopts the stored snapshot after `db.start()`, so
-    // every restart re-acquires its vnodes through the same path a rebalance uses.
+    // Snapshot exists → restart or joiner. Boot owning nothing: the stored snapshot may be
+    // stale (a shed can race the restart), and acting on assumed ownership bypasses the adopt
+    // protocol. `start_cluster` explicitly adopts the stored snapshot after `db.start()`.
     if let Some(existing) = snapshot_store
         .load()
         .await

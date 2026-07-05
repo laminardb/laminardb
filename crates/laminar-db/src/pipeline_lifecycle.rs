@@ -260,10 +260,8 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// The cluster manifest carries no aggregate state (per-vnode partials are authoritative);
-    /// stage each boot-owned vnode's chain at `epoch` — the recovered cut the source offsets
-    /// resume from — so the first cycle rebuilds aggregates. A missing backend is fatal
-    /// (offsets staged, state absent).
+    /// Stage each boot-owned vnode's chain at `epoch` — the recovered cut the source offsets
+    /// resume from. A missing backend is fatal (offsets staged, state absent).
     #[cfg(feature = "cluster")]
     async fn stage_owned_vnodes_from_chains(&self, epoch: u64) -> Result<(), DbError> {
         let Some(self_id) = self
@@ -319,10 +317,8 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// A source's recovery offsets: its manifest offsets, plus any partitions the (per-node
-    /// incomplete) manifest lacked — e.g. re-acquired from a killed peer — filled from the cluster
-    /// handoff union, scoped to this source's topics. Residual partitions in neither fall to the
-    /// committed default in `open()`, never a reprocess-from-zero.
+    /// A source's recovery offsets: manifest offsets plus partitions the per-node-incomplete
+    /// manifest lacked, filled from the handoff union scoped to this source's topics.
     #[cfg(feature = "cluster")]
     fn recovery_source_checkpoint(
         source: &str,
@@ -786,10 +782,8 @@ impl LaminarDB {
                 });
                 graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
                 graph.set_revoke_handle(Arc::clone(&self.pending_revoke_vnodes));
-                // With a durable backend, per-vnode partials are the authoritative agg checkpoint.
-                // The whole-node manifest copy holds only ONE node's slices (first-writer-wins), so
-                // a node restarting while owning vnodes could recover another writer's manifest and
-                // silently lose its groups (the seed/leader-kill under-count).
+                // With a durable backend, per-vnode partials are the authoritative agg checkpoint;
+                // the whole-node manifest copy is one node's slices and traps boot recovery.
                 if self.state_backend.lock().is_some() {
                     graph.set_vnode_partials_authoritative();
                     tracing::info!(
@@ -1498,10 +1492,8 @@ impl LaminarDB {
                             }
                         }
 
-                        // The cluster manifest holds no aggregate state (per-vnode partials are
-                        // authoritative — the manifest is per-node-incomplete); rebuild aggregates
-                        // from each boot-owned vnode's chain at the recovered cut, the same epoch
-                        // the source offsets resume from.
+                        // Rebuild aggregates from each boot-owned vnode's chain at the recovered
+                        // cut — the same epoch the source offsets resume from.
                         #[cfg(feature = "cluster")]
                         if !graph_restore_failed && self.state_backend.lock().is_some() {
                             self.stage_owned_vnodes_from_chains(recovered.epoch())
