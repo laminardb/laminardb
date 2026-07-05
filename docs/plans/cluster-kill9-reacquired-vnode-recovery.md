@@ -1,4 +1,29 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–10)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–11)
+
+## Revision 11 — the reader-spawn race: a missed rebind freezes the share
+
+Rev-10 diagnostics (§E15) cross-cut: on the clean witness (`eo_kill_notier`, 4 MB, no demotion) the
+Uninit fold restored the COMPLETE share (`groups=806, reemit=13`, every chain applied per the
+Agg/drain logs) at both kills — yet the run lost ~the whole share, with per-group finals frozen at
+the recovery cut. Complete state + complete emit + total loss ⇒ **post-recovery input never
+arrived**.
+
+Mechanism (`9495cf6c`): the Kafka reader task initialized `last_assignment_version` to the registry
+version at its own spawn ("open() already assigned at the current version"). Rev-7 broke that
+assumption: a restart boots unassigned@v0, `open()` assigns nothing, and the startup adopt (right
+after `db.start()`) bumps the version. If the bump lands before the spawned reader runs its init,
+the rotation check never fires and the node **never assigns its re-acquired partitions** — every
+group frozen at the restored baseline. Seed-biased: only the seed's startup adopt is the acquiring
+bump (its shed races its rejoin); a follower's acquiring bump arrives via the watcher seconds after
+the reader initialized. Fix: initialize `last_assignment_version`/`last_drain_gen` to 0 — a
+spurious first pass reconciles current-vs-owned and no-ops; no race window remains.
+
+Confirmation grep (works on the OLD failing logs): the seed after each kill previously shows NO
+`acquired partition resume offset` / `rebound partitions after vnode rotation` lines; with the fix
+they must appear at the staged handoff cut. Residual candidate if 16 KB runs still lag the notier
+result: cold/demoted groups absent from dirty-vnode captures (fold=72/112 vs share 806 — hot
+residue), healed lazily by promotion on the Agg path but not by the fold — fix would be capture-side
+(force-fetch cold bytes into FULL partials, as re-base already does).
 
 ## Revision 10 — rev-9 reverted; instrumentation for a decisive next run
 
