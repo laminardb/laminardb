@@ -419,16 +419,15 @@ impl KafkaSource {
             let mut is_paused = false;
             let mut last_revoke_gen: u64 = 0;
             let mut last_assign_gen: u64 = 0;
-            // Track the vnode assignment generation; open() already assigned at
-            // the current version, so only a later rotation triggers a rebind.
-            let mut last_assignment_version = vnode_reassign
-                .as_ref()
-                .map_or(0, |(r, _)| r.assignment_version());
-            // Partitions paused for a pending rotation (their vnode is draining), so
-            // the pre-rotation checkpoint is a clean cut. Reconciled on drain-gen change.
-            let mut last_drain_gen = vnode_reassign
-                .as_ref()
-                .map_or(0, |(r, _)| r.draining_generation());
+            // Start at 0, NOT the current registry version: a restarted node boots unassigned
+            // and its startup adopt races this task's spawn — capturing the already-bumped
+            // version here would silently skip the rebind and the node would never consume its
+            // re-acquired partitions. A spurious first pass reconciles current-vs-owned and
+            // no-ops when open() already assigned for the live version.
+            let mut last_assignment_version = 0u64;
+            // Same race for drains; a stale first pass re-applies the current drain state,
+            // which is idempotent.
+            let mut last_drain_gen = 0u64;
             let mut drain_paused: std::collections::HashSet<(Arc<str>, i32)> =
                 std::collections::HashSet::new();
 
