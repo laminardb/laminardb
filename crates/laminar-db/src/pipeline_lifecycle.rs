@@ -385,6 +385,22 @@ impl LaminarDB {
         *self.recover_target_epoch.lock() = Some(epoch);
     }
 
+    /// Report this process's restart as a fault so the leader rewinds every node to the
+    /// sealed cut. A kill-9'd process cannot report at death, so records shuffled between
+    /// the last seal and the kill double-fold on survivors at replay and its own inbound
+    /// shuffle is lost; the rejoin report drives the round the death could not. No-op when
+    /// `coordinated_recovery` is off or no controller is wired.
+    #[cfg(feature = "cluster")]
+    pub async fn report_rejoin_fault(&self) {
+        if !self.config.coordinated_recovery {
+            return;
+        }
+        let Some(controller) = self.cluster_controller.lock().clone() else {
+            return;
+        };
+        crate::coordinated_recovery::report_local_fault(&controller).await;
+    }
+
     /// Start the per-node recovery monitor once. No-op when `coordinated_recovery` is off.
     /// Must be called from a Tokio runtime.
     #[cfg(feature = "cluster")]

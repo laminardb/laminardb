@@ -656,10 +656,12 @@ pub async fn start_cluster(
     // Re-acquire the stored assignment through the standard adopt path (a restart boots
     // unassigned). Re-load each attempt so a shed that raced the boot wins; bounded retry so a
     // deferred adoption can't strand a static-discovery node (no snapshot watcher there).
+    let mut found_existing_snapshot = false;
     if let Some(snap_store) = snapshot_store.clone() {
         for attempt in 0u32..5 {
             match snap_store.load().await {
                 Ok(Some(snapshot)) => {
+                    found_existing_snapshot = true;
                     if vnode_registry.assignment_version() >= snapshot.version {
                         break; // already adopted (watcher raced us)
                     }
@@ -682,6 +684,13 @@ pub async fn start_cluster(
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+    }
+    // A restart into an established cluster: the previous incarnation's kill left records
+    // shuffled since the last seal double-counted on survivors and its inbound shuffle lost.
+    // Report the rejoin as a fault so the leader rewinds every node to the sealed cut
+    // (no-op unless [supervision] coordinated_recovery is on).
+    if found_existing_snapshot {
+        db.report_rejoin_fault().await;
     }
 
     // Rebalance control plane. Runs only when a snapshot store AND
