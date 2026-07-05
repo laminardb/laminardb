@@ -356,6 +356,11 @@ pub(crate) struct SqlQueryOperator {
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
+    // Vnodes whose chain landed while Uninit: `restore_groups` clears dirty and restores
+    // `last_emitted`, which suppresses their first emit — the MV row stays stale until new input.
+    // `lazy_init` force-re-emits them after the fold (the Uninit twin of the Agg-arm force-emit).
+    #[cfg(feature = "cluster")]
+    pending_restore_reemit: rustc_hash::FxHashSet<u32>,
     // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
     // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore, so a
     // later re-acquire still merges into empty state (no double-count).
@@ -418,6 +423,8 @@ impl SqlQueryOperator {
             vnode_partials_authoritative: false,
             #[cfg(feature = "cluster")]
             pending_restore_deltas: Vec::new(),
+            #[cfg(feature = "cluster")]
+            pending_restore_reemit: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
             deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
@@ -543,6 +550,28 @@ impl SqlQueryOperator {
                         "skipping restart delta replay — base restore failed; discarding stale deltas"
                     );
                     self.pending_restore_deltas.clear();
+                }
+                // Chains folded while Uninit: `restore_groups` restored `last_emitted` with dirty
+                // cleared, but this process's MV snapshot came from the (per-node-incomplete)
+                // manifest — without a forced emit the restored groups stay stale in the MV until
+                // new input. Skip vnodes with a deferred revoke: the drop below needs their
+                // `last_emitted` intact to build retractions.
+                #[cfg(feature = "cluster")]
+                {
+                    let reemit = std::mem::take(&mut self.pending_restore_reemit);
+                    if base_restored && !reemit.is_empty() {
+                        if let Some(vc) = self
+                            .cluster_shuffle
+                            .as_ref()
+                            .map(|c| c.registry.vnode_count())
+                        {
+                            for v in reemit {
+                                if !self.deferred_revoke_vnodes.contains(&v) {
+                                    agg_state.force_reemit_acquired_vnode(v, vc);
+                                }
+                            }
+                        }
+                    }
                 }
                 // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
                 // so a later re-acquire merges into empty state instead of double-counting.
@@ -1832,8 +1861,16 @@ impl GraphOperator for SqlQueryOperator {
                     .as_ref()
                     .map(|c| c.registry.vnode_count())
                 {
-                    if let QueryState::Agg(ref mut agg_state) = self.state {
-                        agg_state.force_reemit_acquired_vnode(vnode, vc);
+                    match self.state {
+                        QueryState::Agg(ref mut agg_state) => {
+                            agg_state.force_reemit_acquired_vnode(vnode, vc);
+                        }
+                        // Stashed into pending_restore — force-emit after lazy_init folds it,
+                        // or the restored last_emitted suppresses the first emit (stale MV row).
+                        QueryState::Uninit => {
+                            self.pending_restore_reemit.insert(vnode);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1915,6 +1952,7 @@ impl GraphOperator for SqlQueryOperator {
                 // partial state.
                 if accepted {
                     self.pending_restore_deltas.extend(delta_objs);
+                    self.pending_restore_reemit.insert(vnode);
                 }
             }
             _ => tracing::warn!(
@@ -2344,6 +2382,101 @@ mod delta_primary_tests {
             total_sum(&mut fixed),
             3,
             "a revoke deferred from the Uninit window still prevents the re-acquire double-count"
+        );
+    }
+
+    // A chain applied while Uninit (boot recovery: chains drain before the first process) folds via
+    // `restore_groups`, which restores `last_emitted` with dirty cleared — without the deferred
+    // force-emit the restored groups never reach the MV until new input (the seed-kill staleness).
+    #[tokio::test]
+    async fn uninit_chain_restore_reemits_groups_after_init() {
+        async fn changelog_op() -> SqlQueryOperator {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("val", DataType::Int64, false),
+            ]));
+            let seed = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["seed"])),
+                    Arc::new(Int64Array::from(vec![0_i64])),
+                ],
+            )
+            .unwrap();
+            let ctx = laminar_sql::create_session_context();
+            let mem =
+                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                    .unwrap();
+            ctx.register_table("events", Arc::new(mem)).unwrap();
+            let mut op = SqlQueryOperator::new(
+                "out",
+                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
+                ctx,
+                None,
+                true, // changelog: emission is dirty-gated + last_emitted-deduped
+                None,
+            );
+            let registry = Arc::new(VnodeRegistry::new(8));
+            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
+            let receiver = Arc::new(
+                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            op.attach_cluster_shuffle(ClusterShuffleConfig {
+                registry,
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                receiver,
+                self_id: NodeId(1),
+            });
+            op
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+            ],
+        )
+        .unwrap();
+
+        // Donor: process emits {a,b} (populates last_emitted), then capture every full vnode slice.
+        let mut donor = changelog_op().await;
+        let emitted: usize = donor
+            .process(&[vec![batch]], &[i64::MIN])
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(emitted, 2);
+        let slices = donor
+            .checkpoint_by_vnode(8)
+            .unwrap()
+            .expect("per-vnode slices");
+
+        // Subject: apply the chains while Uninit (the boot-staging shape), then init.
+        let mut subject = changelog_op().await;
+        for (v, s) in &slices {
+            if let crate::checkpoint_coordinator::StagedSlice::Bytes(b) = s {
+                subject.apply_vnode_chain(*v, b, &[]).unwrap();
+            }
+        }
+        let reemitted: usize = subject
+            .process(&[], &[i64::MIN])
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            reemitted, 2,
+            "chain-restored groups must force-emit after lazy_init (restored last_emitted would \
+             otherwise suppress them and the MV row stays stale)"
         );
     }
 }

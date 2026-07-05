@@ -1,8 +1,28 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revision 5)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–6)
 
-**Status:** implemented (2026-07-04), soak-gated. Fixes the cluster kill-9 aggregate under-count the
+**Status:** implemented (2026-07-05), soak-gated. Fixes the cluster kill-9 aggregate under-count the
 external per-group state-tier soak surfaced (harness doc §E5–E9). Branch
 `fix/cluster-source-offset-handoff-recovery`.
+
+## Revision 6 — force-emit chain-restored groups after the Uninit fold
+
+Rev-5 soak (§E10): follower 0 ✅, EO over-counts gone, seed still under (839–1107). The staging log
+proved chains were staged and applied — the loss was **emission**, not state: a chain applied while
+the operator is still `Uninit` (boot staging always is — chains drain at the cycle top, before the
+first `process`/`lazy_init`) folds via `restore_groups`, which restores `last_emitted` and clears
+dirty. That contract ("groups == last_emitted, nothing pending") is right for the embedded manifest
+restore but wrong for the cluster chain restore: this process's MV snapshot came from the
+per-node-incomplete manifest, so the restored groups' MV rows are stale/absent, and the restored
+`last_emitted` suppresses their first emit until NEW input — groups whose bursts already passed stay
+stale forever (pure loss, no dups — the observed signature). The initialized (`Agg`-arm) applies
+already call `force_reemit_acquired_vnode` — the reason the adopt path is exact; the delta-off chain
+path even reached that call, but `if let QueryState::Agg` silently no-ops while Uninit.
+
+Fix: vnodes whose chain lands while Uninit are recorded (`pending_restore_reemit`); after
+`lazy_init` folds base+deltas, each is `force_reemit_acquired_vnode`d — skipping vnodes with a
+deferred revoke, whose `last_emitted` the drop needs for retractions. Covers boot staging (delta on
+and off) and an adopt that lands before first init. Guarded by
+`uninit_chain_restore_reemits_groups_after_init` (fails without the fix).
 
 ## Soak trend (mismatches; 0 = pass)
 
