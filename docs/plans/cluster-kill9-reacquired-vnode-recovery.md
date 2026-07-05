@@ -1,8 +1,39 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–8)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–9)
 
 **Status:** implemented (2026-07-05), soak-gated. Fixes the cluster kill-9 aggregate under-count the
 external per-group state-tier soak surfaced (harness doc §E5–E9). Branch
 `fix/cluster-source-offset-handoff-recovery`.
+
+## Revision 9 — a re-acquired vnode's chain cancels its deferred revoke
+
+Rev-8 soak (§E13): follower 0 ✅ robust; seed still 558–726 pure loss ≈ its whole 13-vnode share,
+per-group finals at exactly one burst (36/72), `rehydrated=13 rehydration_epoch=Some(9)` logged at
+staging. Root cause (deterministic, found via a 5-way parallel code audit):
+
+A restarted node's agg operator stays **Uninit until its first input**, which only arrives after a
+rotation assigns partitions. The killed seed's rejoin races the shed publication (survivors need
+lease takeover + phi + debounce vs a ~5s restart), so three rotations queue before the first cycle:
+startup adopt of the stale owning snapshot, the late shed (revoke), and the give-back (chains).
+Cycle 1 then runs the STALE revoke against the FRESH chains: `apply_revoked` before
+`apply_rehydrated` (right for an initialized op), the Uninit op defers the revoke into
+`deferred_revoke_vnodes`, the give-back chains fold into `pending_restore` — and **nothing removed
+a re-acquired vnode from the deferred set**. `lazy_init` restores the sealed baseline, the
+force-emit skips every deferred vnode, and the deferred drop destroys the just-restored state of
+all 13 vnodes. Offsets resume at the sealed cut → the sealed burst is never replayed; the next
+burst rebuilds from zero; later checkpoints seal the loss. The follower never hits it (its shed
+completes while it is down — no acquire→revoke→re-acquire prefix); steady runs never revoke.
+
+Fix (`852ea8e9`): `apply_vnode_chain` removes the vnode from `deferred_revoke_vnodes` (a chain
+apply IS a re-acquire; logged "re-acquire supersedes deferred revoke"). Idempotent under the flap's
+duplicate fold (`restore_groups`/`decode_last_emitted` are keyed last-wins; `apply_delta` is per-key
+REPLACE). Guard test `uninit_reacquire_after_deferred_revoke_keeps_restored_state` reproduces the
+first-cycle ordering and the 36-vs-72 signature (fails when the fix is neutered).
+
+Audit residuals noted for later hardening (all verified real, none the soak's mechanism):
+suppression-after-dedup-commit in the emit tail (self-heals via force-reemit today); the drain
+consuming chains on apply-error/no-operator while still marking Active (loud-log candidate);
+`is_recently_unresponsive` 60s TTL widening the shed race; empty FULL partials written for owned
+vnodes while Uninit; ALO recovery accepting an unsealed manifest.
 
 ## Revision 8 — acquired partitions resume from the handoff, not the local snapshot
 
