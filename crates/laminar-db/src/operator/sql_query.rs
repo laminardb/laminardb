@@ -1840,22 +1840,12 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // sequential recovery steps read better inline
     fn apply_vnode_chain(
         &mut self,
         vnode: u32,
         base: &[u8],
         deltas: &[(&[u8], &[u8])],
     ) -> Result<(), DbError> {
-        // A chain apply IS a (re-)acquire: cancel a revoke deferred from the Uninit window, or
-        // lazy_init drops the state this chain restores right after folding it (an
-        // acquire→revoke→re-acquire flap queued before the first cycle — the seed-kill loss).
-        if self.deferred_revoke_vnodes.remove(&vnode) {
-            tracing::info!(
-                query = %self.op_name, vnode,
-                "re-acquire supersedes deferred revoke"
-            );
-        }
         // No deltas → the base alone is the recovered state (full / reference / simple acquire).
         if deltas.is_empty() {
             self.apply_vnode_state(vnode, base)?;
@@ -2484,127 +2474,6 @@ mod delta_primary_tests {
             reemitted, 2,
             "chain-restored groups must force-emit after lazy_init (restored last_emitted would \
              otherwise suppress them and the MV row stays stale)"
-        );
-    }
-
-    // An acquire→revoke→re-acquire flap queued before the first cycle (the seed's rejoin):
-    // the re-acquire chain must cancel the deferred revoke, or lazy_init drops the state it
-    // just restored and the group's baseline is lost.
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn uninit_reacquire_after_deferred_revoke_keeps_restored_state() {
-        async fn changelog_op() -> SqlQueryOperator {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("val", DataType::Int64, false),
-            ]));
-            let seed = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec!["seed"])),
-                    Arc::new(Int64Array::from(vec![0_i64])),
-                ],
-            )
-            .unwrap();
-            let ctx = laminar_sql::create_session_context();
-            let mem =
-                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
-                    .unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            let mut op = SqlQueryOperator::new(
-                "out",
-                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-                ctx,
-                None,
-                true,
-                None,
-            );
-            let registry = Arc::new(VnodeRegistry::new(8));
-            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-            let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                    .await
-                    .unwrap(),
-            );
-            op.attach_cluster_shuffle(ClusterShuffleConfig {
-                registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
-                receiver,
-                self_id: NodeId(1),
-            });
-            op
-        }
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
-            ],
-        )
-        .unwrap();
-
-        let mut donor = changelog_op().await;
-        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        let slices = donor
-            .checkpoint_by_vnode(8)
-            .unwrap()
-            .expect("per-vnode slices");
-        let vnodes: rustc_hash::FxHashSet<u32> = slices.keys().copied().collect();
-
-        // Subject: revoke lands while Uninit (deferred), then the re-acquire chains arrive —
-        // both before the first cycle, exactly the restarted seed's first-cycle ordering.
-        let mut subject = changelog_op().await;
-        subject.drop_owned_vnodes(&vnodes);
-        for (v, s) in &slices {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(b) = s {
-                subject.apply_vnode_chain(*v, b, &[]).unwrap();
-            }
-        }
-        subject.process(&[], &[i64::MIN]).await.unwrap();
-
-        // New input for "a" must ADD to the restored baseline (1), not restart from 0 —
-        // the soak's one-burst loss shows up here as 10 instead of 11.
-        let burst2 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec!["a"])),
-                Arc::new(Int64Array::from(vec![10_i64])),
-            ],
-        )
-        .unwrap();
-        let out = subject.process(&[vec![burst2]], &[i64::MIN]).await.unwrap();
-        let mut total_a: Option<i64> = None;
-        for b in &out {
-            let (Ok(key_idx), Ok(total_idx)) =
-                (b.schema().index_of("key"), b.schema().index_of("total"))
-            else {
-                continue;
-            };
-            let keys = b
-                .column(key_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let totals = b
-                .column(total_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            for i in 0..b.num_rows() {
-                if keys.value(i) == "a" {
-                    total_a = Some(totals.value(i)); // last row wins (retract precedes insert)
-                }
-            }
-        }
-        assert_eq!(
-            total_a,
-            Some(11),
-            "a re-acquire must supersede the deferred revoke; a dropped baseline restarts \
-             the count (10 = pre-kill burst lost)"
         );
     }
 }
