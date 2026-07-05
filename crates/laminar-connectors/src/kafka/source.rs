@@ -477,6 +477,15 @@ impl KafkaSource {
                                 let offset = if let Some(o) =
                                     acquired_resume_offset(&resume, &offsets, topic.as_ref(), p)
                                 {
+                                    // The replay start per acquired partition; a soak compares it
+                                    // against the rehydrated state's epoch cut.
+                                    info!(
+                                        topic = topic.as_ref(),
+                                        partition = p,
+                                        resume = o + 1,
+                                        from_handoff = resume.get(topic.as_ref(), p).is_some(),
+                                        "acquired partition resume offset"
+                                    );
                                     rdkafka::Offset::Offset(o + 1)
                                 } else {
                                     warn!(

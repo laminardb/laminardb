@@ -775,7 +775,15 @@ impl CheckpointCoordinator {
                 )))
             }
         };
-        self.source_offsets_at(epoch).await
+        let offsets = self.source_offsets_at(epoch).await?;
+        // The offsets cut and the chain cut are two separate seal reads; this line + the adopt's
+        // rehydration_epoch expose any skew between them in a soak log.
+        info!(
+            epoch,
+            partitions = offsets.len(),
+            "source-offset handoff staged for acquire"
+        );
+        Ok(offsets)
     }
 
     /// Every node's sealed source-offset handoff blobs at `epoch`, unioned. Recovery passes the

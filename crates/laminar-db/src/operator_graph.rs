@@ -827,7 +827,12 @@ impl OperatorGraph {
                 let Some((base, deltas)) =
                     crate::recovery_manager::resolve_op_chain(&chain, op_name)
                 else {
-                    continue; // no FULL base for this operator in the chain → start fresh
+                    // The chain names this operator yet resolves no FULL base — it starts fresh.
+                    tracing::warn!(
+                        operator = %op_name, vnode,
+                        "rehydration chain has no FULL base for operator; starting fresh"
+                    );
+                    continue;
                 };
                 if let Some(node) = self
                     .nodes
@@ -843,7 +848,8 @@ impl OperatorGraph {
                         applied += 1;
                     }
                 } else {
-                    tracing::debug!(
+                    // The chain is already consumed; a missing operator loses it permanently.
+                    tracing::warn!(
                         operator = %op_name, vnode,
                         "no live operator for rehydrated slice (topology drift)"
                     );

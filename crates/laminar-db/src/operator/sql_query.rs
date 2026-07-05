@@ -519,16 +519,25 @@ impl SqlQueryOperator {
                 #[cfg(feature = "cluster")]
                 let mut base_restored = true;
                 if let Some(ref cp) = self.pending_restore {
-                    if let Err(e) = agg_state.restore_groups(cp) {
-                        #[cfg(feature = "cluster")]
-                        {
-                            base_restored = false;
+                    match agg_state.restore_groups(cp) {
+                        Ok(restored) => {
+                            tracing::info!(
+                                query = %self.op_name,
+                                groups = restored,
+                                "lazy_init fold: restored pending aggregate baseline"
+                            );
                         }
-                        tracing::warn!(
-                            query = %self.op_name,
-                            error = %e,
-                            "Failed to restore aggregate checkpoint (schema evolution?)"
-                        );
+                        Err(e) => {
+                            #[cfg(feature = "cluster")]
+                            {
+                                base_restored = false;
+                            }
+                            tracing::warn!(
+                                query = %self.op_name,
+                                error = %e,
+                                "Failed to restore aggregate checkpoint (schema evolution?)"
+                            );
+                        }
                     }
                 }
                 self.pending_restore = None;
@@ -563,10 +572,30 @@ impl SqlQueryOperator {
                             .as_ref()
                             .map(|c| c.registry.vnode_count())
                         {
+                            let mut skipped = 0usize;
+                            let total = reemit.len();
                             for v in reemit {
-                                if !self.deferred_revoke_vnodes.contains(&v) {
+                                if self.deferred_revoke_vnodes.contains(&v) {
+                                    skipped += 1;
+                                } else {
                                     agg_state.force_reemit_acquired_vnode(v, vc);
                                 }
+                            }
+                            // `reemit_skipped` > 0 = a re-acquired vnode about to be dropped by a
+                            // stale deferred revoke — the flap signature a soak should grep for.
+                            if skipped > 0 {
+                                tracing::warn!(
+                                    query = %self.op_name,
+                                    reemit_vnodes = total,
+                                    reemit_skipped = skipped,
+                                    "lazy_init fold: deferred revoke intersects re-acquired vnodes"
+                                );
+                            } else {
+                                tracing::info!(
+                                    query = %self.op_name,
+                                    reemit_vnodes = total,
+                                    "lazy_init fold: force-emitting restored vnodes"
+                                );
                             }
                         }
                     }
@@ -581,6 +610,11 @@ impl SqlQueryOperator {
                         .map(|c| c.registry.vnode_count())
                     {
                         let revoked = std::mem::take(&mut self.deferred_revoke_vnodes);
+                        tracing::info!(
+                            query = %self.op_name,
+                            vnodes = revoked.len(),
+                            "lazy_init fold: dropping deferred-revoked vnodes"
+                        );
                         match agg_state.drop_vnodes(&revoked, vc) {
                             Ok(r) => self.pending_revoke_retractions.extend(r),
                             Err(e) => tracing::warn!(
@@ -1921,7 +1955,8 @@ impl GraphOperator for SqlQueryOperator {
                     agg_state.mark_vnode_hot(vnode);
                     agg_state.mark_vnode_dirty(vnode);
                 }
-                tracing::debug!(
+                // Info so a soak can compare the merged baseline against expectations per vnode.
+                tracing::info!(
                     query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
                     "applied rehydrated vnode chain"
                 );
