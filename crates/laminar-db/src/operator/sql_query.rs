@@ -326,6 +326,8 @@ fn serialize_agg_cp(cp: &AggStateCheckpoint, op_name: &str) -> Result<Vec<u8>, D
         })
 }
 
+// Orthogonal capability flags wired independently at build; an enum would couple them.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,

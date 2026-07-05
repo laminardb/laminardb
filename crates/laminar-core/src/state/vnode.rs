@@ -151,6 +151,18 @@ impl VnodeRegistry {
         }
     }
 
+    /// Create a registry with every vnode unassigned at version 0, so the first stored
+    /// assignment snapshot (version >= 1) adopts through the standard rotation path.
+    ///
+    /// # Panics
+    /// Panics if `vnode_count == 0`.
+    #[must_use]
+    pub fn new_unassigned(vnode_count: u32) -> Self {
+        let registry = Self::new(vnode_count);
+        registry.assignment_version.store(0, Ordering::Release);
+        registry
+    }
+
     /// Create a registry where every vnode is owned by the same node.
     ///
     /// Used by single-instance / embedded deployments.

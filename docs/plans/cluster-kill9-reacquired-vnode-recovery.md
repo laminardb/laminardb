@@ -1,8 +1,27 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–6)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–7)
 
 **Status:** implemented (2026-07-05), soak-gated. Fixes the cluster kill-9 aggregate under-count the
 external per-group state-tier soak surfaced (harness doc §E5–E9). Branch
 `fix/cluster-source-offset-handoff-recovery`.
+
+## Revision 7 — restarts boot unassigned; ownership only via adopt
+
+Rev-6 soak (§E11): the follower guard failed (0 → 706 mixed) — that run's follower restarts happened
+to **boot owning** (staged=8 at epochs 8 and 13), a path the rev-5 follower run never took (it booted
+∅ both kills — the shed race decides). Every path ever measured exact flows through
+`adopt_assignment_snapshot`; every failure (rev-5 stale under-count, rev-6 exposed mixed) lives on
+the boot-owning path, where a node trusts its possibly-stale persisted snapshot and acts on assumed
+ownership — consuming, folding, and emitting outside the adopt protocol (and split-braining with a
+survivor that adopted a shed).
+
+Fix: delete the boot-owning path. `resolve_vnode_assignment` boots a restart/joiner **unassigned at
+version 0** (`VnodeRegistry::new_unassigned`); after `db.start()`, `start_cluster` re-loads the
+stored snapshot and explicitly adopts it — offsets + chains at the sealed cut, Restoring gate, CL-4
+force re-emit — with a bounded retry (static discovery has no snapshot watcher to re-drive a
+deferred adoption). A full-cluster restart also re-acquires everything through adopt. First-boot
+(CAS-create) still pre-owns: no state exists to recover. The rev-5 boot staging becomes dormant in
+production (kept: in-repo harness configs still pre-own registries); rev-6's Uninit force-emit stays
+load-bearing — the startup adopt can land before the first cycle.
 
 ## Revision 6 — force-emit chain-restored groups after the Uninit fold
 

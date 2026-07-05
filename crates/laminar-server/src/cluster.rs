@@ -653,6 +653,39 @@ pub async fn start_cluster(
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
     info!("Pipeline started");
 
+    // A restart boots unassigned (see `resolve_vnode_assignment`); re-acquire the stored
+    // assignment through the standard adopt path — offsets and chains at the sealed cut,
+    // Restoring gate, force re-emit. Re-load each attempt so a shed that raced the boot
+    // wins. Bounded retry: a deferred adoption (handoff read failure) must not strand a
+    // static-discovery node, which has no snapshot watcher to re-drive it.
+    if let Some(snap_store) = snapshot_store.clone() {
+        for attempt in 0u32..5 {
+            match snap_store.load().await {
+                Ok(Some(snapshot)) => {
+                    if vnode_registry.assignment_version() >= snapshot.version {
+                        break; // already adopted (watcher raced us)
+                    }
+                    let adoption = db.adopt_assignment_snapshot(snapshot).await;
+                    info!(
+                        version = adoption.version,
+                        adopted = adoption.adopted,
+                        newly_acquired = adoption.newly_acquired.len(),
+                        rehydrated = adoption.rehydrated,
+                        "startup assignment adoption"
+                    );
+                    if adoption.adopted {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, attempt, "startup snapshot load failed");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
     // Rebalance control plane. Runs only when a snapshot store AND
     // a chitchat-backed controller are available; static discovery
     // has no KV tier.
@@ -780,19 +813,22 @@ async fn resolve_vnode_assignment(
     };
     let snapshot_store = Arc::new(AssignmentSnapshotStore::new(store));
 
-    // Try to adopt the durably-stored snapshot first. Registry version
-    // must track the persisted fence generation, not restart from 1.
+    // A snapshot already exists → this is a restart or a joiner. Boot owning NOTHING
+    // (version 0, all vnodes unassigned): the stored snapshot may be stale (a shed can
+    // race the restart), and acting on assumed ownership skips the adopt protocol's
+    // consistent cut (offsets+chains at the seal, Restoring gate, force re-emit).
+    // `start_cluster` explicitly adopts the stored snapshot after `db.start()`, so
+    // every restart re-acquires its vnodes through the same path a rebalance uses.
     if let Some(existing) = snapshot_store
         .load()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot load: {e}")))?
     {
-        let registry = VnodeRegistry::new(vnode_count);
-        registry.set_assignment_and_version(
-            existing.to_vnode_vec(vnode_count).into(),
-            existing.version,
+        let registry = VnodeRegistry::new_unassigned(vnode_count);
+        info!(
+            stored_version = existing.version,
+            "found stored assignment snapshot; booting unassigned — adopt runs after start"
         );
-        info!("Adopted existing assignment snapshot v{}", existing.version);
         return Ok((Arc::new(registry), Some(snapshot_store)));
     }
 
