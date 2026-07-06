@@ -245,19 +245,43 @@ async fn restore_pipeline(db: &Arc<LaminarDB>, target: u64) -> bool {
     }
 }
 
-/// Highest epoch committed cluster-wide. Reads the DB-level decision store, so it works
-/// even when a faulted leader's own coordinator is stopped; falls back to the state
-/// backend's durable seal so a freshly-restarted leader can still fix a target.
+/// Highest epoch committed cluster-wide, with intact recovery artifacts. Takes the max of
+/// the decision cut and the state backend's durable seal (either read can lag on a
+/// freshly-restarted leader), then probes the target's source-offset handoff: rewinding to
+/// an epoch whose blobs are pruned makes the offset restore fall back to the startup
+/// default — resumed ahead of the rewound state, the window is lost instead of replayed.
 async fn compute_target_epoch(db: &LaminarDB) -> Option<u64> {
     // Bind clones before awaiting — an if-let scrutinee would hold the lock guard across it.
     let ds = db.decision_store.lock().clone();
-    if let Some(ds) = ds {
-        if let Ok(Some(epoch)) = ds.highest_committed().await {
-            return Some(epoch);
-        }
-    }
+    let decided = match ds {
+        Some(ds) => ds.highest_committed().await.ok().flatten(),
+        None => None,
+    };
     let backend = db.state_backend.lock().clone();
-    backend?.latest_committed_epoch().await.ok().flatten()
+    let sealed = match backend.as_ref() {
+        Some(b) => b.latest_committed_epoch().await.ok().flatten(),
+        None => None,
+    };
+    let target = decided.max(sealed)?;
+    let blobs = match backend.as_ref() {
+        Some(b) => b.read_source_offsets(target).await.map(|v| v.len()).ok(),
+        None => None,
+    };
+    tracing::info!(
+        ?decided,
+        ?sealed,
+        target,
+        ?blobs,
+        "coordinated recovery target"
+    );
+    if blobs.unwrap_or(0) == 0 {
+        tracing::warn!(
+            target,
+            "recovery target has no source-offset handoff blobs; deferring round"
+        );
+        return None;
+    }
+    Some(target)
 }
 
 async fn read_recovery_gen(controller: &ClusterController) -> u64 {

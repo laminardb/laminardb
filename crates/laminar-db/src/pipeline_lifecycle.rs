@@ -2299,7 +2299,17 @@ impl LaminarDB {
                     #[cfg(feature = "cluster")]
                     if watcher_coord_recovery {
                         if let Some(controller) = watcher_controller {
-                            crate::coordinated_recovery::report_local_fault(&controller).await;
+                            // A fault caused by an in-flight round's churn (peers restarting →
+                            // shuffle send failures) must not cascade a fresh round: the active
+                            // round's rewind restores this node anyway.
+                            if controller.observe_recover().await.is_some() {
+                                tracing::info!(
+                                    "fault during an active recovery round; \
+                                     letting the round's restore handle it"
+                                );
+                            } else {
+                                crate::coordinated_recovery::report_local_fault(&controller).await;
+                            }
                             return;
                         }
                     }
