@@ -35,7 +35,7 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
 use super::config::{
-    resolve_value_subject, KafkaSourceConfig, SchemaEvolutionStrategy, StartupMode,
+    resolve_value_subject, KafkaSourceConfig, OffsetReset, SchemaEvolutionStrategy, StartupMode,
     TopicSubscription,
 };
 use super::metrics::KafkaSourceMetrics;
@@ -109,6 +109,11 @@ pub struct KafkaSource {
     /// Offset snapshot for the rebalance callback's seek-on-assign, refreshed
     /// once per `poll_batch()` cycle.
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
+    /// Set by `reset_to_initial` (coordinated genesis rewind): partitions with no
+    /// checkpointed position bind at the configured start, never the broker's committed
+    /// group offsets (those survive the engine-state truncation). Cleared after the
+    /// first successful acquisition wave.
+    force_initial_position: Arc<AtomicBool>,
 
     /// Cluster vnode assignment: when set, `open()` manually `assign()`s the
     /// partitions this node owns (`partition % vnode_count`) instead of
@@ -234,6 +239,7 @@ impl KafkaSource {
             watermark_tracker,
             high_watermarks_rx: None,
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
+            force_initial_position: Arc::new(AtomicBool::new(false)),
             vnode_assignment: None,
             vnode_topic_meta: Vec::new(),
             last_avro_schema: None,
@@ -411,6 +417,9 @@ impl KafkaSource {
         let vnode_topic_meta = self.vnode_topic_meta.clone();
         let reassign_snapshot = Arc::clone(&self.offset_snapshot);
         let reassign_default_offset = startup_default_offset(&self.config.startup_mode);
+        let force_initial = Arc::clone(&self.force_initial_position);
+        let genesis_offset =
+            genesis_default_offset(&self.config.startup_mode, self.config.auto_offset_reset);
         let mut reader_shutdown = shutdown_rx;
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
@@ -486,6 +495,14 @@ impl KafkaSource {
                                         "acquired partition resume offset"
                                     );
                                     rdkafka::Offset::Offset(o + 1)
+                                } else if force_initial.load(Ordering::Acquire) {
+                                    info!(
+                                        topic = topic.as_ref(),
+                                        partition = p,
+                                        "genesis rewind: acquired partition starts at the \
+                                         configured initial position"
+                                    );
+                                    genesis_offset
                                 } else {
                                     warn!(
                                         topic = topic.as_ref(),
@@ -522,6 +539,12 @@ impl KafkaSource {
                                     revoked = to_remove.count(),
                                     "Kafka source rebound partitions after vnode rotation"
                                 );
+                            }
+                            // Post-genesis seals form within a checkpoint interval, so later
+                            // acquisitions carry handoff offsets; keeping the flag armed past
+                            // that would rewind a genuinely-new partition into replayed state.
+                            if to_add.count() > 0 {
+                                force_initial.store(false, Ordering::Release);
                             }
                             // Revoked partitions are gone; their drain pauses no longer apply.
                             drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
@@ -881,6 +904,17 @@ fn startup_default_offset(mode: &StartupMode) -> rdkafka::Offset {
     }
 }
 
+/// Start position for a genesis rewind: engine state was truncated to empty, so the
+/// broker's committed group offsets are from an abandoned timeline — never `Stored`.
+fn genesis_default_offset(mode: &StartupMode, reset: OffsetReset) -> rdkafka::Offset {
+    match (mode, reset) {
+        (StartupMode::Latest, _) | (StartupMode::GroupOffsets, OffsetReset::Latest) => {
+            rdkafka::Offset::End
+        }
+        _ => rdkafka::Offset::Beginning,
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)] // poll_batch has legitimate complexity (backpressure + deser + poison pill fallback)
 impl SourceConnector for KafkaSource {
@@ -1004,7 +1038,14 @@ impl SourceConnector for KafkaSource {
                         i32::try_from(count).unwrap_or(i32::MAX),
                     ));
                 }
-                let default_offset = startup_default_offset(&kafka_config.startup_mode);
+                let default_offset = if self.force_initial_position.load(Ordering::Acquire) {
+                    genesis_default_offset(
+                        &kafka_config.startup_mode,
+                        kafka_config.auto_offset_reset,
+                    )
+                } else {
+                    startup_default_offset(&kafka_config.startup_mode)
+                };
                 // restore() already loaded committed offsets into self.offsets, so
                 // there are no rotation resume offsets at open().
                 let no_resume = OffsetTracker::new();
@@ -1022,6 +1063,11 @@ impl SourceConnector for KafkaSource {
                 consumer.incremental_assign(&tpl).map_err(|e| {
                     ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
                 })?;
+                // Genesis default consumed by this bind; a node that boots unassigned keeps
+                // the flag armed for its adopt-wave rebind instead.
+                if owned > 0 {
+                    self.force_initial_position.store(false, Ordering::Release);
+                }
                 self.vnode_topic_meta = topic_meta;
                 info!(
                     owned_partitions = owned,
@@ -1743,6 +1789,17 @@ impl SourceConnector for KafkaSource {
         Ok(())
     }
 
+    async fn reset_to_initial(&mut self) -> Result<(), ConnectorError> {
+        self.offsets = OffsetTracker::new();
+        match self.offset_snapshot.lock() {
+            Ok(mut snapshot) => *snapshot = OffsetTracker::new(),
+            Err(poisoned) => *poisoned.into_inner() = OffsetTracker::new(),
+        }
+        self.force_initial_position.store(true, Ordering::Release);
+        info!("kafka source reset to the configured initial position (genesis rewind)");
+        Ok(())
+    }
+
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
@@ -1993,6 +2050,28 @@ mod tests {
         assert_eq!(offset_of(1), Some(rdkafka::Offset::Offset(51))); // resume + 1
         assert_eq!(offset_of(2), Some(rdkafka::Offset::Offset(201))); // local wins
         assert_eq!(offset_of(3), Some(rdkafka::Offset::Beginning)); // default
+    }
+
+    /// Committed group offsets survive a genesis truncation, so the genesis default
+    /// must never resolve to `Stored`.
+    #[test]
+    fn genesis_default_never_uses_stored_offsets() {
+        assert_eq!(
+            genesis_default_offset(&StartupMode::GroupOffsets, OffsetReset::Earliest),
+            rdkafka::Offset::Beginning
+        );
+        assert_eq!(
+            genesis_default_offset(&StartupMode::GroupOffsets, OffsetReset::Latest),
+            rdkafka::Offset::End
+        );
+        assert_eq!(
+            genesis_default_offset(&StartupMode::Latest, OffsetReset::Earliest),
+            rdkafka::Offset::End
+        );
+        assert_eq!(
+            genesis_default_offset(&StartupMode::Earliest, OffsetReset::Latest),
+            rdkafka::Offset::Beginning
+        );
     }
 
     #[test]

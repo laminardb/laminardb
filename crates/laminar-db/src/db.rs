@@ -144,6 +144,14 @@ pub struct LaminarDB {
     /// One-shot guard for the recovery-monitor spawn.
     #[cfg(feature = "cluster")]
     pub(crate) recovery_monitor_started: std::sync::atomic::AtomicBool,
+    /// Epoch the most recent start restored from (`None` = started fresh). A rejoin fault
+    /// is reported only when prior local state existed — a fresh joiner lost no window.
+    #[cfg(feature = "cluster")]
+    pub(crate) last_recovery_epoch: parking_lot::Mutex<Option<u64>>,
+    /// Coordinated rounds applied by this process; a rejoin fault racing a round that
+    /// already restored this node must not trigger another.
+    #[cfg(feature = "cluster")]
+    pub(crate) coordinated_restores: std::sync::atomic::AtomicU64,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
@@ -409,6 +417,10 @@ impl LaminarDB {
             recover_target_epoch: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             recovery_monitor_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "cluster")]
+            last_recovery_epoch: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            coordinated_restores: std::sync::atomic::AtomicU64::new(0),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),

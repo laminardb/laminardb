@@ -356,6 +356,15 @@ pub trait SourceConnector: Send {
     /// Called during recovery before polling resumes.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
 
+    /// Rewind to the configured startup position, ignoring committed group offsets and any
+    /// staged checkpoint. A coordinated genesis rewind (no committed cut) truncates all
+    /// durable engine state, but broker-side committed offsets survive that — a replayable
+    /// source must be told explicitly to start over. Call before [`open`](Self::open).
+    /// Default no-op.
+    async fn reset_to_initial(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
     /// Install the cluster vnode assignment so a partitioned source can bind
     /// its input partitions to vnodes (`partition % vnode_count`) and consume
     /// only those it owns, re-binding when the assignment rotates. Called by

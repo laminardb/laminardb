@@ -395,6 +395,23 @@ impl LaminarDB {
         if !self.config.coordinated_recovery {
             return;
         }
+        // A boot that restored no local state is a fresh joiner (cluster formation,
+        // scale-out, wiped disk): it lost no in-flight window, and a round here would
+        // genesis-rewind live peers for nothing.
+        if self.last_recovery_epoch.lock().is_none() {
+            tracing::info!("no prior local state; skipping rejoin fault report");
+            return;
+        }
+        // A coordinated round that raced the startup adopt loop already replayed this
+        // process's window.
+        if self
+            .coordinated_restores
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            tracing::info!("already restored by a coordinated round; skipping rejoin fault report");
+            return;
+        }
         let Some(controller) = self.cluster_controller.lock().clone() else {
             return;
         };
@@ -1378,6 +1395,30 @@ impl LaminarDB {
                 };
                 #[cfg(not(feature = "cluster"))]
                 let recovery = coord.recover().await;
+                #[cfg(feature = "cluster")]
+                {
+                    *self.last_recovery_epoch.lock() = match &recovery {
+                        Ok(Some(recovered)) => Some(recovered.epoch()),
+                        _ => None,
+                    };
+                    // A genesis rewind (no committed cut) truncated all durable state, but
+                    // the broker's committed group offsets survive that — a fresh consumer
+                    // would resume ahead of the empty state and silently skip the replay.
+                    if recover_target == Some(0) {
+                        for src in &mut sources {
+                            if !src.supports_replay {
+                                continue;
+                            }
+                            if let Err(e) = src.connector.reset_to_initial().await {
+                                tracing::warn!(
+                                    source = %src.name, error = %e,
+                                    "genesis source reset failed"
+                                );
+                            }
+                        }
+                        tracing::info!("genesis rewind: sources reset to initial position");
+                    }
+                }
                 match recovery {
                     Ok(Some(recovered)) => {
                         recovered_source_wms = recovered

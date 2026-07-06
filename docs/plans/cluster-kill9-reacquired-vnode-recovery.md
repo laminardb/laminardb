@@ -1,4 +1,39 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–15)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–16)
+
+## Revision 16 — no formation-time rounds; genesis must out-rank the broker's committed offsets
+
+Rev-15 soak: protocol mechanically healthy (prepare == start == complete, orphan/qtimeout 0),
+follower 1720→31, seed 336→892 with the decisive trace `gen1→0, gen2→0, gen3→7, gen4→13` and a
+round firing BEFORE the first kill. Decode: gen3/gen4 (epochs 7/13 ≈ kills at 35s/70s × 5s
+checkpoints) are the two kills with CORRECT targets — the genesis rounds are both **spurious
+formation-time rounds**: at cluster startup, later-booting nodes find the assignment snapshot the
+first node just CAS-created, and rev-12's `found_existing_snapshot` heuristic fires
+`report_rejoin_fault` from a node that never lost anything. Each such round truncates all state
+(nothing committed yet → target 0) while the Kafka sources resume from the **broker's committed
+group offsets** — which survive `truncate_after` because they live in Kafka, outside the engine's
+durable state. The pre-round window is never re-read: the seed's +5 : 527.
+
+Three fixes, all recovery-path:
+
+1. **Rejoin faults require prior local state.** `report_rejoin_fault` no-ops when the boot
+   restored no local checkpoint (`last_recovery_epoch` recorded at every start): a fresh joiner
+   (formation, scale-out, wiped disk) lost no in-flight window. The killed node's restart still
+   reports — its local manifests survive the container kill.
+2. **Genesis out-ranks every surviving offset store.** New `SourceConnector::reset_to_initial`
+   (default no-op), called for replayable sources when the armed rewind target is 0. The Kafka
+   impl clears staged offsets and arms `force_initial_position`: the open-path assignment AND the
+   rotation-rebind fallback bind offset-less partitions at `genesis_default_offset` (never
+   `Offset::Stored` — the committed group offsets are the abandoned timeline), cleared after the
+   first successful acquisition wave (later acquisitions carry post-genesis handoffs; a stale
+   flag would rewind a genuinely-new partition into replayed state).
+3. **A round that raced the boot absorbs the rejoin report.** `coordinated_restores` counts
+   rounds applied by this process; `report_rejoin_fault` no-ops once a round already restored the
+   node (the report used to land after `restore_and_ack` cleared it → the extra 3rd round).
+
+Soak expectations: no round before the first kill; exactly one round per kill with target = the
+pre-kill decided epoch; seed collapses toward the follower's residual. The follower's +3 : 25
+(the §E16 Uninit-fold class) is the remaining suspect if it survives these fixes — chase the fold
+path only if a clean-formation run still shows it.
 
 ## Revision 15 — the standard model: one authority, stop-the-world, truncate the abandoned timeline
 

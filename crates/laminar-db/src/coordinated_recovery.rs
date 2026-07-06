@@ -294,6 +294,7 @@ impl RecoveryMonitor {
         if !start_pipeline(db, Some(target)).await {
             return false;
         }
+        db.coordinated_restores.fetch_add(1, Ordering::SeqCst);
         if let Some(m) = db.engine_metrics.lock().clone() {
             m.coordinated_recoveries_total.inc();
         }
