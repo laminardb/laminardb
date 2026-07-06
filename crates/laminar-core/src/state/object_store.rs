@@ -415,6 +415,38 @@ impl StateBackend for ObjectStoreBackend {
         Ok(())
     }
 
+    async fn truncate_after(&self, after: u64) -> Result<(), StateBackendError> {
+        use futures::stream::{self, StreamExt};
+
+        // Full scan (dynamic `epoch=N` first segment, same constraint as `prune_before`).
+        // Recovery-path only, and a truncation failure must fail the rewind closed —
+        // surviving artifacts would collide with the reused epoch numbers.
+        let mut entries = self.store.list(None);
+        let mut victims: Vec<OsPath> = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
+            let Some(epoch) = Self::epoch_of_first_segment(entry.location.as_ref()) else {
+                continue;
+            };
+            if epoch > after {
+                victims.push(entry.location);
+            }
+        }
+        if victims.is_empty() {
+            return Ok(());
+        }
+        let locations =
+            stream::iter(victims.into_iter().map(Ok::<OsPath, object_store::Error>)).boxed();
+        let mut deletes = self.store.delete_stream(locations);
+        while let Some(res) = deletes.next().await {
+            match res {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(StateBackendError::Io(e.to_string())),
+            }
+        }
+        Ok(())
+    }
+
     async fn latest_committed_epoch(&self) -> Result<Option<u64>, StateBackendError> {
         use tokio_stream::StreamExt;
 
@@ -780,6 +812,39 @@ mod tests {
                 "epoch {epoch} should be retained",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn truncate_after_removes_abandoned_timeline() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        for epoch in 1..=5u64 {
+            backend
+                .write_partial(0, epoch, 0, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            backend
+                .write_source_offsets(epoch, "node-0", 0, Bytes::from_static(b"{}"))
+                .await
+                .unwrap();
+            assert!(backend.epoch_complete(epoch, &[0], &[]).await.unwrap());
+        }
+        assert_eq!(backend.latest_committed_epoch().await.unwrap(), Some(5));
+
+        backend.truncate_after(3).await.unwrap();
+
+        for epoch in 1..=3u64 {
+            assert!(backend.read_partial(0, epoch).await.unwrap().is_some());
+            assert_eq!(backend.read_source_offsets(epoch).await.unwrap().len(), 1);
+        }
+        for epoch in 4..=5u64 {
+            assert!(backend.read_partial(0, epoch).await.unwrap().is_none());
+            assert!(backend.read_source_offsets(epoch).await.unwrap().is_empty());
+        }
+        // The seal must rewind too — it feeds the adopt path's offset cut and the
+        // reused epoch numbers must not find a foreign `_COMMIT` marker.
+        assert_eq!(backend.latest_committed_epoch().await.unwrap(), Some(3));
     }
 
     /// The horizon cursor must advance so the second prune takes the

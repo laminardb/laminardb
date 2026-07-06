@@ -386,7 +386,10 @@ impl<'a> RecoveryManager<'a> {
     ) -> Result<Option<RecoveredState>, DbError> {
         let mut checkpoints = self.store.list().await.map_err(DbError::from)?;
         checkpoints.retain(|&(_, epoch)| epoch <= target_epoch);
-        checkpoints.sort_by_key(|&(_, epoch)| std::cmp::Reverse(epoch)); // newest eligible first
+        // Newest eligible first; id breaks epoch ties — a prior rewind reuses epoch numbers,
+        // so the same epoch can carry manifests from two timelines and the higher id is the
+        // live one.
+        checkpoints.sort_by_key(|&(id, epoch)| std::cmp::Reverse((epoch, id)));
         self.restore_first(&checkpoints, sources, sinks, table_sources, decision_store)
             .await
     }

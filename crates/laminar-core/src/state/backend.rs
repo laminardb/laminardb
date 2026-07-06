@@ -181,6 +181,17 @@ pub trait StateBackend: Send + Sync + 'static {
     /// implement `Ok(())` explicitly so the choice is visible.
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
 
+    /// Delete every artifact (partials, seals, descriptors, source-offset blobs) whose epoch
+    /// is strictly greater than `after`. A coordinated rewind to epoch `after` calls this
+    /// while the cluster is stopped: the resumed pipeline reuses epoch numbers `after+1…`,
+    /// so surviving artifacts from the abandoned timeline would collide with the new one and
+    /// keep `latest_committed_epoch` ahead of the rewound state. Default no-op for backends
+    /// that never serve a coordinated rewind.
+    async fn truncate_after(&self, after: u64) -> Result<(), StateBackendError> {
+        let _ = after;
+        Ok(())
+    }
+
     /// Highest epoch sealed by a durable commit marker, or `None` when
     /// the store holds no committed epoch yet.
     ///

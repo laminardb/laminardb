@@ -2299,16 +2299,24 @@ impl LaminarDB {
                     #[cfg(feature = "cluster")]
                     if watcher_coord_recovery {
                         if let Some(controller) = watcher_controller {
-                            // A fault caused by an in-flight round's churn (peers restarting →
-                            // shuffle send failures) must not cascade a fresh round: the active
-                            // round's rewind restores this node anyway.
-                            if controller.observe_recover().await.is_some() {
-                                tracing::info!(
-                                    "fault during an active recovery round; \
-                                     letting the round's restore handle it"
-                                );
-                            } else {
+                            // Round churn self-heals: an active round's restore clears Faulted.
+                            // Delay past the round plus a settle window and re-check rather
+                            // than dropping the report — a round is a Faulted node's only
+                            // recovery path, so a dropped report is a permanently dead node.
+                            let deadline =
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(150);
+                            while controller.observe_recover().await.is_some()
+                                && tokio::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            if matches!(DbState::load(&watcher_state), DbState::Faulted) {
                                 crate::coordinated_recovery::report_local_fault(&controller).await;
+                            } else {
+                                tracing::info!(
+                                    "fault healed by an in-flight recovery round; not reporting"
+                                );
                             }
                             return;
                         }

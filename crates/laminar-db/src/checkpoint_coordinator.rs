@@ -330,6 +330,9 @@ pub struct CheckpointCoordinator {
     assignment_version: u64,
     // Written before sink commits so recovery can distinguish a committed epoch from a crash.
     decision_store: Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
+    // Highest epoch this process recorded a commit marker for; pins the prune horizon so a
+    // coordinated rewind always finds its target's artifacts intact.
+    highest_decided: u64,
     // Folded by the leader with follower watermarks to compute the cluster-wide min.
     local_watermark_ms: Option<i64>,
     // Leader-side cluster-wide min watermark, fanned out in the Commit announcement.
@@ -424,6 +427,7 @@ impl CheckpointCoordinator {
             state_backend: None,
             assignment_version: 0,
             decision_store: None,
+            highest_decided: 0,
             local_watermark_ms: None,
             #[cfg(feature = "cluster")]
             cluster_min_watermark: None,
@@ -2631,6 +2635,7 @@ impl CheckpointCoordinator {
                         .fail_epoch(checkpoint_id, epoch, start, format!("commit marker: {e}"))
                         .await);
                 }
+                self.highest_decided = self.highest_decided.max(epoch);
             }
         }
 
@@ -2660,6 +2665,12 @@ impl CheckpointCoordinator {
                         self.coordinated_commit_floor
                             .load(std::sync::atomic::Ordering::Acquire),
                     );
+                }
+                // Pin at the decided cut: a coordinated rewind targets the highest commit
+                // marker and must find that epoch's partials and offset blobs intact even
+                // when sink commits stall behind the retention window.
+                if self.decision_store.is_some() {
+                    horizon = horizon.min(self.highest_decided);
                 }
                 if horizon > 0 {
                     if let Err(e) = backend.prune_before(horizon).await {

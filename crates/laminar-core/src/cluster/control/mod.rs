@@ -12,7 +12,7 @@ pub use barrier::{
     BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, InMemoryKv, Phase,
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
-pub use controller::ClusterController;
+pub use controller::{ClusterController, RecoverPhase};
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe
 // 2PC). Callers that already qualify with `cluster::control::…` keep

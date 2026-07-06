@@ -15,6 +15,31 @@ use super::snapshot::AssignmentSnapshotStore;
 use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
 use crate::state::Locality;
 
+/// Phase of a coordinated recovery round, carried in the `control:recover` slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverPhase {
+    /// Stop the pipeline and ack; the rewind target is announced after the cluster quiesces.
+    Prepare,
+    /// Rewind to `epoch` and restart.
+    Start {
+        /// Rewind target; `0` means no committed cut exists — restart fresh.
+        epoch: u64,
+    },
+}
+
+fn parse_recover(raw: &str) -> Option<(RecoverPhase, u64)> {
+    let mut parts = raw.split(':');
+    match parts.next()? {
+        "prep" => Some((RecoverPhase::Prepare, parts.next()?.parse().ok()?)),
+        "start" => {
+            let epoch = parts.next()?.parse().ok()?;
+            let gen = parts.next()?.parse().ok()?;
+            Some((RecoverPhase::Start { epoch }, gen))
+        }
+        _ => None,
+    }
+}
+
 /// Facade composing the cluster-control primitives.
 pub struct ClusterController {
     instance_id: NodeId,
@@ -478,27 +503,43 @@ impl ClusterController {
         self.barrier.ack(ack).await
     }
 
-    /// Announce a recovery round: rewind every node to `epoch` under generation `gen`.
+    /// Announce phase 1 of a recovery round: every node stops its pipeline and acks. The
+    /// rewind target is announced in phase 2, computed after the cluster has quiesced.
     /// On a dedicated key, independent of the 2PC barrier slot.
-    pub async fn announce_recover(&self, epoch: u64, gen: u64) {
+    pub async fn announce_recover_prepare(&self, gen: u64) {
         self.kv
-            .write("control:recover", format!("{epoch}:{gen}"))
+            .write("control:recover", format!("prep:{gen}"))
             .await;
     }
 
-    /// Active recovery target `(epoch, gen)`, highest gen across all node slots (not just the current
-    /// leader's) so a straggler still observes a round whose leader changed. Non-`epoch:gen` values
-    /// (e.g. bare `control:recovery-gen`) are skipped.
-    pub async fn observe_recover(&self) -> Option<(u64, u64)> {
+    /// Announce phase 2: every stopped node rewinds to `epoch` and restarts.
+    pub async fn announce_recover_start(&self, epoch: u64, gen: u64) {
+        self.kv
+            .write("control:recover", format!("start:{epoch}:{gen}"))
+            .await;
+    }
+
+    /// Active recovery announcement `(phase, gen)`, highest gen across all node slots (not just
+    /// the current leader's) so a straggler still observes a round whose leader changed. At the
+    /// same gen `Start` supersedes `Prepare`. Unparseable values (e.g. the bare
+    /// `control:recovery-gen` slot caught by the prefix scan) are skipped.
+    pub async fn observe_recover(&self) -> Option<(RecoverPhase, u64)> {
         self.kv
             .scan("control:recover")
             .await
             .into_iter()
-            .filter_map(|(_, raw)| {
-                let (epoch, gen) = raw.split_once(':')?;
-                Some((epoch.parse::<u64>().ok()?, gen.parse::<u64>().ok()?))
-            })
-            .max_by_key(|&(_, gen)| gen)
+            .filter_map(|(_, raw)| parse_recover(&raw))
+            .max_by_key(|&(phase, gen)| (gen, matches!(phase, RecoverPhase::Start { .. })))
+    }
+
+    /// Ack phase 1: this node's pipeline is stopped for round `gen`.
+    pub async fn announce_stopped(&self, gen: u64) {
+        self.write_u64("control:recovery-stopped", gen).await;
+    }
+
+    /// Each visible node's last stopped-for round generation.
+    pub async fn read_stopped(&self) -> Vec<(NodeId, u64)> {
+        self.read_u64_map("control:recovery-stopped").await
     }
 
     /// Clear the recovery announcement at round end, so a peer that restarts later (its

@@ -185,6 +185,18 @@ impl StateBackend for InProcessBackend {
         Ok(())
     }
 
+    async fn truncate_after(&self, after: u64) -> Result<(), StateBackendError> {
+        self.partials
+            .write()
+            .retain(|&(_, epoch), _| epoch <= after);
+        self.descriptors.write().retain(|&epoch, _| epoch <= after);
+        self.source_offsets
+            .write()
+            .retain(|&epoch, _| epoch <= after);
+        self.sealed.write().retain(|&epoch| epoch <= after);
+        Ok(())
+    }
+
     async fn latest_committed_epoch(&self) -> Result<Option<u64>, StateBackendError> {
         Ok(self.sealed.read().iter().next_back().copied())
     }
@@ -271,6 +283,30 @@ mod tests {
     #[test]
     fn state_backend_is_object_safe() {
         let _: std::sync::Arc<dyn StateBackend> = std::sync::Arc::new(InProcessBackend::new(2));
+    }
+
+    #[tokio::test]
+    async fn truncate_after_drops_newer_epochs_and_seals() {
+        let b = InProcessBackend::new(4);
+        let vnodes = [0u32];
+        for epoch in 1..=5 {
+            b.write_partial(0, epoch, 0, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            assert!(b.epoch_complete(epoch, &vnodes, &[]).await.unwrap());
+        }
+        assert_eq!(b.latest_committed_epoch().await.unwrap(), Some(5));
+
+        b.truncate_after(3).await.unwrap();
+
+        for epoch in 1..=3 {
+            assert!(b.read_partial(0, epoch).await.unwrap().is_some());
+        }
+        for epoch in 4..=5 {
+            assert!(b.read_partial(0, epoch).await.unwrap().is_none());
+        }
+        // The seal must rewind too — it feeds the adopt path's offset cut.
+        assert_eq!(b.latest_committed_epoch().await.unwrap(), Some(3));
     }
 
     #[tokio::test]

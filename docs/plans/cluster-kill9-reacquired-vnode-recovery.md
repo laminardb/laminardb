@@ -1,4 +1,65 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–14)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–15)
+
+## Revision 15 — the standard model: one authority, stop-the-world, truncate the abandoned timeline
+
+Rev-14 soak: seed 1463→336 (blob-probe fail-closed works) but the probe defers FOREVER when a
+kill lands before the first blob-backed epoch (`decided=1 sealed=1 blobs=0` — epoch 1 sealed at
+t≈0 before sources read anything, so its blob write no-ops on the empty offset map: not pruning,
+an empty-at-genesis cut). Follower 1→1720 chaotic ±11: `max(decided, sealed)` rewound to
+sealed-but-not-sink-committed epochs (3/8/12). And 2 kills still made 3 rounds.
+
+All three findings, and every prior regression in this saga (#3/#4, rev 6, rev 9, rev 14), share
+one shape: **two recovery paths reading two different notions of the committed cut** (decision
+markers, the durable seal, local manifests, blob presence). The deepest instance:
+`checkpoint_coordinator.rs` `allocator.advance_to(epoch+1)` means a rewind to `T` REUSES epoch
+numbers `T+1…` while the abandoned timeline's artifacts at those numbers survive in the shared
+backend — so `latest_committed_epoch` keeps returning the pre-kill seal (the adopt path resumes
+offsets ahead of the rewound state = the +3/+6 UNDER), reused epochs find a foreign `_COMMIT`
+marker, and stale partials/blobs collide with the new timeline (the ±11 chaos). No target choice
+can fix that.
+
+Fix — the Flink/RisingWave-class recovery model, all recovery-path (zero hot-path cost):
+
+1. **One commit authority.** The round target is the 2PC decision store's `highest_committed()`,
+   full stop. The seal is node-local durability, never a rewind target. `Err` defers the round
+   (transient I/O must not flap a stop-the-world cycle); `Ok(None)` means genesis.
+2. **Two-phase stop-the-world round.** Leader announces `Prepare(gen)` → every node stops, purges
+   shuffle buffers, acks (`control:recovery-stopped`) → leader waits the stop quorum (30s,
+   best-effort) → **computes the target against the now-quiescent store** (the read IS the cut;
+   no probe, no fallback, no race) → truncates → announces `Start(target, gen)` → nodes purge
+   stragglers, rewind, restart, ack. Closes the in-flight window (the original ±3 and the
+   follower's ±1 residual). A node stopped by `Prepare` whose `Start` never arrives (leader died
+   mid-round) restarts plainly after 60s rather than staying wedged.
+3. **Truncate the abandoned timeline.** After the stop quorum, the leader deletes every backend
+   artifact above the target (`StateBackend::truncate_after`: partials, seals, descriptors,
+   srcoff blobs). Every existing reader — adopt, boot, seal, handoff — becomes consistent by
+   environment; the soak-proven adopt path is untouched. `recover_to_epoch` breaks same-epoch
+   manifest ties by checkpoint id (two timelines can leave two manifests at one epoch; the higher
+   id is the live one).
+4. **Genesis is a valid cut.** No committed epoch → target 0: truncate everything, every node
+   restarts fresh (no manifest ≤ 0 → "starting fresh", sources at initial offsets, full
+   recompute). The early-kill case needs no special-casing: rewind-to-1 restores the epoch-1
+   manifest's near-initial offsets; empty blobs at that cut are simply "nothing consumed yet".
+5. **Faults delay-and-recheck, never drop.** The fault watcher waits out any active round plus a
+   3s settle, then reports only if still Faulted. (In coordinated mode a round is a Faulted
+   node's ONLY recovery path — rev-14's skip was unsafe as well as ineffective.) Round churn
+   self-heals; real faults still trigger; cascading rounds stop.
+6. **Retention pin.** The prune horizon is clamped to the highest recorded decision marker so a
+   rewind target's artifacts can never be pruned even when sink commits stall behind the
+   retention window.
+
+Known residual risks (accepted, logged): a marker-write failure after successful sink commits
+(LDB-6038) can under-read the cut by one epoch — the decided epoch is replayed, duplicates only
+for non-transactional append sinks; folding the marker into the manifest write (single atomic
+commit pointer) is the long-term close. A partitioned node that misses `Prepare` and keeps
+writing during truncation is fenced only by the stop-quorum timeout — full close needs
+generation-stamped artifact paths.
+
+Soak expectations: one round per kill; `leader announced recovery start` with target = the
+pre-kill decided epoch (or 0 on an early kill, followed by full replay and exact totals); every
+scenario collapses to 0 — there is no remaining seam that can move counts: no in-flight window
+(stop quorum), no stale artifacts (truncation), no offset/state cut divergence (single
+authority + adopt reads the truncated seal).
 
 ## Revision 14 — never rewind to a pruned cut; no cascading rounds
 
