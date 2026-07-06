@@ -70,36 +70,48 @@ impl RecoveryMonitor {
                     self.restore(&db, &controller, epoch, gen).await;
                 }
             }
-            if controller.is_leader() && self.take_new_fault(&controller).await {
-                self.drive_round(&db, &controller).await;
+            if controller.is_leader() {
+                let pending = self.pending_faults(&controller).await;
+                if !pending.is_empty() {
+                    self.drive_round(&db, &controller, pending).await;
+                }
             }
         }
     }
 
-    /// `true` when any node's fault sequence changed since last handled. A `0` report is
-    /// "no fault" and forgets the node, so a re-fault reusing a sequence still triggers.
-    async fn take_new_fault(&mut self, controller: &ClusterController) -> bool {
-        let mut triggered = false;
+    /// Fault reports not yet handled. A `0` report is "no fault" and forgets the node, so a
+    /// re-fault reusing a sequence still triggers. Pending faults are recorded as handled only
+    /// once a round actually runs (`drive_round`), so a skipped round retries next poll.
+    async fn pending_faults(&mut self, controller: &ClusterController) -> Vec<(NodeId, u64)> {
+        let mut pending = Vec::new();
         for (node, seq) in controller.read_fault_reports().await {
             if seq == 0 {
                 self.handled_faults.remove(&node);
             } else if self.handled_faults.get(&node) != Some(&seq) {
-                self.handled_faults.insert(node, seq);
-                triggered = true;
+                pending.push((node, seq));
             }
         }
-        triggered
+        pending
     }
 
     /// Leader: fix `N`, announce, restore self (retrying), then wait for every live node to report
     /// restored. Always releases the fence and retires the announcement on exit (so an incomplete
     /// round can't leave a stale target for a later restart to replay); an incomplete round bumps
     /// `coordinated_recovery_failures_total` and relies on a still-faulted node re-triggering.
-    async fn drive_round(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
+    async fn drive_round(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        pending: Vec<(NodeId, u64)>,
+    ) {
         let Some(target) = compute_target_epoch(db).await else {
-            tracing::warn!("coordinated recovery: no committed epoch yet; skipping round");
+            // Faults stay pending (not recorded as handled) so the next poll retries.
+            tracing::warn!("coordinated recovery: no committed epoch readable; deferring round");
             return;
         };
+        for (node, seq) in pending {
+            self.handled_faults.insert(node, seq);
+        }
         let gen_id = read_recovery_gen(controller).await + 1;
         write_recovery_gen(controller, gen_id).await;
         let participants: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
@@ -208,6 +220,9 @@ async fn restore_pipeline(db: &Arc<LaminarDB>, target: u64) -> bool {
             let res = handle.block_on(async move {
                 // A faulted node is already stopped, so ignore the stop error.
                 let _ = db.stop_pipeline().await;
+                // Pre-rewind shuffle slices are stale: their senders rewind and replay them,
+                // so folding a buffered copy after the rewind double-counts.
+                db.purge_shuffle_receiver_buffers();
                 db.set_recover_target_epoch(target);
                 db.start().await
             });
@@ -231,10 +246,18 @@ async fn restore_pipeline(db: &Arc<LaminarDB>, target: u64) -> bool {
 }
 
 /// Highest epoch committed cluster-wide. Reads the DB-level decision store, so it works
-/// even when a faulted leader's own coordinator is stopped.
+/// even when a faulted leader's own coordinator is stopped; falls back to the state
+/// backend's durable seal so a freshly-restarted leader can still fix a target.
 async fn compute_target_epoch(db: &LaminarDB) -> Option<u64> {
-    let ds = db.decision_store.lock().clone()?;
-    ds.highest_committed().await.ok().flatten()
+    // Bind clones before awaiting — an if-let scrutinee would hold the lock guard across it.
+    let ds = db.decision_store.lock().clone();
+    if let Some(ds) = ds {
+        if let Ok(Some(epoch)) = ds.highest_committed().await {
+            return Some(epoch);
+        }
+    }
+    let backend = db.state_backend.lock().clone();
+    backend?.latest_committed_epoch().await.ok().flatten()
 }
 
 async fn read_recovery_gen(controller: &ClusterController) -> u64 {

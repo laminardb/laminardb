@@ -467,6 +467,26 @@ impl LaminarDB {
         self.update_sql_cluster_context();
     }
 
+    /// Drop buffered shuffle slices and stashed barriers before a rewind: their senders
+    /// rewind and replay them, so folding a buffered copy afterwards double-counts.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn purge_shuffle_receiver_buffers(&self) {
+        let Some(receiver) = self.shuffle_receiver.lock().clone() else {
+            return;
+        };
+        let queued = receiver.drain_available().len();
+        let staged = receiver.drain_all_staged().len();
+        let barriers = receiver.drain_staged_barriers().len();
+        if queued + staged + barriers > 0 {
+            tracing::info!(
+                queued,
+                staged,
+                barriers,
+                "purged stale shuffle buffers before coordinated rewind"
+            );
+        }
+    }
+
     #[cfg(feature = "cluster")]
     fn update_sql_cluster_context(&self) {
         if let (Some(registry), Some(sender), Some(receiver)) = (
