@@ -1,4 +1,26 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–13)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–14)
+
+## Revision 14 — never rewind to a pruned cut; no cascading rounds
+
+Rev-13 soak (§E18): seed rounds COMPLETE (coord_complete 0→3) and the **follower collapsed
+1097 → 1** (a single −1 group = the pre-declared no-stop-barrier window: one record shuffled into
+an already-rewound peer). The rewind protocol is exact when the target is good. The seed regressed
+(+3 UNDER on 1256/2000) because its round announced **target_epoch=1** — a pruned cut: the offset
+restore found no handoff blobs, fell back to the startup default, and resumed AHEAD of the
+deep-rewound state, so the purged in-flight buffers were never re-sent by their senders. Also
+2 kills → 3 rounds: round churn (peers restarting → shuffle send failures) reported fresh faults.
+
+Fix (`4a6d382a`):
+- `compute_target_epoch` = max(decision cut, durable seal), then **probe the target's handoff
+  blobs and defer the round if absent** — a coordinated rewind fails closed rather than resuming
+  at the startup default. Logs `decided/sealed/target/blobs`.
+- A fault raised while a recovery announcement is active is not reported (the round covers it).
+
+Soak expectations: `coordinated recovery target decided=.. sealed=.. target=..` shows a sane
+target (the pre-kill seal, not 1) on seed kills; ±3 collapses to the follower's sub-quantum
+residual (±1-class, no-stop-barrier seam — two-phase round if it must go to zero).
+Open question if target=1 recurs in the log despite intact artifacts at 7+: the decided/sealed
+fields now say WHICH read returned 1 — chase that store's keyspace.
 
 ## Revision 13 — the round must survive a killed leader and stale buffers
 
