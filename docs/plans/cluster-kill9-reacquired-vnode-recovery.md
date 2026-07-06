@@ -1,4 +1,31 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–12)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–13)
+
+## Revision 13 — the round must survive a killed leader and stale buffers
+
+Rev-12 soak (§E17): the rejoin fault fires (`reported local fault`, `leader announced recovery`)
+but seed kills STALL the round (`coord_complete=0` — "no committed epoch yet") and the follower's
+COMPLETED rounds double the quantum (±3 → ±6, 825 → 1097). Three seams fixed (`6d1ffccc`):
+
+1. **Skipped rounds consumed the fault** — `take_new_fault` marked the sequence handled before
+   `drive_round` bailed on a missing target → no retry, ever. Pending faults are now recorded
+   only when a round actually runs; a deferred round retries each 200ms poll.
+2. **`compute_target_epoch` had no durable fallback** — DB-level decision store only; on the
+   freshly-restarted reclaimed-leader seed it yields nothing while the seal exists. Falls back to
+   `state_backend.latest_committed_epoch()`.
+3. **The rewind kept the long-lived `ShuffleReceiver`'s buffers** — pre-rewind slices stashed
+   there are ALSO replayed by their rewound senders; folding the buffered copy after the rewind
+   double-counts (the ±3→±6 compounding). `restore_pipeline` now purges queued slices, staged
+   holdovers, and stashed barriers between stop and start.
+
+Known remaining seam (if a sub-quantum residual survives): the round has no stop-barrier — a
+not-yet-rewound node keeps shuffling for the announce-to-observe window (~200–400ms) into an
+already-rewound peer before its own rewind replays those records. Fix shape if needed: a
+two-phase round (stop+ack quorum, then start), or gate source intake on a gossiped
+`is_recovering` flag.
+
+Soak expectations: seed kills now log "coordinated recovery complete" (target from the durable
+seal); the ±6 collapses; the ±3 collapses with it (the rewind now replays the window exactly
+once cluster-wide).
 
 ## Revision 12 — the in-flight shuffle window; rejoin triggers the coordinated rewind
 
