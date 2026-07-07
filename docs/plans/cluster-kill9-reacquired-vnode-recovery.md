@@ -1,4 +1,37 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–16)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–17)
+
+## Revision 17 — the tier cold-capture hole (the stuck 16KB rows) + coordinated recovery by default
+
+The three tier-backed 16KB scenarios (eo_kill / eo_kill_delta / delta_kill) sat at ~1300–1450
+across revs 13–16 while notier and the follower collapsed — the round protocol was never their
+mechanism. Code-verified hole (matches the rev-10 fold=72/112-vs-806 diagnostic):
+
+- The tier store is **node-local and wiped on every open** (`state_tier/mod.rs` `remove_dir_all`),
+  so cold bytes are durable ONLY if folded into a checkpoint partial at capture/upload time.
+- The coordinator's force-fetch fold (`resolve_full_with_cold_groups`, the C2 mechanism) was
+  reachable only from the **delta-primary** capture (`VnodeCapture::FullWithColdGroups` at the
+  chain re-base).
+- The **non-delta authoritative** capture (`checkpoint_by_vnode`, cluster + `skip_whole_node_agg`)
+  SKIPPED the resident partial for any cold-bearing vnode on the stale single-node assumption
+  that the manifest carries resident — false in cluster since rev 5 — and staged a cold-only
+  `ColdGroups` slice. Net: a cold-bearing vnode's durable partial held cold bytes but **dropped
+  its resident groups**; the fold restores only what's durable; the tier that held everything
+  else died with the node.
+
+Fix: in authoritative mode the non-delta capture stages `FullWithColdGroups { resident,
+group_keys }` for a mixed vnode (the coordinator's existing fold makes the durable partial
+self-contained); embedded keeps cold-only (resident rides the manifest there — including it
+would double-apply). Guard test `authoritative_capture_stages_resident_with_cold_groups`
+(vnode_count=1 forces a mixed vnode; old code fails it).
+
+Also (owner directive): **coordinated recovery is now always on in cluster mode** — the
+`[supervision] coordinated_recovery` knob and the cluster local-restart fault path are removed
+(embedded/single-node keep supervised restart). Cluster pipelines always escalate sink/cycle
+faults (`in_cluster()`), since the round replays them.
+
+Companion doc: `docs/plans/checkpoint-restore-production-matrix.md` — the full contract ×
+failure-condition matrix across (embedded | single-node | cluster) × (EO | ALO) × delta chains,
+with the remaining gaps sequenced (in-repo deterministic recovery matrix next).
 
 ## Revision 16 — no formation-time rounds; genesis must out-rank the broker's committed offsets
 
@@ -166,8 +199,9 @@ resets the fault sequence. Fix (`5bb05bd5`): `LaminarDB::report_rejoin_fault` (n
 snapshot → the leader announces → every node `recover_to_epoch(seal)` → the window replays
 consistently on all nodes (the rev-5 boot staging is load-bearing inside the round's restore).
 
-**HARNESS REQUIREMENT: emit `[supervision] coordinated_recovery = true` in the cluster server
-TOML** (docker_compose.rs emits no `[supervision]` today) — without it the trigger no-ops.
+**HARNESS REQUIREMENT (OBSOLETE as of 2026-07-06): coordinated recovery is now always on in
+cluster mode — the `[supervision] coordinated_recovery` knob was removed (an existing
+`coordinated_recovery = true` line in the TOML is ignored harmlessly).**
 Soak expectations: seed logs "reported local fault for coordinated cluster recovery" on rejoin;
 leader logs "leader announced recovery" + "coordinated recovery complete"; all nodes rewind; the
 ±3 histogram collapses. Alternative long-term fix if rewind latency is unacceptable: offset-tagged

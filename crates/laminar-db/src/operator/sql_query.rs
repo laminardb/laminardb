@@ -1598,6 +1598,7 @@ impl GraphOperator for SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    #[allow(clippy::too_many_lines)]
     fn checkpoint_by_vnode(
         &mut self,
         vnode_count: u32,
@@ -1606,6 +1607,10 @@ impl GraphOperator for SqlQueryOperator {
         DbError,
     > {
         use crate::checkpoint_coordinator::StagedSlice;
+        // Hoisted before the `agg_state` borrow: with authoritative per-vnode partials the
+        // manifest carries no resident, so cold-bearing vnodes must stage self-contained slices.
+        #[cfg(feature = "state-tier")]
+        let self_contained = self.skip_whole_node_agg();
         // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
         // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
         let newly_acquired = self.take_newly_acquired();
@@ -1674,10 +1679,8 @@ impl GraphOperator for SqlQueryOperator {
         let cold: Vec<u32> = agg_state.cold_vnodes().iter().copied().collect();
         #[cfg(not(feature = "state-tier"))]
         let cold: Vec<u32> = Vec::new();
-        // A partially-demoted vnode's demoted groups, re-fetched + written as a cold-only partial
-        // (its resident groups still ride the whole-node manifest).
         #[cfg(feature = "state-tier")]
-        let cold_groups = agg_state.cold_groups_by_vnode(vnode_count);
+        let mut cold_groups = agg_state.cold_groups_by_vnode(vnode_count);
         #[cfg(not(feature = "state-tier"))]
         let cold_groups: std::collections::HashMap<u32, Vec<Vec<u8>>> =
             std::collections::HashMap::new();
@@ -1688,15 +1691,38 @@ impl GraphOperator for SqlQueryOperator {
             per_vnode.len() + cold.len() + cold_groups.len(),
         );
         for (vnode, cp) in per_vnode {
-            // A vnode with cold groups stages those instead (cold-only); its resident is in the
-            // manifest, so writing a resident per-vnode partial here would be redundant.
+            let resident = bytes::Bytes::from(serialize_agg_cp(&cp, &self.op_name)?);
+            // A cold-bearing vnode's durable partial must be self-contained when the per-vnode
+            // chain is the primary agg checkpoint: the manifest carries no resident there, the
+            // tier is node-local and wiped on restart, and the cluster fold never promotes — a
+            // resident- or cold-dropping partial is unrecoverable data loss after a kill. The
+            // coordinator force-fetches the cold bytes and folds them in at upload. Embedded
+            // (manifest-primary) keeps the cold-only partial so resident isn't double-applied.
             #[cfg(feature = "state-tier")]
-            if cold_groups.contains_key(&vnode) {
+            if let Some(group_keys) = cold_groups.remove(&vnode) {
+                if self_contained {
+                    out.insert(
+                        vnode,
+                        StagedSlice::FullWithColdGroups {
+                            resident,
+                            group_keys,
+                            codec: crate::checkpoint_coordinator::StateCodec::Agg,
+                        },
+                    );
+                } else {
+                    out.insert(
+                        vnode,
+                        StagedSlice::ColdGroups {
+                            group_keys,
+                            codec: crate::checkpoint_coordinator::StateCodec::Agg,
+                        },
+                    );
+                }
                 continue;
             }
-            let data = serialize_agg_cp(&cp, &self.op_name)?;
-            out.insert(vnode, StagedSlice::Bytes(bytes::Bytes::from(data)));
+            out.insert(vnode, StagedSlice::Bytes(resident));
         }
+        // Fully-cold vnodes (no resident groups left): cold-only is already self-contained.
         #[cfg(feature = "state-tier")]
         for (vnode, group_keys) in cold_groups {
             out.insert(
@@ -3122,5 +3148,65 @@ mod promotion_tests {
             "cluster group demotion emitted a changelog total ({max_emitted}) different from the \
              true running count ({rounds}) — a value > {rounds} is the soak's double-count",
         );
+    }
+
+    /// A cold-bearing vnode's non-delta authoritative capture must be self-contained
+    /// (resident + cold keys): in cluster the manifest carries no resident and the tier is
+    /// node-local + wiped on restart, so a cold-only partial silently drops the vnode's
+    /// resident groups from durable state — unrecoverable after a kill.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authoritative_capture_stages_resident_with_cold_groups() {
+        use crate::checkpoint_coordinator::StagedSlice;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
+        );
+        let tier_tx = crate::state_tier::spawn_worker(
+            &tokio::runtime::Handle::current(),
+            Arc::clone(&store),
+            64,
+        );
+        let mut op = build_op(tier_tx).await;
+        // Group dirty-tracking without delta-primary captures — the non-delta capture path.
+        op.enable_delta_tracking();
+
+        // vnode_count=1 puts both keys in one vnode: "a" goes cold, "b" stays resident.
+        op.process(&[vec![events_batch(&["a", "b"], &[1, 2])]], &[10])
+            .await
+            .unwrap();
+        op.checkpoint_by_vnode(1).unwrap();
+        op.process(&[vec![events_batch(&["b"], &[3])]], &[20])
+            .await
+            .unwrap();
+        let (n, _) = op.demote_cold_groups(usize::MAX, 1).await;
+        assert_eq!(n, 1, "exactly the clean group demotes");
+
+        // Embedded (manifest-primary): cold-only — resident rides the whole-node manifest.
+        let slices = op.checkpoint_by_vnode(1).unwrap().expect("capture");
+        assert!(
+            matches!(slices.get(&0), Some(StagedSlice::ColdGroups { .. })),
+            "manifest-primary capture stages a cold-only slice"
+        );
+
+        // Authoritative (cluster): the same vnode must stage resident + cold keys together.
+        op.set_vnode_partials_authoritative();
+        op.process(&[vec![events_batch(&["b"], &[4])]], &[30])
+            .await
+            .unwrap();
+        let slices = op.checkpoint_by_vnode(1).unwrap().expect("capture");
+        match slices.get(&0) {
+            Some(StagedSlice::FullWithColdGroups {
+                resident,
+                group_keys,
+                ..
+            }) => {
+                assert!(!resident.is_empty(), "resident bytes present");
+                assert_eq!(group_keys.len(), 1, "the demoted group's key is listed");
+            }
+            Some(StagedSlice::ColdGroups { .. }) => {
+                panic!("cold-only slice under authoritative partials drops resident groups")
+            }
+            _ => panic!("expected FullWithColdGroups for the mixed vnode"),
+        }
     }
 }

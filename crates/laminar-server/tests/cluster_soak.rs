@@ -27,7 +27,6 @@
 //!   `_GROUPS` (2000 — agg key-space), `_SPAN` (12 — consecutive rows per agg key)
 //! - `LAMINAR_SOAK_CHANGELOG_AGG`  add an `EMIT CHANGES` agg exercising the changelog
 //!   `last_emitted` delta path; pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` (else it captures FULL)
-//! - `LAMINAR_SOAK_COORD_RECOVERY`  set `[supervision] coordinated_recovery`
 //! - `LAMINAR_SOAK_FAULT_INJECT_MS`  arm a one-shot cycle fault this many ms in;
 //!   `LAMINAR_SOAK_FAULT_INJECT_NODE` (default 1 = follower; 0 = leader) picks which
 
@@ -332,10 +331,6 @@ format = "json"
 "#,
             topic = eo_topic(id),
         ));
-    }
-
-    if std::env::var("LAMINAR_SOAK_COORD_RECOVERY").is_ok() {
-        toml.push_str("\n[supervision]\ncoordinated_recovery = true\n");
     }
 
     let path = dir.join(format!("node{id}.toml"));

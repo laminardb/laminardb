@@ -272,9 +272,6 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
-    /// Fault (rather than drop) on a fatal cycle error even at-least-once, so coordinated
-    /// recovery can drive a global restart and an EO sink's 2PC keeps output exactly-once.
-    pub(crate) coordinated_recovery: bool,
     pub(crate) serialization_timeout: Duration,
     pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     /// Set when a sink write times out; suppresses the next checkpoint to preserve the replay window.
@@ -1187,6 +1184,19 @@ impl ConnectorPipelineCallback {
         self.drain_sink_events();
     }
 
+    /// Cluster pipelines always fault (rather than drop) on fatal errors: coordinated
+    /// recovery replays them, and a swallowed fault would desync the cross-node cut.
+    fn in_cluster(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            self.cluster_controller.is_some()
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
+    }
+
     fn drain_sink_events(&mut self) {
         // A poisoned sink epoch aborts its transaction. Under any exactly-once contract this
         // must fault the pipeline so recovery replays the dropped rows (CP-4) — nothing else
@@ -1195,7 +1205,7 @@ impl ConnectorPipelineCallback {
         let escalate = self.exactly_once_sinks
             || self.delivery_guarantee
                 == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
-            || self.coordinated_recovery;
+            || self.in_cluster();
         while let Ok(event) = self.sink_event_rx.try_recv() {
             tracing::debug!(?event, "sink event");
             let reason = match &event {
@@ -1682,7 +1692,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     fn fault_on_cycle_error(&self) -> bool {
         use laminar_connectors::connector::DeliveryGuarantee;
-        self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce || self.coordinated_recovery
+        self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce || self.in_cluster()
     }
 
     fn take_sink_fault(&mut self) -> Option<String> {

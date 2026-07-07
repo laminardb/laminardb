@@ -389,12 +389,9 @@ impl LaminarDB {
     /// sealed cut. A kill-9'd process cannot report at death, so records shuffled between
     /// the last seal and the kill double-fold on survivors at replay and its own inbound
     /// shuffle is lost; the rejoin report drives the round the death could not. No-op when
-    /// `coordinated_recovery` is off or no controller is wired.
+    /// no controller is wired.
     #[cfg(feature = "cluster")]
     pub async fn report_rejoin_fault(&self) {
-        if !self.config.coordinated_recovery {
-            return;
-        }
         // A boot that restored no local state is a fresh joiner (cluster formation,
         // scale-out, wiped disk): it lost no in-flight window, and a round here would
         // genesis-rewind live peers for nothing.
@@ -418,13 +415,11 @@ impl LaminarDB {
         crate::coordinated_recovery::report_local_fault(&controller).await;
     }
 
-    /// Start the per-node recovery monitor once. No-op when `coordinated_recovery` is off.
-    /// Must be called from a Tokio runtime.
+    /// Start the per-node recovery monitor once. Coordinated recovery is the only cluster
+    /// fault path — a local-only restart rewinds one node while peers advance, an
+    /// inconsistent cut. Must be called from a Tokio runtime.
     #[cfg(feature = "cluster")]
     pub fn enable_coordinated_recovery(self: &Arc<Self>) {
-        if !self.config.coordinated_recovery {
-            return;
-        }
         if self
             .recovery_monitor_started
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -2167,7 +2162,6 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            coordinated_recovery: self.config.coordinated_recovery,
             serialization_timeout: std::time::Duration::from_secs(120),
             sink_event_rx,
             sink_timed_out: false,
@@ -2312,8 +2306,6 @@ impl LaminarDB {
             let watcher_restart_history = Arc::clone(&self.restart_history);
             let watcher_metrics = self.engine_metrics.lock().clone();
             #[cfg(feature = "cluster")]
-            let watcher_coord_recovery = self.config.coordinated_recovery;
-            #[cfg(feature = "cluster")]
             let watcher_controller = self.cluster_controller.lock().clone();
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_ok() {
@@ -2334,33 +2326,31 @@ impl LaminarDB {
                     // Faulted, not Stopped — recoverable via a later start().
                     DbState::Faulted.store(&watcher_state);
                     watcher_shutdown.notify_one();
-                    // Coordinated recovery: report the fault and let the leader drive a global
+                    // Cluster mode: report the fault and let the leader drive a global
                     // restart; the monitor restores this node. A local restart would rewind
                     // only this node while peers advanced — an inconsistent cut.
                     #[cfg(feature = "cluster")]
-                    if watcher_coord_recovery {
-                        if let Some(controller) = watcher_controller {
-                            // Round churn self-heals: an active round's restore clears Faulted.
-                            // Delay past the round plus a settle window and re-check rather
-                            // than dropping the report — a round is a Faulted node's only
-                            // recovery path, so a dropped report is a permanently dead node.
-                            let deadline =
-                                tokio::time::Instant::now() + std::time::Duration::from_secs(150);
-                            while controller.observe_recover().await.is_some()
-                                && tokio::time::Instant::now() < deadline
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                            if matches!(DbState::load(&watcher_state), DbState::Faulted) {
-                                crate::coordinated_recovery::report_local_fault(&controller).await;
-                            } else {
-                                tracing::info!(
-                                    "fault healed by an in-flight recovery round; not reporting"
-                                );
-                            }
-                            return;
+                    if let Some(controller) = watcher_controller {
+                        // Round churn self-heals: an active round's restore clears Faulted.
+                        // Delay past the round plus a settle window and re-check rather
+                        // than dropping the report — a round is a Faulted node's only
+                        // recovery path, so a dropped report is a permanently dead node.
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(150);
+                        while controller.observe_recover().await.is_some()
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        if matches!(DbState::load(&watcher_state), DbState::Faulted) {
+                            crate::coordinated_recovery::report_local_fault(&controller).await;
+                        } else {
+                            tracing::info!(
+                                "fault healed by an in-flight recovery round; not reporting"
+                            );
+                        }
+                        return;
                     }
                     // Auto-restart if supervised; otherwise the pipeline stays Faulted.
                     let supervised = watcher_supervisor.lock().upgrade();

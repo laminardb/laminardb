@@ -587,8 +587,7 @@ pub async fn start_cluster(
     builder = builder
         .shuffle_sender(Arc::clone(&shuffle_sender))
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
-        .target_partitions(1)
-        .coordinated_recovery(config.supervision.coordinated_recovery);
+        .target_partitions(1);
 
     let db = builder
         .build()
@@ -644,7 +643,7 @@ pub async fn start_cluster(
             _ => None,
         };
 
-    // No-op unless [supervision] coordinated_recovery is on. Before start() so an early
+    // Coordinated recovery is the only cluster fault path. Before start() so an early
     // fault is observed.
     db.enable_coordinated_recovery();
 
@@ -687,8 +686,7 @@ pub async fn start_cluster(
     }
     // A restart into an established cluster: the previous incarnation's kill left records
     // shuffled since the last seal double-counted on survivors and its inbound shuffle lost.
-    // Report the rejoin as a fault so the leader rewinds every node to the sealed cut
-    // (no-op unless [supervision] coordinated_recovery is on).
+    // Report the rejoin as a fault so the leader rewinds every node to the sealed cut.
     if found_existing_snapshot {
         db.report_rejoin_fault().await;
     }
