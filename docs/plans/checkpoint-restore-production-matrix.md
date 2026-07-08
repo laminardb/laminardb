@@ -90,9 +90,24 @@ Conditions every mode must handle; ✓ = covered with the closing change; open i
   oracle, abrupt node abort (no final checkpoint) + coordinated round, matrix over
   {EO, ALO} × {tier 16KB, no-tier} × {delta chains on/off}. Every invariant this document
   names gets a red test before the external soak ever runs.
-- **G3 — shuffle seq/ack delivery contract (CL-2, deferred).** Coordinated rounds mask
-  single-frame loss today (whole-window replay); the per-frame contract remains the
-  long-term close for reconnect edges.
+- **G3 — shuffle seq/ack delivery contract (CL-2) — NOW THE PRIME RESIDUAL (rev-17 soak).**
+  The uniform +3-under on fold/round-recovered runs (follower 1313, eo_kill 826, eo_kill_delta
+  1505; bimodal — same build gave follower 31 on a lucky run) is NOT the operator fold (proven
+  exact) nor a cut mismatch (`collect_chain` and offset resume both at `recovered.epoch()`). It
+  is a cross-node shuffle drop: the coordinated round restarts all nodes concurrently and each
+  node's sources begin re-reading + re-shuffling the replay window inside `db.start()` with no
+  gate on peer shuffle-receiver readiness; sends are best-effort (`cluster_repartition.rs:445`
+  `let _ = sender.send_to`) and the transport silently drops queued frames on a down peer
+  connection (`transport.rs:87`). A survivor re-shuffling a window record to a peer whose
+  receiver has not bound yet loses it permanently — the source advances regardless — so every
+  group owned by the late node loses one node-partition slice (~3). Restart-timing dependence =
+  the bimodality. **Fix (rev 18): a receive-readiness gate on the round** — hold each node's
+  SOURCE intake (source-task poll) while the round is unsettled cluster-wide, releasing only
+  after the restore quorum; the coordinator's idle cycles keep draining the shuffle receiver
+  (bound early in `start()`, `SHUFFLE_RECV_QUEUE=1024` + HTTP/2 backpressure absorb the
+  transient), so no node re-shuffles into a void. Reuses the `is_recovering` fence +
+  `RecoveryMonitor` poll + restore quorum; no hot-path cost. The per-frame seq/ack contract
+  remains the deeper long-term close for non-recovery reconnect edges.
 - **G4 — Lever-2 delta checkpoints (default-OFF).** State-layer emission + chain recovery
   done; per-operator chain mixing unwired. Gate: G2 matrix green with chains forced on.
 - **G5 — accepted residual risks (documented, low likelihood):** LDB-6038 marker-write

@@ -152,6 +152,12 @@ pub struct LaminarDB {
     /// already restored this node must not trigger another.
     #[cfg(feature = "cluster")]
     pub(crate) coordinated_restores: std::sync::atomic::AtomicU64,
+    /// Holds source intake closed during a coordinated round until every node has restarted
+    /// and rebound its shuffle receiver (the restore quorum). Sources re-read + re-shuffle the
+    /// replay window on restart; without this gate a node that restarts first shuffles into a
+    /// peer whose receiver isn't up yet and the fire-and-forget frames are lost.
+    #[cfg(feature = "cluster")]
+    pub(crate) source_gate: Arc<std::sync::atomic::AtomicBool>,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
@@ -421,6 +427,8 @@ impl LaminarDB {
             last_recovery_epoch: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             coordinated_restores: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cluster")]
+            source_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),

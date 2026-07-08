@@ -212,6 +212,63 @@ mod exactly_once {
         fn apply_control(&mut self, _msg: laminar_db::pipeline::ControlMsg) {}
     }
 
+    // The source-intake gate (held closed during a coordinated round until the restore quorum)
+    // must stop the source from producing until released — the invariant that keeps a rewound
+    // node from re-shuffling its replay into a peer whose receiver hasn't rebound.
+    #[tokio::test]
+    async fn source_gate_holds_intake_until_released() {
+        let sources = vec![SourceRegistration {
+            name: "src".to_string(),
+            connector: Box::new(
+                laminar_connectors::testing::MockSourceConnector::with_batches(10_000, 10),
+            ),
+            config: laminar_connectors::config::ConnectorConfig::new("mock"),
+            supports_replay: true,
+            restore_checkpoint: None,
+        }];
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = Arc::clone(&shutdown);
+        let config = PipelineConfig {
+            fallback_poll_interval: Duration::from_millis(1),
+            batch_window: Duration::ZERO,
+            ..PipelineConfig::default()
+        };
+        let (_control_tx, control_rx) =
+            crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
+
+        // Start with the gate CLOSED.
+        let gate = Arc::new(AtomicBool::new(true));
+        let coordinator =
+            StreamingCoordinator::new(sources, config, shutdown, control_rx, Arc::clone(&gate))
+                .await
+                .unwrap();
+        let record_counter = Arc::new(AtomicU64::new(0));
+        let callback = BarrierTrackingCallback::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&record_counter),
+        );
+        let handle = tokio::spawn(async move { coordinator.run(callback).await });
+
+        // Gated: no records flow.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            record_counter.load(Ordering::Relaxed),
+            0,
+            "source produced records while the intake gate was closed"
+        );
+
+        // Released: records flow.
+        gate.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            record_counter.load(Ordering::Relaxed) > 0,
+            "source produced no records after the gate was released"
+        );
+
+        shutdown_clone.notify_one();
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_barrier_aligned_checkpoint_fires() {
         let sources = vec![
@@ -248,9 +305,15 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
-        let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
-            .await
-            .unwrap();
+        let coordinator = StreamingCoordinator::new(
+            sources,
+            config,
+            shutdown,
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
 
         let should_trigger = Arc::new(AtomicBool::new(true));
         let record_counter = Arc::new(AtomicU64::new(0));
@@ -318,9 +381,15 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
-        let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
-            .await
-            .unwrap();
+        let coordinator = StreamingCoordinator::new(
+            sources,
+            config,
+            shutdown,
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
 
         let should_trigger = Arc::new(AtomicBool::new(true));
         let record_counter = Arc::new(AtomicU64::new(0));
@@ -459,9 +528,15 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
-        let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
-            .await
-            .unwrap();
+        let coordinator = StreamingCoordinator::new(
+            sources,
+            config,
+            shutdown,
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
 
         let should_trigger = Arc::new(AtomicBool::new(true));
         let record_counter = Arc::new(AtomicU64::new(0));
@@ -517,9 +592,15 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
-        let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
-            .await
-            .unwrap();
+        let coordinator = StreamingCoordinator::new(
+            sources,
+            config,
+            shutdown,
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
 
         let should_trigger = Arc::new(AtomicBool::new(true));
         let record_counter = Arc::new(AtomicU64::new(0));

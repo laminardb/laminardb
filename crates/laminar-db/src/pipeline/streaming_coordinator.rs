@@ -188,6 +188,7 @@ impl StreamingCoordinator {
         config: PipelineConfig,
         shutdown: Arc<tokio::sync::Notify>,
         control_rx: ControlMsgRx,
+        source_gate: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, DbError> {
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
@@ -241,6 +242,7 @@ impl StreamingCoordinator {
             let task_shutdown = Arc::new(tokio::sync::Notify::new());
             let task_shutdown_clone = Arc::clone(&task_shutdown);
             let task_tx = tx.clone();
+            let task_gate = Arc::clone(&source_gate);
             let max_poll = config.max_poll_records;
             let poll_interval = config.fallback_poll_interval;
             let src_name = src.name.clone();
@@ -277,6 +279,17 @@ impl StreamingCoordinator {
                 // Ack a fresh commit before polling more — keeps
                 // max_ack_pending headroom for the broker.
                 loop {
+                    // Source-intake gate: held closed during a coordinated round until the
+                    // restore quorum, so a rewound source doesn't re-shuffle its replay into a
+                    // peer whose receiver hasn't rebound (the frames would be dropped). The
+                    // compute loop keeps draining the shuffle receiver on idle cycles meanwhile.
+                    if task_gate.load(std::sync::atomic::Ordering::Acquire) {
+                        tokio::select! {
+                            biased;
+                            () = task_shutdown_clone.notified() => break,
+                            () = tokio::time::sleep(poll_interval) => continue,
+                        }
+                    }
                     let wake = tokio::select! {
                         biased;
                         () = task_shutdown_clone.notified() => SourceWake::Shutdown,

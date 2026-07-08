@@ -1,4 +1,52 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–17)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–18)
+
+## Revision 18 — the round's receive-readiness gate (the uniform +3 was a shuffle-replay drop)
+
+Rev-17 soak: notier 892→3 and delta_kill 1386→5 collapsed (rev-17's self-contained cold
+captures fixed the ALO/tier state path), but a **uniform +3-under** persisted on the
+fold/round-recovered runs — follower 31→1313 (`+3:1249`), eo_kill 826, eo_kill_delta 1505 — and
+it is **bimodal** across identical builds (the follower was 0/633/716/1026 at rev-10; the 4 MB
+no-tier follower had nothing change in rev-17). A 5-reader adversarially-verified investigation
+(27 facts) placed it precisely, and ruled OUT the operator fold (both routes converge to the
+chain head; test proves it) and the cut (`collect_chain` and the offset resume both key off
+`recovered.epoch()`).
+
+Root cause — a cross-node shuffle-replay drop during the concurrent round restart:
+- The GROUP BY uses the AGG shuffle path (`sql_query.rs:1190-1268`). Shuffle data frames carry
+  **no epoch/sequence** (`proto/shuffle.proto:41-49`) and delivery is fire-and-forget
+  (`shuffle.proto:11-17`); `send_to` returns Ok on **enqueue** (`transport.rs:228`) and a later
+  driver connect/stream failure **drops the queued frames** with no error (CL-2, still open).
+- The receiver is bound once at process start and is NOT dropped by `stop_pipeline`; nothing
+  drains it while the pipeline is stopped; `purge_shuffle_receiver_buffers` is total.
+- `drive_round` ordering: purge → `announce_recover_start` → **leader self-restores inline**
+  (re-reads its source from O_T and re-shuffles the replay) → *then* waits the recovered quorum.
+  Followers react only on their 200 ms poll. So the leader (restarts strictly first) re-shuffles
+  its window into the still-booting recovering node, whose **purge-on-Start** (`coordinated_
+  recovery.rs:107`) discards exactly those frames — and fire-and-forget never re-sends. Loss =
+  the leader's one partition-slice per group = the uniform +3. Restart-timing dependence is the
+  bimodality; the second survivor restarts ~concurrently and lands after the purge (folds fine).
+
+Fix (rev 18) — a **receive-readiness gate on the round** (Flink/RisingWave "all tasks RUNNING
+before data flows"): a `source_gate: Arc<AtomicBool>` on `db`, checked at the top of every
+source-task poll loop (`streaming_coordinator.rs`). `restore_and_ack` sets it closed **before**
+the restart so sources come up paused; both the leader (after its existing restore-quorum wait)
+and every follower (new symmetric wait) release it only once the quorum confirms every node has
+restarted and rebound its receiver. During the gate no node reads or re-shuffles — the round is
+a global quiet period, so no frame can be dropped. Released on timeout too (never wedge sources);
+released in the abandon/orphan paths. Recovery-path only; zero hot-path cost. Guard test
+`source_gate_holds_intake_until_released`.
+
+Secondary mechanism found (NOT the soak's dominant +3; sequenced to rev 19 with its own repro to
+avoid a speculative change to the soak-proven offset path): on a round restart the source is
+rebuilt with `open()` before `restore()`, so an owned partition absent from BOTH the manifest and
+the handoff@T falls back to `Offset::Stored` (broker group offset, possibly ahead of T) and the
+seek block never pulls it back (`recovery_source_checkpoint` topic-scoping + `to_seek_tpl`
+omission + `startup_default_offset(GroupOffsets)=Stored`). A real edge for a newly-acquired-but-
+unconsumed partition; a contributor to the EO/16KB residual (+5). Fix direction: on a recovery
+restart, an owned partition with no staged offset must resume at the truncated seal/handoff cut,
+never the broker Stored offset.
+
+## Revision 17 — the tier cold-capture hole (the stuck 16KB rows) + coordinated recovery by default
 
 ## Revision 17 — the tier cold-capture hole (the stuck 16KB rows) + coordinated recovery by default
 

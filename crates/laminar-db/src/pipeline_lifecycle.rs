@@ -385,6 +385,14 @@ impl LaminarDB {
         *self.recover_target_epoch.lock() = Some(epoch);
     }
 
+    /// Open or close the source-intake gate. Closed (`true`) during a coordinated round until
+    /// the restore quorum, so no node re-shuffles its replay into a peer that hasn't rebound.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_source_gate(&self, closed: bool) {
+        self.source_gate
+            .store(closed, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Report this process's restart as a fault so the leader rewinds every node to the
     /// sealed cut. A kill-9'd process cannot report at death, so records shuffled between
     /// the last seal and the kill double-fold on survivors at replay and its own inbound
@@ -2210,11 +2218,16 @@ impl LaminarDB {
                 crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
             *self.control_tx.lock() = Some(control_tx);
 
+            #[cfg(feature = "cluster")]
+            let source_gate = Arc::clone(&self.source_gate);
+            #[cfg(not(feature = "cluster"))]
+            let source_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let coordinator = crate::pipeline::StreamingCoordinator::new(
                 sources,
                 pipeline_config,
                 Arc::clone(&shutdown),
                 control_rx,
+                source_gate,
             )
             .await?
             .with_checkpoint_complete_rx(checkpoint_complete_rx)

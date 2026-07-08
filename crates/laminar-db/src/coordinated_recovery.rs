@@ -110,6 +110,19 @@ impl RecoveryMonitor {
                     stop_and_purge(db).await;
                 }
                 if self.restore_and_ack(db, controller, epoch, gen).await {
+                    // Hold sources until the whole round has restarted (every receiver rebound),
+                    // then release — symmetric with the leader so no node re-shuffles early.
+                    let participants: FxHashSet<NodeId> =
+                        controller.live_instances().into_iter().collect();
+                    wait_gen_quorum(
+                        || controller.read_recovered(),
+                        controller,
+                        gen,
+                        &participants,
+                        RESTORE_QUORUM_TIMEOUT,
+                    )
+                    .await;
+                    db.set_source_gate(false);
                     controller.set_recovering(false);
                     tracing::warn!(target_epoch = epoch, gen, "node restored to recovery epoch");
                 }
@@ -123,6 +136,7 @@ impl RecoveryMonitor {
                             "recovery round orphaned (no Start); restarting plain"
                         );
                         start_pipeline(db, None).await;
+                        db.set_source_gate(false);
                         self.stopped_for = None;
                         controller.set_recovering(false);
                     }
@@ -242,6 +256,9 @@ impl RecoveryMonitor {
             tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
             false
         };
+        // Every node has restarted and rebound its receiver (or the wait timed out — release
+        // anyway rather than wedge sources): re-shuffle can no longer land in a void.
+        db.set_source_gate(false);
         controller.set_recovering(false);
         // Always retire the announcement — a lingering target would be replayed by a later
         // fresh restart (applied_gen resets to 0); a still-faulted straggler re-triggers.
@@ -275,6 +292,7 @@ impl RecoveryMonitor {
         }
         controller.clear_recover().await;
         start_pipeline(db, None).await;
+        db.set_source_gate(false);
         controller.set_recovering(false);
         tracing::error!(
             gen = gen_id,
@@ -291,7 +309,12 @@ impl RecoveryMonitor {
         target: u64,
         gen_id: u64,
     ) -> bool {
+        // Bring sources up PAUSED: the restart re-reads and re-shuffles the replay window, and a
+        // node that restarts first would shuffle into peers whose receivers haven't rebound.
+        // Released once the restore quorum confirms every node is up (`release_sources`).
+        db.set_source_gate(true);
         if !start_pipeline(db, Some(target)).await {
+            db.set_source_gate(false);
             return false;
         }
         db.coordinated_restores.fetch_add(1, Ordering::SeqCst);

@@ -1186,6 +1186,7 @@ impl ConnectorPipelineCallback {
 
     /// Cluster pipelines always fault (rather than drop) on fatal errors: coordinated
     /// recovery replays them, and a swallowed fault would desync the cross-node cut.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn in_cluster(&self) -> bool {
         #[cfg(feature = "cluster")]
         {
