@@ -134,6 +134,7 @@ impl RecoveryMonitor {
                         RESTORE_QUORUM_TIMEOUT,
                     )
                     .await;
+                    log_release_diagnostic(db, controller, gen, epoch);
                     db.set_source_gate(false);
                     controller.set_recovering(false);
                     tracing::warn!(target_epoch = epoch, gen, "node restored to recovery epoch");
@@ -270,6 +271,7 @@ impl RecoveryMonitor {
         };
         // Every node has restarted and rebound its receiver (or the wait timed out — release
         // anyway rather than wedge sources): re-shuffle can no longer land in a void.
+        log_release_diagnostic(db, controller, gen_id, target);
         db.set_source_gate(false);
         controller.set_recovering(false);
         // Always retire the announcement — a lingering target would be replayed by a later
@@ -395,6 +397,38 @@ where
             false
         }
     }
+}
+
+/// One-line per-node snapshot at gate release. A cross-node diff at the same `gen` attributes the
+/// small bidirectional residual: divergent `owned_vnodes`/`assignment_version` = an assignment
+/// race (a vnode transiently owned by 0 or 2 nodes → drop or double); a wide spread in the log
+/// timestamps of these lines = gate-release skew; per-partition offset logs cover a cut slip.
+fn log_release_diagnostic(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    gen_id: u64,
+    target: u64,
+) {
+    let (owned, version) = {
+        let guard = db.vnode_registry.lock();
+        match guard.as_ref() {
+            Some(reg) => {
+                let self_id = laminar_core::state::NodeId(controller.instance_id().0);
+                (
+                    laminar_core::state::owned_vnodes(reg, self_id).len(),
+                    reg.assignment_version(),
+                )
+            }
+            None => (0, 0),
+        }
+    };
+    tracing::info!(
+        gen = gen_id,
+        target,
+        owned_vnodes = owned,
+        assignment_version = version,
+        "coordinated recovery: releasing source gate"
+    );
 }
 
 /// Highest epoch committed cluster-wide per the 2PC decision store — the only sound rewind
