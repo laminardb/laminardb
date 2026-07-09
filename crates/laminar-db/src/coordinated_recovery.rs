@@ -6,7 +6,7 @@
 //! must not survive), then announces `Start`. No committed epoch → target 0, a fresh start
 //! from initial source offsets. Off by default.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -33,14 +33,26 @@ const RECOVERY_GEN_KEY: &str = "control:recovery-gen";
 /// Rewind target meaning "no committed cut exists": truncate everything and start fresh.
 const GENESIS: u64 = 0;
 
-/// Per-process fault counter; resets to 0 on restart, so the leader triggers on any change
-/// (not just an increase) to catch a re-fault.
-static FAULT_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Fault identity for this process boot: a fresh value each start, reused within the boot.
+/// A per-process counter that resets to 1 collides in the leader's `handled_faults` — a second
+/// kill of the same node reports the same `1` the leader already handled, so no round fires and
+/// the second kill falls back to the orphaned-offset loss. A boot-unique nonce makes every kill
+/// distinct, so the leader's change-detection triggers deterministically without depending on
+/// observing the transient `0` a completed round leaves behind.
+fn boot_fault_nonce() -> u64 {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos());
+        u64::try_from(nanos).unwrap_or(u64::MAX).max(1)
+    })
+}
 
 /// Publish a fault so the leader drives a global restart; this node's monitor then
 /// restores it on observing the round.
 pub(crate) async fn report_local_fault(controller: &ClusterController) {
-    let seq = FAULT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let seq = boot_fault_nonce();
     controller.report_fault(seq).await;
     tracing::warn!(seq, "reported local fault for coordinated cluster recovery");
 }

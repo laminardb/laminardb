@@ -1,4 +1,33 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–18)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–19)
+
+## Revision 19 — every kill fires a round (boot-unique fault nonce)
+
+Rev-18 soak (two runs) proved the gate: **follower 0/0 and eo_kill_delta 0/0 rock-solid**, and
+notier went 1213→0 across the two runs *purely by getting its second round* (no code change) —
+`complete=2` everywhere collapses toward 0. The remaining nondeterminism was round-FIRING: a
+second kill occasionally didn't escalate to a round (`complete=1`), falling back to the old
+orphaned-offset loss (notier 1213, delta_kill 975, eo_kill 1214 on the miss runs).
+
+Root cause: the fault report used `FAULT_SEQ: AtomicU64 = 0`, a **per-process counter that
+resets to 1 on each restart**. A kill-9 makes a fresh process, so the second kill reports the
+same `seq=1` the leader already recorded in `handled_faults[node]` from the first kill → looks
+already-handled → no round. It was nondeterministic because it also relied on the leader
+observing the transient `0` (written by `clear_fault_report` after the first round) over an
+eventually-consistent gossip KV before the second kill overwrote it.
+
+Fix (`report_local_fault`): the fault value is now a **boot-unique nonce** (`SystemTime` nanos at
+first report, memoized per process in a `OnceLock`, reused within the boot). Every kill of a node
+reports a distinct value, so the leader's change-detection (`handled_faults.get(node) != Some(&v)`)
+triggers deterministically for every kill and no longer depends on catching the transient `0`.
+Within a boot the nonce is stable, so repeated reports still dedup to one round.
+
+Remaining (rev 20): eo_kill (EO + 16KB + **non-delta**) holds a ~155 residual even at
+`complete=2` — the deferred `Offset::Stored` fallback on a round-restart re-acquire (an owned
+partition absent from the manifest+handoff@T resumes at the broker committed offset instead of
+the truncated seal cut). eo_kill_delta (delta chains) is clean 0/0, so it is specific to the
+non-delta re-acquire path. Needs its own repro before touching the soak-proven offset machinery.
+
+## Revision 18 — the round's receive-readiness gate (the uniform +3 was a shuffle-replay drop)
 
 ## Revision 18 — the round's receive-readiness gate (the uniform +3 was a shuffle-replay drop)
 
