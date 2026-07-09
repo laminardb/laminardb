@@ -393,6 +393,19 @@ impl LaminarDB {
             .store(closed, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Stamp this node's shuffle fabric with the round's generation. Outbound frames carry it and
+    /// inbound frames below it are discarded, so a pre-rewind frame still in flight can't be
+    /// folded onto the restored state and then re-applied by the sender's replay.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_shuffle_recovery_gen(&self, gen: u64) {
+        if let Some(sender) = self.shuffle_sender.lock().as_ref() {
+            sender.set_recovery_gen(gen);
+        }
+        if let Some(receiver) = self.shuffle_receiver.lock().as_ref() {
+            receiver.set_recovery_gen(gen);
+        }
+    }
+
     /// Report this process's restart as a fault so the leader rewinds every node to the
     /// sealed cut. A kill-9'd process cannot report at death, so records shuffled between
     /// the last seal and the kill double-fold on survivors at replay and its own inbound

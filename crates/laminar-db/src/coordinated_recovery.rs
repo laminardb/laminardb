@@ -359,6 +359,10 @@ impl RecoveryMonitor {
             db.set_source_gate(false);
             return false;
         }
+        // Bump the shuffle generation the moment this node is restored, before the gate opens:
+        // frames a peer produced pre-rewind are now discarded on arrival, so they can't be folded
+        // onto the restored state and then re-applied when that peer replays from the rewound cut.
+        db.set_shuffle_recovery_gen(gen_id);
         db.coordinated_restores.fetch_add(1, Ordering::SeqCst);
         if let Some(m) = db.engine_metrics.lock().clone() {
             m.coordinated_recoveries_total.inc();

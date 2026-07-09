@@ -46,6 +46,11 @@ message VnodeData {
   // opaque IPC blob — not re-modelled in protobuf — so a schema roll on
   // one frame cannot poison the stream.
   bytes arrow_ipc = 3;
+  // Recovery generation of the sending node when this frame was produced. A
+  // coordinated rewind bumps every node's generation; a receiver drops frames
+  // stamped below its own, so pre-rewind frames still in flight cannot be
+  // folded on top of the restored state and then re-applied by the replay.
+  uint64 recovery_gen = 4;
 }
 
 // A Chandy-Lamport checkpoint barrier flowing in-band with the data,

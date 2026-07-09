@@ -58,7 +58,7 @@ mod grpc {
     use std::collections::hash_map::Entry;
     use std::io;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
     use arrow_array::RecordBatch;
@@ -105,6 +105,7 @@ mod grpc {
     fn encode_message(
         msg: &ShuffleMessage,
         encoders: &mut FxHashMap<String, BatchStreamEncoder>,
+        recovery_gen: u64,
     ) -> Result<ShuffleFrame, tonic::Status> {
         let kind = match msg {
             ShuffleMessage::Hello(node_id) => {
@@ -141,6 +142,7 @@ mod grpc {
                     stage: stage.clone(),
                     vnode: *vnode,
                     arrow_ipc,
+                    recovery_gen,
                 })
             }
             ShuffleMessage::Close(reason) => shuffle_frame::Kind::Close(Close {
@@ -182,6 +184,8 @@ mod grpc {
         peers: Mutex<FxHashMap<ShufflePeerId, SocketAddr>>,
         pool: Mutex<FxHashMap<ShufflePeerId, Arc<PeerConn>>>,
         kv: Option<Arc<dyn ClusterKv>>,
+        /// Stamped onto every outbound `VnodeData`; bumped by a coordinated rewind.
+        recovery_gen: Arc<AtomicU64>,
     }
 
     impl std::fmt::Debug for ShuffleSender {
@@ -201,7 +205,14 @@ mod grpc {
                 peers: Mutex::new(FxHashMap::default()),
                 pool: Mutex::new(FxHashMap::default()),
                 kv: None,
+                recovery_gen: Arc::new(AtomicU64::new(0)),
             }
+        }
+
+        /// Advance the generation stamped onto outbound data frames. Called after a coordinated
+        /// rewind so peers can discard anything this node produced before it.
+        pub fn set_recovery_gen(&self, gen: u64) {
+            self.recovery_gen.fetch_max(gen, Ordering::AcqRel);
         }
 
         /// Sender that falls back to `kv` discovery for peers not previously
@@ -310,7 +321,11 @@ mod grpc {
             };
 
             tracing::debug!(peer, addr = %addr, "shuffle reconnecting to peer");
-            let conn = Arc::new(open_call(self.local_id, addr)?);
+            let conn = Arc::new(open_call(
+                self.local_id,
+                addr,
+                Arc::clone(&self.recovery_gen),
+            )?);
 
             // Race: another task may have opened a live call meanwhile.
             let mut pool = self.pool.lock();
@@ -327,7 +342,11 @@ mod grpc {
     /// Open a client-streaming `Shuffle` call to `addr`, sending `Hello(local_id)`
     /// first. Connecting happens in the driver task (non-blocking); a connect
     /// failure flips `alive` so the next `send_to` retries.
-    fn open_call(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<PeerConn> {
+    fn open_call(
+        local_id: ShufflePeerId,
+        addr: SocketAddr,
+        recovery_gen: Arc<AtomicU64>,
+    ) -> io::Result<PeerConn> {
         let endpoint = crate::cluster::control::tls::client_endpoint(&addr.to_string())
             .map_err(io_err)?
             .tcp_nodelay(true);
@@ -342,11 +361,14 @@ mod grpc {
         };
         let encoders: FxHashMap<String, BatchStreamEncoder> = FxHashMap::default();
         let outbound = futures::stream::once(async move { hello }).chain(futures::stream::unfold(
-            (rx, encoders),
-            |(rx, mut encoders)| async move {
+            (rx, encoders, recovery_gen),
+            |(rx, mut encoders, recovery_gen)| async move {
                 let msg = rx.recv().await.ok()?;
-                match encode_message(&msg, &mut encoders) {
-                    Ok(frame) => Some((frame, (rx, encoders))),
+                // Stamp at encode time, not enqueue time: a frame still queued when a rewind
+                // bumps the generation is stale and must be dropped by the peer.
+                let gen = recovery_gen.load(Ordering::Acquire);
+                match encode_message(&msg, &mut encoders, gen) {
+                    Ok(frame) => Some((frame, (rx, encoders, recovery_gen))),
                     Err(e) => {
                         // An unencodable batch would desync the IPC stream;
                         // half-close so the peer reconnects fresh.
@@ -387,6 +409,8 @@ mod grpc {
         rx_returned: Arc<tokio::sync::Notify>,
         server: JoinHandle<()>,
         holdover: Arc<Holdover>,
+        /// Inbound data frames stamped below this are pre-rewind and discarded.
+        recovery_gen: Arc<AtomicU64>,
     }
 
     impl Drop for ShuffleReceiver {
@@ -418,7 +442,11 @@ mod grpc {
             let (tx, rx) =
                 mpsc::bounded_async::<(ShufflePeerId, ShuffleMessage)>(SHUFFLE_RECV_QUEUE);
 
-            let service = ShuffleService { tx };
+            let recovery_gen = Arc::new(AtomicU64::new(0));
+            let service = ShuffleService {
+                tx,
+                recovery_gen: Arc::clone(&recovery_gen),
+            };
             // Accept loop as a stream for `serve_with_incoming` (avoids
             // tokio-stream's `net` feature); nodelay is set per connection.
             let incoming = futures::stream::unfold(listener, |listener| async move {
@@ -455,7 +483,15 @@ mod grpc {
                 rx_returned: Arc::new(tokio::sync::Notify::new()),
                 server,
                 holdover: Arc::new(Holdover::default()),
+                recovery_gen,
             })
+        }
+
+        /// Advance the generation below which inbound data frames are discarded. Called after a
+        /// coordinated rewind so pre-rewind frames still in flight can't be folded onto the
+        /// restored state and then re-applied by the sender's replay.
+        pub fn set_recovery_gen(&self, gen: u64) {
+            self.recovery_gen.fetch_max(gen, Ordering::AcqRel);
         }
 
         /// Bind and publish the listener's address into `kv` for peer discovery.
@@ -618,6 +654,7 @@ mod grpc {
     /// every peer stream.
     struct ShuffleService {
         tx: InboundTx,
+        recovery_gen: Arc<AtomicU64>,
     }
 
     #[tonic::async_trait]
@@ -626,7 +663,12 @@ mod grpc {
             &self,
             request: Request<tonic::Streaming<ShuffleFrame>>,
         ) -> Result<tonic::Response<ShuffleSummary>, tonic::Status> {
-            let summary = run_stream(self.tx.clone(), request.into_inner()).await?;
+            let summary = run_stream(
+                self.tx.clone(),
+                request.into_inner(),
+                Arc::clone(&self.recovery_gen),
+            )
+            .await?;
             Ok(tonic::Response::new(summary))
         }
     }
@@ -637,6 +679,7 @@ mod grpc {
     async fn run_stream(
         tx: InboundTx,
         mut stream: tonic::Streaming<ShuffleFrame>,
+        recovery_gen: Arc<AtomicU64>,
     ) -> Result<ShuffleSummary, tonic::Status> {
         let first = stream
             .message()
@@ -682,6 +725,8 @@ mod grpc {
                 }
                 shuffle_frame::Kind::VnodeData(v) => {
                     frames_received += 1;
+                    // Always decode, even when dropping: the per-stage IPC decoder is stateful
+                    // (schema + continuation), so skipping a chunk desyncs the stream.
                     let batches = decoders
                         .entry(v.stage.clone())
                         .or_default()
@@ -689,6 +734,17 @@ mod grpc {
                         .map_err(|e| {
                             tonic::Status::invalid_argument(format!("shuffle ipc: {e}"))
                         })?;
+                    // Produced before our last coordinated rewind: the sender will replay these
+                    // records from the rewound offset, so folding them now would double-count.
+                    if v.recovery_gen < recovery_gen.load(Ordering::Acquire) {
+                        tracing::debug!(
+                            peer,
+                            stage = %v.stage,
+                            frame_gen = v.recovery_gen,
+                            "dropping pre-rewind shuffle frame"
+                        );
+                        continue;
+                    }
                     let mut stream_broken = false;
                     for batch in batches {
                         if !forward_vnode_batch(&tx, peer, &v.stage, v.vnode, batch).await? {
@@ -763,15 +819,15 @@ mod grpc {
             };
             let mut encoders = FxHashMap::default();
             let msg = ShuffleMessage::VnodeData("s".into(), 0, batch("a"));
-            encode_message(&msg, &mut encoders).unwrap();
+            encode_message(&msg, &mut encoders, 0).unwrap();
 
             let changed = ShuffleMessage::VnodeData("s".into(), 0, batch("b"));
-            let err = encode_message(&changed, &mut encoders).unwrap_err();
+            let err = encode_message(&changed, &mut encoders, 0).unwrap_err();
             assert!(err.message().contains("changed schema"), "{err}");
 
             // A different stage with its own schema is fine.
             let other = ShuffleMessage::VnodeData("t".into(), 0, batch("b"));
-            encode_message(&other, &mut encoders).unwrap();
+            encode_message(&other, &mut encoders, 0).unwrap();
         }
     }
 }
@@ -828,6 +884,10 @@ mod shim {
                 peers: Mutex::new(FxHashMap::default()),
             }
         }
+
+        /// No peer fabric without the cluster feature; matches the cluster build's API.
+        #[allow(clippy::unused_self)]
+        pub fn set_recovery_gen(&self, _gen: u64) {}
 
         /// Register (or update) a peer's shuffle address.
         #[allow(clippy::unused_async)] // async to match the cluster build's API.
@@ -899,6 +959,10 @@ mod shim {
     }
 
     impl ShuffleReceiver {
+        /// No peer fabric without the cluster feature; matches the cluster build's API.
+        #[allow(clippy::unused_self)]
+        pub fn set_recovery_gen(&self, _gen: u64) {}
+
         /// # Errors
         /// Returns `io::Error` on bind failure.
         pub async fn bind(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<Self> {
@@ -1092,6 +1156,55 @@ mod tests {
         let (from, msg) = recv.recv().await.unwrap();
         assert_eq!(from, 1, "receiver attributes frame to sender id");
         assert_eq!(msg, ShuffleMessage::Hello(1234));
+    }
+
+    /// A receiver past a coordinated rewind must discard data frames a peer stamped before it —
+    /// otherwise a pre-rewind frame still in flight folds onto the restored state and the peer's
+    /// replay counts the same records again. Barriers are never generation-dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_drops_pre_rewind_data_frames() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let recv = bind_on_loopback(2).await;
+        let sender = ShuffleSender::new(1);
+        sender.register_peer(2, recv.local_addr()).await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        )
+        .unwrap();
+
+        // Receiver rewinds to generation 5; the sender is still stamping generation 0.
+        recv.set_recovery_gen(5);
+        sender
+            .send_to(2, &ShuffleMessage::VnodeData("s".into(), 0, batch.clone()))
+            .await
+            .unwrap();
+        // A barrier still gets through, proving the stream is live and only data was dropped.
+        sender
+            .send_to(2, &ShuffleMessage::Barrier(CheckpointBarrier::new(1, 1)))
+            .await
+            .unwrap();
+        let (_, msg) = recv.recv().await.unwrap();
+        assert!(
+            matches!(msg, ShuffleMessage::Barrier(_)),
+            "pre-rewind data frame must be dropped, barrier must survive; got {msg:?}"
+        );
+
+        // Once the sender catches up to the receiver's generation, data flows again.
+        sender.set_recovery_gen(5);
+        sender
+            .send_to(2, &ShuffleMessage::VnodeData("s".into(), 0, batch))
+            .await
+            .unwrap();
+        let (_, msg) = recv.recv().await.unwrap();
+        assert!(
+            matches!(msg, ShuffleMessage::VnodeData(..)),
+            "same-generation data frame must be delivered; got {msg:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
