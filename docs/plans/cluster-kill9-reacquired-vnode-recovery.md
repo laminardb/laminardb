@@ -1,4 +1,45 @@
-# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–19)
+# Cluster kill-9 vnode recovery — root cause + fix (revisions 5–20)
+
+## Revision 20 — the round must also quiesce OWNERSHIP (assignment settle + monotonic gen)
+
+The rev-19 diagnostic (`b7da188f`) attributed the small bidirectional ±3/±6 in one soak run.
+Skew (#2) and cut-slip (#1) came back **negative** (`from_handoff=false` count 0 everywhere;
+chain-apply epochs aligned with the round target; a wide 1.9s release spread on a round that was
+nonetheless *clean*). The assignment race (#3) came back **positive**, with a decisive refinement:
+`assignment_version` **agrees** across nodes — the cluster releases the gate at a *stale,
+unconverged* assignment.
+
+- eo_kill / eo_kill_delta, gen=1/target=7: one node owns all 32 vnodes, the other two own **zero**
+  (`av=1`). Both are clean at gen=2 once `av=2` (13/8/11).
+- notier (PASS): `av=2`, 13/8/11 at both gens.
+- Corroboration: eo_kill applies a chain at a **stray, non-target epoch** *after* the gen-1
+  release — the rotation re-adopting vnodes mid-stream.
+
+Root cause: the round's quiet period covers **state and offsets but not ownership**. A kill →
+rejoin is a membership change; the rebalancer rotates on a separate path (`rebalance_debounce`
+5s + `watcher_poll` 2s) that is **not** source-gated and does **not** consult `is_recovering`. The
+round completes in ~1–2s, releases the gate, and *then* the rotation lands mid-stream: a gainer
+double-folds a rehydrated chain over records it already counted (**+3/+6**), and records shuffled
+to the old owner during the move are dropped (**−3/−6**). notier passed only because its
+assignment already matched membership, so no rotation followed.
+
+Fix A — `await_assignment_settled` before releasing the gate on both the leader and follower
+paths. `assignment_reflects_membership` (every vnode owned, every owner assignable, every live
+node holding a share when vnodes ≥ nodes) cleanly separates the cases: notier releases
+immediately (no pause), eo_kill holds until the rotation lands and is adopted. The rebalancer and
+snapshot watcher are not source-gated, so the rotation happens **inside** the no-data window,
+where the vnode move + rehydration are trivially exact. Bounded (30s > 5s+2s); releases anyway on
+timeout. The recovery fence is dropped *before* the wait, since the rotation's pre-rotation
+checkpoint is gated on `is_recovering` and would otherwise deadlock it.
+
+Fix B — monotonic round generation. The soak also showed `gen=1/target=13` with **nodes=1/3**:
+two rounds reusing `gen=1`, so every node that already applied gen 1 skipped the second `Start`
+(`gen > applied_gen`) and only the driving leader restored. A gossip-KV `max + 1` collides when
+the leader that recorded the previous gen dies and its slot vanishes. `gen_id` is now
+`max(kv_max + 1, unix_nanos())` — monotonic across leader changes, with the KV max still winning
+if a new leader's clock lags. Same class of bug as the rev-19 fault-seq collision.
+
+## Revision 19 — every kill fires a round (boot-unique fault nonce)
 
 ## Revision 19 — every kill fires a round (boot-unique fault nonce)
 

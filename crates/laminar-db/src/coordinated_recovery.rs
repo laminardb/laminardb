@@ -24,6 +24,9 @@ const RESTORE_QUORUM_TIMEOUT: Duration = Duration::from_secs(90);
 /// A node stopped by `Prepare` whose `Start` never arrives (leader died mid-round) restarts
 /// itself plainly after this long rather than staying wedged.
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on holding sources for a pending rotation; must exceed `rebalance_debounce` (5s) plus
+/// `watcher_poll` (2s) so the rotation can land and be adopted inside the round.
+const ASSIGNMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many times the leader retries restoring itself before abandoning the round.
 const SELF_RESTORE_ATTEMPTS: u32 = 3;
 
@@ -41,12 +44,15 @@ const GENESIS: u64 = 0;
 /// observing the transient `0` a completed round leaves behind.
 fn boot_fault_nonce() -> u64 {
     static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *NONCE.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(1, |d| d.as_nanos());
-        u64::try_from(nanos).unwrap_or(u64::MAX).max(1)
-    })
+    *NONCE.get_or_init(unix_nanos)
+}
+
+/// Wall-clock nanos, clamped into `u64`. Monotonic enough to order rounds across leader changes.
+fn unix_nanos() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos());
+    u64::try_from(nanos).unwrap_or(u64::MAX).max(1)
 }
 
 /// Publish a fault so the leader drives a global restart; this node's monitor then
@@ -134,9 +140,11 @@ impl RecoveryMonitor {
                         RESTORE_QUORUM_TIMEOUT,
                     )
                     .await;
+                    // Fence off before the wait: the rotation we're waiting for needs to checkpoint.
+                    controller.set_recovering(false);
+                    await_assignment_settled(db, controller).await;
                     log_release_diagnostic(db, controller, gen, epoch);
                     db.set_source_gate(false);
-                    controller.set_recovering(false);
                     tracing::warn!(target_epoch = epoch, gen, "node restored to recovery epoch");
                 }
                 // Failure: state untouched, `Start` still visible → retried next tick.
@@ -190,7 +198,15 @@ impl RecoveryMonitor {
             tracing::warn!("coordinated recovery: decision store unreadable; deferring round");
             return;
         }
-        let gen_id = read_recovery_gen(controller).await + 1;
+        // A gossip-KV `max + 1` collides when the leader that recorded the previous gen dies and
+        // its slot vanishes: the next round reuses that gen, and every node which already applied
+        // it skips the `Start` (`gen > applied_gen`), leaving only the driving leader restored.
+        // Clock-derived gens stay monotonic across leader changes; the KV max still wins if a new
+        // leader's clock lags.
+        let gen_id = read_recovery_gen(controller)
+            .await
+            .saturating_add(1)
+            .max(unix_nanos());
         write_recovery_gen(controller, gen_id).await;
         let participants: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
 
@@ -269,11 +285,17 @@ impl RecoveryMonitor {
             tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
             false
         };
+        // Restore is done, so drop the fence before waiting: the pending rotation's pre-rotation
+        // checkpoint is gated on `is_recovering`, and the wait below is gated on that rotation.
+        controller.set_recovering(false);
         // Every node has restarted and rebound its receiver (or the wait timed out — release
-        // anyway rather than wedge sources): re-shuffle can no longer land in a void.
+        // anyway rather than wedge sources): re-shuffle can no longer land in a void. Sources stay
+        // gated across the rotation so vnodes move with no data in flight.
+        if restored {
+            await_assignment_settled(db, controller).await;
+        }
         log_release_diagnostic(db, controller, gen_id, target);
         db.set_source_gate(false);
-        controller.set_recovering(false);
         // Always retire the announcement — a lingering target would be replayed by a later
         // fresh restart (applied_gen resets to 0); a still-faulted straggler re-triggers.
         controller.clear_recover().await;
@@ -397,6 +419,55 @@ where
             false
         }
     }
+}
+
+/// Whether the vnode assignment reflects current live membership — every vnode owned, every
+/// owner still assignable, and (when there are at least as many vnodes as nodes) every live node
+/// owning a share. A stale assignment means a rebalance rotation is still pending.
+fn assignment_reflects_membership(db: &Arc<LaminarDB>, controller: &ClusterController) -> bool {
+    let guard = db.vnode_registry.lock();
+    let Some(reg) = guard.as_ref() else {
+        return true;
+    };
+    let mut owners: FxHashSet<u64> = FxHashSet::default();
+    for v in 0..reg.vnode_count() {
+        let owner = reg.owner(v);
+        if owner.0 == 0 {
+            return false; // unassigned vnode: rotation still in flight
+        }
+        owners.insert(owner.0);
+    }
+    let live: FxHashSet<u64> = controller
+        .assignable_instances()
+        .into_iter()
+        .map(|n| n.0)
+        .collect();
+    let all_owners_live = owners.iter().all(|o| live.contains(o));
+    let covers_live = (reg.vnode_count() as usize) < live.len() || owners.len() == live.len();
+    all_owners_live && covers_live
+}
+
+/// Hold the round's quiet period open until the rebalance rotation triggered by the rejoin has
+/// landed and been adopted. The round rewinds state and offsets, but ownership rotates on a
+/// separate membership-driven path (`rebalance_debounce` 5s + `watcher_poll` 2s) that is not
+/// source-gated — so releasing first lets the rotation move vnodes mid-stream, where a gainer
+/// double-folds a rehydrated chain over records it already counted and records shuffled to the
+/// old owner are dropped. Waiting here moves the whole rotation into the no-data window.
+/// Bounded: on timeout we release anyway rather than wedge intake.
+async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterController) {
+    if assignment_reflects_membership(db, controller) {
+        return;
+    }
+    tracing::warn!("assignment does not reflect live membership; holding sources for the rotation");
+    let deadline = tokio::time::Instant::now() + ASSIGNMENT_SETTLE_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        if assignment_reflects_membership(db, controller) {
+            tracing::warn!("assignment converged inside the round; releasing sources");
+            return;
+        }
+    }
+    tracing::error!("assignment did not converge before timeout; releasing sources anyway");
 }
 
 /// One-line per-node snapshot at gate release. A cross-node diff at the same `gen` attributes the
