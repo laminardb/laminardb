@@ -17,9 +17,9 @@
 
 ### Notes
 
-- `state_tier_group_demotion` defaults ON for embedded single-node (kill-9-soaked) and
-  OFF for cluster, where it stays vnode-granular pending correctness/soak work tracked
-  in `docs/plans/state-tier-hardening-followups.md`.
+- `state_tier_group_demotion` defaults ON for every topology; the cluster group path is
+  now kill-9-soaked. Set it to `false` for the coarser vnode-granular path. The remaining
+  gate is the perf one tracked in `docs/plans/state-tier-hardening-followups.md`.
 - This release backfills the changelog for the state-tier subsystem only; the
   0.23–0.27 history is otherwise not itemized here.
 

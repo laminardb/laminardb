@@ -1,10 +1,10 @@
-//! Leader-coordinated global restart-to-epoch on a fatal fault (cluster mode).
+//! Leader-coordinated global restart-to-epoch on a fatal fault (cluster mode; always on).
 //!
-//! Two-phase, stop-the-world: the leader announces `Prepare` (every node stops and acks),
-//! computes the rewind target from the quiesced decision store, truncates every durable
-//! artifact above it (the resumed pipeline reuses epoch numbers, so the abandoned timeline
-//! must not survive), then announces `Start`. No committed epoch → target 0, a fresh start
-//! from initial source offsets. Off by default.
+//! Two-phase, stop-the-world: the leader announces `Prepare` (every node stops and acks), reads
+//! the rewind target from the now-quiesced decision store, truncates every durable artifact above
+//! it (the resumed pipeline reuses epoch numbers, so the abandoned timeline must not survive),
+//! then announces `Start`. No committed epoch means target 0 — a fresh start from initial offsets.
+//! No node resumes intake until the whole round has restored and the assignment has settled.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -21,15 +21,13 @@ use crate::LaminarDB;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const STOP_QUORUM_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTORE_QUORUM_TIMEOUT: Duration = Duration::from_secs(90);
-/// A node stopped by `Prepare` whose `Start` never arrives (leader died mid-round) restarts
-/// itself plainly after this long rather than staying wedged.
+/// How long a node stopped by `Prepare` waits for a `Start` before giving up on the round.
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(60);
-/// Bound on holding sources for a pending rotation; must exceed `rebalance_debounce` (5s) plus
-/// `watcher_poll` (2s) so the rotation can land and be adopted inside the round.
+/// Must exceed `rebalance_debounce` (5s) + `watcher_poll` (2s) so a pending rotation lands inside
+/// the round.
 const ASSIGNMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Minimum time `Prepare` stays published before `Start`. Must exceed a peer's observe cycle
-/// ([`POLL_INTERVAL`]) plus the gossip round trip for its `stopped` ack, or a fast round retires
-/// `Start` before its peers ever see it.
+/// Must exceed a peer's observe cycle plus the gossip round trip for its `stopped` ack, or a fast
+/// round retires `Start` before its peers ever see it.
 const PREPARE_MIN_DWELL: Duration = Duration::from_secs(2);
 /// How many times the leader retries restoring itself before abandoning the round.
 const SELF_RESTORE_ATTEMPTS: u32 = 3;
@@ -40,12 +38,9 @@ const RECOVERY_GEN_KEY: &str = "control:recovery-gen";
 /// Rewind target meaning "no committed cut exists": truncate everything and start fresh.
 const GENESIS: u64 = 0;
 
-/// Fault identity for this process boot: a fresh value each start, reused within the boot.
-/// A per-process counter that resets to 1 collides in the leader's `handled_faults` — a second
-/// kill of the same node reports the same `1` the leader already handled, so no round fires and
-/// the second kill falls back to the orphaned-offset loss. A boot-unique nonce makes every kill
-/// distinct, so the leader's change-detection triggers deterministically without depending on
-/// observing the transient `0` a completed round leaves behind.
+/// Boot-unique so a second kill of a node never reports the value the leader already handled
+/// (a per-process counter resets to 1 and collides, and no round fires). Stable within a boot,
+/// so repeated reports dedup to one round.
 fn boot_fault_nonce() -> u64 {
     static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *NONCE.get_or_init(unix_nanos)
@@ -67,8 +62,8 @@ pub(crate) async fn report_local_fault(controller: &ClusterController) {
     tracing::warn!(seq, "reported local fault for coordinated cluster recovery");
 }
 
-/// Fault with a fresh identity rather than the boot nonce, so a leader that already handled this
-/// boot's fault still drives a new round (an orphaned node needs one to be restored).
+/// A fresh identity, not the boot nonce: the leader already handled that one, so only a new value
+/// drives the round an orphaned node needs.
 async fn report_fresh_fault(controller: &ClusterController) {
     let seq = unix_nanos();
     controller.report_fault(seq).await;
@@ -116,8 +111,7 @@ impl RecoveryMonitor {
         }
     }
 
-    /// Act on the leader's announcement: stop on `Prepare`, restore on `Start`. A stop whose
-    /// `Start` never arrives falls back to a plain restart after [`ORPHAN_STOP_TIMEOUT`].
+    /// Act on the leader's announcement: stop on `Prepare`, restore on `Start`.
     async fn observe(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
         match controller.observe_recover().await {
             Some((RecoverPhase::Prepare, gen))
@@ -140,21 +134,19 @@ impl RecoveryMonitor {
                     stop_and_purge(db).await;
                 }
                 if self.restore_and_ack(db, controller, epoch, gen).await {
-                    // Hold sources until the whole round has restarted (every receiver rebound),
-                    // then release — symmetric with the leader so no node re-shuffles early. This
-                    // is CL-2's safety premise: nobody emits at the new generation until everyone
-                    // is at it, so an older-generation frame is provably pre-rewind.
-                    wait_gen_quorum(
+                    // Nobody emits at the new generation until everyone is at it, so a peer's
+                    // older-generation frame is provably pre-rewind and safe to discard.
+                    let quorum = wait_gen_quorum(
                         || controller.read_recovered(),
                         controller,
                         gen,
                         RESTORE_QUORUM_TIMEOUT,
                     )
                     .await;
-                    // Fence off before the wait: the rotation we're waiting for needs to checkpoint.
+                    // Unfence before the settle wait: the rotation it waits on must checkpoint.
                     controller.set_recovering(false);
-                    if !await_assignment_settled(db, controller).await {
-                        hold_on_stale_assignment(db, gen);
+                    if !quorum || !await_assignment_settled(db, controller).await {
+                        hold_intake(db, gen, quorum);
                         return;
                     }
                     log_release_diagnostic(db, controller, gen, epoch);
@@ -166,19 +158,12 @@ impl RecoveryMonitor {
             _ => {
                 if let Some((gen, at)) = self.stopped_for {
                     if at.elapsed() > ORPHAN_STOP_TIMEOUT {
-                        // Never resume from an orphaned round. The pipeline is stopped at an
-                        // unknown cut and this node's shuffle generation is still the pre-round
-                        // one, so resuming either has its frames discarded by peers that did
-                        // rewind (silent loss) or folded from un-rewound state (double-count).
-                        // Stay shut and ask for a round that actually restores us.
+                        // Resuming here would emit at the pre-round generation from an unknown cut:
+                        // rewound peers discard those frames, un-rewound ones double-count them.
                         if let Some(m) = db.engine_metrics.lock().clone() {
                             m.coordinated_recovery_failures_total.inc();
                         }
-                        tracing::error!(
-                            gen,
-                            "recovery round orphaned (no Start); holding intake and requesting a \
-                             fresh round rather than resuming at a stale recovery generation"
-                        );
+                        tracing::error!(gen, "recovery round orphaned (no Start); holding intake");
                         self.stopped_for = None;
                         report_fresh_fault(controller).await;
                     }
@@ -221,10 +206,8 @@ impl RecoveryMonitor {
             return;
         }
         // A gossip-KV `max + 1` collides when the leader that recorded the previous gen dies and
-        // its slot vanishes: the next round reuses that gen, and every node which already applied
-        // it skips the `Start` (`gen > applied_gen`), leaving only the driving leader restored.
-        // Clock-derived gens stay monotonic across leader changes; the KV max still wins if a new
-        // leader's clock lags.
+        // its slot vanishes; clock-derived gens stay monotonic across leader changes, and the KV
+        // max still wins if a new leader's clock lags.
         let gen_id = read_recovery_gen(controller)
             .await
             .saturating_add(1)
@@ -236,10 +219,8 @@ impl RecoveryMonitor {
         tracing::warn!(gen = gen_id, "leader announced recovery prepare");
         stop_and_purge(db).await;
         controller.announce_stopped(gen_id).await;
-        // Hold `Prepare` up long enough for every peer to observe it and ack `stopped`, so they
-        // are in the participant set before `Start` is announced. Without this a driver with a
-        // stale membership view races through the whole round in under a poll interval and
-        // retires `Start` before anyone sees it.
+        // Peers must observe `Prepare` and ack `stopped` before `Start`, or a driver with a stale
+        // membership view races the whole round through in under a poll interval.
         tokio::time::sleep(PREPARE_MIN_DWELL).await;
         if !wait_gen_quorum(
             || controller.read_stopped(),
@@ -309,14 +290,12 @@ impl RecoveryMonitor {
             tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
             false
         };
-        // Restore is done, so drop the fence before waiting: the pending rotation's pre-rotation
-        // checkpoint is gated on `is_recovering`, and the wait below is gated on that rotation.
+        // Unfence before the settle wait: the rotation it waits on must checkpoint.
         controller.set_recovering(false);
-        // Every node has restarted and rebound its receiver (or the wait timed out — release
-        // anyway rather than wedge sources): re-shuffle can no longer land in a void. Sources stay
-        // gated across the rotation so vnodes move with no data in flight.
-        if restored && !await_assignment_settled(db, controller).await {
-            hold_on_stale_assignment(db, gen_id);
+        // Sources stay gated across the rotation so vnodes move with no data in flight. Releasing
+        // without a full restore would emit at a generation the stragglers haven't reached.
+        if !quorum_met || !await_assignment_settled(db, controller).await {
+            hold_intake(db, gen_id, quorum_met);
             controller.clear_recover().await;
             return;
         }
@@ -325,31 +304,20 @@ impl RecoveryMonitor {
         // Always retire the announcement — a lingering target would be replayed by a later
         // fresh restart (applied_gen resets to 0); a still-faulted straggler re-triggers.
         controller.clear_recover().await;
-        if restored && quorum_met {
-            // Counts make this a usable health signal: `complete` used to be logged even when a
-            // single node restored, because the participant snapshot could collapse to `{self}`.
-            let participants = round_participants(controller, gen_id).await.len();
-            let restored_count = controller
-                .read_recovered()
-                .await
-                .into_iter()
-                .filter(|(_, g)| *g >= gen_id)
-                .count();
-            tracing::warn!(
-                gen = gen_id,
-                participants,
-                restored = restored_count,
-                "coordinated recovery complete; fence released"
-            );
-        } else {
-            if let Some(m) = db.engine_metrics.lock().clone() {
-                m.coordinated_recovery_failures_total.inc();
-            }
-            tracing::error!(
-                gen = gen_id,
-                "coordinated recovery round incomplete; announcement retired"
-            );
-        }
+        // Counts keep this honest: a round that restored only its driver must not read as complete.
+        let participants = round_participants(controller, gen_id).await.len();
+        let restored_count = controller
+            .read_recovered()
+            .await
+            .into_iter()
+            .filter(|(_, g)| *g >= gen_id)
+            .count();
+        tracing::warn!(
+            gen = gen_id,
+            participants,
+            restored = restored_count,
+            "coordinated recovery complete; fence released"
+        );
     }
 
     /// Undo a round that failed before `Start`: retire the announcement, restart the leader
@@ -382,17 +350,15 @@ impl RecoveryMonitor {
         target: u64,
         gen_id: u64,
     ) -> bool {
-        // Bring sources up PAUSED: the restart re-reads and re-shuffles the replay window, and a
+        // Sources come up paused: the restart re-reads and re-shuffles the replay window, and a
         // node that restarts first would shuffle into peers whose receivers haven't rebound.
-        // Released once the restore quorum confirms every node is up (`release_sources`).
         db.set_source_gate(true);
         if !start_pipeline(db, Some(target)).await {
             db.set_source_gate(false);
             return false;
         }
-        // Bump the shuffle generation the moment this node is restored, before the gate opens:
-        // frames a peer produced pre-rewind are now discarded on arrival, so they can't be folded
-        // onto the restored state and then re-applied when that peer replays from the rewound cut.
+        // Bump before the gate opens so a peer's pre-rewind frames are discarded on arrival rather
+        // than folded onto the restored state and then re-applied by that peer's replay.
         db.set_shuffle_recovery_gen(gen_id);
         db.coordinated_restores.fetch_add(1, Ordering::SeqCst);
         if let Some(m) = db.engine_metrics.lock().clone() {
@@ -488,14 +454,10 @@ fn assignment_reflects_membership(db: &Arc<LaminarDB>, controller: &ClusterContr
     all_owners_live && covers_live
 }
 
-/// Hold the round's quiet period open until the rebalance rotation triggered by the rejoin has
-/// landed and been adopted. The round rewinds state and offsets, but ownership rotates on a
-/// separate membership-driven path (`rebalance_debounce` 5s + `watcher_poll` 2s) that is not
-/// source-gated — so releasing first lets the rotation move vnodes mid-stream, where a gainer
-/// double-folds a rehydrated chain over records it already counted and records shuffled to the
-/// old owner are dropped. Waiting here moves the whole rotation into the no-data window.
-/// `false` if it never converged: the caller then FAILS CLOSED — holding sources is safe, while
-/// releasing into a known-stale assignment re-opens the very mid-stream rotation this prevents.
+/// Hold the round's quiet period open until a pending rebalance rotation has landed and been
+/// adopted. Ownership rotates on a separate, un-gated membership path, so releasing first lets it
+/// move vnodes mid-stream: the gainer double-folds a rehydrated chain over records it already
+/// counted, and records shuffled to the old owner are dropped. `false` if it never converged.
 async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterController) -> bool {
     if assignment_reflects_membership(db, controller) {
         return true;
@@ -512,23 +474,21 @@ async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterContr
     false
 }
 
-/// Fail-closed handler for a rotation that never landed: keep intake shut and surface it loudly
-/// rather than resume against an assignment we know is stale.
-fn hold_on_stale_assignment(db: &Arc<LaminarDB>, gen_id: u64) {
+/// Fail closed: resuming without the whole round restored, or against a stale assignment, either
+/// drops this node's frames at rewound peers or double-counts them. Holding is the safe half.
+fn hold_intake(db: &Arc<LaminarDB>, gen_id: u64, quorum: bool) {
     if let Some(m) = db.engine_metrics.lock().clone() {
         m.coordinated_recovery_failures_total.inc();
     }
     tracing::error!(
         gen = gen_id,
-        "assignment never converged; holding sources shut rather than releasing into a stale \
-         assignment (a rotation is stuck — check the pre-rotation checkpoint)"
+        restore_quorum = quorum,
+        "holding intake shut: the round did not fully restore, or the rotation never landed"
     );
 }
 
-/// One-line per-node snapshot at gate release. A cross-node diff at the same `gen` attributes the
-/// small bidirectional residual: divergent `owned_vnodes`/`assignment_version` = an assignment
-/// race (a vnode transiently owned by 0 or 2 nodes → drop or double); a wide spread in the log
-/// timestamps of these lines = gate-release skew; per-partition offset logs cover a cut slip.
+/// Per-node snapshot at gate release; a cross-node diff at the same `gen` shows whether every node
+/// resumed against the same, settled assignment.
 fn log_release_diagnostic(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
@@ -587,12 +547,10 @@ async fn write_recovery_gen(controller: &ClusterController, gen_id: u64) {
         .await;
 }
 
-/// Everyone this round must account for: the driver's live view UNION every node that acked
-/// `stopped` for this generation. The union is load-bearing — a just-restarted victim driving its
-/// own round can see `live == {self}`, and awaiting only that snapshot makes both quorums vacuous:
-/// `Start` is then published and retired inside one poll interval, its peers never observe it, and
-/// they orphan with a stale shuffle generation whose frames the restored victim then discards.
-/// A node that acked `stopped` is stopped and MUST be restored, whatever the local view says.
+/// The live view UNION everyone that acked `stopped` for this generation. The union matters: a
+/// just-restarted node driving its own round can see `live == {self}`, and awaiting only that
+/// makes both quorums vacuous. A node that acked `stopped` is stopped and must be restored,
+/// whatever the local view says.
 async fn round_participants(controller: &ClusterController, gen_id: u64) -> FxHashSet<NodeId> {
     let mut set: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
     for (node, gen) in controller.read_stopped().await {
@@ -603,9 +561,8 @@ async fn round_participants(controller: &ClusterController, gen_id: u64) -> FxHa
     set
 }
 
-/// Wait until every round participant reports `gen >= gen_id` via `read` (stopped or restored
-/// acks), or the deadline. Participants are re-derived each iteration so a peer that acks
-/// `stopped` late still joins the set and blocks the round rather than being stranded.
+/// Wait until every participant reports `gen >= gen_id` via `read`, or the deadline. Participants
+/// are re-derived each iteration so a late `stopped` acker joins the set instead of being stranded.
 async fn wait_gen_quorum<R, Fut>(
     read: R,
     controller: &ClusterController,

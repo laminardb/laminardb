@@ -366,8 +366,8 @@ pub struct ServerSection {
     /// instead of backpressuring. Requires a `state-tier` build. `None` = no tier.
     #[serde(default)]
     pub state_tier_dir: Option<std::path::PathBuf>,
-    /// Demote at GROUP (not vnode) granularity. Requires the cold tier. Unset defaults ON for
-    /// embedded, OFF for cluster (its group path has open correctness gaps); `Some(b)` forces either.
+    /// Demote at GROUP (not vnode) granularity. Requires the cold tier. Unset defaults ON;
+    /// `Some(false)` forces the coarser vnode-granular path. Inert without `state_tier_dir`.
     #[serde(default)]
     pub state_tier_group_demotion: Option<bool>,
 }
@@ -385,11 +385,11 @@ fn default_pgwire_tls_min_version() -> String {
 }
 
 impl ServerSection {
-    /// Effective group-demotion setting; unset defaults ON for embedded, OFF for cluster.
-    /// Explicit config wins.
+    /// Effective group-demotion setting; unset defaults ON for every topology since the cluster
+    /// group path is kill-9 soaked. Explicit config wins.
     #[cfg(feature = "state-tier")]
-    pub(crate) fn group_demotion(&self, embedded: bool) -> bool {
-        self.state_tier_group_demotion.unwrap_or(embedded)
+    pub(crate) fn group_demotion(&self) -> bool {
+        self.state_tier_group_demotion.unwrap_or(true)
     }
 }
 
@@ -962,16 +962,21 @@ mod tests {
 
     #[cfg(feature = "state-tier")]
     #[test]
-    fn group_demotion_defaults_by_topology() {
+    fn group_demotion_defaults_on_with_explicit_opt_out() {
         let mut s = ServerSection::default();
         assert_eq!(s.state_tier_group_demotion, None, "unset by default");
-        assert!(s.group_demotion(true), "unset defaults ON for embedded");
-        assert!(!s.group_demotion(false), "unset defaults OFF for cluster");
+        assert!(
+            s.group_demotion(),
+            "unset defaults ON for every topology (cluster path is kill-9 soaked)"
+        );
 
         s.state_tier_group_demotion = Some(false);
-        assert!(!s.group_demotion(true), "explicit OFF overrides embedded");
+        assert!(
+            !s.group_demotion(),
+            "explicit OFF falls back to vnode-granular"
+        );
         s.state_tier_group_demotion = Some(true);
-        assert!(s.group_demotion(false), "explicit ON overrides cluster");
+        assert!(s.group_demotion(), "explicit ON stays ON");
     }
 
     const AI_TOML: &str = r#"

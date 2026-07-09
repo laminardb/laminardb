@@ -133,8 +133,7 @@ pub async fn run_server(
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
         builder = builder.state_tier_dir(dir);
-        // Embedded single-node: group demotion defaults ON (kill-9-soaked); explicit config overrides.
-        builder = builder.state_tier_group_demotion(config.server.group_demotion(true));
+        builder = builder.state_tier_group_demotion(config.server.group_demotion());
     }
 
     let storage_dir = config.state.local_storage_dir();

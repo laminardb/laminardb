@@ -456,9 +456,9 @@ pub async fn start_cluster(
     #[cfg(feature = "state-tier")]
     if let Some(ref dir) = config.server.state_tier_dir {
         builder = builder.state_tier_dir(dir);
-        // Cluster group demotion defaults OFF (vnode-granular is the default; the cluster group
-        // path has open correctness gaps). Explicit `[server] state_tier_group_demotion = true` opts in.
-        builder = builder.state_tier_group_demotion(config.server.group_demotion(false));
+        // Group-granular demotion is the default now that the cluster path is kill-9 soaked;
+        // `[server] state_tier_group_demotion = false` falls back to vnode-granular.
+        builder = builder.state_tier_group_demotion(config.server.group_demotion());
     }
 
     if let Some(path) = config.state.local_storage_dir() {
