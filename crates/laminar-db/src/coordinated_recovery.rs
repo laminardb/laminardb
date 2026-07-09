@@ -27,6 +27,10 @@ const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on holding sources for a pending rotation; must exceed `rebalance_debounce` (5s) plus
 /// `watcher_poll` (2s) so the rotation can land and be adopted inside the round.
 const ASSIGNMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum time `Prepare` stays published before `Start`. Must exceed a peer's observe cycle
+/// ([`POLL_INTERVAL`]) plus the gossip round trip for its `stopped` ack, or a fast round retires
+/// `Start` before its peers ever see it.
+const PREPARE_MIN_DWELL: Duration = Duration::from_secs(2);
 /// How many times the leader retries restoring itself before abandoning the round.
 const SELF_RESTORE_ATTEMPTS: u32 = 3;
 
@@ -61,6 +65,14 @@ pub(crate) async fn report_local_fault(controller: &ClusterController) {
     let seq = boot_fault_nonce();
     controller.report_fault(seq).await;
     tracing::warn!(seq, "reported local fault for coordinated cluster recovery");
+}
+
+/// Fault with a fresh identity rather than the boot nonce, so a leader that already handled this
+/// boot's fault still drives a new round (an orphaned node needs one to be restored).
+async fn report_fresh_fault(controller: &ClusterController) {
+    let seq = unix_nanos();
+    controller.report_fault(seq).await;
+    tracing::warn!(seq, "reported fresh fault after an orphaned recovery round");
 }
 
 /// Spawn the long-lived per-node monitor. It drives stop/start, so it must outlive those
@@ -129,14 +141,13 @@ impl RecoveryMonitor {
                 }
                 if self.restore_and_ack(db, controller, epoch, gen).await {
                     // Hold sources until the whole round has restarted (every receiver rebound),
-                    // then release — symmetric with the leader so no node re-shuffles early.
-                    let participants: FxHashSet<NodeId> =
-                        controller.live_instances().into_iter().collect();
+                    // then release — symmetric with the leader so no node re-shuffles early. This
+                    // is CL-2's safety premise: nobody emits at the new generation until everyone
+                    // is at it, so an older-generation frame is provably pre-rewind.
                     wait_gen_quorum(
                         || controller.read_recovered(),
                         controller,
                         gen,
-                        &participants,
                         RESTORE_QUORUM_TIMEOUT,
                     )
                     .await;
@@ -155,14 +166,21 @@ impl RecoveryMonitor {
             _ => {
                 if let Some((gen, at)) = self.stopped_for {
                     if at.elapsed() > ORPHAN_STOP_TIMEOUT {
+                        // Never resume from an orphaned round. The pipeline is stopped at an
+                        // unknown cut and this node's shuffle generation is still the pre-round
+                        // one, so resuming either has its frames discarded by peers that did
+                        // rewind (silent loss) or folded from un-rewound state (double-count).
+                        // Stay shut and ask for a round that actually restores us.
+                        if let Some(m) = db.engine_metrics.lock().clone() {
+                            m.coordinated_recovery_failures_total.inc();
+                        }
                         tracing::error!(
                             gen,
-                            "recovery round orphaned (no Start); restarting plain"
+                            "recovery round orphaned (no Start); holding intake and requesting a \
+                             fresh round rather than resuming at a stale recovery generation"
                         );
-                        start_pipeline(db, None).await;
-                        db.set_source_gate(false);
                         self.stopped_for = None;
-                        controller.set_recovering(false);
+                        report_fresh_fault(controller).await;
                     }
                 }
             }
@@ -212,18 +230,21 @@ impl RecoveryMonitor {
             .saturating_add(1)
             .max(unix_nanos());
         write_recovery_gen(controller, gen_id).await;
-        let participants: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
 
         controller.set_recovering(true);
         controller.announce_recover_prepare(gen_id).await;
         tracing::warn!(gen = gen_id, "leader announced recovery prepare");
         stop_and_purge(db).await;
         controller.announce_stopped(gen_id).await;
+        // Hold `Prepare` up long enough for every peer to observe it and ack `stopped`, so they
+        // are in the participant set before `Start` is announced. Without this a driver with a
+        // stale membership view races through the whole round in under a poll interval and
+        // retires `Start` before anyone sees it.
+        tokio::time::sleep(PREPARE_MIN_DWELL).await;
         if !wait_gen_quorum(
             || controller.read_stopped(),
             controller,
             gen_id,
-            &participants,
             STOP_QUORUM_TIMEOUT,
         )
         .await
@@ -281,7 +302,6 @@ impl RecoveryMonitor {
                 || controller.read_recovered(),
                 controller,
                 gen_id,
-                &participants,
                 RESTORE_QUORUM_TIMEOUT,
             )
             .await
@@ -306,8 +326,19 @@ impl RecoveryMonitor {
         // fresh restart (applied_gen resets to 0); a still-faulted straggler re-triggers.
         controller.clear_recover().await;
         if restored && quorum_met {
+            // Counts make this a usable health signal: `complete` used to be logged even when a
+            // single node restored, because the participant snapshot could collapse to `{self}`.
+            let participants = round_participants(controller, gen_id).await.len();
+            let restored_count = controller
+                .read_recovered()
+                .await
+                .into_iter()
+                .filter(|(_, g)| *g >= gen_id)
+                .count();
             tracing::warn!(
                 gen = gen_id,
+                participants,
+                restored = restored_count,
                 "coordinated recovery complete; fence released"
             );
         } else {
@@ -556,15 +587,29 @@ async fn write_recovery_gen(controller: &ClusterController, gen_id: u64) {
         .await;
 }
 
-/// Wait until every still-live `participant` reports `gen >= gen_id` via `read` (stopped or
-/// restored acks), or the deadline. Only the round's original participants are awaited: one
-/// that left membership can't ack (don't burn the timeout on it), and one that joined later
-/// recovers on its own observe. `true` if every pending participant acked.
+/// Everyone this round must account for: the driver's live view UNION every node that acked
+/// `stopped` for this generation. The union is load-bearing — a just-restarted victim driving its
+/// own round can see `live == {self}`, and awaiting only that snapshot makes both quorums vacuous:
+/// `Start` is then published and retired inside one poll interval, its peers never observe it, and
+/// they orphan with a stale shuffle generation whose frames the restored victim then discards.
+/// A node that acked `stopped` is stopped and MUST be restored, whatever the local view says.
+async fn round_participants(controller: &ClusterController, gen_id: u64) -> FxHashSet<NodeId> {
+    let mut set: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
+    for (node, gen) in controller.read_stopped().await {
+        if gen >= gen_id {
+            set.insert(node);
+        }
+    }
+    set
+}
+
+/// Wait until every round participant reports `gen >= gen_id` via `read` (stopped or restored
+/// acks), or the deadline. Participants are re-derived each iteration so a peer that acks
+/// `stopped` late still joins the set and blocks the round rather than being stranded.
 async fn wait_gen_quorum<R, Fut>(
     read: R,
     controller: &ClusterController,
     gen_id: u64,
-    participants: &FxHashSet<NodeId>,
     timeout: Duration,
 ) -> bool
 where
@@ -573,7 +618,7 @@ where
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let live: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
+        let participants = round_participants(controller, gen_id).await;
         let acked: FxHashSet<NodeId> = read()
             .await
             .into_iter()
@@ -583,7 +628,7 @@ where
         let pending: Vec<NodeId> = participants
             .iter()
             .copied()
-            .filter(|n| live.contains(n) && !acked.contains(n))
+            .filter(|n| !acked.contains(n))
             .collect();
         if pending.is_empty() {
             return true;
