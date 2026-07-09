@@ -284,11 +284,27 @@ impl StreamingCoordinator {
                     // peer whose receiver hasn't rebound (the frames would be dropped). The
                     // compute loop keeps draining the shuffle receiver on idle cycles meanwhile.
                     if task_gate.load(std::sync::atomic::Ordering::Acquire) {
+                        // Barriers must still flow: the round waits for the rebalance rotation,
+                        // and the rotation's pre-rotation checkpoint aligns on a barrier from
+                        // every source. Starving them here deadlocks the round against itself.
+                        if let Some(barrier) = barrier_handle.poll(epoch) {
+                            epoch += 1;
+                            let cp = connector.checkpoint();
+                            let msg = SourceMsg::Barrier {
+                                source_idx: idx,
+                                barrier,
+                                checkpoint: cp,
+                            };
+                            if task_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
                         tokio::select! {
                             biased;
                             () = task_shutdown_clone.notified() => break,
-                            () = tokio::time::sleep(poll_interval) => continue,
+                            () = tokio::time::sleep(poll_interval) => {}
                         }
+                        continue;
                     }
                     let wake = tokio::select! {
                         biased;

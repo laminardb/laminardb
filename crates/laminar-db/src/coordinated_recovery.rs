@@ -142,7 +142,10 @@ impl RecoveryMonitor {
                     .await;
                     // Fence off before the wait: the rotation we're waiting for needs to checkpoint.
                     controller.set_recovering(false);
-                    await_assignment_settled(db, controller).await;
+                    if !await_assignment_settled(db, controller).await {
+                        hold_on_stale_assignment(db, gen);
+                        return;
+                    }
                     log_release_diagnostic(db, controller, gen, epoch);
                     db.set_source_gate(false);
                     tracing::warn!(target_epoch = epoch, gen, "node restored to recovery epoch");
@@ -186,6 +189,7 @@ impl RecoveryMonitor {
     /// announcement on exit (so an incomplete round can't leave a stale target for a later
     /// restart to replay); an incomplete round bumps `coordinated_recovery_failures_total`
     /// and relies on a still-faulted node re-triggering.
+    #[allow(clippy::too_many_lines)]
     async fn drive_round(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -291,8 +295,10 @@ impl RecoveryMonitor {
         // Every node has restarted and rebound its receiver (or the wait timed out — release
         // anyway rather than wedge sources): re-shuffle can no longer land in a void. Sources stay
         // gated across the rotation so vnodes move with no data in flight.
-        if restored {
-            await_assignment_settled(db, controller).await;
+        if restored && !await_assignment_settled(db, controller).await {
+            hold_on_stale_assignment(db, gen_id);
+            controller.clear_recover().await;
+            return;
         }
         log_release_diagnostic(db, controller, gen_id, target);
         db.set_source_gate(false);
@@ -453,10 +459,11 @@ fn assignment_reflects_membership(db: &Arc<LaminarDB>, controller: &ClusterContr
 /// source-gated — so releasing first lets the rotation move vnodes mid-stream, where a gainer
 /// double-folds a rehydrated chain over records it already counted and records shuffled to the
 /// old owner are dropped. Waiting here moves the whole rotation into the no-data window.
-/// Bounded: on timeout we release anyway rather than wedge intake.
-async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterController) {
+/// `false` if it never converged: the caller then FAILS CLOSED — holding sources is safe, while
+/// releasing into a known-stale assignment re-opens the very mid-stream rotation this prevents.
+async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterController) -> bool {
     if assignment_reflects_membership(db, controller) {
-        return;
+        return true;
     }
     tracing::warn!("assignment does not reflect live membership; holding sources for the rotation");
     let deadline = tokio::time::Instant::now() + ASSIGNMENT_SETTLE_TIMEOUT;
@@ -464,10 +471,23 @@ async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterContr
         tokio::time::sleep(POLL_INTERVAL).await;
         if assignment_reflects_membership(db, controller) {
             tracing::warn!("assignment converged inside the round; releasing sources");
-            return;
+            return true;
         }
     }
-    tracing::error!("assignment did not converge before timeout; releasing sources anyway");
+    false
+}
+
+/// Fail-closed handler for a rotation that never landed: keep intake shut and surface it loudly
+/// rather than resume against an assignment we know is stale.
+fn hold_on_stale_assignment(db: &Arc<LaminarDB>, gen_id: u64) {
+    if let Some(m) = db.engine_metrics.lock().clone() {
+        m.coordinated_recovery_failures_total.inc();
+    }
+    tracing::error!(
+        gen = gen_id,
+        "assignment never converged; holding sources shut rather than releasing into a stale \
+         assignment (a rotation is stuck — check the pre-rotation checkpoint)"
+    );
 }
 
 /// One-line per-node snapshot at gate release. A cross-node diff at the same `gen` attributes the
