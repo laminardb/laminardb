@@ -146,6 +146,8 @@ pub struct EngineMetrics {
     pub coordinated_recoveries_total: IntCounter,
     /// Leader-coordinated recovery rounds abandoned (self-restore failed or restore quorum timed out).
     pub coordinated_recovery_failures_total: IntCounter,
+    /// Shuffle frames a peer sent that never arrived; each one fences an epoch and forces replay.
+    pub shuffle_frames_lost_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -493,6 +495,11 @@ impl EngineMetrics {
             coordinated_recovery_failures_total: reg!(IntCounter::new(
                 "coordinated_recovery_failures_total",
                 "Leader-coordinated recovery rounds abandoned (self-restore failed or quorum timed out)"
+            )
+            .unwrap()),
+            shuffle_frames_lost_total: reg!(IntCounter::new(
+                "shuffle_frames_lost_total",
+                "Cross-node shuffle frames sent but never delivered (fences the epoch, forces replay)"
             )
             .unwrap()),
         }

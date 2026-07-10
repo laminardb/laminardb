@@ -18,6 +18,19 @@ const SHUFFLE_RECV_QUEUE: usize = 1024;
 /// Peer identifier on the wire; matches `cluster::discovery::NodeId`'s inner type.
 pub type ShufflePeerId = u64;
 
+/// Identity of this process, announced in `Hello`. A restarted peer restarts its per-peer
+/// sequence at zero; without this the receiver would read that as a gap and fence an epoch.
+#[cfg(feature = "cluster")]
+fn process_incarnation() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos());
+        u64::try_from(nanos).unwrap_or(u64::MAX).max(1)
+    })
+}
+
 /// Gossip KV key under which a receiver publishes its listener address for peer
 /// discovery.
 #[cfg(feature = "cluster")]
@@ -99,22 +112,34 @@ mod grpc {
         io::Error::other(e.to_string())
     }
 
+    /// A message plus the delivery header fixed when it was ENQUEUED. Stamping at enqueue is what
+    /// makes a discarded queue entry visible: it consumed a `seq`, so the peer sees a gap.
+    struct Outbound {
+        gen: u64,
+        /// `VnodeData`: this frame's sequence. `Barrier`: frames enqueued to this peer so far.
+        seq: u64,
+        msg: ShuffleMessage,
+    }
+
     /// Encode a [`ShuffleMessage`] into a wire [`ShuffleFrame`]. The per-stage
     /// [`BatchStreamEncoder`] writes the schema only on a stage's first
     /// `VnodeData`. Runs in the driver task, off the compute thread.
     fn encode_message(
-        msg: &ShuffleMessage,
+        out: &Outbound,
         encoders: &mut FxHashMap<String, BatchStreamEncoder>,
-        recovery_gen: u64,
     ) -> Result<ShuffleFrame, tonic::Status> {
+        let Outbound { gen, seq, msg } = out;
+        let (recovery_gen, seq) = (*gen, *seq);
         let kind = match msg {
-            ShuffleMessage::Hello(node_id) => {
-                shuffle_frame::Kind::Hello(Hello { node_id: *node_id })
-            }
+            ShuffleMessage::Hello(node_id) => shuffle_frame::Kind::Hello(Hello {
+                node_id: *node_id,
+                incarnation: super::process_incarnation(),
+            }),
             ShuffleMessage::Barrier(b) => shuffle_frame::Kind::Barrier(Barrier {
                 checkpoint_id: b.checkpoint_id,
                 epoch: b.epoch,
                 flags: b.flags,
+                last_seq: seq,
             }),
             ShuffleMessage::VnodeData(stage, vnode, batch) => {
                 let encoder = match encoders.entry(stage.clone()) {
@@ -143,6 +168,7 @@ mod grpc {
                     vnode: *vnode,
                     arrow_ipc,
                     recovery_gen,
+                    seq,
                 })
             }
             ShuffleMessage::Close(reason) => shuffle_frame::Kind::Close(Close {
@@ -158,7 +184,7 @@ mod grpc {
     /// reconnects. Buffering messages (not frames) keeps Arrow IPC serialization
     /// off the compute thread.
     struct PeerConn {
-        tx: MAsyncTx<mpsc::Array<ShuffleMessage>>,
+        tx: MAsyncTx<mpsc::Array<Outbound>>,
         alive: Arc<AtomicBool>,
         driver: JoinHandle<()>,
     }
@@ -186,6 +212,9 @@ mod grpc {
         kv: Option<Arc<dyn ClusterKv>>,
         /// Stamped onto every outbound `VnodeData`; bumped by a coordinated rewind.
         recovery_gen: Arc<AtomicU64>,
+        /// Data frames enqueued per peer. Lives here, not on `PeerConn`, so it survives the
+        /// reconnect that discards a queue — otherwise the loss would leave no trace.
+        seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
     }
 
     impl std::fmt::Debug for ShuffleSender {
@@ -206,6 +235,7 @@ mod grpc {
                 pool: Mutex::new(FxHashMap::default()),
                 kv: None,
                 recovery_gen: Arc::new(AtomicU64::new(0)),
+                seqs: Mutex::new(FxHashMap::default()),
             }
         }
 
@@ -213,6 +243,12 @@ mod grpc {
         /// rewind so peers can discard anything this node produced before it.
         pub fn set_recovery_gen(&self, gen: u64) {
             self.recovery_gen.fetch_max(gen, Ordering::AcqRel);
+        }
+
+        /// Consume a sequence without sending, modelling a frame the transport discarded.
+        #[cfg(test)]
+        pub fn burn_seq_for_test(&self, peer: ShufflePeerId) {
+            *self.seqs.lock().entry(peer).or_insert(0) += 1;
         }
 
         /// Sender that falls back to `kv` discovery for peers not previously
@@ -238,9 +274,30 @@ mod grpc {
         /// endpoint cannot be built, or the per-peer stream has shut down.
         pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
             let conn = self.connection_for(peer).await?;
+            // Stamp before enqueue. A data frame consumes its sequence here, so a queue the
+            // transport later discards still leaves a hole the peer can see; a barrier carries
+            // the running count, which is what lets the peer fence the epoch before it seals.
+            let gen = self.recovery_gen.load(Ordering::Acquire);
+            let seq = {
+                let mut seqs = self.seqs.lock();
+                let counter = seqs.entry(peer).or_insert(0);
+                match msg {
+                    ShuffleMessage::VnodeData(..) => {
+                        let s = *counter;
+                        *counter += 1;
+                        s
+                    }
+                    _ => *counter,
+                }
+            };
             // Cheap clone (`RecordBatch` is an Arc bump); the driver serializes
             // off-thread.
-            conn.tx.send(msg.clone()).await.map_err(|_| {
+            let out = Outbound {
+                gen,
+                seq,
+                msg: msg.clone(),
+            };
+            conn.tx.send(out).await.map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("shuffle stream to peer {peer} closed"),
@@ -321,11 +378,7 @@ mod grpc {
             };
 
             tracing::debug!(peer, addr = %addr, "shuffle reconnecting to peer");
-            let conn = Arc::new(open_call(
-                self.local_id,
-                addr,
-                Arc::clone(&self.recovery_gen),
-            )?);
+            let conn = Arc::new(open_call(self.local_id, addr)?);
 
             // Race: another task may have opened a live call meanwhile.
             let mut pool = self.pool.lock();
@@ -342,33 +395,29 @@ mod grpc {
     /// Open a client-streaming `Shuffle` call to `addr`, sending `Hello(local_id)`
     /// first. Connecting happens in the driver task (non-blocking); a connect
     /// failure flips `alive` so the next `send_to` retries.
-    fn open_call(
-        local_id: ShufflePeerId,
-        addr: SocketAddr,
-        recovery_gen: Arc<AtomicU64>,
-    ) -> io::Result<PeerConn> {
+    fn open_call(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<PeerConn> {
         let endpoint = crate::cluster::control::tls::client_endpoint(&addr.to_string())
             .map_err(io_err)?
             .tcp_nodelay(true);
-        let (tx, rx) = mpsc::bounded_async::<ShuffleMessage>(SHUFFLE_SEND_QUEUE);
+        let (tx, rx) = mpsc::bounded_async::<Outbound>(SHUFFLE_SEND_QUEUE);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_for_driver = Arc::clone(&alive);
 
         // Request stream: a `Hello` chained onto an unfold over the per-peer
         // receiver, serializing dequeued messages here in the driver task.
         let hello = ShuffleFrame {
-            kind: Some(shuffle_frame::Kind::Hello(Hello { node_id: local_id })),
+            kind: Some(shuffle_frame::Kind::Hello(Hello {
+                node_id: local_id,
+                incarnation: super::process_incarnation(),
+            })),
         };
         let encoders: FxHashMap<String, BatchStreamEncoder> = FxHashMap::default();
         let outbound = futures::stream::once(async move { hello }).chain(futures::stream::unfold(
-            (rx, encoders, recovery_gen),
-            |(rx, mut encoders, recovery_gen)| async move {
-                let msg = rx.recv().await.ok()?;
-                // Stamp at encode time, not enqueue time: a frame still queued when a rewind
-                // bumps the generation is stale and must be dropped by the peer.
-                let gen = recovery_gen.load(Ordering::Acquire);
-                match encode_message(&msg, &mut encoders, gen) {
-                    Ok(frame) => Some((frame, (rx, encoders, recovery_gen))),
+            (rx, encoders),
+            |(rx, mut encoders)| async move {
+                let out = rx.recv().await.ok()?;
+                match encode_message(&out, &mut encoders) {
+                    Ok(frame) => Some((frame, (rx, encoders))),
                     Err(e) => {
                         // An unencodable batch would desync the IPC stream;
                         // half-close so the peer reconnects fresh.
@@ -387,8 +436,11 @@ mod grpc {
             let mut client = ShuffleTransportClient::<Channel>::new(channel)
                 .max_decoding_message_size(MAX_SHUFFLE_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_SHUFFLE_MESSAGE_BYTES);
-            // Returns on server half-close ack or transport break; either way done.
-            let _ = client.shuffle(Request::new(outbound)).await;
+            // A break here means frames already handed to tonic may never have landed. The peer
+            // detects the hole from the sequence, so this only needs to be visible, not fatal.
+            if let Err(status) = client.shuffle(Request::new(outbound)).await {
+                tracing::warn!(peer_addr = %addr, error = %status, "shuffle stream broke");
+            }
             alive_for_driver.store(false, Ordering::Release);
         });
 
@@ -411,6 +463,7 @@ mod grpc {
         holdover: Arc<Holdover>,
         /// Inbound data frames stamped below this are pre-rewind and discarded.
         recovery_gen: Arc<AtomicU64>,
+        delivery: Arc<DeliveryTracker>,
     }
 
     impl Drop for ShuffleReceiver {
@@ -443,9 +496,11 @@ mod grpc {
                 mpsc::bounded_async::<(ShufflePeerId, ShuffleMessage)>(SHUFFLE_RECV_QUEUE);
 
             let recovery_gen = Arc::new(AtomicU64::new(0));
+            let delivery = Arc::new(DeliveryTracker::default());
             let service = ShuffleService {
                 tx,
                 recovery_gen: Arc::clone(&recovery_gen),
+                delivery: Arc::clone(&delivery),
             };
             // Accept loop as a stream for `serve_with_incoming` (avoids
             // tokio-stream's `net` feature); nodelay is set per connection.
@@ -484,6 +539,7 @@ mod grpc {
                 server,
                 holdover: Arc::new(Holdover::default()),
                 recovery_gen,
+                delivery,
             })
         }
 
@@ -492,6 +548,16 @@ mod grpc {
         /// restored state and then re-applied by the sender's replay.
         pub fn set_recovery_gen(&self, gen: u64) {
             self.recovery_gen.fetch_max(gen, Ordering::AcqRel);
+            // The rewind discards in-flight frames by design; forget the old sequence so those
+            // deliberate discards are not later mistaken for transit loss.
+            self.delivery.rebaseline_all();
+        }
+
+        /// Data frames a peer sent that never arrived. Non-zero means an epoch must not seal:
+        /// the records are gone and only a rewind to the last committed cut can restore them.
+        #[must_use]
+        pub fn lost_frames(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.delivery.lost)
         }
 
         /// Bind and publish the listener's address into `kv` for peer discovery.
@@ -650,11 +716,103 @@ mod grpc {
         }
     }
 
+    /// What we expect next from a peer, carried across its reconnects (which is exactly when the
+    /// transport discards a queue).
+    ///
+    /// `expected == None` means "re-baseline on the next frame" and is reserved for a rewind: the
+    /// round discards in-flight frames on purpose, so the peer resumes from a point we cannot
+    /// predict. A *fresh* peer is different — its sequence provably starts at 0, so `Some(0)` is
+    /// what lets the barrier's high-water mark reveal frames that never arrived at all.
+    #[derive(Default)]
+    struct PeerSeq {
+        incarnation: u64,
+        expected: Option<u64>,
+    }
+
+    /// Tracks delivery per peer and counts frames that were sent but never arrived.
+    #[derive(Default)]
+    struct DeliveryTracker {
+        peers: Mutex<FxHashMap<ShufflePeerId, PeerSeq>>,
+        lost: Arc<AtomicU64>,
+    }
+
+    impl DeliveryTracker {
+        /// A new sender process restarts its sequence at zero. A reconnect of the *same* process
+        /// keeps its state — that is precisely the case whose dropped queue we must detect.
+        fn observe_hello(&self, peer: ShufflePeerId, incarnation: u64) {
+            let mut peers = self.peers.lock();
+            let st = peers.entry(peer).or_default();
+            if st.incarnation != incarnation {
+                *st = PeerSeq {
+                    incarnation,
+                    expected: Some(0),
+                };
+            }
+        }
+
+        /// Every node re-baselines after a rewind: the round discards in-flight frames on purpose.
+        fn rebaseline_all(&self) {
+            for st in self.peers.lock().values_mut() {
+                st.expected = None;
+            }
+        }
+
+        fn note_loss(&self, peer: ShufflePeerId, missing: u64, at: &str) {
+            self.lost.fetch_add(missing, Ordering::AcqRel);
+            tracing::error!(
+                peer,
+                missing,
+                at,
+                "shuffle frames lost in transit; fencing the epoch"
+            );
+        }
+
+        /// `false` if this frame is a duplicate and must not be folded.
+        fn observe_data(&self, peer: ShufflePeerId, seq: u64) -> bool {
+            let mut peers = self.peers.lock();
+            let st = peers.entry(peer).or_default();
+            match st.expected {
+                None => {
+                    st.expected = Some(seq + 1);
+                    true
+                }
+                Some(expected) if seq >= expected => {
+                    let missing = seq - expected;
+                    st.expected = Some(seq + 1);
+                    drop(peers);
+                    if missing > 0 {
+                        self.note_loss(peer, missing, "data");
+                    }
+                    true
+                }
+                Some(_) => false,
+            }
+        }
+
+        /// The barrier closes the epoch and carries how many data frames the peer enqueued to us.
+        /// Anything short is a loss we must see BEFORE the epoch seals, not after.
+        fn observe_barrier(&self, peer: ShufflePeerId, last_seq: u64) {
+            let mut peers = self.peers.lock();
+            let st = peers.entry(peer).or_default();
+            match st.expected {
+                None => st.expected = Some(last_seq),
+                Some(expected) if last_seq > expected => {
+                    let missing = last_seq - expected;
+                    st.expected = Some(last_seq);
+                    drop(peers);
+                    self.note_loss(peer, missing, "barrier");
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
     /// `ShuffleTransport` service: the producer end of the inbound queue shared by
     /// every peer stream.
     struct ShuffleService {
         tx: InboundTx,
         recovery_gen: Arc<AtomicU64>,
+        delivery: Arc<DeliveryTracker>,
     }
 
     #[tonic::async_trait]
@@ -667,6 +825,7 @@ mod grpc {
                 self.tx.clone(),
                 request.into_inner(),
                 Arc::clone(&self.recovery_gen),
+                Arc::clone(&self.delivery),
             )
             .await?;
             Ok(tonic::Response::new(summary))
@@ -680,13 +839,17 @@ mod grpc {
         tx: InboundTx,
         mut stream: tonic::Streaming<ShuffleFrame>,
         recovery_gen: Arc<AtomicU64>,
+        delivery: Arc<DeliveryTracker>,
     ) -> Result<ShuffleSummary, tonic::Status> {
         let first = stream
             .message()
             .await?
             .ok_or_else(|| tonic::Status::invalid_argument("shuffle stream closed before Hello"))?;
         let peer = match first.kind {
-            Some(shuffle_frame::Kind::Hello(h)) => h.node_id,
+            Some(shuffle_frame::Kind::Hello(h)) => {
+                delivery.observe_hello(h.node_id, h.incarnation);
+                h.node_id
+            }
             _ => {
                 return Err(tonic::Status::invalid_argument(
                     "first shuffle frame must be Hello",
@@ -714,6 +877,9 @@ mod grpc {
                 }
                 shuffle_frame::Kind::Barrier(b) => {
                     frames_received += 1;
+                    // The epoch boundary: verify we saw every data frame the peer sent for it,
+                    // while the checkpoint can still be fenced.
+                    delivery.observe_barrier(peer, b.last_seq);
                     let msg = ShuffleMessage::Barrier(CheckpointBarrier {
                         checkpoint_id: b.checkpoint_id,
                         epoch: b.epoch,
@@ -736,6 +902,8 @@ mod grpc {
                         })?;
                     // Produced before our last coordinated rewind: the sender will replay these
                     // records from the rewound offset, so folding them now would double-count.
+                    // Their sequence belongs to the abandoned run — do NOT track it, or the
+                    // round's own deliberate discards would look like transit loss.
                     if v.recovery_gen < recovery_gen.load(Ordering::Acquire) {
                         tracing::debug!(
                             peer,
@@ -744,6 +912,9 @@ mod grpc {
                             "dropping pre-rewind shuffle frame"
                         );
                         continue;
+                    }
+                    if !delivery.observe_data(peer, v.seq) {
+                        continue; // already folded
                     }
                     let mut stream_broken = false;
                     for batch in batches {
@@ -819,15 +990,39 @@ mod grpc {
             };
             let mut encoders = FxHashMap::default();
             let msg = ShuffleMessage::VnodeData("s".into(), 0, batch("a"));
-            encode_message(&msg, &mut encoders, 0).unwrap();
+            encode_message(
+                &Outbound {
+                    gen: 0,
+                    seq: 0,
+                    msg,
+                },
+                &mut encoders,
+            )
+            .unwrap();
 
             let changed = ShuffleMessage::VnodeData("s".into(), 0, batch("b"));
-            let err = encode_message(&changed, &mut encoders, 0).unwrap_err();
+            let err = encode_message(
+                &Outbound {
+                    gen: 0,
+                    seq: 0,
+                    msg: changed,
+                },
+                &mut encoders,
+            )
+            .unwrap_err();
             assert!(err.message().contains("changed schema"), "{err}");
 
             // A different stage with its own schema is fine.
             let other = ShuffleMessage::VnodeData("t".into(), 0, batch("b"));
-            encode_message(&other, &mut encoders, 0).unwrap();
+            encode_message(
+                &Outbound {
+                    gen: 0,
+                    seq: 0,
+                    msg: other,
+                },
+                &mut encoders,
+            )
+            .unwrap();
         }
     }
 }
@@ -962,6 +1157,13 @@ mod shim {
         /// No peer fabric without the cluster feature; matches the cluster build's API.
         #[allow(clippy::unused_self)]
         pub fn set_recovery_gen(&self, _gen: u64) {}
+
+        /// No peer fabric without the cluster feature; nothing can be lost in transit.
+        #[must_use]
+        #[allow(clippy::unused_self)]
+        pub fn lost_frames(&self) -> Arc<std::sync::atomic::AtomicU64> {
+            Arc::new(std::sync::atomic::AtomicU64::new(0))
+        }
 
         /// # Errors
         /// Returns `io::Error` on bind failure.
@@ -1204,6 +1406,114 @@ mod tests {
         assert!(
             matches!(msg, ShuffleMessage::VnodeData(..)),
             "same-generation data frame must be delivered; got {msg:?}"
+        );
+    }
+
+    /// CL-2: a frame the transport discards (queue drop on reconnect, or a mid-stream break)
+    /// must not vanish silently. The sequence makes the hole visible at the receiver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_counts_frames_lost_in_transit() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::atomic::Ordering as O;
+
+        let recv = bind_on_loopback(2).await;
+        let sender = ShuffleSender::new(1);
+        sender.register_peer(2, recv.local_addr()).await;
+        let lost = recv.lost_frames();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let data = || ShuffleMessage::VnodeData("s".into(), 0, batch.clone());
+
+        // Frame 0 lands. Frame 1 is "lost": burn its sequence without sending it.
+        sender.send_to(2, &data()).await.unwrap();
+        let _ = recv.recv().await.unwrap();
+        sender.burn_seq_for_test(2);
+        assert_eq!(
+            lost.load(O::Acquire),
+            0,
+            "no loss until the hole is observed"
+        );
+
+        // Frame 2 arrives with a gap where frame 1 should have been.
+        sender.send_to(2, &data()).await.unwrap();
+        let _ = recv.recv().await.unwrap();
+        assert_eq!(
+            lost.load(O::Acquire),
+            1,
+            "the gap must be counted exactly once"
+        );
+    }
+
+    /// The trailing-loss case the data-gap check cannot see: the last frames of an epoch are
+    /// dropped and nothing follows them. The barrier's high-water mark exposes it while the
+    /// checkpoint can still be fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_high_water_mark_catches_trailing_loss() {
+        use std::sync::atomic::Ordering as O;
+
+        let recv = bind_on_loopback(2).await;
+        let sender = ShuffleSender::new(1);
+        sender.register_peer(2, recv.local_addr()).await;
+        let lost = recv.lost_frames();
+
+        // Two data frames enqueued, both dropped in transit; then the epoch's barrier.
+        sender.burn_seq_for_test(2);
+        sender.burn_seq_for_test(2);
+        sender
+            .send_to(2, &ShuffleMessage::Barrier(CheckpointBarrier::new(1, 1)))
+            .await
+            .unwrap();
+        let (_, msg) = recv.recv().await.unwrap();
+        assert!(matches!(msg, ShuffleMessage::Barrier(_)));
+        assert_eq!(
+            lost.load(O::Acquire),
+            2,
+            "the barrier must reveal frames that never arrived before the epoch seals"
+        );
+    }
+
+    /// A rewind deliberately discards in-flight frames, and a restarted peer restarts its
+    /// sequence at zero. Neither is transit loss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rewind_and_restart_do_not_count_as_loss() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::atomic::Ordering as O;
+
+        let recv = bind_on_loopback(2).await;
+        let sender = ShuffleSender::new(1);
+        sender.register_peer(2, recv.local_addr()).await;
+        let lost = recv.lost_frames();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let data = || ShuffleMessage::VnodeData("s".into(), 0, batch.clone());
+
+        sender.send_to(2, &data()).await.unwrap();
+        let _ = recv.recv().await.unwrap();
+
+        // A round discards whatever was queued, then both ends move to the new generation.
+        sender.burn_seq_for_test(2);
+        sender.burn_seq_for_test(2);
+        recv.set_recovery_gen(9);
+        sender.set_recovery_gen(9);
+
+        sender.send_to(2, &data()).await.unwrap();
+        let _ = recv.recv().await.unwrap();
+        assert_eq!(
+            lost.load(O::Acquire),
+            0,
+            "a rewind's deliberate discards are not transit loss"
         );
     }
 

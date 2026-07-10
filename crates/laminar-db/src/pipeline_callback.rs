@@ -282,6 +282,11 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Frames a peer shuffled to us that never arrived (CL-2). Read before every seal.
+    #[cfg(feature = "cluster")]
+    pub(crate) shuffle_lost: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(feature = "cluster")]
+    pub(crate) shuffle_lost_seen: u64,
     /// Cached convergence verdict for the periodic-checkpoint gate, published by the
     /// snapshot watcher. `None` in single-node mode (gate defaults open).
     #[cfg(feature = "cluster")]
@@ -1198,7 +1203,32 @@ impl ConnectorPipelineCallback {
         }
     }
 
+    /// A shuffle frame a peer sent never arrived, so this node's state is missing records that
+    /// only exist upstream. Sealing here would commit the gap permanently — the rewind target
+    /// would sit at or above the corrupt epoch. Fault instead: the round rewinds to the last
+    /// committed cut and the replay regenerates them (CL-2).
+    #[cfg(feature = "cluster")]
+    fn check_shuffle_loss(&mut self) {
+        let Some(ref counter) = self.shuffle_lost else {
+            return;
+        };
+        let lost = counter.load(std::sync::atomic::Ordering::Acquire);
+        if lost > self.shuffle_lost_seen {
+            let missing = lost - self.shuffle_lost_seen;
+            self.shuffle_lost_seen = lost;
+            self.prom.shuffle_frames_lost_total.inc_by(missing);
+            self.sink_fault.get_or_insert_with(|| {
+                format!("{missing} shuffle frame(s) lost in transit; replaying from the last checkpoint")
+            });
+        }
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[allow(clippy::unused_self)]
+    fn check_shuffle_loss(&mut self) {}
+
     fn drain_sink_events(&mut self) {
+        self.check_shuffle_loss();
         // A poisoned sink epoch aborts its transaction. Under any exactly-once contract this
         // must fault the pipeline so recovery replays the dropped rows (CP-4) — nothing else
         // does. Under pure at-least-once, at least suppress the next checkpoint so offsets

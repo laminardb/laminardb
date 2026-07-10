@@ -2197,6 +2197,14 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             barrier_injectors: Vec::new(),
             #[cfg(feature = "cluster")]
+            shuffle_lost: self
+                .shuffle_receiver
+                .lock()
+                .as_ref()
+                .map(|r| r.lost_frames()),
+            #[cfg(feature = "cluster")]
+            shuffle_lost_seen: 0,
+            #[cfg(feature = "cluster")]
             pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),

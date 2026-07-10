@@ -32,6 +32,9 @@ message ShuffleFrame {
 // Connection handshake: the sender identifying itself.
 message Hello {
   uint64 node_id = 1;
+  // Process incarnation of the sender. A restarted peer restarts its per-peer
+  // sequence at 0; the receiver must re-baseline rather than report a gap.
+  uint64 incarnation = 2;
 }
 
 // A batch of rows the sender has already classified as belonging to a
@@ -51,6 +54,10 @@ message VnodeData {
   // stamped below its own, so pre-rewind frames still in flight cannot be
   // folded on top of the restored state and then re-applied by the replay.
   uint64 recovery_gen = 4;
+  // Per-peer sequence, assigned when the frame is ENQUEUED (not encoded), so a
+  // frame discarded from the outbound queue still consumes a number and the
+  // receiver sees a gap. Monotonic per (sender incarnation, receiving peer).
+  uint64 seq = 5;
 }
 
 // A Chandy-Lamport checkpoint barrier flowing in-band with the data,
@@ -59,6 +66,11 @@ message Barrier {
   uint64 checkpoint_id = 1;
   uint64 epoch = 2;
   uint64 flags = 3;
+  // Count of VnodeData frames the sender has enqueued to this peer before the
+  // barrier. The barrier is the epoch boundary and rides the same ordered
+  // stream, so a receiver that has seen fewer frames knows data was lost and
+  // can fence the epoch before it seals.
+  uint64 last_seq = 4;
 }
 
 // Graceful-close signal with a short human-readable reason.
