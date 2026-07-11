@@ -1,8 +1,8 @@
-name: State-tier soak
+name: Checkpoint fault and soak
 
-# Kill-9 group-demotion soak for the tiered aggregate state. Expensive and timing-sensitive, so it
-# runs weekly (and on demand) rather than on the per-PR critical path. The embedded variant is
-# Docker-free (built-in generator + local filesystem), so it needs no Kafka/MinIO services.
+# Process-death and coordinated-recovery soaks. Expensive and timing-sensitive, so they run weekly
+# (and on demand) rather than on the per-PR critical path. Every job is Docker-free: the built-in
+# generator drives local/shared filesystem checkpoint and state stores.
 on:
   workflow_dispatch:
     inputs:
@@ -63,3 +63,106 @@ jobs:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+
+      - name: Upload embedded node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-kill9-logs
+          path: target/tmp/**/soak-embed-*/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  cluster-kill9:
+    name: Three-node cluster kill-9 soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: checkpoint-cluster-kill9
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+
+      - name: Kill leader and followers during in-flight checkpoints
+        run: cargo test -p laminar-server --no-default-features --features cluster --test cluster_soak three_node_kill9_soak -- --ignored --nocapture
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
+          LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+          LAMINAR_SOAK_INTERVAL_MS: "250"
+
+      - name: Upload cluster node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-kill9-logs
+          path: target/tmp/**/soak-*/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  cluster-coordinated-recovery:
+    name: Coordinated recovery (${{ matrix.role }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: leader
+            node: "0"
+          - role: follower
+            node: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: checkpoint-cluster-recovery-${{ matrix.role }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+
+      - name: Inject a fatal pipeline cycle fault on the ${{ matrix.role }}
+        run: cargo test -p laminar-server --no-default-features --features cluster --test cluster_soak three_node_kill9_soak -- --ignored --nocapture
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_SOAK_KILLS: "0"
+          LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+          LAMINAR_SOAK_INTERVAL_MS: "250"
+          LAMINAR_SOAK_FAULT_INJECT_MS: "5000"
+          LAMINAR_SOAK_FAULT_INJECT_NODE: ${{ matrix.node }}
+
+      - name: Upload coordinated-recovery node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-recovery-${{ matrix.role }}-logs
+          path: target/tmp/**/soak-*/*.log
+          if-no-files-found: warn
+          retention-days: 14
