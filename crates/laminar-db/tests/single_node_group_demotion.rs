@@ -67,6 +67,35 @@ async fn open_with(
     db
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_state_tier_checkpoint_does_not_require_cluster_controller() {
+    let dir = tempfile::tempdir().unwrap();
+    let ckpt = dir.path().join("ckpt");
+    let state_dir = dir.path().join("state");
+    let tier_dir = dir.path().join("tier");
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // `state-tier` also compiles cluster support. This remains a local runtime and must not
+    // enter cross-node shuffle alignment merely because that compile-time feature is present.
+    let db = open_with(&ckpt, &state_dir, &tier_dir, 64 << 20, false).await;
+    db.start().await.unwrap();
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(key_batch(&[1, 2, 3]))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_counts(&db).await.len() != 3 {
+        assert!(Instant::now() < deadline, "input cycle did not complete");
+    }
+
+    let checkpoint = db.checkpoint().await.unwrap();
+    assert!(
+        checkpoint.success,
+        "local checkpoint failed: {checkpoint:?}"
+    );
+    db.shutdown().await.unwrap();
+}
+
 /// `SELECT k, n FROM counts` as a sorted `k -> n` map.
 async fn read_counts(db: &LaminarDB) -> BTreeMap<i64, i64> {
     let result = db.execute("SELECT k, n FROM counts").await.unwrap();

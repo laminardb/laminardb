@@ -8,19 +8,19 @@
 //! Ignored by default — spawns processes and runs for minutes:
 //!
 //! ```text
-//! cargo test -p laminar-server --test cluster_soak -- --ignored --nocapture
+//! cargo test -p laminar-server --no-default-features --features cluster,aws,kafka \
+//!   --test cluster_soak three_node_kill9_soak -- --ignored --nocapture
 //! ```
 //!
 //! Environment knobs:
 //! - `LAMINAR_SOAK_SECONDS`      total soak duration (default 90)
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; floor 100)
-//! - `LAMINAR_SOAK_CHECKPOINT_URL`  e.g. `s3://bucket/soak` (default: shared `file://` dir)
-//! - `LAMINAR_SOAK_STATE_URL`  the `[state]` backend — vnode partials + durability gate
-//!   (default: shared `file://`)
+//! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
+//! - `LAMINAR_SOAK_STATE_URL`  required cluster-shared state prefix for vnode partials
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  forwarded into both
 //!   storage maps
-//! - `LAMINAR_SOAK_KAFKA_BROKERS`  adds a per-node exactly-once Kafka sink, then diffs each topic
-//!   (read_committed) against the generator output: every seq exactly once, no gaps, no dups
+//! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
+//! - `LAMINAR_SOAK_RPS` / `_TOTAL`  source production rate and maximum record count
 //! - `LAMINAR_SOAK_STATE_TIER`  enable the disk cold tier (build `--features state-tier`); adds a
 //!   memory budget + `EMIT CHANGES` agg so state demotes, then asserts demote/promote counters
 //!   moved. Knobs: `LAMINAR_SOAK_BUDGET_BYTES` (256 KiB), `_VNODES` (256), `_RPS` (400),
@@ -125,21 +125,20 @@ impl Drop for Node {
     }
 }
 
-/// Per-node sink topic, unique per test process so reruns don't diff a prior run's records.
-fn eo_topic(id: usize) -> String {
-    format!("soak-eo-n{id}-{}", std::process::id())
-}
-
-fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -> PathBuf {
+fn write_config(
+    dir: &Path,
+    id: usize,
+    interval_ms: u64,
+    checkpoint_url: &str,
+    brokers: &str,
+    input_topic: &str,
+    consumer_group: &str,
+) -> PathBuf {
     let depth = env_u64("LAMINAR_SOAK_DEPTH", 4);
     // Vnode partials go through [state], not [checkpoint]: without a SHARED state store the leader
     // durability gate (which lists the full registry) can never seal an epoch.
-    let state_url = std::env::var("LAMINAR_SOAK_STATE_URL").unwrap_or_else(|_| {
-        let shared = dir.join("state");
-        std::fs::create_dir_all(&shared).unwrap();
-        let fwd = shared.display().to_string().replace(char::from(92), "/");
-        format!("file:///{fwd}")
-    });
+    let state_url = std::env::var("LAMINAR_SOAK_STATE_URL")
+        .expect("three_node_kill9_soak requires cluster-shared LAMINAR_SOAK_STATE_URL storage");
     let http = BASE_PORT + id as u16;
     let gossip = BASE_PORT + 100 + id as u16;
     let seeds: Vec<String> = (0..NODES)
@@ -151,7 +150,6 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
     // Cold tier: a tiny budget forces demotion, a larger vnode ring keeps vnodes clean (only
     // clean vnodes are demotable).
     let tier = std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok();
-    let rps = env_u64("LAMINAR_SOAK_RPS", if tier { 400 } else { 200 });
     let vnodes = env_u64("LAMINAR_SOAK_VNODES", if tier { 256 } else { 64 });
     let mut server_extra = String::new();
     if tier {
@@ -168,10 +166,32 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
             server_extra.push_str("state_tier_group_demotion = true\n");
         }
     }
-    if std::env::var("LAMINAR_SOAK_KAFKA_BROKERS").is_ok() {
-        server_extra.push_str("delivery = \"exactly_once\"\n");
+
+    fn dump_log_tail(&self) {
+        eprintln!("--- node{} log tail:", self.id);
+        if let Ok(log) = std::fs::read_to_string(&self.log_path) {
+            for line in log.lines().rev().take(40).collect::<Vec<_>>().iter().rev() {
+                eprintln!("  {line}");
+            }
+        }
     }
 
+    fn assert_running(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            panic!("node{} has no child process", self.id);
+        };
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                self.dump_log_tail();
+                panic!("node{} exited before becoming ready: {status}", self.id);
+            }
+            Err(error) => {
+                self.dump_log_tail();
+                panic!("failed to inspect node{} process: {error}", self.id);
+            }
+        }
+    }
     let mut storage = String::new();
     for (env, key) in [
         ("LAMINAR_SOAK_S3_ENDPOINT", "endpoint"),
@@ -240,16 +260,25 @@ max_in_flight_epochs = {depth}
 [checkpoint.storage]
 {storage}
 
-# Workload: deterministic generator source + a pass-through stream so
-# the pipeline (and checkpointing) actually runs.
+# Workload: a shared Kafka consumer group gives cluster-admissible,
+# replayable split ownership across the three processes.
 [[source]]
-name = "gen"
-connector = "generator"
-properties = {{ "rows.per.second" = "{rps}", "batch.max.size" = "256" }}
+name = "kin"
+connector = "kafka"
+format = "json"
+[source.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{input_topic}"
+"group.id" = "{consumer_group}"
+"startup.mode" = "earliest"
+[[source.schema]]
+name = "seq"
+type = "BIGINT"
+nullable = false
 
 [[pipeline]]
 name = "soak_stream"
-sql = "SELECT seq, ts_ms, value FROM gen"
+sql = "SELECT seq FROM kin"
 "#,
         data = data_dir.display().to_string().replace('\\', "/"),
         seeds = seeds.join(", "),
@@ -266,7 +295,7 @@ sql = "SELECT seq, ts_ms, value FROM gen"
             r#"
 [[pipeline]]
 name = "soak_delta_agg"
-sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups}"
+        sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM kin GROUP BY (seq / {span}) % {groups}"
 "#,
         ));
     }
@@ -280,7 +309,7 @@ sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM
             r#"
 [[pipeline]]
 name = "soak_changelog_agg"
-sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+        sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM kin GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
 "#,
         ));
     }
@@ -297,126 +326,14 @@ sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM
             r#"
 [[pipeline]]
 name = "soak_agg"
-sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
+        sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM kin GROUP BY (seq / {span}) % {groups} EMIT CHANGES"
 "#,
-        ));
-    }
-
-    // Exactly-once Kafka sink: each node writes its own topic (independent seq stream), so each
-    // topic must be dense 0..=max with no duplicates under read_committed.
-    if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
-        toml.push_str(&format!(
-            r#"
-[[sink]]
-name = "soak_sink"
-pipeline = "soak_stream"
-connector = "kafka"
-
-[sink.properties]
-"bootstrap.servers" = "{brokers}"
-topic = "{topic}"
-format = "json"
-"#,
-            topic = eo_topic(id),
         ));
     }
 
     let path = dir.join(format!("node{id}.toml"));
     std::fs::write(&path, toml).unwrap();
     path
-}
-
-/// Diff each node's sink topic against the deterministic generator: under exactly-once each topic
-/// (read_committed) must be dense 0..=max — a gap = lost rows, a duplicate = leaked replay.
-/// Transactions still open at the kill are invisible under read_committed (the abort path working).
-fn verify_exactly_once_output(brokers: &str) {
-    use rdkafka::consumer::{BaseConsumer, Consumer};
-    use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
-
-    for id in 0..NODES {
-        let topic = eo_topic(id);
-        let consumer: BaseConsumer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("group.id", format!("soak-eo-diff-{}", std::process::id()))
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("isolation.level", "read_committed")
-            .create()
-            .expect("diff consumer");
-        // Assign every partition from metadata — hard-coding partition 0 misses data if the broker
-        // auto-creates the topic with more than one partition.
-        let metadata = consumer
-            .fetch_metadata(Some(&topic), Duration::from_secs(10))
-            .expect("topic metadata");
-        let partitions: Vec<i32> = metadata
-            .topics()
-            .first()
-            .map(|t| {
-                t.partitions()
-                    .iter()
-                    .map(rdkafka::metadata::MetadataPartition::id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert!(!partitions.is_empty(), "{topic}: no partitions in metadata");
-        let mut tpl = TopicPartitionList::new();
-        for p in partitions {
-            tpl.add_partition_offset(&topic, p, Offset::Beginning)
-                .unwrap();
-        }
-        consumer.assign(&tpl).expect("assign");
-
-        // Read until idle (the LSO stops a read_committed consumer ahead of any open transaction).
-        let mut seqs: Vec<i64> = Vec::new();
-        let mut idle = 0u32;
-        while idle < 5 {
-            match consumer.poll(Duration::from_secs(2)) {
-                Some(Ok(msg)) => {
-                    idle = 0;
-                    let v: serde_json::Value =
-                        serde_json::from_slice(msg.payload().unwrap_or_default())
-                            .unwrap_or_else(|e| panic!("{topic}: undecodable sink record: {e}"));
-                    seqs.push(
-                        v["seq"]
-                            .as_i64()
-                            .unwrap_or_else(|| panic!("{topic}: record without seq: {v}")),
-                    );
-                }
-                Some(Err(e)) => panic!("{topic}: consume error: {e}"),
-                None => idle += 1,
-            }
-        }
-
-        assert!(
-            !seqs.is_empty(),
-            "{topic}: no committed records — the sink never committed a transaction",
-        );
-        let count = seqs.len();
-        let max = *seqs.iter().max().unwrap();
-        seqs.sort_unstable();
-        seqs.dedup();
-        let duplicates = count - seqs.len();
-        let mut gaps: Vec<(i64, i64)> = Vec::new(); // (expected, found)
-        let mut expected = 0i64;
-        for &s in &seqs {
-            if s != expected {
-                gaps.push((expected, s));
-                expected = s;
-            }
-            expected += 1;
-        }
-        assert!(
-            duplicates == 0 && gaps.is_empty(),
-            "{topic}: exactly-once VIOLATED — {count} records, max seq {max}, \
-             {duplicates} duplicate(s), gap(s) at {gaps:?}",
-        );
-        assert!(
-            max >= 200,
-            "{topic}: only {count} committed records (max seq {max}) — too little \
-             output survived the fault rounds for the diff to be meaningful",
-        );
-        eprintln!("soak: {topic}: exactly-once OK — {count} records, dense 0..={max}");
-    }
 }
 
 /// Wait until `pred` holds, polling, or panic with `what` at deadline.
@@ -533,7 +450,8 @@ fn embedded_kill9_group_demotion_soak() {
     let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let log_dir = std::env::temp_dir().join(format!("soak-embed-{}", std::process::id()));
+    let log_dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-embed-{}", std::process::id()));
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("soak: embedded node logs in {}", log_dir.display());
 
@@ -547,11 +465,20 @@ fn embedded_kill9_group_demotion_soak() {
     };
 
     node.spawn();
-    wait_for(
-        "embedded node to commit a checkpoint",
-        Duration::from_secs(30),
-        || node.commits().unwrap_or(0.0) >= 1.0,
-    );
+    let boot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for(
+            "embedded node to commit a checkpoint",
+            Duration::from_secs(30),
+            || {
+                node.assert_running();
+                node.commits().unwrap_or(0.0) >= 1.0
+            },
+        );
+    }));
+    if let Err(payload) = boot {
+        node.dump_log_tail();
+        std::panic::resume_unwind(payload);
+    }
     eprintln!("soak: embedded node up");
 
     // Wait for demotion AND a following checkpoint (captures cold-only partials) so the first kill
@@ -649,13 +576,23 @@ fn three_node_kill9_soak() {
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500).max(100);
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let shared = dir.path().join("checkpoints");
-    std::fs::create_dir_all(&shared).unwrap();
-    let default_url = format!(
-        "file:///{}",
-        shared.display().to_string().replace('\\', "/")
+    let url = std::env::var("LAMINAR_SOAK_CHECKPOINT_URL").expect(
+        "three_node_kill9_soak requires cluster-shared LAMINAR_SOAK_CHECKPOINT_URL storage",
     );
-    let url = std::env::var("LAMINAR_SOAK_CHECKPOINT_URL").unwrap_or(default_url);
+    let brokers = std::env::var("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS")
+        .expect("three_node_kill9_soak requires LAMINAR_SOAK_KAFKA_SOURCE_BROKERS");
+    let input_topic = format!("soak-cluster-in-{}", std::process::id());
+    let consumer_group = format!("soak-cluster-{}", std::process::id());
+    kafka_create_topic(&brokers, &input_topic, NODES as i32);
+    let source_rps = env_u64("LAMINAR_SOAK_RPS", 400).max(1);
+    let default_total = source_rps.saturating_mul(soak_secs.saturating_add(300));
+    let source_total = env_u64("LAMINAR_SOAK_TOTAL", default_total);
+    let source_total = i64::try_from(source_total).expect("LAMINAR_SOAK_TOTAL exceeds i64");
+    let producer_brokers = brokers.clone();
+    let producer_topic = input_topic.clone();
+    let _producer = std::thread::spawn(move || {
+        produce_seq(&producer_brokers, &producer_topic, source_total, source_rps);
+    });
 
     // Node logs under target/ (not the tempdir) so they survive a failed run for post-mortem.
     let log_dir =
@@ -672,7 +609,15 @@ fn three_node_kill9_soak() {
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
             id,
-            config_path: write_config(dir.path(), id, interval_ms, &url),
+            config_path: write_config(
+                dir.path(),
+                id,
+                interval_ms,
+                &url,
+                &brokers,
+                &input_topic,
+                &consumer_group,
+            ),
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
@@ -690,17 +635,17 @@ fn three_node_kill9_soak() {
         wait_for(
             "all nodes serving /metrics",
             Duration::from_secs(60),
-            || nodes.iter().all(|n| n.epoch().is_some()),
+            || {
+                nodes.iter_mut().all(|n| {
+                    n.assert_running();
+                    n.epoch().is_some()
+                })
+            },
         );
     }));
     if boot.is_err() {
         for n in &nodes {
-            eprintln!("--- node{} log tail:", n.id);
-            if let Ok(log) = std::fs::read_to_string(&n.log_path) {
-                for line in log.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
-                    eprintln!("  {line}");
-                }
-            }
+            n.dump_log_tail();
         }
         panic!("soak: cluster failed to boot — node log tails above");
     }
@@ -708,9 +653,8 @@ fn three_node_kill9_soak() {
     let mut floor = assert_progress(&nodes, 0.0, Duration::from_secs(90), "startup");
     eprintln!("soak: cluster up, epoch {floor}");
 
-    // `LAMINAR_SOAK_KILLS=0` runs a steady no-fault soak — the vehicle for observing *effective*
-    // demotion, since rebalance rehydration (every kill) sets `dirty_all` and refuses demotion
-    // until the next capture. Default: kill for the whole window.
+    // `LAMINAR_SOAK_KILLS=0` runs a steady no-process-death soak while the optional cycle fault
+    // drives coordinated recovery. Default: kill for the whole window.
     let max_kills = env_u64("LAMINAR_SOAK_KILLS", u64::MAX);
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
     let mut round = 0u32;
@@ -787,7 +731,7 @@ fn three_node_kill9_soak() {
         }
     }
 
-    // Tier validation: scrape while every node is still live (the Kafka diff below kills them all).
+    // Tier validation: scrape while every node is still live.
     // Demotions prove the budget→demote trigger fired on clean vnodes; fetches prove a row hit a
     // cold vnode and promotion read it back. Both must survive the kills (restart rehydrates
     // demoted vnodes from durable partials, not the wiped tier).
@@ -830,128 +774,6 @@ fn three_node_kill9_soak() {
         );
         eprintln!("soak: coordinated recoveries applied = {recoveries}");
     }
-
-    if let Ok(brokers) = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS") {
-        // Let in-flight epochs commit, then stop every writer so the diff reads a stable topic
-        // (transactions open at the kill abort, invisible under read_committed).
-        std::thread::sleep(Duration::from_secs(5));
-        for n in &mut nodes {
-            n.kill9();
-        }
-        verify_exactly_once_output(&brokers);
-    }
-}
-
-// ── Graceful-rotation soak ─────────────────────────────────────────────
-
-/// Node config for the graceful-rotation soak: shared Kafka source, pass-through pipeline, per-node
-/// exactly-once sink (the EO sink forces the pre-rotation drain). Seeds `n_seeds` nodes for gossip.
-fn write_graceful_config(
-    dir: &Path,
-    id: usize,
-    n_seeds: usize,
-    interval_ms: u64,
-    checkpoint_url: &str,
-    brokers: &str,
-    input_topic: &str,
-) -> PathBuf {
-    let state_shared = dir.join("state");
-    std::fs::create_dir_all(&state_shared).unwrap();
-    let state_url = format!(
-        "file:///{}",
-        state_shared.display().to_string().replace('\\', "/")
-    );
-    let http = BASE_PORT + id as u16;
-    let gossip = BASE_PORT + 100 + id as u16;
-    let seeds: Vec<String> = (0..n_seeds)
-        .map(|i| format!("\"127.0.0.1:{}\"", BASE_PORT + 100 + i as u16))
-        .collect();
-    let data_dir = dir.join(format!("node{id}-data"));
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    // Optional delta checkpoints + a non-changelog agg to exercise delta write/chain-recovery
-    // across the graceful rotation (see `write_config`).
-    let (delta_line, delta_agg) = std::env::var("LAMINAR_SOAK_DELTA_CHAIN_MAX").map_or_else(
-        |_| (String::new(), String::new()),
-        |v| {
-            let n: u32 = v.parse().expect("LAMINAR_SOAK_DELTA_CHAIN_MAX must be a u32");
-            let groups = env_u64("LAMINAR_SOAK_GROUPS", 2000);
-            (
-                format!("delta_chain_max = {n}"),
-                format!(
-                    "\n[[pipeline]]\nname = \"soak_delta_agg\"\nsql = \"SELECT seq % {groups} AS k, COUNT(*) AS n, MAX(seq) AS hi FROM kin GROUP BY seq % {groups}\"\n"
-                ),
-            )
-        },
-    );
-
-    let toml = format!(
-        r#"
-node_id = "n{id}"
-storage_dir = "{data}"
-
-[server]
-mode = "cluster"
-bind = "127.0.0.1:{http}"
-delivery = "exactly_once"
-
-[discovery]
-strategy = "gossip"
-seeds = [{seeds}]
-gossip_port = {gossip}
-advertise_host = "127.0.0.1"
-
-[coordination]
-strategy = "raft"
-
-[state]
-backend = "object_store"
-url = "{state_url}"
-instance_id = "n{id}"
-vnode_capacity = 64
-
-[checkpoint]
-url = "{url}"
-interval = "{interval_ms}ms"
-max_retained = 5
-max_in_flight_epochs = 4
-{delta_line}
-
-[[source]]
-name = "kin"
-connector = "kafka"
-format = "json"
-[source.properties]
-"bootstrap.servers" = "{brokers}"
-topic = "{input_topic}"
-"group.id" = "soak-grace-n{id}"
-"startup.mode" = "earliest"
-[[source.schema]]
-name = "seq"
-type = "BIGINT"
-nullable = false
-
-[[pipeline]]
-name = "passthrough"
-sql = "SELECT seq FROM kin"
-{delta_agg}
-[[sink]]
-name = "kout"
-pipeline = "passthrough"
-connector = "kafka"
-[sink.properties]
-"bootstrap.servers" = "{brokers}"
-topic = "{topic}"
-format = "json"
-"#,
-        data = data_dir.display().to_string().replace('\\', "/"),
-        seeds = seeds.join(", "),
-        url = checkpoint_url,
-        topic = eo_topic(id),
-    );
-    let path = dir.join(format!("node{id}.toml"));
-    std::fs::write(&path, toml).unwrap();
-    path
 }
 
 /// Create `topic` with `partitions` partitions (blocking; the admin API is async).
@@ -976,7 +798,7 @@ fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
 }
 
 /// Produce `{"seq": n}` for `n in 0..count`, keyed by `seq`, paced near `rps` so the cluster is
-/// still consuming during the mid-run rotation. Blocks until all are produced and flushed.
+/// still consuming throughout the fault rounds. Blocks until all are produced and flushed.
 fn produce_seq(brokers: &str, topic: &str, count: i64, rps: u64) {
     use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
     let producer: BaseProducer = rdkafka::ClientConfig::new()
@@ -1011,179 +833,4 @@ fn produce_seq(brokers: &str, topic: &str, count: i64, rps: u64) {
         std::thread::sleep(Duration::from_millis(50));
     }
     producer.flush(Duration::from_secs(60)).expect("flush");
-}
-
-/// All `seq` values across every node's output topic, with per-topic counts.
-fn collect_output_seqs(brokers: &str, n_nodes: usize) -> (Vec<i64>, Vec<usize>) {
-    use rdkafka::consumer::{BaseConsumer, Consumer};
-    use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
-    let mut all = Vec::new();
-    let mut per_topic = vec![0usize; n_nodes];
-    for (id, topic_count) in per_topic.iter_mut().enumerate() {
-        let topic = eo_topic(id);
-        let consumer: BaseConsumer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set(
-                "group.id",
-                format!("soak-grace-diff-{}", std::process::id()),
-            )
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("isolation.level", "read_committed")
-            .create()
-            .expect("diff consumer");
-        let Ok(md) = consumer.fetch_metadata(Some(&topic), Duration::from_secs(10)) else {
-            continue; // topic may not exist yet (node never owned a partition)
-        };
-        let parts: Vec<i32> = md
-            .topics()
-            .first()
-            .map(|t| {
-                t.partitions()
-                    .iter()
-                    .map(rdkafka::metadata::MetadataPartition::id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if parts.is_empty() {
-            continue;
-        }
-        let mut tpl = TopicPartitionList::new();
-        for p in parts {
-            tpl.add_partition_offset(&topic, p, Offset::Beginning)
-                .unwrap();
-        }
-        consumer.assign(&tpl).expect("assign");
-        let mut idle = 0u32;
-        while idle < 5 {
-            match consumer.poll(Duration::from_secs(2)) {
-                Some(Ok(msg)) => {
-                    idle = 0;
-                    let v: serde_json::Value =
-                        serde_json::from_slice(msg.payload().unwrap_or_default()).expect("json");
-                    all.push(v["seq"].as_i64().expect("seq"));
-                    *topic_count += 1;
-                }
-                Some(Err(e)) => panic!("{topic}: consume error: {e}"),
-                None => idle += 1,
-            }
-        }
-    }
-    (all, per_topic)
-}
-
-/// End-to-end graceful rotation (a node joins mid-run; the EO sink forces the pre-rotation drain).
-/// Output topics must union to a dense `0..=TOTAL-1`, proving each partition handed off cleanly.
-#[test]
-#[ignore = "spawns 4 real laminardb processes; needs LAMINAR_SOAK_KAFKA_BROKERS; run with --ignored"]
-fn graceful_rotation_kafka_soak() {
-    let brokers = std::env::var("LAMINAR_SOAK_KAFKA_BROKERS")
-        .expect("graceful_rotation_kafka_soak requires LAMINAR_SOAK_KAFKA_BROKERS");
-    let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 200).max(100);
-    let total: i64 = env_u64("LAMINAR_SOAK_TOTAL", 12000) as i64;
-    const INITIAL: usize = 3;
-    const ALL: usize = 4; // a 4th node joins mid-run
-                          // Enough partitions that the joining node reliably acquires some.
-    const PARTS: i32 = 12;
-
-    let input = format!("soak-grace-in-{}", std::process::id());
-    kafka_create_topic(&brokers, &input, PARTS);
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let cp = dir.path().join("checkpoints");
-    std::fs::create_dir_all(&cp).unwrap();
-    let url = format!("file:///{}", cp.display().to_string().replace('\\', "/"));
-    let log_dir =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-grace-{}", std::process::id()));
-    std::fs::create_dir_all(&log_dir).unwrap();
-    eprintln!("soak: node logs in {}", log_dir.display());
-
-    let mut nodes: Vec<Node> = (0..ALL)
-        .map(|id| Node {
-            id,
-            config_path: write_graceful_config(
-                dir.path(),
-                id,
-                // Seed only the initial set so formation completes before node 3 exists;
-                // it joins the running cluster via gossip on these seeds.
-                INITIAL,
-                interval_ms,
-                &url,
-                &brokers,
-                &input,
-            ),
-            log_path: log_dir.join(format!("node{id}.log")),
-            child: None,
-            http_port: BASE_PORT + id as u16,
-            fault_inject_ms: None,
-        })
-        .collect();
-
-    for node in nodes.iter_mut().take(INITIAL) {
-        node.spawn();
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    wait_for(
-        "initial nodes serving /metrics",
-        Duration::from_secs(60),
-        || nodes[..INITIAL].iter().all(|n| n.epoch().is_some()),
-    );
-    assert_progress(&nodes[..INITIAL], 0.0, Duration::from_secs(90), "startup");
-    eprintln!("soak: 3 nodes up; producing {total} records");
-
-    // Modest rate so records still flow after the rotation settles — else the backlog drains
-    // before node 3 acquires its partitions.
-    let (pb, pt) = (brokers.clone(), input.clone());
-    let producer = std::thread::spawn(move || produce_seq(&pb, &pt, total, 400));
-
-    std::thread::sleep(Duration::from_secs(3));
-    eprintln!("soak: adding node 3 → graceful rotation");
-    nodes[3].spawn();
-    wait_for("node 3 serving /metrics", Duration::from_secs(60), || {
-        nodes[3].epoch().is_some()
-    });
-    // Let the two-phase drain + reassignment settle; production continues so node 3 consumes
-    // fresh records on its newly-acquired partitions.
-    std::thread::sleep(Duration::from_secs(15));
-
-    producer.join().expect("producer thread");
-    eprintln!("soak: produced all; waiting for the cluster to drain output");
-    wait_for("all records sunk", Duration::from_secs(180), || {
-        let (seqs, _) = collect_output_seqs(&brokers, ALL);
-        let mut s = seqs;
-        s.sort_unstable();
-        s.dedup();
-        s.len() >= total as usize
-    });
-
-    // Read the diff against the live, settled cluster — killing first races it into phantom reads.
-    std::thread::sleep(Duration::from_secs(5));
-    let (mut seqs, per_topic) = collect_output_seqs(&brokers, ALL);
-    let count = seqs.len();
-    seqs.sort_unstable();
-    seqs.dedup();
-    let duplicates = count - seqs.len();
-    let max = seqs.last().copied().unwrap_or(-1);
-    let mut gaps = Vec::new();
-    let mut expected = 0i64;
-    for &s in &seqs {
-        if s != expected {
-            gaps.push((expected, s));
-            expected = s;
-        }
-        expected += 1;
-    }
-    eprintln!("soak: per-node output counts {per_topic:?}");
-    assert!(
-        per_topic[3] > 0,
-        "node 3 produced no output — the graceful rotation never moved partitions \
-         to it, so B2 was not exercised (per-topic {per_topic:?})",
-    );
-    assert!(
-        duplicates == 0 && gaps.is_empty() && max == total - 1,
-        "graceful-rotation exactly-once VIOLATED — {count} records, max seq {max} \
-         (want {}), {duplicates} duplicate(s), gap(s) {gaps:?}",
-        total - 1,
-    );
-    eprintln!("soak: graceful rotation exactly-once OK — union dense 0..={max}, 0 duplicates");
 }

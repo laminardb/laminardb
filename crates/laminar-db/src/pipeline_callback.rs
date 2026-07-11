@@ -1867,10 +1867,11 @@ impl ConnectorPipelineCallback {
         &mut self,
         attempt: CheckpointAttempt,
     ) -> Result<(), DbError> {
-        let cc = self
-            .cluster_controller
-            .clone()
-            .ok_or_else(|| DbError::Checkpoint("cluster checkpoint has no controller".into()))?;
+        // `state-tier` enables the cluster compile feature, but embedded and single-node
+        // runtimes deliberately have no controller. They have no cross-node shuffle to align.
+        let Some(cc) = self.cluster_controller.clone() else {
+            return Ok(());
+        };
         if !cc.is_leader() {
             return Err(DbError::Checkpoint(
                 "only the cluster leader may align checkpoint shuffles".into(),

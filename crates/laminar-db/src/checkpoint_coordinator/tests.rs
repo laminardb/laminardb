@@ -217,6 +217,38 @@ async fn test_checkpoint_no_sources_no_sinks() {
 }
 
 #[tokio::test]
+async fn checkpoint_manifest_uses_the_configured_vnode_count() {
+    const VNODE_COUNT: u16 = 64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_vnode_count(VNODE_COUNT));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
+
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(result.success);
+
+    let finalized = coord.store().load_latest().await.unwrap().unwrap();
+    assert_eq!(finalized.vnode_count, VNODE_COUNT);
+    assert_eq!(
+        finalized.durable_phase,
+        laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized
+    );
+
+    let recovered = coord
+        .recover()
+        .await
+        .unwrap()
+        .expect("recoverable checkpoint");
+    assert_eq!(recovered.epoch(), result.epoch);
+}
+
+#[tokio::test]
 async fn checkpoint_without_decision_store_fails_before_epoch_claim() {
     let dir = tempfile::tempdir().unwrap();
     let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
@@ -623,8 +655,19 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
     use tokio::sync::watch;
 
+    const VNODE_COUNT: u16 = 64;
+
     let dir = tempfile::tempdir().unwrap();
-    let (mut coord, decision_store) = make_coordinator_with_decision_store(dir.path()).await;
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_vnode_count(VNODE_COUNT));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    let decision_store = in_memory_decision_store();
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
     decision_store.record_committed(1, 1).await.unwrap();
 
     let leader_id = NodeId(1);
@@ -694,6 +737,7 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     // Follower's manifest is on disk at the leader's epoch.
     let stored = coord.store().load_latest().await.unwrap().unwrap();
     assert_eq!(stored.epoch, 1);
+    assert_eq!(stored.vnode_count, VNODE_COUNT);
 }
 
 #[cfg(feature = "cluster")]

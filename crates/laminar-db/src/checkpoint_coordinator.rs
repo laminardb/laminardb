@@ -3154,7 +3154,11 @@ impl CheckpointCoordinator {
             }
         }
 
-        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
+        let mut manifest = CheckpointManifest::new_with_vnode_count(
+            checkpoint_id,
+            epoch,
+            self.store.vnode_count(),
+        );
         manifest.participant_id = self.store.participant_id();
         manifest.source_offsets = source_offset_overrides;
         manifest.table_offsets = extra_table_offsets;
@@ -3300,7 +3304,11 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
+        let mut manifest = CheckpointManifest::new_with_vnode_count(
+            checkpoint_id,
+            epoch,
+            self.store.vnode_count(),
+        );
         manifest.participant_id = self.store.participant_id();
         manifest.source_offsets = source_offsets;
         manifest.table_offsets = table_offsets;
