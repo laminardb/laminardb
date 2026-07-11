@@ -76,7 +76,7 @@ jobs:
   cluster-kill9:
     name: Three-node cluster kill-9 soak
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -100,7 +100,7 @@ jobs:
 
       - name: Start cluster-shared dependencies
         run: |
-          docker compose -f tests/docker/compose.yml up -d --wait minio redpanda
+          docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 minio redpanda
           docker run --rm --network host --entrypoint /bin/sh \
             minio/mc:RELEASE.2024-10-08T09-37-26Z -c \
             'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
@@ -129,9 +129,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Print object-store logs on failure
+      - name: Print dependency diagnostics on failure
         if: failure()
-        run: docker compose -f tests/docker/compose.yml logs minio redpanda
+        run: |
+          docker compose -f tests/docker/compose.yml ps -a
+          docker compose -f tests/docker/compose.yml logs minio redpanda
+          docker inspect --format '{{json .State.Health}}' laminardb-redpanda || true
 
       - name: Stop cluster-shared dependencies
         if: always()
@@ -140,15 +143,13 @@ jobs:
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - role: leader
-            node: "0"
           - role: follower
-            node: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -172,7 +173,7 @@ jobs:
 
       - name: Start cluster-shared dependencies
         run: |
-          docker compose -f tests/docker/compose.yml up -d --wait minio redpanda
+          docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 minio redpanda
           docker run --rm --network host --entrypoint /bin/sh \
             minio/mc:RELEASE.2024-10-08T09-37-26Z -c \
             'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
@@ -184,8 +185,7 @@ jobs:
           LAMINAR_SOAK_KILLS: "0"
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           LAMINAR_SOAK_INTERVAL_MS: "250"
-          LAMINAR_SOAK_FAULT_INJECT_MS: "5000"
-          LAMINAR_SOAK_FAULT_INJECT_NODE: ${{ matrix.node }}
+          LAMINAR_SOAK_FAULT_INJECT_ROLE: ${{ matrix.role }}
           LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/recovery-${{ matrix.role }}/checkpoints
           LAMINAR_SOAK_STATE_URL: s3://laminardb-soak/${{ github.run_id }}/recovery-${{ matrix.role }}/state
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
@@ -203,9 +203,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Print object-store logs on failure
+      - name: Print dependency diagnostics on failure
         if: failure()
-        run: docker compose -f tests/docker/compose.yml logs minio redpanda
+        run: |
+          docker compose -f tests/docker/compose.yml ps -a
+          docker compose -f tests/docker/compose.yml logs minio redpanda
+          docker inspect --format '{{json .State.Health}}' laminardb-redpanda || true
 
       - name: Stop cluster-shared dependencies
         if: always()

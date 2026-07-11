@@ -42,7 +42,7 @@ services:
       - --node-id=0
       - --check=false
     healthcheck:
-      test: ["CMD", "rpk", "cluster", "health", "-x", "all_nodes_healthy=true"]
+      test: ["CMD", "rpk", "cluster", "health", "-e", "-X", "brokers=127.0.0.1:19092"]
       interval: 2s
       timeout: 3s
       retries: 20

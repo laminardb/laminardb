@@ -20,20 +20,23 @@
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  forwarded into both
 //!   storage maps
 //! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
-//! - `LAMINAR_SOAK_RPS` / `_TOTAL`  source production rate and maximum record count
+//! - `LAMINAR_SOAK_RPS`  source production rate
 //! - `LAMINAR_SOAK_STATE_TIER`  enable the disk cold tier (build `--features state-tier`); adds a
 //!   memory budget + `EMIT CHANGES` agg so state demotes, then asserts demote/promote counters
 //!   moved. Knobs: `LAMINAR_SOAK_BUDGET_BYTES` (256 KiB), `_VNODES` (256), `_RPS` (400),
 //!   `_GROUPS` (2000 — agg key-space), `_SPAN` (12 — consecutive rows per agg key)
 //! - `LAMINAR_SOAK_CHANGELOG_AGG`  add an `EMIT CHANGES` agg exercising the changelog
 //!   `last_emitted` delta path; pair with `LAMINAR_SOAK_DELTA_CHAIN_MAX` (else it captures FULL)
-//! - `LAMINAR_SOAK_FAULT_INJECT_MS`  arm a one-shot cycle fault this many ms in;
-//!   `LAMINAR_SOAK_FAULT_INJECT_NODE` (default 1 = follower; 0 = leader) picks which
+//! - `LAMINAR_SOAK_FAULT_INJECT_ROLE`  trigger one fatal cycle fault after steady state on the
+//!   observed `leader` or a `follower`
 
 use std::io::{Read, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const NODES: usize = 3;
@@ -53,8 +56,10 @@ struct Node {
     log_path: PathBuf,
     child: Option<Child>,
     http_port: u16,
-    /// `LAMINAR_FAULT_INJECT_AFTER_MS` for this node, when armed (recovery soak).
-    fault_inject_ms: Option<u64>,
+    /// Per-process one-shot fault trigger used only by the coordinated-recovery soak.
+    fault_trigger_path: Option<PathBuf>,
+    /// Debug checkpoint handshake used to prove a hard kill landed inside an active phase.
+    checkpoint_gate_path: Option<PathBuf>,
 }
 
 impl Node {
@@ -73,14 +78,20 @@ impl Node {
             )
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log));
-        // take() arms only the first spawn (no re-arm on restart); env_remove stops a stray
-        // inherited value from arming other nodes.
-        match self.fault_inject_ms.take() {
-            Some(ms) => {
-                cmd.env("LAMINAR_FAULT_INJECT_AFTER_MS", ms.to_string());
+        match &self.fault_trigger_path {
+            Some(path) => {
+                cmd.env("LAMINAR_FAULT_INJECT_TRIGGER_FILE", path);
             }
             None => {
-                cmd.env_remove("LAMINAR_FAULT_INJECT_AFTER_MS");
+                cmd.env_remove("LAMINAR_FAULT_INJECT_TRIGGER_FILE");
+            }
+        }
+        match &self.checkpoint_gate_path {
+            Some(path) => {
+                cmd.env("LAMINAR_CHECKPOINT_KILL_GATE_FILE", path);
+            }
+            None => {
+                cmd.env_remove("LAMINAR_CHECKPOINT_KILL_GATE_FILE");
             }
         }
         self.child = Some(cmd.spawn().expect("spawn laminardb"));
@@ -94,19 +105,88 @@ impl Node {
         }
     }
 
-    /// Scrape one gauge/counter from `/metrics`; `None` while the node is down or booting.
-    fn metric(&self, name: &str) -> Option<f64> {
+    fn http_get(&self, path: &str) -> Option<String> {
         let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-        stream
-            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .ok()?;
-        let mut body = String::new();
-        stream.read_to_string(&mut body).ok()?;
-        body.lines()
-            .find(|l| l.starts_with(name) && !l.starts_with('#'))
-            .and_then(|l| l.split_whitespace().last())
-            .and_then(|v| v.parse().ok())
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).ok()?;
+        let (headers, body) = response.split_once("\r\n\r\n")?;
+        if !headers.lines().next()?.contains(" 200 ") {
+            return None;
+        }
+        Some(body.to_owned())
+    }
+
+    /// Scrape one gauge/counter from `/metrics`; `None` while the node is down or booting.
+    fn metric(&self, name: &str) -> Option<f64> {
+        let body = self.http_get("/metrics")?;
+        let mut found = false;
+        let sum = body
+            .lines()
+            .filter(|line| {
+                line.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+            })
+            .filter_map(|line| line.split_whitespace().last()?.parse::<f64>().ok())
+            .inspect(|_| found = true)
+            .sum();
+        found.then_some(sum)
+    }
+
+    fn is_leader(&self) -> Option<bool> {
+        let body = self.http_get("/api/v1/cluster/leader")?;
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()?
+            .get("is_leader")?
+            .as_bool()
+    }
+
+    fn peer_names(&self) -> Option<Vec<String>> {
+        serde_json::from_str::<Vec<serde_json::Value>>(&self.http_get("/api/v1/cluster/nodes")?)
+            .ok()?
+            .into_iter()
+            .map(|node| {
+                if node.get("state")?.as_str()? != "Active" {
+                    return None;
+                }
+                node.get("name")?.as_str().map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn trigger_fault(&self, role: &str) {
+        let path = self
+            .fault_trigger_path
+            .as_ref()
+            .expect("fault trigger was not configured for this node");
+        std::fs::write(path, role).expect("create fault trigger");
+    }
+
+    fn arm_checkpoint_kill(&self, role: &str) {
+        let path = self
+            .checkpoint_gate_path
+            .as_ref()
+            .expect("checkpoint kill gate was not configured for this node");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("ready"));
+        std::fs::write(path, role).expect("arm checkpoint kill gate");
+    }
+
+    fn checkpoint_kill_ready(&self, role: &str) -> bool {
+        self.checkpoint_gate_path.as_ref().is_some_and(|path| {
+            std::fs::read_to_string(path.with_extension("ready"))
+                .is_ok_and(|ready| ready.trim() == role)
+        })
+    }
+
+    fn disarm_checkpoint_kill(&self) {
+        if let Some(path) = &self.checkpoint_gate_path {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path.with_extension("ready"));
+        }
     }
 
     fn epoch(&self) -> Option<f64> {
@@ -117,11 +197,161 @@ impl Node {
     fn commits(&self) -> Option<f64> {
         self.metric("laminardb_checkpoints_completed_total")
     }
+
+    fn dump_log_tail(&self) {
+        eprintln!("--- node{} log tail:", self.id);
+        if let Ok(log) = std::fs::read_to_string(&self.log_path) {
+            for line in log.lines().rev().take(40).collect::<Vec<_>>().iter().rev() {
+                eprintln!("  {line}");
+            }
+        }
+    }
+
+    fn assert_running(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            panic!("node{} has no child process", self.id);
+        };
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                self.dump_log_tail();
+                panic!("node{} exited before becoming ready: {status}", self.id);
+            }
+            Err(error) => {
+                self.dump_log_tail();
+                panic!("failed to inspect node{} process: {error}", self.id);
+            }
+        }
+    }
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
         self.kill9();
+    }
+}
+
+struct ProducerGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ProducerGuard {
+    fn spawn(brokers: String, topic: String, rps: u64) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            produce_seq(&brokers, &topic, rps, &producer_stop);
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn assert_running(&mut self) {
+        if !self
+            .handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            return;
+        }
+        let result = self.handle.take().expect("producer handle").join();
+        match result {
+            Ok(()) => panic!("Kafka producer stopped before the soak completed"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("Kafka producer thread failed");
+        }
+    }
+}
+
+impl Drop for ProducerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct KafkaCommitOracle {
+    consumer: rdkafka::consumer::BaseConsumer,
+    topic: String,
+    partitions: i32,
+}
+
+impl KafkaCommitOracle {
+    fn new(brokers: &str, group: &str, topic: &str, partitions: i32) -> Self {
+        use rdkafka::consumer::Consumer;
+
+        let consumer: rdkafka::consumer::BaseConsumer = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("group.id", group)
+            .set("enable.auto.commit", "false")
+            .create()
+            .expect("Kafka commit oracle consumer");
+        let metadata = consumer
+            .fetch_metadata(Some(topic), Duration::from_secs(10))
+            .expect("fetch soak topic metadata");
+        let actual = metadata
+            .topics()
+            .iter()
+            .find(|candidate| candidate.name() == topic)
+            .map(|candidate| candidate.partitions().len())
+            .expect("created soak topic missing from Kafka metadata");
+        assert_eq!(
+            actual, partitions as usize,
+            "soak topic has {actual} partitions, expected {partitions}"
+        );
+        Self {
+            consumer,
+            topic: topic.to_owned(),
+            partitions,
+        }
+    }
+
+    fn committed_offsets(&self) -> Option<Vec<i64>> {
+        use rdkafka::consumer::Consumer;
+        use rdkafka::{Offset, TopicPartitionList};
+
+        let mut requested = TopicPartitionList::with_capacity(self.partitions as usize);
+        for partition in 0..self.partitions {
+            requested.add_partition(&self.topic, partition);
+        }
+        let committed = self
+            .consumer
+            .committed_offsets(requested, Duration::from_secs(5))
+            .ok()?;
+        let mut offsets = vec![None; self.partitions as usize];
+        for partition in committed.elements() {
+            let index = usize::try_from(partition.partition()).ok()?;
+            if index >= offsets.len() || partition.topic() != self.topic {
+                return None;
+            }
+            if let Offset::Offset(offset) = partition.offset() {
+                if offset >= 0 {
+                    offsets[index] = Some(offset);
+                }
+            }
+        }
+        Some(
+            offsets
+                .into_iter()
+                .map(|offset| offset.unwrap_or(-1))
+                .collect(),
+        )
+    }
+
+    fn committed_offset_sum(&self) -> Option<i64> {
+        self.committed_offsets()
+            .map(|offsets| offsets.into_iter().sum())
     }
 }
 
@@ -167,31 +397,6 @@ fn write_config(
         }
     }
 
-    fn dump_log_tail(&self) {
-        eprintln!("--- node{} log tail:", self.id);
-        if let Ok(log) = std::fs::read_to_string(&self.log_path) {
-            for line in log.lines().rev().take(40).collect::<Vec<_>>().iter().rev() {
-                eprintln!("  {line}");
-            }
-        }
-    }
-
-    fn assert_running(&mut self) {
-        let Some(child) = self.child.as_mut() else {
-            panic!("node{} has no child process", self.id);
-        };
-        match child.try_wait() {
-            Ok(None) => {}
-            Ok(Some(status)) => {
-                self.dump_log_tail();
-                panic!("node{} exited before becoming ready: {status}", self.id);
-            }
-            Err(error) => {
-                self.dump_log_tail();
-                panic!("failed to inspect node{} process: {error}", self.id);
-            }
-        }
-    }
     let mut storage = String::new();
     for (env, key) in [
         ("LAMINAR_SOAK_S3_ENDPOINT", "endpoint"),
@@ -348,33 +553,270 @@ fn wait_for(what: &str, deadline: Duration, mut pred: impl FnMut() -> bool) {
     panic!("soak: timed out after {deadline:?} waiting for: {what}");
 }
 
+/// Observe the embedded aggregate's live changelog. With `key = None`, returns a key whose count
+/// reached `minimum`; with a key, returns that key's first post-connect batch maximum. The latter
+/// is a data oracle across process death: after a post-observation checkpoint, restored state must
+/// continue above the pre-kill count rather than restart the aggregate from zero.
+fn observe_aggregate_count(
+    node: &mut Node,
+    key: Option<i64>,
+    minimum: i64,
+    deadline: Duration,
+) -> (i64, i64) {
+    use std::io::ErrorKind;
+    use tungstenite::stream::MaybeTlsStream;
+    use tungstenite::{Error, Message};
+
+    let start = Instant::now();
+    let url = format!("ws://127.0.0.1:{}/ws/soak_agg", node.http_port);
+    let (mut socket, _) = loop {
+        node.assert_running();
+        match tungstenite::connect(url.as_str()) {
+            Ok(connected) => break connected,
+            Err(_) if start.elapsed() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("failed to connect aggregate data oracle: {error}"),
+        }
+    };
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set aggregate WebSocket read timeout");
+    }
+
+    while start.elapsed() < deadline {
+        node.assert_running();
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let envelope: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("aggregate WebSocket JSON");
+                let Some(rows) = envelope.get("data").and_then(serde_json::Value::as_array) else {
+                    continue;
+                };
+                let mut matches = rows
+                    .iter()
+                    .filter_map(|row| Some((row.get("k")?.as_i64()?, row.get("n")?.as_i64()?)));
+                if let Some(wanted) = key {
+                    if let Some(count) = matches
+                        .filter_map(|(observed, count)| (observed == wanted).then_some(count))
+                        .max()
+                    {
+                        return (wanted, count);
+                    }
+                } else if let Some((observed, count)) = matches.find(|(_, count)| *count >= minimum)
+                {
+                    return (observed, count);
+                }
+            }
+            Ok(Message::Ping(payload)) => socket
+                .send(Message::Pong(payload))
+                .expect("aggregate WebSocket pong"),
+            Ok(Message::Close(frame)) => {
+                panic!("aggregate data oracle closed unexpectedly: {frame:?}")
+            }
+            Ok(_) => {}
+            Err(Error::Io(error))
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => panic!("aggregate data oracle failed: {error}"),
+        }
+    }
+    panic!("timed out waiting for aggregate data-oracle observation (key={key:?})");
+}
+
 /// Highest epoch visible on any live node.
 fn cluster_epoch(nodes: &[Node]) -> f64 {
-    nodes.iter().filter_map(Node::epoch).fold(0.0, f64::max)
+    let mut epochs = nodes
+        .iter()
+        .filter(|node| node.child.is_some())
+        .map(|node| node.epoch());
+    let first = epochs
+        .next()
+        .flatten()
+        .expect("expected-live node did not expose checkpoint_epoch");
+    epochs
+        .try_fold(first, |highest, epoch| {
+            epoch.map(|epoch| highest.max(epoch))
+        })
+        .expect("expected-live node did not expose checkpoint_epoch")
 }
 
-/// Total commits across live nodes; a killed node drops out, so progress is asserted relative to a
-/// fresh reading, never an absolute floor.
+fn try_cluster_metric(nodes: &[Node], name: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut live = 0usize;
+    for node in nodes.iter().filter(|node| node.child.is_some()) {
+        total += node.metric(name)?;
+        live += 1;
+    }
+    (live > 0).then_some(total)
+}
+
+fn cluster_metric(nodes: &[Node], name: &str) -> f64 {
+    try_cluster_metric(nodes, name)
+        .unwrap_or_else(|| panic!("expected-live node did not expose metric {name:?}"))
+}
+
 fn cluster_commits(nodes: &[Node]) -> f64 {
-    nodes.iter().filter_map(Node::commits).sum()
+    cluster_metric(nodes, "laminardb_checkpoints_completed_total")
 }
 
-/// Assert the cluster commits two more checkpoints within `window`, returning the new epoch floor.
-/// Commits (not epoch numbers, which also advance on aborts) are the real progress signal.
-fn assert_progress(nodes: &[Node], floor: f64, window: Duration, label: &str) -> f64 {
-    let target = cluster_commits(nodes) + 2.0;
+fn assert_running_nodes(nodes: &mut [Node]) {
+    let mut live = 0;
+    for node in nodes.iter_mut().filter(|node| node.child.is_some()) {
+        node.assert_running();
+        live += 1;
+    }
+    assert!(live > 0, "soak has no expected-live node processes");
+}
+
+fn observed_leader(nodes: &[Node]) -> Option<usize> {
+    let roles: Option<Vec<bool>> = nodes.iter().map(Node::is_leader).collect();
+    let leaders: Vec<usize> = roles?
+        .into_iter()
+        .enumerate()
+        .filter_map(|(id, is_leader)| is_leader.then_some(id))
+        .collect();
+    (leaders.len() == 1).then_some(leaders[0])
+}
+
+fn has_full_membership(nodes: &[Node]) -> bool {
+    nodes.iter().all(|node| {
+        let Some(peers) = node.peer_names() else {
+            return false;
+        };
+        let peers: std::collections::BTreeSet<String> = peers
+            .into_iter()
+            .filter(|name| name != &format!("n{}", node.id))
+            .collect();
+        let expected: std::collections::BTreeSet<String> = (0..NODES)
+            .filter(|id| *id != node.id)
+            .map(|id| format!("n{id}"))
+            .collect();
+        peers == expected
+    })
+}
+
+fn wait_for_stable_leader(nodes: &mut [Node], producer: &mut ProducerGuard) -> usize {
+    let mut candidate = None;
+    let mut stable_samples = 0u8;
+    let mut chosen = None;
     wait_for(
-        &format!("{label}: cluster commits to reach {target}"),
+        "one stable observed cluster leader",
+        Duration::from_secs(30),
+        || {
+            assert_running_nodes(nodes);
+            producer.assert_running();
+            match observed_leader(nodes) {
+                Some(id) if candidate == Some(id) => stable_samples += 1,
+                Some(id) => {
+                    candidate = Some(id);
+                    stable_samples = 1;
+                }
+                None => {
+                    candidate = None;
+                    stable_samples = 0;
+                }
+            }
+            if stable_samples >= 3 {
+                chosen = candidate;
+                true
+            } else {
+                false
+            }
+        },
+    );
+    chosen.expect("stable leader wait completed without a leader")
+}
+
+/// Assert two committed checkpoints over advancing source data. With Kafka, also require a new
+/// broker offset commit so an empty-checkpoint loop cannot satisfy the soak.
+fn assert_progress(
+    nodes: &mut [Node],
+    mut producer: Option<&mut ProducerGuard>,
+    commit_oracle: Option<&KafkaCommitOracle>,
+    window: Duration,
+    label: &str,
+) -> f64 {
+    assert_running_nodes(nodes);
+    if let Some(producer) = producer.as_deref_mut() {
+        producer.assert_running();
+    }
+    let ingested_target = cluster_metric(nodes, "laminardb_events_ingested_total") + 1.0;
+    let emitted_target = cluster_metric(nodes, "laminardb_events_emitted_total") + 1.0;
+    wait_for(
+        &format!("{label}: source ingestion and graph output to advance"),
         window,
-        || cluster_commits(nodes) >= target,
+        || {
+            assert_running_nodes(nodes);
+            if let Some(producer) = producer.as_deref_mut() {
+                producer.assert_running();
+            }
+            try_cluster_metric(nodes, "laminardb_events_ingested_total")
+                .is_some_and(|ingested| ingested >= ingested_target)
+                && try_cluster_metric(nodes, "laminardb_events_emitted_total")
+                    .is_some_and(|emitted| emitted >= emitted_target)
+        },
     );
-    let new_epoch = cluster_epoch(nodes);
-    // Abandonment leaves gaps, never reuse — epochs must be monotonic.
-    assert!(
-        new_epoch >= floor,
-        "{label}: cluster epoch regressed: {new_epoch} < previous floor {floor}",
+
+    // Take the durability baselines only after graph output advanced, so checkpoints that happened
+    // before this phase cannot satisfy the source-offset proof.
+    let checkpoint_target = cluster_commits(nodes) + 2.0;
+    let mut kafka_offset_baseline = None;
+    if let Some(oracle) = commit_oracle {
+        wait_for(
+            &format!("{label}: complete Kafka committed-offset snapshot"),
+            window,
+            || {
+                assert_running_nodes(nodes);
+                if let Some(producer) = producer.as_deref_mut() {
+                    producer.assert_running();
+                }
+                kafka_offset_baseline = oracle.committed_offsets();
+                kafka_offset_baseline.is_some()
+            },
+        );
+    }
+    let kafka_offset_targets = kafka_offset_baseline
+        .as_ref()
+        .map(|offsets| offsets.iter().map(|offset| offset + 1).collect::<Vec<_>>());
+    wait_for(
+        &format!("{label}: checkpoints and durable source offsets to advance"),
+        window,
+        || {
+            assert_running_nodes(nodes);
+            if let Some(producer) = producer.as_deref_mut() {
+                producer.assert_running();
+            }
+            try_cluster_metric(nodes, "laminardb_checkpoints_completed_total")
+                .is_some_and(|commits| commits >= checkpoint_target)
+                && kafka_offset_targets.as_ref().is_none_or(|targets| {
+                    commit_oracle
+                        .and_then(KafkaCommitOracle::committed_offsets)
+                        .is_some_and(|current| {
+                            let baseline = kafka_offset_baseline.as_ref().expect("offset baseline");
+                            assert_eq!(
+                                current.len(),
+                                baseline.len(),
+                                "Kafka committed-offset partition count changed"
+                            );
+                            for (partition, (current, baseline)) in
+                                current.iter().zip(baseline).enumerate()
+                            {
+                                assert!(
+                                    current >= baseline,
+                                    "Kafka partition {partition} committed offset regressed: \
+                                     {current} < {baseline}"
+                                );
+                            }
+                            current
+                                .iter()
+                                .zip(targets)
+                                .all(|(current, target)| current >= target)
+                        })
+                })
+        },
     );
-    new_epoch
+    cluster_epoch(nodes)
 }
 
 /// EMBEDDED single-node config: tiny budget + slow-cycling `EMIT CHANGES` agg drive group
@@ -448,6 +890,8 @@ fn embedded_kill9_group_demotion_soak() {
     let soak_secs = env_u64("LAMINAR_SOAK_SECONDS", 75);
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 300).max(100);
     let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
+    let oracle_min_count = i64::try_from(env_u64("LAMINAR_SOAK_SPAN", 12).saturating_mul(2))
+        .expect("LAMINAR_SOAK_SPAN is too large for the aggregate data oracle");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let log_dir =
@@ -461,7 +905,8 @@ fn embedded_kill9_group_demotion_soak() {
         log_path: log_dir.join("node0.log"),
         child: None,
         http_port: BASE_PORT,
-        fault_inject_ms: None,
+        fault_trigger_path: None,
+        checkpoint_gate_path: None,
     };
 
     node.spawn();
@@ -484,6 +929,7 @@ fn embedded_kill9_group_demotion_soak() {
     // Wait for demotion AND a following checkpoint (captures cold-only partials) so the first kill
     // actually exercises cold-group recovery.
     wait_for("group demotion to fire", Duration::from_secs(60), || {
+        node.assert_running();
         node.metric("laminardb_state_tier_demote_total")
             .unwrap_or(0.0)
             > 0.0
@@ -492,7 +938,10 @@ fn embedded_kill9_group_demotion_soak() {
     wait_for(
         "a checkpoint after demotion (captures cold-only partials)",
         Duration::from_secs(30),
-        || node.commits().unwrap_or(0.0) >= after_demote + 1.0,
+        || {
+            node.assert_running();
+            node.commits().unwrap_or(0.0) >= after_demote + 1.0
+        },
     );
     eprintln!(
         "soak: demotion fired (demotes={}), cold groups captured",
@@ -504,24 +953,46 @@ fn embedded_kill9_group_demotion_soak() {
     let mut kills = 0u64;
     let mut round = 0u64;
     let mut max_resident = 0.0f64;
-    while Instant::now() < deadline {
+    while kills < max_kills {
         round += 1;
-        if kills < max_kills {
-            eprintln!("soak round {round}: kill -9 embedded node");
-            node.kill9();
-            kills += 1;
-            node.spawn();
-            // Must recover from checkpoint (cold groups from cold-only partials) and resume —
-            // the single-node cluster path stalls here; embedded must not.
-            assert_progress(
-                std::slice::from_ref(&node),
-                0.0,
-                Duration::from_secs(60),
-                "progress after kill",
-            );
-        } else {
-            std::thread::sleep(Duration::from_secs(2));
-        }
+        let (oracle_key, baseline_count) =
+            observe_aggregate_count(&mut node, None, oracle_min_count, Duration::from_secs(60));
+        let commits_after_observation = node
+            .commits()
+            .expect("embedded node stopped exposing checkpoint commits");
+        wait_for(
+            "two checkpoints after the aggregate data-oracle observation",
+            Duration::from_secs(30),
+            || {
+                node.assert_running();
+                node.commits()
+                    .is_some_and(|commits| commits >= commits_after_observation + 2.0)
+            },
+        );
+        eprintln!("soak round {round}: kill -9 embedded node");
+        node.kill9();
+        kills += 1;
+        node.spawn();
+        let (_, recovered_count) =
+            observe_aggregate_count(&mut node, Some(oracle_key), 0, Duration::from_secs(60));
+        assert!(
+            recovered_count > baseline_count,
+            "embedded aggregate key {oracle_key} restarted at {recovered_count} after kill; \
+             the checkpointed pre-kill count was {baseline_count}"
+        );
+        eprintln!(
+            "soak round {round}: aggregate key {oracle_key} continued from {baseline_count} \
+             to {recovered_count} after restart"
+        );
+        // Must recover from checkpoint (cold groups from cold-only partials) and resume —
+        // the single-node cluster path stalls here; embedded must not.
+        assert_progress(
+            std::slice::from_mut(&mut node),
+            None,
+            None,
+            Duration::from_secs(60),
+            "progress after kill",
+        );
         eprintln!(
             "soak round {round}: demotes={} fetches={} resident_bytes={} state_bytes={}",
             node.metric("laminardb_state_tier_demote_total")
@@ -532,6 +1003,23 @@ fn embedded_kill9_group_demotion_soak() {
             node.metric("laminardb_state_bytes").unwrap_or(0.0),
         );
         max_resident = max_resident.max(node.metric("laminardb_state_bytes").unwrap_or(0.0));
+    }
+    assert_eq!(
+        kills, max_kills,
+        "embedded soak did not complete every requested kill"
+    );
+
+    while Instant::now() < deadline {
+        round += 1;
+        assert_progress(
+            std::slice::from_mut(&mut node),
+            None,
+            None,
+            Duration::from_secs(60),
+            "steady progress",
+        );
+        max_resident = max_resident.max(node.metric("laminardb_state_bytes").unwrap_or(0.0));
+        std::thread::sleep(Duration::from_secs(2));
     }
 
     let demotes = node
@@ -584,15 +1072,10 @@ fn three_node_kill9_soak() {
     let input_topic = format!("soak-cluster-in-{}", std::process::id());
     let consumer_group = format!("soak-cluster-{}", std::process::id());
     kafka_create_topic(&brokers, &input_topic, NODES as i32);
+    let commit_oracle =
+        KafkaCommitOracle::new(&brokers, &consumer_group, &input_topic, NODES as i32);
     let source_rps = env_u64("LAMINAR_SOAK_RPS", 400).max(1);
-    let default_total = source_rps.saturating_mul(soak_secs.saturating_add(300));
-    let source_total = env_u64("LAMINAR_SOAK_TOTAL", default_total);
-    let source_total = i64::try_from(source_total).expect("LAMINAR_SOAK_TOTAL exceeds i64");
-    let producer_brokers = brokers.clone();
-    let producer_topic = input_topic.clone();
-    let _producer = std::thread::spawn(move || {
-        produce_seq(&producer_brokers, &producer_topic, source_total, source_rps);
-    });
+    let mut producer = ProducerGuard::spawn(brokers.clone(), input_topic.clone(), source_rps);
 
     // Node logs under target/ (not the tempdir) so they survive a failed run for post-mortem.
     let log_dir =
@@ -600,11 +1083,18 @@ fn three_node_kill9_soak() {
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("soak: node logs in {}", log_dir.display());
 
-    // Recovery soak: arm a one-shot fault on a single node (default 1 = follower, 0 = leader).
-    let fault_inject_ms = std::env::var("LAMINAR_SOAK_FAULT_INJECT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    let fault_inject_node = env_u64("LAMINAR_SOAK_FAULT_INJECT_NODE", 1) as usize;
+    let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
+    if let Some(role) = fault_role.as_deref() {
+        assert!(
+            matches!(role, "leader" | "follower"),
+            "LAMINAR_SOAK_FAULT_INJECT_ROLE must be 'leader' or 'follower', got {role:?}"
+        );
+    }
+    let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
+    assert!(
+        fault_role.is_none() || max_kills == 0,
+        "coordinated-recovery fault injection and process kill rounds are separate soak modes"
+    );
 
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
@@ -621,12 +1111,16 @@ fn three_node_kill9_soak() {
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
             http_port: BASE_PORT + id as u16,
-            fault_inject_ms: fault_inject_ms.filter(|_| id == fault_inject_node),
+            fault_trigger_path: fault_role
+                .as_ref()
+                .map(|_| dir.path().join(format!("fault-node-{id}.trigger"))),
+            checkpoint_gate_path: (max_kills > 0)
+                .then(|| dir.path().join(format!("checkpoint-node-{id}.arm"))),
         })
         .collect();
     for n in &mut nodes {
         n.spawn();
-        // Stagger so node 0 (lowest id) is the stable initial leader.
+        // Stagger process startup to reduce formation churn; role is observed from the API below.
         std::thread::sleep(Duration::from_millis(500));
     }
 
@@ -636,6 +1130,7 @@ fn three_node_kill9_soak() {
             "all nodes serving /metrics",
             Duration::from_secs(60),
             || {
+                producer.assert_running();
                 nodes.iter_mut().all(|n| {
                     n.assert_running();
                     n.epoch().is_some()
@@ -649,68 +1144,229 @@ fn three_node_kill9_soak() {
         }
         panic!("soak: cluster failed to boot — node log tails above");
     }
+    wait_for(
+        "every node to observe full cluster membership",
+        Duration::from_secs(60),
+        || {
+            assert_running_nodes(&mut nodes);
+            producer.assert_running();
+            has_full_membership(&nodes)
+        },
+    );
     // A pre-join epoch can burn a full 30s gate timeout before convergence, so allow for it.
-    let mut floor = assert_progress(&nodes, 0.0, Duration::from_secs(90), "startup");
-    eprintln!("soak: cluster up, epoch {floor}");
+    let mut latest_epoch = assert_progress(
+        &mut nodes,
+        Some(&mut producer),
+        Some(&commit_oracle),
+        Duration::from_secs(90),
+        "startup",
+    );
+    eprintln!(
+        "soak: cluster up, epoch {latest_epoch}, ingested={}, Kafka committed offset sum={}",
+        cluster_metric(&nodes, "laminardb_events_ingested_total"),
+        commit_oracle.committed_offset_sum().unwrap_or(0)
+    );
 
-    // `LAMINAR_SOAK_KILLS=0` runs a steady no-process-death soak while the optional cycle fault
-    // drives coordinated recovery. Default: kill for the whole window.
-    let max_kills = env_u64("LAMINAR_SOAK_KILLS", u64::MAX);
+    if let Some(role) = fault_role.as_deref() {
+        let leader = wait_for_stable_leader(&mut nodes, &mut producer);
+        let victim = match role {
+            "leader" => leader,
+            "follower" => (0..NODES)
+                .find(|id| *id != leader)
+                .expect("three-node cluster has no follower"),
+            _ => unreachable!(),
+        };
+        let fault_baseline = nodes[victim]
+            .metric("laminardb_pipeline_faults_total")
+            .expect("selected node did not expose pipeline_faults_total");
+        let recovery_baselines: Vec<f64> = nodes
+            .iter()
+            .map(|node| {
+                node.metric("laminardb_coordinated_recoveries_total")
+                    .expect("node did not expose coordinated_recoveries_total")
+            })
+            .collect();
+        let failure_baselines: Vec<f64> = nodes
+            .iter()
+            .map(|node| {
+                node.metric("laminardb_coordinated_recovery_failures_total")
+                    .expect("node did not expose coordinated_recovery_failures_total")
+            })
+            .collect();
+        eprintln!("soak: trigger fatal cycle fault on observed {role} node {victim}");
+        nodes[victim].trigger_fault(role);
+        wait_for(
+            "selected node to report the injected pipeline fault",
+            Duration::from_secs(30),
+            || {
+                assert_running_nodes(&mut nodes);
+                producer.assert_running();
+                nodes[victim]
+                    .metric("laminardb_pipeline_faults_total")
+                    .is_some_and(|faults| faults > fault_baseline)
+            },
+        );
+        wait_for(
+            "every node to apply the coordinated recovery round",
+            Duration::from_secs(90),
+            || {
+                assert_running_nodes(&mut nodes);
+                producer.assert_running();
+                nodes
+                    .iter()
+                    .zip(&recovery_baselines)
+                    .all(|(node, baseline)| {
+                        node.metric("laminardb_coordinated_recoveries_total")
+                            .is_some_and(|recoveries| recoveries > *baseline)
+                    })
+            },
+        );
+        for (node, baseline) in nodes.iter().zip(&failure_baselines) {
+            let failures = node
+                .metric("laminardb_coordinated_recovery_failures_total")
+                .expect("node stopped exposing coordinated_recovery_failures_total");
+            assert_eq!(
+                failures, *baseline,
+                "node{} recorded a coordinated recovery failure",
+                node.id
+            );
+        }
+        latest_epoch = assert_progress(
+            &mut nodes,
+            Some(&mut producer),
+            Some(&commit_oracle),
+            Duration::from_secs(90),
+            "progress after coordinated recovery",
+        );
+        eprintln!("soak: coordinated {role} recovery complete, epoch {latest_epoch}");
+    }
+
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
     let mut round = 0u32;
     let mut kills = 0u64;
-    while Instant::now() < deadline {
-        round += 1;
-        if kills < max_kills {
-            // kill -9 a node mid-epoch (cadence guarantees an epoch is in flight). Round-robin over
-            // the soak hits the leader and every follower.
-            let victim = (kills as usize) % NODES;
-            kills += 1;
-            eprintln!("soak round {round}: kill -9 node {victim}");
-            nodes[victim].kill9();
-            floor = assert_progress(
-                &nodes,
-                floor,
-                Duration::from_secs(90),
-                "progress after kill",
-            );
-
-            // Restart it; it must rejoin and the cluster keeps committing.
-            nodes[victim].spawn();
-            wait_for(
-                "killed node serving /metrics again",
-                Duration::from_secs(60),
-                || nodes[victim].epoch().is_some(),
-            );
-            floor = assert_progress(
-                &nodes,
-                floor,
-                Duration::from_secs(90),
-                "progress after rejoin",
-            );
-        } else {
-            // No-fault steady state: confirm progress, then pace the loop so demotion gets clean windows.
-            floor = assert_progress(&nodes, floor, Duration::from_secs(90), "steady progress");
-            std::thread::sleep(Duration::from_secs(5));
-        }
-
-        // Per-round tier snapshot: the final scrape can land just after a rebalance wiped a node's
-        // tier, so logging each round captures the peak.
+    let mut leader_kills = 0u64;
+    let mut follower_kills = 0u64;
+    let log_tier = |nodes: &[Node], round: u32| {
         if std::env::var("LAMINAR_SOAK_STATE_TIER").is_ok() {
-            let s = |m: &str| -> f64 { nodes.iter().filter_map(|n| n.metric(m)).sum() };
             eprintln!(
                 "soak round {round} tier: demotes={} fetches={} resident_bytes={} \
                  slices={} in_memory_state={}",
-                s("laminardb_state_tier_demote_total"),
-                s("laminardb_state_tier_fetch_total"),
-                s("laminardb_state_tier_bytes"),
-                s("laminardb_state_tier_slices"),
-                s("laminardb_state_bytes"),
+                cluster_metric(nodes, "laminardb_state_tier_demote_total"),
+                cluster_metric(nodes, "laminardb_state_tier_fetch_total"),
+                cluster_metric(nodes, "laminardb_state_tier_bytes"),
+                cluster_metric(nodes, "laminardb_state_tier_slices"),
+                cluster_metric(nodes, "laminardb_state_bytes"),
             );
         }
+    };
+
+    while kills < max_kills {
+        round += 1;
+        let leader = wait_for_stable_leader(&mut nodes, &mut producer);
+        let (victim, victim_role) = if kills.is_multiple_of(NODES as u64) {
+            leader_kills += 1;
+            (leader, "leader")
+        } else {
+            let followers: Vec<usize> = (0..NODES).filter(|id| *id != leader).collect();
+            let victim = followers[((kills - 1) as usize) % followers.len()];
+            follower_kills += 1;
+            (victim, "follower")
+        };
+        nodes[victim].assert_running();
+        nodes[victim].arm_checkpoint_kill(victim_role);
+        wait_for(
+            "selected node to enter its armed checkpoint phase",
+            Duration::from_secs(45),
+            || {
+                assert_running_nodes(&mut nodes);
+                producer.assert_running();
+                nodes[victim].checkpoint_kill_ready(victim_role)
+            },
+        );
+        eprintln!(
+            "soak round {round}: kill -9 observed {victim_role} node {victim} inside checkpoint"
+        );
+        nodes[victim].kill9();
+        nodes[victim].disarm_checkpoint_kill();
+        kills += 1;
+        let post_kill_epoch = assert_progress(
+            &mut nodes,
+            Some(&mut producer),
+            Some(&commit_oracle),
+            Duration::from_secs(90),
+            "progress after kill",
+        );
+        eprintln!("soak round {round}: survivors advanced to epoch {post_kill_epoch}");
+
+        // Restart it; every process must be live again and the workload/checkpoint offsets advance.
+        nodes[victim].spawn();
+        wait_for(
+            "killed node serving /metrics again",
+            Duration::from_secs(60),
+            || {
+                assert_running_nodes(&mut nodes);
+                producer.assert_running();
+                nodes[victim].epoch().is_some()
+            },
+        );
+        let victim_ingested = nodes[victim]
+            .metric("laminardb_events_ingested_total")
+            .expect("restarted node did not expose events_ingested_total");
+        wait_for(
+            "restarted node to rejoin membership and ingest its assigned workload",
+            Duration::from_secs(60),
+            || {
+                assert_running_nodes(&mut nodes);
+                producer.assert_running();
+                has_full_membership(&nodes)
+                    && nodes[victim]
+                        .metric("laminardb_events_ingested_total")
+                        .is_some_and(|ingested| ingested > victim_ingested)
+            },
+        );
+        latest_epoch = assert_progress(
+            &mut nodes,
+            Some(&mut producer),
+            Some(&commit_oracle),
+            Duration::from_secs(90),
+            "progress after rejoin",
+        );
+        log_tier(&nodes, round);
+    }
+    assert_eq!(
+        kills, max_kills,
+        "cluster soak did not complete every requested kill"
+    );
+    if max_kills >= NODES as u64 {
+        assert!(
+            leader_kills > 0,
+            "cluster soak did not kill an observed leader"
+        );
+        assert!(
+            follower_kills >= 2,
+            "cluster soak did not complete both requested follower-role kills"
+        );
     }
 
-    eprintln!("soak: completed {round} rounds ({kills} kills), final epoch {floor}");
+    while Instant::now() < deadline {
+        round += 1;
+        latest_epoch = assert_progress(
+            &mut nodes,
+            Some(&mut producer),
+            Some(&commit_oracle),
+            Duration::from_secs(90),
+            "steady progress",
+        );
+        log_tier(&nodes, round);
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    assert_running_nodes(&mut nodes);
+    producer.assert_running();
+    eprintln!(
+        "soak: completed {round} rounds ({kills} kills: {leader_kills} leader, \
+         {follower_kills} follower), final epoch {latest_epoch}"
+    );
 
     // Durability-gate poll wait vs whole checkpoint (leader-only metric; sum picks it up).
     // avg = histogram sum/count.
@@ -761,19 +1417,7 @@ fn three_node_kill9_soak() {
         );
     }
 
-    // Recovery proof: with a fault injected and no kill-9 churn (which would reset the per-node
-    // metric on restart), the cluster must have applied the leader-coordinated round.
-    if fault_inject_ms.is_some() && max_kills == 0 {
-        let recoveries: f64 = nodes
-            .iter()
-            .filter_map(|n| n.metric("laminardb_coordinated_recoveries_total"))
-            .sum();
-        assert!(
-            recoveries >= 1.0,
-            "fault injected but no coordinated recovery recorded across the cluster",
-        );
-        eprintln!("soak: coordinated recoveries applied = {recoveries}");
-    }
+    producer.stop();
 }
 
 /// Create `topic` with `partitions` partitions (blocking; the admin API is async).
@@ -790,47 +1434,49 @@ fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
             .create()
             .expect("admin client");
         let new = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
-        admin
+        let results = admin
             .create_topics([&new], &AdminOptions::new())
             .await
             .expect("create_topics");
+        for result in results {
+            if let Err((failed_topic, error)) = result {
+                panic!("failed to create Kafka topic {failed_topic:?}: {error}");
+            }
+        }
     });
 }
 
-/// Produce `{"seq": n}` for `n in 0..count`, keyed by `seq`, paced near `rps` so the cluster is
-/// still consuming throughout the fault rounds. Blocks until all are produced and flushed.
-fn produce_seq(brokers: &str, topic: &str, count: i64, rps: u64) {
-    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-    let producer: BaseProducer = rdkafka::ClientConfig::new()
+/// Produce an unbounded `{"seq": n}` stream, paced near `rps`, until the guard requests stop.
+/// Every delivery is awaited so broker-side rejection or timeout fails the soak.
+fn produce_seq(brokers: &str, topic: &str, rps: u64, stop: &AtomicBool) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
         .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "10000")
+        .set("enable.idempotence", "true")
         .create()
         .expect("producer");
-    let batch = (rps / 20).max(1) as i64; // ~20 bursts/sec
-    let mut n = 0i64;
-    while n < count {
-        for _ in 0..batch.min(count - n) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("producer runtime");
+    runtime.block_on(async {
+        let start = tokio::time::Instant::now();
+        let mut n = 0i64;
+        while !stop.load(Ordering::Acquire) {
             let payload = format!(r#"{{"seq":{n}}}"#);
             let key = n.to_string();
-            let mut rec = BaseRecord::to(topic).payload(&payload).key(&key);
-            loop {
-                match producer.send(rec) {
-                    Ok(()) => break,
-                    Err((
-                        rdkafka::error::KafkaError::MessageProduction(
-                            rdkafka::types::RDKafkaErrorCode::QueueFull,
-                        ),
-                        r,
-                    )) => {
-                        rec = r;
-                        producer.poll(Duration::from_millis(20));
-                    }
-                    Err((e, _)) => panic!("produce: {e}"),
-                }
-            }
-            n += 1;
+            producer
+                .send(
+                    FutureRecord::to(topic).payload(&payload).key(&key),
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_or_else(|(error, _)| panic!("Kafka delivery failed: {error}"));
+            n = n.checked_add(1).expect("soak sequence overflow");
+            let target = start + Duration::from_secs_f64(n as f64 / rps as f64);
+            tokio::time::sleep_until(target).await;
         }
-        producer.poll(Duration::from_millis(0));
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    producer.flush(Duration::from_secs(60)).expect("flush");
+    });
 }

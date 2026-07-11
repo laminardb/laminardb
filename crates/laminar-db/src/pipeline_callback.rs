@@ -2185,32 +2185,64 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         watermark: i64,
     ) -> Result<crate::pipeline::CycleOutcome, crate::pipeline::CycleError> {
         // Test-only one-shot fault injector for the recovery soak (inert in release / when
-        // unset): the first cycle after `LAMINAR_FAULT_INJECT_AFTER_MS` faults once.
-        #[cfg(debug_assertions)]
+        // unset). The harness creates a per-process trigger file only after the cluster has
+        // reached steady state and it has observed the node's actual leader/follower role.
+        #[cfg(all(debug_assertions, feature = "cluster"))]
         {
-            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
             use std::sync::OnceLock;
-            use std::time::{Duration, Instant};
-            static AFTER_MS: OnceLock<Option<u64>> = OnceLock::new();
-            static START: OnceLock<Instant> = OnceLock::new();
+            use std::time::Instant;
+            static TRIGGER_FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+            static POLL_START: OnceLock<Instant> = OnceLock::new();
+            static NEXT_POLL_MS: AtomicU64 = AtomicU64::new(0);
             static FIRED: AtomicBool = AtomicBool::new(false);
-            if let Some(after_ms) = *AFTER_MS.get_or_init(|| {
-                std::env::var("LAMINAR_FAULT_INJECT_AFTER_MS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            }) {
-                let start = START.get_or_init(Instant::now);
-                if !FIRED.load(Ordering::Relaxed)
-                    && start.elapsed() >= Duration::from_millis(after_ms)
-                    && FIRED
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            if let Some(path) = TRIGGER_FILE
+                .get_or_init(|| {
+                    std::env::var_os("LAMINAR_FAULT_INJECT_TRIGGER_FILE").map(Into::into)
+                })
+                .as_ref()
+            {
+                let now_ms =
+                    u64::try_from(POLL_START.get_or_init(Instant::now).elapsed().as_millis())
+                        .unwrap_or(u64::MAX);
+                let next_poll = NEXT_POLL_MS.load(Ordering::Relaxed);
+                if now_ms >= next_poll
+                    && NEXT_POLL_MS
+                        .compare_exchange(
+                            next_poll,
+                            now_ms.saturating_add(25),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
                         .is_ok()
                 {
-                    return Err(crate::pipeline::CycleError::Fatal(
-                        "injected fault for coordinated-recovery soak \
-                         (LAMINAR_FAULT_INJECT_AFTER_MS)"
-                            .into(),
-                    ));
+                    let requested_role = std::fs::read_to_string(path).ok();
+                    let role_matches = requested_role.as_deref().is_some_and(|role| {
+                        self.cluster_controller.as_ref().is_some_and(|controller| {
+                            match role.trim() {
+                                "leader" => controller.is_leader(),
+                                "follower" => {
+                                    !controller.is_leader() && controller.current_leader().is_some()
+                                }
+                                _ => false,
+                            }
+                        })
+                    });
+                    if role_matches
+                        && !FIRED.load(Ordering::Relaxed)
+                        && FIRED
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        if std::fs::remove_file(path).is_ok() {
+                            return Err(crate::pipeline::CycleError::Fatal(
+                                "injected fault for coordinated-recovery soak \
+                                 (LAMINAR_FAULT_INJECT_TRIGGER_FILE)"
+                                    .into(),
+                            ));
+                        }
+                        FIRED.store(false, Ordering::Release);
+                    }
                 }
             }
         }

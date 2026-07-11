@@ -575,7 +575,7 @@ pub trait CheckpointStore: Send + Sync {
     /// the previous valid checkpoint.
     ///
     /// Orphaned `state.bin` files (written but no manifest) are harmless and
-    /// cleaned up by [`prune()`](Self::prune).
+    /// cleaned up by [`Self::cleanup_orphans`].
     ///
     /// # Errors
     ///

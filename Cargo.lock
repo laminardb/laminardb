@@ -5135,6 +5135,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "uuid",
  "x509-parser",
  "xxhash-rust",

@@ -59,6 +59,7 @@ thiserror = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+tungstenite = "0.28"
 toml = "1.1"
 
 # Web framework
@@ -125,7 +126,7 @@ tokio-postgres-rustls = "0.13"
 rcgen = "0.13"
 serde_json = { workspace = true }
 
-# Kafka consumer/admin used by the cluster_soak exactly-once output diff.
+# Kafka admin, producer, and committed-offset oracle used by the cluster soak.
 # Same per-platform split as laminar-db's kafka_docker_scenarios dev-dep
 # (Windows resolves OpenSSL via OPENSSL_DIR instead of the ssl feature).
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]

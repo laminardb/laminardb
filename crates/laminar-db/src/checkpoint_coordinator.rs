@@ -405,6 +405,37 @@ impl std::fmt::Display for CheckpointPhase {
     }
 }
 
+/// Debug-only handshake used by the real-process soak to stop a selected role inside an active
+/// checkpoint before sending `SIGKILL`. The arm file contains `leader` or `follower`; the runtime
+/// publishes a sibling `.ready` file and holds the checkpoint until the harness kills the process
+/// or removes the arm. Release builds contain no hook.
+#[cfg(all(debug_assertions, feature = "cluster"))]
+async fn checkpoint_kill_gate(role: &'static str) {
+    static GATE_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(gate_file) = GATE_FILE
+        .get_or_init(|| std::env::var_os("LAMINAR_CHECKPOINT_KILL_GATE_FILE").map(Into::into))
+        .as_ref()
+    else {
+        return;
+    };
+    if std::fs::read_to_string(gate_file)
+        .ok()
+        .is_none_or(|requested| requested.trim() != role)
+    {
+        return;
+    }
+
+    let ready_file = gate_file.with_extension("ready");
+    if std::fs::write(&ready_file, role).is_err() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while gate_file.is_file() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = std::fs::remove_file(ready_file);
+}
+
 /// Result of a checkpoint attempt.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CheckpointResult {
@@ -3146,6 +3177,8 @@ impl CheckpointCoordinator {
         } = request;
 
         self.phase = CheckpointPhase::PreCommitting;
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        checkpoint_kill_gate("follower").await;
         match self.pre_commit_sinks_until(epoch, deadline).await {
             Ok(descriptors) => self.pending_sink_descriptors = descriptors,
             Err(e) => {
@@ -3232,6 +3265,8 @@ impl CheckpointCoordinator {
         info!(checkpoint_id, epoch, "starting checkpoint");
 
         self.phase = CheckpointPhase::Snapshotting;
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        checkpoint_kill_gate("leader").await;
         let source_offsets = source_offset_overrides;
         let table_offsets = extra_table_offsets;
 
