@@ -119,16 +119,16 @@ pub fn register_mongodb_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "mongodb-sink",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
+        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, true),
                 Field::new("value", DataType::Utf8, false),
             ]));
-            Box::new(MongoDbSink::new(
+            Ok(Box::new(MongoDbSink::new(
                 schema,
                 MongoDbSinkConfig::default(),
                 registry,
-            ))
+            )))
         }),
     );
 }

@@ -42,6 +42,12 @@ field and runs before `pipeline.start()`. Streaming-DDL is rejected on
 pgwire and on the HTTP `/api/v1/sql` endpoint after pipeline start, so
 the config TOML is the only working bootstrap channel.
 
+The demo selects <code>delivery = "exactly_once"</code> once under
+<code>[server]</code>. Its Kafka source is replayable, Iceberg is a
+checkpoint-committable sink, and <code>[state]</code> uses a node-durable local
+backend. This is the supported embedded/single-node exact topology; connector
+properties do not carry separate delivery flags or writer IDs.
+
 PowerShell:
 
 ```powershell
@@ -106,18 +112,20 @@ the current snapshot.
 
 ```sh
 docker compose down -v
+rm -rf .laminardb
 ```
 
 `-v` wipes the named volumes (Iceberg manifests, Parquet files, Kafka
-log segments).
+log segments). Removing <code>.laminardb</code> also clears the demo's local
+checkpoint state and deployment identity before a clean rerun.
 
 ## What the pipeline does
 
 | Stage | Behavior |
 |---|---|
 | `crypto_ticks` source | Reads `crypto.ticks` Kafka topic with `event.time.column = ts` and `WATERMARK FOR ts AS ts - INTERVAL '5' SECOND` (allows 5s of out-of-orderness before a window closes). |
-| `ohlc_1m` MV | `GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), symbol` produces non-overlapping per-symbol 1-minute buckets. `EMIT ON WINDOW CLOSE` makes the MV append-only — required by Iceberg's exactly-once 2PC contract. |
-| `ohlc_iceberg_sink` | 2PC commit per epoch (`exactly_once = true`, `two_phase_commit = true`). `auto.create='true'` authors the unpartitioned table on first commit. |
+| `ohlc_1m` MV | `GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), symbol` produces non-overlapping per-symbol 1-minute buckets. `EMIT ON WINDOW CLOSE` makes the MV append-only, as required by Iceberg's coordinated exact contract. |
+| `ohlc_iceberg_sink` | Stages checkpoint committables and publishes them after the durable checkpoint decision. The global server delivery setting activates the protocol; `auto.create='true'` authors the unpartitioned table on first commit. |
 | `query.sql` | Reads the Iceberg table through the iceberg-REST catalog; computes tick-weighted hourly VWAP from per-bar `notional` and `volume` so per-tick weighting is preserved across bars of different volume. |
 
 ## Gotchas

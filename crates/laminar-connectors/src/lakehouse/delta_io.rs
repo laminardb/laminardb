@@ -11,15 +11,12 @@
 //! - Clean separation of concerns (buffering/epoch management vs. actual writes)
 //! - Easy mocking for unit tests
 //!
-//! # Exactly-Once Semantics
+//! # Transaction identity
 //!
-//! Delta Lake's transaction log supports application-level transaction metadata
-//! via the `txn` action. We use this to store `(writer_id, epoch)` pairs, enabling
-//! exactly-once semantics:
-//!
-//! 1. On recovery, read `txn` metadata to find the last committed epoch for this writer
-//! 2. Skip epochs <= last committed (idempotent replay)
-//! 3. Each write includes the epoch in `txn` metadata
+//! Delta's `txn` action provides an idempotence primitive. Production global exactly-once uses
+//! the runtime-owned deployment/pipeline/sink namespace with globally unique checkpoint IDs and
+//! one designated catalog commit. Writer-local IDs below support ordinary direct transactions;
+//! they are not a distributed checkpoint protocol by themselves.
 
 #[cfg(feature = "delta-lake")]
 use std::collections::HashMap;
@@ -224,11 +221,13 @@ pub async fn write_batches(
         "writing batches to Delta Lake"
     );
 
-    // Build the write operation with transaction metadata for exactly-once.
-    // Note: Delta Lake uses i64 for epoch, but our API uses u64. This is safe
-    // as epochs won't exceed i64::MAX in practice.
-    #[allow(clippy::cast_possible_wrap)]
-    let epoch_i64 = epoch as i64;
+    // Delta encodes application transaction versions as signed integers. Overflow must fail
+    // closed; wrapping a new epoch onto an old version would suppress or duplicate output.
+    let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+        ConnectorError::TransactionError(format!(
+            "Delta transaction epoch {epoch} exceeds i64::MAX"
+        ))
+    })?;
 
     let mut write_builder = table
         .write(batches)
@@ -276,7 +275,7 @@ pub async fn write_batches(
     Ok((table, version))
 }
 
-/// Retrieves the last committed epoch for a writer from Delta Lake's txn metadata.
+/// Retrieves the last committed application transaction version.
 ///
 /// This is used for exactly-once recovery: on startup, we check what epoch was
 /// last committed and skip any epochs <= that value.
@@ -288,41 +287,46 @@ pub async fn write_batches(
 ///
 /// # Returns
 ///
-/// The last committed epoch for this writer, or 0 if no commits found.
+/// The last committed non-negative version, or `None` when the namespace has
+/// never committed. Metadata read/decoding failures are propagated so exact
+/// recovery never mistakes an unreadable cursor for an empty one.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::TransactionError` when the table snapshot or
+/// transaction metadata cannot be read, or when the stored cursor is negative.
 #[cfg(feature = "delta-lake")]
-pub async fn get_last_committed_epoch(table: &DeltaTable, writer_id: &str) -> u64 {
-    // Query the table's application transaction version.
-    let Ok(snapshot) = table.snapshot() else {
-        debug!(writer_id, "no snapshot available, assuming epoch 0");
-        return 0;
-    };
+pub async fn get_last_committed_version(
+    table: &DeltaTable,
+    writer_id: &str,
+) -> Result<Option<u64>, ConnectorError> {
+    let snapshot = table.snapshot().map_err(|error| {
+        ConnectorError::TransactionError(format!("read Delta snapshot: {error}"))
+    })?;
 
     match snapshot
         .transaction_version(&table.log_store(), writer_id)
         .await
     {
         Ok(Some(version)) => {
-            // Note: Delta Lake uses i64 for version, but our epoch is u64.
-            // Versions are always non-negative, so this is safe.
-            #[allow(clippy::cast_sign_loss)]
-            let epoch = version as u64;
+            let version = u64::try_from(version).map_err(|_| {
+                ConnectorError::TransactionError(format!(
+                    "Delta transaction cursor for '{writer_id}' is negative"
+                ))
+            })?;
             debug!(
                 writer_id,
-                epoch, "found last committed epoch from txn metadata"
+                version, "found last committed version from txn metadata"
             );
-            epoch
+            Ok(Some(version))
         }
         Ok(None) => {
-            debug!(
-                writer_id,
-                "no txn metadata found for writer, assuming epoch 0"
-            );
-            0
+            debug!(writer_id, "no transaction metadata found for namespace");
+            Ok(None)
         }
-        Err(e) => {
-            warn!(writer_id, error = %e, "failed to read txn metadata, assuming epoch 0");
-            0
-        }
+        Err(error) => Err(ConnectorError::TransactionError(format!(
+            "read Delta transaction cursor for '{writer_id}': {error}"
+        ))),
     }
 }
 
@@ -354,7 +358,7 @@ pub fn decode_commit_descriptors(
 }
 
 /// Append `adds` from all writers in one transaction, stamped with the
-/// committer's application transaction (`committer_id`, `epoch`) for idempotency.
+/// committer's application transaction (`committer_id`, `checkpoint_id`) for idempotency.
 ///
 /// # Errors
 /// Returns `ConnectorError::TransactionError` on commit failure.
@@ -363,7 +367,7 @@ pub async fn commit_adds_coordinated(
     table: &DeltaTable,
     adds: Vec<deltalake::kernel::Add>,
     committer_id: &str,
-    epoch: u64,
+    checkpoint_id: u64,
 ) -> Result<i64, ConnectorError> {
     use deltalake::kernel::transaction::CommitBuilder;
     use deltalake::kernel::Action;
@@ -381,9 +385,13 @@ pub async fn commit_adds_coordinated(
     };
 
     let actions: Vec<Action> = adds.into_iter().map(Action::Add).collect();
-    #[allow(clippy::cast_possible_wrap)]
+    let checkpoint_id = i64::try_from(checkpoint_id).map_err(|_| {
+        ConnectorError::TransactionError(
+            "checkpoint id exceeds Delta transaction-version range".into(),
+        )
+    })?;
     let props = CommitProperties::default()
-        .with_application_transaction(Transaction::new(committer_id, epoch as i64));
+        .with_application_transaction(Transaction::new(committer_id, checkpoint_id));
     let finalized = CommitBuilder::from(props)
         .with_actions(actions)
         .build(Some(snapshot), table.log_store(), operation)
@@ -1093,8 +1101,11 @@ pub async fn merge_changelog(
     let upsert_pred = col("source._op").in_list(vec![lit("I"), lit("U"), lit("r")], false);
     let delete_pred = col("source._op").eq(lit("D"));
 
-    #[allow(clippy::cast_possible_wrap)]
-    let epoch_i64 = epoch as i64;
+    let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+        ConnectorError::TransactionError(format!(
+            "Delta MERGE transaction epoch {epoch} exceeds i64::MAX"
+        ))
+    })?;
 
     let non_key_for_update = non_key_user_columns;
     let all_for_insert = all_user_columns;

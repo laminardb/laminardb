@@ -36,6 +36,7 @@ mod catalog;
 mod catalog_connector;
 mod changelog_filter;
 /// Unified checkpoint coordination.
+#[doc(hidden)]
 pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
@@ -74,6 +75,7 @@ mod operator_graph;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
+mod pipeline_identity;
 mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
@@ -119,10 +121,7 @@ pub mod ffi;
 
 pub use builder::LaminarDbBuilder;
 pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
-pub use checkpoint_coordinator::{
-    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
-    CheckpointStats,
-};
+pub use checkpoint_coordinator::{CheckpointPhase, CheckpointResult, CheckpointStats};
 pub use config::{BackpressurePolicy, LaminarConfig, RestartPolicy};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
@@ -132,6 +131,7 @@ pub use handle::{
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
     StreamInfo, TypedSubscription, UntypedSourceHandle,
 };
+pub use laminar_connectors::connector::DeliveryGuarantee;
 #[cfg(feature = "state-tier")]
 pub use metrics::TierMetrics;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};

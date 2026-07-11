@@ -739,6 +739,13 @@ mod grpc {
     impl DeliveryTracker {
         /// A new sender process restarts its sequence at zero. A reconnect of the *same* process
         /// keeps its state — that is precisely the case whose dropped queue we must detect.
+        ///
+        /// Known gap: an unseen peer is assumed to start at zero, which is wrong when *we* are the
+        /// side that restarted — the surviving sender's counter is mid-sequence and its next frame
+        /// reads as a gap of that whole counter. See `restarted_receiver_false_positives_on_a_
+        /// surviving_sender`. The receiver cannot tell that apart from a sender whose early frames
+        /// were discarded before its stream ever opened, so closing it needs the *sender* to reset
+        /// its counter when the receiver's incarnation changes, not a receiver-side heuristic.
         fn observe_hello(&self, peer: ShufflePeerId, incarnation: u64) {
             let mut peers = self.peers.lock();
             let st = peers.entry(peer).or_default();
@@ -973,6 +980,69 @@ mod grpc {
             }
         }
         Ok(true)
+    }
+
+    #[cfg(test)]
+    mod delivery_tests {
+        use super::*;
+
+        const LOST: Ordering = Ordering::Acquire;
+
+        /// A restarted sender starts its counter at zero, so a frame that never arrived is a hole.
+        #[test]
+        fn restarted_sender_still_reveals_a_hole() {
+            let d = DeliveryTracker::default();
+            d.observe_hello(7, 1);
+            assert!(d.observe_data(7, 0));
+            d.observe_hello(7, 2); // the sender restarted: fresh counter
+            assert!(d.observe_data(7, 1)); // its frame 0 never arrived
+            assert_eq!(d.lost.load(LOST), 1);
+        }
+
+        /// CL-2 proper: a reconnect of the *same* incarnation keeps its expectation, or the queue
+        /// the transport discarded leaves no trace.
+        #[test]
+        fn same_incarnation_reconnect_keeps_expectation() {
+            let d = DeliveryTracker::default();
+            d.observe_hello(7, 1);
+            assert!(d.observe_data(7, 0));
+            d.observe_hello(7, 1); // reconnect of the same process
+            assert!(d.observe_data(7, 2)); // frame 1 died with the queue
+            assert_eq!(d.lost.load(LOST), 1);
+        }
+
+        /// A rewind discards in-flight frames on purpose; the next frame re-baselines.
+        #[test]
+        fn rewind_rebaseline_absorbs_the_discarded_frames() {
+            let d = DeliveryTracker::default();
+            d.observe_hello(7, 1);
+            assert!(d.observe_data(7, 0));
+            d.rebaseline_all();
+            assert!(d.observe_data(7, 40));
+            assert_eq!(d.lost.load(LOST), 0);
+        }
+
+        /// A peer that outlived *our* restart keeps its counter (`ShuffleSender::seqs` is per
+        /// process, not per connection), but our tracker is empty, so `observe_hello` baselines it
+        /// at 0 and its next frame reads as a gap of the peer's whole history — a spurious fence
+        /// and recovery round on every restart where the peer survived.
+        ///
+        /// Not fixable at the receiver: `Hello` carrying the sender's next sequence would also hide
+        /// the real loss in `barrier_high_water_mark_catches_trailing_loss` (frames enqueued and
+        /// discarded before the stream ever opened). The sender must reset `seqs[peer]` when the
+        /// receiver's incarnation changes, which needs a receiver→sender identity signal.
+        #[test]
+        #[ignore = "known defect: needs a receiver→sender incarnation signal so the sender rebases"]
+        fn restarted_receiver_false_positives_on_a_surviving_sender() {
+            let d = DeliveryTracker::default(); // our tracker, fresh after a restart
+            d.observe_hello(7, 0xABCD); // the peer never restarted; its counter is at 500
+            assert!(d.observe_data(7, 500));
+            assert_eq!(
+                d.lost.load(LOST),
+                0,
+                "a surviving peer's history is not transit loss"
+            );
+        }
     }
 
     #[cfg(test)]

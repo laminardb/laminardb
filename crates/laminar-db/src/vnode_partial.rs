@@ -1,4 +1,4 @@
-//! Per-vnode durable partial state (`epoch=N/vnode=V/partial.bin`).
+//! Per-vnode durable partial state in an immutable checkpoint-attempt namespace.
 //!
 //! An empty `operators` map is valid: it seals the epoch carrying no state.
 
@@ -13,20 +13,18 @@ pub(crate) struct OpDelta {
 
 /// Operator-state slices for one vnode at one epoch, in one of three shapes:
 ///
-/// - FULL: `operators` non-empty, `base_epoch = None`, `deltas` empty.
-/// - REFERENCE: `operators`/`deltas` empty, `base_epoch = Some(N)` — byte-identical to epoch N.
-/// - DELTA: `deltas` non-empty, `base_epoch = Some(parent)` — per-operator changes since `parent`.
+/// - FULL: `operators` non-empty, `base = None`, `deltas` empty.
+/// - REFERENCE: `operators`/`deltas` empty, `base = Some(attempt)` — byte-identical to the base.
+/// - DELTA: `deltas` non-empty, `base = Some(parent)` — per-operator changes since `parent`.
 ///
-/// `base_epoch` is the parent link; the reader walks it back to a FULL and replays deltas forward.
-/// The writer re-bases (re-emits FULL) before the base leaves the prune window.
+/// `base` is an exact parent-attempt link; the reader walks it back to a FULL and replays deltas
+/// forward. The writer re-bases before the base leaves the prune window.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct VnodePartial {
-    /// Sealed epoch, for audit.
-    pub checkpoint_id: u64,
     /// `(operator_name, vnode-slice bytes)`: FULL slices; also operators that re-based this epoch.
     pub operators: Vec<(String, Vec<u8>)>,
-    /// `Some(epoch)` = parent link (reference base, or delta parent).
-    pub base_epoch: Option<u64>,
+    /// Exact parent attempt for a reference or delta chain.
+    pub base: Option<laminar_core::state::CheckpointAttempt>,
     /// `(operator_name, delta)`. Non-empty only for delta partials.
     pub deltas: Vec<(String, OpDelta)>,
 }
@@ -53,17 +51,15 @@ mod tests {
     #[test]
     fn round_trips() {
         let p = VnodePartial {
-            checkpoint_id: 42,
             operators: vec![
                 ("agg".to_string(), vec![1, 2, 3]),
                 ("other".to_string(), vec![]),
             ],
-            base_epoch: None,
+            base: None,
             deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
-        assert_eq!(back.checkpoint_id, 42);
         assert_eq!(back.operators.len(), 2);
         assert_eq!(back.operators[0].0, "agg");
         assert_eq!(back.operators[0].1, vec![1, 2, 3]);
@@ -72,28 +68,28 @@ mod tests {
     #[test]
     fn empty_operators_round_trips() {
         let p = VnodePartial {
-            checkpoint_id: 7,
             operators: Vec::new(),
-            base_epoch: None,
+            base: None,
             deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
-        assert_eq!(back.checkpoint_id, 7);
         assert!(back.operators.is_empty());
     }
 
     #[test]
     fn reference_round_trips() {
         let p = VnodePartial {
-            checkpoint_id: 9,
             operators: Vec::new(),
-            base_epoch: Some(4),
+            base: Some(laminar_core::state::CheckpointAttempt::new(4, 9)),
             deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
-        assert_eq!(back.base_epoch, Some(4));
+        assert_eq!(
+            back.base,
+            Some(laminar_core::state::CheckpointAttempt::new(4, 9))
+        );
         assert!(back.operators.is_empty());
     }
 

@@ -95,9 +95,7 @@ arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
-
-# Probabilistic data structures
-xorf = "0.12"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # Encoding
 base64 = "0.22"

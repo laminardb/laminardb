@@ -38,8 +38,6 @@ pub struct IcebergReferenceTableSource {
     delivered_snapshot_id: Option<i64>,
     /// Time of last change poll.
     last_poll_time: Option<Instant>,
-    /// Current epoch.
-    epoch: u64,
     /// Cached catalog connection.
     #[cfg(feature = "iceberg")]
     catalog: Option<Arc<dyn iceberg::Catalog>>,
@@ -57,7 +55,6 @@ impl IcebergReferenceTableSource {
             loaded_snapshot_id: None,
             delivered_snapshot_id: None,
             last_poll_time: None,
-            epoch: 0,
             #[cfg(feature = "iceberg")]
             catalog: None,
         }
@@ -201,7 +198,7 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(self.epoch);
+        let mut cp = SourceCheckpoint::new();
         if let Some(sid) = self.delivered_snapshot_id {
             cp.set_offset("snapshot_id", sid.to_string());
         }
@@ -210,7 +207,6 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
     }
 
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        self.epoch = checkpoint.epoch();
         if let Some(sid) = checkpoint.get_offset("snapshot_id") {
             let snap: i64 = sid.parse().map_err(|_| {
                 ConnectorError::Internal(format!("invalid snapshot_id in checkpoint: '{sid}'"))
@@ -258,8 +254,6 @@ mod tests {
         // Simulate fully-delivered snapshot.
         source.delivered_snapshot_id = Some(99);
         source.loaded_snapshot_id = Some(99);
-        source.epoch = 7;
-
         let cp = source.checkpoint();
         assert_eq!(cp.get_offset("snapshot_id"), Some("99"));
         assert_eq!(cp.get_metadata("connector_type"), Some("iceberg-reference"));
@@ -268,7 +262,6 @@ mod tests {
         restored.restore(&cp).await.unwrap();
         assert_eq!(restored.delivered_snapshot_id, Some(99));
         assert_eq!(restored.loaded_snapshot_id, Some(99));
-        assert_eq!(restored.epoch, 7);
     }
 
     #[tokio::test]

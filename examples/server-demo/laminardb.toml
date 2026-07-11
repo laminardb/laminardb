@@ -11,6 +11,7 @@
 [server]
 mode = "embedded"
 bind = "127.0.0.1:9000"
+delivery = "at_least_once"
 metrics_bind = "127.0.0.1:9090"
 workers = 0
 log_level = "info"
@@ -21,8 +22,6 @@ backend = "in_process"
 [checkpoint]
 url = "file:///tmp/laminardb-server-demo/checkpoints"
 interval = "10s"
-mode = "aligned"
-snapshot_strategy = "full"
 
 # ── Sources ─────────────────────────────────────────────────────────────
 
@@ -219,7 +218,6 @@ EMIT AFTER WATERMARK
 name = "ohlc_sink"
 pipeline = "ohlc_bars"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 brokers = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "ohlc-bars"
@@ -229,7 +227,6 @@ topic = "ohlc-bars"
 name = "volume_sink"
 pipeline = "volume_metrics"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 brokers = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "volume-metrics"
@@ -239,7 +236,6 @@ topic = "volume-metrics"
 name = "vwap_sink"
 pipeline = "vwap"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 brokers = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "vwap-results"
@@ -249,7 +245,6 @@ topic = "vwap-results"
 name = "anomaly_sink"
 pipeline = "anomaly_alerts"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 brokers = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "anomaly-alerts"

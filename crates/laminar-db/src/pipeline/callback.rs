@@ -9,7 +9,8 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SourceConnector;
+use laminar_connectors::connector::{SourceConnector, SourceContract, SourcePosition};
+use laminar_core::state::CheckpointAttempt;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Why a barrier checkpoint was deliberately skipped, as opposed to
@@ -44,6 +45,91 @@ pub enum BarrierOutcome {
     Skipped(SkipReason),
     /// Attempted and failed; retry on the next interval.
     Failed,
+}
+
+/// Durable completion of one exact checkpoint attempt.
+///
+/// The checkpoint ID cannot be reconstructed from the execution epoch: durable ID
+/// reservations may be burned when an earlier attempt is abandoned. Keeping the exact
+/// attempt on the completion channel prevents downstream barriers and source commits from
+/// being attributed to a different checkpoint timeline.
+#[derive(Debug)]
+pub(crate) enum CheckpointCompletion {
+    /// The exact attempt reached its durable commit point.
+    Committed {
+        /// Exact attempt admitted before capture.
+        attempt: CheckpointAttempt,
+        /// Coordinator result for the same attempt.
+        result: crate::checkpoint_coordinator::CheckpointResult,
+        /// Per-source positions persisted by that exact attempt.
+        source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+    },
+    /// The admitted attempt terminated without a durable commit.
+    Failed {
+        /// Exact attempt that failed.
+        attempt: CheckpointAttempt,
+        /// Stable user-facing failure reason.
+        error: String,
+    },
+}
+
+impl CheckpointCompletion {
+    /// Create a completion for a path whose exact attempt is already authoritative.
+    #[cfg(any(feature = "cluster", test))]
+    #[must_use]
+    pub(crate) fn new(
+        attempt: CheckpointAttempt,
+        source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+    ) -> Self {
+        Self::Committed {
+            attempt,
+            result: crate::checkpoint_coordinator::CheckpointResult {
+                success: true,
+                checkpoint_id: attempt.checkpoint_id,
+                epoch: attempt.epoch,
+                duration: std::time::Duration::ZERO,
+                error: None,
+            },
+            source_checkpoints,
+        }
+    }
+
+    /// Build a completion only when the coordinator result belongs to the admitted attempt.
+    pub(crate) fn validated(
+        admitted: CheckpointAttempt,
+        result: crate::checkpoint_coordinator::CheckpointResult,
+        source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+    ) -> Result<Self, String> {
+        let completed = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
+        if completed != admitted {
+            return Err(format!(
+                "checkpoint completion identity mismatch: admitted epoch={} id={}, \
+                 coordinator completed epoch={} id={}",
+                admitted.epoch, admitted.checkpoint_id, completed.epoch, completed.checkpoint_id,
+            ));
+        }
+        Ok(Self::Committed {
+            attempt: admitted,
+            result,
+            source_checkpoints,
+        })
+    }
+
+    /// Create a terminal failure for an already-admitted exact attempt.
+    pub(crate) fn failed(attempt: CheckpointAttempt, error: impl Into<String>) -> Self {
+        Self::Failed {
+            attempt,
+            error: error.into(),
+        }
+    }
+
+    /// Exact attempt that reached a terminal outcome.
+    #[must_use]
+    pub(crate) const fn attempt(&self) -> CheckpointAttempt {
+        match self {
+            Self::Committed { attempt, .. } | Self::Failed { attempt, .. } => *attempt,
+        }
+    }
 }
 
 /// How a failed `execute_cycle` should be handled by the coordinator.
@@ -87,12 +173,12 @@ pub struct SourceRegistration {
     pub name: String,
     /// The connector (owned).
     pub connector: Box<dyn SourceConnector>,
-    /// Connector config (for open).
+    /// Connector config included in the atomic startup request.
     pub config: ConnectorConfig,
-    /// Whether this source supports replay from a checkpointed position.
-    pub supports_replay: bool,
-    /// Checkpoint to restore on startup (set during recovery).
-    pub restore_checkpoint: Option<SourceCheckpoint>,
+    /// Durability and placement semantics resolved from the connector configuration.
+    pub contract: SourceContract,
+    /// Exact position to install atomically when the source starts.
+    pub position: SourcePosition,
 }
 
 /// Callback trait for the coordinator to interact with the rest of the DB.
@@ -133,8 +219,8 @@ pub trait PipelineCallback: Send + 'static {
         true
     }
 
-    /// `true` while a coordinated restart is in flight; the checkpoint gate holds and the
-    /// shutdown drain skips its final checkpoint. Default `false`.
+    /// `true` while a coordinated restart is in flight; the checkpoint admission gate holds.
+    /// Default `false`.
     fn is_recovering(&self) -> bool {
         false
     }
@@ -152,6 +238,45 @@ pub trait PipelineCallback: Send + 'static {
         None
     }
 
+    /// Record a checkpoint failure observed by the coordinator. Exactly-once implementations
+    /// fault for recovery; weaker guarantees may retain retry-on-next-interval behaviour.
+    fn record_checkpoint_failure(&mut self, _checkpoint_id: u64, _reason: &str) {}
+
+    /// Record a failure before an exact checkpoint attempt could be reserved.
+    fn record_checkpoint_admission_failure(&mut self, _reason: &str) {}
+
+    /// Join tracked asynchronous checkpoint tails before connector teardown. When `abort` is
+    /// true, cancel them first because the bounded graceful-drain budget has expired.
+    fn settle_checkpoint_tail_tasks(
+        &mut self,
+        _abort: bool,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    /// Durably reserve the exact attempt before barriers are admitted to sources.
+    ///
+    /// Implementations must never synthesize an in-memory checkpoint ID. A successful
+    /// reservation may be abandoned, but its ID is permanently burned.
+    fn reserve_checkpoint_attempt(
+        &mut self,
+        _attempt_started: std::time::Instant,
+    ) -> impl std::future::Future<Output = Result<CheckpointAttempt, String>> + Send {
+        std::future::ready(Err(
+            "checkpoint coordinator has no durable attempt allocator".into(),
+        ))
+    }
+
+    /// Abandon a reserved attempt that cannot reach the durable checkpoint tail.
+    /// Transactional sinks must roll back that epoch before the next attempt begins.
+    fn abandon_checkpoint_attempt(
+        &mut self,
+        _attempt: CheckpointAttempt,
+        _reason: &str,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+
     /// `true` when the cluster is converged enough for the leader to checkpoint; the
     /// cluster impl reads a locally-published verdict, no gossip. Default `true`
     /// (single-node). `impl Future` (not `async fn`) preserves the `trait_variant`
@@ -165,13 +290,12 @@ pub trait PipelineCallback: Send + 'static {
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 
-    /// Perform a periodic (timer-based) checkpoint. At-least-once semantics.
-    /// For exactly-once, use [`checkpoint_with_barrier`].
+    /// Service a cluster follower announcement observed from the leader.
     ///
-    /// [`checkpoint_with_barrier`]: PipelineCallback::checkpoint_with_barrier
-    async fn maybe_checkpoint(
+    /// Periodic, connector-request, manual, and shutdown admission belongs exclusively to the
+    /// streaming coordinator. This control seam must never originate a local checkpoint.
+    async fn service_checkpoint_control(
         &mut self,
-        force: bool,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64>;
 
@@ -179,7 +303,8 @@ pub trait PipelineCallback: Send + 'static {
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-        checkpoint_id: u64,
+        attempt: CheckpointAttempt,
+        attempt_started: std::time::Instant,
     ) -> BarrierOutcome;
 
     /// Record cycle metrics.
@@ -225,15 +350,10 @@ pub trait PipelineCallback: Send + 'static {
         let _ = (epoch, checkpoint_id);
     }
 
-    /// Next checkpoint ID when managed externally.
-    fn next_checkpoint_id(&self) -> Option<u64> {
-        None
-    }
-
     /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
-    /// re-initialises cleanly. Default no-op.
-    fn close_sinks(&mut self) -> impl std::future::Future<Output = ()> + Send {
-        std::future::ready(())
+    /// re-initialises cleanly. Every sink must be attempted; the result aggregates failures.
+    fn close_sinks(&mut self) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        std::future::ready(Ok(()))
     }
 
     /// Register the local source barrier injectors.

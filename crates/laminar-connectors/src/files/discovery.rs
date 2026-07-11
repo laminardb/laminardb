@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crossfire::{mpsc, AsyncRx, MAsyncTx, MTx};
 use tracing::{debug, error, info, warn};
 
-use super::manifest::FileIngestionManifest;
+use super::manifest::FileInventorySnapshot;
 use crate::error::ConnectorError;
 
 /// A file discovered by the discovery engine.
@@ -60,7 +60,7 @@ impl FileDiscoveryEngine {
     /// Starts a discovery engine for the given config.
     ///
     /// Files already present in `known_files` are skipped.
-    pub fn start(config: DiscoveryConfig, known_files: Arc<FileIngestionManifest>) -> Self {
+    pub(super) fn start(config: DiscoveryConfig, known_files: Arc<FileInventorySnapshot>) -> Self {
         let (tx, rx) = mpsc::bounded_async::<DiscoveredFile>(256);
 
         let handle = if is_cloud_path(&config.path) {
@@ -105,7 +105,7 @@ fn is_cloud_path(path: &str) -> bool {
 async fn cloud_poll_loop(
     config: DiscoveryConfig,
     tx: MAsyncTx<mpsc::Array<DiscoveredFile>>,
-    known: Arc<FileIngestionManifest>,
+    known: Arc<FileInventorySnapshot>,
 ) {
     let (store, prefix) = match build_cloud_store(&config.path) {
         Ok(v) => v,
@@ -216,7 +216,7 @@ fn build_cloud_store(
 async fn local_discovery_loop(
     config: DiscoveryConfig,
     tx: MAsyncTx<mpsc::Array<DiscoveredFile>>,
-    known: Arc<FileIngestionManifest>,
+    known: Arc<FileInventorySnapshot>,
 ) -> Result<(), ConnectorError> {
     use notify::{RecursiveMode, Watcher};
 
@@ -436,6 +436,7 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::files::manifest::FileIngestionManifest;
 
     #[test]
     fn test_split_dir_and_glob() {
@@ -476,7 +477,7 @@ mod tests {
             stabilisation_delay: Duration::from_secs(1),
             glob_pattern: None,
         };
-        let known = Arc::new(FileIngestionManifest::new());
+        let known = Arc::new(FileIngestionManifest::new().snapshot_for_dedup());
         let mut engine = FileDiscoveryEngine::start(config, known);
         // Give the background task a moment to start (and fail on the bad path).
         tokio::time::sleep(Duration::from_millis(50)).await;

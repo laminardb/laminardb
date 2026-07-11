@@ -30,8 +30,10 @@ pub struct PipelineConfig {
     /// channel provides natural backpressure during the window. `ZERO` = no batching.
     pub batch_window: Duration,
 
-    /// Maximum time to wait for all sources to align on a checkpoint barrier.
-    pub barrier_alignment_timeout: Duration,
+    /// Sole checkpoint-derived control-plane budget. Each connector startup stage and checkpoint
+    /// barrier creates one absolute deadline from this duration; individual connectors cannot
+    /// reset it.
+    pub checkpoint_timeout: Duration,
 
     /// End-to-end delivery guarantee for the pipeline.
     pub delivery_guarantee: DeliveryGuarantee,
@@ -75,7 +77,7 @@ impl Default for PipelineConfig {
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_interval: None,
             batch_window: Duration::from_millis(5),
-            barrier_alignment_timeout: Duration::from_secs(30),
+            checkpoint_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),
             cycle_budget_ns: 10_000_000,     // 10ms
             drain_budget_ns: 1_000_000,      // 1ms
@@ -88,4 +90,10 @@ impl Default for PipelineConfig {
             max_replay_buffer_bytes: 256 * 1024 * 1024, // 256 MiB per source
         }
     }
+}
+
+impl PipelineConfig {
+    /// Private rollback budget for a failed connector startup stage. This is deliberately fixed:
+    /// cleanup is fail-safe implementation policy, not another latency tuning dimension.
+    pub(crate) const CONNECTOR_STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 }

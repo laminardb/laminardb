@@ -124,12 +124,12 @@ async fn test_write_batch_creates_parquet() {
 }
 
 #[tokio::test]
-async fn test_exactly_once_epoch_skip() {
+async fn test_application_transaction_cursor_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
-    let writer_id = "exactly-once-writer";
+    let writer_id = "cursor-writer";
 
-    // Create table and write epoch 1.
+    // Create the table and write application transaction version 1.
     let schema = test_schema();
     let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
         .await
@@ -151,18 +151,23 @@ async fn test_exactly_once_epoch_skip() {
     .await
     .unwrap();
 
-    // Check last committed epoch.
-    let last_epoch = get_last_committed_epoch(&table, writer_id).await;
-    assert_eq!(last_epoch, 1);
+    let last_version = get_last_committed_version(&table, writer_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last_version, 1);
 
     // Simulate recovery: reopen table.
     let reopened_table = open_or_create_table(table_path, HashMap::new(), None)
         .await
         .unwrap();
 
-    // Verify we can read the last committed epoch.
-    let recovered_epoch = get_last_committed_epoch(&reopened_table, writer_id).await;
-    assert_eq!(recovered_epoch, 1);
+    // The low-level Delta transaction cursor remains available after reopen.
+    let recovered_version = get_last_committed_version(&reopened_table, writer_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_version, 1);
 }
 
 #[tokio::test]
@@ -176,14 +181,14 @@ async fn test_multiple_epochs_sequential() {
         .await
         .unwrap();
 
-    // Write epochs 1, 2, 3.
-    for epoch in 1..=3 {
+    // Write application transaction versions 1, 2, 3.
+    for version in 1..=3 {
         let batch = test_batch(10);
         let result = write_batches(
             table,
             vec![batch],
             writer_id,
-            epoch,
+            version,
             SaveMode::Append,
             None,
             false,
@@ -194,15 +199,18 @@ async fn test_multiple_epochs_sequential() {
         .await
         .unwrap();
         table = result.0;
-        assert_eq!(result.1, epoch as i64);
+        assert_eq!(result.1, version as i64);
     }
 
     // Final version should be 3.
     assert_eq!(table.version(), Some(3));
 
-    // Last committed epoch should be 3.
-    let last_epoch = get_last_committed_epoch(&table, writer_id).await;
-    assert_eq!(last_epoch, 3);
+    // The writer-local application transaction cursor should be 3.
+    let last_version = get_last_committed_version(&table, writer_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last_version, 3);
 }
 
 #[tokio::test]
@@ -430,7 +438,9 @@ async fn test_sink_source_roundtrip() {
     use super::super::delta_source::DeltaSource;
     use super::super::delta_source_config::DeltaSourceConfig;
     use crate::config::ConnectorConfig;
-    use crate::connector::{SinkConnector, SourceConnector};
+    use crate::connector::{
+        DeliveryGuarantee, SinkConnector, SourceConnector, SourcePosition, SourceStart,
+    };
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -441,11 +451,9 @@ async fn test_sink_source_roundtrip() {
     let connector_config = ConnectorConfig::new("delta-lake");
     sink.open(&connector_config).await.unwrap();
 
-    sink.begin_epoch(1).await.unwrap();
     let batch = test_batch(25);
     sink.write_batch(&batch).await.unwrap();
-    sink.pre_commit(1).await.unwrap();
-    sink.commit_epoch(1).await.unwrap();
+    sink.flush().await.unwrap();
     sink.close().await.unwrap();
 
     // Read data via source.
@@ -453,7 +461,14 @@ async fn test_sink_source_roundtrip() {
     source_config.starting_version = Some(0);
     let mut source = DeltaSource::new(source_config, None);
     let source_connector_config = ConnectorConfig::new("delta-lake");
-    source.open(&source_connector_config).await.unwrap();
+    source
+        .start(SourceStart {
+            config: source_connector_config,
+            position: SourcePosition::Initial,
+            delivery: DeliveryGuarantee::BestEffort,
+        })
+        .await
+        .unwrap();
 
     // Poll — should get version 1 data (25 rows).
     let result = source.poll_batch(10000).await.unwrap();
@@ -472,11 +487,11 @@ async fn test_sink_source_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_source_checkpoint_restore() {
+async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certified() {
     use super::super::delta_source::DeltaSource;
     use super::super::delta_source_config::DeltaSourceConfig;
     use crate::config::ConnectorConfig;
-    use crate::connector::SourceConnector;
+    use crate::connector::{DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart};
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -522,7 +537,14 @@ async fn test_source_checkpoint_restore() {
     source_config.starting_version = Some(0);
     let mut source = DeltaSource::new(source_config.clone(), None);
     let connector_config = ConnectorConfig::new("delta-lake");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(SourceStart {
+            config: connector_config.clone(),
+            position: SourcePosition::Initial,
+            delivery: DeliveryGuarantee::BestEffort,
+        })
+        .await
+        .unwrap();
 
     // Poll to consume latest version (2).
     let _ = source.poll_batch(10000).await.unwrap();
@@ -534,18 +556,20 @@ async fn test_source_checkpoint_restore() {
     assert_eq!(cp.get_offset("delta_version"), Some("2"));
     source.close().await.unwrap();
 
-    // Restore from checkpoint — should resume at version 2.
+    // Delta replay is not admitted until its snapshot/CDF cut is certified.
     let mut source2 = DeltaSource::new(source_config, None);
-    source2.open(&connector_config).await.unwrap();
-    source2.restore(&cp).await.unwrap();
-
-    assert_eq!(source2.current_version(), 2);
-
-    // No new data — already at latest.
-    let result = source2.poll_batch(10000).await.unwrap();
-    assert!(result.is_none());
-
-    source2.close().await.unwrap();
+    let error = source2
+        .start(SourceStart {
+            config: connector_config,
+            position: SourcePosition::Resume {
+                attempt: laminar_core::state::CheckpointAttempt::new(2, 2),
+                checkpoint: cp,
+            },
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        })
+        .await
+        .expect_err("uncertified Delta replay must fail closed");
+    assert!(error.to_string().contains("ephemeral"));
 }
 
 #[tokio::test]
@@ -566,15 +590,12 @@ async fn test_auto_flush_writes_data() {
     let connector_config = ConnectorConfig::new("delta-lake");
     sink.open(&connector_config).await.unwrap();
 
-    sink.begin_epoch(1).await.unwrap();
-
     // Write 25 rows — should trigger auto-flush after 10.
     let batch = test_batch(25);
     sink.write_batch(&batch).await.unwrap();
 
-    // Commit the rest.
-    sink.pre_commit(1).await.unwrap();
-    sink.commit_epoch(1).await.unwrap();
+    // Durably flush anything below the automatic threshold.
+    sink.flush().await.unwrap();
     sink.close().await.unwrap();
 
     // Verify all 25 rows are in the Delta table.
@@ -592,66 +613,6 @@ async fn test_auto_flush_writes_data() {
         total_rows, 25,
         "all 25 rows should be written, not dropped by auto-flush"
     );
-}
-
-#[tokio::test]
-async fn test_sink_exactly_once_epoch() {
-    let temp_dir = TempDir::new().unwrap();
-    let table_path = temp_dir.path().to_str().unwrap();
-    let writer_id = "exactly-once-test";
-
-    let schema = test_schema();
-    let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-        .await
-        .unwrap();
-
-    // Write epoch 1 with 10 rows.
-    let (table, v1) = write_batches(
-        table,
-        vec![test_batch(10)],
-        writer_id,
-        1,
-        SaveMode::Append,
-        None,
-        false,
-        None,
-        false,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v1, 1);
-
-    // Write epoch 2 with 15 rows using the same writer.
-    let (table, v2) = write_batches(
-        table,
-        vec![test_batch(15)],
-        writer_id,
-        2,
-        SaveMode::Append,
-        None,
-        false,
-        None,
-        false,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v2, 2);
-
-    // Verify the last committed epoch is 2.
-    let last_epoch = get_last_committed_epoch(&table, writer_id).await;
-    assert_eq!(last_epoch, 2);
-
-    // Verify total rows = 25 (10 + 15).
-    let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
-        .await
-        .unwrap();
-    let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
-        .await
-        .unwrap();
-    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(total_rows, 25);
 }
 
 #[tokio::test]

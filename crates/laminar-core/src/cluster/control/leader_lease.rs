@@ -39,7 +39,7 @@ fn now_millis() -> i64 {
 pub struct LeaderLease {
     /// CAS sequence; bumps on every write.
     pub seq: u64,
-    /// Fencing token; bumps only when ownership changes.
+    /// Fencing token; stable across live renewals and bumps on every acquisition after a lapse.
     pub token: u64,
     /// Current lease holder.
     pub owner: NodeId,
@@ -169,19 +169,20 @@ impl LeaderLeaseStore {
                 owner: me,
                 expires_at_ms: now_ms + self.ttl_ms,
             },
-            Some(ref cur) if cur.owner == me || cur.is_expired(now_ms) => {
-                let token = if cur.owner == me {
-                    cur.token
-                } else {
-                    cur.token + 1
-                };
-                LeaderLease {
-                    seq: cur.seq + 1,
-                    token,
-                    owner: me,
-                    expires_at_ms: now_ms + self.ttl_ms,
-                }
-            }
+            Some(ref cur) if cur.owner == me && !cur.is_expired(now_ms) => LeaderLease {
+                seq: cur.seq + 1,
+                token: cur.token,
+                owner: me,
+                expires_at_ms: now_ms + self.ttl_ms,
+            },
+            Some(ref cur) if cur.is_expired(now_ms) => LeaderLease {
+                seq: cur.seq + 1,
+                // Expiry ends the old term even if the same process wins again. Reusing the
+                // token would make work spanning the lease gap indistinguishable from a renewal.
+                token: cur.token + 1,
+                owner: me,
+                expires_at_ms: now_ms + self.ttl_ms,
+            },
             // Live lease held by another node; back off.
             Some(cur) => return Ok(LeaseOutcome::Held(cur)),
         };
@@ -354,6 +355,21 @@ mod tests {
                 assert_eq!(l.expires_at_ms, 1_500, "expiry extended");
             }
             LeaseOutcome::Held(_) => panic!("owner renewal must be Acquired"),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_owner_reacquire_after_expiry_bumps_token() {
+        let s = store(1_000);
+        let me = NodeId(1);
+        s.try_acquire(me, 0).await.unwrap();
+        match s.try_acquire(me, 1_000).await.unwrap() {
+            LeaseOutcome::Acquired(l) => {
+                assert_eq!(l.seq, 2);
+                assert_eq!(l.token, 2, "a lease lapse starts a new fencing term");
+                assert_eq!(l.expires_at_ms, 2_000);
+            }
+            LeaseOutcome::Held(_) => panic!("expired lease must be reacquirable"),
         }
     }
 

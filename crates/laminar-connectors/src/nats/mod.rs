@@ -1,6 +1,6 @@
 //! NATS source and sink — `core` (non-durable, at-most-once) or
-//! `jetstream` (default; replayable; at-least-once, or exactly-once
-//! with `Nats-Msg-Id` dedup).
+//! `jetstream` (default; replayable, durable at-least-once with optional
+//! bounded `Nats-Msg-Id` broker deduplication).
 
 pub mod config;
 pub mod metrics;
@@ -48,7 +48,9 @@ pub fn register_nats_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "nats",
         info,
-        Arc::new(|reg| Box::new(NatsSink::new(Arc::new(Schema::empty()), reg))),
+        Arc::new(|_config, registry| {
+            Ok(Box::new(NatsSink::new(Arc::new(Schema::empty()), registry)))
+        }),
     );
 }
 
@@ -156,7 +158,11 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
     let mut keys = vec![
         K::required("servers", "NATS server URLs, comma-separated"),
         K::optional("mode", "core | jetstream", "jetstream"),
-        K::optional("stream", "Target stream (used for validation only)", ""),
+        K::optional(
+            "stream",
+            "Required JetStream target; validated and sent as Nats-Expected-Stream",
+            "",
+        ),
         K::optional("subject", "Literal subject for every row", ""),
         K::optional(
             "subject.column",
@@ -164,23 +170,13 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         K::optional(
-            "expected.stream",
-            "Nats-Expected-Stream header for fail-fast",
-            "",
-        ),
-        K::optional(
-            "delivery.guarantee",
-            "at_least_once | exactly_once",
-            "at_least_once",
-        ),
-        K::optional(
             "dedup.id.column",
-            "Column used as Nats-Msg-Id (required for exactly-once)",
+            "Unique row column used as Nats-Msg-Id for bounded broker deduplication",
             "",
         ),
         K::optional(
             "min.duplicate.window.ms",
-            "Minimum stream duplicate_window accepted under exactly-once",
+            "Minimum stream duplicate_window accepted when deduplication is enabled",
             "120000",
         ),
         K::optional("max.pending", "Max outstanding PubAck futures", "4096"),

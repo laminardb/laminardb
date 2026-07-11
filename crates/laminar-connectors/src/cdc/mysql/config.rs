@@ -3,12 +3,20 @@
 //! Provides [`MySqlCdcConfig`] with all settings needed to connect to
 //! a MySQL database and stream binlog changes.
 
-use std::time::Duration;
-
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
 use super::gtid::GtidSet;
+
+const REMOVED_CONFIG_KEYS: &[&str] = &[
+    "database",
+    "snapshot.mode",
+    "poll.timeout.ms",
+    "max.poll.records",
+    "heartbeat.interval.ms",
+    "connect.timeout.ms",
+    "read.timeout.ms",
+];
 
 /// Configuration for the MySQL CDC source connector.
 #[derive(Debug, Clone)]
@@ -19,9 +27,6 @@ pub struct MySqlCdcConfig {
 
     /// MySQL port.
     pub port: u16,
-
-    /// Database name (optional for binlog replication).
-    pub database: Option<String>,
 
     /// Username for authentication.
     pub username: String,
@@ -50,36 +55,12 @@ pub struct MySqlCdcConfig {
     /// Whether to use GTID-based replication (recommended).
     pub use_gtid: bool,
 
-    // ── Snapshot ──
-    /// How to handle the initial data snapshot.
-    pub snapshot_mode: SnapshotMode,
-
-    // ── Tuning ──
-    /// Timeout for each poll operation.
-    pub poll_timeout: Duration,
-
-    /// Maximum records to return per poll.
-    pub max_poll_records: usize,
-
-    /// Heartbeat interval for the binlog connection.
-    pub heartbeat_interval: Duration,
-
-    /// Connection timeout.
-    pub connect_timeout: Duration,
-
-    /// Read timeout for binlog events.
-    pub read_timeout: Duration,
-
     // ── Schema ──
-    /// Tables to include (format: "database.table" or just "table").
-    /// Empty = all tables.
+    /// The one table to include, in fully-qualified `database.table` form.
+    ///
+    /// A source has one stable Arrow schema. Deploy another source for each
+    /// additional table instead of multiplexing incompatible row schemas.
     pub table_include: Vec<String>,
-
-    /// Tables to exclude from replication.
-    pub table_exclude: Vec<String>,
-
-    /// Database filter (if set, only replicate from this database).
-    pub database_filter: Option<String>,
 
     /// Maximum events to buffer (default: 100,000).
     pub max_buffered_events: usize,
@@ -95,24 +76,17 @@ impl Default for MySqlCdcConfig {
         Self {
             host: "localhost".to_string(),
             port: 3306,
-            database: None,
-            username: "root".to_string(),
+            username: String::new(),
             password: None,
             ssl_mode: SslMode::Preferred,
-            server_id: 1001, // Default replica server ID
+            // There is no safe shared replication client ID. Configuration parsing and
+            // validation require callers to choose a topology-unique value.
+            server_id: 0,
             gtid_set: None,
             binlog_filename: None,
             binlog_position: None,
             use_gtid: true, // GTID is the recommended approach
-            snapshot_mode: SnapshotMode::Initial,
-            poll_timeout: Duration::from_millis(100),
-            max_poll_records: 1000,
-            heartbeat_interval: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(60),
             table_include: Vec::new(),
-            table_exclude: Vec::new(),
-            database_filter: None,
             max_buffered_events: 100_000,
             backpressure_high_watermark: 0.8,
         }
@@ -131,38 +105,6 @@ impl MySqlCdcConfig {
         (self.max_buffered_events as f64 * self.backpressure_high_watermark) as usize
     }
 
-    /// Creates a new config with required fields.
-    #[must_use]
-    pub fn new(host: &str, username: &str) -> Self {
-        Self {
-            host: host.to_string(),
-            username: username.to_string(),
-            ..Self::default()
-        }
-    }
-
-    /// Creates a new config with server ID.
-    #[must_use]
-    pub fn with_server_id(host: &str, username: &str, server_id: u32) -> Self {
-        Self {
-            host: host.to_string(),
-            username: username.to_string(),
-            server_id,
-            ..Self::default()
-        }
-    }
-
-    /// Builds a MySQL connection URL.
-    #[must_use]
-    pub fn connection_url(&self) -> String {
-        let mut url = format!("mysql://{}@{}:{}", self.username, self.host, self.port);
-        if let Some(ref db) = self.database {
-            url.push('/');
-            url.push_str(db);
-        }
-        url
-    }
-
     /// Parses configuration from a generic [`ConnectorConfig`].
     ///
     /// # Errors
@@ -170,24 +112,22 @@ impl MySqlCdcConfig {
     /// Returns `ConnectorError` if required keys are missing or values are
     /// invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        Self::reject_removed_keys(config)?;
+
         let mut cfg = Self {
             host: config.require("host")?.to_string(),
             username: config.require("username")?.to_string(),
+            server_id: config.require_parsed("server.id")?,
             ..Self::default()
         };
 
         if let Some(port) = config.get("port") {
             cfg.port = crate::config::parse_port(port)?;
         }
-        cfg.database = config.get("database").map(String::from);
         cfg.password = config.get("password").map(String::from);
 
         if let Some(ssl) = config.get_parsed::<SslMode>("ssl.mode")? {
             cfg.ssl_mode = ssl;
-        }
-
-        if let Some(id) = config.get_parsed::<u32>("server.id")? {
-            cfg.server_id = id;
         }
 
         if let Some(gtid) = config.get_parsed::<GtidSet>("gtid.set")? {
@@ -200,38 +140,18 @@ impl MySqlCdcConfig {
             cfg.binlog_position = Some(pos);
         }
 
-        if let Some(use_gtid) = config.get("use.gtid") {
-            cfg.use_gtid = use_gtid.parse().unwrap_or(true);
-        }
-
-        if let Some(mode) = config.get_parsed::<SnapshotMode>("snapshot.mode")? {
-            cfg.snapshot_mode = mode;
-        }
-
-        if let Some(timeout) = config.get_parsed::<u64>("poll.timeout.ms")? {
-            cfg.poll_timeout = Duration::from_millis(timeout);
-        }
-        if let Some(max) = config.get_parsed::<usize>("max.poll.records")? {
-            cfg.max_poll_records = max;
-        }
-        if let Some(interval) = config.get_parsed::<u64>("heartbeat.interval.ms")? {
-            cfg.heartbeat_interval = Duration::from_millis(interval);
-        }
-        if let Some(timeout) = config.get_parsed::<u64>("connect.timeout.ms")? {
-            cfg.connect_timeout = Duration::from_millis(timeout);
-        }
-        if let Some(timeout) = config.get_parsed::<u64>("read.timeout.ms")? {
-            cfg.read_timeout = Duration::from_millis(timeout);
+        if let Some(use_gtid) = config.get_parsed::<bool>("use.gtid")? {
+            cfg.use_gtid = use_gtid;
         }
 
         if let Some(tables) = config.get("table.include") {
-            cfg.table_include = tables.split(',').map(|s| s.trim().to_string()).collect();
+            cfg.table_include = tables
+                .split(',')
+                .map(str::trim)
+                .filter(|table| !table.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
-        if let Some(tables) = config.get("table.exclude") {
-            cfg.table_exclude = tables.split(',').map(|s| s.trim().to_string()).collect();
-        }
-        cfg.database_filter = config.get("database.filter").map(String::from);
-
         if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
             cfg.max_buffered_events = max;
         }
@@ -243,6 +163,19 @@ impl MySqlCdcConfig {
         Ok(cfg)
     }
 
+    fn reject_removed_keys(config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if let Some(key) = REMOVED_CONFIG_KEYS
+            .iter()
+            .find(|key| config.get(key).is_some())
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "MySQL CDC property '{key}' is not supported: it was removed because the \
+                 connector did not execute it"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -251,18 +184,41 @@ impl MySqlCdcConfig {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         crate::config::require_non_empty(&self.host, "host")?;
         crate::config::require_non_empty(&self.username, "username")?;
+        if self.port == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "port must be > 0".to_string(),
+            ));
+        }
         if self.server_id == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "server.id must be > 0".to_string(),
             ));
         }
-        if self.max_poll_records == 0 {
+        if self.max_buffered_events == 0 {
             return Err(ConnectorError::ConfigurationError(
-                "max.poll.records must be > 0".to_string(),
+                "max.buffered.events must be > 0".to_string(),
             ));
         }
+        if !(self.backpressure_high_watermark.is_finite()
+            && 0.0 < self.backpressure_high_watermark
+            && self.backpressure_high_watermark <= 1.0)
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "backpressure.high.watermark must be finite and in (0, 1]".to_string(),
+            ));
+        }
+        self.target_table()?;
 
-        // If not using GTID, binlog filename should be specified for explicit positioning
+        if self.use_gtid && (self.binlog_filename.is_some() || self.binlog_position.is_some()) {
+            return Err(ConnectorError::ConfigurationError(
+                "binlog.filename/binlog.position cannot be set when use.gtid=true".into(),
+            ));
+        }
+        if !self.use_gtid && self.gtid_set.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "gtid.set cannot be set when use.gtid=false".into(),
+            ));
+        }
         if !self.use_gtid && self.binlog_filename.is_none() && self.binlog_position.is_some() {
             return Err(ConnectorError::ConfigurationError(
                 "binlog.filename required when binlog.position is set".to_string(),
@@ -272,45 +228,37 @@ impl MySqlCdcConfig {
         Ok(())
     }
 
-    /// Returns whether a table should be included based on include/exclude lists.
-    #[must_use]
-    pub fn should_include_table(&self, database: &str, table: &str) -> bool {
-        let full_name = format!("{database}.{table}");
-
-        // Check exclude list first
-        if self
-            .table_exclude
-            .iter()
-            .any(|t| t == table || t == &full_name || t.ends_with(&format!(".{table}")))
-        {
-            return false;
+    fn target_table(&self) -> Result<(&str, &str), ConnectorError> {
+        let [target] = self.table_include.as_slice() else {
+            return Err(ConnectorError::ConfigurationError(
+                "MySQL CDC currently requires exactly one table.include entry; multi-table or \
+                 unfiltered capture cannot preserve one stable Arrow schema"
+                    .into(),
+            ));
+        };
+        let Some((database, table)) = target.split_once('.') else {
+            return Err(ConnectorError::ConfigurationError(
+                "MySQL CDC table.include must be one fully-qualified database.table name".into(),
+            ));
+        };
+        if database.is_empty() || table.is_empty() || table.contains('.') {
+            return Err(ConnectorError::ConfigurationError(
+                "MySQL CDC table.include must be one fully-qualified database.table name".into(),
+            ));
         }
-
-        // Check database filter
-        if let Some(ref db_filter) = self.database_filter {
-            if db_filter != database {
-                return false;
-            }
-        }
-
-        // Check include list
-        if self.table_include.is_empty() {
-            return true;
-        }
-
-        self.table_include
-            .iter()
-            .any(|t| t == table || t == &full_name || t.ends_with(&format!(".{table}")))
+        Ok((database, table))
     }
 
-    /// Returns the replication mode description.
+    /// Returns the connection's default database derived from `table.include`.
+    pub(crate) fn target_database(&self) -> Result<&str, ConnectorError> {
+        self.target_table().map(|(database, _)| database)
+    }
+
+    /// Returns whether a table is the source's one configured table.
     #[must_use]
-    pub fn replication_mode(&self) -> &'static str {
-        if self.use_gtid {
-            "GTID"
-        } else {
-            "binlog position"
-        }
+    pub fn should_include_table(&self, database: &str, table: &str) -> bool {
+        self.target_table()
+            .is_ok_and(|target| target == (database, table))
     }
 }
 
@@ -338,80 +286,48 @@ str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
     VerifyIdentity => "verify_identity", "verify-identity"
 );
 
-/// How to handle the initial snapshot when no prior checkpoint exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SnapshotMode {
-    /// Take a full snapshot on first start, then switch to streaming.
-    #[default]
-    Initial,
-    /// Never take a snapshot; only stream from current binlog position.
-    Never,
-    /// Always take a snapshot on startup, even if a checkpoint exists.
-    Always,
-    /// Only take a schema snapshot, no data.
-    SchemaOnly,
-}
-
-str_enum!(SnapshotMode, lowercase_nodash, String, "unknown snapshot mode",
-    Initial => "initial";
-    Never => "never";
-    Always => "always";
-    SchemaOnly => "schema_only", "schema-only"
-);
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_config() -> MySqlCdcConfig {
+        MySqlCdcConfig {
+            username: "repl_user".into(),
+            server_id: 2000,
+            table_include: vec!["app.users".into()],
+            ..MySqlCdcConfig::default()
+        }
+    }
+
+    fn valid_connector_config() -> ConnectorConfig {
+        let mut config = ConnectorConfig::new("mysql-cdc");
+        config.set("host", "mysql.local");
+        config.set("username", "repl_user");
+        config.set("server.id", "2000");
+        config.set("table.include", "app.users");
+        config
+    }
 
     #[test]
     fn test_default_config() {
         let cfg = MySqlCdcConfig::default();
         assert_eq!(cfg.host, "localhost");
         assert_eq!(cfg.port, 3306);
-        assert_eq!(cfg.username, "root");
+        assert!(cfg.username.is_empty());
         assert!(cfg.use_gtid);
         assert_eq!(cfg.ssl_mode, SslMode::Preferred);
-        assert_eq!(cfg.snapshot_mode, SnapshotMode::Initial);
-        assert_eq!(cfg.server_id, 1001);
-    }
-
-    #[test]
-    fn test_new_config() {
-        let cfg = MySqlCdcConfig::new("db.example.com", "myuser");
-        assert_eq!(cfg.host, "db.example.com");
-        assert_eq!(cfg.username, "myuser");
-    }
-
-    #[test]
-    fn test_with_server_id() {
-        let cfg = MySqlCdcConfig::with_server_id("db.example.com", "myuser", 5000);
-        assert_eq!(cfg.server_id, 5000);
-    }
-
-    #[test]
-    fn test_connection_url() {
-        let mut cfg = MySqlCdcConfig::new("db.example.com", "myuser");
-        assert_eq!(cfg.connection_url(), "mysql://myuser@db.example.com:3306");
-
-        cfg.database = Some("mydb".to_string());
-        assert_eq!(
-            cfg.connection_url(),
-            "mysql://myuser@db.example.com:3306/mydb"
-        );
+        assert_eq!(cfg.server_id, 0);
     }
 
     #[test]
     fn test_from_connector_config() {
-        let mut config = ConnectorConfig::new("mysql-cdc");
-        config.set("host", "mysql.local");
-        config.set("username", "repl_user");
+        let mut config = valid_connector_config();
         config.set("password", "secret");
         config.set("port", "3307");
-        config.set("server.id", "2000");
         config.set("ssl.mode", "required");
-        config.set("snapshot.mode", "never");
         config.set("use.gtid", "true");
-        config.set("max.poll.records", "500");
+        config.set("max.buffered.events", "50000");
+        config.set("backpressure.high.watermark", "0.75");
 
         let cfg = MySqlCdcConfig::from_config(&config).unwrap();
         assert_eq!(cfg.host, "mysql.local");
@@ -420,9 +336,9 @@ mod tests {
         assert_eq!(cfg.port, 3307);
         assert_eq!(cfg.server_id, 2000);
         assert_eq!(cfg.ssl_mode, SslMode::Required);
-        assert_eq!(cfg.snapshot_mode, SnapshotMode::Never);
         assert!(cfg.use_gtid);
-        assert_eq!(cfg.max_poll_records, 500);
+        assert_eq!(cfg.max_buffered_events, 50_000);
+        assert_eq!(cfg.backpressure_high_watermark, 0.75);
     }
 
     #[test]
@@ -433,25 +349,89 @@ mod tests {
 
     #[test]
     fn test_validate_empty_host() {
-        let mut cfg = MySqlCdcConfig::default();
+        let mut cfg = valid_config();
         cfg.host = String::new();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn test_validate_zero_server_id() {
-        let mut cfg = MySqlCdcConfig::default();
+        let mut cfg = valid_config();
         cfg.server_id = 0;
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn test_validate_binlog_position_without_filename() {
-        let mut cfg = MySqlCdcConfig::default();
+        let mut cfg = valid_config();
         cfg.use_gtid = false;
         cfg.binlog_position = Some(12345);
         cfg.binlog_filename = None;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unbounded_or_multi_table_capture() {
+        let mut cfg = valid_config();
+        cfg.table_include.clear();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+
+        cfg.table_include = vec!["app.users".into(), "app.orders".into()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+    }
+
+    #[test]
+    fn validate_requires_fully_qualified_table() {
+        let cfg = MySqlCdcConfig {
+            table_include: vec!["users".into()],
+            ..valid_config()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("database.table"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_or_non_finite_runtime_bounds() {
+        let mut cfg = valid_config();
+        cfg.max_buffered_events = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("buffered"));
+
+        let mut cfg = valid_config();
+        cfg.backpressure_high_watermark = f64::NAN;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("watermark"));
+    }
+
+    #[test]
+    fn removed_properties_are_rejected_explicitly() {
+        for key in REMOVED_CONFIG_KEYS {
+            let mut config = valid_connector_config();
+            config.set(*key, "removed-value");
+            let error = MySqlCdcConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains(key));
+        }
+    }
+
+    #[test]
+    fn use_gtid_requires_a_boolean() {
+        let mut config = valid_connector_config();
+        config.set("use.gtid", "sometimes");
+        let error = MySqlCdcConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("use.gtid"));
     }
 
     #[test]
@@ -468,77 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_mode_fromstr() {
-        assert_eq!(
-            "initial".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::Initial
-        );
-        assert_eq!(
-            "never".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::Never
-        );
-        assert_eq!(
-            "always".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::Always
-        );
-        assert_eq!(
-            "schema_only".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::SchemaOnly
-        );
-        assert!("bad".parse::<SnapshotMode>().is_err());
-    }
-
-    #[test]
     fn test_table_filtering_simple() {
-        let mut cfg = MySqlCdcConfig::default();
-        // No filters → include all
-        assert!(cfg.should_include_table("mydb", "users"));
-
-        // Include list - exact match
-        cfg.table_include = vec!["mydb.users".to_string()];
+        let cfg = MySqlCdcConfig {
+            table_include: vec!["mydb.users".to_string()],
+            ..valid_config()
+        };
         assert!(cfg.should_include_table("mydb", "users"));
         assert!(!cfg.should_include_table("mydb", "orders"));
-    }
-
-    #[test]
-    fn test_table_filtering_exclude() {
-        let mut cfg = MySqlCdcConfig::default();
-        cfg.table_exclude = vec!["mydb.logs".to_string()];
-        assert!(cfg.should_include_table("mydb", "users"));
-        assert!(!cfg.should_include_table("mydb", "logs"));
-    }
-
-    #[test]
-    fn test_table_filtering_database() {
-        let mut cfg = MySqlCdcConfig::default();
-        cfg.database_filter = Some("production".to_string());
-        assert!(cfg.should_include_table("production", "users"));
-        assert!(!cfg.should_include_table("staging", "users"));
-    }
-
-    #[test]
-    fn test_table_filtering_table_name_only() {
-        let mut cfg = MySqlCdcConfig::default();
-        cfg.table_include = vec!["users".to_string()];
-        assert!(cfg.should_include_table("any_db", "users"));
-        assert!(!cfg.should_include_table("any_db", "orders"));
-    }
-
-    #[test]
-    fn test_replication_mode() {
-        let mut cfg = MySqlCdcConfig::default();
-        cfg.use_gtid = true;
-        assert_eq!(cfg.replication_mode(), "GTID");
-
-        cfg.use_gtid = false;
-        assert_eq!(cfg.replication_mode(), "binlog position");
+        assert!(!cfg.should_include_table("other", "users"));
     }
 
     #[test]
     fn test_from_config_with_gtid_set() {
-        let mut config = ConnectorConfig::new("mysql-cdc");
-        config.set("host", "localhost");
-        config.set("username", "root");
+        let mut config = valid_connector_config();
         config.set("gtid.set", "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-10");
 
         let cfg = MySqlCdcConfig::from_config(&config).unwrap();
@@ -547,9 +469,7 @@ mod tests {
 
     #[test]
     fn test_from_config_with_binlog_position() {
-        let mut config = ConnectorConfig::new("mysql-cdc");
-        config.set("host", "localhost");
-        config.set("username", "root");
+        let mut config = valid_connector_config();
         config.set("use.gtid", "false");
         config.set("binlog.filename", "mysql-bin.000003");
         config.set("binlog.position", "12345");
@@ -558,5 +478,22 @@ mod tests {
         assert!(!cfg.use_gtid);
         assert_eq!(cfg.binlog_filename, Some("mysql-bin.000003".to_string()));
         assert_eq!(cfg.binlog_position, Some(12345));
+    }
+
+    #[test]
+    fn validate_rejects_conflicting_start_positions() {
+        let mut cfg = valid_config();
+        cfg.binlog_filename = Some("mysql-bin.000003".into());
+        assert!(cfg.validate().unwrap_err().to_string().contains("use.gtid"));
+
+        let mut cfg = valid_config();
+        cfg.use_gtid = false;
+        cfg.gtid_set = Some("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-10".parse().unwrap());
+        assert!(cfg.validate().unwrap_err().to_string().contains("gtid.set"));
+    }
+
+    #[test]
+    fn target_database_is_derived_from_table_include() {
+        assert_eq!(valid_config().target_database().unwrap(), "app");
     }
 }

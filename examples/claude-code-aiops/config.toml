@@ -7,6 +7,10 @@
 [server]
 mode = "embedded"
 bind = "127.0.0.1:8080"
+# OTLP ingress cannot be replayed after a crash, so this pipeline explicitly
+# chooses best effort. Delta still durably acknowledges each direct commit,
+# but the end-to-end pipeline does not claim replay or exactly-once delivery.
+delivery = "best_effort"
 
 [state]
 backend = "in_process"

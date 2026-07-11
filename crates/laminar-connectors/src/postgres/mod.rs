@@ -6,7 +6,6 @@ pub mod sink_metrics;
 pub mod types;
 
 // Re-export primary types at module level.
-pub use crate::connector::DeliveryGuarantee;
 pub use sink::PostgresSink;
 pub use sink_config::{PostgresSinkConfig, SslMode, WriteMode};
 pub use sink_metrics::PostgresSinkMetrics;
@@ -32,17 +31,17 @@ pub fn register_postgres_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "postgres-sink",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
+        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
             // Default schema (overridden during open).
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, true),
                 Field::new("value", DataType::Utf8, false),
             ]));
-            Box::new(PostgresSink::new(
+            Ok(Box::new(PostgresSink::new(
                 schema,
                 PostgresSinkConfig::default(),
                 registry,
-            ))
+            )))
         }),
     );
 }
@@ -84,16 +83,6 @@ fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
             "changelog.mode",
             "Handle Z-set records (split INSERT/DELETE by _op)",
             "false",
-        ),
-        ConfigKeySpec::optional(
-            "delivery.guarantee",
-            "at_least_once or exactly_once",
-            "at_least_once",
-        ),
-        ConfigKeySpec::optional(
-            "sink.id",
-            "Unique ID for offset tracking (auto-generated if not set)",
-            "",
         ),
     ]
 }
@@ -142,7 +131,7 @@ mod tests {
         assert!(optional.contains(&"write.mode"));
         assert!(optional.contains(&"primary.key"));
         assert!(optional.contains(&"batch.size"));
-        assert!(optional.contains(&"delivery.guarantee"));
+        assert!(!optional.contains(&"delivery.guarantee"));
         assert!(optional.contains(&"changelog.mode"));
         assert!(optional.contains(&"ssl.mode"));
     }

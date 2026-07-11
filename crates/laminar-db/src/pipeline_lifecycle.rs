@@ -5,11 +5,313 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use laminar_core::streaming;
+use laminar_connectors::config::ConnectorConfig;
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract, SinkTopology,
+    SourceConsistency, SourceContract, SourceTopology,
+};
+use laminar_core::{state::StateBackendDurability, streaming};
 use rustc_hash::FxHashMap;
 
 use crate::db::{DbState, LaminarDB, SourceWatermarkState};
 use crate::error::DbError;
+
+/// Runtime placement boundary used for connector admission.
+///
+/// `Cluster` means a controller is actually installed on this DB instance. A
+/// binary compiled with cluster support but running without a controller is
+/// still a local runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeMode {
+    Local,
+    Cluster,
+}
+
+const fn required_recovery_scope(runtime: RuntimeMode) -> StateBackendDurability {
+    match runtime {
+        RuntimeMode::Local => StateBackendDurability::NodeDurable,
+        RuntimeMode::Cluster => StateBackendDurability::ClusterShared,
+    }
+}
+
+const EXACT_SINK_PROTOCOL: &str =
+    "exactly-once external sinks require checkpoint-committable consistency, coordinated phase \
+     1, participant-complete sealed markers, and a namespaced exact external cursor";
+
+/// Validate source durability and placement before the connector performs I/O.
+fn admit_source_contract(
+    contract: SourceContract,
+    delivery: DeliveryGuarantee,
+    checkpointing_enabled: bool,
+    runtime: RuntimeMode,
+) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
+        return Err(
+            "[LDB-0013] cluster exactly-once is not admitted until the leader term is \
+             atomically bound to checkpoint decisions and external sink commits",
+        );
+    }
+    if contract.consistency == SourceConsistency::CommitCoupled {
+        if delivery == DeliveryGuarantee::ExactlyOnce {
+            return Err(
+                "exactly-once commit-coupled sources require a certified in-flight \
+                 transaction/barrier checkpoint cut, which is not implemented",
+            );
+        }
+        if delivery != DeliveryGuarantee::AtLeastOnce {
+            return Err("commit-coupled sources currently support only at-least-once delivery");
+        }
+        if !checkpointing_enabled {
+            return Err(
+                "commit-coupled sources require checkpointing so upstream retention can advance",
+            );
+        }
+    }
+
+    if delivery != DeliveryGuarantee::BestEffort
+        && contract.consistency == SourceConsistency::Ephemeral
+    {
+        return Err("at-least-once and exactly-once delivery require replayable sources");
+    }
+
+    if runtime == RuntimeMode::Cluster {
+        match contract.topology {
+            SourceTopology::Splittable => {}
+            SourceTopology::NodeLocalIngress if delivery == DeliveryGuarantee::BestEffort => {}
+            SourceTopology::NodeLocalIngress => {
+                return Err(
+                    "cluster node-local ingress is supported only with best-effort delivery",
+                );
+            }
+            SourceTopology::Singleton => {
+                return Err(
+                    "cluster singleton sources require fenced singleton placement, which is not implemented",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate sink durability, placement, and changelog semantics before I/O.
+fn admit_sink_contract(
+    contract: SinkContract,
+    delivery: DeliveryGuarantee,
+    runtime: RuntimeMode,
+    carries_changelog: bool,
+) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
+        return Err(
+            "[LDB-0013] cluster exactly-once is not admitted until the leader term is \
+             atomically bound to checkpoint decisions and external sink commits",
+        );
+    }
+    match (delivery, contract.consistency) {
+        (DeliveryGuarantee::ExactlyOnce, SinkConsistency::CheckpointCommittable) => {}
+        (DeliveryGuarantee::ExactlyOnce, _) => return Err(EXACT_SINK_PROTOCOL),
+        (_, SinkConsistency::CheckpointCommittable) => {
+            return Err(
+                "checkpoint-committable sinks require global exactly-once delivery; running the \
+                 coordinated protocol under a weaker label is not supported",
+            );
+        }
+        _ => {}
+    }
+
+    if delivery == DeliveryGuarantee::AtLeastOnce
+        && contract.consistency == SinkConsistency::Ephemeral
+    {
+        return Err("at-least-once delivery requires a durably acknowledged sink");
+    }
+
+    if runtime == RuntimeMode::Cluster {
+        match contract.topology {
+            SinkTopology::MultiWriter => {}
+            SinkTopology::NodeLocalEgress if delivery == DeliveryGuarantee::BestEffort => {}
+            SinkTopology::NodeLocalEgress => {
+                return Err(
+                    "cluster node-local egress is supported only with best-effort delivery",
+                );
+            }
+            SinkTopology::Singleton => {
+                return Err(
+                    "cluster singleton sinks require fenced singleton placement, which is not implemented",
+                );
+            }
+        }
+    }
+
+    if carries_changelog && !contract.accepts_full_changelog() {
+        return Err(
+            "the input carries deletes/retractions and requires FullChangelog sink semantics; \
+             append-only or keyed-upsert alone is insufficient",
+        );
+    }
+
+    Ok(())
+}
+
+/// Immutable facts required to admit one configured sink before external I/O.
+#[derive(Clone, Copy)]
+struct SinkAdmissionContext<'a> {
+    config: &'a ConnectorConfig,
+    name: &'a str,
+    input: &'a str,
+    delivery: DeliveryGuarantee,
+    runtime: RuntimeMode,
+    carries_changelog: bool,
+    checkpointing_enabled: bool,
+    state_backend_scope: StateBackendDurability,
+}
+
+struct PreparedSink {
+    name: String,
+    connector: Box<dyn SinkConnector>,
+    config: ConnectorConfig,
+    filter_expr: Option<String>,
+    input: String,
+    contract: SinkContract,
+    write_timeout: std::time::Duration,
+    requires_recovery_on_error: bool,
+}
+
+/// Resolve and validate a sink before any external I/O. Keeping this boundary separate from the
+/// bounded open stage makes it impossible for one connector to become active before every sink is
+/// known to be admissible.
+fn admit_sink(
+    sink: &dyn SinkConnector,
+    context: SinkAdmissionContext<'_>,
+) -> Result<(SinkContract, Option<u64>), DbError> {
+    let SinkAdmissionContext {
+        config,
+        name,
+        input,
+        delivery,
+        runtime,
+        carries_changelog,
+        checkpointing_enabled,
+        state_backend_scope,
+    } = context;
+    let contract = sink.contract(config).map_err(|e| {
+        DbError::Config(format!(
+            "sink '{name}' (type '{}') has an invalid contract: {e}",
+            config.connector_type()
+        ))
+    })?;
+
+    admit_sink_contract(contract, delivery, runtime, carries_changelog).map_err(|reason| {
+        let detail = format!(
+            "sink '{name}' is not admissible in {runtime:?} mode with {delivery} delivery: \
+             {reason} (contract: {contract:?})"
+        );
+        if carries_changelog && !contract.accepts_full_changelog() {
+            DbError::MaterializedView(format!(
+                "[LDB-1300] {detail}. Route '{input}' to a FullChangelog sink or disable \
+                 incremental emission."
+            ))
+        } else {
+            DbError::Config(format!("[LDB-5035] {detail}"))
+        }
+    })?;
+
+    if delivery == DeliveryGuarantee::ExactlyOnce {
+        if !checkpointing_enabled {
+            return Err(DbError::Config(format!(
+                "[LDB-5035] sink '{name}' cannot run exactly-once without checkpointing"
+            )));
+        }
+        let required_scope = required_recovery_scope(runtime);
+        if !state_backend_scope.satisfies(required_scope) {
+            return Err(DbError::Config(format!(
+                "[LDB-5035] sink '{name}' cannot run exactly-once: prepared participant markers \
+                 require {required_scope:?} state, but the configured backend is \
+                 {state_backend_scope:?}"
+            )));
+        }
+        if sink.as_coordinated_committer().is_none() {
+            return Err(DbError::Config(format!(
+                "[LDB-5035] sink '{name}' claims {contract:?} but does not implement the complete \
+                 coordinated exact protocol: {EXACT_SINK_PROTOCOL}"
+            )));
+        }
+    } else if sink.as_coordinated_committer().is_some() {
+        return Err(DbError::Config(format!(
+            "[LDB-5035] sink '{name}' exposes a coordinated committer outside global \
+             exactly-once delivery"
+        )));
+    }
+
+    let configured_timeout = config
+        .get_parsed::<u64>("sink.write.timeout.ms")
+        .map_err(|e| {
+            DbError::Connector(format!(
+                "Invalid 'sink.write.timeout.ms' for sink '{name}': {e}"
+            ))
+        })?;
+    if configured_timeout == Some(0) {
+        return Err(DbError::Connector(format!(
+            "sink '{name}': sink.write.timeout.ms must be > 0"
+        )));
+    }
+
+    Ok((contract, configured_timeout))
+}
+
+async fn close_opened_sinks(sinks: &mut [PreparedSink], cleanup_deadline: tokio::time::Instant) {
+    for prepared in sinks.iter_mut().rev() {
+        match tokio::time::timeout_at(cleanup_deadline, prepared.connector.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    sink = %prepared.name,
+                    %error,
+                    "sink close failed while rolling back pipeline startup"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sink = %prepared.name,
+                    "sink close exceeded the shared pipeline-startup cleanup deadline"
+                );
+            }
+        }
+    }
+}
+
+async fn open_prepared_sinks(
+    sinks: &mut [PreparedSink],
+    open_timeout: std::time::Duration,
+) -> Result<(), DbError> {
+    let open_deadline = tokio::time::Instant::now() + open_timeout;
+    let mut index = 0;
+    while index < sinks.len() {
+        let prepared = &mut sinks[index];
+        let name = prepared.name.clone();
+        let open_error =
+            match tokio::time::timeout_at(open_deadline, prepared.connector.open(&prepared.config))
+                .await
+            {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some(format!(
+                    "exceeded the shared {open_timeout:?} sink-open stage deadline"
+                )),
+            };
+        if let Some(error) = open_error {
+            // A failed/cancelled open may already hold resources, so include the current sink.
+            // Previously opened and current connectors share one fresh rollback deadline.
+            let cleanup_deadline = tokio::time::Instant::now()
+                + crate::pipeline::PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT;
+            close_opened_sinks(&mut sinks[..=index], cleanup_deadline).await;
+            return Err(DbError::Connector(format!(
+                "Failed to open sink '{name}': {error}"
+            )));
+        }
+        index += 1;
+    }
+    Ok(())
+}
 
 /// Resolve a query's output schema by planning it. On `ASOF JOIN` failure,
 /// retries with the schema-equivalent rewrite. Returns `None` if the query
@@ -216,7 +518,7 @@ impl LaminarDB {
         all_cold.dedup();
         let rehy = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
             .rehydrate(&all_cold)
-            .await;
+            .await?;
 
         let (mut applied, mut lost) = (0usize, 0usize);
         for (op_name, cold_vnodes) in cold_map {
@@ -260,10 +562,13 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Stage each boot-owned vnode's chain at `epoch` — the recovered cut the source offsets
+    /// Stage each boot-owned vnode's chain at the exact recovered attempt the source offsets
     /// resume from. A missing backend is fatal (offsets staged, state absent).
     #[cfg(feature = "cluster")]
-    async fn stage_owned_vnodes_from_chains(&self, epoch: u64) -> Result<(), DbError> {
+    async fn stage_owned_vnodes_from_chains(
+        &self,
+        attempt: laminar_core::state::CheckpointAttempt,
+    ) -> Result<(), DbError> {
         let Some(self_id) = self
             .cluster_controller
             .lock()
@@ -278,7 +583,8 @@ impl LaminarDB {
         };
         tracing::info!(
             owned = owned.len(),
-            epoch,
+            epoch = attempt.epoch,
+            checkpoint_id = attempt.checkpoint_id,
             "cluster recovery: rehydrating boot-owned vnodes from chains"
         );
         if owned.is_empty() {
@@ -292,26 +598,22 @@ impl LaminarDB {
             ));
         };
         let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-            .rehydrate_at(&owned, epoch)
-            .await;
-        // A partial read can fail transiently while report.epoch is still Some, leaving only
-        // successes in `restored`. Starting then runs the unreadable owned vnodes with empty
-        // state over already-staged offsets — a permanent gap. Fail fast; the supervisor retries.
-        if report.has_errors() {
-            return Err(DbError::Checkpoint(
-                "[LDB-6032] one or more owned-vnode partials were unreadable on cluster \
-                 recovery (see [LDB-6051] above) — refusing to start with staged source offsets \
-                 and lost aggregate state"
-                    .to_string(),
-            ));
-        }
+            .rehydrate_at(&owned, attempt)
+            .await?;
         let mut staged = self.rehydrated_vnode_state.lock();
         for (vnode, chain) in report.restored {
-            staged.insert(vnode, crate::db::RehydratedVnode { epoch, chain });
+            staged.insert(
+                vnode,
+                crate::db::RehydratedVnode {
+                    epoch: attempt.epoch,
+                    chain,
+                },
+            );
         }
         tracing::info!(
             staged = staged.len(),
-            epoch,
+            epoch = attempt.epoch,
+            checkpoint_id = attempt.checkpoint_id,
             "cluster recovery: staged boot-owned vnodes for aggregate recovery"
         );
         Ok(())
@@ -323,25 +625,19 @@ impl LaminarDB {
     fn recovery_source_checkpoint(
         source: &str,
         manifest_cp: Option<&laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint>,
-        handoff: &HashMap<String, String>,
-        epoch: u64,
+        handoff: &HashMap<String, HashMap<String, String>>,
+        _epoch: u64,
     ) -> Option<laminar_connectors::checkpoint::SourceCheckpoint> {
         use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
         let mut cp = manifest_cp
             .cloned()
-            .unwrap_or_else(|| ConnectorCheckpoint::with_offsets(epoch, HashMap::new()));
-        let topics: std::collections::HashSet<String> = cp
-            .offsets
-            .keys()
-            .filter_map(|k| k.rsplit_once('-').map(|(t, _)| t.to_string()))
-            .collect();
+            .unwrap_or_else(|| ConnectorCheckpoint::with_offsets(HashMap::new()));
         let fill: Vec<(String, String)> = handoff
-            .iter()
-            .filter(|(k, _)| {
-                k.rsplit_once('-')
-                    .is_some_and(|(t, _)| topics.contains(t) && !cp.offsets.contains_key(*k))
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .get(source)
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| !cp.offsets.contains_key(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         if !fill.is_empty() {
             tracing::info!(
@@ -368,8 +664,19 @@ impl LaminarDB {
     pub(crate) fn connector_ddl_rejected(&self) -> bool {
         matches!(
             DbState::load(&self.state),
-            DbState::Running | DbState::ShuttingDown
+            DbState::Starting | DbState::Running | DbState::ShuttingDown
         )
+    }
+
+    /// A checkpoint identity is immutable for one running topology. Live topology evolution needs
+    /// a versioned topology barrier/savepoint migration protocol, so checkpointed runtimes reject
+    /// it until that protocol exists.
+    pub(crate) fn checkpointed_topology_ddl_rejected(&self) -> bool {
+        self.config.checkpoint.is_some()
+            && matches!(
+                DbState::load(&self.state),
+                DbState::Starting | DbState::Running | DbState::ShuttingDown
+            )
     }
 
     /// Enable auto-restart from the last checkpoint on a fault. Without it, a fault parks
@@ -450,6 +757,29 @@ impl LaminarDB {
         crate::coordinated_recovery::spawn_monitor(self);
     }
 
+    /// Close resources created by an unsuccessful `start_inner` attempt.
+    async fn cleanup_failed_start(&self) {
+        if let Some(handle) = self.committer_handle.lock().take() {
+            handle.abort();
+        }
+        let handles = std::mem::take(&mut *self.startup_sink_handles.lock());
+        for handle in handles {
+            if let Err(error) = handle.close().await {
+                tracing::warn!(
+                    sink = %handle.name(),
+                    %error,
+                    "sink close failed while cleaning up unsuccessful pipeline start"
+                );
+            }
+        }
+        if let Some(coordinator) = self.coordinator.lock().await.as_mut() {
+            coordinator.clear_sinks();
+        }
+        *self.control_tx.lock() = None;
+        *self.force_ckpt_tx.lock() = None;
+        *self.exact_deployment_lock.lock() = None;
+    }
+
     /// Start the streaming pipeline. Idempotent if already running. On failure
     /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
@@ -457,6 +787,7 @@ impl LaminarDB {
     ///
     /// Returns an error if the pipeline cannot be started.
     pub async fn start(&self) -> Result<(), DbError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         // CAS-claim the start so a supervisor racing a manual start can't both enter
         // start_inner and spawn two pipelines over the same state.
         loop {
@@ -516,6 +847,7 @@ impl LaminarDB {
                 Ok(())
             }
             Err(e) => {
+                self.cleanup_failed_start().await;
                 // Reset so a retry re-runs startup rather than silently returning Ok.
                 DbState::Created.store(&self.state);
                 Err(e)
@@ -543,25 +875,96 @@ impl LaminarDB {
             tracing::debug!(sink = %name, connector_type = ?reg.connector_type, "Registered sink");
         }
 
-        // Cluster mode needs a durable, shared state backend: a peer recovers a dead node's
-        // vnodes by reading its per-vnode partials from shared storage. The in-process backend
-        // keeps partials in local memory, so a real cluster can't recover them after a node dies.
         #[cfg(feature = "cluster")]
-        if self.cluster_controller.lock().is_some() {
-            let durable = self
-                .state_backend
-                .lock()
-                .as_ref()
-                .is_some_and(|b| b.is_durable());
-            if !durable {
-                return Err(DbError::Config(
-                    "[LDB-0011] cluster mode requires a durable state backend so a peer can \
-                     recover a failed node's vnodes; set object_store_url to shared storage \
-                     (s3://, gs://, az://, or file://) or install an ObjectStoreBackend. The \
-                     in-process backend is non-durable and cannot recover after a node restart."
-                        .into(),
-                ));
+        let startup_runtime = if self.cluster_controller.lock().is_some() {
+            RuntimeMode::Cluster
+        } else {
+            RuntimeMode::Local
+        };
+        #[cfg(not(feature = "cluster"))]
+        let startup_runtime = RuntimeMode::Local;
+
+        // A renewable lease can identify the current leader, but the object-store
+        // decision CAS and external sink transaction do not atomically consume its
+        // term/token. Until those writes are term-fenced end to end, admitting
+        // cluster EO would allow an expired leader to finalize a checkpoint.
+        // Keep this duplicate of the builder admission because tests and embedders
+        // can construct a database through lower-level paths.
+        if startup_runtime == RuntimeMode::Cluster
+            && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+        {
+            return Err(DbError::Config(
+                "[LDB-0013] cluster exactly-once is not admitted: the durable leader lease is \
+                 not atomically bound to checkpoint decisions or sink commits. Use cluster \
+                 at_least_once, or exactly_once in embedded/single-node mode"
+                    .into(),
+            ));
+        }
+        if startup_runtime == RuntimeMode::Local
+            && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && self.config.object_store_url.is_some()
+        {
+            return Err(DbError::Config(
+                "[LDB-0014] local exactly-once with a shared/object-store checkpoint namespace \
+                 is not admitted until the deployment lease is term-fenced. Use a local \
+                 checkpoint directory (node-durable), or at_least_once delivery"
+                    .into(),
+            ));
+        }
+
+        if self.config.checkpoint.is_some()
+            && self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
+        {
+            // Without an object-store URL the checkpoint store is a local directory and thus
+            // survives a same-node process restart. Explicit URLs are classified fail-closed;
+            // notably memory:// cannot own source acknowledgements under a replay guarantee.
+            let checkpoint_scope = self.config.object_store_url.as_deref().map_or(
+                StateBackendDurability::NodeDurable,
+                StateBackendDurability::for_storage_url,
+            );
+            let required = required_recovery_scope(startup_runtime);
+            if !checkpoint_scope.satisfies(required) {
+                return Err(DbError::Config(format!(
+                    "[LDB-5036] {startup_runtime:?} {:?} delivery requires {required:?} \
+                     checkpoint/decision storage, but the configured checkpoint store is \
+                     {checkpoint_scope:?}",
+                    self.config.delivery_guarantee
+                )));
             }
+        }
+
+        let state_backend_scope = self
+            .state_backend
+            .lock()
+            .as_ref()
+            .map_or(StateBackendDurability::Volatile, |backend| {
+                backend.durability_scope()
+            });
+        match startup_runtime {
+            // A cluster peer must be able to recover a failed node's vnodes.
+            RuntimeMode::Cluster
+                if !state_backend_scope.satisfies(StateBackendDurability::ClusterShared) =>
+            {
+                return Err(DbError::Config(format!(
+                    "[LDB-0011] cluster mode requires ClusterShared state so a peer can \
+                         recover a failed node's vnodes; the configured backend is \
+                         {state_backend_scope:?}. Use shared cloud storage (s3://, gs://, or \
+                         az://); in-process, local paths, and file:// storage are not \
+                         cluster-shared."
+                )));
+            }
+            // Local exact recovery may use the same node's durable filesystem.
+            RuntimeMode::Local
+                if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+                    && !state_backend_scope.satisfies(StateBackendDurability::NodeDurable) =>
+            {
+                return Err(DbError::Config(format!(
+                    "[LDB-5035] local exactly-once delivery requires NodeDurable state, but the \
+                     configured backend is {state_backend_scope:?}; configure a local path, \
+                     file:// URL, or shared cloud object store"
+                )));
+            }
+            _ => {}
         }
 
         if let Some(ref cp_config) = self.config.checkpoint {
@@ -570,6 +973,42 @@ impl LaminarDB {
             };
 
             let max_retained = cp_config.max_retained.unwrap_or(3);
+            if max_retained == 0 {
+                return Err(DbError::Config(
+                    "checkpoint.max_retained must be greater than zero".into(),
+                ));
+            }
+            if cp_config.max_in_flight_epochs == Some(0) || cp_config.max_staged_bytes == Some(0) {
+                return Err(DbError::Config(
+                    "checkpoint in-flight, staged-byte, and uncommitted-epoch caps must be \
+                     greater than zero"
+                        .into(),
+                ));
+            }
+            if cp_config.interval_ms == Some(0) {
+                return Err(DbError::Config(
+                    "checkpoint.interval_ms must be greater than zero; use None for manual-only"
+                        .into(),
+                ));
+            }
+            if cp_config.timeout_ms == Some(0) {
+                return Err(DbError::Config(
+                    "checkpoint.timeout_ms must be greater than zero".into(),
+                ));
+            }
+            if let Some(chain_max) = cp_config.delta_chain_max {
+                if startup_runtime != RuntimeMode::Cluster {
+                    return Err(DbError::Config(
+                        "checkpoint.delta_chain_max is supported only in cluster mode".into(),
+                    ));
+                }
+                if chain_max == 0 || max_retained < 2 || chain_max as usize >= max_retained {
+                    return Err(DbError::Config(format!(
+                        "checkpoint.delta_chain_max must be > 0 and < max_retained \
+                         ({max_retained})"
+                    )));
+                }
+            }
             let vnode_count = self.vnode_registry.lock().as_ref().map_or(
                 laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
                 |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
@@ -580,6 +1019,54 @@ impl LaminarDB {
                 .clone()
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            if startup_runtime == RuntimeMode::Local
+                && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+                && self.exact_deployment_lock.lock().is_none()
+            {
+                std::fs::create_dir_all(&data_dir).map_err(|error| {
+                    DbError::Config(format!(
+                        "create exactly-once checkpoint directory {}: {error}",
+                        data_dir.display()
+                    ))
+                })?;
+                let lock_path = data_dir.join(".laminardb-exact.lock");
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&lock_path)
+                    .map_err(|error| {
+                        DbError::Config(format!(
+                            "[LDB-0014] open exactly-once deployment lock {}: {error}",
+                            lock_path.display()
+                        ))
+                    })?;
+                lock.try_lock().map_err(|error| {
+                    DbError::Config(format!(
+                        "[LDB-0014] exactly-once checkpoint namespace {} is already owned by \
+                         another live process: {error}",
+                        data_dir.display()
+                    ))
+                })?;
+                *self.exact_deployment_lock.lock() = Some(lock);
+            }
+            let participant = self.checkpoint_participant();
+            let participant_id = participant.unwrap_or(0);
+            let identity_registrations = crate::pipeline_identity::PipelineRegistrations::new(
+                source_regs.values(),
+                sink_regs.values(),
+                stream_regs.values(),
+                table_regs.values(),
+            );
+            let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
+                &self.config,
+                &self.catalog,
+                identity_registrations,
+                vnode_count,
+                participant.is_some(),
+            );
+            let pipeline_identity = crate::pipeline_identity::compute(&identity_context)?;
 
             let (store, decision_backing): (
                 Box<dyn laminar_core::storage::CheckpointStore>,
@@ -592,10 +1079,10 @@ impl LaminarDB {
                 .map_err(|e| DbError::Config(format!("object store: {e}")))?;
                 let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     Arc::clone(&obj),
-                    String::new(),
-                    max_retained,
+                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
-                .with_vnode_count(vnode_count);
+                .with_vnode_count(vnode_count)
+                .with_participant_id(participant_id);
                 (Box::new(cs), obj)
             } else {
                 std::fs::create_dir_all(&data_dir).map_err(|e| {
@@ -605,45 +1092,48 @@ impl LaminarDB {
                     object_store::local::LocalFileSystem::new_with_prefix(&data_dir)
                         .map_err(|e| DbError::Config(format!("local fs: {e}")))?,
                 );
+                let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
+                    data_dir.join("nodes").join(id.to_string())
+                });
                 let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    &data_dir,
-                    max_retained,
+                    checkpoint_dir,
                 )
-                .with_vnode_count(vnode_count);
+                .with_vnode_count(vnode_count)
+                .with_participant_id(participant_id);
                 (Box::new(cs), obj)
             };
 
             let defaults = CkpConfig::default();
             let config = CkpConfig {
-                interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
                 max_retained,
+                checkpoint_timeout: cp_config.timeout_ms.map_or(
+                    defaults.checkpoint_timeout,
+                    std::time::Duration::from_millis,
+                ),
                 max_in_flight_epochs: cp_config
                     .max_in_flight_epochs
                     .unwrap_or(defaults.max_in_flight_epochs),
                 max_staged_bytes: cp_config
                     .max_staged_bytes
                     .unwrap_or(defaults.max_staged_bytes),
-                max_uncommitted_epochs: cp_config
-                    .max_uncommitted_epochs
-                    .unwrap_or(defaults.max_uncommitted_epochs),
-                uncommitted_epochs_backpressure: cp_config.uncommitted_epochs_backpressure,
-                restorable_gate_poll_initial: cp_config.restorable_gate_poll_initial_ms.map_or(
-                    defaults.restorable_gate_poll_initial,
-                    std::time::Duration::from_millis,
-                ),
-                restorable_gate_poll_max: cp_config.restorable_gate_poll_max_ms.map_or(
-                    defaults.restorable_gate_poll_max,
-                    std::time::Duration::from_millis,
-                ),
                 ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
+            coord.bind_pipeline_identity(pipeline_identity)?;
             if let Some(ref prom) = *self.engine_metrics.lock() {
                 coord.set_metrics(Arc::clone(prom));
             }
 
             #[cfg(feature = "cluster")]
             if let Some(controller) = self.cluster_controller.lock().clone() {
+                if coord.participant_id() != controller.instance_id().0 {
+                    return Err(DbError::Config(format!(
+                        "[LDB-0012] checkpoint store participant {} does not match cluster \
+                         instance {}",
+                        coord.participant_id(),
+                        controller.instance_id().0
+                    )));
+                }
                 coord.set_cluster_controller(controller);
             }
 
@@ -698,7 +1188,13 @@ impl LaminarDB {
                     )
                 }
             };
-            coord.set_decision_store(ds);
+            let deployment_id = ds.load_or_create_deployment_id().await.map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "load/create durable deployment identity before checkpoint startup: {error}"
+                ))
+            })?;
+            coord.set_decision_store(ds)?;
+            coord.bind_deployment_id(deployment_id)?;
 
             *self.coordinator.lock().await = Some(coord);
         }
@@ -746,7 +1242,27 @@ impl LaminarDB {
         };
         use crate::operator_graph::OperatorGraph;
         use crate::pipeline::{PipelineConfig, SourceRegistration};
+        use laminar_connectors::connector::SourceConnector as _;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
+
+        #[cfg(feature = "cluster")]
+        let runtime_mode = if self.cluster_controller.lock().is_some() {
+            RuntimeMode::Cluster
+        } else {
+            RuntimeMode::Local
+        };
+        #[cfg(not(feature = "cluster"))]
+        let runtime_mode = RuntimeMode::Local;
+        let checkpointing_enabled = self.config.checkpoint.is_some();
+        let pipeline_checkpoint_timeout = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|config| config.timeout_ms)
+            .map_or(
+                crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+                std::time::Duration::from_millis,
+            );
 
         let ctx = {
             use datafusion::execution::SessionStateBuilder;
@@ -839,17 +1355,14 @@ impl LaminarDB {
                         "cluster agg: per-vnode partials authoritative (no manifest copy)"
                     );
                 }
-                // Incremental delta checkpoints (opt-in). Clamp the chain bound below the prune
-                // window so a chain base never ages out before the chain head.
+                // Incremental delta checkpoints (opt-in). Startup validation proved the chain
+                // bound fits strictly inside the retention window.
                 if let Some(cp) = self.config.checkpoint.as_ref() {
                     if let Some(chain_max) = cp.delta_chain_max {
-                        let retain =
-                            u32::try_from(cp.max_retained.unwrap_or(3)).unwrap_or(u32::MAX);
-                        let bounded = chain_max.min(retain.saturating_sub(1)).max(1);
-                        graph.set_delta_chain_max(bounded);
+                        graph.set_delta_chain_max(chain_max);
                         // Enabling delta makes the chain the primary aggregate checkpoint.
                         tracing::info!(
-                            delta_chain_max = bounded,
+                            delta_chain_max = chain_max,
                             "delta checkpoints enabled (chain is the primary aggregate checkpoint)"
                         );
                     }
@@ -949,7 +1462,9 @@ impl LaminarDB {
                 .collect(),
         );
 
-        for reg in stream_regs.values() {
+        let mut ordered_streams: Vec<_> = stream_regs.values().collect();
+        ordered_streams.sort_by(|left, right| left.name.cmp(&right.name));
+        for reg in ordered_streams {
             graph.add_query(
                 reg.name.clone(),
                 reg.query_sql.clone(),
@@ -1079,6 +1594,25 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            let contract = source.contract(&config).map_err(|e| {
+                DbError::Config(format!(
+                    "source '{name}' (type '{}') has an invalid contract: {e}",
+                    config.connector_type()
+                ))
+            })?;
+            admit_source_contract(
+                contract,
+                self.config.delivery_guarantee,
+                checkpointing_enabled,
+                runtime_mode,
+            )
+            .map_err(|reason| {
+                DbError::Config(format!(
+                    "source '{name}' is not admissible in {runtime_mode:?} mode with {} delivery: \
+                     {reason} (contract: {contract:?})",
+                    self.config.delivery_guarantee
+                ))
+            })?;
             #[cfg(feature = "cluster")]
             if let (Some(registry), Some(self_id)) = (
                 self.vnode_registry.lock().clone(),
@@ -1088,14 +1622,6 @@ impl LaminarDB {
                     .map(|c| laminar_core::state::NodeId(c.instance_id().0)),
             ) {
                 source.set_vnode_assignment(registry, self_id);
-            }
-            let supports_replay = source.supports_replay();
-            if !supports_replay {
-                tracing::warn!(
-                    source = %name,
-                    "source does not support replay — exactly-once semantics \
-                     are degraded to at-most-once for this source"
-                );
             }
             // Connector-property watermark wiring: `event.time.column` (Kafka)
             // and `event.time.field` (WebSocket) as an alternative to `WATERMARK FOR`.
@@ -1131,8 +1657,8 @@ impl LaminarDB {
                 name: name.clone(),
                 connector: source,
                 config,
-                supports_replay,
-                restore_checkpoint: None, // Set after recovery below
+                contract,
+                position: laminar_connectors::connector::SourcePosition::Initial,
             });
         }
 
@@ -1149,12 +1675,29 @@ impl LaminarDB {
                     entry.schema.clone(),
                     entry.data_notify(),
                 );
+                let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
+                let contract = connector.contract(&config).map_err(|e| {
+                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
+                })?;
+                admit_source_contract(
+                    contract,
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+                .map_err(|reason| {
+                    DbError::Config(format!(
+                        "source '{name}' is not admissible in {runtime_mode:?} mode with {} \
+                         delivery: {reason} (contract: {contract:?})",
+                        self.config.delivery_guarantee
+                    ))
+                })?;
                 sources.push(SourceRegistration {
                     name: name.clone(),
                     connector: Box::new(connector),
-                    config: laminar_connectors::config::ConnectorConfig::new("catalog-bridge"),
-                    supports_replay: false,
-                    restore_checkpoint: None,
+                    config,
+                    contract,
+                    position: laminar_connectors::connector::SourcePosition::Initial,
                 });
             }
         }
@@ -1170,12 +1713,29 @@ impl LaminarDB {
                     entry.schema.clone(),
                     entry.data_notify(),
                 );
+                let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
+                let contract = connector.contract(&config).map_err(|e| {
+                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
+                })?;
+                admit_source_contract(
+                    contract,
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+                .map_err(|reason| {
+                    DbError::Config(format!(
+                        "source '{name}' is not admissible in {runtime_mode:?} mode with {} \
+                         delivery: {reason} (contract: {contract:?})",
+                        self.config.delivery_guarantee
+                    ))
+                })?;
                 sources.push(SourceRegistration {
                     name: name.clone(),
                     connector: Box::new(connector),
-                    config: laminar_connectors::config::ConnectorConfig::new("catalog-bridge"),
-                    supports_replay: false,
-                    restore_checkpoint: None,
+                    config,
+                    contract,
+                    position: laminar_connectors::connector::SourcePosition::Initial,
                 });
             }
         }
@@ -1223,19 +1783,12 @@ impl LaminarDB {
             set
         };
 
-        #[allow(clippy::type_complexity)]
-        let mut sinks: Vec<(
-            String,
-            crate::sink_task::SinkTaskHandle,
-            Option<String>,
-            String, // input stream name (FROM clause target)
-            bool,   // changelog-capable
-        )> = Vec::new();
+        let mut prepared_sinks = Vec::new();
         for (name, reg) in &sink_regs {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let mut config = build_sink_config(reg)?;
+            let mut config = build_sink_config(reg, self.config.delivery_guarantee)?;
             let upstream_schema = stream_output_schemas.get(&reg.input).cloned().or_else(|| {
                 self.catalog
                     .get_source(&reg.input)
@@ -1245,7 +1798,7 @@ impl LaminarDB {
                 let schema_str = crate::pipeline_callback::encode_arrow_schema(&schema);
                 config.set("_arrow_schema".to_string(), schema_str);
             }
-            let mut sink = self
+            let sink = self
                 .connector_registry
                 .create_sink(&config, prom_registry.as_deref())
                 .map_err(|e| {
@@ -1255,33 +1808,32 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
-            sink.open(&config)
-                .await
-                .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
-            let caps = sink.capabilities();
-            // A changelog input (an incremental MV, or a stream forwarding one's changelog) can only
-            // be consumed by a connector that upserts (collapses per key) or handles changelog
-            // records. A non-capable sink would silently drop retractions, so reject it loudly.
-            if !(caps.changelog || caps.upsert) && changelog_carrying.contains(&reg.input) {
-                return Err(DbError::MaterializedView(format!(
-                    "[LDB-1300] sink '{name}' cannot consume the changelog from '{}': its connector \
-                     supports neither upsert nor changelog writes and would drop retractions. Route \
-                     it to an upsert/changelog-capable sink (e.g. Delta with write.mode='upsert' or \
-                     Kafka with envelope='upsert') or set incremental_emit = false.",
-                    reg.input
-                )));
-            }
-            let write_timeout =
-                match config
-                    .get_parsed::<u64>("sink.write.timeout.ms")
-                    .map_err(|e| {
-                        DbError::Connector(format!(
-                            "Invalid 'sink.write.timeout.ms' for sink '{name}': {e}"
-                        ))
-                    })? {
-                    Some(ms) => std::time::Duration::from_millis(ms),
-                    None => caps.suggested_write_timeout,
-                };
+
+            let carries_changelog = changelog_carrying.contains(&reg.input);
+            let state_backend_scope = self
+                .state_backend
+                .lock()
+                .as_ref()
+                .map_or(StateBackendDurability::Volatile, |backend| {
+                    backend.durability_scope()
+                });
+            let (contract, configured_timeout) = admit_sink(
+                sink.as_ref(),
+                SinkAdmissionContext {
+                    config: &config,
+                    name,
+                    input: &reg.input,
+                    delivery: self.config.delivery_guarantee,
+                    runtime: runtime_mode,
+                    carries_changelog,
+                    checkpointing_enabled,
+                    state_backend_scope,
+                },
+            )?;
+            let write_timeout = configured_timeout.map_or(
+                sink.suggested_write_timeout(),
+                std::time::Duration::from_millis,
+            );
             if write_timeout.is_zero() {
                 return Err(DbError::Connector(format!(
                     "sink '{name}': write_timeout must be > 0 \
@@ -1289,26 +1841,58 @@ impl LaminarDB {
                      suggested_write_timeout)"
                 )));
             }
+            prepared_sinks.push(PreparedSink {
+                name: name.clone(),
+                connector: sink,
+                config,
+                filter_expr: reg.filter_expr.clone(),
+                input: reg.input.clone(),
+                contract,
+                write_timeout,
+                requires_recovery_on_error: contract.is_checkpoint_committable()
+                    || self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
+                    || runtime_mode == RuntimeMode::Cluster,
+            });
+        }
+
+        // Opening is one atomic startup stage: a slow connector consumes the remaining shared
+        // checkpoint-derived budget rather than receiving a fresh timeout of its own.
+        open_prepared_sinks(&mut prepared_sinks, pipeline_checkpoint_timeout).await?;
+
+        #[allow(clippy::type_complexity)]
+        let mut sinks: Vec<(
+            String,
+            crate::sink_task::SinkTaskHandle,
+            Option<String>,
+            String, // input stream name (FROM clause target)
+            SinkContract,
+        )> = Vec::with_capacity(prepared_sinks.len());
+        for prepared in prepared_sinks {
+            let PreparedSink {
+                name,
+                connector,
+                filter_expr,
+                input,
+                contract,
+                write_timeout,
+                requires_recovery_on_error,
+                config: _,
+            } = prepared;
             let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
                 crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
                     name: name.clone(),
                     sink_id,
-                    connector: sink,
-                    exactly_once: caps.exactly_once,
-                    coordinated_commit: caps.coordinated_commit,
+                    connector,
+                    contract,
+                    requires_recovery_on_error,
                     channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
                     flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
                     write_timeout,
                     event_tx: sink_event_tx.clone(),
                 });
-            sinks.push((
-                name.clone(),
-                handle,
-                reg.filter_expr.clone(),
-                reg.input.clone(),
-                caps.changelog,
-            ));
+            self.startup_sink_handles.lock().push(handle.clone());
+            sinks.push((name, handle, filter_expr, input, contract));
         }
         drop(sink_event_tx);
 
@@ -1329,68 +1913,25 @@ impl LaminarDB {
             table_sources.push((name.clone(), source, mode));
         }
 
-        let (coordinated_committer, committer_poll) = {
+        let (coordinated_committer, committer_poll, committer_notify) = {
             let mut guard = self.coordinator.lock().await;
             if let Some(coord) = guard.as_mut() {
                 for (name, handle, _, _, _) in &sinks {
-                    coord.register_sink(
-                        name.clone(),
-                        handle.clone(),
-                        handle.exactly_once(),
-                        handle.coordinated_commit(),
-                    );
+                    coord.register_sink(name.clone(), handle.clone());
                 }
                 (
-                    coord.coordinated_committer(),
-                    coord.committer_poll_interval(),
+                    coord.coordinated_committer()?,
+                    crate::checkpoint_coordinator::CheckpointCoordinator::committer_poll_interval(),
+                    coord.committer_notify(),
                 )
             } else {
-                // No coordinator (checkpointing disabled) means no designated
-                // committer; a coordinated sink would seal epochs that never
-                // get externally committed → silent data loss. Fail fast.
-                if sinks.iter().any(|(_, h, _, _, _)| h.coordinated_commit()) {
-                    return Err(DbError::Config(
-                        "a sink declares coordinated_commit but checkpointing is \
-                         disabled; coordinated commit requires a checkpoint coordinator"
-                            .into(),
-                    ));
-                }
-                (None, std::time::Duration::from_secs(1))
+                (
+                    None,
+                    std::time::Duration::from_secs(1),
+                    Arc::new(tokio::sync::Notify::new()),
+                )
             }
         };
-
-        // Decoupled designated committer: a poll loop off the barrier path that
-        // commits sealed epochs for coordinated-commit sinks. Spawned only when
-        // such sinks exist; stops on terminal pipeline state. The handle is held
-        // so shutdown can abort it (its work is idempotent).
-        if let Some(mut committer) = coordinated_committer {
-            let state = Arc::clone(&self.state);
-            let handle = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(committer_poll);
-                loop {
-                    tick.tick().await;
-                    if matches!(
-                        DbState::load(&state),
-                        DbState::Stopped
-                            | DbState::ShuttingDown
-                            | DbState::Faulted
-                            | DbState::Created
-                    ) {
-                        break;
-                    }
-                    if let Err(e) = committer.commit_ready().await {
-                        tracing::warn!(error = %e, "coordinated committer pass failed; will retry");
-                    }
-                }
-            });
-            // Abort any prior committer (e.g. on a Faulted→start() restart) so a
-            // stale loop can't run concurrently with the new one.
-            let mut guard = self.committer_handle.lock();
-            if let Some(prev) = guard.take() {
-                prev.abort();
-            }
-            *guard = Some(handle);
-        }
 
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
         // Hoist watermarks now so generators are seeded before watermark-state construction;
@@ -1417,22 +1958,14 @@ impl LaminarDB {
                         Ok(Some(recovered)) => Some(recovered.epoch()),
                         _ => None,
                     };
-                    // A genesis rewind (no committed cut) truncated all durable state, but
-                    // the broker's committed group offsets survive that — a fresh consumer
-                    // would resume ahead of the empty state and silently skip the replay.
-                    if recover_target == Some(0) {
+                    // A genesis rewind has no durable engine cursor. Keep every source's atomic
+                    // startup request at Initial; the connector applies its configured initial
+                    // policy as part of start rather than becoming active and then rewinding.
+                    if recover_target == Some(0) && matches!(&recovery, Ok(None)) {
                         for src in &mut sources {
-                            if !src.supports_replay {
-                                continue;
-                            }
-                            if let Err(e) = src.connector.reset_to_initial().await {
-                                tracing::warn!(
-                                    source = %src.name, error = %e,
-                                    "genesis source reset failed"
-                                );
-                            }
+                            src.position = laminar_connectors::connector::SourcePosition::Initial;
                         }
-                        tracing::info!("genesis rewind: sources reset to initial position");
+                        tracing::info!("genesis rewind: sources will start at initial position");
                     }
                 }
                 match recovery {
@@ -1451,20 +1984,23 @@ impl LaminarDB {
                                         cp,
                                     );
                                 if let Err(e) = source.restore(&restored).await {
-                                    tracing::warn!(
-                                        table=%name, error=%e,
-                                        "Table source restore failed"
-                                    );
+                                    return Err(DbError::Checkpoint(format!(
+                                        "table source restore failed for '{name}': {e}"
+                                    )));
                                 }
                             }
                         }
                         // The manifest is per-node incomplete (first-writer-wins), so a partition
                         // re-acquired from a killed peer is absent; the handoff union at the
                         // recovered epoch fills it. A read failure fails recovery closed.
+                        let recovered_attempt = laminar_core::state::CheckpointAttempt::new(
+                            recovered.manifest.epoch,
+                            recovered.manifest.checkpoint_id,
+                        );
                         #[cfg(feature = "cluster")]
                         let handoff =
                             coord
-                                .source_offsets_at(recovered.epoch())
+                                .source_offsets_at(recovered_attempt)
                                 .await
                                 .map_err(|e| {
                                     DbError::Checkpoint(format!(
@@ -1472,7 +2008,7 @@ impl LaminarDB {
                                 ))
                                 })?;
                         for src in &mut sources {
-                            if !src.supports_replay {
+                            if !src.contract.supports_replay() {
                                 continue;
                             }
                             let manifest_cp = recovered.manifest.source_offsets.get(&src.name);
@@ -1491,10 +2027,19 @@ impl LaminarDB {
                                     source = %src.name,
                                     "attaching checkpoint offsets for source recovery"
                                 );
-                                src.restore_checkpoint = Some(restored);
+                                src.position =
+                                    laminar_connectors::connector::SourcePosition::Resume {
+                                        attempt: recovered_attempt,
+                                        checkpoint: restored,
+                                    };
+                            } else {
+                                return Err(DbError::Checkpoint(format!(
+                                    "[LDB-6042] recovered checkpoint {} has no restorable \
+                                     offset for replayable source '{}'",
+                                    recovered.manifest.checkpoint_id, src.name
+                                )));
                             }
                         }
-                        let mut graph_restore_failed = false;
                         let op_keys: Vec<&String> =
                             recovered.manifest.operator_states.keys().collect();
                         let instance_hint = {
@@ -1538,27 +2083,29 @@ impl LaminarDB {
                                     }
                                 }
                             } else {
-                                tracing::warn!(
-                                    "manifest has 'operator_graph' but decode_inline returned None"
-                                );
+                                return Err(DbError::Checkpoint(
+                                    "[LDB-6029] operator graph checkpoint is not inline after \
+                                     sidecar resolution"
+                                        .to_string(),
+                                ));
                             }
                         } else if recovered
                             .manifest
                             .operator_states
                             .contains_key("stream_executor")
                         {
-                            graph_restore_failed = true;
-                            tracing::warn!(
-                                "Found old stream_executor checkpoint format; \
-                                 skipping restore (clean break). Starting fresh."
-                            );
+                            return Err(DbError::Checkpoint(
+                                "[LDB-6029] legacy stream_executor checkpoint is unsupported; \
+                                 explicit checkpoint reset is required"
+                                    .to_string(),
+                            ));
                         }
 
                         // Cold-tier vnodes are wiped on restart; replay them from durable partials.
                         // Only the demoting operator's slice is applied — others restored from
                         // the manifest (double-applying would corrupt state).
                         #[cfg(feature = "state-tier")]
-                        if !graph_restore_failed {
+                        {
                             let cold_map = graph.take_tier_cold_vnodes();
                             if !cold_map.is_empty() {
                                 self.rehydrate_cold_vnodes(&mut graph, &cold_map).await?;
@@ -1568,53 +2115,62 @@ impl LaminarDB {
                         // Rebuild aggregates from each boot-owned vnode's chain at the recovered
                         // cut — the same epoch the source offsets resume from.
                         #[cfg(feature = "cluster")]
-                        if !graph_restore_failed && self.state_backend.lock().is_some() {
-                            self.stage_owned_vnodes_from_chains(recovered.epoch())
+                        if self.state_backend.lock().is_some() {
+                            self.stage_owned_vnodes_from_chains(recovered_attempt)
                                 .await?;
                         }
 
-                        if !graph_restore_failed {
-                            // The manifest's MV rows are one writer's slice: restoring keyed rows
-                            // on a cluster node plants ghost keys the distributed union double
-                            // counts; adopt's force-emit rebuilds them. Append MVs keep restoring.
-                            #[cfg(feature = "cluster")]
-                            let skip_keyed = self.cluster_controller.lock().is_some()
-                                && self.state_backend.lock().is_some();
-                            #[cfg(not(feature = "cluster"))]
-                            let skip_keyed = false;
-                            let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
-                            let mut store = self.mv_store.write();
-                            let mut restored = 0usize;
-                            let mut skipped = 0usize;
-                            for (key, op) in &recovered.manifest.operator_states {
-                                if let Some(name) = key.strip_prefix(prefix) {
-                                    if skip_keyed && store.is_keyed_changelog(name) {
-                                        skipped += 1;
-                                        continue;
-                                    }
-                                    if let Some(bytes) = op.decode_inline() {
-                                        match store.restore_from_ipc(name, &bytes) {
-                                            Ok(true) => restored += 1,
-                                            Ok(false) => {}
-                                            Err(e) => {
-                                                tracing::warn!(mv = name, error = %e, "MV restore failed");
-                                            }
+                        // The manifest's MV rows are one writer's slice: restoring keyed rows
+                        // on a cluster node plants ghost keys the distributed union double
+                        // counts; adopt's force-emit rebuilds them. Append MVs keep restoring.
+                        #[cfg(feature = "cluster")]
+                        let skip_keyed = self.cluster_controller.lock().is_some()
+                            && self.state_backend.lock().is_some();
+                        #[cfg(not(feature = "cluster"))]
+                        let skip_keyed = false;
+                        let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
+                        let mut store = self.mv_store.write();
+                        let mut restored = 0usize;
+                        let mut skipped = 0usize;
+                        for (key, op) in &recovered.manifest.operator_states {
+                            if let Some(name) = key.strip_prefix(prefix) {
+                                if skip_keyed && store.is_keyed_changelog(name) {
+                                    skipped += 1;
+                                    continue;
+                                }
+                                if let Some(bytes) = op.decode_inline() {
+                                    match store.restore_from_ipc(name, &bytes) {
+                                        Ok(true) => restored += 1,
+                                        Ok(false) => {
+                                            return Err(DbError::Checkpoint(format!(
+                                                "MV checkpoint '{name}' has no matching \
+                                                 registered materialized view"
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            return Err(DbError::Checkpoint(format!(
+                                                "MV restore failed for '{name}': {e}"
+                                            )));
                                         }
                                     }
+                                } else {
+                                    return Err(DbError::Checkpoint(format!(
+                                        "MV checkpoint '{name}' is not inline after sidecar \
+                                             resolution"
+                                    )));
                                 }
                             }
-                            if restored > 0 || skipped > 0 {
-                                tracing::info!(
-                                    mvs = restored,
-                                    skipped_keyed = skipped,
-                                    "Restored MV state from checkpoint"
-                                );
-                            }
+                        }
+                        if restored > 0 || skipped > 0 {
+                            tracing::info!(
+                                mvs = restored,
+                                skipped_keyed = skipped,
+                                "Restored MV state from checkpoint"
+                            );
                         }
                         tracing::info!(
+                            checkpoint_id = recovered.manifest.checkpoint_id,
                             epoch = recovered.epoch(),
-                            sources_restored = recovered.sources_restored,
-                            sinks_rolled_back = recovered.sinks_rolled_back,
                             "Recovered from unified checkpoint"
                         );
                     }
@@ -1622,7 +2178,7 @@ impl LaminarDB {
                         tracing::info!("No checkpoint found, starting fresh");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Checkpoint recovery failed, starting fresh");
+                        return Err(e);
                     }
                 }
             }
@@ -1635,7 +2191,7 @@ impl LaminarDB {
                 // site the coordinator's sink set was empty, so marker-committed Pending epochs
                 // were never re-driven and unmarked Pending epochs never rolled back (CP-2).
                 // Must precede begin_initial_epoch, which opens the next epoch on those sinks.
-                coord.reconcile_prepared_on_init().await;
+                coord.reconcile_prepared_on_init().await?;
                 coord.begin_initial_epoch().await?;
             }
         }
@@ -1971,15 +2527,7 @@ impl LaminarDB {
                 } else {
                     std::time::Duration::ZERO
                 }),
-            barrier_alignment_timeout: self
-                .config
-                .checkpoint
-                .as_ref()
-                .and_then(|c| c.alignment_timeout_ms)
-                .map_or(
-                    std::time::Duration::from_secs(30),
-                    std::time::Duration::from_millis,
-                ),
+            checkpoint_timeout: pipeline_checkpoint_timeout,
             delivery_guarantee: self.config.delivery_guarantee,
             cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
             drain_budget_ns,
@@ -1995,47 +2543,21 @@ impl LaminarDB {
         {
             use laminar_connectors::connector::DeliveryGuarantee;
 
-            if pipeline_config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-                for src in &sources {
-                    if !src.supports_replay {
-                        return Err(DbError::Config(format!(
-                            "[LDB-5030] exactly-once requires all sources to support replay, \
-                             but source '{}' does not. Use at-least-once or remove this source.",
-                            src.name
-                        )));
-                    }
-                }
-                for (name, handle, _, _, _) in &sinks {
-                    if !handle.exactly_once() {
-                        return Err(DbError::Config(format!(
-                            "[LDB-5031] exactly-once requires all sinks to support \
-                             exactly-once semantics, but sink '{name}' does not. \
-                             Use at-least-once or configure a transactional sink."
-                        )));
-                    }
-                }
-                if pipeline_config.checkpoint_interval.is_none() {
-                    return Err(DbError::Config(
-                        "[LDB-5032] exactly-once requires checkpointing to be enabled. \
-                         Set checkpoint.interval.ms in the pipeline configuration."
-                            .into(),
-                    ));
-                }
-            } else if pipeline_config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce {
-                let has_non_replayable = sources.iter().any(|s| !s.supports_replay);
-                let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
-                if has_non_replayable && has_eo_sink {
-                    tracing::warn!(
-                        "[LDB-5033] pipeline has exactly-once sinks but some sources \
-                         do not support replay — effective guarantee is at-most-once \
-                         for events from non-replayable sources"
-                    );
-                }
+            if pipeline_config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+                && pipeline_config.checkpoint_interval.is_none()
+            {
+                return Err(DbError::Config(
+                    "[LDB-5032] exactly-once requires checkpointing to be enabled. \
+                     Set checkpoint.interval.ms in the pipeline configuration."
+                        .into(),
+                ));
             }
 
             // Drive the pre-rotation drain off the sinks, not the DB-level guarantee (set per sink
             // by the server): an EO sink can't dedup a rotation dup, so rotation pauses the source.
-            let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
+            let has_eo_sink = sinks
+                .iter()
+                .any(|(_, h, _, _, _)| h.checkpoint_committable());
             self.rotation_drain_required
                 .store(has_eo_sink, std::sync::atomic::Ordering::Release);
         }
@@ -2045,22 +2567,6 @@ impl LaminarDB {
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
-        let pipeline_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            for reg in stream_regs.values() {
-                reg.name.hash(&mut hasher);
-                reg.query_sql.hash(&mut hasher);
-            }
-            for name in source_regs.keys() {
-                name.hash(&mut hasher);
-            }
-            for name in sink_regs.keys() {
-                name.hash(&mut hasher);
-            }
-            Some(hasher.finish())
-        };
-
         graph.set_query_budget_ns(pipeline_config.query_budget_ns);
         graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
         graph.set_max_input_buf_bytes(pipeline_config.max_input_buf_bytes);
@@ -2095,19 +2601,25 @@ impl LaminarDB {
         >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
         *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
 
-        let (checkpoint_complete_tx, checkpoint_complete_rx) = crossfire::mpsc::bounded_async::<(
-            u64,
-            rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>,
-        )>(16);
-        // Cap in-flight epochs at 1 when any sink is exactly-once — DDL-configured
-        // sinks declare this via capabilities, not the pipeline-level guarantee,
-        // so checking capabilities guards against pipelining over an open transaction.
-        let has_exactly_once_sink = sinks
+        let (checkpoint_complete_tx, checkpoint_complete_rx) =
+            crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(16);
+        // Cap in-flight epochs at 1 when any sink is checkpoint-committable. DDL-configured sinks
+        // declare this through their admitted contract, so the runtime cannot pipeline output
+        // from a successor epoch into a still-open transaction or staged descriptor.
+        let has_checkpoint_committable_sink = sinks
             .iter()
-            .any(|(_, handle, _, _, _)| handle.exactly_once());
+            .any(|(_, handle, _, _, _)| handle.checkpoint_committable());
         let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let staged_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (epoch_allocator, ckpt_quorum_timeout, max_in_flight_epochs, max_staged_bytes) = {
+        let (
+            epoch_allocator,
+            ckpt_quorum_timeout,
+            checkpoint_timeout,
+            checkpoint_cleanup_timeout,
+            max_in_flight_epochs,
+            max_staged_bytes,
+            coordinated_commit_admission,
+        ) = {
             let guard = coordinator.lock().await;
             match guard.as_ref() {
                 Some(coord) => {
@@ -2120,7 +2632,7 @@ impl LaminarDB {
                         .as_ref()
                         .and_then(|c| c.delta_chain_max)
                         .is_some();
-                    let depth = if has_exactly_once_sink
+                    let depth = if has_checkpoint_committable_sink
                         || pipeline_config.delivery_guarantee
                             == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
                         || delta_enabled
@@ -2132,11 +2644,22 @@ impl LaminarDB {
                     (
                         Some(coord.epoch_allocator()),
                         cfg.quorum_timeout,
+                        cfg.checkpoint_timeout,
+                        cfg.cleanup_timeout,
                         depth,
                         cfg.max_staged_bytes.max(1), // 0 would pause admission permanently
+                        coord.coordinated_commit_admission(),
                     )
                 }
-                None => (None, std::time::Duration::from_secs(3), 1, u64::MAX),
+                None => (
+                    None,
+                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(120),
+                    crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout,
+                    1,
+                    u64::MAX,
+                    None,
+                ),
             }
         };
         #[cfg(not(feature = "cluster"))]
@@ -2174,19 +2697,14 @@ impl LaminarDB {
             filter_ctx: laminar_sql::create_session_context(),
             compiled_sink_filters: Vec::new(),
             pending_sink_filter_compiles: sinks_pending_filter_count,
-            last_checkpoint: std::time::Instant::now(),
-            checkpoint_interval: self
-                .config
-                .checkpoint
-                .as_ref()
-                .and_then(|c| c.interval_ms)
-                .map(std::time::Duration::from_millis),
-            pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            serialization_timeout: std::time::Duration::from_secs(120),
+            serialization_timeout: checkpoint_timeout,
+            checkpoint_timeout,
+            checkpoint_cleanup_timeout,
             sink_event_rx,
             sink_timed_out: false,
             sink_fault: None,
+            checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_signal: Arc::clone(&self.shutdown_signal),
             #[cfg(feature = "cluster")]
             converged_rx: callback_controller.as_ref().map(|cc| cc.converged_watch()),
@@ -2206,7 +2724,6 @@ impl LaminarDB {
             shuffle_lost_seen: 0,
             #[cfg(feature = "cluster")]
             pending_follower_checkpoint: None,
-            force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
             #[cfg(feature = "cluster")]
             active_subs: Arc::clone(&self.active_subs),
@@ -2214,6 +2731,7 @@ impl LaminarDB {
             sub_route: std::sync::OnceLock::new(),
             static_stream_names,
             checkpoint_complete_tx,
+            checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
             staged_bytes: Arc::clone(&staged_bytes),
             #[cfg(feature = "cluster")]
@@ -2221,7 +2739,7 @@ impl LaminarDB {
             epoch_allocator,
             #[cfg(feature = "cluster")]
             quorum_timeout: ckpt_quorum_timeout,
-            exactly_once_sinks: has_exactly_once_sink,
+            checkpoint_committable_sinks: has_checkpoint_committable_sink,
             state_memory_budget_bytes: self.config.state_memory_budget_bytes,
             // Backdated so the first cycle probes immediately.
             state_budget_probe_at: std::time::Instant::now()
@@ -2251,13 +2769,15 @@ impl LaminarDB {
                 source_gate,
             )
             .await?
+            .with_force_checkpoint_rx(force_ckpt_rx)
             .with_checkpoint_complete_rx(checkpoint_complete_rx)
             .with_checkpoint_admission(
                 checkpoint_in_flight,
                 max_in_flight_epochs,
                 staged_bytes,
                 max_staged_bytes,
-            );
+            )
+            .with_coordinated_commit_admission(coordinated_commit_admission);
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
@@ -2397,6 +2917,43 @@ impl LaminarDB {
 
             *self.runtime_handle.lock() = Some(handle);
         }
+
+        // Start the designated committer only after recovery, reconciliation,
+        // source restoration, and the compute runtime all succeeded. Its first
+        // pass runs immediately to close any recovery/external-commit crash window. New
+        // checkpoints wake it directly; the interval is only a safety net.
+        if let Some(mut committer) = coordinated_committer {
+            let state = Arc::clone(&self.state);
+            let handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(committer_poll);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick.tick().await;
+
+                if let Err(e) = committer.commit_ready().await {
+                    tracing::warn!(error = %e, "initial coordinated committer pass failed; will retry");
+                }
+                loop {
+                    tokio::select! {
+                        () = committer_notify.notified() => {}
+                        _ = tick.tick() => {}
+                    }
+                    if matches!(
+                        DbState::load(&state),
+                        DbState::Stopped | DbState::Faulted | DbState::Created
+                    ) {
+                        break;
+                    }
+                    if let Err(e) = committer.commit_ready().await {
+                        tracing::warn!(error = %e, "coordinated committer pass failed; will retry");
+                    }
+                }
+            });
+            let mut guard = self.committer_handle.lock();
+            if let Some(previous) = guard.replace(handle) {
+                previous.abort();
+            }
+        }
+        self.startup_sink_handles.lock().clear();
         Ok(())
     }
 
@@ -2406,34 +2963,74 @@ impl LaminarDB {
     ///
     /// Returns `Err` if the watcher task panicked.
     pub async fn shutdown(&self) -> Result<(), DbError> {
-        if matches!(
-            DbState::load(&self.state),
-            DbState::Stopped | DbState::ShuttingDown
-        ) {
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let _lifecycle = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Pipeline(format!(
+                    "pipeline shutdown could not acquire lifecycle ownership within \
+                     {SHUTDOWN_TIMEOUT:?}; startup/stop remains fenced"
+                ))
+            })?;
+
+        let state = DbState::load(&self.state);
+        if matches!(state, DbState::Stopped) {
             return Ok(());
         }
 
-        DbState::ShuttingDown.store(&self.state);
+        // A prior timed-out call leaves the watcher handle and deployment lock owned here. A
+        // retry must resume waiting instead of returning a false success while the compute thread
+        // is still live.
+        if !matches!(state, DbState::ShuttingDown) {
+            DbState::ShuttingDown.store(&self.state);
 
-        *self.force_ckpt_tx.lock() = None;
+            *self.force_ckpt_tx.lock() = None;
 
-        self.shutdown_signal.notify_one();
-        if let Some(h) = self.committer_handle.lock().take() {
-            h.abort();
+            self.shutdown_signal.notify_one();
         }
 
         let handle = self.runtime_handle.lock().take();
-        if let Some(handle) = handle {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
-                Ok(Ok(())) => tracing::info!("Pipeline shut down cleanly"),
-                Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during shutdown"),
-                Err(_) => tracing::warn!("Pipeline shutdown timed out after 10s"),
+        let mut watcher_error = None;
+        if let Some(mut handle) = handle {
+            match tokio::time::timeout_at(deadline, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    watcher_error = Some(DbError::Pipeline(format!(
+                        "pipeline watcher failed during shutdown: {error}"
+                    )));
+                }
+                Err(_) => {
+                    // Dropping this JoinHandle would detach only the watcher while the dedicated
+                    // compute thread continued. Retain every owner/fence and let a later call
+                    // resume the wait.
+                    *self.runtime_handle.lock() = Some(handle);
+                    return Err(DbError::Pipeline(format!(
+                        "pipeline shutdown exceeded {SHUTDOWN_TIMEOUT:?}; runtime is still \
+                         draining and remains fenced in ShuttingDown; retry shutdown"
+                    )));
+                }
             }
         }
+        if watcher_error.is_none() {
+            if let Some(fault) = self.last_fault.lock().clone() {
+                watcher_error = Some(DbError::Pipeline(format!(
+                    "pipeline faulted while shutting down: {fault}"
+                )));
+            } else {
+                tracing::info!("Pipeline shut down cleanly");
+            }
+        }
+        let committer = self.committer_handle.lock().take();
+        if let Some(handle) = committer {
+            handle.abort();
+            let _ = handle.await;
+        }
 
+        *self.exact_deployment_lock.lock() = None;
         DbState::Stopped.store(&self.state);
         self.close();
-        Ok(())
+        watcher_error.map_or(Ok(()), Err)
     }
 
     /// Stop the streaming pipeline so it can be restarted.
@@ -2442,6 +3039,17 @@ impl LaminarDB {
     /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting
     /// or the coordinator does not exit within the stop timeout.
     pub async fn stop_pipeline(&self) -> Result<(), DbError> {
+        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+        let _lifecycle = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::InvalidOperation(
+                    "pipeline stop could not acquire lifecycle ownership within 10s; an earlier \
+                     lifecycle operation remains fenced"
+                        .into(),
+                )
+            })?;
         match DbState::compare_exchange(DbState::Running, DbState::ShuttingDown, &self.state) {
             Ok(_) => {}
             Err(DbState::Created | DbState::Stopped) => return Ok(()),
@@ -2459,9 +3067,6 @@ impl LaminarDB {
         *self.control_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
-        if let Some(h) = self.committer_handle.lock().take() {
-            h.abort();
-        }
 
         let handle = self.runtime_handle.lock().take();
         if let Some(mut handle) = handle {
@@ -2469,7 +3074,7 @@ impl LaminarDB {
             // coordinator exits, so it must already see the flag if we time out.
             self.stop_timed_out
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+            match tokio::time::timeout_at(deadline, &mut handle).await {
                 Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
                 Err(_) => {
@@ -2488,8 +3093,635 @@ impl LaminarDB {
             }
         }
 
+        let committer = self.committer_handle.lock().take();
+        if let Some(handle) = committer {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        *self.exact_deployment_lock.lock() = None;
         DbState::Created.store(&self.state);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod connector_admission_tests {
+    use super::{
+        admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
+        open_prepared_sinks, PreparedSink, RuntimeMode, SinkAdmissionContext, EXACT_SINK_PROTOCOL,
+    };
+    use crate::pipeline::PipelineConfig;
+    use arrow_array::RecordBatch;
+    use arrow_schema::{Schema, SchemaRef};
+    use async_trait::async_trait;
+    use laminar_connectors::config::ConnectorConfig;
+    use laminar_connectors::connector::{
+        DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract, SinkInputMode,
+        SinkTopology, SourceConsistency, SourceContract, SourceTopology, WriteResult,
+    };
+    use laminar_connectors::error::ConnectorError;
+    use laminar_core::state::StateBackendDurability;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn source_contract_admission_matrix_is_fail_closed() {
+        let consistencies = [
+            SourceConsistency::Ephemeral,
+            SourceConsistency::Replayable,
+            SourceConsistency::CommitCoupled,
+        ];
+        let topologies = [
+            SourceTopology::Singleton,
+            SourceTopology::Splittable,
+            SourceTopology::NodeLocalIngress,
+        ];
+        let deliveries = [
+            DeliveryGuarantee::BestEffort,
+            DeliveryGuarantee::AtLeastOnce,
+            DeliveryGuarantee::ExactlyOnce,
+        ];
+        let runtimes = [RuntimeMode::Local, RuntimeMode::Cluster];
+
+        for consistency in consistencies {
+            for topology in topologies {
+                for delivery in deliveries {
+                    for runtime in runtimes {
+                        for checkpointing_enabled in [false, true] {
+                            let contract = SourceContract::new(consistency, topology);
+                            let expected = match consistency {
+                                SourceConsistency::Ephemeral => {
+                                    delivery == DeliveryGuarantee::BestEffort
+                                }
+                                SourceConsistency::Replayable => true,
+                                SourceConsistency::CommitCoupled => {
+                                    delivery == DeliveryGuarantee::AtLeastOnce
+                                        && checkpointing_enabled
+                                }
+                            };
+                            let expected = expected
+                                && !(runtime == RuntimeMode::Cluster
+                                    && delivery == DeliveryGuarantee::ExactlyOnce)
+                                && (runtime != RuntimeMode::Cluster
+                                    || topology == SourceTopology::Splittable
+                                    || (topology == SourceTopology::NodeLocalIngress
+                                        && delivery == DeliveryGuarantee::BestEffort));
+
+                            assert_eq!(
+                                admit_source_contract(
+                                    contract,
+                                    delivery,
+                                    checkpointing_enabled,
+                                    runtime,
+                                )
+                                .is_ok(),
+                                expected,
+                                "contract={contract:?}, delivery={delivery:?}, \
+                                 checkpointing_enabled={checkpointing_enabled}, runtime={runtime:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_singleton_is_rejected_even_for_best_effort() {
+        let contract =
+            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton);
+        let error = admit_source_contract(
+            contract,
+            DeliveryGuarantee::BestEffort,
+            true,
+            RuntimeMode::Cluster,
+        )
+        .unwrap_err();
+        assert!(error.contains("fenced singleton placement"));
+    }
+
+    #[test]
+    fn commit_coupled_exactly_once_requires_a_certified_barrier_cut() {
+        let contract =
+            SourceContract::new(SourceConsistency::CommitCoupled, SourceTopology::Singleton);
+        let error = admit_source_contract(
+            contract,
+            DeliveryGuarantee::ExactlyOnce,
+            true,
+            RuntimeMode::Local,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("certified in-flight transaction/barrier checkpoint cut"));
+    }
+
+    #[test]
+    fn sink_contract_admission_matrix_is_fail_closed() {
+        let consistencies = [
+            SinkConsistency::Ephemeral,
+            SinkConsistency::DurableAtLeastOnce,
+            SinkConsistency::CheckpointCommittable,
+        ];
+        let topologies = [
+            SinkTopology::Singleton,
+            SinkTopology::MultiWriter,
+            SinkTopology::NodeLocalEgress,
+        ];
+        let input_modes = [
+            SinkInputMode::AppendOnly,
+            SinkInputMode::KeyedUpsert,
+            SinkInputMode::FullChangelog,
+        ];
+        let deliveries = [
+            DeliveryGuarantee::BestEffort,
+            DeliveryGuarantee::AtLeastOnce,
+            DeliveryGuarantee::ExactlyOnce,
+        ];
+        let runtimes = [RuntimeMode::Local, RuntimeMode::Cluster];
+
+        for consistency in consistencies {
+            for topology in topologies {
+                for input_mode in input_modes {
+                    for delivery in deliveries {
+                        for runtime in runtimes {
+                            for carries_changelog in [false, true] {
+                                let contract = SinkContract::new(consistency, topology, input_mode);
+                                let durable = delivery != DeliveryGuarantee::AtLeastOnce
+                                    || consistency != SinkConsistency::Ephemeral;
+                                let placed = runtime != RuntimeMode::Cluster
+                                    || topology == SinkTopology::MultiWriter
+                                    || (topology == SinkTopology::NodeLocalEgress
+                                        && delivery == DeliveryGuarantee::BestEffort);
+                                let input_compatible =
+                                    !carries_changelog || input_mode.accepts_full_changelog();
+                                let protocol_compatible =
+                                    if delivery == DeliveryGuarantee::ExactlyOnce {
+                                        consistency == SinkConsistency::CheckpointCommittable
+                                    } else {
+                                        consistency != SinkConsistency::CheckpointCommittable
+                                    };
+                                let expected = protocol_compatible
+                                    && durable
+                                    && placed
+                                    && input_compatible
+                                    && !(runtime == RuntimeMode::Cluster
+                                        && delivery == DeliveryGuarantee::ExactlyOnce);
+
+                                assert_eq!(
+                                    admit_sink_contract(
+                                        contract,
+                                        delivery,
+                                        runtime,
+                                        carries_changelog,
+                                    )
+                                    .is_ok(),
+                                    expected,
+                                    "contract={contract:?}, delivery={delivery:?}, \
+                                     runtime={runtime:?}, carries_changelog={carries_changelog}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct OpenProbeSink {
+        contract: SinkContract,
+        opened: Arc<AtomicBool>,
+        schema: SchemaRef,
+        exact_protocol: bool,
+    }
+
+    struct StartupProbeSink {
+        open_delay: Duration,
+        close_delay: Duration,
+        open_calls: Arc<AtomicU64>,
+        close_calls: Arc<AtomicU64>,
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl SinkConnector for StartupProbeSink {
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+            Ok(SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ))
+        }
+
+        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.open_delay).await;
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(0, 0))
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.close_delay).await;
+            Ok(())
+        }
+    }
+
+    fn prepared_startup_probe(
+        name: &str,
+        delay: Duration,
+        open_calls: Arc<AtomicU64>,
+        close_calls: Arc<AtomicU64>,
+    ) -> PreparedSink {
+        prepared_lifecycle_probe(name, delay, Duration::ZERO, open_calls, close_calls)
+    }
+
+    fn prepared_lifecycle_probe(
+        name: &str,
+        open_delay: Duration,
+        close_delay: Duration,
+        open_calls: Arc<AtomicU64>,
+        close_calls: Arc<AtomicU64>,
+    ) -> PreparedSink {
+        PreparedSink {
+            name: name.into(),
+            connector: Box::new(StartupProbeSink {
+                open_delay,
+                close_delay,
+                open_calls,
+                close_calls,
+                schema: Arc::new(Schema::empty()),
+            }),
+            config: ConnectorConfig::new("startup-probe"),
+            filter_expr: None,
+            input: "input".into(),
+            contract: SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ),
+            write_timeout: Duration::from_secs(1),
+            requires_recovery_on_error: true,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sink_open_stage_uses_one_deadline_and_rolls_back_current_and_prior() {
+        let prior_open = Arc::new(AtomicU64::new(0));
+        let prior_close = Arc::new(AtomicU64::new(0));
+        let current_open = Arc::new(AtomicU64::new(0));
+        let current_close = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![
+            prepared_startup_probe(
+                "prior",
+                Duration::from_secs(6),
+                Arc::clone(&prior_open),
+                Arc::clone(&prior_close),
+            ),
+            prepared_startup_probe(
+                "current",
+                Duration::from_secs(6),
+                Arc::clone(&current_open),
+                Arc::clone(&current_close),
+            ),
+        ];
+
+        let error = open_prepared_sinks(&mut sinks, Duration::from_secs(10))
+            .await
+            .expect_err("the second sink must consume the remaining shared startup budget");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to open sink 'current'")
+                && message.contains("shared 10s sink-open stage deadline"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(prior_open.load(Ordering::SeqCst), 1);
+        assert_eq!(current_open.load(Ordering::SeqCst), 1);
+        assert_eq!(prior_close.load(Ordering::SeqCst), 1);
+        assert_eq!(current_close.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sink_startup_cleanup_uses_one_fresh_deadline_for_all_connectors() {
+        let first_close = Arc::new(AtomicU64::new(0));
+        let second_close = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![
+            prepared_lifecycle_probe(
+                "first",
+                Duration::ZERO,
+                Duration::from_secs(10),
+                Arc::new(AtomicU64::new(0)),
+                Arc::clone(&first_close),
+            ),
+            prepared_lifecycle_probe(
+                "second",
+                Duration::ZERO,
+                Duration::from_secs(10),
+                Arc::new(AtomicU64::new(0)),
+                Arc::clone(&second_close),
+            ),
+        ];
+        let started = tokio::time::Instant::now();
+        let deadline = started + PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT;
+
+        close_opened_sinks(&mut sinks, deadline).await;
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+            "sequential closes must consume one shared budget, not reset it"
+        );
+        assert_eq!(first_close.load(Ordering::SeqCst), 1);
+        assert_eq!(second_close.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn coordinated_commit_is_rejected_under_at_least_once_before_open() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let sink = OpenProbeSink {
+            contract: SinkContract::new(
+                SinkConsistency::CheckpointCommittable,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ),
+            opened: Arc::clone(&opened),
+            schema: Arc::new(Schema::empty()),
+            exact_protocol: true,
+        };
+        let config = ConnectorConfig::new("iceberg");
+
+        let error = admit_sink(
+            &sink,
+            SinkAdmissionContext {
+                config: &config,
+                name: "iceberg_out",
+                input: "input",
+                delivery: DeliveryGuarantee::AtLeastOnce,
+                runtime: RuntimeMode::Local,
+                carries_changelog: false,
+                checkpointing_enabled: true,
+                state_backend_scope: StateBackendDurability::Volatile,
+            },
+        )
+        .expect_err("the exact descriptor/cursor path must not activate under ALO");
+
+        assert!(error.to_string().contains("require global exactly-once"));
+        assert!(!opened.load(Ordering::SeqCst));
+    }
+
+    #[async_trait]
+    impl SinkConnector for OpenProbeSink {
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+            Ok(self.contract)
+        }
+
+        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+            self.opened.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(0, 0))
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn as_coordinated_committer(
+            &self,
+        ) -> Option<&dyn laminar_connectors::connector::CoordinatedCommitter> {
+            self.exact_protocol.then_some(self)
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl laminar_connectors::connector::CoordinatedCommitter for OpenProbeSink {
+        async fn commit_aggregated(
+            &self,
+            _batch: laminar_connectors::connector::CoordinatedCommitBatch,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn committed_checkpoint_id(
+            &self,
+            _namespace: &laminar_connectors::connector::CoordinatedCommitNamespace,
+        ) -> Result<Option<u64>, ConnectorError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn complete_exact_protocol_is_admitted_without_opening() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let sink = OpenProbeSink {
+            contract: SinkContract::new(
+                SinkConsistency::CheckpointCommittable,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ),
+            opened: Arc::clone(&opened),
+            schema: Arc::new(Schema::empty()),
+            exact_protocol: true,
+        };
+
+        let config = ConnectorConfig::new("exact-probe");
+        admit_sink(
+            &sink,
+            SinkAdmissionContext {
+                config: &config,
+                name: "exact_out",
+                input: "input",
+                delivery: DeliveryGuarantee::ExactlyOnce,
+                runtime: RuntimeMode::Local,
+                carries_changelog: false,
+                checkpointing_enabled: true,
+                state_backend_scope: StateBackendDurability::NodeDurable,
+            },
+        )
+        .unwrap();
+        assert!(!opened.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let sink = OpenProbeSink {
+            contract: SinkContract::new(
+                SinkConsistency::CheckpointCommittable,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ),
+            opened: Arc::clone(&opened),
+            schema: Arc::new(Schema::empty()),
+            exact_protocol: false,
+        };
+
+        let config = ConnectorConfig::new("incomplete-exact-probe");
+        let error = admit_sink(
+            &sink,
+            SinkAdmissionContext {
+                config: &config,
+                name: "exact_out",
+                input: "input",
+                delivery: DeliveryGuarantee::ExactlyOnce,
+                runtime: RuntimeMode::Local,
+                carries_changelog: false,
+                checkpointing_enabled: true,
+                state_backend_scope: StateBackendDurability::NodeDurable,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not implement"));
+        assert!(!opened.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exact_state_scope_is_runtime_aware_and_checked_before_open() {
+        let cases = [
+            (RuntimeMode::Local, StateBackendDurability::Volatile, false),
+            (
+                RuntimeMode::Local,
+                StateBackendDurability::NodeDurable,
+                true,
+            ),
+            (
+                RuntimeMode::Cluster,
+                StateBackendDurability::NodeDurable,
+                false,
+            ),
+            (
+                RuntimeMode::Cluster,
+                StateBackendDurability::ClusterShared,
+                false,
+            ),
+        ];
+
+        for (runtime, scope, expected_admission) in cases {
+            let opened = Arc::new(AtomicBool::new(false));
+            let sink = OpenProbeSink {
+                contract: SinkContract::new(
+                    SinkConsistency::CheckpointCommittable,
+                    SinkTopology::MultiWriter,
+                    SinkInputMode::AppendOnly,
+                ),
+                opened: Arc::clone(&opened),
+                schema: Arc::new(Schema::empty()),
+                exact_protocol: true,
+            };
+
+            let config = ConnectorConfig::new("exact-probe");
+            let result = admit_sink(
+                &sink,
+                SinkAdmissionContext {
+                    config: &config,
+                    name: "exact_out",
+                    input: "input",
+                    delivery: DeliveryGuarantee::ExactlyOnce,
+                    runtime,
+                    carries_changelog: false,
+                    checkpointing_enabled: true,
+                    state_backend_scope: scope,
+                },
+            );
+
+            assert_eq!(
+                result.is_ok(),
+                expected_admission,
+                "runtime={runtime:?}, scope={scope:?}, result={result:?}"
+            );
+            assert!(!opened.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn exact_rejection_precedes_open_for_network_and_file_sink_contracts() {
+        let candidates = [
+            (
+                "kafka",
+                SinkContract::new(
+                    SinkConsistency::DurableAtLeastOnce,
+                    SinkTopology::Singleton,
+                    SinkInputMode::AppendOnly,
+                ),
+            ),
+            (
+                "postgres",
+                SinkContract::new(
+                    SinkConsistency::DurableAtLeastOnce,
+                    SinkTopology::Singleton,
+                    SinkInputMode::AppendOnly,
+                ),
+            ),
+            (
+                "file",
+                SinkContract::new(
+                    SinkConsistency::DurableAtLeastOnce,
+                    SinkTopology::Singleton,
+                    SinkInputMode::AppendOnly,
+                ),
+            ),
+        ];
+
+        for (name, contract) in candidates {
+            let opened = Arc::new(AtomicBool::new(false));
+            let sink = OpenProbeSink {
+                contract,
+                opened: Arc::clone(&opened),
+                schema: Arc::new(Schema::empty()),
+                exact_protocol: false,
+            };
+            let config = ConnectorConfig::new(name);
+            let error = admit_sink(
+                &sink,
+                SinkAdmissionContext {
+                    config: &config,
+                    name,
+                    input: "input",
+                    delivery: DeliveryGuarantee::ExactlyOnce,
+                    runtime: RuntimeMode::Local,
+                    carries_changelog: false,
+                    checkpointing_enabled: true,
+                    state_backend_scope: StateBackendDurability::NodeDurable,
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains(EXACT_SINK_PROTOCOL));
+            assert!(
+                !opened.load(Ordering::SeqCst),
+                "{name} was opened before admission"
+            );
+        }
     }
 }
 
@@ -2677,6 +3909,56 @@ mod resolver_tests {
             .to_string();
         assert!(err.contains("unresolvable stream dependency"), "got: {err}");
         assert!(err.contains('a') && err.contains('b'), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod exact_deployment_lock_tests {
+    use std::sync::Arc;
+
+    use laminar_connectors::connector::DeliveryGuarantee;
+    use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
+
+    async fn exact_db(root: &std::path::Path) -> crate::db::LaminarDB {
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&state_dir).unwrap());
+        let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", 4));
+        crate::db::LaminarDB::builder()
+            .storage_dir(root.join("checkpoints"))
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: Some(1_000),
+                data_dir: Some(root.join("checkpoints")),
+                ..Default::default()
+            })
+            .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
+            .state_backend(backend)
+            .vnode_registry(Arc::new(VnodeRegistry::single_owner(4, NodeId(0))))
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn second_local_exact_process_cannot_share_checkpoint_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let first = exact_db(root.path()).await;
+        let second = exact_db(root.path()).await;
+
+        first.start().await.unwrap();
+        let error = second
+            .start()
+            .await
+            .expect_err("the deployment lock must reject a second live writer");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+
+        first.shutdown().await.unwrap();
+        second
+            .start()
+            .await
+            .expect("OS lock must be released by clean shutdown");
+        second.shutdown().await.unwrap();
     }
 }
 

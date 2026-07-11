@@ -19,9 +19,7 @@ use tokio_postgres::NoTls;
 
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SinkConnector;
-use laminar_connectors::postgres::{
-    DeliveryGuarantee, PostgresSink, PostgresSinkConfig, WriteMode,
-};
+use laminar_connectors::postgres::{PostgresSink, PostgresSinkConfig, WriteMode};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -234,75 +232,6 @@ async fn test_auto_flush_on_batch_size() {
     sink.close().await.expect("close");
 }
 
-// ── Exactly-once tests ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_exactly_once_commit() {
-    let (_container, host, port) = start_pg().await;
-
-    let mut config = sink_config(&host, port, WriteMode::Upsert);
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    let mut sink = PostgresSink::new(test_schema(), config, None);
-    sink.open(&ConnectorConfig::new("postgres-sink"))
-        .await
-        .expect("open");
-
-    sink.begin_epoch(1).await.expect("begin");
-    sink.write_batch(&make_batch(&[10, 20], &["x", "y"], &[1.1, 2.2]))
-        .await
-        .expect("write");
-    sink.pre_commit(1).await.expect("pre_commit");
-    sink.commit_epoch(1).await.expect("commit");
-
-    // Data should be visible.
-    let pg = connect(&host, port).await;
-    let count: i64 = pg
-        .query_one("SELECT COUNT(*) FROM public.test_events", &[])
-        .await
-        .expect("count")
-        .get(0);
-    assert_eq!(count, 2);
-
-    // Epoch marker should be written.
-    let epoch_row = pg
-        .query_one("SELECT epoch FROM _laminardb_sink_offsets LIMIT 1", &[])
-        .await
-        .expect("epoch select");
-    assert_eq!(epoch_row.get::<_, i64>(0), 1);
-
-    sink.close().await.expect("close");
-}
-
-#[tokio::test]
-async fn test_exactly_once_rollback_discards() {
-    let (_container, host, port) = start_pg().await;
-
-    let mut config = sink_config(&host, port, WriteMode::Upsert);
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    let mut sink = PostgresSink::new(test_schema(), config, None);
-    sink.open(&ConnectorConfig::new("postgres-sink"))
-        .await
-        .expect("open");
-
-    sink.begin_epoch(1).await.expect("begin");
-    sink.write_batch(&make_batch(&[100], &["rollback_me"], &[0.0]))
-        .await
-        .expect("write");
-    // Don't pre_commit — just rollback.
-    sink.rollback_epoch(1).await.expect("rollback");
-
-    // Table should be empty (data never flushed).
-    let pg = connect(&host, port).await;
-    let count: i64 = pg
-        .query_one("SELECT COUNT(*) FROM public.test_events", &[])
-        .await
-        .expect("count")
-        .get(0);
-    assert_eq!(count, 0);
-
-    sink.close().await.expect("close");
-}
-
 // ── Auto-create table test ──────────────────────────────────────────
 
 #[tokio::test]
@@ -389,64 +318,6 @@ async fn test_changelog_upsert_and_delete() {
     assert_eq!(rows[1].get::<_, i64>(0), 3);
 
     sink.close().await.expect("close");
-}
-
-// ── Epoch recovery (idempotent replay) test ─────────────────────────
-
-#[tokio::test]
-async fn test_epoch_recovery_skips_replay() {
-    let (_container, host, port) = start_pg().await;
-
-    let mut config = sink_config(&host, port, WriteMode::Upsert);
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    config.sink_id = "recovery-test-sink".into();
-
-    // First sink: commit epoch 5.
-    {
-        let mut sink = PostgresSink::new(test_schema(), config.clone(), None);
-        sink.open(&ConnectorConfig::new("postgres-sink"))
-            .await
-            .expect("open1");
-        sink.begin_epoch(5).await.expect("begin");
-        sink.write_batch(&make_batch(&[1], &["original"], &[1.0]))
-            .await
-            .expect("write");
-        sink.pre_commit(5).await.expect("pre_commit");
-        sink.commit_epoch(5).await.expect("commit");
-        sink.close().await.expect("close1");
-    }
-
-    // Second sink: simulate recovery replay of epoch 5.
-    {
-        let mut sink = PostgresSink::new(test_schema(), config.clone(), None);
-        sink.open(&ConnectorConfig::new("postgres-sink"))
-            .await
-            .expect("open2");
-
-        // Last committed epoch should be recovered.
-        assert_eq!(sink.last_committed_epoch(), 5);
-
-        // Replaying epoch 5 should be a no-op (already committed).
-        sink.begin_epoch(5).await.expect("begin replay");
-        sink.write_batch(&make_batch(&[1], &["SHOULD_NOT_OVERWRITE"], &[999.0]))
-            .await
-            .expect("write replay");
-        sink.pre_commit(5).await.expect("pre_commit replay");
-        sink.commit_epoch(5).await.expect("commit replay");
-        sink.close().await.expect("close2");
-    }
-
-    // Verify original data is unchanged (replay was skipped).
-    let pg = connect(&host, port).await;
-    let row = pg
-        .query_one(
-            "SELECT name, value FROM public.test_events WHERE id = 1",
-            &[],
-        )
-        .await
-        .expect("select");
-    assert_eq!(row.get::<_, &str>(0), "original");
-    assert!((row.get::<_, f64>(1) - 1.0).abs() < f64::EPSILON);
 }
 
 // ── Z-set changelog collapse (incremental MV → upsert) ──────────────

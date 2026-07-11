@@ -13,7 +13,8 @@ use arrow_array::RecordBatch;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
+use crate::connector::{SourceBatch, SourceConnector, SourceContract};
 use crate::error::ConnectorError;
 use crate::reference::ReferenceTableSource;
 
@@ -38,6 +39,7 @@ enum Phase {
 pub struct CdcTableSource {
     connector: Box<dyn SourceConnector>,
     config: ConnectorConfig,
+    pending_position: Option<SourcePosition>,
     phase: Phase,
     max_batch_size: usize,
 }
@@ -55,15 +57,39 @@ impl CdcTableSource {
         Self {
             connector,
             config,
+            pending_position: Some(SourcePosition::Initial),
             phase: Phase::Init,
             max_batch_size,
         }
     }
 
-    /// Ensures the connector is opened before polling.
-    async fn ensure_open(&mut self) -> Result<(), ConnectorError> {
+    /// Returns the restart and placement contract of the wrapped CDC source.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an invalid concrete source configuration or contract.
+    pub fn contract(&self) -> Result<SourceContract, ConnectorError> {
+        self.connector.contract(&self.config)
+    }
+
+    /// Atomically starts the connector at its pending position before polling.
+    async fn ensure_started(&mut self) -> Result<(), ConnectorError> {
         if matches!(self.phase, Phase::Init) {
-            self.connector.open(&self.config).await?;
+            let position =
+                self.pending_position
+                    .clone()
+                    .ok_or_else(|| ConnectorError::InvalidState {
+                        expected: "pending source position".into(),
+                        actual: "source position already consumed".into(),
+                    })?;
+            self.connector
+                .start(SourceStart {
+                    config: self.config.clone(),
+                    position,
+                    delivery: DeliveryGuarantee::BestEffort,
+                })
+                .await?;
+            self.pending_position = None;
             self.phase = Phase::Snapshot;
         }
         Ok(())
@@ -81,7 +107,7 @@ impl CdcTableSource {
 #[async_trait::async_trait]
 impl ReferenceTableSource for CdcTableSource {
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        self.ensure_open().await?;
+        self.ensure_started().await?;
 
         if !matches!(self.phase, Phase::Snapshot) {
             return Ok(None);
@@ -109,8 +135,13 @@ impl ReferenceTableSource for CdcTableSource {
         self.connector.checkpoint()
     }
 
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        self.connector.restore(checkpoint).await
+    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "CDC reference-table recovery requires an exact checkpoint attempt, but \
+             ReferenceTableSource::restore supplies only connector state; atomic resume is \
+             unsupported until that API carries SourcePosition::Resume"
+                .into(),
+        ))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -160,7 +191,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SourceConnector for MockCdcConnector {
-        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+            if !matches!(request.position, SourcePosition::Initial) {
+                return Err(ConnectorError::ConfigurationError(
+                    "mock CDC source received an unexpected resume position".into(),
+                ));
+            }
             self.opened = true;
             Ok(())
         }
@@ -177,11 +213,7 @@ mod tests {
         }
 
         fn checkpoint(&self) -> SourceCheckpoint {
-            SourceCheckpoint::new(0)
-        }
-
-        async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-            Ok(())
+            SourceCheckpoint::new()
         }
 
         async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -241,7 +273,25 @@ mod tests {
         let connector = MockCdcConnector::new(vec![]);
         let src = CdcTableSource::new(Box::new(connector), ConnectorConfig::new("mock-cdc"), 1024);
         let cp = src.checkpoint();
-        assert_eq!(cp.epoch(), 0);
+        assert!(cp.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_fails_closed_without_an_exact_attempt() {
+        let connector = MockCdcConnector::new(vec![]);
+        let mut src =
+            CdcTableSource::new(Box::new(connector), ConnectorConfig::new("mock-cdc"), 1024);
+
+        let error = src
+            .restore(&SourceCheckpoint::new())
+            .await
+            .expect_err("reference restore cannot synthesize an exact checkpoint attempt");
+        assert!(error.to_string().contains("exact checkpoint attempt"));
+        assert!(matches!(src.phase, Phase::Init));
+        assert!(matches!(
+            src.pending_position,
+            Some(SourcePosition::Initial)
+        ));
     }
 
     #[tokio::test]

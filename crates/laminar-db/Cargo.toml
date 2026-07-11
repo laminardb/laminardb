@@ -90,6 +90,7 @@ datafusion-optimizer = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # rkyv for operator checkpoint state. Hot-path structs (GroupCheckpoint,
 # JoinStateCheckpoint, etc.) carry Arrow IPC `Vec<u8>` blobs — serde_json
 # encoded each byte as a JSON decimal (3-4× size + per-byte format cost).

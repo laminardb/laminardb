@@ -9,7 +9,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 1. **Embedded First** -- Single binary, no external dependencies
 2. **Sub-Microsecond Latency** -- Minimal allocations on hot path
 3. **SQL Native** -- Full SQL support via Apache DataFusion
-4. **Exactly-Once** -- End-to-end exactly-once semantics
+4. **Explicit Delivery Contracts** -- Best-effort, at-least-once, or certified single-node exactly-once, validated before connector I/O
 5. **Arrow-Native** -- Apache Arrow RecordBatch at every boundary
 
 ## Architecture Overview
@@ -41,7 +41,7 @@ The system has a coordinator layer (SQL execution, compiled projections), a back
 |  +--------------+ +--------------+                                |
 |  |  Checkpoint  | |   Sink I/O   |                                |
 |  | Coordinator  | |  (external   |                                |
-|  |  (2PC, store)| |  writers)    |                                |
+|  | (seal, decide)| |  writers)    |                                |
 |  +--------------+ +--------------+                                |
 +------------------------------------------------------------------+
 |                      CONTROL PLANE                                |
@@ -65,7 +65,7 @@ and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
 **Components:**
 - **StreamExecutor** -- Drives DataFusion SQL execution per cycle. Optimization tiers: `CompiledProjection` (single-source non-aggregate queries compiled to `PhysicalExpr`), `IncrementalAggState` (incremental GROUP BY with per-group accumulators), and `CoreWindowState` (tumbling/hopping/session windows via optimized `CoreWindowAssigner`). Queries that don't match these tiers fall back to full DataFusion execution.
 - **Operators** -- Stateless transforms (map, filter, project) and stateful operators (tumbling/sliding/hopping/session windows, stream-stream joins, ASOF joins, temporal joins, lookup joins, lag/lead, ranking).
-- **State** -- Operators hold state in internal `FxHashMap`s (per-group accumulators, window buffers, join buffers). Checkpointed via JSON serialization into the `CheckpointManifest`.
+- **State** -- Operators hold state in internal `FxHashMap`s (per-group accumulators, window buffers, join buffers). A checkpoint serializes and seals state under an immutable attempt; the manifest inventories the exact state keys, lengths, and digests.
 - **Emit** -- Pushes output RecordBatches to downstream streams and sinks via tokio mpsc channels.
 
 **Compiled query execution**: Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL overhead. Complex queries cache their optimized logical plans.
@@ -81,7 +81,7 @@ and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
 Durability and I/O, runs on the main tokio async runtime (not the compute thread).
 
 **Components:**
-- **Checkpoint Coordinator** -- Orchestrates periodic full-state snapshots with manifest-based persistence via two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`crates/laminar-core/src/checkpoint/checkpoint_store.rs`).
+- **Checkpoint Coordinator** -- Orchestrates exact checkpoint attempts, durable manifests/decisions, source positions, and coordinated external commits for certified exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`crates/laminar-core/src/checkpoint/checkpoint_store.rs`).
 - **Recovery Manager** -- Loads the latest checkpoint manifest and restores operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
 - **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, Iceberg, WebSocket, OTEL, Files) run as tokio tasks on the main runtime.
 
@@ -122,8 +122,8 @@ How an event moves through the system:
 2. **Watermark tracking**: Each source maintains an `EventTimeExtractor` + `BoundedOutOfOrdernessGenerator` for watermark computation. Late rows are filtered. Watermarks can be per-partition, per-key, or aligned across sources.
 3. **Operator processing**: The coordinator runs batches through SQL execution cycles (windows, joins, aggregations, filters). State is held in per-group accumulators and window buffers.
 4. **Emit**: Results are published to named streams. Subscribers receive RecordBatches via typed `TypedSubscription<T>` or callback subscriptions.
-5. **Durability**: Operator state is periodically snapshotted to directory-based checkpoints (JSON manifest + optional binary sidecar), persisted atomically via temp-file + rename.
-6. **Sink output**: External sinks (Kafka, PostgreSQL, Delta Lake, WebSocket) receive batches with exactly-once semantics via two-phase commit.
+5. **Durability**: Operator state and connector positions are captured under an exact attempt, sealed with a participant-complete inventory, then referenced by a prepared/finalized manifest and durable decision.
+6. **Sink output**: Each sink advertises durability, topology, and input-mode contracts. Kafka/PostgreSQL/file sinks provide durable at-least-once writes; append-mode Delta Lake and Iceberg provide coordinated exact commits when the whole single-node pipeline is configured and admitted for exactly-once.
 
 ## Crate Map
 
@@ -234,6 +234,7 @@ Custom connectors implement `SourceConnector` and `SinkConnector`:
 ```rust
 #[async_trait]
 pub trait SourceConnector: Send {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError>;
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
     async fn poll_batch(&mut self, max_records: usize) -> Result<Option<SourceBatch>, ConnectorError>;
     fn schema(&self) -> SchemaRef;
@@ -244,18 +245,29 @@ pub trait SourceConnector: Send {
 
 #[async_trait]
 pub trait SinkConnector: Send {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError>;
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError>;
     fn schema(&self) -> SchemaRef;
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError>;
-    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError>;
-    async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError>;
+    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError>;
     async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError>;
+    fn suggested_write_timeout(&self) -> Duration;
+    fn as_coordinated_committer(&self) -> Option<&dyn CoordinatedCommitter>;
     async fn close(&mut self) -> Result<(), ConnectorError>;
 }
 ```
 
-The SDK adds retry policies, rate limiting, circuit breakers, and a test harness.
+`SourceCheckpoint` contains only connector-specific offsets and metadata. Exact
+attempt identity is carried once by the resume/barrier protocol and the enclosing
+checkpoint manifest, so connector payloads cannot disagree with recovery about
+which attempt they belong to.
+
+The typed source/sink contracts are the sole admission authority; independent capability booleans
+cannot form contradictory protocol combinations. Checkpoint-committable sinks return an immutable prepared descriptor. The runtime seals every participant's
+descriptor, records one exact durable decision, and only then invokes the designated coordinated
+committer; there is no per-writer inline `commit_epoch` path. The SDK also adds retry policies,
+rate limiting, circuit breakers, and a test harness.
 
 ### Lookup Tables
 
@@ -326,7 +338,7 @@ The thread-per-core model described in earlier documentation was removed in PR #
 
 1. Receives batches from source connectors via `tokio::sync::mpsc` channels
 2. Executes SQL cycles via `StreamExecutor` (compiled projections, incremental aggregations, DataFusion fallback)
-3. Manages checkpoint barriers for exactly-once semantics
+3. Manages checkpoint barriers for the selected pipeline-wide recovery contract
 4. Routes results to sink connectors
 
 ### Coordinator and Executor
@@ -341,30 +353,42 @@ multiple competing ones.
 
 ### Deployment Model
 
-LaminarDB is a **single-node** embedded database. All operator state is keyed by
-operator index (position in the operator graph). Multi-node partitioning
-(VNode-scoped state, distributed barriers, partition migration) is deferred to
-a future phase.
+LaminarDB runs embedded, as a standalone single node, or as a cluster. Cluster
+state is vnode-scoped and requires a cloud object store that is visible to every
+node. Local paths and `file://` storage are node-durable only.
 
 ## Exactly-Once Semantics
 
-Exactly-once processing works through:
+Certified exactly-once processing is currently an embedded/single-node mode and works through:
 
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
 2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured
-3. **Checkpoints** -- Periodic full-state snapshots: JSON-serialized operator state, source offsets, sink epochs, watermarks. Persisted atomically via temp-file + rename
-4. **Two-phase commit** -- Coordinated across exactly-once sinks via `CheckpointCoordinator` (at-most-once sinks receive no pre_commit/commit guarantees)
-5. **Recovery** -- `RecoveryManager` loads the latest checkpoint manifest, restores source offsets, rolls back exactly-once sinks, and resumes from committed state. Falls back to older checkpoints if latest is corrupt
+3. **Checkpoints** -- Immutable attempts bind operator-state seals, source positions, watermarks, participant markers, parent links, pipeline identity, and deployment incarnation before finalization
+4. **Coordinated external commit** -- Participant-complete prepared markers are sealed before a designated committer publishes a namespaced checkpoint cut to append-mode Delta Lake or Iceberg
+5. **Recovery** -- `RecoveryManager` accepts an identity-matching Finalized manifest or an exact
+   decided Prepared manifest (which it finalizes), restores state/source positions, and resumes
+   external commits from their exact cursor
+
+Startup additionally requires node-durable state, a local checkpoint directory
+held by an exclusive OS deployment lock, replayable sources, and a
+checkpoint-committable sink. Shared-object-store local exact deployments fail
+closed with `[LDB-0014]` until their lease term can fence decisions and sink
+commits. Incompatible connectors fail before external I/O; there is no
+per-connector delivery override or public writer ID.
 
 ## Cluster Architecture (Distributed Mode)
 
-With the `cluster` feature enabled, multi-node operation:
+With the `cluster` feature enabled, multi-node operation provides:
 
 - **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip is implemented.
-- **Coordination** -- Metadata consensus (scaffolding only, not production-ready)
+- **Coordination** -- Metadata/partition coordination and a renewable leader lease
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
-- **Distributed Checkpoints** -- Cross-node barrier coordination (planned; not yet implemented in checkpoint_coordinator)
+- **Distributed Checkpoints** -- Cross-node capture and shared durable state for at-least-once recovery
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out
 - **Inter-Node RPC** -- gRPC service definitions for remote lookups, barrier forwarding, aggregate fan-out
 
-**Status**: Discovery and coordination are implemented but not yet production-hardened. Production hardening is planned for Phase 6c.
+**Delivery boundary**: cluster mode currently admits only `at_least_once` and
+requires cluster-shared S3/GCS/Azure state. Cluster `exactly_once` fails closed
+with `[LDB-0013]`: the leader lease token is not yet an atomic precondition of
+both checkpoint-decision writes and external sink commits, so end-to-end term
+fencing cannot yet be proven.

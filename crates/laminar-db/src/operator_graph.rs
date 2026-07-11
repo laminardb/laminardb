@@ -180,6 +180,9 @@ const STATS_SAMPLE_INTERVAL: u64 = 32;
 #[allow(clippy::disallowed_types)]
 pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
 
+/// Persisted operator-graph state ABI.
+pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct GraphCheckpoint {
     pub version: u32,
@@ -2626,7 +2629,7 @@ impl OperatorGraph {
             return Ok(None);
         }
         Ok(Some(GraphCheckpoint {
-            version: 1,
+            version: GRAPH_CHECKPOINT_VERSION,
             operators,
         }))
     }
@@ -2782,6 +2785,12 @@ impl OperatorGraph {
     }
 
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {
+        if checkpoint.version != GRAPH_CHECKPOINT_VERSION {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] unsupported operator graph checkpoint version {}; expected {}",
+                checkpoint.version, GRAPH_CHECKPOINT_VERSION
+            )));
+        }
         let mut restored = 0;
         for node in &mut self.nodes {
             if node.removed {

@@ -7,22 +7,6 @@
 
 use std::collections::HashMap;
 
-/// Per-sink commit status tracked during the checkpoint commit phase.
-///
-/// After the manifest is persisted (Step 5), sinks start as [`Pending`](Self::Pending).
-/// The coordinator updates each sink's status during commit (Step 6) and
-/// saves the manifest again. Recovery uses these statuses to determine
-/// which sinks need rollback.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum SinkCommitStatus {
-    /// Sink has been pre-committed but not yet committed.
-    Pending,
-    /// Sink commit succeeded.
-    Committed,
-    /// Sink commit failed.
-    Failed(String),
-}
-
 /// Default virtual partition count for state key distribution.
 ///
 /// Manifests are written with this value unless the caller overrides via
@@ -30,6 +14,71 @@ pub enum SinkCommitStatus {
 /// impls pass the runtime value into [`CheckpointManifest::validate`]
 /// so a manifest written with a different count is flagged on restore.
 pub const DEFAULT_VNODE_COUNT: u16 = 256;
+
+/// Current checkpoint manifest format. Older manifests are rejected rather
+/// than guessed at recovery time.
+/// Version 3 removes the obsolete inline sink-commit ledger; the exact durable
+/// checkpoint decision is the sole exactly-once commit authority.
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 4;
+
+/// Canonical pipeline-identity payload version.
+pub const PIPELINE_IDENTITY_VERSION: u16 = 1;
+
+/// SHA-256 identity of the logical pipeline and recovery-state ABI.
+///
+/// The canonical version is part of the persisted contract: changing canonicalization or state
+/// compatibility requires a new version rather than silently comparing unlike digests.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub struct PipelineIdentity {
+    /// Version of the canonical payload format.
+    pub canonical_version: u16,
+    /// Exactly 64 lowercase hexadecimal characters.
+    pub sha256: String,
+}
+
+impl PipelineIdentity {
+    /// Identity of an empty canonical payload, used by manifest-only tests and empty runtimes.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            canonical_version: PIPELINE_IDENTITY_VERSION,
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        }
+    }
+
+    /// Validate the persisted identity format.
+    fn validation_error(&self) -> Option<String> {
+        if self.canonical_version != PIPELINE_IDENTITY_VERSION {
+            return Some(format!(
+                "unsupported pipeline identity version {}; expected {PIPELINE_IDENTITY_VERSION}",
+                self.canonical_version
+            ));
+        }
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Some("pipeline identity must be 64 lowercase hexadecimal characters".into());
+        }
+        None
+    }
+}
+
+/// Durable publication state of a checkpoint manifest.
+///
+/// `Prepared` records are inventory, not an independent commit signal. Recovery may promote one
+/// only when the exact durable checkpoint decision exists. `Finalized` records are published
+/// recovery candidates, still subject to that decision whenever a decision store is configured.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableCheckpointPhase {
+    /// State has been captured but the checkpoint has not completed.
+    Prepared,
+    /// The checkpoint completed and is eligible for recovery.
+    Finalized,
+}
 
 /// A point-in-time snapshot of all pipeline state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -42,21 +91,15 @@ pub struct CheckpointManifest {
     pub epoch: u64,
     /// Timestamp when checkpoint was created (millis since Unix epoch).
     pub timestamp_ms: u64,
+    /// Durable publication state. This field is intentionally required.
+    pub durable_phase: DurableCheckpointPhase,
+    /// Writer identity (`0` outside cluster mode).
+    pub participant_id: u64,
 
     // ── Connector State ──
     /// Per-source connector offsets (key: source name).
     #[serde(default)]
     pub source_offsets: HashMap<String, ConnectorCheckpoint>,
-    /// Per-sink last committed epoch (key: sink name).
-    #[serde(default)]
-    pub sink_epochs: HashMap<String, u64>,
-    /// Per-sink commit status (key: sink name).
-    ///
-    /// Populated during the commit phase (Step 6) and saved to the manifest
-    /// afterward. Recovery uses this to decide which sinks need rollback
-    /// (those with [`SinkCommitStatus::Pending`] or [`SinkCommitStatus::Failed`]).
-    #[serde(default)]
-    pub sink_commit_statuses: HashMap<String, SinkCommitStatus>,
     /// Per-table source offsets for reference tables (key: table name).
     #[serde(default)]
     pub table_offsets: HashMap<String, ConnectorCheckpoint>,
@@ -93,13 +136,11 @@ pub struct CheckpointManifest {
     pub sink_names: Vec<String>,
 
     // ── Pipeline Identity ──
-    /// Hash of the pipeline configuration at checkpoint time.
-    ///
-    /// Computed from SQL queries, source/sink configuration, and connector
-    /// options. Recovery logs a warning when this changes, indicating
-    /// operator state may be incompatible with the new configuration.
-    #[serde(default)]
-    pub pipeline_hash: Option<u64>,
+    /// Required, deterministic identity of the logical topology and state ABI.
+    pub pipeline_identity: PipelineIdentity,
+    /// Create-once checkpoint/decision-store incarnation. A storage reset rotates this value so
+    /// surviving external sink cursors cannot be reused by a fresh checkpoint-id sequence.
+    pub deployment_id: String,
 
     // ── Metadata ──
     /// Virtual partition count for state key distribution.
@@ -137,15 +178,17 @@ impl CheckpointManifest {
     /// [`DEFAULT_VNODE_COUNT`] if the runtime hasn't overridden it.
     ///
     /// Returns a list of issues found. An empty list means the manifest is valid.
-    /// Callers should treat non-empty results as warnings (recovery may still
-    /// proceed) or errors depending on severity.
+    /// Every returned issue makes the manifest ineligible for recovery.
     #[must_use]
     pub fn validate(&self, expected_vnode_count: u16) -> Vec<ManifestValidationError> {
         let mut errors = Vec::new();
 
-        if self.version == 0 {
+        if self.version != CHECKPOINT_MANIFEST_VERSION {
             errors.push(ManifestValidationError {
-                message: "manifest version is 0".into(),
+                message: format!(
+                    "unsupported manifest version {}; expected {CHECKPOINT_MANIFEST_VERSION}",
+                    self.version
+                ),
             });
         }
 
@@ -167,13 +210,15 @@ impl CheckpointManifest {
             });
         }
 
-        // Sink epochs should match sink commit statuses
-        for sink_name in self.sink_epochs.keys() {
-            if !self.sink_commit_statuses.is_empty()
-                && !self.sink_commit_statuses.contains_key(sink_name)
-            {
+        if let Some(message) = self.pipeline_identity.validation_error() {
+            errors.push(ManifestValidationError { message });
+        }
+        if !self.deployment_id.is_empty() {
+            let valid = uuid::Uuid::parse_str(&self.deployment_id)
+                .is_ok_and(|id| !id.is_nil() && id.to_string() == self.deployment_id);
+            if !valid {
                 errors.push(ManifestValidationError {
-                    message: format!("sink '{sink_name}' has epoch but no commit status"),
+                    message: "deployment_id must be a canonical non-nil UUID".into(),
                 });
             }
         }
@@ -202,6 +247,12 @@ impl CheckpointManifest {
             });
         }
 
+        if !self.operator_states.is_empty() && self.state_checksum.is_none() {
+            errors.push(ManifestValidationError {
+                message: "operator state is missing its integrity checksum".into(),
+            });
+        }
+
         errors
     }
 
@@ -223,13 +274,13 @@ impl CheckpointManifest {
             .as_millis() as u64;
 
         Self {
-            version: 1,
+            version: CHECKPOINT_MANIFEST_VERSION,
             checkpoint_id,
             epoch,
             timestamp_ms,
+            durable_phase: DurableCheckpointPhase::Prepared,
+            participant_id: 0,
             source_offsets: HashMap::new(),
-            sink_epochs: HashMap::new(),
-            sink_commit_statuses: HashMap::new(),
             table_offsets: HashMap::new(),
             operator_states: HashMap::new(),
             table_store_checkpoint_path: None,
@@ -237,7 +288,8 @@ impl CheckpointManifest {
             source_watermarks: HashMap::new(),
             source_names: Vec::new(),
             sink_names: Vec::new(),
-            pipeline_hash: None,
+            pipeline_identity: PipelineIdentity::empty(),
+            deployment_id: String::new(),
             vnode_count,
             state_checksum: None,
         }
@@ -251,34 +303,30 @@ impl CheckpointManifest {
 /// - **`PostgreSQL` CDC**: `{"lsn": "0/1234ABCD"}`
 /// - **`MySQL` CDC**: `{"gtid_set": "uuid:1-5", "binlog_file": "mysql-bin.000003"}`
 /// - **Delta Lake**: `{"version": "42"}`
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+///
+/// The containing [`CheckpointManifest`] supplies the exact attempt identity;
+/// duplicating its epoch in each connector payload would create conflicting
+/// authorities during recovery.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ConnectorCheckpoint {
     /// Connector-specific offset data.
     pub offsets: HashMap<String, String>,
-    /// Epoch this checkpoint belongs to.
-    pub epoch: u64,
     /// Optional metadata (connector type, topic name, etc.).
-    #[serde(default)]
     pub metadata: HashMap<String, String>,
 }
 
 impl ConnectorCheckpoint {
-    /// Creates a new connector checkpoint with the given epoch.
+    /// Creates an empty connector checkpoint.
     #[must_use]
-    pub fn new(epoch: u64) -> Self {
-        Self {
-            offsets: HashMap::new(),
-            epoch,
-            metadata: HashMap::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Creates a connector checkpoint with pre-populated offsets.
     #[must_use]
-    pub fn with_offsets(epoch: u64, offsets: HashMap<String, String>) -> Self {
+    pub fn with_offsets(offsets: HashMap<String, String>) -> Self {
         Self {
             offsets,
-            epoch,
             metadata: HashMap::new(),
         }
     }
@@ -430,12 +478,12 @@ mod tests {
     #[test]
     fn test_manifest_new() {
         let m = CheckpointManifest::new(1, 5);
-        assert_eq!(m.version, 1);
+        assert_eq!(m.version, CHECKPOINT_MANIFEST_VERSION);
+        assert_eq!(m.durable_phase, DurableCheckpointPhase::Prepared);
         assert_eq!(m.checkpoint_id, 1);
         assert_eq!(m.epoch, 5);
         assert!(m.timestamp_ms > 0);
         assert!(m.source_offsets.is_empty());
-        assert!(m.sink_epochs.is_empty());
         assert!(m.operator_states.is_empty());
     }
 
@@ -444,15 +492,11 @@ mod tests {
         let mut m = CheckpointManifest::new(42, 10);
         m.source_offsets.insert(
             "kafka-src".into(),
-            ConnectorCheckpoint::with_offsets(
-                10,
-                HashMap::from([
-                    ("partition-0".into(), "1234".into()),
-                    ("partition-1".into(), "5678".into()),
-                ]),
-            ),
+            ConnectorCheckpoint::with_offsets(HashMap::from([
+                ("partition-0".into(), "1234".into()),
+                ("partition-1".into(), "5678".into()),
+            ])),
         );
-        m.sink_epochs.insert("pg-sink".into(), 9);
         m.watermark = Some(999_000);
         m.operator_states
             .insert("window-agg".into(), OperatorCheckpoint::inline(b"hello"));
@@ -465,34 +509,29 @@ mod tests {
         assert_eq!(restored.watermark, Some(999_000));
         let src = restored.source_offsets.get("kafka-src").unwrap();
         assert_eq!(src.offsets.get("partition-0"), Some(&"1234".into()));
-        assert_eq!(restored.sink_epochs.get("pg-sink"), Some(&9));
 
         let op = restored.operator_states.get("window-agg").unwrap();
         assert_eq!(op.decode_inline().unwrap(), b"hello");
     }
 
     #[test]
-    fn test_manifest_backward_compat_missing_fields() {
-        // Simulate an older manifest with only mandatory fields
-        let json = r#"{
-            "version": 1,
-            "checkpoint_id": 1,
-            "epoch": 1,
-            "timestamp_ms": 1000
-        }"#;
-
-        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(m.version, 1);
-        assert!(m.source_offsets.is_empty());
-        assert!(m.sink_epochs.is_empty());
-        assert!(m.operator_states.is_empty());
-        assert!(m.watermark.is_none());
+    fn test_manifest_rejects_previous_version() {
+        let mut manifest = CheckpointManifest::new(1, 1);
+        manifest.version = CHECKPOINT_MANIFEST_VERSION - 1;
+        let restored: CheckpointManifest =
+            serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
+        let errors = restored.validate(DEFAULT_VNODE_COUNT);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("unsupported manifest version 3")),
+            "{errors:?}"
+        );
     }
 
     #[test]
     fn test_connector_checkpoint_new() {
-        let cp = ConnectorCheckpoint::new(5);
-        assert_eq!(cp.epoch, 5);
+        let cp = ConnectorCheckpoint::new();
         assert!(cp.offsets.is_empty());
         assert!(cp.metadata.is_empty());
     }
@@ -500,8 +539,7 @@ mod tests {
     #[test]
     fn test_connector_checkpoint_with_offsets() {
         let offsets = HashMap::from([("lsn".into(), "0/ABCD".into())]);
-        let cp = ConnectorCheckpoint::with_offsets(3, offsets);
-        assert_eq!(cp.epoch, 3);
+        let cp = ConnectorCheckpoint::with_offsets(offsets);
         assert_eq!(cp.offsets.get("lsn"), Some(&"0/ABCD".into()));
     }
 
@@ -533,7 +571,7 @@ mod tests {
         let mut m = CheckpointManifest::new(1, 1);
         m.table_offsets.insert(
             "instruments".into(),
-            ConnectorCheckpoint::with_offsets(1, HashMap::from([("lsn".into(), "0/ABCD".into())])),
+            ConnectorCheckpoint::with_offsets(HashMap::from([("lsn".into(), "0/ABCD".into())])),
         );
         m.table_store_checkpoint_path = Some("/tmp/table_store_cp".into());
 
@@ -561,17 +599,22 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_topology_backward_compat() {
-        // Older manifests without topology fields should deserialize fine.
+    fn test_manifest_requires_durable_phase() {
         let json = r#"{
             "version": 1,
             "checkpoint_id": 5,
             "epoch": 3,
             "timestamp_ms": 1000
         }"#;
-        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
-        assert!(m.source_names.is_empty());
-        assert!(m.sink_names.is_empty());
+        assert!(serde_json::from_str::<CheckpointManifest>(json).is_err());
+    }
+
+    #[test]
+    fn test_manifest_requires_pipeline_identity() {
+        let manifest = CheckpointManifest::new(5, 3);
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value.as_object_mut().unwrap().remove("pipeline_identity");
+        assert!(serde_json::from_value::<CheckpointManifest>(value).is_err());
     }
 
     #[test]
@@ -579,7 +622,7 @@ mod tests {
         let mut m = CheckpointManifest::new(1, 1);
         m.source_names = vec!["a".into(), "b".into()];
         m.source_offsets
-            .insert("c".into(), ConnectorCheckpoint::new(1));
+            .insert("c".into(), ConnectorCheckpoint::new());
 
         let errors = m.validate(DEFAULT_VNODE_COUNT);
         assert!(
@@ -591,14 +634,17 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_pipeline_hash_round_trip() {
+    fn test_manifest_pipeline_identity_round_trip() {
         let mut m = CheckpointManifest::new(1, 1);
-        m.pipeline_hash = Some(0xDEAD_BEEF_CAFE_1234);
+        m.pipeline_identity = PipelineIdentity {
+            canonical_version: PIPELINE_IDENTITY_VERSION,
+            sha256: "ab".repeat(32),
+        };
 
         let json = serde_json::to_string(&m).unwrap();
         let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.pipeline_hash, Some(0xDEAD_BEEF_CAFE_1234));
+        assert_eq!(restored.pipeline_identity, m.pipeline_identity);
     }
 
     #[test]
@@ -646,14 +692,13 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_pipeline_hash_backward_compat() {
+    fn test_manifest_rejects_missing_v2_fields() {
         let json = r#"{
             "version": 1,
             "checkpoint_id": 1,
             "epoch": 1,
             "timestamp_ms": 1000
         }"#;
-        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
-        assert!(m.pipeline_hash.is_none());
+        assert!(serde_json::from_str::<CheckpointManifest>(json).is_err());
     }
 }

@@ -1,12 +1,6 @@
 //! MySQL CDC binlog I/O.
 
 #[cfg(feature = "mysql-cdc")]
-use std::time::Duration;
-
-#[cfg(feature = "mysql-cdc")]
-use tokio_stream::StreamExt as _;
-
-#[cfg(feature = "mysql-cdc")]
 use mysql_async::binlog::events::{Event as MysqlEvent, EventData, RowsEventData};
 #[cfg(feature = "mysql-cdc")]
 use mysql_async::binlog::row::BinlogRow;
@@ -16,7 +10,7 @@ use mysql_async::binlog::value::BinlogValue;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, GnoInterval, OptsBuilder, Sid};
 
 #[cfg(feature = "mysql-cdc")]
-use tracing::{debug, info};
+use tracing::info;
 
 #[cfg(feature = "mysql-cdc")]
 use crate::error::ConnectorError;
@@ -61,9 +55,7 @@ pub async fn connect(config: &MySqlCdcConfig) -> Result<Conn, ConnectorError> {
         opts = opts.pass(Some(password));
     }
 
-    if let Some(ref database) = config.database {
-        opts = opts.db_name(Some(database));
-    }
+    opts = opts.db_name(Some(config.target_database()?));
 
     // Configure SSL based on ssl_mode.
     opts = match config.ssl_mode {
@@ -154,57 +146,6 @@ pub async fn start_binlog_stream(
     })?;
 
     Ok(stream)
-}
-
-/// Reads binlog events from the stream with a timeout.
-///
-/// Returns up to `max_events` events, or fewer if the timeout expires.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::ReadError` if an I/O error occurs.
-#[cfg(feature = "mysql-cdc")]
-pub async fn read_events(
-    stream: &mut BinlogStream,
-    max_events: usize,
-    timeout: Duration,
-) -> Result<Vec<MysqlEvent>, ConnectorError> {
-    let mut events = Vec::with_capacity(max_events.min(64));
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if events.len() >= max_events {
-            break;
-        }
-
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match tokio::time::timeout(remaining, stream.next()).await {
-            Ok(Some(Ok(event))) => {
-                events.push(event);
-            }
-            Ok(Some(Err(e))) => {
-                // I/O error reading from binlog stream.
-                return Err(ConnectorError::ReadError(format!(
-                    "binlog stream error: {e}"
-                )));
-            }
-            Ok(None) => {
-                // Stream ended (server disconnected or NON_BLOCK mode).
-                debug!("binlog stream ended");
-                break;
-            }
-            Err(_) => {
-                // Timeout - return whatever we have.
-                break;
-            }
-        }
-    }
-
-    Ok(events)
 }
 
 /// Decodes a mysql_async binlog event into our internal `BinlogMessage` type.
@@ -572,10 +513,14 @@ pub fn build_ssl_opts(ssl_mode: &SslMode) -> Option<mysql_async::SslOpts> {
     }
 }
 
-/// Builds an `OptsBuilder` from our config (for testing).
+/// Builds an `OptsBuilder` from the validated connector configuration.
+///
+/// # Errors
+///
+/// Returns a configuration error when `table.include` does not identify exactly one qualified
+/// table from which the connection database can be derived.
 #[cfg(feature = "mysql-cdc")]
-#[must_use]
-pub fn build_opts(config: &MySqlCdcConfig) -> OptsBuilder {
+pub fn build_opts(config: &MySqlCdcConfig) -> Result<OptsBuilder, ConnectorError> {
     let mut opts = OptsBuilder::default()
         .ip_or_hostname(&config.host)
         .tcp_port(config.port)
@@ -586,15 +531,13 @@ pub fn build_opts(config: &MySqlCdcConfig) -> OptsBuilder {
         opts = opts.pass(Some(password));
     }
 
-    if let Some(ref database) = config.database {
-        opts = opts.db_name(Some(database));
-    }
+    opts = opts.db_name(Some(config.target_database()?));
 
     if let Some(ssl_opts) = build_ssl_opts(&config.ssl_mode) {
         opts = opts.ssl_opts(Some(ssl_opts));
     }
 
-    opts
+    Ok(opts)
 }
 
 /// Builds a `BinlogStreamRequest` from our config (for testing).
@@ -641,10 +584,10 @@ mod tests {
         MySqlCdcConfig {
             host: "localhost".to_string(),
             port: 3306,
-            database: Some("testdb".to_string()),
             username: "root".to_string(),
             password: Some("secret".to_string()),
             server_id: 12345,
+            table_include: vec!["testdb.users".into()],
             ..Default::default()
         }
     }
@@ -652,7 +595,7 @@ mod tests {
     #[test]
     fn test_connect_builds_opts() {
         let config = test_config();
-        let opts_builder = build_opts(&config);
+        let opts_builder = build_opts(&config).unwrap();
 
         // Convert to Opts to verify values.
         let opts: Opts = opts_builder.into();
@@ -669,20 +612,20 @@ mod tests {
         let config = MySqlCdcConfig {
             host: "dbhost".to_string(),
             port: 3307,
-            database: None,
             username: "repl".to_string(),
             password: None,
             server_id: 999,
+            table_include: vec!["app.events".into()],
             ..Default::default()
         };
-        let opts_builder = build_opts(&config);
+        let opts_builder = build_opts(&config).unwrap();
         let opts: Opts = opts_builder.into();
 
         assert_eq!(opts.ip_or_hostname(), "dbhost");
         assert_eq!(opts.tcp_port(), 3307);
         assert_eq!(opts.user(), Some("repl"));
         assert_eq!(opts.pass(), None);
-        assert_eq!(opts.db_name(), None);
+        assert_eq!(opts.db_name(), Some("app"));
     }
 
     #[test]

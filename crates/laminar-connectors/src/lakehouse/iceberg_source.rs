@@ -15,13 +15,17 @@ use std::time::Instant;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+#[cfg(feature = "iceberg")]
 use tracing::debug;
 #[cfg(feature = "iceberg")]
 use tracing::info;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+};
+use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
 
 use super::iceberg_config::IcebergSourceConfig;
@@ -32,7 +36,7 @@ use super::iceberg_config::IcebergSourceConfig;
 /// `RecordBatch` data. Supports pinning to a specific snapshot.
 #[allow(dead_code)] // Fields used by feature-gated I/O methods.
 pub struct IcebergSource {
-    /// Source configuration — reparsed from `ConnectorConfig` in `open()`.
+    /// Source configuration — reparsed from `ConnectorConfig` in `start()`.
     config: IcebergSourceConfig,
     /// Discovered Arrow schema.
     schema: Option<SchemaRef>,
@@ -44,8 +48,6 @@ pub struct IcebergSource {
     last_snapshot_id: Option<i64>,
     /// Time of last snapshot poll.
     last_poll_time: Option<Instant>,
-    /// Current epoch for checkpoint.
-    epoch: u64,
     /// Cached catalog connection.
     #[cfg(feature = "iceberg")]
     catalog: Option<Arc<dyn iceberg::Catalog>>,
@@ -65,7 +67,6 @@ impl IcebergSource {
             buffer: VecDeque::new(),
             last_snapshot_id: None,
             last_poll_time: None,
-            epoch: 0,
             #[cfg(feature = "iceberg")]
             catalog: None,
             #[cfg(feature = "iceberg")]
@@ -88,7 +89,7 @@ impl IcebergSource {
             .catalog
             .as_ref()
             .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open".into(),
+                expected: "started".into(),
                 actual: "catalog not initialized".into(),
             })?;
         let table = super::iceberg_io::load_table(
@@ -150,7 +151,16 @@ impl IcebergSource {
 
 #[async_trait]
 impl SourceConnector for IcebergSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Iceberg is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
         // Re-parse config from runtime ConnectorConfig (not factory defaults).
         if !config.properties().is_empty() {
             self.config = IcebergSourceConfig::from_config(config)?;
@@ -221,7 +231,7 @@ impl SourceConnector for IcebergSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(self.epoch);
+        let mut cp = SourceCheckpoint::new();
         if let Some(sid) = self.last_snapshot_id {
             cp.set_offset("snapshot_id", sid.to_string());
         }
@@ -229,19 +239,11 @@ impl SourceConnector for IcebergSource {
         cp
     }
 
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        self.epoch = checkpoint.epoch();
-        if let Some(sid) = checkpoint.get_offset("snapshot_id") {
-            self.last_snapshot_id = Some(sid.parse().map_err(|_| {
-                ConnectorError::Internal(format!("invalid snapshot_id in checkpoint: '{sid}'"))
-            })?);
-            debug!(snapshot_id = ?self.last_snapshot_id, "iceberg source restored");
-        }
-        Ok(())
-    }
-
-    fn supports_replay(&self) -> bool {
-        false
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract {
+            consistency: SourceConsistency::Ephemeral,
+            topology: SourceTopology::Singleton,
+        })
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -281,28 +283,35 @@ mod tests {
     fn test_checkpoint_round_trip() {
         let mut source = IcebergSource::new(test_source_config(), None);
         source.last_snapshot_id = Some(42);
-        source.epoch = 5;
 
         let cp = source.checkpoint();
-        assert_eq!(cp.epoch(), 5);
         assert_eq!(cp.get_offset("snapshot_id"), Some("42"));
         assert_eq!(cp.get_metadata("connector_type"), Some("iceberg"));
     }
 
     #[tokio::test]
-    async fn test_restore_from_checkpoint() {
+    async fn resume_fails_before_opening_the_ephemeral_source() {
         let mut source = IcebergSource::new(test_source_config(), None);
-        let mut cp = SourceCheckpoint::new(10);
-        cp.set_offset("snapshot_id", "123");
-
-        source.restore(&cp).await.unwrap();
-        assert_eq!(source.epoch, 10);
-        assert_eq!(source.last_snapshot_id, Some(123));
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("iceberg"),
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(7, 11),
+                    checkpoint: SourceCheckpoint::new(),
+                },
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .expect_err("ephemeral Iceberg source must reject recovery");
+        assert!(error.to_string().contains("ephemeral"));
+        assert_eq!(source.state, ConnectorState::Created);
     }
 
     #[test]
-    fn test_supports_replay_false() {
+    fn test_source_contract_is_ephemeral_singleton() {
         let source = IcebergSource::new(test_source_config(), None);
-        assert!(!source.supports_replay());
+        let contract = source.contract(&ConnectorConfig::new("iceberg")).unwrap();
+        assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
     }
 }

@@ -22,12 +22,22 @@ use testcontainers::GenericImage;
 use tokio::time::sleep;
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{SinkConnector, SourceConnector};
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SinkConnector, SourceConnector, SourcePosition, SourceStart,
+};
 use laminar_connectors::mongodb::{
     CollectionKind, FullDocumentMode, MongoDbCdcSource, MongoDbSink, MongoDbSinkConfig,
     MongoDbSourceConfig, TimeSeriesConfig, TimeSeriesGranularity, WriteMode,
 };
 use testcontainers::ImageExt;
+
+fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
+    SourceStart {
+        config: config.clone(),
+        position: SourcePosition::Initial,
+        delivery: DeliveryGuarantee::BestEffort,
+    }
+}
 
 /// Creates a testcontainers MongoDB 8.0 instance and returns the connection URI.
 async fn start_mongo() -> (testcontainers::ContainerAsync<GenericImage>, String) {
@@ -110,7 +120,10 @@ async fn insert_cdc() {
     let config = MongoDbSourceConfig::new(&uri, "test_insert_cdc", "events");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(initial_source_start(&connector_config))
+        .await
+        .unwrap();
 
     // Wait for stream to be ready.
     sleep(Duration::from_secs(1)).await;
@@ -143,7 +156,7 @@ async fn insert_cdc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resume_after_disconnect() {
+async fn checkpoint_resume_is_rejected_until_tokens_are_checkpoint_coupled() {
     let (_container, uri) = start_mongo().await;
 
     let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
@@ -154,7 +167,10 @@ async fn resume_after_disconnect() {
     let config = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(initial_source_start(&connector_config))
+        .await
+        .unwrap();
     sleep(Duration::from_secs(1)).await;
 
     for i in 0..5 {
@@ -175,34 +191,20 @@ async fn resume_after_disconnect() {
     let checkpoint = source.checkpoint();
     source.close().await.unwrap();
 
-    // Insert 5 more docs, then reopen from the checkpoint.
-    for i in 5..10 {
-        coll.insert_one(doc! { "seq": i }).await.unwrap();
-    }
-
     let config2 = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
     let mut source2 = MongoDbCdcSource::new(config2, None);
-    source2.restore(&checkpoint).await.unwrap();
-    source2.open(&connector_config).await.unwrap();
-    sleep(Duration::from_secs(1)).await;
-
-    let mut phase2_events = 0;
-    for _ in 0..20 {
-        sleep(Duration::from_millis(200)).await;
-        if let Ok(Some(batch)) = source2.poll_batch(100).await {
-            phase2_events += batch.num_rows();
-            if phase2_events >= 5 {
-                break;
-            }
-        }
-    }
-
-    assert!(
-        phase2_events >= 5,
-        "expected at least 5 events after resume, got {phase2_events}"
-    );
-
-    source2.close().await.unwrap();
+    let error = source2
+        .start(SourceStart {
+            config: connector_config,
+            position: SourcePosition::Resume {
+                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                checkpoint,
+            },
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        })
+        .await
+        .expect_err("MongoDB resume tokens are not coupled to exact engine checkpoints");
+    assert!(error.to_string().contains("ephemeral"));
 }
 
 // ── Sink Tests ──
@@ -376,7 +378,7 @@ async fn timeseries_source_guard() {
     let config = MongoDbSourceConfig::new(&uri, "test_ts_guard", "metrics");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    let result = source.open(&connector_config).await;
+    let result = source.start(initial_source_start(&connector_config)).await;
 
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
@@ -452,7 +454,10 @@ async fn update_delta_mode() {
     let config = MongoDbSourceConfig::new(&uri, "test_update_delta", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(initial_source_start(&connector_config))
+        .await
+        .unwrap();
     sleep(Duration::from_secs(1)).await;
 
     // Update a field.
@@ -523,7 +528,10 @@ async fn update_lookup_mode() {
     config.full_document_mode = FullDocumentMode::UpdateLookup;
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(initial_source_start(&connector_config))
+        .await
+        .unwrap();
     sleep(Duration::from_secs(1)).await;
 
     coll.update_one(doc! { "_id": "u2" }, doc! { "$set": { "name": "Bob_v2" } })
@@ -582,7 +590,10 @@ async fn replace_cdc() {
     let config = MongoDbSourceConfig::new(&uri, "test_replace_cdc", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(initial_source_start(&connector_config))
+        .await
+        .unwrap();
     sleep(Duration::from_secs(1)).await;
 
     // Replace the entire document.
@@ -634,7 +645,10 @@ async fn delete_cdc() {
     let config = MongoDbSourceConfig::new(&uri, "test_delete_cdc", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
-    source.open(&connector_config).await.unwrap();
+    source
+        .start(initial_source_start(&connector_config))
+        .await
+        .unwrap();
     sleep(Duration::from_secs(1)).await;
 
     coll.delete_one(doc! { "_id": "d1" }).await.unwrap();

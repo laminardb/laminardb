@@ -11,19 +11,19 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+delivery = "at_least_once"
 metrics_bind = "0.0.0.0:9090"
 workers = 8
 
 [state]
-backend = "local"
-path = "/data/laminardb/state"
+backend = "object_store"
+url = "s3://laminardb-checkpoints/prod-state"
+instance_id = "star-1"
 vnode_capacity = 256
 
 [checkpoint]
 url = "s3://laminardb-checkpoints/prod"
 interval = "30s"
-mode = "aligned"
-snapshot_strategy = "fork_cow"
 
 [discovery]
 strategy = "static"
@@ -69,7 +69,6 @@ parallelism = 8
 name = "enriched_orders"
 pipeline = "order_enrichment"
 connector = "kafka"
-delivery = "exactly_once"
 [sink.properties]
 brokers = "${KAFKA_BROKERS}"
 topic = "enriched_orders"

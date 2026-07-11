@@ -1,5 +1,13 @@
 # LaminarDB — payments + fraud-check streaming demo
 
+> **Archived contract fixture — not currently runnable.** The configured NATS
+> Core sources are non-replayable and therefore require pipeline-wide
+> `best_effort`, while the Iceberg sinks require pipeline-wide `exactly_once`.
+> LaminarDB now rejects that impossible mixed contract before opening external
+> connectors. The SQL remains useful as a design fixture; restore this demo only
+> after moving the inputs to a certified replayable source. Do not use the run
+> commands below against the current configuration.
+
 Two correlated payment streams over NATS:
 
 * `payments.initiated`  — a payment is created (someone hits Pay)
@@ -37,7 +45,7 @@ DuckDB can resolve the name from the host:
 The published `9000:9000` Docker port forwards `rustfs:9000` to the
 running container.
 
-## Run it
+## Historical setup (disabled by the contract gate)
 
 ```bash
 # 1. NATS + RustFS + Postgres + Lakekeeper.

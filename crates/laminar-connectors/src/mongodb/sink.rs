@@ -15,12 +15,16 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
-use tracing::{debug, info};
+#[cfg(feature = "mongodb-cdc")]
+use tracing::debug;
+use tracing::info;
 
 #[cfg(feature = "mongodb-cdc")]
 use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
+use crate::connector::{SinkConnector, SinkContract, WriteResult};
+#[cfg(feature = "mongodb-cdc")]
+use crate::connector::{SinkConsistency, SinkInputMode, SinkTopology};
 use crate::error::ConnectorError;
 #[cfg(feature = "mongodb-cdc")]
 use laminar_core::changelog::WEIGHT_COLUMN;
@@ -29,6 +33,15 @@ use super::config::MongoDbSinkConfig;
 use super::metrics::MongoDbSinkMetrics;
 use super::timeseries::CollectionKind;
 use super::write_model::WriteMode;
+
+#[cfg(not(feature = "mongodb-cdc"))]
+fn mongodb_sink_feature_error() -> ConnectorError {
+    ConnectorError::ConfigurationError(
+        "MongoDB sink requires the 'mongodb-cdc' feature flag. Rebuild with \
+         `--features mongodb-cdc` to enable durable MongoDB writes."
+            .into(),
+    )
+}
 
 /// `MongoDB` sink connector.
 ///
@@ -164,40 +177,38 @@ impl MongoDbSink {
     ///
     /// Both `write_batch` (on auto-flush) and `flush` delegate here.
     async fn flush_inner(&mut self) -> Result<WriteResult, ConnectorError> {
-        if self.buffer.is_empty() {
-            return Ok(WriteResult::new(0, 0));
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            return Err(mongodb_sink_feature_error());
         }
 
-        // CDC replay parses a JSON envelope (_op/_full_document/_update_desc), so it
-        // keeps the serde_json path; every other mode goes Arrow → BSON directly.
         #[cfg(feature = "mongodb-cdc")]
-        let (doc_count, byte_estimate) = if matches!(self.config.write_mode, WriteMode::CdcReplay) {
-            let (docs, bytes) = self.batches_to_json_docs();
-            let n = docs.len();
-            self.write_cdc_docs(&docs).await?;
-            (n, bytes)
-        } else {
-            let collapsed = self.collapse_changelog_buffer_for_upsert()?;
-            let (docs, bytes) = self.batches_to_bson_docs();
-            let n = docs.len();
-            self.write_bson_docs(docs, collapsed).await?;
-            (n, bytes)
-        };
+        {
+            if self.buffer.is_empty() {
+                return Ok(WriteResult::new(0, 0));
+            }
 
-        #[cfg(not(feature = "mongodb-cdc"))]
-        let (doc_count, byte_estimate) = {
-            let (docs, bytes) = self.batches_to_json_docs();
-            debug!(
-                count = docs.len(),
-                "flush (no-op without mongodb-cdc feature)"
-            );
-            (docs.len(), bytes)
-        };
+            // CDC replay parses a JSON envelope (_op/_full_document/_update_desc), so it keeps
+            // the serde_json path; every other mode goes Arrow -> BSON directly.
+            let (doc_count, byte_estimate) =
+                if matches!(self.config.write_mode, WriteMode::CdcReplay) {
+                    let (docs, bytes) = self.batches_to_json_docs();
+                    let n = docs.len();
+                    self.write_cdc_docs(&docs).await?;
+                    (n, bytes)
+                } else {
+                    let collapsed = self.collapse_changelog_buffer_for_upsert()?;
+                    let (docs, bytes) = self.batches_to_bson_docs();
+                    let n = docs.len();
+                    self.write_bson_docs(docs, collapsed).await?;
+                    (n, bytes)
+                };
 
-        self.metrics.record_flush(doc_count as u64, byte_estimate);
-        self.clear_buffer();
+            self.metrics.record_flush(doc_count as u64, byte_estimate);
+            self.clear_buffer();
 
-        Ok(WriteResult::new(doc_count, byte_estimate))
+            Ok(WriteResult::new(doc_count, byte_estimate))
+        }
     }
 
     /// Collapse a Z-set changelog buffer (an incremental MV: rows carry `__weight`) into a single
@@ -451,63 +462,104 @@ fn json_to_bson_document(
 
 #[async_trait]
 impl SinkConnector for MongoDbSink {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        if !config.properties().is_empty() {
-            self.config = MongoDbSinkConfig::from_config(config)?;
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            let cfg = if config.properties().is_empty() {
+                self.config.clone()
+            } else {
+                MongoDbSinkConfig::from_config(config)?
+            };
+            cfg.validate()?;
+            // Journaled w=1 (or any fixed node count whose relationship to the live replica-set
+            // majority is unknown) can be rolled back after primary failover. Only the server's
+            // Majority policy is a topology-independent replicated durability acknowledgement.
+            let majority = matches!(
+                cfg.write_concern.w,
+                super::config::WriteConcernLevel::Majority
+            );
+            let consistency = if majority && cfg.write_concern.journal {
+                SinkConsistency::DurableAtLeastOnce
+            } else {
+                SinkConsistency::Ephemeral
+            };
+            let (topology, input_mode) = match cfg.write_mode {
+                WriteMode::Insert => (SinkTopology::MultiWriter, SinkInputMode::AppendOnly),
+                WriteMode::Replace { .. } => (SinkTopology::Singleton, SinkInputMode::AppendOnly),
+                WriteMode::Upsert { .. } | WriteMode::CdcReplay => {
+                    (SinkTopology::Singleton, SinkInputMode::FullChangelog)
+                }
+            };
+            Ok(SinkContract::new(consistency, topology, input_mode))
         }
-        self.config.validate()?;
+
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            let _ = config;
+            Err(mongodb_sink_feature_error())
+        }
+    }
+
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            let _ = config;
+            return Err(mongodb_sink_feature_error());
+        }
 
         #[cfg(feature = "mongodb-cdc")]
         {
+            if !config.properties().is_empty() {
+                self.config = MongoDbSinkConfig::from_config(config)?;
+            }
+            self.config.validate()?;
             self.connect().await?;
+
+            self.state = ConnectorState::Running;
+            info!(
+                database = %self.config.database,
+                collection = %self.config.collection,
+                write_mode = ?self.config.write_mode,
+                ordered = self.config.ordered,
+                "MongoDB sink opened"
+            );
+
+            Ok(())
         }
-
-        self.state = ConnectorState::Running;
-        info!(
-            database = %self.config.database,
-            collection = %self.config.collection,
-            write_mode = ?self.config.write_mode,
-            ordered = self.config.ordered,
-            "MongoDB sink opened"
-        );
-
-        Ok(())
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        let rows = batch.num_rows();
-        if rows == 0 {
-            return Ok(WriteResult::new(0, 0));
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            let _ = batch;
+            return Err(mongodb_sink_feature_error());
         }
 
-        self.buffer.push(batch.clone());
-        self.buffered_rows += rows;
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            let rows = batch.num_rows();
+            if rows == 0 {
+                return Ok(WriteResult::new(0, 0));
+            }
 
-        if self.should_flush() {
-            return self.flush_inner().await;
+            self.buffer.push(batch.clone());
+            self.buffered_rows += rows;
+
+            if self.should_flush() {
+                return self.flush_inner().await;
+            }
+
+            // Just buffered, nothing written yet.
+            Ok(WriteResult::new(0, 0))
         }
-
-        // Just buffered, nothing written yet.
-        Ok(WriteResult::new(0, 0))
     }
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(30)).with_idempotent();
-
-        if matches!(self.config.write_mode, WriteMode::Upsert { .. }) {
-            // with_changelog stops prepare_for_sink stripping __weight, so group deletes reach the
-            // collapse path as tombstones.
-            caps = caps.with_upsert().with_changelog();
-        }
-        if matches!(self.config.write_mode, WriteMode::CdcReplay) {
-            caps = caps.with_changelog();
-        }
-
-        caps
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(30)
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
@@ -905,6 +957,10 @@ mod tests {
         .unwrap()
     }
 
+    fn test_config() -> MongoDbSinkConfig {
+        MongoDbSinkConfig::new("mongodb://localhost:27017", "db", "coll")
+    }
+
     #[test]
     fn test_new_sink() {
         let config = MongoDbSinkConfig::new("mongodb://localhost:27017", "db", "coll");
@@ -912,34 +968,98 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 0);
     }
 
+    #[cfg(feature = "mongodb-cdc")]
     #[test]
-    fn test_sink_capabilities_insert() {
-        let config = MongoDbSinkConfig::default();
+    fn test_sink_contract_insert() {
+        let config = test_config();
         let sink = MongoDbSink::new(test_schema(), config, None);
-        let caps = sink.capabilities();
-        assert!(caps.idempotent);
-        assert!(!caps.upsert);
-        assert!(!caps.changelog);
+        let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+        assert_eq!(contract.topology, SinkTopology::MultiWriter);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
     }
 
+    #[cfg(feature = "mongodb-cdc")]
     #[test]
-    fn test_sink_capabilities_upsert() {
-        let mut config = MongoDbSinkConfig::default();
+    fn test_sink_contract_upsert() {
+        let mut config = test_config();
         config.write_mode = WriteMode::Upsert {
             key_fields: vec!["id".to_string()],
         };
         let sink = MongoDbSink::new(test_schema(), config, None);
-        let caps = sink.capabilities();
-        assert!(caps.upsert);
+        let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
+        assert_eq!(contract.topology, SinkTopology::Singleton);
+        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
     }
 
+    #[cfg(feature = "mongodb-cdc")]
     #[test]
-    fn test_sink_capabilities_cdc_replay() {
-        let mut config = MongoDbSinkConfig::default();
+    fn test_sink_contract_cdc_replay() {
+        let mut config = test_config();
         config.write_mode = WriteMode::CdcReplay;
         let sink = MongoDbSink::new(test_schema(), config, None);
-        let caps = sink.capabilities();
-        assert!(caps.changelog);
+        let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
+        assert_eq!(contract.topology, SinkTopology::Singleton);
+        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn replace_is_singleton_append_only() {
+        let mut config = test_config();
+        config.write_mode = WriteMode::Replace {
+            upsert_on_missing: false,
+        };
+        let sink = MongoDbSink::new(test_schema(), config, None);
+        let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
+        assert_eq!(contract.topology, SinkTopology::Singleton);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn fixed_node_write_concern_is_not_durable_admission() {
+        let mut config = test_config();
+        config.write_concern.w = super::super::config::WriteConcernLevel::Nodes(1);
+        config.write_concern.journal = true;
+        let sink = MongoDbSink::new(test_schema(), config, None);
+        let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn unjournaled_majority_is_not_durable_admission() {
+        let mut config = test_config();
+        config.write_concern.w = super::super::config::WriteConcernLevel::Majority;
+        config.write_concern.journal = false;
+        let sink = MongoDbSink::new(test_schema(), config, None);
+        let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
+    }
+
+    #[cfg(not(feature = "mongodb-cdc"))]
+    #[tokio::test]
+    async fn missing_feature_fails_contract_and_open() {
+        let mut sink = MongoDbSink::new(test_schema(), test_config(), None);
+        let config = ConnectorConfig::new("mongodb");
+        let contract_error = sink
+            .contract(&config)
+            .expect_err("contract must fail closed");
+        assert!(contract_error.to_string().contains("mongodb-cdc"));
+
+        let open_error = sink.open(&config).await.expect_err("open must fail closed");
+        assert!(open_error.to_string().contains("mongodb-cdc"));
+        let write_error = sink
+            .write_batch(&test_batch(1))
+            .await
+            .expect_err("write must fail closed");
+        assert!(write_error.to_string().contains("mongodb-cdc"));
+        let flush_error = sink.flush().await.expect_err("flush must fail closed");
+        assert!(flush_error.to_string().contains("mongodb-cdc"));
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.state, ConnectorState::Created);
     }
 
     #[test]

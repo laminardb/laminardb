@@ -151,6 +151,8 @@ pub enum ClusterStartupError {
     EngineConstruction(String),
     #[error("HTTP startup failed: {0}")]
     HttpStartup(String),
+    #[error("engine shutdown failed: {0}")]
+    EngineShutdown(String),
 }
 
 pub struct ClusterHandle {
@@ -230,12 +232,6 @@ impl ClusterHandle {
             }
         }
 
-        // 4. Stop renewing the leader lease so it expires promptly and a
-        //    surviving node can take over without waiting out the TTL.
-        if let Some(token) = &self.lease_shutdown_token {
-            token.cancel();
-        }
-
         // Tell rebalance tasks to exit at their next select point.
         // Fire all aborts before awaiting any so a slow responder
         // doesn't serialise the others.
@@ -245,6 +241,19 @@ impl ClusterHandle {
         }
         for task in self.rebalance_tasks.drain(..) {
             let _ = task.await;
+        }
+
+        // Settle checkpoint tails while the lease, membership, and discovery control plane are
+        // still live. Tearing those down first can manufacture a leadership loss in the middle
+        // of an otherwise clean durable cut.
+        self.db
+            .shutdown()
+            .await
+            .map_err(|error| ClusterStartupError::EngineShutdown(error.to_string()))?;
+
+        // Engine state and external commits are settled; now relinquish leadership promptly.
+        if let Some(token) = &self.lease_shutdown_token {
+            token.cancel();
         }
 
         // Stop membership watcher
@@ -258,11 +267,6 @@ impl ClusterHandle {
         // Abort config watcher
         if let Some(wh) = &self.watcher_handle {
             wh.abort();
-        }
-
-        // Shutdown engine
-        if let Err(e) = self.db.shutdown().await {
-            tracing::warn!("Engine shutdown error: {e}");
         }
 
         // Abort HTTP
@@ -280,17 +284,7 @@ pub async fn start_cluster(
     config_path: PathBuf,
 ) -> Result<ClusterHandle, ClusterStartupError> {
     let node_id_str = cluster_cfg.node_id.as_str().to_string();
-    // Use xxhash3 (deterministic across Rust versions) for the numeric NodeId.
-    // DefaultHasher is explicitly unstable across compiler versions.
-    let node_id_num = {
-        let h = xxhash_rust::xxh3::xxh3_64(node_id_str.as_bytes());
-        // Avoid the UNASSIGNED sentinel (0)
-        if h == 0 {
-            1
-        } else {
-            h
-        }
-    };
+    let node_id_num = numeric_node_id(&node_id_str);
     let node_id = NodeId(node_id_num);
 
     let bind_addr = &config.server.bind;
@@ -444,7 +438,9 @@ pub async fn start_cluster(
 
     // Build LaminarDB with Profile::Cluster
     let mut builder = LaminarDB::builder();
-    builder = builder.profile(Profile::Cluster);
+    builder = builder
+        .profile(Profile::Cluster)
+        .delivery_guarantee(config.server.delivery);
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
@@ -530,18 +526,11 @@ pub async fn start_cluster(
         None => None,
     };
 
-    // Namespace checkpoints per node for partition migration reads.
-    let checkpoint_url = {
-        let base = &config.checkpoint.url;
-        if base.is_empty() {
-            String::new()
-        } else if base.ends_with('/') {
-            format!("{base}nodes/{node_id_str}/")
-        } else {
-            format!("{base}/nodes/{node_id_str}/")
-        }
-    };
-    builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint, true);
+    // LaminarDB derives the participant namespace from the installed controller. Keep the base
+    // URL shared so durable commit decisions remain visible to every node.
+    builder = builder.incremental_emit(config.server.incremental_emit);
+    builder =
+        server::apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint, true);
 
     builder = builder
         .state_backend(Arc::clone(&state_backend))
@@ -664,7 +653,11 @@ pub async fn start_cluster(
                     if vnode_registry.assignment_version() >= snapshot.version {
                         break; // already adopted (watcher raced us)
                     }
-                    let adoption = db.adopt_assignment_snapshot(snapshot).await;
+                    let adoption = db.adopt_assignment_snapshot(snapshot).await.map_err(|e| {
+                        ClusterStartupError::EngineConstruction(format!(
+                            "assignment state recovery: {e}"
+                        ))
+                    })?;
                     info!(
                         version = adoption.version,
                         adopted = adoption.adopted,
@@ -768,6 +761,17 @@ pub async fn start_cluster(
         rebalance_tasks,
         rebalance_shutdown,
     })
+}
+
+/// Stable numeric identity shared by cluster runtime and offline checkpoint validation.
+pub(crate) fn numeric_node_id(node_id: &str) -> u64 {
+    // xxhash3 is deterministic across Rust/compiler versions. Avoid the UNASSIGNED sentinel.
+    let hash = xxhash_rust::xxh3::xxh3_64(node_id.as_bytes());
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
 }
 
 fn num_cpus() -> u32 {

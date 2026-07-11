@@ -195,11 +195,12 @@ impl ClusterEngineHarness {
 
             // No pre-call to `set_authoritative_version`: exercise the real
             // wiring that lifts the snapshot version into the fence on `db.start()`.
-            let state_backend: Arc<dyn StateBackend> = Arc::new(ObjectStoreBackend::new(
-                Arc::clone(&shared_store),
-                self_id.0.to_string(),
-                vnode_count,
-            ));
+            let state_backend: Arc<dyn StateBackend> =
+                Arc::new(ObjectStoreBackend::cluster_shared(
+                    Arc::clone(&shared_store),
+                    self_id.0.to_string(),
+                    vnode_count,
+                ));
 
             let registry = Arc::new(VnodeRegistry::new(vnode_count));
             registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
@@ -209,9 +210,6 @@ impl ClusterEngineHarness {
                 data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
                 delta_chain_max: delta,
-                // Cold tier only demotes changelog aggregates; incremental emit
-                // makes the tier test's GROUP BY one (no-op for non-tier callers).
-                incremental_emit: tier_budget.is_some(),
                 ..StreamCheckpointConfig::default()
             };
 
@@ -223,6 +221,9 @@ impl ClusterEngineHarness {
             let mut builder = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
                 .checkpoint(cp_cfg)
+                // Cold tier only demotes changelog aggregates; incremental emit makes the tier
+                // test's GROUP BY one (no-op for non-tier callers).
+                .incremental_emit(tier_budget.is_some())
                 .cluster_controller(Arc::clone(&nh.controller))
                 .state_backend(Arc::clone(&state_backend))
                 .vnode_registry(Arc::clone(&registry))

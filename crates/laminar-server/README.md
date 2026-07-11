@@ -54,8 +54,9 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node scaffolding, not production-hardened)
+mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node at-least-once)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+delivery = "at_least_once"  # pipeline-wide; exactly_once is single-node only
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
 # Optional node-level cap on total operator state held in memory, in bytes.
@@ -73,10 +74,8 @@ log_level = "info"
 # backend is rejected. Set a memory budget too, or nothing is demoted.
 # state_tier_dir = "/var/lib/laminardb/state-tier"
 # Demote at GROUP granularity (shed individual idle aggregate groups) instead of
-# whole idle vnodes. Requires the cold tier. Unset defaults ON for embedded
-# single-node (kill-9-soaked) and OFF for cluster (the cluster group path has
-# open correctness gaps; it stays vnode-granular). Set true to force it on either
-# topology, false to force vnode-granular.
+# whole idle vnodes. Requires the cold tier. Unset defaults ON; set false to
+# force the coarser vnode-granular path.
 # state_tier_group_demotion = true
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -92,6 +91,12 @@ path = "./data/state"       # required when backend = "local"
 # When backend = "object_store": url = "s3://bucket/state" (same schemes as
 # [checkpoint]) and instance_id = "node-0" (required, unique per node);
 # credentials from provider env vars or [state.storage].
+# Local paths and file:// are node-durable and valid for embedded/single-node
+# exactly-once; an exclusive OS lock prevents two live local writers. A shared
+# checkpoint URL under local exactly-once fails with LDB-0014 until it has a
+# term-fenced deployment lease. Cluster mode requires cloud object storage shared by every node.
+# Cluster exactly-once currently fails closed with LDB-0013 because the leader
+# term is not atomically bound to checkpoint decisions and external sink commits.
 
 [checkpoint]
 # Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the
@@ -99,6 +104,7 @@ path = "./data/state"       # required when backend = "local"
 # standard provider env vars, or set them under [checkpoint.storage].
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
+timeout = "120s" # one deadline across fence, capture, durable decision, and completion
 
 [[source]]
 name = "trades"
@@ -135,7 +141,6 @@ EMIT ON WINDOW CLOSE
 name = "output"
 pipeline = "avg_price"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 bootstrap.servers = "localhost:9092"
 topic = "avg-prices"

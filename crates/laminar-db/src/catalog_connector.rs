@@ -14,7 +14,10 @@ use tokio::sync::Notify;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{SourceBatch, SourceConnector};
+use laminar_connectors::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
+    SourceTopology,
+};
 use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming;
 
@@ -45,8 +48,16 @@ impl CatalogSourceConnector {
 
 #[async_trait]
 impl SourceConnector for CatalogSourceConnector {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        Ok(())
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        match request.position {
+            SourcePosition::Initial => Ok(()),
+            SourcePosition::Resume { attempt, .. } => {
+                Err(ConnectorError::ConfigurationError(format!(
+                    "catalog bridge is ephemeral and cannot resume checkpoint epoch={} id={}",
+                    attempt.epoch, attempt.checkpoint_id
+                )))
+            }
+        }
     }
 
     async fn poll_batch(
@@ -94,16 +105,12 @@ impl SourceConnector for CatalogSourceConnector {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset(
             "records_polled".to_string(),
             self.records_polled.to_string(),
         );
         cp
-    }
-
-    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -114,7 +121,10 @@ impl SourceConnector for CatalogSourceConnector {
         Some(Arc::clone(&self.data_notify))
     }
 
-    fn supports_replay(&self) -> bool {
-        false
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::NodeLocalIngress,
+        ))
     }
 }

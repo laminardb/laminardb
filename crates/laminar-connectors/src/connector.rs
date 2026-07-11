@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::checkpoint::SourceCheckpoint;
@@ -21,10 +22,14 @@ use crate::error::ConnectorError;
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryGuarantee {
-    /// At-least-once: records may be replayed on recovery. Requires
-    /// checkpointing but tolerates non-replayable sources (with degradation).
+    /// Best effort: no replay contract. Intended for bare-metal/embedded
+    /// low-latency pipelines that explicitly accept loss on failure.
     #[default]
+    BestEffort,
+    /// At-least-once: records may be replayed on recovery. Requires
+    /// checkpointing and replayable sources.
     AtLeastOnce,
     /// Exactly-once: no duplicates or losses. Requires all sources to
     /// support replay, all sinks to support exactly-once, and checkpoint
@@ -35,6 +40,7 @@ pub enum DeliveryGuarantee {
 impl std::fmt::Display for DeliveryGuarantee {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DeliveryGuarantee::BestEffort => write!(f, "best-effort"),
             DeliveryGuarantee::AtLeastOnce => write!(f, "at-least-once"),
             DeliveryGuarantee::ExactlyOnce => write!(f, "exactly-once"),
         }
@@ -46,10 +52,177 @@ impl FromStr for DeliveryGuarantee {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().replace('-', "_").as_str() {
+            "best_effort" | "besteffort" | "none" => Ok(Self::BestEffort),
             "at_least_once" | "atleastonce" => Ok(Self::AtLeastOnce),
             "exactly_once" | "exactlyonce" => Ok(Self::ExactlyOnce),
             other => Err(format!("unknown delivery guarantee: '{other}'")),
         }
+    }
+}
+
+/// Recovery semantics provided by a source.
+///
+/// This is deliberately a small, ordered set of operational contracts rather
+/// than a collection of independent capability flags. A source must advertise
+/// the strongest contract its implementation can actually uphold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceConsistency {
+    /// Events cannot be reconstructed after the runtime has accepted them.
+    #[default]
+    Ephemeral,
+    /// A persisted source position can be used to reproduce accepted events.
+    Replayable,
+    /// Replay is supported, and upstream progress/resources advance only when
+    /// the corresponding `LaminarDB` checkpoint is durably committed.
+    CommitCoupled,
+}
+
+impl SourceConsistency {
+    /// Whether a persisted source position can be replayed after recovery.
+    #[must_use]
+    pub const fn supports_replay(self) -> bool {
+        !matches!(self, Self::Ephemeral)
+    }
+
+    /// Whether checkpoint commits are required for safe upstream progress.
+    #[must_use]
+    pub const fn requires_checkpointing(self) -> bool {
+        matches!(self, Self::CommitCoupled)
+    }
+}
+
+/// How a source may be placed across runtime nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceTopology {
+    /// Exactly one runtime instance owns the source.
+    #[default]
+    Singleton,
+    /// Input partitions can be assigned independently across runtime nodes.
+    Splittable,
+    /// Each runtime node receives a distinct, node-local input stream.
+    NodeLocalIngress,
+}
+
+/// Complete source admission contract for a concrete connector configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SourceContract {
+    /// Recovery and external-progress semantics.
+    pub consistency: SourceConsistency,
+    /// Valid runtime placement model.
+    pub topology: SourceTopology,
+}
+
+impl SourceContract {
+    /// Construct a source contract from its two explicit dimensions.
+    #[must_use]
+    pub const fn new(consistency: SourceConsistency, topology: SourceTopology) -> Self {
+        Self {
+            consistency,
+            topology,
+        }
+    }
+
+    /// Whether a persisted source position can be replayed after recovery.
+    #[must_use]
+    pub const fn supports_replay(self) -> bool {
+        self.consistency.supports_replay()
+    }
+
+    /// Whether checkpoint commits are required for safe upstream progress.
+    #[must_use]
+    pub const fn requires_checkpointing(self) -> bool {
+        self.consistency.requires_checkpointing()
+    }
+}
+
+/// Durability protocol provided by a sink.
+///
+/// This describes externally observable behaviour, not an implementation
+/// detail such as whether the client library buffers or retries writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SinkConsistency {
+    /// An accepted write can be lost when the connector or peer fails.
+    #[default]
+    Ephemeral,
+    /// Successful writes are durably acknowledged, but replay may duplicate
+    /// them because visibility is not coupled to a `LaminarDB` checkpoint.
+    DurableAtLeastOnce,
+    /// Output can be staged and made visible by the checkpoint commit
+    /// protocol. This is necessary, but not sufficient, for exactly-once
+    /// certification: namespaces and recovery cursors must also be fenced.
+    CheckpointCommittable,
+}
+
+/// How a sink may be placed across runtime nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SinkTopology {
+    /// Only one fenced runtime writer may target the configured destination.
+    #[default]
+    Singleton,
+    /// Independent runtime writers can safely target the destination.
+    MultiWriter,
+    /// Each runtime node owns a distinct local egress endpoint or audience.
+    NodeLocalEgress,
+}
+
+/// The strongest input update model a configured sink understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SinkInputMode {
+    /// Inserts only; retractions or deletes would be lost.
+    #[default]
+    AppendOnly,
+    /// Rows are reconciled by a configured key, but the connector does not
+    /// consume a native full-changelog envelope.
+    KeyedUpsert,
+    /// Inserts, updates, and deletes/retractions are represented faithfully.
+    FullChangelog,
+}
+
+impl SinkInputMode {
+    /// Whether this mode can faithfully consume a full Z-set changelog,
+    /// including deletes/retractions.
+    #[must_use]
+    pub const fn accepts_full_changelog(self) -> bool {
+        matches!(self, Self::FullChangelog)
+    }
+}
+
+/// Complete sink admission contract for a concrete connector configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SinkContract {
+    /// Durability and checkpoint-commit semantics.
+    pub consistency: SinkConsistency,
+    /// Valid runtime placement model.
+    pub topology: SinkTopology,
+    /// Strongest supported input update model.
+    pub input_mode: SinkInputMode,
+}
+
+impl SinkContract {
+    /// Construct a sink contract from its three explicit dimensions.
+    #[must_use]
+    pub const fn new(
+        consistency: SinkConsistency,
+        topology: SinkTopology,
+        input_mode: SinkInputMode,
+    ) -> Self {
+        Self {
+            consistency,
+            topology,
+            input_mode,
+        }
+    }
+
+    /// Whether this contract participates in checkpoint-owned external commit.
+    #[must_use]
+    pub const fn is_checkpoint_committable(self) -> bool {
+        matches!(self.consistency, SinkConsistency::CheckpointCommittable)
+    }
+
+    /// Whether this contract faithfully consumes inserts, updates, and retractions.
+    #[must_use]
+    pub const fn accepts_full_changelog(self) -> bool {
+        self.input_mode.accepts_full_changelog()
     }
 }
 
@@ -183,131 +356,36 @@ impl WriteResult {
     }
 }
 
-/// Capabilities declared by a sink connector.
+/// Atomic startup position for a source connector.
+///
+/// A resume request carries both the durable checkpoint attempt and the
+/// connector checkpoint captured by that attempt. Connectors must install the
+/// position before `start` returns and before `poll_batch` can emit records.
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct SinkConnectorCapabilities {
-    /// Whether the sink supports exactly-once semantics via epochs.
-    pub exactly_once: bool,
-
-    /// Whether the sink supports idempotent writes.
-    pub idempotent: bool,
-
-    /// Whether the sink supports upsert (insert-or-update) writes.
-    pub upsert: bool,
-
-    /// Whether the sink can handle changelog/retraction records.
-    pub changelog: bool,
-
-    /// Whether the sink supports two-phase commit (pre-commit + commit).
-    pub two_phase_commit: bool,
-
-    /// Whether the sink supports schema evolution.
-    pub schema_evolution: bool,
-
-    /// Whether the sink supports partitioned writes.
-    pub partitioned: bool,
-
-    /// Whether output pending in an abandoned epoch survives into the
-    /// next epoch's commit WITHOUT a connector rollback (e.g. a Kafka
-    /// transactional producer's single open transaction). When set, a
-    /// live coordination failure skips the connector rollback so the
-    /// pending rows are not discarded — sources only rewind on
-    /// restart, never on a live abort. When unset, live failures roll
-    /// the connector back.
-    pub preserves_pending_on_abandon: bool,
-
-    /// Whether the sink commits to a single shared log/catalog where concurrent
-    /// writers conflict. When set, the runtime collects each writer's
-    /// `pre_commit` descriptor and runs one commit on the leader via
-    /// [`CoordinatedCommitter`] instead of `commit_epoch` per node.
-    pub coordinated_commit: bool,
-
-    /// Default per-call `write_batch` I/O timeout. Users can override via
-    /// the `sink.write.timeout.ms` connector property.
-    pub suggested_write_timeout: std::time::Duration,
+pub enum SourcePosition {
+    /// Start from the connector's configured deterministic initial position.
+    Initial,
+    /// Resume from an exact durable engine checkpoint.
+    Resume {
+        /// Checkpoint attempt that owns the connector state.
+        attempt: laminar_core::state::CheckpointAttempt,
+        /// Connector cursor captured by `attempt`.
+        checkpoint: SourceCheckpoint,
+    },
 }
 
-impl SinkConnectorCapabilities {
-    /// All booleans default to `false`; flip via `with_*` below or by
-    /// assigning the fields directly (they're `pub`).
-    #[must_use]
-    pub fn new(suggested_write_timeout: std::time::Duration) -> Self {
-        Self {
-            exactly_once: false,
-            idempotent: false,
-            upsert: false,
-            changelog: false,
-            two_phase_commit: false,
-            schema_evolution: false,
-            partitioned: false,
-            preserves_pending_on_abandon: false,
-            coordinated_commit: false,
-            suggested_write_timeout,
-        }
-    }
-
-    /// Declare that pending output survives an abandoned epoch into the
-    /// next commit without a rollback (see the field docs).
-    #[must_use]
-    pub fn with_preserves_pending_on_abandon(mut self) -> Self {
-        self.preserves_pending_on_abandon = true;
-        self
-    }
-
-    /// Enable exactly-once semantics (requires epoch + 2PC impl).
-    #[must_use]
-    pub fn with_exactly_once(mut self) -> Self {
-        self.exactly_once = true;
-        self
-    }
-    /// Enable idempotent writes (safe re-delivery on retry).
-    #[must_use]
-    pub fn with_idempotent(mut self) -> Self {
-        self.idempotent = true;
-        self
-    }
-    /// Enable upsert (key-based insert-or-update).
-    #[must_use]
-    pub fn with_upsert(mut self) -> Self {
-        self.upsert = true;
-        self
-    }
-    /// Enable changelog/retraction records.
-    #[must_use]
-    pub fn with_changelog(mut self) -> Self {
-        self.changelog = true;
-        self
-    }
-    /// Enable two-phase commit (`pre_commit` + `commit_epoch`).
-    #[must_use]
-    pub fn with_two_phase_commit(mut self) -> Self {
-        self.two_phase_commit = true;
-        self
-    }
-    /// Enable additive schema evolution.
-    #[must_use]
-    pub fn with_schema_evolution(mut self) -> Self {
-        self.schema_evolution = true;
-        self
-    }
-    /// Enable partitioned writes.
-    #[must_use]
-    pub fn with_partitioned(mut self) -> Self {
-        self.partitioned = true;
-        self
-    }
-    /// Declare a single shared commit target requiring a designated committer.
-    ///
-    /// Implies `exactly_once`: the descriptor path (`pre_commit` → aggregated
-    /// commit) only runs for exactly-once sinks, so coordinated commit is inert
-    /// without it.
-    #[must_use]
-    pub fn with_coordinated_commit(mut self) -> Self {
-        self.coordinated_commit = true;
-        self.exactly_once = true;
-        self
-    }
+/// Complete source startup request.
+///
+/// Startup is intentionally a single operation so a connector cannot become
+/// externally active between opening resources and restoring its position.
+#[derive(Debug, Clone)]
+pub struct SourceStart {
+    /// Fully resolved connector configuration.
+    pub config: ConnectorConfig,
+    /// Initial or exact recovery position.
+    pub position: SourcePosition,
+    /// Pipeline-wide delivery guarantee used for fail-closed cursor policy.
+    pub delivery: DeliveryGuarantee,
 }
 
 /// Trait for source connectors that read data from external systems.
@@ -317,17 +395,29 @@ impl SinkConnectorCapabilities {
 ///
 /// # Lifecycle
 ///
-/// 1. `open()` — initialize connection, discover schema
+/// 1. `start()` — atomically install the configured or recovered cursor and initialize the reader
 /// 2. `poll_batch()` — read batches in a loop
-/// 3. `checkpoint()` / `restore()` — manage offsets
+/// 3. `checkpoint()` — capture the current connector cursor
 /// 4. `close()` — clean shutdown
 #[async_trait]
 pub trait SourceConnector: Send {
-    /// Called once before polling begins.
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
+    /// Opens the source and establishes its initial or resumed position as one
+    /// indivisible lifecycle transition.
+    ///
+    /// Implementations must not emit records or expose an externally active
+    /// consumer before the requested position has been applied successfully.
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError>;
 
     /// `Ok(None)` = no data currently available; runtime retries after a delay.
-    /// `max_records` is a hint — implementations may return fewer.
+    /// A returned batch must contain at most `max_records` rows.
+    ///
+    /// The runtime may cancel this future to service shutdown or control-plane
+    /// work (including an epoch-commit notification in runtimes that multiplex
+    /// it with polling). Implementations must not advance external or
+    /// checkpoint-visible position across an `.await` unless dropping the
+    /// future at that point preserves replay of every not-yet-returned record.
+    /// Stage work privately, then advance the cursor and return without another
+    /// cancellation point.
     async fn poll_batch(
         &mut self,
         max_records: usize,
@@ -353,22 +443,10 @@ pub trait SourceConnector: Send {
     /// current position after a restart.
     fn checkpoint(&self) -> SourceCheckpoint;
 
-    /// Called during recovery before polling resumes.
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
-
-    /// Rewind to the configured startup position, ignoring committed group offsets and any
-    /// staged checkpoint. A coordinated genesis rewind (no committed cut) truncates all
-    /// durable engine state, but broker-side committed offsets survive that — a replayable
-    /// source must be told explicitly to start over. Call before [`open`](Self::open).
-    /// Default no-op.
-    async fn reset_to_initial(&mut self) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-
     /// Install the cluster vnode assignment so a partitioned source can bind
     /// its input partitions to vnodes (`partition % vnode_count`) and consume
     /// only those it owns, re-binding when the assignment rotates. Called by
-    /// the cluster startup wiring before [`open`](Self::open).
+    /// the cluster startup wiring before [`start`](Self::start).
     ///
     /// Default: no-op — single-node deployments and sources without a natural
     /// partitioning ignore it. Only the Kafka source overrides it today.
@@ -405,17 +483,17 @@ pub trait SourceConnector: Send {
         None
     }
 
-    /// Whether this source supports replay from a checkpointed position.
+    /// Declare recovery and placement semantics for this exact configuration.
     ///
-    /// Sources that return `false` (e.g., WebSocket, raw TCP) cannot seek
-    /// back to a previous offset on recovery. Checkpointing still captures
-    /// their state for best-effort recovery, but exactly-once semantics
-    /// are degraded to at-most-once for events from this source.
+    /// The fail-closed default is an ephemeral singleton. Durable or
+    /// distributed semantics must be opted into by the connector explicitly.
     ///
-    /// The default implementation returns `true` because most durable
-    /// sources (Kafka, CDC, files) support replay.
-    fn supports_replay(&self) -> bool {
-        true
+    /// # Errors
+    ///
+    /// Returns an error when the concrete configuration cannot provide a valid
+    /// recovery or placement contract. The default implementation never fails.
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::default())
     }
 
     /// Returns a shared flag that the source sets to `true` when it
@@ -433,8 +511,8 @@ pub trait SourceConnector: Send {
 
     /// Acknowledge that `epoch` has been durably committed.
     ///
-    /// Called after the manifest is persisted and every exactly-once sink
-    /// committed the epoch. The `checkpoint` argument is the exact
+    /// Called after the manifest and exact engine commit decision are durable. Coordinated
+    /// external sink publication may complete asynchronously afterward. The `checkpoint` is the exact
     /// per-source `SourceCheckpoint` that was persisted into the manifest
     /// for this epoch — sources can rely on it to advance external offset
     /// state (broker group offsets, lookup-DB cursors, ack tokens) using
@@ -448,7 +526,9 @@ pub trait SourceConnector: Send {
     ///
     /// # Errors
     ///
-    /// Errors are logged; they do not roll back the committed epoch.
+    /// The epoch is already durable and cannot be rolled back. During normal processing an error
+    /// faults replay-capable pipelines so recovery retries the advisory upstream commit; during
+    /// shutdown it is logged and the durable `LaminarDB` checkpoint remains authoritative.
     async fn notify_epoch_committed(
         &mut self,
         _epoch: u64,
@@ -456,90 +536,91 @@ pub trait SourceConnector: Send {
     ) -> Result<(), ConnectorError> {
         Ok(())
     }
-
-    /// `true` if this source releases an upstream resource only when an epoch is durably
-    /// committed (via [`SourceConnector::notify_epoch_committed`]), so running it without
-    /// checkpointing lets that resource grow without bound. A `PostgreSQL` logical replication slot
-    /// is the canonical case: its WAL is reclaimed only as the confirmed-flush LSN advances, which
-    /// happens on commit — with checkpointing off the slot never advances and the source database's
-    /// WAL fills. The pipeline rejects such a source when checkpointing is disabled.
-    ///
-    /// Default `false` (Kafka, files, etc. self-manage retention or tolerate a static offset).
-    fn requires_checkpointing_for_progress(&self) -> bool {
-        false
-    }
 }
 
 /// Trait for sink connectors that write data to external systems.
 ///
 /// Sink connectors operate in Ring 1, receiving data from Ring 0 and
-/// writing to external systems. Implementations that advertise
-/// `exactly_once` also implement `begin_epoch`/`pre_commit`/`commit_epoch`/
+/// writing to external systems. Implementations whose contract is
+/// [`SinkConsistency::CheckpointCommittable`] prepare checkpoint-owned
+/// committables with `begin_epoch`/`pre_commit`, expose a
+/// [`CoordinatedCommitter`] for the single external commit, and implement
 /// `rollback_epoch`; the runtime drives them via the checkpoint coordinator.
 ///
-/// Lifecycle: `open()` → loop over epochs of `begin_epoch()`,
-/// `write_batch()*`, `pre_commit()`, `commit_epoch()` (or `rollback_epoch()`
-/// on failure) → `close()`.
+/// All sinks follow `open()` → `write_batch()`/`flush()` → `close()`.
+/// Checkpoint-committable sinks additionally loop over `begin_epoch()`, staged
+/// writes, `pre_commit()`, and coordinated commit (or `rollback_epoch()` on a
+/// proven pre-decision failure).
 #[async_trait]
 pub trait SinkConnector: Send {
+    /// Declare durability, placement, and input semantics for this exact
+    /// configuration without opening files, sockets, clients, or transactions.
+    ///
+    /// The fail-closed default is an ephemeral append-only singleton. Durable
+    /// or distributed behaviour must be opted into explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the concrete configuration cannot provide a valid
+    /// durability, placement, or input contract. The default implementation never fails.
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        Ok(SinkContract::default())
+    }
+
     /// Open the connection and prepare to accept writes.
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
 
     /// Must be cancellation-safe: the runtime wraps this in
     /// `tokio::time::timeout`. Don't split a `&mut self` mutation
     /// across an `.await`. In-flight transactional state may remain open
-    /// after cancellation; the caller will `rollback_epoch` it.
+    /// after cancellation; for checkpoint-committable sinks the caller will
+    /// `rollback_epoch` it after proving no durable commit decision exists.
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError>;
 
     /// Expected Arrow schema of input batches.
     fn schema(&self) -> SchemaRef;
 
-    /// Default: no-op (at-least-once semantics).
+    /// Begin checkpoint-owned staging. Called only for an admitted
+    /// checkpoint-committable contract; weaker sinks use the no-op default.
     async fn begin_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
     }
 
-    /// Phase 1 of 2PC: flush + prepare, do NOT finalize the txn. The
-    /// runtime persists the manifest between `pre_commit` and
-    /// `commit_epoch`; on failure it calls `rollback_epoch`.
+    /// Flush + prepare, but do not finalize externally. The runtime persists
+    /// the checkpoint decision before a designated committer finalizes the
+    /// collected descriptors; on failure it calls `rollback_epoch`.
     ///
-    /// Returns an opaque commit descriptor for `coordinated_commit` sinks (the
+    /// Returns an opaque commit descriptor for checkpoint-committable sinks (the
     /// committables the designated committer will aggregate), else `None`.
     /// Default delegates to `flush()` and returns `None`.
     ///
     /// # Errors
-    /// Returns `ConfigurationError` if the sink declares `coordinated_commit`
+    /// Returns `ConfigurationError` if the sink exposes a coordinated committer
     /// yet relies on this default — it would seal epochs with no external commit.
     async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
-        if self.capabilities().coordinated_commit {
+        if self.as_coordinated_committer().is_some() {
             return Err(ConnectorError::ConfigurationError(
-                "sink declares coordinated_commit but does not override pre_commit".into(),
+                "sink exposes a coordinated committer but does not override pre_commit".into(),
             ));
         }
         self.flush().await?;
         Ok(None)
     }
 
-    /// Phase 2 of 2PC: finalize the txn. Called after the manifest is
-    /// durable. Default: no-op (at-least-once semantics).
-    async fn commit_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-
-    /// Must be idempotent: the runtime calls this on every exactly-once
-    /// sink after a `pre_commit` failure, including sinks that never
-    /// `pre_commit`ed.
+    /// Must be idempotent. The runtime calls this on every
+    /// checkpoint-committable sink after proving a pre-decision failure,
+    /// including sinks that never completed `pre_commit`.
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
     }
 
-    /// Required (no default) so every implementation declares
-    /// `suggested_write_timeout`.
-    fn capabilities(&self) -> SinkConnectorCapabilities;
+    /// Default per-call `write_batch` I/O timeout. Users can override this via
+    /// the `sink.write.timeout.ms` connector property.
+    fn suggested_write_timeout(&self) -> std::time::Duration;
 
     /// Must be internally bounded — the sink task's periodic timer
     /// calls this on every tick. Thorough drains belong in `pre_commit`
-    /// / `commit_epoch` / `close`, not here.
+    /// / coordinated commit / `close`, not here.
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -553,13 +634,168 @@ pub trait SinkConnector: Send {
         None
     }
 
-    /// Leader-side committer for `coordinated_commit` sinks; `None` otherwise.
+    /// Leader-side committer for a checkpoint-committable contract; `None`
+    /// for every weaker contract.
     fn as_coordinated_committer(&self) -> Option<&dyn CoordinatedCommitter> {
         None
     }
 }
 
-/// Leader-side commit for sinks that declare `coordinated_commit`.
+/// Stable external commit namespace for one deployment incarnation of a logical pipeline sink.
+///
+/// The configured target (Delta table or Iceberg table) already scopes the
+/// external metadata. The create-once deployment id prevents checkpoint-store resets or two
+/// identically configured deployments from sharing a cursor. Pipeline identity plus sink id then
+/// binds that deployment to one recovery-compatible logical writer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CoordinatedCommitNamespace {
+    /// Canonical logical-pipeline identity used by checkpoint recovery.
+    pub pipeline_identity: laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity,
+    /// Create-once UUID stored with checkpoint decisions and shared by every cluster member.
+    pub deployment_id: String,
+    /// Stable sink registration id within the pipeline.
+    pub sink_id: String,
+}
+
+impl CoordinatedCommitNamespace {
+    /// Construct and validate a namespace before any external metadata lookup.
+    ///
+    /// # Errors
+    /// Returns a configuration error for a malformed pipeline digest or empty
+    /// sink id.
+    pub fn try_new(
+        pipeline_identity: laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity,
+        deployment_id: impl Into<String>,
+        sink_id: impl Into<String>,
+    ) -> Result<Self, ConnectorError> {
+        let deployment_id = deployment_id.into();
+        let sink_id = sink_id.into();
+        if pipeline_identity.sha256.len() != 64
+            || !pipeline_identity
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "coordinated commit requires a canonical lowercase SHA-256 pipeline identity"
+                    .into(),
+            ));
+        }
+        if sink_id.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "coordinated commit sink id cannot be empty".into(),
+            ));
+        }
+        let parsed_deployment = uuid::Uuid::parse_str(&deployment_id).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "coordinated commit deployment id is not a UUID: {error}"
+            ))
+        })?;
+        if parsed_deployment.is_nil() || parsed_deployment.to_string() != deployment_id {
+            return Err(ConnectorError::ConfigurationError(
+                "coordinated commit deployment id must be a canonical non-nil UUID".into(),
+            ));
+        }
+        Ok(Self {
+            pipeline_identity,
+            deployment_id,
+            sink_id,
+        })
+    }
+
+    /// Bounded, filesystem/catalog-safe key for external transaction metadata.
+    #[must_use]
+    pub fn external_key(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.pipeline_identity.canonical_version.to_be_bytes());
+        digest.update(self.pipeline_identity.sha256.as_bytes());
+        digest.update([0]);
+        digest.update(self.deployment_id.as_bytes());
+        digest.update([0]);
+        digest.update(self.sink_id.as_bytes());
+        let digest = digest.finalize();
+        format!("ldb-c2-{digest:x}")
+    }
+}
+
+/// One participant's validated prepared marker for one exact attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedCommitPayload {
+    /// Exact checkpoint attempt that admitted this marker.
+    pub attempt: laminar_core::state::CheckpointAttempt,
+    /// Stable runtime participant id (`0` in local modes).
+    pub participant_id: u64,
+    /// Connector-specific committable, or `None` for an explicitly empty cut.
+    pub payload: Option<Vec<u8>>,
+}
+
+/// Exact batch submitted to a designated external-sink committer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedCommitBatch {
+    /// External cursor namespace.
+    pub namespace: CoordinatedCommitNamespace,
+    /// Exact external cursor that must precede this batch. A freshly observed
+    /// cursor below this value proves target rollback and must fail closed.
+    pub expected_predecessor: u64,
+    /// Highest exact attempt atomically covered by this commit.
+    pub target: laminar_core::state::CheckpointAttempt,
+    /// Every sealed participant marker through `target`, including empty ones.
+    pub entries: Vec<CoordinatedCommitPayload>,
+}
+
+impl CoordinatedCommitBatch {
+    /// Validate a cursor freshly read from the external target against this
+    /// exact batch. Advancing overlap is safe only at an attempt named by the
+    /// batch; rollback or an unproven gap would skip output.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the batch is malformed, the observed cursor
+    /// proves rollback, or an overlap cannot be tied to an exact batch entry.
+    pub fn validate_observed_cursor(&self, observed: u64) -> Result<(), String> {
+        if self.expected_predecessor >= self.target.checkpoint_id {
+            return Err(format!(
+                "invalid coordinated batch predecessor {} for target {}",
+                self.expected_predecessor, self.target.checkpoint_id
+            ));
+        }
+        if self.entries.is_empty()
+            || !self
+                .entries
+                .iter()
+                .any(|entry| entry.attempt == self.target)
+            || self.entries.iter().any(|entry| {
+                entry.attempt.checkpoint_id <= self.expected_predecessor
+                    || entry.attempt.checkpoint_id > self.target.checkpoint_id
+            })
+        {
+            return Err(
+                "coordinated batch entries do not cover the predecessor-to-target interval".into(),
+            );
+        }
+        if observed < self.expected_predecessor {
+            return Err(format!(
+                "external cursor rolled back from expected predecessor {} to {observed}",
+                self.expected_predecessor
+            ));
+        }
+        if observed < self.target.checkpoint_id
+            && observed != self.expected_predecessor
+            && !self
+                .entries
+                .iter()
+                .any(|entry| entry.attempt.checkpoint_id == observed)
+        {
+            return Err(format!(
+                "external cursor {observed} is not an exact attempt in batch {}..={}",
+                self.expected_predecessor, self.target.checkpoint_id
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Leader-side commit for checkpoint-committable sinks.
 ///
 /// The designated committer aggregates every writer's `pre_commit` descriptor
 /// for an epoch into one external commit. Must be idempotent: re-running with
@@ -567,21 +803,18 @@ pub trait SinkConnector: Send {
 /// reflects the epoch.
 #[async_trait]
 pub trait CoordinatedCommitter: Send + Sync {
-    /// Commit `descriptors` as a single operation. `epoch` is the commit-THROUGH
-    /// target: the runtime may batch descriptors drawn from several sealed epochs
-    /// into one call, so a given descriptor need not belong to `epoch` itself.
-    async fn commit_aggregated(
-        &self,
-        epoch: u64,
-        descriptors: Vec<Vec<u8>>,
-    ) -> Result<(), ConnectorError>;
+    /// Atomically commit the validated participant markers and advance the
+    /// namespaced external cursor to the batch's exact target. Empty markers
+    /// still advance the cursor.
+    async fn commit_aggregated(&self, batch: CoordinatedCommitBatch) -> Result<(), ConnectorError>;
 
-    /// Highest epoch already committed to the external system, if any. Lets the
-    /// committer resume from the right cursor on restart instead of rescanning
-    /// from epoch 0. Default `None` (no resume hint).
-    async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
-        Ok(None)
-    }
+    /// Highest globally unique checkpoint id already committed in `namespace`.
+    /// A metadata read error must be returned, never converted to an absent
+    /// cursor, because that could duplicate a previously committed batch.
+    async fn committed_checkpoint_id(
+        &self,
+        namespace: &CoordinatedCommitNamespace,
+    ) -> Result<Option<u64>, ConnectorError>;
 }
 
 #[cfg(test)]
@@ -632,30 +865,122 @@ mod tests {
     }
 
     #[test]
-    fn test_sink_capabilities_builder() {
-        let caps = SinkConnectorCapabilities::new(std::time::Duration::from_secs(5))
-            .with_exactly_once()
-            .with_changelog()
-            .with_partitioned();
-
-        assert!(caps.exactly_once);
-        assert!(!caps.idempotent);
-        assert!(!caps.upsert);
-        assert!(caps.changelog);
-        assert!(!caps.schema_evolution);
-        assert!(caps.partitioned);
-        assert_eq!(
-            caps.suggested_write_timeout,
-            std::time::Duration::from_secs(5)
-        );
+    fn source_contract_defaults_fail_closed() {
+        let contract = SourceContract::default();
+        assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert!(!contract.supports_replay());
+        assert!(!contract.requires_checkpointing());
     }
 
     #[test]
-    fn with_coordinated_commit_implies_exactly_once() {
-        let caps = SinkConnectorCapabilities::new(std::time::Duration::from_secs(5))
-            .with_coordinated_commit();
-        assert!(caps.coordinated_commit);
-        assert!(caps.exactly_once);
+    fn commit_coupled_sources_are_replayable_and_require_checkpoints() {
+        let contract = SourceContract::new(
+            SourceConsistency::CommitCoupled,
+            SourceTopology::NodeLocalIngress,
+        );
+        assert!(contract.supports_replay());
+        assert!(contract.requires_checkpointing());
+    }
+
+    #[test]
+    fn sink_contract_defaults_fail_closed() {
+        let contract = SinkContract::default();
+        assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
+        assert_eq!(contract.topology, SinkTopology::Singleton);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert!(!contract.input_mode.accepts_full_changelog());
+    }
+
+    #[test]
+    fn coordinated_namespace_is_bounded_stable_and_sink_scoped() {
+        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        const DEPLOYMENT: &str = "018f0000-0000-7000-8000-000000000001";
+
+        let first =
+            CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT, "orders")
+                .unwrap();
+        let same =
+            CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT, "orders")
+                .unwrap();
+        let other =
+            CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT, "audit")
+                .unwrap();
+        let other_deployment = CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "018f0000-0000-7000-8000-000000000002",
+            "orders",
+        )
+        .unwrap();
+
+        assert_eq!(first.external_key(), same.external_key());
+        assert_ne!(first.external_key(), other.external_key());
+        assert_ne!(first.external_key(), other_deployment.external_key());
+        assert_eq!(first.external_key().len(), "ldb-c2-".len() + 64);
+        assert!(first
+            .external_key()
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+    }
+
+    #[test]
+    fn coordinated_namespace_rejects_ambiguous_identity() {
+        const DEPLOYMENT: &str = "018f0000-0000-7000-8000-000000000001";
+
+        use laminar_core::storage::checkpoint_manifest::{
+            PipelineIdentity, PIPELINE_IDENTITY_VERSION,
+        };
+        let malformed = PipelineIdentity {
+            canonical_version: PIPELINE_IDENTITY_VERSION,
+            sha256: "NOT-A-DIGEST".into(),
+        };
+        assert!(CoordinatedCommitNamespace::try_new(malformed, DEPLOYMENT, "orders").is_err());
+        assert!(
+            CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT, "").is_err()
+        );
+        assert!(CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "not-a-uuid",
+            "orders"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn coordinated_batch_rejects_cursor_rollback_and_unproven_overlap() {
+        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+        let first = CheckpointAttempt::new(8, 108);
+        let target = CheckpointAttempt::new(10, 110);
+        let batch = CoordinatedCommitBatch {
+            namespace: CoordinatedCommitNamespace::try_new(
+                PipelineIdentity::empty(),
+                "018f0000-0000-7000-8000-000000000001",
+                "orders",
+            )
+            .unwrap(),
+            expected_predecessor: 107,
+            target,
+            entries: vec![
+                CoordinatedCommitPayload {
+                    attempt: first,
+                    participant_id: 0,
+                    payload: None,
+                },
+                CoordinatedCommitPayload {
+                    attempt: target,
+                    participant_id: 0,
+                    payload: None,
+                },
+            ],
+        };
+
+        assert!(batch.validate_observed_cursor(106).is_err());
+        assert!(batch.validate_observed_cursor(109).is_err());
+        assert!(batch.validate_observed_cursor(107).is_ok());
+        assert!(batch.validate_observed_cursor(108).is_ok());
+        assert!(batch.validate_observed_cursor(110).is_ok());
     }
 
     struct DefaultPreCommitSink {
@@ -676,16 +1001,32 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             test_schema()
         }
-        fn capabilities(&self) -> SinkConnectorCapabilities {
-            let caps = SinkConnectorCapabilities::new(std::time::Duration::from_secs(5));
-            if self.coordinated {
-                caps.with_coordinated_commit()
-            } else {
-                caps
-            }
+        fn suggested_write_timeout(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(5)
+        }
+        fn as_coordinated_committer(&self) -> Option<&dyn CoordinatedCommitter> {
+            self.coordinated
+                .then_some(self as &dyn CoordinatedCommitter)
         }
         async fn close(&mut self) -> Result<(), ConnectorError> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CoordinatedCommitter for DefaultPreCommitSink {
+        async fn commit_aggregated(
+            &self,
+            _batch: CoordinatedCommitBatch,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn committed_checkpoint_id(
+            &self,
+            _namespace: &CoordinatedCommitNamespace,
+        ) -> Result<Option<u64>, ConnectorError> {
+            Ok(None)
         }
     }
 

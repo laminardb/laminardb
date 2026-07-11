@@ -6,14 +6,15 @@
 //! - **Append mode**: COPY BINARY for maximum throughput (>500K rows/sec)
 //! - **Upsert mode**: `INSERT ... ON CONFLICT DO UPDATE` with UNNEST arrays
 //!
-//! Exactly-once semantics use co-transactional offset storage: data and epoch
-//! markers are committed in the same `PostgreSQL` transaction.
+//! The connector provides durable at-least-once delivery. Typed runtime
+//! admission excludes it from exactly-once pipelines because it has no
+//! coordinated external checkpoint committer.
 //!
 //! # Ring Architecture
 //!
 //! - **Ring 0**: No sink code. Data arrives via SPSC channel (~5ns push).
 //! - **Ring 1**: Batch buffering, COPY/INSERT writes, transaction management.
-//! - **Ring 2**: Connection pool, table creation, epoch recovery.
+//! - **Ring 2**: Connection pool and table creation.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,17 +22,18 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
+use crate::connector::{
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+};
 use crate::error::ConnectorError;
 
 use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
 use super::types::{arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast, arrow_type_to_pg_sql};
-use crate::connector::DeliveryGuarantee;
 
 #[cfg(feature = "postgres-sink")]
 use super::types::arrow_column_to_pg_array;
@@ -43,8 +45,7 @@ use deadpool_postgres::Pool;
 /// `PostgreSQL` sink connector.
 ///
 /// Writes Arrow `RecordBatch` to `PostgreSQL` tables using COPY BINARY
-/// (append) or UNNEST-based upsert, with optional exactly-once semantics
-/// via co-transactional epoch storage.
+/// (append) or UNNEST-based upsert with durable at-least-once semantics.
 pub struct PostgresSink {
     /// Sink configuration.
     config: PostgresSinkConfig,
@@ -54,10 +55,6 @@ pub struct PostgresSink {
     user_schema: SchemaRef,
     /// Connector lifecycle state.
     state: ConnectorState,
-    /// Current epoch (for exactly-once).
-    current_epoch: u64,
-    /// Last committed epoch.
-    last_committed_epoch: u64,
     /// Buffered records awaiting flush.
     buffer: Vec<RecordBatch>,
     /// Total rows in buffer.
@@ -91,15 +88,13 @@ impl PostgresSink {
         registry: Option<&prometheus::Registry>,
     ) -> Self {
         let user_schema = build_user_schema(&schema);
-        // Pre-allocate buffer to avoid reallocation during first epoch.
+        // Pre-allocate the write buffer to avoid reallocation on the first batches.
         let buf_capacity = (config.batch_size / 1024).max(4);
         Self {
             config,
             schema,
             user_schema,
             state: ConnectorState::Created,
-            current_epoch: 0,
-            last_committed_epoch: 0,
             buffer: Vec::with_capacity(buf_capacity),
             buffered_rows: 0,
             last_flush: Instant::now(),
@@ -119,18 +114,6 @@ impl PostgresSink {
     #[must_use]
     pub fn state(&self) -> ConnectorState {
         self.state
-    }
-
-    /// Returns the current epoch.
-    #[must_use]
-    pub fn current_epoch(&self) -> u64 {
-        self.current_epoch
-    }
-
-    /// Returns the last committed epoch.
-    #[must_use]
-    pub fn last_committed_epoch(&self) -> u64 {
-        self.last_committed_epoch
     }
 
     /// Returns the number of buffered rows pending flush.
@@ -315,32 +298,6 @@ impl PostgresSink {
 
         ddl.push(')');
         ddl
-    }
-
-    /// Builds CREATE TABLE DDL for the offset tracking table.
-    #[must_use]
-    pub fn build_offset_table_sql() -> &'static str {
-        "CREATE TABLE IF NOT EXISTS _laminardb_sink_offsets (\
-         \n    sink_id TEXT PRIMARY KEY,\
-         \n    epoch BIGINT NOT NULL,\
-         \n    source_offsets JSONB,\
-         \n    watermark BIGINT,\
-         \n    updated_at TIMESTAMPTZ DEFAULT NOW()\
-         \n)"
-    }
-
-    /// Builds the epoch commit SQL.
-    #[must_use]
-    pub fn build_epoch_commit_sql() -> &'static str {
-        "INSERT INTO _laminardb_sink_offsets (sink_id, epoch, updated_at) \
-         VALUES ($1, $2, NOW()) \
-         ON CONFLICT (sink_id) DO UPDATE SET epoch = $2, updated_at = NOW()"
-    }
-
-    /// Builds the epoch recovery SQL.
-    #[must_use]
-    pub fn build_epoch_recover_sql() -> &'static str {
-        "SELECT epoch FROM _laminardb_sink_offsets WHERE sink_id = $1"
     }
 
     // ── Changelog/Retraction ────────────────────────────────────────
@@ -542,13 +499,14 @@ impl PostgresSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        // Collapse the whole epoch per primary key into a cardinality-safe `{U,D}` batch that
-        // `split_changelog_batch` understands. A Z-set changelog (`__weight`, no `_op`) MUST be
-        // collapsed or its many retract+insert events per key fail the split / violate ON CONFLICT
-        // cardinality. A CDC changelog (`_op`) MUST be collapsed too: otherwise a delete-then-
-        // reinsert of a key in one epoch splits into both bins and, applied upserts-then-deletes,
-        // wrongly ends deleted (CN-3). `collapse_changelog` keeps the last arrival per key and
-        // normalizes `_op`, so each key contributes exactly one terminal U or D.
+        // Collapse the whole buffered flush window per primary key into a cardinality-safe
+        // `{U,D}` batch that `split_changelog_batch` understands. A Z-set changelog (`__weight`,
+        // no `_op`) MUST be collapsed or its many retract+insert events per key fail the split /
+        // violate ON CONFLICT cardinality. A CDC changelog (`_op`) MUST be collapsed too:
+        // otherwise a delete-then-reinsert of a key in one flush window splits into both bins
+        // and, applied upserts-then-deletes, wrongly ends deleted (CN-3). `collapse_changelog`
+        // keeps the last arrival per key and normalizes `_op`, so each key contributes exactly
+        // one terminal U or D.
         let split_input: Vec<RecordBatch> = {
             let schema = self.buffer[0].schema();
             let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
@@ -572,7 +530,7 @@ impl PostgresSink {
             }
         }
 
-        // Inserts/updates before deletes: a key inserted then deleted in the same epoch
+        // Inserts/updates before deletes: a key inserted then deleted in the same flush window
         // ends deleted; deleted then re-inserted ends at the upserted state.
         if !all_inserts.is_empty() {
             let insert_batch =
@@ -670,28 +628,6 @@ impl PostgresSink {
             WriteMode::Upsert => self.flush_upsert(client).await,
         }
     }
-
-    /// Checks whether the given epoch has already been committed to `PostgreSQL`.
-    #[cfg(feature = "postgres-sink")]
-    #[allow(clippy::cast_sign_loss)]
-    async fn is_epoch_committed(
-        &self,
-        client: &tokio_postgres::Client,
-        epoch: u64,
-    ) -> Result<bool, ConnectorError> {
-        let sink_id = self.config.effective_sink_id();
-        let row = client
-            .query_opt(Self::build_epoch_recover_sql(), &[&sink_id])
-            .await
-            .map_err(|e| ConnectorError::Internal(format!("epoch recovery query: {e}")))?;
-
-        if let Some(row) = row {
-            let committed: i64 = row.get(0);
-            Ok(committed as u64 >= epoch)
-        } else {
-            Ok(false)
-        }
-    }
 }
 
 // ── SinkConnector implementation ────────────────────────────────────
@@ -699,6 +635,36 @@ impl PostgresSink {
 #[cfg(feature = "postgres-sink")]
 #[async_trait]
 impl SinkConnector for PostgresSink {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            PostgresSinkConfig::from_config(config)?
+        };
+        cfg.validate()?;
+        let input_mode = if cfg.changelog_mode {
+            SinkInputMode::FullChangelog
+        } else if cfg.write_mode == WriteMode::Upsert {
+            SinkInputMode::KeyedUpsert
+        } else {
+            SinkInputMode::AppendOnly
+        };
+        // Append-only writes commute across independent runtime writers. Mutable writes do not:
+        // without key-affine placement and a fenced handoff, an older upsert/delete from one node
+        // can land after a newer value from another node. Keep those modes singleton until the
+        // runtime can prove that stronger topology protocol.
+        let topology = if cfg.write_mode == WriteMode::Append {
+            SinkTopology::MultiWriter
+        } else {
+            SinkTopology::Singleton
+        };
+        Ok(SinkContract::new(
+            SinkConsistency::DurableAtLeastOnce,
+            topology,
+            input_mode,
+        ))
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -706,29 +672,17 @@ impl SinkConnector for PostgresSink {
             self.config = PostgresSinkConfig::from_config(config)?;
         }
         // Validate unconditionally — `from_config` above is skipped when `properties` is empty
-        // (pre-set config), so this is the only place the invariants (incl. EO+append, CN-6) are
-        // guaranteed to run on the config actually in effect.
+        // (pre-set config), so this is the only place all write invariants are guaranteed to run
+        // on the config actually in effect.
         self.config.validate()?;
-
-        // Validate changelog requires upsert.
-        if self.config.changelog_mode && self.config.write_mode != WriteMode::Upsert {
-            return Err(ConnectorError::ConfigurationError(
-                "changelog mode requires write.mode = 'upsert'".into(),
-            ));
-        }
 
         info!(
             table = %self.config.qualified_table_name(),
             mode = %self.config.write_mode,
-            guarantee = %self.config.delivery_guarantee,
             "opening PostgreSQL sink connector"
         );
 
         self.prepare_statements();
-
-        if self.config.sink_id.is_empty() {
-            self.config.sink_id = self.config.effective_sink_id();
-        }
 
         // Build connection pool.
         let mut pool_cfg = deadpool_postgres::Config::new();
@@ -775,33 +729,6 @@ impl SinkConnector for PostgresSink {
             }
         }
 
-        // Create offset tracking table for exactly-once.
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            client
-                .batch_execute(Self::build_offset_table_sql())
-                .await
-                .map_err(|e| {
-                    ConnectorError::Internal(format!("create offset table failed: {e}"))
-                })?;
-
-            // Recover last committed epoch.
-            {
-                let recover_sink_id = self.config.effective_sink_id();
-                let row = client
-                    .query_opt(Self::build_epoch_recover_sql(), &[&recover_sink_id])
-                    .await
-                    .map_err(|e| ConnectorError::Internal(format!("epoch recovery: {e}")))?;
-                if let Some(row) = row {
-                    let epoch: i64 = row.get(0);
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        self.last_committed_epoch = epoch as u64;
-                    }
-                    info!(epoch, "recovered last committed epoch");
-                }
-            }
-        }
-
         self.pool = Some(pool);
         self.state = ConnectorState::Running;
 
@@ -830,12 +757,7 @@ impl SinkConnector for PostgresSink {
         self.buffer.push(batch.clone());
         self.buffered_rows += batch.num_rows();
 
-        // In exactly-once mode, defer all flushing to pre_commit.
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            return Ok(WriteResult::new(0, 0));
-        }
-
-        // At-least-once: auto-flush when thresholds are reached.
+        // Auto-flush when thresholds are reached.
         let should_flush = self.buffered_rows >= self.config.batch_size
             || self.last_flush.elapsed() >= self.config.flush_interval;
 
@@ -859,122 +781,9 @@ impl SinkConnector for PostgresSink {
         self.schema.clone()
     }
 
-    async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        self.current_epoch = epoch;
-        debug!(epoch, "PostgreSQL sink epoch started");
-        Ok(())
-    }
-
-    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
-        if epoch != self.current_epoch {
-            return Err(ConnectorError::TransactionError(format!(
-                "epoch mismatch in pre_commit: expected {}, got {epoch}",
-                self.current_epoch
-            )));
-        }
-
-        if self.buffer.is_empty() {
-            return Ok(None);
-        }
-
-        let client = self
-            .pool()?
-            .get()
-            .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
-
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            // Check for already-committed epoch (recovery replay).
-            if self.is_epoch_committed(&client, epoch).await? {
-                info!(epoch, "epoch already committed in PostgreSQL, skipping");
-                self.buffer.clear();
-                self.buffered_rows = 0;
-                return Ok(None);
-            }
-
-            // Co-transactional: data + epoch marker in one PG transaction.
-            client
-                .batch_execute("BEGIN")
-                .await
-                .map_err(|e| ConnectorError::WriteError(format!("BEGIN: {e}")))?;
-
-            match self.flush_to_client(&client).await {
-                Ok(_result) => {
-                    let sink_id = self.config.effective_sink_id();
-                    #[allow(clippy::cast_possible_wrap)]
-                    let epoch_i64 = epoch as i64;
-                    let params: Vec<&(dyn postgres_types::ToSql + Sync)> =
-                        vec![&sink_id, &epoch_i64];
-                    client
-                        .execute(Self::build_epoch_commit_sql(), &params)
-                        .await
-                        .map_err(|e| {
-                            ConnectorError::WriteError(format!("epoch marker write: {e}"))
-                        })?;
-
-                    client
-                        .batch_execute("COMMIT")
-                        .await
-                        .map_err(|e| ConnectorError::WriteError(format!("COMMIT: {e}")))?;
-                }
-                Err(e) => {
-                    let _ = client.batch_execute("ROLLBACK").await;
-                    return Err(e);
-                }
-            }
-        } else {
-            // At-least-once: just flush remaining buffer.
-            self.flush_to_client(&client).await?;
-        }
-
-        self.buffer.clear();
-        self.buffered_rows = 0;
-        self.last_flush = Instant::now();
-
-        debug!(epoch, "PostgreSQL sink pre-committed");
-        Ok(None)
-    }
-
-    async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        if epoch != self.current_epoch {
-            return Err(ConnectorError::TransactionError(format!(
-                "epoch mismatch: expected {}, got {epoch}",
-                self.current_epoch
-            )));
-        }
-
-        self.last_committed_epoch = epoch;
-        self.metrics.record_commit();
-
-        debug!(epoch, "PostgreSQL sink epoch committed");
-        Ok(())
-    }
-
-    async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        self.buffer.clear();
-        self.buffered_rows = 0;
-
-        self.metrics.record_rollback();
-        warn!(epoch, "PostgreSQL sink epoch rolled back");
-        Ok(())
-    }
-
-    fn capabilities(&self) -> SinkConnectorCapabilities {
+    fn suggested_write_timeout(&self) -> Duration {
         // statement_timeout + small margin for pool checkout / setup.
-        let write_timeout = self.config.statement_timeout + Duration::from_secs(5);
-        let mut caps = SinkConnectorCapabilities::new(write_timeout).with_idempotent();
-
-        if self.config.write_mode == WriteMode::Upsert {
-            caps = caps.with_upsert();
-        }
-        if self.config.changelog_mode {
-            caps = caps.with_changelog();
-        }
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once().with_two_phase_commit();
-        }
-
-        caps
+        self.config.statement_timeout + Duration::from_secs(5)
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
@@ -1012,7 +821,6 @@ impl SinkConnector for PostgresSink {
         info!(
             table = %self.config.qualified_table_name(),
             records = self.metrics.records_written.get(),
-            epochs = self.metrics.epochs_committed.get(),
             "PostgreSQL sink connector closed"
         );
 
@@ -1023,6 +831,12 @@ impl SinkConnector for PostgresSink {
 #[cfg(not(feature = "postgres-sink"))]
 #[async_trait]
 impl SinkConnector for PostgresSink {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "PostgreSQL sink requires the 'postgres-sink' feature".into(),
+        ))
+    }
+
     async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
         Err(ConnectorError::ConfigurationError(
             "PostgreSQL sink requires the 'postgres-sink' feature".into(),
@@ -1039,19 +853,8 @@ impl SinkConnector for PostgresSink {
         self.schema.clone()
     }
 
-    fn capabilities(&self) -> SinkConnectorCapabilities {
-        let write_timeout = self.config.statement_timeout + Duration::from_secs(5);
-        let mut caps = SinkConnectorCapabilities::new(write_timeout).with_idempotent();
-        if self.config.write_mode == WriteMode::Upsert {
-            caps = caps.with_upsert();
-        }
-        if self.config.changelog_mode {
-            caps = caps.with_changelog();
-        }
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once().with_two_phase_commit();
-        }
-        caps
+    fn suggested_write_timeout(&self) -> Duration {
+        self.config.statement_timeout + Duration::from_secs(5)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -1066,9 +869,6 @@ impl std::fmt::Debug for PostgresSink {
             .field("state", &self.state)
             .field("table", &self.config.qualified_table_name())
             .field("mode", &self.config.write_mode)
-            .field("guarantee", &self.config.delivery_guarantee)
-            .field("current_epoch", &self.current_epoch)
-            .field("last_committed_epoch", &self.last_committed_epoch)
             .field("buffered_rows", &self.buffered_rows)
             .finish_non_exhaustive()
     }
@@ -1263,8 +1063,6 @@ mod tests {
     fn test_new_defaults() {
         let sink = PostgresSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
-        assert_eq!(sink.current_epoch(), 0);
-        assert_eq!(sink.last_committed_epoch(), 0);
         assert_eq!(sink.buffered_rows(), 0);
         assert!(sink.upsert_sql.is_none());
         assert!(sink.copy_sql.is_none());
@@ -1414,27 +1212,6 @@ mod tests {
 
         assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS"));
         assert!(!sql.contains("PRIMARY KEY"));
-    }
-
-    #[test]
-    fn test_offset_table_sql() {
-        let sql = PostgresSink::build_offset_table_sql();
-        assert!(sql.contains("_laminardb_sink_offsets"));
-        assert!(sql.contains("sink_id TEXT PRIMARY KEY"));
-        assert!(sql.contains("epoch BIGINT NOT NULL"));
-    }
-
-    #[test]
-    fn test_epoch_commit_sql() {
-        let sql = PostgresSink::build_epoch_commit_sql();
-        assert!(sql.contains("INSERT INTO _laminardb_sink_offsets"));
-        assert!(sql.contains("ON CONFLICT (sink_id) DO UPDATE"));
-    }
-
-    #[test]
-    fn test_epoch_recover_sql() {
-        let sql = PostgresSink::build_epoch_recover_sql();
-        assert!(sql.contains("SELECT epoch FROM _laminardb_sink_offsets"));
     }
 
     // ── Changelog splitting tests ──
@@ -1592,100 +1369,51 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_exactly_once_defers_flush() {
-        let mut config = test_config();
-        config.batch_size = 5; // Would normally trigger flush at 10 rows
-        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let mut sink = PostgresSink::new(test_schema(), config, None);
-        sink.state = ConnectorState::Running;
+    // ── Contract tests ──
 
-        let batch = test_batch(10);
-        let result = sink.write_batch(&batch).await.expect("write");
-
-        // Exactly-once: no auto-flush, all buffered.
-        assert_eq!(result.records_written, 0);
-        assert_eq!(sink.buffered_rows(), 10);
-    }
-
-    // ── Capabilities tests ──
-
+    #[cfg(feature = "postgres-sink")]
     #[test]
-    fn test_capabilities_append_at_least_once() {
+    fn contract_append_is_multi_writer_durable_at_least_once() {
         let sink = PostgresSink::new(test_schema(), test_config(), None);
-        let caps = sink.capabilities();
-        assert!(caps.idempotent);
-        assert!(!caps.upsert);
-        assert!(!caps.changelog);
-        assert!(!caps.exactly_once);
+        let contract = sink.contract(&ConnectorConfig::new("postgres")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+        assert_eq!(contract.topology, SinkTopology::MultiWriter);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert_eq!(
+            sink.suggested_write_timeout(),
+            sink.config.statement_timeout + Duration::from_secs(5)
+        );
     }
 
+    #[cfg(feature = "postgres-sink")]
     #[test]
-    fn test_capabilities_upsert() {
+    fn contract_upsert_requires_keyed_input() {
         let sink = PostgresSink::new(test_schema(), upsert_config(), None);
-        let caps = sink.capabilities();
-        assert!(caps.upsert);
-        assert!(caps.idempotent);
+        let contract = sink.contract(&ConnectorConfig::new("postgres")).unwrap();
+        assert_eq!(contract.input_mode, SinkInputMode::KeyedUpsert);
+        assert_eq!(contract.topology, SinkTopology::Singleton);
     }
 
+    #[cfg(feature = "postgres-sink")]
     #[test]
-    fn test_capabilities_changelog() {
-        let mut config = test_config();
+    fn contract_changelog_accepts_full_changelog() {
+        let mut config = upsert_config();
         config.changelog_mode = true;
         let sink = PostgresSink::new(test_schema(), config, None);
-        let caps = sink.capabilities();
-        assert!(caps.changelog);
+        let contract = sink.contract(&ConnectorConfig::new("postgres")).unwrap();
+        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+        assert_eq!(contract.topology, SinkTopology::Singleton);
+        assert!(contract.accepts_full_changelog());
     }
 
+    #[cfg(not(feature = "postgres-sink"))]
     #[test]
-    fn test_capabilities_exactly_once() {
-        let mut config = upsert_config();
-        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let sink = PostgresSink::new(test_schema(), config, None);
-        let caps = sink.capabilities();
-        assert!(caps.exactly_once);
-    }
-
-    // ── Epoch lifecycle tests ──
-
-    #[tokio::test]
-    async fn test_epoch_lifecycle_state() {
-        let mut sink = PostgresSink::new(test_schema(), test_config(), None);
-        sink.state = ConnectorState::Running;
-
-        sink.begin_epoch(1).await.expect("begin");
-        assert_eq!(sink.current_epoch(), 1);
-
-        // commit_epoch updates last_committed_epoch and records metric.
-        sink.commit_epoch(1).await.expect("commit");
-        assert_eq!(sink.last_committed_epoch(), 1);
-
-        assert_eq!(sink.metrics.epochs_committed.get(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_epoch_mismatch_rejected() {
-        let mut sink = PostgresSink::new(test_schema(), test_config(), None);
-        sink.state = ConnectorState::Running;
-
-        sink.begin_epoch(1).await.expect("begin");
-        let result = sink.commit_epoch(2).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_rollback_clears_buffer() {
-        let mut config = test_config();
-        config.batch_size = 1000;
-        let mut sink = PostgresSink::new(test_schema(), config, None);
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(50);
-        sink.write_batch(&batch).await.expect("write");
-        assert_eq!(sink.buffered_rows(), 50);
-
-        sink.rollback_epoch(0).await.expect("rollback");
-        assert_eq!(sink.buffered_rows(), 0);
+    fn missing_feature_fails_contract_before_io() {
+        let sink = PostgresSink::new(test_schema(), test_config(), None);
+        let error = sink
+            .contract(&ConnectorConfig::new("postgres"))
+            .expect_err("disabled PostgreSQL sink must fail admission");
+        assert!(error.to_string().contains("postgres-sink"));
     }
 
     // ── Debug output test ──

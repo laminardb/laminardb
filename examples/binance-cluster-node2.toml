@@ -1,4 +1,8 @@
-# LaminarDB Binance Cluster Demo — Node 2 (Follower)
+# ARCHIVED CONTRACT FIXTURE — not a runnable cluster configuration.
+# Cluster mode requires at_least_once plus splittable replayable sources; these
+# singleton, non-replayable WebSocket feeds cannot satisfy that contract and
+# are rejected before connector I/O. Use Kafka partitions for a runnable cluster demo.
+# Original role: Binance Cluster Demo — Node 2 (Follower)
 node_id = "binance-node-2"
 
 sql = """
@@ -74,13 +78,13 @@ console_cors_allowed_origins = [
 ]
 
 [state]
-backend = "local"
-path = "./data/cluster-state"
+backend = "object_store"
+url = "${LAMINAR_STATE_URL:-s3://laminardb-dev/binance-state}"
 instance_id = "binance-node-2"
 vnode_capacity = 256
 
 [checkpoint]
-url = "file://./data/cluster-ckpt"
+url = "${LAMINAR_CHECKPOINT_URL:-s3://laminardb-dev/binance-checkpoints}"
 interval = "10s"
 
 [discovery]

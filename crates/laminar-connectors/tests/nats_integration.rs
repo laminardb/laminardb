@@ -20,10 +20,20 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_nats::jetstream::{self, stream::Config as StreamConfig};
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{SinkConnector, SourceConnector};
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SinkConnector, SourceConnector, SourcePosition, SourceStart,
+};
 use laminar_connectors::nats::{NatsSink, NatsSource};
 
 const NATS_URL: &str = "nats://127.0.0.1:4222";
+
+fn initial_source_start(config: ConnectorConfig) -> SourceStart {
+    SourceStart {
+        config,
+        position: SourcePosition::Initial,
+        delivery: DeliveryGuarantee::BestEffort,
+    }
+}
 
 fn payload_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -98,13 +108,13 @@ async fn roundtrip_jetstream() {
     let batch = test_batch(&[1, 2, 3]);
     let written = sink.write_batch(&batch).await.expect("write_batch");
     assert_eq!(written.records_written, 3);
-    sink.pre_commit(1).await.expect("pre_commit drains acks");
+    sink.flush().await.expect("flush drains acks");
     sink.close().await.expect("sink close");
 
     // Source: read them back.
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties(
+        .start(initial_source_start(ConnectorConfig::with_properties(
             "nats",
             source_props(&[
                 ("servers", NATS_URL),
@@ -114,7 +124,7 @@ async fn roundtrip_jetstream() {
                 ("format", "json"),
                 ("fetch.max.wait.ms", "250"),
             ]),
-        ))
+        )))
         .await
         .expect("source open");
 
@@ -136,7 +146,7 @@ async fn roundtrip_jetstream() {
 async fn roundtrip_core() {
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties(
+        .start(initial_source_start(ConnectorConfig::with_properties(
             "nats",
             source_props(&[
                 ("servers", NATS_URL),
@@ -144,7 +154,7 @@ async fn roundtrip_core() {
                 ("subject", "core.events"),
                 ("format", "json"),
             ]),
-        ))
+        )))
         .await
         .expect("source open");
 
@@ -176,19 +186,19 @@ async fn roundtrip_core() {
     );
 }
 
-// ── exactly-once ──
+// ── JetStream deduplication ──
 
 /// Publishing the same `Nats-Msg-Id` twice inside `duplicate_window`:
 /// server drops the repeat, stream holds one message.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
-async fn exactly_once_dedup_drops_duplicate() {
+async fn jetstream_dedup_drops_duplicate() {
     let ctx = connect().await;
     reset_stream(
         &ctx,
         StreamConfig {
-            name: "EO".into(),
-            subjects: vec!["eo.events".into()],
+            name: "DEDUP".into(),
+            subjects: vec!["dedup.events".into()],
             duplicate_window: Duration::from_secs(300),
             ..Default::default()
         },
@@ -214,9 +224,8 @@ async fn exactly_once_dedup_drops_duplicate() {
         "nats",
         source_props(&[
             ("servers", NATS_URL),
-            ("subject", "eo.events"),
-            ("stream", "EO"),
-            ("delivery.guarantee", "exactly_once"),
+            ("subject", "dedup.events"),
+            ("stream", "DEDUP"),
             ("dedup.id.column", "event_id"),
             ("format", "json"),
         ]),
@@ -225,13 +234,13 @@ async fn exactly_once_dedup_drops_duplicate() {
     .expect("sink open");
 
     sink.write_batch(&batch).await.expect("first publish");
-    sink.pre_commit(1).await.expect("first drain");
+    sink.flush().await.expect("first drain");
     sink.write_batch(&batch).await.expect("second publish");
-    sink.pre_commit(2).await.expect("second drain");
+    sink.flush().await.expect("second drain");
     sink.close().await.expect("close");
 
     // Server side: stream should contain exactly one message.
-    let mut stream = ctx.get_stream("EO").await.expect("get_stream");
+    let mut stream = ctx.get_stream("DEDUP").await.expect("get_stream");
     let info = stream.info().await.expect("info");
     assert_eq!(
         info.state.messages, 1,
@@ -247,7 +256,7 @@ async fn exactly_once_dedup_drops_duplicate() {
 /// configured minimum (LDB-5056).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
-async fn exactly_once_rejects_short_duplicate_window() {
+async fn dedup_rejects_short_duplicate_window() {
     let ctx = connect().await;
     reset_stream(
         &ctx,
@@ -268,7 +277,6 @@ async fn exactly_once_rejects_short_duplicate_window() {
                 ("servers", NATS_URL),
                 ("subject", "short.events"),
                 ("stream", "SHORT"),
-                ("delivery.guarantee", "exactly_once"),
                 ("dedup.id.column", "id"),
                 ("format", "json"),
                 ("min.duplicate.window.ms", "60000"),
@@ -349,7 +357,7 @@ async fn consumer_lag_settles_to_zero_after_drain() {
 
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties(
+        .start(initial_source_start(ConnectorConfig::with_properties(
             "nats",
             source_props(&[
                 ("servers", NATS_URL),
@@ -360,16 +368,11 @@ async fn consumer_lag_settles_to_zero_after_drain() {
                 ("fetch.max.wait.ms", "100"),
                 ("lag.poll.interval.ms", "200"),
             ]),
-        ))
+        )))
         .await
         .expect("source open");
 
     drain_rows(&mut source, 5, Duration::from_secs(5)).await;
-    let cp = laminar_connectors::checkpoint::SourceCheckpoint::new(1);
-    source
-        .notify_epoch_committed(1, &cp)
-        .await
-        .expect("commit acks");
 
     let lag_after = poll_gauge_until(&source, "consumer_lag", |v| v == 0, Duration::from_secs(3))
         .await
@@ -418,7 +421,7 @@ async fn by_start_time_replays_from_cutoff() {
 
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties(
+        .start(initial_source_start(ConnectorConfig::with_properties(
             "nats",
             source_props(&[
                 ("servers", NATS_URL),
@@ -430,7 +433,7 @@ async fn by_start_time_replays_from_cutoff() {
                 ("deliver.policy", "by_start_time"),
                 ("start.time", &cutoff),
             ]),
-        ))
+        )))
         .await
         .expect("source open");
 
@@ -501,11 +504,11 @@ fn dedup_batch(ids: std::ops::Range<i64>) -> RecordBatch {
     .unwrap()
 }
 
-/// Exactly-once survives a broker restart: replay after restart is
-/// deduped by persisted `duplicate_window` state.
+/// Deduplication survives a broker restart: replay after restart is suppressed
+/// by persisted `duplicate_window` state.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose available on host; chaos test restarts the broker"]
-async fn exactly_once_survives_broker_restart() {
+async fn dedup_survives_broker_restart() {
     let ctx = connect().await;
     reset_stream(
         &ctx,
@@ -523,7 +526,6 @@ async fn exactly_once_survives_broker_restart() {
         ("servers", NATS_URL),
         ("subject", "restart.events"),
         ("stream", "RESTART"),
-        ("delivery.guarantee", "exactly_once"),
         ("dedup.id.column", "event_id"),
         ("format", "json"),
         ("ack.timeout.ms", "10000"),
@@ -534,11 +536,11 @@ async fn exactly_once_survives_broker_restart() {
         .await
         .expect("sink open");
 
-    // First epoch: publish rows 0..50.
+    // First run: publish rows 0..50.
     sink.write_batch(&dedup_batch(0..50))
         .await
         .expect("first batch publish");
-    sink.pre_commit(1).await.expect("first epoch drain");
+    sink.flush().await.expect("first drain");
 
     // JetStream persists dedup state across restart.
     restart_nats();
@@ -555,7 +557,7 @@ async fn exactly_once_survives_broker_restart() {
     sink.write_batch(&dedup_batch(0..100))
         .await
         .expect("second batch publish");
-    sink.pre_commit(2).await.expect("second epoch drain");
+    sink.flush().await.expect("second drain");
     sink.close().await.expect("sink close");
 
     let mut stream = ctx.get_stream("RESTART").await.expect("get_stream");
@@ -567,11 +569,10 @@ async fn exactly_once_survives_broker_restart() {
     );
 }
 
-/// A source that never commits the epoch must not ack; the server
-/// replays on the next consumer.
+/// Successfully deserialized messages are acknowledged independently of checkpoints.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
-async fn source_redelivers_when_epoch_not_committed() {
+async fn source_acks_without_checkpoint_commit() {
     let ctx = connect().await;
     reset_stream(
         &ctx,
@@ -604,37 +605,26 @@ async fn source_redelivers_when_epoch_not_committed() {
 
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties("nats", props.clone()))
+        .start(initial_source_start(ConnectorConfig::with_properties(
+            "nats",
+            props.clone(),
+        )))
         .await
         .expect("source 1 open");
-    let first = drain_rows(&mut source, 3, Duration::from_secs(5)).await;
+    drain_rows(&mut source, 3, Duration::from_secs(5)).await;
     source.close().await.expect("source 1 close");
 
-    // Wait past ack_wait so the server unparks the unacked set.
+    // Wait past ack_wait: immediate source acknowledgements must prevent redelivery even though
+    // no checkpoint was taken or committed.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties("nats", props.clone()))
+        .start(initial_source_start(ConnectorConfig::with_properties(
+            "nats", props,
+        )))
         .await
         .expect("source 2 open");
-    let second = drain_rows(&mut source, 3, Duration::from_secs(5)).await;
-    assert_eq!(
-        first, second,
-        "expected the same messages redelivered after no-commit close"
-    );
-    let cp = laminar_connectors::checkpoint::SourceCheckpoint::new(1);
-    source
-        .notify_epoch_committed(1, &cp)
-        .await
-        .expect("epoch commit acks");
-    source.close().await.expect("source 2 close");
-
-    let mut source = NatsSource::new(payload_schema(), None);
-    source
-        .open(&ConnectorConfig::with_properties("nats", props))
-        .await
-        .expect("source 3 open");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut saw_redelivery = false;
     while tokio::time::Instant::now() < deadline {
@@ -646,10 +636,10 @@ async fn source_redelivers_when_epoch_not_committed() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    source.close().await.expect("source 3 close");
+    source.close().await.expect("source 2 close");
     assert!(
         !saw_redelivery,
-        "expected no messages after source 2 committed — got a redelivery"
+        "expected no messages after immediate acknowledgement — got a redelivery"
     );
 }
 
@@ -663,7 +653,7 @@ const SECURE_NATS_URL: &str = "nats://127.0.0.1:4223";
 async fn user_pass_roundtrip_core() {
     let mut source = NatsSource::new(payload_schema(), None);
     source
-        .open(&ConnectorConfig::with_properties(
+        .start(initial_source_start(ConnectorConfig::with_properties(
             "nats",
             source_props(&[
                 ("servers", SECURE_NATS_URL),
@@ -674,7 +664,7 @@ async fn user_pass_roundtrip_core() {
                 ("user", "alice"),
                 ("password", "wonderland"),
             ]),
-        ))
+        )))
         .await
         .expect("source open with user_pass");
 

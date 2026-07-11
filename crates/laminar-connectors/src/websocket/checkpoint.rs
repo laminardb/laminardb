@@ -39,15 +39,15 @@ impl WebSocketSourceCheckpoint {
     /// struct is stored as a JSON string under `"websocket_state"` in the
     /// checkpoint's offsets map.
     #[must_use]
-    pub fn to_source_checkpoint(&self, epoch: u64) -> SourceCheckpoint {
+    pub fn to_source_checkpoint(&self) -> SourceCheckpoint {
         let json = match serde_json::to_string(self) {
             Ok(j) => j,
             Err(e) => {
                 tracing::error!(error = %e, "failed to serialize WebSocket checkpoint state");
-                return SourceCheckpoint::new(epoch);
+                return SourceCheckpoint::new();
             }
         };
-        let mut cp = SourceCheckpoint::new(epoch);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset(CHECKPOINT_KEY, json);
         cp
     }
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn test_roundtrip_empty() {
         let ws_cp = WebSocketSourceCheckpoint::default();
-        let source_cp = ws_cp.to_source_checkpoint(1);
+        let source_cp = ws_cp.to_source_checkpoint();
         let restored = WebSocketSourceCheckpoint::from_source_checkpoint(&source_cp);
 
         assert_eq!(restored.last_sequence, None);
@@ -108,8 +108,7 @@ mod tests {
             ],
         };
 
-        let source_cp = ws_cp.to_source_checkpoint(5);
-        assert_eq!(source_cp.epoch(), 5);
+        let source_cp = ws_cp.to_source_checkpoint();
 
         let restored = WebSocketSourceCheckpoint::from_source_checkpoint(&source_cp);
         assert_eq!(restored.last_sequence, Some(42));
@@ -127,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_from_empty_source_checkpoint() {
-        let source_cp = SourceCheckpoint::new(0);
+        let source_cp = SourceCheckpoint::new();
         let restored = WebSocketSourceCheckpoint::from_source_checkpoint(&source_cp);
         assert!(restored.last_sequence.is_none());
         assert_eq!(restored.watermark, 0);
@@ -135,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_from_invalid_json() {
-        let mut source_cp = SourceCheckpoint::new(1);
+        let mut source_cp = SourceCheckpoint::new();
         source_cp.set_offset("websocket_state", "not valid json");
         let restored = WebSocketSourceCheckpoint::from_source_checkpoint(&source_cp);
         // Should fall back to default
@@ -144,13 +143,14 @@ mod tests {
     }
 
     #[test]
-    fn test_epoch_preserved() {
+    fn test_state_is_independent_of_checkpoint_attempt() {
         let ws_cp = WebSocketSourceCheckpoint {
             watermark: 100,
             ..Default::default()
         };
-        let source_cp = ws_cp.to_source_checkpoint(42);
-        assert_eq!(source_cp.epoch(), 42);
+        let source_cp = ws_cp.to_source_checkpoint();
+        let restored = WebSocketSourceCheckpoint::from_source_checkpoint(&source_cp);
+        assert_eq!(restored.watermark, 100);
     }
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
             last_sequence: Some(99),
             ..Default::default()
         };
-        let source_cp = ws_cp.to_source_checkpoint(1);
+        let source_cp = ws_cp.to_source_checkpoint();
         let raw_json = source_cp.get_offset("websocket_state");
         assert!(raw_json.is_some());
         assert!(raw_json.unwrap().contains("99"));

@@ -43,7 +43,7 @@ async fn open_join(
     left_outer: bool,
 ) -> LaminarDB {
     let store = Arc::new(LocalFileSystem::new_with_prefix(state_dir).unwrap());
-    let backend = Arc::new(ObjectStoreBackend::new(store, "node-0", VNODES));
+    let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", VNODES));
     let registry = Arc::new(VnodeRegistry::new(VNODES));
     registry.set_assignment((0..VNODES).map(|_| NodeId(0)).collect::<Vec<_>>().into());
 
@@ -51,9 +51,9 @@ async fn open_join(
         .storage_dir(ckpt)
         .checkpoint(StreamCheckpointConfig {
             interval_ms: None,
-            incremental_emit: true,
             ..StreamCheckpointConfig::default()
         })
+        .incremental_emit(true)
         .state_backend(backend)
         .vnode_registry(registry)
         .state_tier_dir(tier_dir)
@@ -307,16 +307,16 @@ async fn open_multiway3(
     tier_dir: &std::path::Path,
 ) -> LaminarDB {
     let store = Arc::new(LocalFileSystem::new_with_prefix(state_dir).unwrap());
-    let backend = Arc::new(ObjectStoreBackend::new(store, "node-0", VNODES));
+    let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", VNODES));
     let registry = Arc::new(VnodeRegistry::new(VNODES));
     registry.set_assignment((0..VNODES).map(|_| NodeId(0)).collect::<Vec<_>>().into());
     let db = LaminarDB::builder()
         .storage_dir(ckpt)
         .checkpoint(StreamCheckpointConfig {
             interval_ms: None,
-            incremental_emit: true,
             ..StreamCheckpointConfig::default()
         })
+        .incremental_emit(true)
         .state_backend(backend)
         .vnode_registry(registry)
         .state_tier_dir(tier_dir)

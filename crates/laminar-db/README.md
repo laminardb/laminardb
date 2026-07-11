@@ -11,7 +11,7 @@ Unified database facade for LaminarDB. The main entry point that wires the SQL p
 - **`SourceHandle<T>`** / **`UntypedSourceHandle`** -- Typed and untyped handles for pushing data into sources.
 - **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
 - **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump.
-- **`CheckpointCoordinator`** -- Orchestrates two-phase commit checkpoints across all operators and sinks.
+- **`CheckpointCoordinator`** -- Seals source/operator state, records the exact durable decision, and hands coordinated external publication to the designated committer.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
 - **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Delta`).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.

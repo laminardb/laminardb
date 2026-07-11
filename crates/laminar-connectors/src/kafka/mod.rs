@@ -37,9 +37,7 @@ pub use partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 pub use sink::KafkaSink;
-pub use sink_config::{
-    Acks, CompressionType, DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy,
-};
+pub use sink_config::{Acks, CompressionType, KafkaSinkConfig, PartitionStrategy};
 pub use sink_metrics::KafkaSinkMetrics;
 
 // Shared re-exports
@@ -90,10 +88,14 @@ pub fn register_kafka_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "kafka",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
+        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
             // Empty schema — the sink's schema is bound from the upstream query at build time.
             let empty = Arc::new(arrow_schema::Schema::empty());
-            Box::new(KafkaSink::new(empty, KafkaSinkConfig::default(), registry))
+            Ok(Box::new(KafkaSink::new(
+                empty,
+                KafkaSinkConfig::default(),
+                registry,
+            )))
         }),
     );
 }
@@ -302,26 +304,10 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
-        // Delivery & Transactions
-        ConfigKeySpec::optional(
-            "delivery.guarantee",
-            "Delivery guarantee (at-least-once/exactly-once)",
-            "at-least-once",
-        ),
-        ConfigKeySpec::optional(
-            "transactional.id",
-            "Transactional ID prefix (auto-generated if not set)",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "transaction.timeout.ms",
-            "Transaction timeout in milliseconds",
-            "60000",
-        ),
         ConfigKeySpec::optional("acks", "Acknowledgment level (0/1/all)", "all"),
         ConfigKeySpec::optional(
             "max.in.flight.requests",
-            "Max in-flight requests (<=5 for exactly-once)",
+            "Maximum in-flight producer requests per connection",
             "5",
         ),
         ConfigKeySpec::optional(

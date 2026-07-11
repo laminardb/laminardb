@@ -28,12 +28,6 @@ pub struct PostgresSinkMetrics {
     /// Total upsert operations (upsert mode).
     pub upsert_operations: IntCounter,
 
-    /// Total epochs committed (exactly-once).
-    pub epochs_committed: IntCounter,
-
-    /// Total epochs rolled back.
-    pub epochs_rolled_back: IntCounter,
-
     /// Total changelog deletes applied (Z-set weight -1).
     pub changelog_deletes: IntCounter,
 }
@@ -68,14 +62,6 @@ impl PostgresSinkMetrics {
                 "postgres_sink_upsert_operations_total",
                 "Total upsert operations",
             ),
-            epochs_committed: reg.counter(
-                "postgres_sink_epochs_committed_total",
-                "Total epochs committed",
-            ),
-            epochs_rolled_back: reg.counter(
-                "postgres_sink_epochs_rolled_back_total",
-                "Total epochs rolled back",
-            ),
             changelog_deletes: reg.counter(
                 "postgres_sink_changelog_deletes_total",
                 "Total changelog deletes applied",
@@ -107,16 +93,6 @@ impl PostgresSinkMetrics {
     /// Records a write or connection error.
     pub fn record_error(&self) {
         self.errors_total.inc();
-    }
-
-    /// Records a successful epoch commit.
-    pub fn record_commit(&self) {
-        self.epochs_committed.inc();
-    }
-
-    /// Records an epoch rollback.
-    pub fn record_rollback(&self) {
-        self.epochs_rolled_back.inc();
     }
 
     /// Records changelog DELETE operations.
@@ -162,17 +138,6 @@ mod tests {
 
         assert_eq!(m.batches_flushed.get(), 2);
         assert_eq!(m.copy_operations.get(), 1);
-    }
-
-    #[test]
-    fn test_epoch_metrics() {
-        let m = PostgresSinkMetrics::new(None);
-        m.record_commit();
-        m.record_commit();
-        m.record_rollback();
-
-        assert_eq!(m.epochs_committed.get(), 2);
-        assert_eq!(m.epochs_rolled_back.get(), 1);
     }
 
     #[test]

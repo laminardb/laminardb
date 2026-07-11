@@ -17,6 +17,7 @@ data:
 
     [server]
     mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
+    delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
     workers = {{ .Values.laminardb.workers }}
     log_level = "{{ .Values.laminardb.logLevel }}"
@@ -73,8 +74,7 @@ data:
     [checkpoint]
     url = "{{ .Values.laminardb.checkpoint.url | default "file:///var/lib/laminardb/checkpoints" }}"
     interval = "{{ .Values.laminardb.checkpoint.interval }}"
-    mode = "{{ .Values.laminardb.checkpoint.mode }}"
-    snapshot_strategy = "{{ .Values.laminardb.checkpoint.snapshotStrategy }}"
+    timeout = "{{ .Values.laminardb.checkpoint.timeout }}"
 
     {{- if $isCluster }}
 
@@ -167,9 +167,6 @@ data:
     name = "{{ .name }}"
     pipeline = "{{ .pipeline }}"
     connector = "{{ .connector }}"
-    {{- if .delivery }}
-    delivery = "{{ .delivery }}"
-    {{- end }}
     {{- if .properties }}
     [sink.properties]
     {{- range $key, $val := .properties }}

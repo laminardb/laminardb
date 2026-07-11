@@ -43,11 +43,9 @@ fn zset_changelog(rows: &[(&str, i64, i64)]) -> RecordBatch {
     .unwrap()
 }
 
-async fn run_epoch(sink: &mut DeltaLakeSink, epoch: u64, batch: &RecordBatch) {
-    sink.begin_epoch(epoch).await.unwrap();
+async fn flush_batch(sink: &mut DeltaLakeSink, batch: &RecordBatch) {
     sink.write_batch(batch).await.unwrap();
-    sink.pre_commit(epoch).await.unwrap();
-    sink.commit_epoch(epoch).await.unwrap();
+    sink.flush().await.unwrap();
 }
 
 /// Read the table back via `register_delta_table` (which registers the S3
@@ -133,7 +131,7 @@ async fn upsert_against_minio_s3_object_store() {
     let mut cfg = DeltaLakeSinkConfig::new("s3://warehouse/agg");
     cfg.write_mode = DeltaWriteMode::Upsert;
     cfg.merge_key_columns = vec!["region".to_string()];
-    cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     cfg.writer_id = "minio-writer".to_string();
     cfg.storage_options = storage.clone();
 
@@ -142,15 +140,13 @@ async fn upsert_against_minio_s3_object_store() {
         .await
         .expect("open Delta sink against MinIO");
 
-    run_epoch(
+    flush_batch(
         &mut sink,
-        1,
         &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
     )
     .await;
-    run_epoch(
+    flush_batch(
         &mut sink,
-        2,
         &zset_changelog(&[
             ("east", 10, -1),
             ("east", 30, 1),
@@ -161,9 +157,8 @@ async fn upsert_against_minio_s3_object_store() {
     .await;
     // Multiple updates to one key in a single epoch — the cardinality case —
     // over real object-store I/O.
-    run_epoch(
+    flush_batch(
         &mut sink,
-        3,
         &zset_changelog(&[
             ("east", 30, -1),
             ("east", 40, 1),

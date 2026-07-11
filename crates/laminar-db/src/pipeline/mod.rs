@@ -8,6 +8,7 @@ pub mod callback;
 pub mod config;
 pub mod streaming_coordinator;
 
+pub(crate) use callback::CheckpointCompletion;
 pub use callback::{
     BarrierOutcome, CycleError, CycleOutcome, PipelineCallback, SkipReason, SourceRegistration,
 };

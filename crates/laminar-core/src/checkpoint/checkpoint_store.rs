@@ -26,7 +26,8 @@ use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::checkpoint::checkpoint_manifest::CheckpointManifest;
+use crate::checkpoint::checkpoint_manifest::{CheckpointManifest, DurableCheckpointPhase};
+use crate::durable_fs::{durable_rename, DurableRenameMode};
 
 /// Fsync a file to ensure its contents are durable on disk.
 async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
@@ -35,22 +36,15 @@ async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
     f.sync_all().await
 }
 
-/// Fsync a directory to make rename operations durable.
-///
-/// On Unix, this flushes directory metadata (new/renamed entries).
-/// On Windows, directory sync is not supported; the OS handles durability.
-#[allow(clippy::unnecessary_wraps, clippy::unused_async)] // no-op on Windows
-async fn sync_dir(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        let f = tokio::fs::File::open(path).await?;
-        f.sync_all().await?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+/// Move a synced temporary file into place without blocking the async runtime.
+async fn durable_replace(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        durable_rename(&source, &destination, DurableRenameMode::Replace)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Errors from checkpoint store operations.
@@ -71,6 +65,10 @@ pub enum CheckpointStoreError {
     /// Object store error.
     #[error("object store error: {0}")]
     ObjectStore(#[from] object_store::Error),
+
+    /// Persisted checkpoint metadata violates the store contract.
+    #[error("invalid checkpoint: {0}")]
+    Invalid(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -79,13 +77,12 @@ pub enum CheckpointStoreError {
 
 /// Classification of a single validation finding.
 ///
-/// `ManifestWarning` is non-fatal — the checkpoint is still usable.
-/// `IntegrityFailure` is fatal — recovery must skip this checkpoint.
+/// Both variants are fatal. They remain distinct so diagnostics can separate
+/// an incompatible runtime contract from corrupt persisted bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationIssue {
-    /// Non-fatal manifest-level warning (e.g. `vnode_count` mismatch,
-    /// orphaned source offset).
-    ManifestWarning(String),
+    /// Fatal manifest-level incompatibility (for example a vnode-count mismatch).
+    ManifestIncompatibility(String),
     /// Fatal: manifest is missing/corrupt, or the sidecar integrity
     /// check (checksum, presence) failed.
     IntegrityFailure(String),
@@ -95,14 +92,14 @@ impl ValidationIssue {
     /// True if this issue renders the checkpoint unusable for recovery.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::IntegrityFailure(_))
+        true
     }
 
     /// Underlying human-readable message.
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::ManifestWarning(s) | Self::IntegrityFailure(s) => s,
+            Self::ManifestIncompatibility(s) | Self::IntegrityFailure(s) => s,
         }
     }
 }
@@ -119,7 +116,7 @@ pub struct ValidationResult {
     /// Checkpoint ID that was validated.
     pub checkpoint_id: u64,
     /// Whether the checkpoint is valid for recovery. A checkpoint is
-    /// valid iff it has no [`ValidationIssue::IntegrityFailure`] issues.
+    /// valid iff it has no validation issues.
     pub valid: bool,
     /// Issues found during validation.
     pub issues: Vec<ValidationIssue>,
@@ -252,6 +249,34 @@ pub trait CheckpointStore: Send + Sync {
         crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT
     }
 
+    /// Participant whose manifests belong in this store namespace.
+    ///
+    /// Embedded and standalone stores use participant `0`; cluster stores use their stable
+    /// numeric instance id and a matching participant-specific namespace.
+    fn participant_id(&self) -> u64 {
+        0
+    }
+
+    /// Reject a manifest that was routed to another participant's namespace.
+    ///
+    /// # Errors
+    /// Returns [`CheckpointStoreError::Invalid`] when the manifest participant does not match
+    /// this store's participant.
+    fn ensure_manifest_participant(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointStoreError> {
+        if manifest.participant_id == self.participant_id() {
+            Ok(())
+        } else {
+            Err(CheckpointStoreError::Invalid(format!(
+                "manifest participant {} does not match store participant {}",
+                manifest.participant_id,
+                self.participant_id()
+            )))
+        }
+    }
+
     /// Atomically persists a checkpoint manifest. Implementations must
     /// guarantee readers never observe a partial manifest.
     ///
@@ -287,30 +312,54 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// # Errors
     /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
-        // Default: O(N) manifest reads via list(). Production backends
-        // should override; list() already sorts ascending.
-        Ok(self.list().await?.iter().map(|(id, _)| *id).collect())
-    }
+    async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError>;
 
-    /// Prunes old checkpoints, keeping at most `keep_count` recent
-    /// ones. Returns the number of checkpoints removed.
+    /// Prunes manifests whose checkpoint epoch is strictly below `before_epoch`.
+    ///
+    /// This is the production retention primitive. The coordinator supplies the
+    /// same externally-committed/recovery-safe horizon used for state and decision
+    /// retention, so all three durable inventories advance together. The manifest
+    /// referenced by the latest recovery pointer is always retained.
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError>;
+    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure. A
+    /// malformed latest pointer or manifest fails closed without deleting it.
+    async fn prune_before(&self, before_epoch: u64) -> Result<usize, CheckpointStoreError>;
 
-    /// Overwrites an existing manifest, bypassing the conditional-PUT
-    /// fence used by [`Self::save`]. Used after a successful sink
-    /// commit to record per-sink status transitions.
+    /// Atomically publish a prepared checkpoint as the latest recoverable cut.
     ///
-    /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
-    async fn update_manifest(
+    /// The transition is idempotent and preserves the checksum stamped by
+    /// [`Self::save_with_state`].
+    async fn finalize(
         &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<(), CheckpointStoreError> {
-        self.save(manifest).await
+        checkpoint_id: u64,
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        let mut manifest = self
+            .load_by_id(checkpoint_id)
+            .await?
+            .ok_or(CheckpointStoreError::NotFound(checkpoint_id))?;
+        if manifest.checkpoint_id != checkpoint_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "storage id {checkpoint_id} contains manifest id {}",
+                manifest.checkpoint_id
+            )));
+        }
+        self.ensure_manifest_participant(&manifest)?;
+        let errors = manifest.validate(self.vnode_count());
+        if !errors.is_empty() {
+            return Err(CheckpointStoreError::Invalid(
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            manifest.durable_phase = DurableCheckpointPhase::Finalized;
+            self.save(&manifest).await?;
+        }
+        Ok(manifest)
     }
 
     /// Writes operator state sidecar bytes for a checkpoint.
@@ -372,8 +421,15 @@ pub trait CheckpointStore: Send + Sync {
         };
 
         for err in manifest.validate(self.vnode_count()) {
-            issues.push(ValidationIssue::ManifestWarning(format!(
+            issues.push(ValidationIssue::ManifestIncompatibility(format!(
                 "manifest validation: {err}"
+            )));
+        }
+        if manifest.participant_id != self.participant_id() {
+            issues.push(ValidationIssue::ManifestIncompatibility(format!(
+                "manifest participant {} does not match store participant {}",
+                manifest.participant_id,
+                self.participant_id()
             )));
         }
 
@@ -426,7 +482,7 @@ pub trait CheckpointStore: Send + Sync {
             ));
         }
 
-        let valid = issues.iter().all(|i| !i.is_fatal());
+        let valid = issues.is_empty();
         Ok(ValidationResult {
             checkpoint_id: id,
             valid,
@@ -456,12 +512,26 @@ pub trait CheckpointStore: Send + Sync {
         for id in &ids {
             let result = self.validate_checkpoint(*id).await?;
             if result.valid {
-                return Ok(RecoveryReport {
-                    chosen_id: Some(*id),
-                    skipped,
-                    examined,
-                    elapsed: start.elapsed(),
-                });
+                match self.load_by_id(*id).await? {
+                    Some(manifest)
+                        if manifest.durable_phase == DurableCheckpointPhase::Finalized =>
+                    {
+                        return Ok(RecoveryReport {
+                            chosen_id: Some(*id),
+                            skipped,
+                            examined,
+                            elapsed: start.elapsed(),
+                        });
+                    }
+                    Some(_) => {
+                        skipped.push((*id, "checkpoint is prepared but not finalized".into()));
+                        continue;
+                    }
+                    None => {
+                        skipped.push((*id, "manifest disappeared during validation".into()));
+                        continue;
+                    }
+                }
             }
             let reason = result
                 .issues
@@ -514,7 +584,8 @@ pub trait CheckpointStore: Send + Sync {
         &self,
         manifest: &CheckpointManifest,
         state_data: Option<&[bytes::Bytes]>,
-    ) -> Result<(), CheckpointStoreError> {
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        self.ensure_manifest_participant(manifest)?;
         let mut manifest = manifest.clone();
         if let Some(chunks) = state_data {
             // Compute checksum across the chunks before writing. This is
@@ -532,7 +603,8 @@ pub trait CheckpointStore: Send + Sync {
             // Inline-only: checksum guards against a torn manifest.json write.
             manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
         }
-        self.save(&manifest).await
+        self.save(&manifest).await?;
+        Ok(manifest)
     }
 }
 
@@ -561,8 +633,8 @@ fn stamp_checksum(
 /// for Windows compatibility.
 pub struct FileSystemCheckpointStore {
     base_dir: PathBuf,
-    max_retained: usize,
     vnode_count: u16,
+    participant_id: u64,
 }
 
 impl FileSystemCheckpointStore {
@@ -576,11 +648,11 @@ impl FileSystemCheckpointStore {
     /// with a non-default value should chain [`Self::with_vnode_count`] so
     /// manifest validation checks the right invariant.
     #[must_use]
-    pub fn new(base_dir: impl Into<PathBuf>, max_retained: usize) -> Self {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
-            max_retained,
             vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            participant_id: 0,
         }
     }
 
@@ -588,6 +660,13 @@ impl FileSystemCheckpointStore {
     #[must_use]
     pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
         self.vnode_count = vnode_count;
+        self
+    }
+
+    /// Bind this store to one runtime participant.
+    #[must_use]
+    pub fn with_participant_id(mut self, participant_id: u64) -> Self {
+        self.participant_id = participant_id;
         self
     }
 
@@ -616,13 +695,34 @@ impl FileSystemCheckpointStore {
         self.checkpoints_dir().join("latest.txt")
     }
 
+    /// Read the recovery pointer without loading its manifest. Retention must
+    /// preserve this exact ID even if newer prepared attempts sort after it.
+    async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
+        let content = match tokio::fs::read_to_string(self.latest_path()).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let id = Self::parse_checkpoint_id(content.trim()).ok_or_else(|| {
+            CheckpointStoreError::Invalid(format!(
+                "invalid checkpoint recovery pointer {:?}",
+                content.trim()
+            ))
+        })?;
+        Ok(Some(id))
+    }
+
     /// Parses a checkpoint ID from a directory name like `checkpoint_000042`.
     fn parse_checkpoint_id(name: &str) -> Option<u64> {
         name.strip_prefix("checkpoint_")
             .and_then(|s| s.parse().ok())
     }
 
-    /// Collects and sorts all checkpoint directory entries.
+    /// Collects and sorts checkpoint directories that contain a manifest.
+    ///
+    /// A sidecar-only directory is an expected crash orphan: it was written
+    /// before manifest publication and must not turn an otherwise fresh store
+    /// into unusable checkpoint history.
     async fn sorted_checkpoint_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
         let dir = self.checkpoints_dir();
         let mut reader = match tokio::fs::read_dir(&dir).await {
@@ -637,12 +737,18 @@ impl FileSystemCheckpointStore {
             if !ft.is_dir() {
                 continue;
             }
-            if let Some(id) = entry
+            let Some(id) = entry
                 .file_name()
                 .to_str()
                 .and_then(Self::parse_checkpoint_id)
-            {
-                ids.push(id);
+            else {
+                continue;
+            };
+            match tokio::fs::metadata(entry.path().join("manifest.json")).await {
+                Ok(meta) if meta.is_file() => ids.push(id),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -687,7 +793,12 @@ impl CheckpointStore for FileSystemCheckpointStore {
         self.vnode_count
     }
 
+    fn participant_id(&self) -> u64 {
+        self.participant_id
+    }
+
     async fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
+        self.ensure_manifest_participant(manifest)?;
         let cp_dir = self.checkpoint_dir(manifest.checkpoint_id);
         tokio::fs::create_dir_all(&cp_dir).await?;
 
@@ -699,8 +810,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let write_res = async {
             tokio::fs::write(&tmp_path, &json).await?;
             sync_file(&tmp_path).await?;
-            tokio::fs::rename(&tmp_path, &manifest_path).await?;
-            sync_dir(&cp_dir).await
+            durable_replace(&tmp_path, &manifest_path).await
         }
         .await;
         if let Err(e) = write_res {
@@ -709,7 +819,12 @@ impl CheckpointStore for FileSystemCheckpointStore {
             return Err(e.into());
         }
 
-        // Update latest.txt pointer — only after manifest is durable.
+        // Prepared attempts are inventory, never the published recovery cut.
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            return Ok(());
+        }
+
+        // Update latest.txt pointer only after a finalized manifest is durable.
         let latest = self.latest_path();
         let latest_dir = latest.parent().unwrap_or(Path::new(".")).to_path_buf();
         tokio::fs::create_dir_all(&latest_dir).await?;
@@ -717,19 +832,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let tmp_latest = latest.with_extension("txt.tmp");
         tokio::fs::write(&tmp_latest, &latest_content).await?;
         sync_file(&tmp_latest).await?;
-        tokio::fs::rename(&tmp_latest, &latest).await?;
-        sync_dir(&latest_dir).await?;
-
-        // Auto-prune if configured.
-        if self.max_retained > 0 {
-            if let Err(e) = self.prune(self.max_retained).await {
-                tracing::warn!(
-                    max_retained = self.max_retained,
-                    error = %e,
-                    "[LDB-6009] Checkpoint prune failed — old checkpoints may accumulate on disk"
-                );
-            }
-        }
+        durable_replace(&tmp_latest, &latest).await?;
 
         Ok(())
     }
@@ -763,6 +866,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
             Err(e) => return Err(e.into()),
         };
         let manifest: CheckpointManifest = serde_json::from_str(&json)?;
+        self.ensure_manifest_participant(&manifest)?;
 
         let errors = manifest.validate(self.vnode_count());
         if !errors.is_empty() {
@@ -795,22 +899,34 @@ impl CheckpointStore for FileSystemCheckpointStore {
         Ok(result)
     }
 
-    async fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError> {
-        let ids = self.sorted_checkpoint_ids().await?;
-        if ids.len() <= keep_count {
-            return Ok(0);
-        }
+    async fn prune_before(&self, before_epoch: u64) -> Result<usize, CheckpointStoreError> {
+        let latest_id = self.latest_checkpoint_id().await?;
+        let mut candidates = Vec::new();
 
-        let to_remove = ids.len() - keep_count;
-        let mut removed = 0;
-
-        for &id in &ids[..to_remove] {
-            let dir = self.checkpoint_dir(id);
-            if tokio::fs::remove_dir_all(&dir).await.is_ok() {
-                removed += 1;
+        // Resolve the complete candidate set before deleting anything. A corrupt
+        // manifest therefore fails this pass closed instead of partially advancing
+        // retention past an inventory we could not classify.
+        for id in self.sorted_checkpoint_ids().await? {
+            if Some(id) == latest_id {
+                continue;
+            }
+            let manifest = self
+                .load_by_id(id)
+                .await?
+                .ok_or(CheckpointStoreError::NotFound(id))?;
+            if manifest.epoch < before_epoch {
+                candidates.push(id);
             }
         }
 
+        let mut removed = 0;
+        for id in candidates {
+            match tokio::fs::remove_dir_all(self.checkpoint_dir(id)).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(removed)
     }
 
@@ -837,8 +953,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         file.sync_all().await?;
         drop(file);
 
-        tokio::fs::rename(&tmp, &path).await?;
-        sync_dir(&cp_dir).await?;
+        durable_replace(&tmp, &path).await?;
 
         Ok(())
     }
@@ -847,7 +962,8 @@ impl CheckpointStore for FileSystemCheckpointStore {
         &self,
         manifest: &CheckpointManifest,
         state_data: Option<&[bytes::Bytes]>,
-    ) -> Result<(), CheckpointStoreError> {
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        self.ensure_manifest_participant(manifest)?;
         let mut manifest = manifest.clone();
         // Write sidecar FIRST — if this fails, manifest is never written
         // and latest.txt still points to the previous valid checkpoint.
@@ -861,7 +977,8 @@ impl CheckpointStore for FileSystemCheckpointStore {
             // Inline-only: checksum guards against a torn manifest.json write.
             manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
         }
-        self.save(&manifest).await
+        self.save(&manifest).await?;
+        Ok(manifest)
     }
 
     async fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {
@@ -923,8 +1040,8 @@ struct LatestPointer {
 pub struct ObjectStoreCheckpointStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
-    max_retained: usize,
     vnode_count: u16,
+    participant_id: u64,
 }
 
 impl ObjectStoreCheckpointStore {
@@ -937,12 +1054,12 @@ impl ObjectStoreCheckpointStore {
     /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
     /// with a non-default value should chain [`Self::with_vnode_count`].
     #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: String, max_retained: usize) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
         Self {
             store,
             prefix,
-            max_retained,
             vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            participant_id: 0,
         }
     }
 
@@ -950,6 +1067,13 @@ impl ObjectStoreCheckpointStore {
     #[must_use]
     pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
         self.vnode_count = vnode_count;
+        self
+    }
+
+    /// Bind this store to one runtime participant.
+    #[must_use]
+    pub fn with_participant_id(mut self, participant_id: u64) -> Self {
+        self.participant_id = participant_id;
         self
     }
 
@@ -963,6 +1087,16 @@ impl ObjectStoreCheckpointStore {
 
     fn state_path(&self, id: u64) -> object_store::path::Path {
         object_store::path::Path::from(format!("{}checkpoints/state-{id:06}.bin", self.prefix))
+    }
+
+    /// Read the recovery pointer without loading its manifest. Retention must
+    /// preserve this exact ID even if newer prepared attempts sort after it.
+    async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
+        let Some(data) = self.get_bytes(&self.latest_pointer_path()).await? else {
+            return Ok(None);
+        };
+        let pointer: LatestPointer = serde_json::from_slice(&data)?;
+        Ok(Some(pointer.checkpoint_id))
     }
 
     // ── Helpers ──
@@ -1032,6 +1166,7 @@ impl ObjectStoreCheckpointStore {
         match self.get_bytes(path).await? {
             Some(data) => {
                 let manifest: CheckpointManifest = serde_json::from_slice(&data)?;
+                self.ensure_manifest_participant(&manifest)?;
                 Ok(Some(manifest))
             }
             None => Ok(None),
@@ -1068,7 +1203,12 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         self.vnode_count
     }
 
+    fn participant_id(&self) -> u64 {
+        self.participant_id
+    }
+
     async fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
+        self.ensure_manifest_participant(manifest)?;
         let json = serde_json::to_string_pretty(manifest)?;
         let path = self.manifest_path(manifest.checkpoint_id);
         let json_bytes = bytes::Bytes::from(json);
@@ -1108,6 +1248,12 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
         }
 
+        // A prepared manifest is deliberately invisible to the normal latest
+        // pointer. Recovery inventory still discovers it through list_ids().
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            return Ok(());
+        }
+
         // Monotonic pointer update. A stale writer must not regress the
         // pointer from id N+1 back to id N. Read the current pointer; if
         // it already references a newer id, skip the write. Same-writer
@@ -1138,25 +1284,40 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         )
         .await?;
 
-        // Auto-prune
-        if self.max_retained > 0 {
-            if let Err(e) = self.prune(self.max_retained).await {
-                tracing::warn!(
-                    max_retained = self.max_retained,
-                    error = %e,
-                    "[LDB-6009] Object store checkpoint prune failed"
-                );
-            }
-        }
-
         Ok(())
     }
 
-    async fn update_manifest(
+    async fn finalize(
         &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<(), CheckpointStoreError> {
-        let json = serde_json::to_string_pretty(manifest)?;
+        checkpoint_id: u64,
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        let mut manifest = self
+            .load_by_id(checkpoint_id)
+            .await?
+            .ok_or(CheckpointStoreError::NotFound(checkpoint_id))?;
+        if manifest.checkpoint_id != checkpoint_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "storage id {checkpoint_id} contains manifest id {}",
+                manifest.checkpoint_id
+            )));
+        }
+        self.ensure_manifest_participant(&manifest)?;
+        let errors = manifest.validate(self.vnode_count());
+        if !errors.is_empty() {
+            return Err(CheckpointStoreError::Invalid(
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        if manifest.durable_phase == DurableCheckpointPhase::Finalized {
+            return Ok(manifest);
+        }
+
+        manifest.durable_phase = DurableCheckpointPhase::Finalized;
+        let json = serde_json::to_string_pretty(&manifest)?;
         let path = self.manifest_path(manifest.checkpoint_id);
         let payload = PutPayload::from_bytes(bytes::Bytes::from(json));
 
@@ -1165,7 +1326,25 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             .put_opts(&path, payload, PutOptions::default())
             .await?;
 
-        Ok(())
+        let latest = self.latest_pointer_path();
+        if let Some(current) = self.get_bytes(&latest).await? {
+            if let Ok(existing) = serde_json::from_slice::<LatestPointer>(&current) {
+                if existing.checkpoint_id > manifest.checkpoint_id {
+                    return Ok(manifest);
+                }
+            }
+        }
+        let pointer = serde_json::to_string(&LatestPointer {
+            checkpoint_id: manifest.checkpoint_id,
+        })?;
+        self.put_with_retry(
+            &latest,
+            PutPayload::from_bytes(bytes::Bytes::from(pointer)),
+            &PutOptions::default(),
+        )
+        .await?;
+
+        Ok(manifest)
     }
 
     async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
@@ -1201,54 +1380,44 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         Ok(result)
     }
 
-    async fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError> {
-        let ids = self.list_checkpoint_ids().await?;
-        if ids.len() <= keep_count {
-            return Ok(0);
+    async fn prune_before(&self, before_epoch: u64) -> Result<usize, CheckpointStoreError> {
+        let latest_id = self.latest_checkpoint_id().await?;
+        let mut candidates = Vec::new();
+
+        // Resolve the complete candidate set before deleting anything. A corrupt
+        // manifest therefore fails this pass closed instead of partially advancing
+        // retention past an inventory we could not classify.
+        for id in self.list_checkpoint_ids().await? {
+            if Some(id) == latest_id {
+                continue;
+            }
+            let manifest = self
+                .load_by_id(id)
+                .await?
+                .ok_or(CheckpointStoreError::NotFound(id))?;
+            if manifest.epoch < before_epoch {
+                candidates.push(id);
+            }
         }
 
-        let to_remove = ids.len() - keep_count;
         let mut removed = 0;
-        let mut logged_error = false;
-
-        for &id in &ids[..to_remove] {
+        for id in candidates {
             let manifest = self.manifest_path(id);
             let state = self.state_path(id);
-            let manifest_res = self.store.delete(&manifest).await;
-            let state_res = self.store.delete(&state).await;
+            let manifest_result = self.store.delete(&manifest).await;
+            let state_result = self.store.delete(&state).await;
 
-            // Count the id as removed only if the manifest is gone
-            // (state.bin is optional — its absence is fine).
-            let manifest_ok = matches!(
-                manifest_res,
-                Ok(()) | Err(object_store::Error::NotFound { .. })
-            );
-            if manifest_ok {
-                removed += 1;
+            match manifest_result {
+                Ok(()) => removed += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
             }
-
-            // Surface the first real error so operators can notice.
-            // Permission errors silently leak old checkpoints forever
-            // otherwise.
-            for err in [manifest_res, state_res]
-                .into_iter()
-                .filter_map(Result::err)
-            {
-                if matches!(err, object_store::Error::NotFound { .. }) {
-                    continue;
-                }
-                if !logged_error {
-                    tracing::warn!(
-                        checkpoint_id = id,
-                        error = %err,
-                        "[LDB-6027] checkpoint prune: delete failed — \
-                         retained objects may accumulate"
-                    );
-                    logged_error = true;
+            if let Err(error) = state_result {
+                if !matches!(error, object_store::Error::NotFound { .. }) {
+                    return Err(CheckpointStoreError::ObjectStore(error));
                 }
             }
         }
-
         Ok(removed)
     }
 
@@ -1319,11 +1488,13 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_store(dir: &Path) -> FileSystemCheckpointStore {
-        FileSystemCheckpointStore::new(dir, 3)
+        FileSystemCheckpointStore::new(dir)
     }
 
     fn make_manifest(id: u64, epoch: u64) -> CheckpointManifest {
-        CheckpointManifest::new(id, epoch)
+        let mut manifest = CheckpointManifest::new(id, epoch);
+        manifest.durable_phase = DurableCheckpointPhase::Finalized;
+        manifest
     }
 
     #[tokio::test]
@@ -1340,6 +1511,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_is_invisible_until_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        let prepared = CheckpointManifest::new(1, 1);
+
+        let persisted = store.save_with_state(&prepared, None).await.unwrap();
+        assert_eq!(persisted.durable_phase, DurableCheckpointPhase::Prepared);
+        assert!(store.load_latest().await.unwrap().is_none());
+        assert_eq!(store.list_ids().await.unwrap(), vec![1]);
+
+        let finalized = store.finalize(1).await.unwrap();
+        assert_eq!(finalized.durable_phase, DurableCheckpointPhase::Finalized);
+        assert_eq!(store.load_latest().await.unwrap().unwrap().checkpoint_id, 1);
+        assert_eq!(store.finalize(1).await.unwrap(), finalized);
+    }
+
+    #[tokio::test]
+    async fn validated_recovery_skips_newer_prepared_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path());
+        store.save(&make_manifest(1, 1)).await.unwrap();
+        store
+            .save_with_state(&CheckpointManifest::new(2, 2), None)
+            .await
+            .unwrap();
+
+        let report = store.recover_latest_validated().await.unwrap();
+        assert_eq!(report.chosen_id, Some(1));
+        assert_eq!(
+            report.skipped,
+            vec![(2, "checkpoint is prepared but not finalized".into())]
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_latest_returns_none_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
@@ -1349,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_latest_returns_most_recent() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         for i in 1..=5 {
             store.save(&make_manifest(i, i)).await.unwrap();
@@ -1363,7 +1569,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_by_id() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         store.save(&make_manifest(1, 10)).await.unwrap();
         store.save(&make_manifest(2, 20)).await.unwrap();
@@ -1380,7 +1586,7 @@ mod tests {
     #[tokio::test]
     async fn test_list() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         store.save(&make_manifest(1, 10)).await.unwrap();
         store.save(&make_manifest(3, 30)).await.unwrap();
@@ -1391,37 +1597,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prune_keeps_max() {
+    async fn test_save_does_not_run_retention_inline() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10); // no auto-prune
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         for i in 1..=5 {
             store.save(&make_manifest(i, i)).await.unwrap();
         }
 
-        let removed = store.prune(2).await.unwrap();
-        assert_eq!(removed, 3);
-
         let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
+        assert_eq!(list.len(), 5);
     }
 
     #[tokio::test]
-    async fn test_auto_prune_on_save() {
+    async fn epoch_prune_preserves_latest_recovery_cut() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 2);
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path());
+        store.save(&make_manifest(1, 1)).await.unwrap();
+        for id in 2..=5 {
+            store.save(&CheckpointManifest::new(id, id)).await.unwrap();
         }
 
-        let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        // Should keep the two most recent
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
+        assert_eq!(store.prune_before(10).await.unwrap(), 4);
+        assert_eq!(store.list_ids().await.unwrap(), vec![1]);
+        assert_eq!(store.load_latest().await.unwrap().unwrap().checkpoint_id, 1);
     }
 
     #[tokio::test]
@@ -1456,15 +1655,14 @@ mod tests {
         let mut m = make_manifest(1, 5);
         m.source_offsets.insert(
             "kafka-src".into(),
-            ConnectorCheckpoint::with_offsets(
-                5,
-                HashMap::from([("0".into(), "1000".into()), ("1".into(), "2000".into())]),
-            ),
+            ConnectorCheckpoint::with_offsets(HashMap::from([
+                ("0".into(), "1000".into()),
+                ("1".into(), "2000".into()),
+            ])),
         );
-        m.sink_epochs.insert("pg-sink".into(), 4);
         m.table_offsets.insert(
             "instruments".into(),
-            ConnectorCheckpoint::with_offsets(5, HashMap::from([("lsn".into(), "0/AB".into())])),
+            ConnectorCheckpoint::with_offsets(HashMap::from([("lsn".into(), "0/AB".into())])),
         );
         m.operator_states
             .insert("window".into(), OperatorCheckpoint::inline(b"data"));
@@ -1479,8 +1677,6 @@ mod tests {
 
         let src = loaded.source_offsets.get("kafka-src").unwrap();
         assert_eq!(src.offsets.get("0"), Some(&"1000".into()));
-
-        assert_eq!(loaded.sink_epochs.get("pg-sink"), Some(&4));
 
         let tbl = loaded.table_offsets.get("instruments").unwrap();
         assert_eq!(tbl.offsets.get("lsn"), Some(&"0/AB".into()));
@@ -1511,16 +1707,6 @@ mod tests {
         std::fs::write(cp_dir.join("latest.txt"), "checkpoint_000099").unwrap();
 
         assert!(store.load_latest().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_prune_no_op_when_under_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        store.save(&make_manifest(1, 1)).await.unwrap();
-        let removed = store.prune(5).await.unwrap();
-        assert_eq!(removed, 0);
     }
 
     #[tokio::test]
@@ -1581,7 +1767,7 @@ mod tests {
 
     fn make_obj_store() -> ObjectStoreCheckpointStore {
         let store = Arc::new(object_store::memory::InMemory::new());
-        ObjectStoreCheckpointStore::new(store, String::new(), 3)
+        ObjectStoreCheckpointStore::new(store, String::new())
     }
 
     #[tokio::test]
@@ -1606,7 +1792,6 @@ mod tests {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            10,
         );
 
         store.save(&make_manifest(1, 10)).await.unwrap();
@@ -1624,7 +1809,6 @@ mod tests {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            10,
         );
 
         store.save(&make_manifest(1, 10)).await.unwrap();
@@ -1636,42 +1820,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_obj_prune() {
+    async fn test_obj_save_does_not_run_retention_inline() {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            10,
         );
 
         for i in 1..=5 {
             store.save(&make_manifest(i, i)).await.unwrap();
         }
 
-        let removed = store.prune(2).await.unwrap();
-        assert_eq!(removed, 3);
-
         let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
+        assert_eq!(list.len(), 5);
     }
 
     #[tokio::test]
-    async fn test_obj_auto_prune_on_save() {
+    async fn obj_epoch_prune_preserves_latest_recovery_cut() {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            2,
         );
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
+        store.save(&make_manifest(1, 1)).await.unwrap();
+        for id in 2..=5 {
+            store.save(&CheckpointManifest::new(id, id)).await.unwrap();
         }
 
-        let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
+        assert_eq!(store.prune_before(10).await.unwrap(), 4);
+        assert_eq!(store.list_ids().await.unwrap(), vec![1]);
+        assert_eq!(store.load_latest().await.unwrap().unwrap().checkpoint_id, 1);
     }
 
     #[tokio::test]
@@ -1698,7 +1874,7 @@ mod tests {
     #[tokio::test]
     async fn test_obj_with_prefix() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string());
 
         store.save(&make_manifest(1, 42)).await.unwrap();
         let loaded = store.load_latest().await.unwrap().unwrap();
@@ -1706,14 +1882,58 @@ mod tests {
         assert_eq!(loaded.epoch, 42);
     }
 
+    #[tokio::test]
+    async fn test_obj_participant_namespaces_are_isolated() {
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let participant_11 =
+            ObjectStoreCheckpointStore::new(inner.clone(), "participants/11/".to_string())
+                .with_participant_id(11);
+        let participant_22 = ObjectStoreCheckpointStore::new(inner, "participants/22/".to_string())
+            .with_participant_id(22);
+
+        let mut manifest_11 = make_manifest(7, 101);
+        manifest_11.participant_id = 11;
+        let mut manifest_22 = make_manifest(7, 202);
+        manifest_22.participant_id = 22;
+
+        participant_11.save(&manifest_11).await.unwrap();
+        participant_22.save(&manifest_22).await.unwrap();
+
+        let loaded_11 = participant_11.load_by_id(7).await.unwrap().unwrap();
+        let loaded_22 = participant_22.load_by_id(7).await.unwrap().unwrap();
+        assert_eq!((loaded_11.participant_id, loaded_11.epoch), (11, 101));
+        assert_eq!((loaded_22.participant_id, loaded_22.epoch), (22, 202));
+        assert_eq!(participant_11.list().await.unwrap(), vec![(7, 101)]);
+        assert_eq!(participant_22.list().await.unwrap(), vec![(7, 202)]);
+    }
+
+    #[tokio::test]
+    async fn test_obj_rejects_manifest_for_wrong_participant() {
+        let store = ObjectStoreCheckpointStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            "participants/11/".to_string(),
+        )
+        .with_participant_id(11);
+        let mut manifest = make_manifest(7, 101);
+        manifest.participant_id = 22;
+
+        let error = store.save(&manifest).await.unwrap_err();
+        assert!(matches!(error, CheckpointStoreError::Invalid(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid checkpoint: manifest participant 22 does not match store participant 11"
+        );
+        assert!(store.list_ids().await.unwrap().is_empty());
+    }
+
     // -----------------------------------------------------------------------
-    // v2 layout verification + backward compatibility tests
+    // Object-store layout and conditional-publication tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_obj_layout_paths() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
 
         store.save(&make_manifest(1, 10)).await.unwrap();
 
@@ -1739,7 +1959,6 @@ mod tests {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            10,
         );
 
         let m = make_manifest(1, 10);
@@ -1754,84 +1973,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_obj_update_manifest_overwrites() {
-        use crate::checkpoint::checkpoint_manifest::SinkCommitStatus;
-
+    async fn object_store_finalize_only_publishes_the_stored_prepared_manifest() {
         let store = make_obj_store();
+        let prepared = CheckpointManifest::new(7, 70);
+        store.save_with_state(&prepared, None).await.unwrap();
+        assert!(store.load_latest().await.unwrap().is_none());
 
-        // Step 5: initial save with Pending sink status
-        let mut m = make_manifest(1, 10);
-        m.sink_commit_statuses
-            .insert("pg-sink".into(), SinkCommitStatus::Pending);
-        store.save(&m).await.unwrap();
+        let finalized = store.finalize(7).await.unwrap();
 
-        // Verify Pending persisted
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.sink_commit_statuses.get("pg-sink"),
-            Some(&SinkCommitStatus::Pending)
-        );
-
-        // Step 6b: update manifest with Committed status
-        m.sink_commit_statuses
-            .insert("pg-sink".into(), SinkCommitStatus::Committed);
-        store.update_manifest(&m).await.unwrap();
-
-        // Verify Committed persisted (the bug: save() would skip this)
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.sink_commit_statuses.get("pg-sink"),
-            Some(&SinkCommitStatus::Committed)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_obj_save_still_uses_conditional_put() {
-        let store = make_obj_store();
-
-        let m = make_manifest(1, 10);
-        store.save(&m).await.unwrap();
-
-        // Second save() with same ID skips (conditional PUT)
-        // but does not error
-        store.save(&m).await.unwrap();
-
-        // update_manifest() with same ID overwrites
-        let mut m2 = make_manifest(1, 10);
-        m2.watermark = Some(42);
-        store.update_manifest(&m2).await.unwrap();
-
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(loaded.watermark, Some(42));
-    }
-
-    #[tokio::test]
-    async fn test_fs_update_manifest_overwrites() {
-        use crate::checkpoint::checkpoint_manifest::SinkCommitStatus;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let mut m = make_manifest(1, 10);
-        m.sink_commit_statuses
-            .insert("sink-a".into(), SinkCommitStatus::Pending);
-        store.save(&m).await.unwrap();
-
-        m.sink_commit_statuses
-            .insert("sink-a".into(), SinkCommitStatus::Committed);
-        store.update_manifest(&m).await.unwrap();
-
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.sink_commit_statuses.get("sink-a"),
-            Some(&SinkCommitStatus::Committed)
-        );
+        assert_eq!(finalized.durable_phase, DurableCheckpointPhase::Finalized);
+        assert_eq!(store.load_latest().await.unwrap(), Some(finalized));
     }
 
     #[tokio::test]
     async fn test_obj_state_paths() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
 
         store.save(&make_manifest(1, 1)).await.unwrap();
         store
@@ -1851,7 +2008,7 @@ mod tests {
     #[tokio::test]
     async fn test_obj_latest_json_format() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
 
         store.save(&make_manifest(5, 50)).await.unwrap();
 
@@ -1873,7 +2030,7 @@ mod tests {
     #[tokio::test]
     async fn test_obj_latest_monotonic_guard_skips_regression() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
 
         store.save(&make_manifest(10, 10)).await.unwrap();
         // A delayed writer (e.g., paused ex-leader) tries to write id=5
@@ -1932,7 +2089,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_checkpoint_corrupt_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         // Create a checkpoint dir with corrupt manifest JSON.
         let cp_dir = dir.path().join("checkpoints/checkpoint_000001");
@@ -1952,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_checkpoint_state_checksum_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         let state = b"important operator state";
         let m = make_manifest(1, 1);
@@ -1968,7 +2125,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_checkpoint_state_checksum_mismatch() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         // Save with state to get a checksum.
         let state = b"original state";
@@ -1997,7 +2154,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_checkpoint_state_missing_when_expected() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         // Save with state.
         let m = make_manifest(1, 1);
@@ -2025,7 +2182,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_latest_validated_skips_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         // Save two checkpoints.
         store.save(&make_manifest(1, 10)).await.unwrap();
@@ -2056,9 +2213,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recover_latest_validated_all_corrupt_is_fresh_start() {
+    async fn test_recover_latest_validated_all_corrupt_reports_unusable_history() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         // Save a checkpoint, then corrupt it.
         store.save(&make_manifest(1, 1)).await.unwrap();
@@ -2067,17 +2224,17 @@ mod tests {
             .join("checkpoints/checkpoint_000001/manifest.json");
         std::fs::write(cp_manifest, "corrupt").unwrap();
 
-        // The corrupt manifest will cause load_by_id (via list()) to fail,
-        // so it may not appear in the list at all. Either way, recovery
-        // should not select it.
         let report = store.recover_latest_validated().await.unwrap();
         assert!(report.chosen_id.is_none());
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, 1);
     }
 
     #[tokio::test]
     async fn test_cleanup_orphans_removes_stateless_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         // Create an orphan: state.bin exists but no manifest.json.
         let orphan_dir = dir.path().join("checkpoints/checkpoint_000099");
@@ -2099,7 +2256,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_orphans_noop_when_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         store.save(&make_manifest(1, 1)).await.unwrap();
         let cleaned = store.cleanup_orphans().await.unwrap();
@@ -2109,7 +2266,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_with_state_writes_checksum() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         let state = b"state-data-for-checksum";
         let m = make_manifest(1, 1);
@@ -2128,16 +2285,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_state_checksum_backward_compat() {
-        // Older manifests without state_checksum should deserialize fine.
+    async fn test_legacy_manifest_is_rejected() {
         let json = r#"{
             "version": 1,
             "checkpoint_id": 1,
             "epoch": 1,
             "timestamp_ms": 1000
         }"#;
-        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
-        assert!(m.state_checksum.is_none());
+        assert!(serde_json::from_str::<CheckpointManifest>(json).is_err());
     }
 
     // ObjectStore variants
@@ -2163,7 +2318,6 @@ mod tests {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            10,
         );
 
         let state = b"obj-store-state-data";
@@ -2182,7 +2336,6 @@ mod tests {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
-            10,
         );
 
         store.save(&make_manifest(1, 10)).await.unwrap();
@@ -2196,7 +2349,7 @@ mod tests {
     #[tokio::test]
     async fn test_obj_cleanup_orphans() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
 
         // Save a checkpoint (creates manifest + state).
         let state = b"state-with-manifest";

@@ -2,7 +2,7 @@
 //!
 //! [`DeltaLakeSink`] implements [`SinkConnector`], writing Arrow `RecordBatch`
 //! data to Delta Lake tables with ACID transactions and at-least-once delivery
-//! (exactly-once opt-in via `delivery.guarantee = 'exactly-once'`).
+//! (exactly-once is selected once at the pipeline/runtime boundary).
 //!
 //! # Write Strategies
 //!
@@ -10,9 +10,9 @@
 //! - **Overwrite mode**: Replace partition contents for recomputation
 //! - **Upsert mode**: CDC MERGE via Z-set changelog integration
 //!
-//! Exactly-once semantics use epoch-to-Delta-version mapping: each `LaminarDB`
-//! epoch maps to exactly one Delta Lake transaction via `txn` application
-//! transaction metadata in the Delta log.
+//! Exactly-once append writes prepare immutable Parquet descriptors during the
+//! checkpoint and publish them with one namespaced, designated Delta commit.
+//! At-least-once append, overwrite, and upsert writes commit through `flush()`.
 //!
 //! # Ring Architecture
 //!
@@ -35,7 +35,9 @@ use deltalake::DeltaTable;
 use deltalake::protocol::SaveMode;
 
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
+use crate::connector::{
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+};
 use crate::error::ConnectorError;
 
 use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
@@ -70,27 +72,13 @@ fn count_collapsed_ops(batch: &RecordBatch) -> (u64, u64) {
 /// at-least-once delivery (exactly-once opt-in), partitioning, and
 /// background compaction.
 ///
-/// # Lifecycle
-///
-/// ```text
-/// new() -> open() -> [begin_epoch() -> write_batch()* -> commit_epoch()] -> close()
-///                          |                                    |
-///                          +--- rollback_epoch() (on failure) --+
-/// ```
-///
 /// # Exactly-Once Semantics
 ///
-/// Each `LaminarDB` epoch maps to exactly one Delta Lake transaction (version).
-/// On recovery, the sink checks `_delta_log/` for the last committed epoch
-/// via `txn` (application transaction) metadata. If an epoch was already
-/// committed, it is skipped (idempotent commit).
-///
-/// # 2PC Protocol
-///
-/// `pre_commit()` coalesces the buffer but does NOT write to Delta.
-/// `commit_epoch()` performs the actual Delta write+commit atomically.
-/// `rollback_epoch()` discards the staged buffer without side effects.
-/// This ensures that a rolled-back epoch never leaves data in Delta.
+/// `pre_commit()` materializes immutable Parquet files and returns their Delta
+/// `Add` actions. The runtime durably seals the checkpoint before one
+/// designated committer calls `commit_aggregated()` with every writer's
+/// descriptor. `rollback_epoch()` discards in-memory state; unreferenced files
+/// are reclaimed later by retention-safe vacuum.
 pub struct DeltaLakeSink {
     /// Sink configuration.
     config: DeltaLakeSinkConfig,
@@ -100,8 +88,6 @@ pub struct DeltaLakeSink {
     state: ConnectorState,
     /// Current epoch being written.
     current_epoch: u64,
-    /// Last successfully committed epoch.
-    last_committed_epoch: u64,
     /// `RecordBatch` buffer for the current epoch.
     buffer: Vec<RecordBatch>,
     /// Total rows buffered in current epoch.
@@ -117,11 +103,9 @@ pub struct DeltaLakeSink {
     /// Delta Lake table handle (present when `delta-lake` feature is enabled).
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
-    /// Whether the current epoch was skipped (already committed).
-    epoch_skipped: bool,
-    /// Staged batches ready for commit (populated by `pre_commit()`, consumed
-    /// by `commit_epoch()`). This separation ensures `rollback_epoch()` can
-    /// discard prepared data without leaving orphan files in Delta.
+    /// Staged batches ready for either coordinated descriptor creation or an
+    /// at-least-once flush. This separation lets `rollback_epoch()` discard
+    /// prepared in-memory data without publishing it to the Delta log.
     staged_batches: Vec<RecordBatch>,
     /// Rows staged for commit (mirrors `staged_batches`).
     staged_rows: usize,
@@ -173,14 +157,12 @@ impl DeltaLakeSink {
             schema: None,
             state: ConnectorState::Created,
             current_epoch: 0,
-            last_committed_epoch: 0,
             buffer: Vec::with_capacity(16),
             buffered_rows: 0,
             buffered_bytes: 0,
             delta_version: 0,
             buffer_start_time: None,
             metrics: DeltaLakeSinkMetrics::new(registry),
-            epoch_skipped: false,
             staged_batches: Vec::new(),
             staged_rows: 0,
             staged_bytes: 0,
@@ -291,28 +273,6 @@ impl DeltaLakeSink {
             }
         }
 
-        // Resolve last committed epoch for exactly-once recovery. In coordinated
-        // mode nothing is ever committed under writer_id (only the designated
-        // committer commits, under COORDINATED_COMMITTER_ID), so we must read the
-        // committer's txn id or recovery always sees 0 and re-stages sealed epochs
-        // into orphan Parquet.
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let recovery_id = if self.is_coordinated() {
-                COORDINATED_COMMITTER_ID
-            } else {
-                self.config.writer_id.as_str()
-            };
-            self.last_committed_epoch =
-                delta_io::get_last_committed_epoch(&table, recovery_id).await;
-            if self.last_committed_epoch > 0 {
-                info!(
-                    recovery_id,
-                    last_committed_epoch = self.last_committed_epoch,
-                    "recovered last committed epoch from Delta Lake txn metadata"
-                );
-            }
-        }
-
         // Store the Delta version.
         #[allow(clippy::cast_sign_loss)]
         {
@@ -363,12 +323,6 @@ impl DeltaLakeSink {
     #[must_use]
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch
-    }
-
-    /// Returns the last committed epoch.
-    #[must_use]
-    pub fn last_committed_epoch(&self) -> u64 {
-        self.last_committed_epoch
     }
 
     /// Returns the number of buffered rows pending flush.
@@ -1099,12 +1053,63 @@ async fn ensure_uc_table_exists(
 
 #[async_trait]
 impl SinkConnector for DeltaLakeSink {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            DeltaLakeSinkConfig::from_config(config)?
+        };
+        if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && cfg.write_mode != DeltaWriteMode::Append
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta exactly-once requires coordinated append mode".into(),
+            ));
+        }
+        let consistency = if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && cfg.write_mode == DeltaWriteMode::Append
+        {
+            // Append mode emits durable data-file descriptors for one
+            // designated catalog commit. Certification still requires an
+            // exact external namespace/cursor, enforced by runtime admission.
+            SinkConsistency::CheckpointCommittable
+        } else {
+            SinkConsistency::DurableAtLeastOnce
+        };
+        let target = cfg.table_path.to_ascii_lowercase();
+        let shared_target = [
+            "s3://", "s3a://", "gs://", "gcs://", "az://", "abfs://", "uc://",
+        ]
+        .iter()
+        .any(|scheme| target.starts_with(scheme));
+        let topology = if cfg.write_mode == DeltaWriteMode::Append && shared_target {
+            SinkTopology::MultiWriter
+        } else {
+            // Node-local files plus overwrite/MERGE lack fenced distributed ownership.
+            SinkTopology::Singleton
+        };
+        let input_mode = if cfg.write_mode == DeltaWriteMode::Upsert {
+            SinkInputMode::FullChangelog
+        } else {
+            SinkInputMode::AppendOnly
+        };
+        Ok(SinkContract::new(consistency, topology, input_mode))
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
         // Re-parse config if properties provided.
         if !config.properties().is_empty() {
             self.config = DeltaLakeSinkConfig::from_config(config)?;
+        }
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && !self.is_coordinated()
+        {
+            self.state = ConnectorState::Failed;
+            return Err(ConnectorError::ConfigurationError(
+                "Delta exactly-once requires coordinated append mode".into(),
+            ));
         }
 
         info!(
@@ -1174,10 +1179,6 @@ impl SinkConnector for DeltaLakeSink {
         }
 
         if batch.num_rows() == 0 {
-            return Ok(WriteResult::new(0, 0));
-        }
-
-        if self.epoch_skipped {
             return Ok(WriteResult::new(0, 0));
         }
 
@@ -1274,10 +1275,6 @@ impl SinkConnector for DeltaLakeSink {
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         // Complete deferred Delta table init on the first epoch.
-        // This must run BEFORE the epoch skip check so that
-        // last_committed_epoch is resolved from the Delta log.
-        // Without this, exactly-once recovery would miss already-committed
-        // epochs and produce duplicates.
         #[cfg(feature = "delta-lake")]
         if self.needs_deferred_delta_init {
             // Schema may not be available yet on the very first epoch.
@@ -1300,20 +1297,6 @@ impl SinkConnector for DeltaLakeSink {
             }
         }
 
-        // For exactly-once, skip epochs already committed.
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && epoch <= self.last_committed_epoch
-        {
-            warn!(
-                epoch,
-                last_committed = self.last_committed_epoch,
-                "Delta Lake: skipping already-committed epoch"
-            );
-            self.epoch_skipped = true;
-            return Ok(());
-        }
-
-        self.epoch_skipped = false;
         self.current_epoch = epoch;
         self.buffer.clear();
         self.buffered_rows = 0;
@@ -1325,16 +1308,8 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
-        // Skip if already committed (exactly-once idempotency).
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && epoch <= self.last_committed_epoch
-        {
-            return Ok(None);
-        }
-
-        // Stage buffered data for commit. The actual Delta write happens in
-        // commit_epoch() — this ensures rollback_epoch() can discard the data
-        // without leaving orphan files in Delta.
+        // Stage buffered data. Coordinated append materializes immutable
+        // Parquet files below and publishes them only after a durable seal.
         if !self.buffer.is_empty() {
             self.staged_batches = std::mem::take(&mut self.buffer);
             self.staged_rows = self.buffered_rows;
@@ -1344,9 +1319,8 @@ impl SinkConnector for DeltaLakeSink {
             self.buffer_start_time = None;
         }
 
-        // Coordinated (append) mode: write Parquet now and hand the Add actions
-        // to the designated committer; the catalog commit happens in
-        // commit_aggregated. Upsert/at-least-once keep the commit_epoch path.
+        // Coordinated append: write Parquet now and hand the Add actions to the
+        // designated committer; the catalog commit happens in commit_aggregated.
         #[cfg(feature = "delta-lake")]
         if self.is_coordinated() {
             if self.staged_batches.is_empty() {
@@ -1373,38 +1347,10 @@ impl SinkConnector for DeltaLakeSink {
         Ok(None)
     }
 
-    async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        // Skip if already committed (exactly-once idempotency).
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && epoch <= self.last_committed_epoch
-        {
-            return Ok(());
-        }
-
-        // Write staged data to Delta as a single atomic transaction. Coordinated
-        // (append) sinks commit via the designated committer (commit_aggregated),
-        // not here.
-        #[cfg(feature = "delta-lake")]
-        {
-            if !self.is_coordinated() && !self.staged_batches.is_empty() {
-                self.flush_staged_to_delta().await?;
-            }
-        }
-
-        self.last_committed_epoch = epoch;
-
-        info!(
-            epoch,
-            delta_version = self.delta_version,
-            "Delta Lake: committed epoch"
-        );
-
-        Ok(())
-    }
-
     async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        // Discard both buffered and staged data. Because the actual Delta
-        // write only happens in commit_epoch(), no orphan files are created.
+        // Discard buffered/staged data. A coordinated attempt may already have
+        // materialized an unreferenced immutable Parquet file; it must be reclaimed only by a
+        // retention-safe vacuum after ambiguous catalog commits are impossible, never here.
         self.buffer.clear();
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
@@ -1413,41 +1359,19 @@ impl SinkConnector for DeltaLakeSink {
         self.staged_rows = 0;
         self.staged_bytes = 0;
 
-        self.epoch_skipped = false;
         self.metrics.record_rollback();
         warn!(epoch, "Delta Lake: rolled back epoch");
         Ok(())
     }
 
-    fn capabilities(&self) -> SinkConnectorCapabilities {
+    fn suggested_write_timeout(&self) -> Duration {
         // Delta commits can run long under compaction or contention.
-        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(180)).with_idempotent();
-
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once().with_two_phase_commit();
-        }
-        // Append is the only mode that decomposes into distributed write +
-        // single commit; upsert (MERGE) keeps the per-writer path.
-        if self.is_coordinated() {
-            caps = caps.with_coordinated_commit();
-        }
-        if self.config.write_mode == DeltaWriteMode::Upsert {
-            caps = caps.with_upsert().with_changelog();
-        }
-        if self.config.schema_evolution {
-            caps = caps.with_schema_evolution();
-        }
-        if !self.config.partition_columns.is_empty() {
-            caps = caps.with_partitioned();
-        }
-
-        caps
+        Duration::from_secs(180)
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        // For at-least-once delivery, flush() is the only commit trigger
-        // because the checkpoint coordinator skips begin_epoch/pre_commit/
-        // commit_epoch for non-exactly-once sinks. Write directly to Delta.
+        // For at-least-once delivery, flush() is the commit trigger. Write
+        // directly to Delta without entering the coordinated protocol.
         #[cfg(feature = "delta-lake")]
         if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce {
             // Retry any orphaned staged data from a prior failed flush
@@ -1475,8 +1399,8 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        // For exactly-once, just coalesce in memory — the 2PC path
-        // (pre_commit + commit_epoch) handles the actual Delta write.
+        // For exactly-once, just coalesce in memory. `pre_commit` creates the
+        // descriptor and `commit_aggregated` publishes it after the seal.
         if self.buffer.len() > 1 {
             let schema = self.buffer[0].schema();
             let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
@@ -1490,17 +1414,18 @@ impl SinkConnector for DeltaLakeSink {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Delta Lake sink connector");
 
-        // Commit any remaining data before closing.
-        // For at-least-once, use flush() which handles both orphaned
-        // staged data and buffered data. For exactly-once, use 2PC.
-        // Coordinated sinks are committed by the designated committer, not on
-        // close; any un-checkpointed buffer is dropped and reprocessed on restart.
+        // Only at-least-once may land buffered data during close. Exactly-once output without a
+        // matching durable checkpoint must be discarded and replayed after recovery.
         #[cfg(feature = "delta-lake")]
-        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce {
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            self.buffer.clear();
+            self.staged_batches.clear();
+            self.buffered_rows = 0;
+            self.buffered_bytes = 0;
+            self.staged_rows = 0;
+            self.staged_bytes = 0;
+        } else {
             self.flush().await?;
-        } else if !self.is_coordinated() && !self.buffer.is_empty() {
-            self.pre_commit(self.current_epoch).await?;
-            self.commit_epoch(self.current_epoch).await?;
         }
 
         // Cancel and join the background compaction task.
@@ -1544,55 +1469,73 @@ impl SinkConnector for DeltaLakeSink {
     }
 }
 
-/// Single app-transaction id the designated committer uses for idempotency; it
-/// is scoped to the table's own log, so a constant is sufficient.
-#[cfg(feature = "delta-lake")]
-const COORDINATED_COMMITTER_ID: &str = "laminardb.coordinated";
-
 #[cfg(feature = "delta-lake")]
 #[async_trait]
 impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
     async fn commit_aggregated(
         &self,
-        epoch: u64,
-        descriptors: Vec<Vec<u8>>,
+        batch: crate::connector::CoordinatedCommitBatch,
     ) -> Result<(), ConnectorError> {
+        let external_key = batch.namespace.external_key();
         let table = super::delta_io::open_or_create_table(
             &self.resolved_table_path,
             self.resolved_storage_options.clone(),
             None,
         )
         .await?;
-        // Idempotent: skip if this epoch is already sealed for the committer.
-        if super::delta_io::get_last_committed_epoch(&table, COORDINATED_COMMITTER_ID).await
-            >= epoch
-        {
+        // Idempotent: skip if this exact-or-newer checkpoint id is already
+        // committed in this pipeline/sink namespace.
+        let observed_cursor = super::delta_io::get_last_committed_version(&table, &external_key)
+            .await?
+            .unwrap_or(0);
+        batch
+            .validate_observed_cursor(observed_cursor)
+            .map_err(|error| {
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated cursor continuity check failed: {error}"
+                ))
+            })?;
+        if observed_cursor >= batch.target.checkpoint_id {
             return Ok(());
         }
+        let descriptors: Vec<Vec<u8>> = batch
+            .entries
+            .iter()
+            // Leadership may change after the runtime built this batch. Never append payloads
+            // already covered by the target's freshly observed cursor.
+            .filter(|entry| entry.attempt.checkpoint_id > observed_cursor)
+            .filter_map(|entry| entry.payload.clone())
+            .collect();
         let adds = super::delta_io::decode_commit_descriptors(&descriptors)?;
-        if adds.is_empty() {
-            return Ok(());
-        }
-        super::delta_io::commit_adds_coordinated(&table, adds, COORDINATED_COMMITTER_ID, epoch)
-            .await?;
+        // An empty cut still commits the application transaction so restart
+        // cannot rescan it forever or merge later descriptors across the gap.
+        super::delta_io::commit_adds_coordinated(
+            &table,
+            adds,
+            &external_key,
+            batch.target.checkpoint_id,
+        )
+        .await?;
         info!(
-            epoch,
+            epoch = batch.target.epoch,
+            checkpoint_id = batch.target.checkpoint_id,
             writers = descriptors.len(),
             "delta coordinated commit"
         );
         Ok(())
     }
 
-    async fn committed_through(&self) -> Result<Option<u64>, ConnectorError> {
+    async fn committed_checkpoint_id(
+        &self,
+        namespace: &crate::connector::CoordinatedCommitNamespace,
+    ) -> Result<Option<u64>, ConnectorError> {
         let table = super::delta_io::open_or_create_table(
             &self.resolved_table_path,
             self.resolved_storage_options.clone(),
             None,
         )
         .await?;
-        let epoch =
-            super::delta_io::get_last_committed_epoch(&table, COORDINATED_COMMITTER_ID).await;
-        Ok((epoch > 0).then_some(epoch))
+        super::delta_io::get_last_committed_version(&table, &namespace.external_key()).await
     }
 }
 
@@ -1622,10 +1565,8 @@ impl std::fmt::Debug for DeltaLakeSink {
             .field("mode", &self.config.write_mode)
             .field("guarantee", &self.config.delivery_guarantee)
             .field("current_epoch", &self.current_epoch)
-            .field("last_committed_epoch", &self.last_committed_epoch)
             .field("buffered_rows", &self.buffered_rows)
             .field("delta_version", &self.delta_version)
-            .field("epoch_skipped", &self.epoch_skipped)
             .finish_non_exhaustive()
     }
 }

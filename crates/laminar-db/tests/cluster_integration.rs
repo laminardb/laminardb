@@ -178,7 +178,9 @@ mod failures {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn split_brain_write_partial_rejected() {
         use bytes::Bytes;
-        use laminar_core::state::{ObjectStoreBackend, StateBackend, StateBackendError};
+        use laminar_core::state::{
+            CheckpointAttempt, ObjectStoreBackend, StateBackend, StateBackendError,
+        };
         use object_store::local::LocalFileSystem;
         use object_store::ObjectStore;
 
@@ -186,18 +188,20 @@ mod failures {
         let store: std::sync::Arc<dyn ObjectStore> =
             std::sync::Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("local fs"));
 
-        let fresh = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "leader", 4);
-        let stale = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "ex-leader", 4);
+        let fresh = ObjectStoreBackend::cluster_shared(std::sync::Arc::clone(&store), "leader", 4);
+        let stale =
+            ObjectStoreBackend::cluster_shared(std::sync::Arc::clone(&store), "ex-leader", 4);
 
         fresh.set_authoritative_version(3);
+        let attempt = CheckpointAttempt::new(1, 1);
         fresh
-            .write_partial(0, 1, 3, Bytes::from_static(b"fresh"))
+            .write_partial(attempt, 0, 3, Bytes::from_static(b"fresh"))
             .await
             .expect("fresh write at current version");
 
         stale.set_authoritative_version(3);
         let err = stale
-            .write_partial(0, 1, 2, Bytes::from_static(b"stale"))
+            .write_partial(attempt, 0, 2, Bytes::from_static(b"stale"))
             .await
             .expect_err("stale write must be rejected");
         match err {
@@ -211,7 +215,7 @@ mod failures {
             other => panic!("expected StaleVersion, got {other:?}"),
         }
 
-        let got = fresh.read_partial(0, 1).await.unwrap().unwrap();
+        let got = fresh.read_partial(attempt, 0).await.unwrap().unwrap();
         assert_eq!(&got[..], b"fresh");
     }
 
@@ -298,13 +302,18 @@ mod failures {
         }
 
         use bytes::Bytes;
-        use laminar_core::state::StateBackendError;
+        use laminar_core::state::{CheckpointAttempt, StateBackendError};
         let node = &harness.nodes[0];
         let authoritative = node.state_backend.authoritative_version();
         let stale_caller = authoritative - 1;
         let err = node
             .state_backend
-            .write_partial(0, 9_999, stale_caller, Bytes::from_static(b"stale"))
+            .write_partial(
+                CheckpointAttempt::new(9_999, 9_999),
+                0,
+                stale_caller,
+                Bytes::from_static(b"stale"),
+            )
             .await
             .expect_err("stale write must be rejected by the live fence");
         match err {
@@ -1442,7 +1451,7 @@ mod rebalance {
     use std::time::{Duration, Instant};
 
     use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
-    use laminar_core::state::NodeId;
+    use laminar_core::state::{CheckpointAttempt, NodeId};
 
     use super::cluster_harness::ClusterEngineHarness;
 
@@ -1700,6 +1709,7 @@ mod rebalance {
         use bytes::Bytes;
 
         const SEED_EPOCH: u64 = 50;
+        let seed_attempt = CheckpointAttempt::new(SEED_EPOCH, SEED_EPOCH);
 
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
         harness.start_all().await;
@@ -1715,13 +1725,13 @@ mod rebalance {
         let all_vnodes: Vec<u32> = (0..VNODE_COUNT).collect();
         for &v in &all_vnodes {
             backend
-                .write_partial(v, SEED_EPOCH, version, Bytes::from(format!("vnode-{v}")))
+                .write_partial(seed_attempt, v, version, Bytes::from(format!("vnode-{v}")))
                 .await
                 .expect("seed write_partial");
         }
         assert!(
             backend
-                .epoch_complete(SEED_EPOCH, &all_vnodes, &[])
+                .seal_checkpoint(seed_attempt, version, &all_vnodes, &[])
                 .await
                 .expect("seal seed epoch"),
             "seed epoch must seal once every vnode partial is present",
@@ -1855,7 +1865,7 @@ mod two_pc {
     use laminar_core::cluster::control::{BarrierAnnouncement, CheckpointDecisionStore, Phase};
     use laminar_core::cluster::testing::MiniCluster;
     use laminar_core::state::{
-        owned_vnodes, InProcessBackend, NodeId, StateBackend, VnodeRegistry,
+        owned_vnodes, CheckpointAttempt, InProcessBackend, NodeId, StateBackend, VnodeRegistry,
     };
     use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
@@ -1873,7 +1883,7 @@ mod two_pc {
         vnodes: Vec<u32>,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) -> CheckpointCoordinator {
-        let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
+        let store = Box::new(FileSystemCheckpointStore::new(dir));
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
@@ -1929,7 +1939,9 @@ mod two_pc {
             Arc::clone(&leader_node.controller),
         )
         .await;
-        leader_coord.set_decision_store(Arc::clone(&decision_store));
+        leader_coord
+            .set_decision_store(Arc::clone(&decision_store))
+            .unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
@@ -1937,7 +1949,9 @@ mod two_pc {
             Arc::clone(&follower_node.controller),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
+        follower_coord
+            .set_decision_store(Arc::clone(&decision_store))
+            .unwrap();
 
         let ann = BarrierAnnouncement {
             epoch: 1,
@@ -1970,8 +1984,9 @@ mod two_pc {
             .expect("follower checkpoint Result");
         assert!(committed, "follower must commit on leader's Commit");
 
+        let attempt = CheckpointAttempt::new(leader_result.epoch, leader_result.checkpoint_id);
         for v in 0..4 {
-            assert!(backend.read_partial(v, 1).await.unwrap().is_some());
+            assert!(backend.read_partial(attempt, v).await.unwrap().is_some());
         }
 
         cluster.shutdown().await;
@@ -2011,7 +2026,9 @@ mod two_pc {
             Arc::clone(&leader_node.controller),
         )
         .await;
-        leader_coord.set_decision_store(Arc::clone(&decision_store));
+        leader_coord
+            .set_decision_store(Arc::clone(&decision_store))
+            .unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
@@ -2019,7 +2036,9 @@ mod two_pc {
             Arc::clone(&follower_node.controller),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
+        follower_coord
+            .set_decision_store(Arc::clone(&decision_store))
+            .unwrap();
 
         let ann = BarrierAnnouncement {
             epoch: 1,
@@ -2069,7 +2088,7 @@ mod two_pc {
 
         let decision_dir = tempfile::tempdir().unwrap();
         let decision_store = make_decision_store(&decision_dir);
-        decision_store.record_committed(42).await.unwrap();
+        decision_store.record_committed(42, 42).await.unwrap();
 
         let follower_dir = tempfile::tempdir().unwrap();
         let mut follower_coord = make_coord(
@@ -2079,7 +2098,9 @@ mod two_pc {
             Arc::clone(&follower_node.controller),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
+        follower_coord
+            .set_decision_store(Arc::clone(&decision_store))
+            .unwrap();
 
         let ann = BarrierAnnouncement {
             epoch: 42,
@@ -2126,7 +2147,9 @@ mod two_pc {
             Arc::clone(&follower_node.controller),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
+        follower_coord
+            .set_decision_store(Arc::clone(&decision_store))
+            .unwrap();
 
         let ann = BarrierAnnouncement {
             epoch: 99,
@@ -2155,7 +2178,8 @@ mod minio {
     use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
     use laminar_core::cluster::testing::MiniCluster;
     use laminar_core::state::{
-        owned_vnodes, rendezvous_assignment, NodeId, ObjectStoreBackend, VnodeRegistry,
+        owned_vnodes, rendezvous_assignment, CheckpointAttempt, NodeId, ObjectStoreBackend,
+        VnodeRegistry,
     };
     use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
@@ -2174,7 +2198,7 @@ mod minio {
         gate_vnodes: Vec<u32>,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) -> CheckpointCoordinator {
-        let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
+        let store = Box::new(FileSystemCheckpointStore::new(dir));
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
@@ -2212,12 +2236,12 @@ mod minio {
         );
         let store = minio_store(&bucket).await;
 
-        let leader_backend = Arc::new(ObjectStoreBackend::new(
+        let leader_backend = Arc::new(ObjectStoreBackend::cluster_shared(
             Arc::clone(&store),
             leader_node.instance_id.0.to_string(),
             4,
         ));
-        let follower_backend = Arc::new(ObjectStoreBackend::new(
+        let follower_backend = Arc::new(ObjectStoreBackend::cluster_shared(
             Arc::clone(&store),
             follower_node.instance_id.0.to_string(),
             4,
@@ -2282,15 +2306,22 @@ mod minio {
         let committed = follower_handle.await.expect("join").expect("follower");
         assert!(committed, "follower must commit on leader's Commit");
 
+        let attempt = CheckpointAttempt::new(leader_result.epoch, leader_result.checkpoint_id);
         for v in 0..4 {
-            let path = object_store::path::Path::from(format!("epoch=1/vnode={v}/partial.bin"));
+            let path = object_store::path::Path::from(format!(
+                "state-v2/epoch={}/checkpoint={}/vnode={v}/partial.bin",
+                attempt.epoch, attempt.checkpoint_id
+            ));
             let meta = store.head(&path).await;
             assert!(meta.is_ok(), "missing partial for vnode {v}: {meta:?}");
         }
-        let commit_path = object_store::path::Path::from("epoch=1/_COMMIT");
+        let seal_path = object_store::path::Path::from(format!(
+            "state-v2/epoch={}/checkpoint={}/_SEAL",
+            attempt.epoch, attempt.checkpoint_id
+        ));
         assert!(
-            store.head(&commit_path).await.is_ok(),
-            "missing epoch=1/_COMMIT marker on MinIO",
+            store.head(&seal_path).await.is_ok(),
+            "missing exact-attempt _SEAL marker on MinIO",
         );
 
         cluster.shutdown().await;
@@ -2316,44 +2347,51 @@ mod minio {
                 .as_millis()
         );
         let store = minio_store(&bucket).await;
-        let node1 = ObjectStoreBackend::new(Arc::clone(&store), "1".to_string(), 4);
-        let node2 = ObjectStoreBackend::new(Arc::clone(&store), "2".to_string(), 4);
+        let node1 = ObjectStoreBackend::cluster_shared(Arc::clone(&store), "1".to_string(), 4);
+        let node2 = ObjectStoreBackend::cluster_shared(Arc::clone(&store), "2".to_string(), 4);
 
         let full = [0u32, 1, 2, 3];
         let required = ["node=1/sink=s".to_string(), "node=2/sink=s".to_string()];
+        let attempt = CheckpointAttempt::new(1, 1);
 
         // Node 1 writes its vnode slice and its commit descriptor.
         for v in [0u32, 1] {
             node1
-                .write_partial(v, 1, 0, Bytes::from_static(b"a"))
+                .write_partial(attempt, v, 0, Bytes::from_static(b"a"))
                 .await
                 .unwrap();
         }
         node1
-            .write_commit_descriptor(1, "node=1/sink=s", 0, Bytes::from_static(b"d1"))
+            .write_commit_descriptor(attempt, "node=1/sink=s", 0, Bytes::from_static(b"d1"))
             .await
             .unwrap();
 
         // Leader cannot seal yet — node 2's partials and descriptor are missing.
-        assert!(!node1.epoch_complete(1, &full, &required).await.unwrap());
+        assert!(!node1
+            .seal_checkpoint(attempt, 0, &full, &required)
+            .await
+            .unwrap());
 
         // Node 2 writes its slice and descriptor to the same bucket.
         for v in [2u32, 3] {
             node2
-                .write_partial(v, 1, 0, Bytes::from_static(b"b"))
+                .write_partial(attempt, v, 0, Bytes::from_static(b"b"))
                 .await
                 .unwrap();
         }
         node2
-            .write_commit_descriptor(1, "node=2/sink=s", 0, Bytes::from_static(b"d2"))
+            .write_commit_descriptor(attempt, "node=2/sink=s", 0, Bytes::from_static(b"d2"))
             .await
             .unwrap();
 
         // Now the leader seals: all partials and both descriptors are durable.
-        assert!(node1.epoch_complete(1, &full, &required).await.unwrap());
+        assert!(node1
+            .seal_checkpoint(attempt, 0, &full, &required)
+            .await
+            .unwrap());
 
         // The leader reads both nodes' descriptors for the committer to aggregate.
-        let mut descriptors = node1.read_commit_descriptors(1).await.unwrap();
+        let mut descriptors = node1.read_commit_descriptors(attempt).await.unwrap();
         descriptors.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             descriptors,

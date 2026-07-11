@@ -187,10 +187,20 @@ impl ReferenceTableSource for PostgresReferenceTableSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        SourceCheckpoint::new(u64::from(self.snapshot_done))
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("snapshot_complete", self.snapshot_done.to_string());
+        checkpoint
     }
 
-    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+        self.snapshot_done = match checkpoint.get_offset("snapshot_complete") {
+            Some(value) => value.parse().map_err(|_| {
+                ConnectorError::Internal(format!(
+                    "invalid snapshot_complete in checkpoint: '{value}'"
+                ))
+            })?,
+            None => false,
+        };
         Ok(())
     }
 
@@ -230,5 +240,32 @@ fn pg_type_to_arrow(pg_type: &tokio_postgres::types::Type) -> arrow_schema::Data
         Type::FLOAT8 => arrow_schema::DataType::Float64,
         // TIMESTAMP, UUID, JSONB, etc. → read as Utf8 (String).
         _ => arrow_schema::DataType::Utf8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_round_trip_preserves_snapshot_completion() {
+        let mut source = PostgresReferenceTableSource::new(ConnectorConfig::new("postgres"));
+        source.snapshot_done = true;
+
+        let checkpoint = source.checkpoint();
+        assert_eq!(checkpoint.get_offset("snapshot_complete"), Some("true"));
+
+        let mut restored = PostgresReferenceTableSource::new(ConnectorConfig::new("postgres"));
+        restored.restore(&checkpoint).await.unwrap();
+        assert!(restored.snapshot_done);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_invalid_snapshot_completion() {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("snapshot_complete", "complete");
+        let mut source = PostgresReferenceTableSource::new(ConnectorConfig::new("postgres"));
+
+        assert!(source.restore(&checkpoint).await.is_err());
     }
 }

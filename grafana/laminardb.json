@@ -199,13 +199,12 @@
       "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
     },
     {
-      "title": "Sink 2PC Latency (p99)",
+      "title": "Checkpoint Sink Preparation Latency (p99)",
       "type": "timeseries",
       "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "targets": [
-        { "expr": "histogram_quantile(0.99, rate(laminardb_sink_precommit_duration_seconds_bucket{instance=~\"$instance\",pipeline=~\"$pipeline\"}[5m]))", "legendFormat": "pre-commit p99" },
-        { "expr": "histogram_quantile(0.99, rate(laminardb_sink_commit_duration_seconds_bucket{instance=~\"$instance\",pipeline=~\"$pipeline\"}[5m]))", "legendFormat": "commit p99" }
+        { "expr": "histogram_quantile(0.99, rate(laminardb_sink_precommit_duration_seconds_bucket{instance=~\"$instance\",pipeline=~\"$pipeline\"}[5m]))", "legendFormat": "prepare/flush p99" }
       ],
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
     },

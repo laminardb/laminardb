@@ -104,8 +104,6 @@ pub struct IcebergSinkConfig {
     pub compression: String,
     /// Auto-create table if it doesn't exist.
     pub auto_create: bool,
-    /// Writer ID for exactly-once deduplication (auto UUID if not set).
-    pub writer_id: String,
 }
 
 impl IcebergSinkConfig {
@@ -123,16 +121,10 @@ impl IcebergSinkConfig {
             .get("auto.create")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
-        let writer_id = config
-            .get("writer.id")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| uuid::Uuid::now_v7().to_string(), ToString::to_string);
-
         Ok(Self {
             catalog,
             compression,
             auto_create,
-            writer_id,
         })
     }
 }
@@ -267,7 +259,6 @@ mod tests {
         assert_eq!(cfg.catalog.namespace, "prod");
         assert_eq!(cfg.catalog.table_name, "events");
         assert_eq!(cfg.compression, "snappy");
-        assert!(!cfg.writer_id.is_empty());
     }
 
     #[test]

@@ -23,7 +23,9 @@ use testcontainers::ImageExt;
 use tokio::time::sleep;
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SourceConnector;
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart,
+};
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, TopicSubscription};
 
 fn test_schema() -> SchemaRef {
@@ -34,6 +36,14 @@ fn test_schema() -> SchemaRef {
 }
 
 const REDPANDA_HOST_PORT: u16 = 19092;
+
+fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
+    SourceStart {
+        config: config.clone(),
+        position: SourcePosition::Initial,
+        delivery: DeliveryGuarantee::BestEffort,
+    }
+}
 
 async fn produce_messages(brokers: &str, topic: &str, count: usize) {
     let producer: FutureProducer = ClientConfig::new()
@@ -134,7 +144,10 @@ async fn roundtrip(brokers: &str) {
     let cfg = make_config(brokers, "test-roundtrip-group", topic);
     let mut source = KafkaSource::new(test_schema(), cfg, None);
     let connector_cfg = ConnectorConfig::new("kafka");
-    source.open(&connector_cfg).await.unwrap();
+    source
+        .start(initial_source_start(&connector_cfg))
+        .await
+        .unwrap();
 
     let batches = poll_all(&mut source, n, Duration::from_secs(30)).await;
 
@@ -173,7 +186,10 @@ async fn checkpoint_restore(brokers: &str) {
     let connector_cfg = ConnectorConfig::new("kafka");
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
-    source.open(&connector_cfg).await.unwrap();
+    source
+        .start(initial_source_start(&connector_cfg))
+        .await
+        .unwrap();
 
     poll_all(&mut source, n, Duration::from_secs(30)).await;
     let checkpoint = source.checkpoint();
@@ -188,8 +204,17 @@ async fn checkpoint_restore(brokers: &str) {
     produce_messages(brokers, topic, extra).await;
 
     let mut source2 = KafkaSource::new(test_schema(), cfg, None);
-    source2.open(&connector_cfg).await.unwrap();
-    source2.restore(&checkpoint).await.unwrap();
+    source2
+        .start(SourceStart {
+            config: connector_cfg,
+            position: SourcePosition::Resume {
+                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                checkpoint,
+            },
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        })
+        .await
+        .unwrap();
 
     let batches = poll_all(&mut source2, extra, Duration::from_secs(30)).await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -231,7 +256,10 @@ async fn poison_pill(brokers: &str) {
 
     let mut source = KafkaSource::new(test_schema(), cfg, None);
     let connector_cfg = ConnectorConfig::new("kafka");
-    source.open(&connector_cfg).await.unwrap();
+    source
+        .start(initial_source_start(&connector_cfg))
+        .await
+        .unwrap();
 
     let batches = poll_all(&mut source, 2, Duration::from_secs(30)).await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();

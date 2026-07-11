@@ -58,6 +58,7 @@ crossfire = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
@@ -108,7 +109,6 @@ base64 = { workspace = true, optional = true }
 # File source/sink
 globset = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
-xorf = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [features]
@@ -156,7 +156,7 @@ parquet-lookup = ["dep:parquet", "dep:object_store"]
 # WebSocket source and sink
 websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
 # File source and sink (AutoLoader-style)
-files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream", "dep:xorf"]
+files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream"]
 # OpenTelemetry OTLP/gRPC source
 otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
 # NATS core + JetStream source and sink

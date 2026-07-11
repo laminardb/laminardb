@@ -13,7 +13,9 @@ use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
+use crate::connector::{
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+};
 use crate::error::ConnectorError;
 
 use super::connection::ConnectionManager;
@@ -46,8 +48,6 @@ pub struct WebSocketSinkClient {
     state: ConnectorState,
     /// Metrics.
     metrics: WebSocketSinkMetrics,
-    /// Current epoch.
-    current_epoch: u64,
     /// Buffer for messages while disconnected.
     disconnect_buffer: VecDeque<String>,
     /// Max buffer size in bytes when disconnected.
@@ -82,7 +82,6 @@ impl WebSocketSinkClient {
             ws_sink: None,
             state: ConnectorState::Created,
             metrics: WebSocketSinkMetrics::new(registry),
-            current_epoch: 0,
             disconnect_buffer: VecDeque::new(),
             max_buffer_bytes,
             buffered_bytes: 0,
@@ -185,6 +184,24 @@ impl WebSocketSinkClient {
 
 #[async_trait]
 impl SinkConnector for WebSocketSinkClient {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            WebSocketSinkConfig::from_config(config)?
+        };
+        if !matches!(cfg.mode, SinkMode::Client { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "WebSocketSinkClient requires mode = 'client'".into(),
+            ));
+        }
+        Ok(SinkContract::new(
+            SinkConsistency::Ephemeral,
+            SinkTopology::NodeLocalEgress,
+            SinkInputMode::AppendOnly,
+        ))
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -275,16 +292,11 @@ impl SinkConnector for WebSocketSinkClient {
         self.schema.clone()
     }
 
-    fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::new(Duration::from_secs(10))
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(10)
     }
 
-    async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        self.current_epoch = epoch;
-        Ok(())
-    }
-
-    async fn commit_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn flush(&mut self) -> Result<(), ConnectorError> {
         // Flush the WebSocket.
         if let Some(ref mut sink) = self.ws_sink {
             sink.flush()
@@ -314,7 +326,6 @@ impl std::fmt::Debug for WebSocketSinkClient {
             .field("state", &self.state)
             .field("connected", &self.ws_sink.is_some())
             .field("buffered_messages", &self.disconnect_buffer.len())
-            .field("current_epoch", &self.current_epoch)
             .finish_non_exhaustive()
     }
 }
@@ -413,9 +424,12 @@ mod tests {
     }
 
     #[test]
-    fn test_capabilities() {
+    fn test_contract() {
         let sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
-        let caps = sink.capabilities();
-        assert!(!caps.exactly_once);
+        let contract = sink.contract(&ConnectorConfig::new("websocket")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
+        assert_eq!(contract.topology, SinkTopology::NodeLocalEgress);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(10));
     }
 }

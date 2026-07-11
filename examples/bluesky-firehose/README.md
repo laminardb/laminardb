@@ -174,9 +174,10 @@ flushes per batch, so each row arrives as its window closes.
 
 ## Notes
 
-- The WebSocket source can't replay on recovery, so delivery is
-  **at-most-once** for this source (logged at startup). Exactly-once
-  applies to replayable sources (Kafka, etc.).
+- The WebSocket source can't replay on recovery, so the config explicitly sets
+  the pipeline-wide delivery contract to **best effort**. A failure can lose
+  accepted events; at-least-once and exactly-once are rejected for this source
+  instead of being silently downgraded.
 - `GET http://127.0.0.1:7777/metrics` exposes Prometheus counters —
   `laminardb_events_ingested_total` vs `_emitted_total` is the
   server-side view of the same throughput `watch.py` measures.

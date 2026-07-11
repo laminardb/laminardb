@@ -15,7 +15,8 @@ use parking_lot::Mutex;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorInfo};
 use crate::connector::{
-    SinkConnector, SinkConnectorCapabilities, SourceBatch, SourceConnector, WriteResult,
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
+    SourceConnector, WriteResult,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
@@ -57,6 +58,7 @@ pub fn mock_batch(n: usize) -> RecordBatch {
 #[derive(Debug)]
 pub struct MockSourceConnector {
     schema: SchemaRef,
+    initial_batches: u64,
     batches_remaining: AtomicU64,
     batch_size: usize,
     records_produced: AtomicU64,
@@ -70,6 +72,7 @@ impl MockSourceConnector {
     pub fn new() -> Self {
         Self {
             schema: mock_schema(),
+            initial_batches: 10,
             batches_remaining: AtomicU64::new(10),
             batch_size: 5,
             records_produced: AtomicU64::new(0),
@@ -83,6 +86,7 @@ impl MockSourceConnector {
     pub fn with_batches(count: u64, batch_size: usize) -> Self {
         Self {
             schema: mock_schema(),
+            initial_batches: count,
             batches_remaining: AtomicU64::new(count),
             batch_size,
             records_produced: AtomicU64::new(0),
@@ -115,7 +119,36 @@ impl Default for MockSourceConnector {
 
 #[async_trait]
 impl SourceConnector for MockSourceConnector {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn start(
+        &mut self,
+        request: crate::connector::SourceStart,
+    ) -> Result<(), ConnectorError> {
+        let records = match request.position {
+            crate::connector::SourcePosition::Initial => 0,
+            crate::connector::SourcePosition::Resume { checkpoint, .. } => checkpoint
+                .get_offset("records")
+                .ok_or_else(|| {
+                    ConnectorError::ConfigurationError(
+                        "mock source checkpoint is missing 'records'".into(),
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|error| {
+                    ConnectorError::ConfigurationError(format!(
+                        "invalid mock source record cursor: {error}"
+                    ))
+                })?,
+        };
+        let consumed_batches = if self.batch_size == 0 {
+            0
+        } else {
+            records / self.batch_size as u64
+        };
+        self.records_produced.store(records, Ordering::Relaxed);
+        self.batches_remaining.store(
+            self.initial_batches.saturating_sub(consumed_batches),
+            Ordering::Relaxed,
+        );
         self.is_open
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -142,16 +175,12 @@ impl SourceConnector for MockSourceConnector {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset(
             "records",
             self.records_produced.load(Ordering::Relaxed).to_string(),
         );
         cp
-    }
-
-    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -179,7 +208,6 @@ pub struct MockSinkConnector {
     written: Arc<Mutex<Vec<RecordBatch>>>,
     records_written: AtomicU64,
     is_open: std::sync::atomic::AtomicBool,
-    current_epoch: AtomicU64,
 }
 
 impl MockSinkConnector {
@@ -191,7 +219,6 @@ impl MockSinkConnector {
             written: Arc::new(Mutex::new(Vec::new())),
             records_written: AtomicU64::new(0),
             is_open: std::sync::atomic::AtomicBool::new(false),
-            current_epoch: AtomicU64::new(0),
         }
     }
 
@@ -222,6 +249,14 @@ impl Default for MockSinkConnector {
 
 #[async_trait]
 impl SinkConnector for MockSinkConnector {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        Ok(SinkContract::new(
+            SinkConsistency::Ephemeral,
+            SinkTopology::NodeLocalEgress,
+            SinkInputMode::AppendOnly,
+        ))
+    }
+
     async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.is_open
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -241,25 +276,8 @@ impl SinkConnector for MockSinkConnector {
         self.schema.clone()
     }
 
-    async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        self.current_epoch.store(epoch, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn commit_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-
-    async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        // In a real implementation, this would discard buffered data
-        Ok(())
-    }
-
-    fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::new(Duration::from_secs(60))
-            .with_exactly_once()
-            .with_idempotent()
-            .with_two_phase_commit()
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(60)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -297,7 +315,7 @@ pub fn register_mock_sink(registry: &ConnectorRegistry) {
             is_sink: true,
             config_keys: vec![],
         },
-        Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSinkConnector::new())),
+        Arc::new(|_config, _registry| Ok(Box::new(MockSinkConnector::new()))),
     );
 }
 
@@ -315,7 +333,14 @@ mod tests {
     #[tokio::test]
     async fn test_mock_source_connector() {
         let mut source = MockSourceConnector::with_batches(3, 5);
-        source.open(&ConnectorConfig::new("mock")).await.unwrap();
+        source
+            .start(crate::connector::SourceStart {
+                config: ConnectorConfig::new("mock"),
+                position: crate::connector::SourcePosition::Initial,
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .unwrap();
 
         let b1 = source.poll_batch(100).await.unwrap();
         assert!(b1.is_some());
@@ -350,28 +375,37 @@ mod tests {
         assert_eq!(sink.batch_count(), 1);
         assert_eq!(sink.records_written(), 10);
 
-        // Test epoch management
-        sink.begin_epoch(1).await.unwrap();
         sink.write_batch(&mock_batch(5)).await.unwrap();
-        sink.commit_epoch(1).await.unwrap();
 
         assert_eq!(sink.records_written(), 15);
         assert_eq!(sink.batch_count(), 2);
 
-        let caps = sink.capabilities();
-        assert!(caps.exactly_once);
-        assert!(caps.idempotent);
+        let contract = sink.contract(&ConnectorConfig::new("mock")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
+        assert_eq!(contract.topology, SinkTopology::NodeLocalEgress);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(60));
 
         sink.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn test_mock_source_restore() {
+    async fn test_mock_source_resume() {
         let mut source = MockSourceConnector::new();
-        source.open(&ConnectorConfig::new("mock")).await.unwrap();
-
-        let cp = SourceCheckpoint::new(5);
-        assert!(source.restore(&cp).await.is_ok());
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("records", "10");
+        source
+            .start(crate::connector::SourceStart {
+                config: ConnectorConfig::new("mock"),
+                position: crate::connector::SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(5, 5),
+                    checkpoint,
+                },
+                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .unwrap();
+        assert_eq!(source.records_produced(), 10);
     }
 
     #[test]

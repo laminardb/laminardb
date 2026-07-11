@@ -17,7 +17,10 @@ use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+};
+use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
 
 use crate::schema::json::decoder::JsonDecoderConfig;
@@ -108,7 +111,16 @@ impl WebSocketSourceServer {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for WebSocketSourceServer {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket server is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
         self.state = ConnectorState::Initializing;
 
         // If config has properties, re-parse (supports runtime config via SQL WITH).
@@ -354,25 +366,18 @@ impl SourceConnector for WebSocketSourceServer {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        self.checkpoint_state.to_source_checkpoint(0)
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        info!(
-            epoch = checkpoint.epoch(),
-            "restoring WebSocket source server from checkpoint (best-effort)"
-        );
-        self.checkpoint_state = WebSocketSourceCheckpoint::from_source_checkpoint(checkpoint);
-        warn!("WebSocket source server restored; data gap expected (non-replayable)");
-        Ok(())
+        self.checkpoint_state.to_source_checkpoint()
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
 
-    fn supports_replay(&self) -> bool {
-        false
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract {
+            consistency: SourceConsistency::Ephemeral,
+            topology: SourceTopology::NodeLocalIngress,
+        })
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

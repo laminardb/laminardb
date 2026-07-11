@@ -189,6 +189,17 @@ fn parse_create_table_with(
 }
 
 impl LaminarDB {
+    fn ensure_topology_ddl_allowed(&self, operation: &str) -> Result<(), DbError> {
+        if self.checkpointed_topology_ddl_rejected() {
+            Err(DbError::Pipeline(format!(
+                "[LDB-6043] {operation} cannot change a running checkpointed topology; stop the \
+                 pipeline and reset/migrate its checkpoint state first"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Resolve `${VAR}` in connector + format options (config vars, then env) and
     /// verify the type is registered + format known — up front, before any
     /// catalog mutation. `None` when no connector is declared.
@@ -242,6 +253,7 @@ impl LaminarDB {
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("CREATE SOURCE")?;
         // Connectors are instantiated in start() — reject mid-run DDL. Match the
         // `connector` key case-insensitively, as `resolve_connector_info` does.
         let has_connector =
@@ -454,6 +466,7 @@ impl LaminarDB {
         &self,
         create: &laminar_sql::parser::CreateSinkStatement,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("CREATE SINK")?;
         let has_connector =
             create.connector_type.is_some() || has_connector_key(&create.with_options);
         if has_connector && self.connector_ddl_rejected() {
@@ -527,6 +540,7 @@ impl LaminarDB {
         &self,
         create: &sqlparser::ast::CreateTable,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("CREATE TABLE")?;
         let name = create.name.to_string();
         reject_reserved_namespace(&name)?;
 
@@ -612,6 +626,7 @@ impl LaminarDB {
         if_exists: bool,
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("DROP SOURCE")?;
         let name_str = name.to_string();
 
         if self.connector_ddl_rejected() {
@@ -721,6 +736,7 @@ impl LaminarDB {
         if_exists: bool,
         _cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("DROP SINK")?;
         let name_str = name.to_string();
 
         if self.connector_ddl_rejected() {
@@ -749,6 +765,7 @@ impl LaminarDB {
         query_sql: &str,
         retention_bytes: Option<u64>,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("CREATE STREAM")?;
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
         // A stream over an incremental MV must net the changelog — an aggregate or a simple
@@ -856,6 +873,7 @@ impl LaminarDB {
         if_exists: bool,
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("DROP STREAM")?;
         let name_str = name.to_string();
 
         if cascade {
@@ -1070,6 +1088,7 @@ impl LaminarDB {
         if_not_exists: bool,
         query_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("CREATE MATERIALIZED VIEW")?;
         let name_str = name.to_string();
         reject_reserved_namespace(&name_str)?;
 
@@ -1368,11 +1387,7 @@ impl LaminarDB {
         if has_window {
             return (IncEmit::None, false);
         }
-        let flag = self
-            .config
-            .checkpoint
-            .as_ref()
-            .is_some_and(|cp| cp.incremental_emit);
+        let flag = self.config.incremental_emit;
         let reads_incremental = self.first_incremental_ref(query_sql).is_some();
         let Some(df) = self.ctx.sql(query_sql).await.ok() else {
             return (IncEmit::None, false);
@@ -1478,6 +1493,7 @@ impl LaminarDB {
         if_exists: bool,
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("DROP MATERIALIZED VIEW")?;
         let name_str = name.to_string();
 
         let mut dropped_names;
@@ -1575,6 +1591,7 @@ impl LaminarDB {
         names: &[sqlparser::ast::ObjectName],
         if_exists: bool,
     ) -> Result<ExecuteResult, DbError> {
+        self.ensure_topology_ddl_allowed("DROP TABLE")?;
         for obj_name in names {
             let name_str = obj_name.to_string();
 

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::{
-    backend::StateBackend, in_process::InProcessBackend, object_store::ObjectStoreBackend,
+    backend::{StateBackend, StateBackendDurability},
+    in_process::InProcessBackend,
+    object_store::ObjectStoreBackend,
 };
 
 /// Default number of vnodes if the user does not override.
@@ -68,7 +70,7 @@ pub enum StateBackendConfig {
     Local {
         /// Filesystem root for state.
         path: PathBuf,
-        /// Node identity (written into epoch commit markers for audit).
+        /// Node identity (written into exact-attempt state seals for audit).
         #[serde(default = "default_instance_id")]
         instance_id: String,
         /// Number of vnodes the backend should size for.
@@ -76,8 +78,8 @@ pub enum StateBackendConfig {
         vnode_capacity: u32,
     },
 
-    /// Durable shared-state backend on S3 / GCS / Azure. Used by all
-    /// distributed-embedded and cluster modes.
+    /// Object-store backend. Cloud URLs (`s3://`, `gs://`, `az://`) are
+    /// cluster-shared; `file://` is node-durable only.
     ObjectStore {
         /// Object store URL: `s3://bucket/prefix`, `gs://bucket/prefix`,
         /// etc.
@@ -195,7 +197,7 @@ impl StateBackendConfig {
                     .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
                 let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
                     .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                Ok(Arc::new(ObjectStoreBackend::new(
+                Ok(Arc::new(ObjectStoreBackend::node_durable(
                     Arc::new(fs),
                     instance_id,
                     *vnode_capacity,
@@ -209,11 +211,18 @@ impl StateBackendConfig {
                 ..
             } => {
                 let store = cloud_store(url, storage)?;
-                Ok(Arc::new(ObjectStoreBackend::new(
-                    store,
-                    instance_id,
-                    *vnode_capacity,
-                )))
+                let backend = match self.durability_scope() {
+                    StateBackendDurability::Volatile => {
+                        ObjectStoreBackend::new(store, instance_id, *vnode_capacity)
+                    }
+                    StateBackendDurability::NodeDurable => {
+                        ObjectStoreBackend::node_durable(store, instance_id, *vnode_capacity)
+                    }
+                    StateBackendDurability::ClusterShared => {
+                        ObjectStoreBackend::cluster_shared(store, instance_id, *vnode_capacity)
+                    }
+                };
+                Ok(Arc::new(backend))
             }
         }
     }
@@ -251,11 +260,18 @@ impl StateBackendConfig {
         }
     }
 
-    /// Returns true if this backend persists state across process
-    /// restarts.
+    /// Failure scope survived by the configured backend.
+    ///
+    /// A local path and `file://` survive a same-node process restart but do
+    /// not claim peer visibility. Supported cloud schemes name a shared
+    /// service and therefore satisfy cluster recovery admission.
     #[must_use]
-    pub fn is_durable(&self) -> bool {
-        !matches!(self, Self::InProcess { .. })
+    pub fn durability_scope(&self) -> StateBackendDurability {
+        match self {
+            Self::InProcess { .. } => StateBackendDurability::Volatile,
+            Self::Local { .. } => StateBackendDurability::NodeDurable,
+            Self::ObjectStore { url, .. } => StateBackendDurability::for_storage_url(url),
+        }
     }
 
     /// Number of vnodes this backend is sized for.
@@ -301,7 +317,7 @@ mod tests {
                 vnode_capacity: 256
             }
         ));
-        assert!(!c.is_durable());
+        assert_eq!(c.durability_scope(), StateBackendDurability::Volatile);
         assert!(c.local_storage_dir().is_none());
     }
 
@@ -317,12 +333,32 @@ vnode_capacity = 128
             c.local_storage_dir(),
             Some(std::path::Path::new("/var/laminar"))
         );
-        assert!(c.is_durable());
+        assert_eq!(c.durability_scope(), StateBackendDurability::NodeDurable);
         if let StateBackendConfig::Local { vnode_capacity, .. } = c {
             assert_eq!(vnode_capacity, 128);
         } else {
             panic!("expected Local");
         }
+    }
+
+    #[test]
+    fn storage_url_durability_is_fail_closed() {
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file:///var/lib/laminar"),
+            StateBackendDurability::NodeDurable
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("s3://bucket/state"),
+            StateBackendDurability::ClusterShared
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("memory://state"),
+            StateBackendDurability::Volatile
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("custom://state"),
+            StateBackendDurability::Volatile
+        );
     }
 
     #[test]
@@ -335,6 +371,7 @@ vnodes = [0, 1, 2, 3]
 merger_instance = "node-0"
 "#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.durability_scope(), StateBackendDurability::ClusterShared);
         match c {
             StateBackendConfig::ObjectStore {
                 url,
@@ -379,36 +416,46 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
 
     #[tokio::test]
     async fn build_in_process_returns_backend() {
+        use crate::state::CheckpointAttempt;
         use bytes::Bytes;
         let c = StateBackendConfig::in_process();
         let backend = c.build().await.unwrap();
+        assert_eq!(backend.durability_scope(), StateBackendDurability::Volatile);
+        let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(0, 1, 0, Bytes::from_static(b"ok"))
+            .write_partial(attempt, 0, 0, Bytes::from_static(b"ok"))
             .await
             .unwrap();
         assert_eq!(
-            &backend.read_partial(0, 1).await.unwrap().unwrap()[..],
+            &backend.read_partial(attempt, 0).await.unwrap().unwrap()[..],
             b"ok",
         );
     }
 
     #[tokio::test]
     async fn build_local_instantiates_backend() {
+        use crate::state::CheckpointAttempt;
         let dir = tempfile::tempdir().unwrap();
         let c = StateBackendConfig::local(dir.path());
         let backend = c.build().await.unwrap();
+        assert_eq!(
+            backend.durability_scope(),
+            StateBackendDurability::NodeDurable
+        );
+        let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(0, 1, 0, bytes::Bytes::from_static(b"z"))
+            .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
         assert_eq!(
-            &backend.read_partial(0, 1).await.unwrap().unwrap()[..],
+            &backend.read_partial(attempt, 0).await.unwrap().unwrap()[..],
             b"z",
         );
     }
 
     #[tokio::test]
     async fn build_object_store_file_url_instantiates_backend() {
+        use crate::state::CheckpointAttempt;
         let dir = tempfile::tempdir().unwrap();
         let url = format!(
             "file://{}",
@@ -416,11 +463,16 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         );
         let c = StateBackendConfig::object_store(url, "node-0");
         let backend = c.build().await.unwrap();
+        assert_eq!(
+            backend.durability_scope(),
+            StateBackendDurability::NodeDurable
+        );
+        let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(0, 1, 0, bytes::Bytes::from_static(b"z"))
+            .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
-        let got = backend.read_partial(0, 1).await.unwrap().unwrap();
+        let got = backend.read_partial(attempt, 0).await.unwrap().unwrap();
         assert_eq!(&got[..], b"z");
     }
 

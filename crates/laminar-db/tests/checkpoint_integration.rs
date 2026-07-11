@@ -1,6 +1,24 @@
 #![allow(clippy::disallowed_types)]
 //! Unified checkpoint integration tests.
 
+type DecisionStore = laminar_core::checkpoint_decision::CheckpointDecisionStore;
+
+fn in_memory_decision_store() -> std::sync::Arc<DecisionStore> {
+    std::sync::Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    )
+}
+
+fn bind_in_memory_decision_store(
+    coordinator: &mut laminar_db::checkpoint_coordinator::CheckpointCoordinator,
+) {
+    coordinator
+        .set_decision_store(in_memory_decision_store())
+        .unwrap();
+}
+
 mod disk_persistence {
     use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
     use laminar_core::streaming::StreamCheckpointConfig;
@@ -63,7 +81,7 @@ mod disk_persistence {
         );
 
         // Verify the store can load the manifest
-        let store = FileSystemCheckpointStore::new(&storage, 3);
+        let store = FileSystemCheckpointStore::new(&storage);
         let manifest = store.load_latest().await.unwrap();
         assert!(manifest.is_some(), "manifest should be loadable from disk");
 
@@ -104,7 +122,9 @@ mod exactly_once {
     use tokio::sync::Notify;
 
     use laminar_connectors::checkpoint::SourceCheckpoint;
-    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
+    use laminar_connectors::connector::{SourceConsistency, SourceContract, SourceTopology};
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
@@ -112,16 +132,15 @@ mod exactly_once {
         CycleError, CycleOutcome, PipelineCallback, PipelineConfig, SourceRegistration,
         StreamingCoordinator,
     };
-    use laminar_db::recovery_manager::RecoveryManager;
 
     /// A callback that tracks barrier checkpoint calls and records state.
     struct BarrierTrackingCallback {
         cycle_count: u64,
         barrier_checkpoints: Vec<FxHashMap<String, SourceCheckpoint>>,
-        force_checkpoints: u64,
         should_trigger: Arc<AtomicBool>,
         total_records_processed: Arc<AtomicU64>,
         barrier_counter: Option<Arc<AtomicU64>>,
+        next_attempt: u64,
     }
 
     impl BarrierTrackingCallback {
@@ -129,10 +148,10 @@ mod exactly_once {
             Self {
                 cycle_count: 0,
                 barrier_checkpoints: Vec::new(),
-                force_checkpoints: 0,
                 should_trigger,
                 total_records_processed: record_counter,
                 barrier_counter: None,
+                next_attempt: 1,
             }
         }
 
@@ -173,18 +192,13 @@ mod exactly_once {
             0
         }
 
-        async fn maybe_checkpoint(
+        async fn service_checkpoint_control(
             &mut self,
-            force: bool,
             _source_offsets: rustc_hash::FxHashMap<
                 String,
                 laminar_connectors::checkpoint::SourceCheckpoint,
             >,
         ) -> Option<u64> {
-            if force {
-                self.force_checkpoints += 1;
-                return Some(self.force_checkpoints);
-            }
             if self.should_trigger.load(Ordering::Relaxed) {
                 Some(1)
             } else {
@@ -192,17 +206,29 @@ mod exactly_once {
             }
         }
 
+        async fn reserve_checkpoint_attempt(
+            &mut self,
+            _attempt_started: std::time::Instant,
+        ) -> Result<CheckpointAttempt, String> {
+            let id = self.next_attempt;
+            self.next_attempt = self
+                .next_attempt
+                .checked_add(1)
+                .ok_or_else(|| "test checkpoint attempt space exhausted".to_string())?;
+            Ok(CheckpointAttempt::new(id, id))
+        }
+
         async fn checkpoint_with_barrier(
             &mut self,
             source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-            _checkpoint_id: u64,
+            attempt: CheckpointAttempt,
+            _attempt_started: std::time::Instant,
         ) -> laminar_db::pipeline::BarrierOutcome {
-            let epoch = self.barrier_checkpoints.len() as u64 + 1;
             self.barrier_checkpoints.push(source_checkpoints);
             if let Some(ref counter) = self.barrier_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
-            laminar_db::pipeline::BarrierOutcome::Committed(epoch)
+            laminar_db::pipeline::BarrierOutcome::Committed(attempt.epoch)
         }
 
         fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}
@@ -223,8 +249,11 @@ mod exactly_once {
                 laminar_connectors::testing::MockSourceConnector::with_batches(10_000, 10),
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
-            supports_replay: true,
-            restore_checkpoint: None,
+            contract: SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Splittable,
+            ),
+            position: laminar_connectors::connector::SourcePosition::Initial,
         }];
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = Arc::clone(&shutdown);
@@ -278,8 +307,11 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(50, 10),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                supports_replay: true,
-                restore_checkpoint: None,
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Splittable,
+                ),
+                position: laminar_connectors::connector::SourcePosition::Initial,
             },
             SourceRegistration {
                 name: "src_b".to_string(),
@@ -287,8 +319,11 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(50, 10),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                supports_replay: true,
-                restore_checkpoint: None,
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Splittable,
+                ),
+                position: laminar_connectors::connector::SourcePosition::Initial,
             },
         ];
 
@@ -299,7 +334,7 @@ mod exactly_once {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
             checkpoint_interval: Some(Duration::from_millis(10)),
-            barrier_alignment_timeout: Duration::from_secs(5),
+            checkpoint_timeout: Duration::from_secs(5),
             ..PipelineConfig::default()
         };
 
@@ -356,15 +391,21 @@ mod exactly_once {
                 name: "src_a".to_string(),
                 connector: Box::new(src_a),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                supports_replay: true,
-                restore_checkpoint: None,
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Splittable,
+                ),
+                position: laminar_connectors::connector::SourcePosition::Initial,
             },
             SourceRegistration {
                 name: "src_b".to_string(),
                 connector: Box::new(src_b),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                supports_replay: true,
-                restore_checkpoint: None,
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Splittable,
+                ),
+                position: laminar_connectors::connector::SourcePosition::Initial,
             },
         ];
 
@@ -375,7 +416,7 @@ mod exactly_once {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
             checkpoint_interval: Some(Duration::from_millis(10)),
-            barrier_alignment_timeout: Duration::from_secs(5),
+            checkpoint_timeout: Duration::from_secs(5),
             ..PipelineConfig::default()
         };
 
@@ -422,10 +463,11 @@ mod exactly_once {
         let dir = tempfile::tempdir().unwrap();
 
         // Run pipeline, trigger barrier checkpoint, persist.
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 5));
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
+        super::bind_in_memory_decision_store(&mut coord);
 
         let mut operator_states = HashMap::new();
         operator_states.insert(
@@ -438,7 +480,6 @@ mod exactly_once {
             "src_a".to_string(),
             laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint {
                 offsets: HashMap::from([("records".into(), "500".into())]),
-                epoch: 1,
                 metadata: HashMap::new(),
             },
         );
@@ -446,7 +487,6 @@ mod exactly_once {
             "src_b".to_string(),
             laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint {
                 offsets: HashMap::from([("records".into(), "300".into())]),
-                epoch: 1,
                 metadata: HashMap::new(),
             },
         );
@@ -461,7 +501,6 @@ mod exactly_once {
                 watermark: Some(4500),
                 source_offset_overrides: source_overrides,
                 source_watermarks,
-                pipeline_hash: Some(0xDEAD_BEEF),
                 ..CheckpointRequest::default()
             })
             .await
@@ -472,9 +511,8 @@ mod exactly_once {
 
         drop(coord);
 
-        let store = FileSystemCheckpointStore::new(dir.path(), 5);
-        let mgr = RecoveryManager::new(&store);
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path());
+        let manifest = store.load_latest().await.unwrap().unwrap();
 
         assert_eq!(manifest.epoch, 1);
         assert_eq!(manifest.watermark, Some(4500));
@@ -500,7 +538,10 @@ mod exactly_once {
 
         assert_eq!(manifest.source_watermarks.get("src_a"), Some(&5000));
         assert_eq!(manifest.source_watermarks.get("src_b"), Some(&4500));
-        assert_eq!(manifest.pipeline_hash, Some(0xDEAD_BEEF));
+        assert_eq!(
+            manifest.pipeline_identity,
+            laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty()
+        );
     }
 
     #[tokio::test]
@@ -511,8 +552,11 @@ mod exactly_once {
                 laminar_connectors::testing::MockSourceConnector::with_batches(100, 5),
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
-            supports_replay: true,
-            restore_checkpoint: None,
+            contract: SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Splittable,
+            ),
+            position: laminar_connectors::connector::SourcePosition::Initial,
         }];
 
         let shutdown = Arc::new(Notify::new());
@@ -522,7 +566,7 @@ mod exactly_once {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
             checkpoint_interval: Some(Duration::from_millis(10)),
-            barrier_alignment_timeout: Duration::from_secs(5),
+            checkpoint_timeout: Duration::from_secs(5),
             ..PipelineConfig::default()
         };
 
@@ -565,8 +609,11 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(3, 5),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                supports_replay: true,
-                restore_checkpoint: None,
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Splittable,
+                ),
+                position: laminar_connectors::connector::SourcePosition::Initial,
             },
             SourceRegistration {
                 name: "fast_b".to_string(),
@@ -574,8 +621,11 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(3, 5),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                supports_replay: true,
-                restore_checkpoint: None,
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Splittable,
+                ),
+                position: laminar_connectors::connector::SourcePosition::Initial,
             },
         ];
 
@@ -586,7 +636,7 @@ mod exactly_once {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
             checkpoint_interval: Some(Duration::from_millis(5)),
-            barrier_alignment_timeout: Duration::from_secs(1),
+            checkpoint_timeout: Duration::from_secs(1),
             ..PipelineConfig::default()
         };
 
@@ -644,6 +694,10 @@ mod performance {
 
     #[async_trait]
     impl CheckpointStore for SlowCheckpointStore {
+        async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
+            Ok(vec![])
+        }
+
         async fn save(&self, _manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
             tokio::time::sleep(self.delay).await;
             Ok(())
@@ -664,7 +718,7 @@ mod performance {
             Ok(vec![])
         }
 
-        async fn prune(&self, _keep_count: usize) -> Result<usize, CheckpointStoreError> {
+        async fn prune_before(&self, _before_epoch: u64) -> Result<usize, CheckpointStoreError> {
             Ok(0)
         }
 
@@ -689,6 +743,7 @@ mod performance {
         let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
+        super::bind_in_memory_decision_store(&mut coordinator);
 
         let (tx, rx) = crossfire::mpsc::bounded_async::<Duration>(100);
 
@@ -741,6 +796,31 @@ mod performance {
             max_interval
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_uses_one_end_to_end_attempt_deadline() {
+        let store = Box::new(SlowCheckpointStore::new(Duration::from_secs(30)));
+        let mut config = CheckpointConfig::default();
+        config.checkpoint_timeout = Duration::from_millis(100);
+        let mut coordinator = CheckpointCoordinator::new(config, store).await.unwrap();
+        super::bind_in_memory_decision_store(&mut coordinator);
+
+        let started = tokio::time::Instant::now();
+        let result = coordinator
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("end-to-end deadline")));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a 30s store operation must be cut off by the 100ms attempt deadline"
+        );
+    }
 }
 
 mod recovery {
@@ -753,17 +833,18 @@ mod recovery {
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use laminar_db::recovery_manager::RecoveryManager;
 
     fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
-        FileSystemCheckpointStore::new(dir, 5)
+        FileSystemCheckpointStore::new(dir)
     }
 
     async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
         let store = Box::new(make_store(dir));
-        CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
-            .unwrap()
+            .unwrap();
+        super::bind_in_memory_decision_store(&mut coordinator);
+        coordinator
     }
 
     #[tokio::test]
@@ -792,9 +873,7 @@ mod recovery {
         assert_eq!(result.epoch, 1);
 
         let store = make_store(dir.path());
-        let mgr = RecoveryManager::new(&store);
-
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let manifest = store.load_latest().await.unwrap().unwrap();
         assert_eq!(manifest.checkpoint_id, 1);
         assert_eq!(manifest.epoch, 1);
         assert_eq!(manifest.watermark, Some(5000));
@@ -807,9 +886,8 @@ mod recovery {
     async fn test_recovery_fresh_start() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
-        let mgr = RecoveryManager::new(&store);
 
-        let result = mgr.load_latest().await.unwrap();
+        let result = store.load_latest().await.unwrap();
         assert!(result.is_none(), "fresh start should return None");
     }
 
@@ -824,8 +902,7 @@ mod recovery {
             store.save(&m).await.unwrap();
         }
 
-        let mgr = RecoveryManager::new(&store);
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let manifest = store.load_latest().await.unwrap().unwrap();
 
         assert_eq!(manifest.epoch, 3);
         assert_eq!(manifest.watermark, Some(3000));
@@ -844,7 +921,6 @@ mod recovery {
                     ("partition-0".into(), "1234".into()),
                     ("partition-1".into(), "5678".into()),
                 ]),
-                epoch: 5,
                 metadata: HashMap::from([("topic".into(), "trades".into())]),
             },
         );
@@ -852,14 +928,12 @@ mod recovery {
             "pg-orders".into(),
             ConnectorCheckpoint {
                 offsets: HashMap::from([("lsn".into(), "0/ABCDEF".into())]),
-                epoch: 5,
                 metadata: HashMap::from([("slot".into(), "laminar_slot".into())]),
             },
         );
         store.save(&manifest).await.unwrap();
 
-        let mgr = RecoveryManager::new(&store);
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let manifest = store.load_latest().await.unwrap().unwrap();
 
         let kafka = manifest.source_offsets.get("kafka-trades").unwrap();
         assert_eq!(kafka.offsets.get("partition-0"), Some(&"1234".into()));
@@ -888,8 +962,7 @@ mod recovery {
             .insert("filter".into(), OperatorCheckpoint::inline(&filter_state));
         store.save(&manifest).await.unwrap();
 
-        let mgr = RecoveryManager::new(&store);
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let manifest = store.load_latest().await.unwrap().unwrap();
 
         assert_eq!(manifest.operator_states.len(), 2);
 
@@ -916,8 +989,7 @@ mod recovery {
         assert!(result.success);
 
         let store = make_store(dir.path());
-        let mgr = RecoveryManager::new(&store);
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let manifest = store.load_latest().await.unwrap().unwrap();
 
         assert_eq!(
             manifest.table_store_checkpoint_path.as_deref(),
@@ -926,19 +998,32 @@ mod recovery {
     }
 
     #[tokio::test]
-    async fn test_coordinator_resumes_epoch_after_recovery() {
+    async fn test_coordinator_resumes_epoch_and_durable_id_after_recovery() {
         let dir = tempfile::tempdir().unwrap();
+        let reservation_objects: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
 
         {
-            let mut coord = make_coordinator(dir.path()).await;
+            let store = Box::new(make_store(dir.path()));
+            let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+                .await
+                .unwrap();
             coord
+                .set_decision_store(std::sync::Arc::new(
+                    laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+                        std::sync::Arc::clone(&reservation_objects),
+                    ),
+                ))
+                .unwrap();
+
+            let first = coord
                 .checkpoint(CheckpointRequest {
                     watermark: Some(1000),
                     ..CheckpointRequest::default()
                 })
                 .await
                 .unwrap();
-            coord
+            let second = coord
                 .checkpoint(CheckpointRequest {
                     watermark: Some(2000),
                     ..CheckpointRequest::default()
@@ -946,13 +1031,37 @@ mod recovery {
                 .await
                 .unwrap();
 
-            assert_eq!(coord.epoch(), 3);
-            assert_eq!(coord.next_checkpoint_id(), 3);
+            assert_eq!((first.epoch, first.checkpoint_id), (1, 1));
+            assert_eq!((second.epoch, second.checkpoint_id), (2, 2));
         }
 
-        let coord2 = make_coordinator(dir.path()).await;
-        assert_eq!(coord2.epoch(), 3);
-        assert_eq!(coord2.next_checkpoint_id(), 3);
+        // Re-create both coordinator and allocator over their persisted stores. The next
+        // successful checkpoint proves recovery resumed the local epoch and the durable ID
+        // reservation stream without consuming an ID merely to inspect allocator state.
+        let store = Box::new(make_store(dir.path()));
+        let mut restarted = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
+        restarted
+            .set_decision_store(std::sync::Arc::new(
+                laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+                    reservation_objects,
+                ),
+            ))
+            .unwrap();
+
+        let third = restarted
+            .checkpoint(CheckpointRequest {
+                watermark: Some(3000),
+                ..CheckpointRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!((third.epoch, third.checkpoint_id), (3, 3));
+
+        let manifest = make_store(dir.path()).load_latest().await.unwrap().unwrap();
+        assert_eq!((manifest.epoch, manifest.checkpoint_id), (3, 3));
+        assert_eq!(manifest.watermark, Some(3000));
     }
 
     #[tokio::test]
@@ -965,40 +1074,15 @@ mod recovery {
             "exchange_rates".into(),
             ConnectorCheckpoint {
                 offsets: HashMap::from([("lsn".into(), "0/FF00".into())]),
-                epoch: 1,
                 metadata: HashMap::new(),
             },
         );
         store.save(&manifest).await.unwrap();
 
-        let mgr = RecoveryManager::new(&store);
-        let manifest = mgr.load_latest().await.unwrap().unwrap();
+        let manifest = store.load_latest().await.unwrap().unwrap();
 
         let table_cp = manifest.table_offsets.get("exchange_rates").unwrap();
         assert_eq!(table_cp.offsets.get("lsn"), Some(&"0/FF00".into()));
-    }
-
-    #[tokio::test]
-    async fn test_checkpoint_store_prune_keeps_latest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        for i in 1..=5 {
-            let m = CheckpointManifest::new(i, i);
-            store.save(&m).await.unwrap();
-        }
-
-        let all = store.list().await.unwrap();
-        assert_eq!(all.len(), 5);
-
-        let pruned = store.prune(2).await.unwrap();
-        assert_eq!(pruned, 3);
-
-        let remaining = store.list().await.unwrap();
-        assert_eq!(remaining.len(), 2);
-
-        let latest = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(latest.checkpoint_id, 5);
     }
 
     #[test]
@@ -1011,11 +1095,9 @@ mod recovery {
             "kafka".into(),
             ConnectorCheckpoint {
                 offsets: HashMap::from([("p0".into(), "100".into())]),
-                epoch: 100,
                 metadata: HashMap::new(),
             },
         );
-        manifest.sink_epochs.insert("pg-sink".into(), 99);
         manifest
             .operator_states
             .insert("0".into(), OperatorCheckpoint::inline(b"state-bytes"));
@@ -1032,7 +1114,6 @@ mod recovery {
             restored.table_store_checkpoint_path.as_deref(),
             Some("/tmp/cp")
         );
-        assert_eq!(restored.sink_epochs.get("pg-sink"), Some(&99));
         assert_eq!(
             restored
                 .operator_states
@@ -1123,7 +1204,7 @@ mod restart {
         }
 
         {
-            let store = FileSystemCheckpointStore::new(&storage, 3);
+            let store = FileSystemCheckpointStore::new(&storage);
             let manifest = store.load_latest().await.unwrap();
             assert!(
                 manifest.is_some(),

@@ -77,6 +77,9 @@ pub struct LaminarConfig {
     pub storage_dir: Option<PathBuf>,
     /// Checkpoint config. `None` = disabled.
     pub checkpoint: Option<StreamCheckpointConfig>,
+    /// Emit dirty-only changelogs for keyed non-windowed aggregate materialized views instead of
+    /// re-materializing every group each cycle. This is query execution policy, not checkpointing.
+    pub incremental_emit: bool,
     /// Cloud checkpoint URL, e.g. `s3://bucket/prefix`.
     pub object_store_url: Option<String>,
     /// Credential/config overrides for the object store.
@@ -127,6 +130,7 @@ impl Default for LaminarConfig {
             default_backpressure: BackpressureStrategy::Block,
             storage_dir: None,
             checkpoint: None,
+            incremental_emit: true,
             object_store_url: None,
             object_store_options: HashMap::new(),
             http_auth_token: None,

@@ -1829,7 +1829,7 @@ impl IncrementalAggState {
         }
         // A fully-cold vnode (every resident group demoted — including a demoted global aggregate) is
         // in none of the sets above, yet its chain must keep advancing: otherwise it stages nothing,
-        // the coordinator writes an empty `base_epoch=None` partial, and the chain base is orphaned at
+        // the coordinator writes an empty `base=None` partial, and the chain base is orphaned at
         // once. Seed it so it emits an empty delta below the bound and a cold-carrying re-base at it.
         #[cfg(feature = "state-tier")]
         for k in self.cold_groups.keys() {
@@ -5110,7 +5110,7 @@ mod tests {
 
     /// A FULLY cold vnode (every resident group demoted — here the single group of a
     /// global aggregate) must stay in the capture set so its chain keeps advancing. Otherwise it
-    /// stages nothing, the coordinator writes an empty `base_epoch=None` partial that orphans the
+    /// stages nothing, the coordinator writes an empty `base=None` partial that orphans the
     /// chain base immediately, and recovery loses the demoted state. Asserts the vnode is captured
     /// every epoch and the re-base at the bound carries the cold group.
     #[cfg(feature = "state-tier")]

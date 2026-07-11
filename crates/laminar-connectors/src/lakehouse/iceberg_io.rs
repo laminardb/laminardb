@@ -166,8 +166,13 @@ pub fn current_snapshot_id(table: &Table) -> Option<i64> {
     table.metadata().current_snapshot().map(|s| s.snapshot_id())
 }
 
-/// Table property holding the highest epoch the designated committer sealed.
-const COORDINATED_EPOCH_PROP: &str = "laminardb.commit.epoch";
+fn coordinated_checkpoint_property(external_key: &str) -> String {
+    format!("laminardb.commit.{external_key}.checkpoint_id")
+}
+
+fn coordinated_epoch_property(external_key: &str) -> String {
+    format!("laminardb.commit.{external_key}.epoch")
+}
 
 /// Self-describing Iceberg commit payload: carries the spec/schema/format the
 /// files were serialized against so the committer decodes by the encoder's
@@ -253,20 +258,32 @@ pub fn decode_commit_descriptors(
     Ok(out)
 }
 
-/// Highest epoch the designated committer has sealed, per table properties.
-#[must_use]
-pub fn coordinated_committed_epoch(table: &Table) -> Option<u64> {
+/// Highest exact checkpoint id committed in one pipeline/sink namespace.
+///
+/// # Errors
+/// Returns a transaction error when the persisted cursor is malformed; exact
+/// recovery must not reinterpret corrupt metadata as an empty cursor.
+pub fn coordinated_committed_checkpoint_id(
+    table: &Table,
+    external_key: &str,
+) -> Result<Option<u64>, ConnectorError> {
+    let property = coordinated_checkpoint_property(external_key);
     table
         .metadata()
         .properties()
-        .get(COORDINATED_EPOCH_PROP)?
-        .parse()
-        .ok()
+        .get(&property)
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                ConnectorError::TransactionError(format!(
+                    "invalid Iceberg coordinated cursor '{property}'='{value}': {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
-/// Append `data_files` and stamp the coordinated-commit epoch in one atomic
-/// transaction. The epoch property is the idempotency guard: a re-run after
-/// leader failover is skipped by the caller once the table reflects `epoch`.
+/// Append `data_files` and stamp the namespaced exact checkpoint cursor in one
+/// atomic transaction. An empty file set still advances the cursor.
 ///
 /// # Errors
 /// Returns `ConnectorError::TransactionError` on commit failure.
@@ -274,17 +291,28 @@ pub async fn commit_data_files_coordinated(
     table: &Table,
     catalog: &dyn Catalog,
     data_files: Vec<iceberg::spec::DataFile>,
-    epoch: u64,
+    external_key: &str,
+    attempt: laminar_core::state::CheckpointAttempt,
 ) -> Result<Table, ConnectorError> {
     let tx = Transaction::new(table);
-    let tx: Transaction = tx
-        .fast_append()
-        .add_data_files(data_files)
-        .apply(tx)
-        .map_err(|e| ConnectorError::TransactionError(format!("apply fast_append: {e}")))?;
+    let tx = if data_files.is_empty() {
+        tx
+    } else {
+        tx.fast_append()
+            .add_data_files(data_files)
+            .apply(tx)
+            .map_err(|e| ConnectorError::TransactionError(format!("apply fast_append: {e}")))?
+    };
     let tx = tx
         .update_table_properties()
-        .set(COORDINATED_EPOCH_PROP.to_string(), epoch.to_string())
+        .set(
+            coordinated_checkpoint_property(external_key),
+            attempt.checkpoint_id.to_string(),
+        )
+        .set(
+            coordinated_epoch_property(external_key),
+            attempt.epoch.to_string(),
+        )
         .apply(tx)
         .map_err(|e| {
             ConnectorError::TransactionError(format!("apply update_table_properties: {e}"))

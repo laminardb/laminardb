@@ -377,9 +377,9 @@ async fn run_upsert_scenario(
     let dir = tempfile::tempdir().unwrap();
     let cfg = laminar_db::LaminarConfig {
         storage_dir: Some(dir.path().to_path_buf()),
+        incremental_emit: true,
         checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
             interval_ms: None,
-            incremental_emit: true,
             ..Default::default()
         }),
         ..Default::default()

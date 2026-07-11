@@ -1,6 +1,6 @@
 # laminar-connectors
 
-External system connectors for LaminarDB. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
+External system connectors for LaminarDB. Each connector declares a recovery and delivery contract; only checkpoint-committable sinks with coordinated external publication are admitted for exactly-once pipelines.
 
 ## Connectors
 
@@ -10,7 +10,7 @@ External system connectors for LaminarDB. Each connector implements the `SourceC
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | rdkafka consumer groups, Schema Registry | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | pgoutput logical replication | Implemented |
-| MySQL CDC | `mysql-cdc` | Binlog decoding, GTID position tracking | Implemented |
+| MySQL CDC | `mysql-cdc` | Single-table binlog decoding; best-effort only, without checkpoint resume | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking, `$changeStreamSplitLargeEvent` support | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
@@ -76,7 +76,7 @@ requirements:
 | `config` | `ConnectorConfig`, `ConfigKeySpec`, `ConnectorInfo`, `ConnectorState` |
 | `registry` | `ConnectorRegistry` for registering and looking up connectors by name |
 | `kafka` | Kafka source/sink, Avro serde, schema registry, partitioner, backpressure |
-| `postgres` | PostgreSQL sink (COPY BINARY, upsert, exactly-once) |
+| `postgres` | PostgreSQL durable at-least-once sink (COPY BINARY, upsert/changelog) |
 | `cdc/postgres` | PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
 | `cdc/mysql` | MySQL CDC source (binlog decoder, GTID, Z-set changelog) |
 | `mongodb` | MongoDB CDC source (change streams, resume tokens) and sink (ordered/unordered writes) |

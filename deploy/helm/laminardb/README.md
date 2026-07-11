@@ -41,13 +41,12 @@ laminardb:
   workers: 4
   
   state:
-    backend: local
-    path: "/var/lib/laminardb/state"
+    backend: object_store
+    url: "az://laminardb-checkpoints/cluster-state"
     
   checkpoint:
     interval: "30s"
-    mode: aligned
-    snapshotStrategy: incremental
+    timeout: "120s"
     # Object store so checkpoints are recoverable across nodes (credentials via extraEnv).
     url: "az://laminardb-checkpoints/cluster"
     
@@ -169,9 +168,9 @@ prometheusRule:
 | `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
 | `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.state.backend` | Storage type: `in_process`, `local`, or `object_store` | `local` |
+| `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or single-node `exactly_once` (cluster currently requires `at_least_once`) | `at_least_once` |
 | `laminardb.state.path` | Path for persistent state (required if backend=local) | `/var/lib/laminardb/state` |
 | `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |
-| `laminardb.checkpoint.enabled` | Enable checkpoint coordination | `true` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
 | `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |

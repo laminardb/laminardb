@@ -143,8 +143,10 @@ pub fn spawn_snapshot_watcher(
                     }
                     Ok(Some(snap)) if !snap.draining && snap.version > local => {
                         debug!(local, remote = snap.version, "adopting newer assignment");
-                        let adoption = db.adopt_assignment_snapshot(snap).await;
-                        log_adoption("watcher", &adoption);
+                        match db.adopt_assignment_snapshot(snap).await {
+                            Ok(adoption) => log_adoption("watcher", &adoption),
+                            Err(e) => warn!(error = %e, "snapshot watcher: adoption failed"),
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "snapshot watcher: load failed"),
@@ -424,7 +426,7 @@ async fn try_rebalance(
             }
             RotateOutcome::Conflict(winner) => {
                 let v = winner.version;
-                adopt_any(db, winner).await;
+                adopt_any(db, winner).await?;
                 controller.announce_snapshot_version(v).await;
                 return Ok(Some(v));
             }
@@ -508,7 +510,10 @@ async fn commit_snapshot(
     {
         RotateOutcome::Rotated => {
             let v = proposal.version;
-            let adoption = db.adopt_assignment_snapshot(proposal).await;
+            let adoption = db
+                .adopt_assignment_snapshot(proposal)
+                .await
+                .map_err(|e| e.to_string())?;
             log_adoption("rebalance", &adoption);
             controller.announce_snapshot_version(v).await;
             // Retain [v-1, v] as slack for in-flight readers.
@@ -519,7 +524,7 @@ async fn commit_snapshot(
         }
         RotateOutcome::Conflict(winner) => {
             let v = winner.version;
-            adopt_any(db, winner).await;
+            adopt_any(db, winner).await?;
             controller.announce_snapshot_version(v).await;
             Ok(Some(v))
         }
@@ -527,13 +532,17 @@ async fn commit_snapshot(
 }
 
 /// Adopt a snapshot whether it is a draining or a committed one.
-async fn adopt_any(db: &Arc<LaminarDB>, snap: AssignmentSnapshot) {
+async fn adopt_any(db: &Arc<LaminarDB>, snap: AssignmentSnapshot) -> Result<(), String> {
     if snap.draining {
         db.adopt_draining_snapshot(&snap);
     } else {
-        let adoption = db.adopt_assignment_snapshot(snap).await;
+        let adoption = db
+            .adopt_assignment_snapshot(snap)
+            .await
+            .map_err(|e| e.to_string())?;
         log_adoption("rebalance-conflict", &adoption);
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@
 //! `decoder` submodule, resolves column types against `schema::TableCache`, and
 //! emits Z-set `changelog::ChangeEvent`s that `MySqlCdcSource` converts into
 //! Arrow `RecordBatch`es on `poll_batch`.
-#![allow(dead_code)] // reader path is feature-gated; helpers are used conditionally
 #![allow(clippy::doc_markdown)] // MySQL terminology dominates — backtick-warning noise
 
 pub mod changelog;
@@ -22,7 +21,7 @@ pub use changelog::{
     column_value_to_json, delete_to_events, events_to_record_batch, insert_to_events, row_to_json,
     update_to_events, CdcOperation, ChangeEvent,
 };
-pub use config::{MySqlCdcConfig, SnapshotMode, SslMode};
+pub use config::{MySqlCdcConfig, SslMode};
 pub use decoder::{
     BeginMessage, BinlogMessage, BinlogPosition, ColumnValue, CommitMessage, DecoderError,
     DeleteMessage, InsertMessage, QueryMessage, RotateMessage, RowData, TableMapMessage,
@@ -77,15 +76,13 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
 /// Returns the configuration key specifications for `MySQL` CDC source.
 ///
 /// This is used for configuration discovery and validation.
-#[allow(clippy::too_many_lines)]
 fn mysql_cdc_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         // Connection settings
-        ConfigKeySpec::optional("host", "MySQL server hostname", "localhost"),
+        ConfigKeySpec::required("host", "MySQL server hostname"),
         ConfigKeySpec::optional("port", "MySQL server port", "3306"),
-        ConfigKeySpec::optional("database", "Database name to replicate", ""),
         ConfigKeySpec::required("username", "MySQL replication user"),
-        ConfigKeySpec::required("password", "MySQL replication password"),
+        ConfigKeySpec::optional("password", "MySQL replication password", ""),
         // SSL settings
         ConfigKeySpec::optional(
             "ssl.mode",
@@ -110,42 +107,23 @@ fn mysql_cdc_config_keys() -> Vec<ConfigKeySpec> {
             "Starting binlog position (if not using GTID)",
             "4",
         ),
-        // Snapshot settings
-        ConfigKeySpec::optional(
-            "snapshot.mode",
-            "Snapshot mode (initial/never/always/schema_only)",
-            "initial",
-        ),
         // Table filtering
-        ConfigKeySpec::optional(
+        ConfigKeySpec::required(
             "table.include",
-            "Comma-separated list of tables to include",
-            "",
+            "One fully-qualified database.table name; use one source per table",
+        ),
+        // Executed buffer/backpressure settings. Poll batch sizing and lifecycle deadlines are
+        // owned by the runtime rather than duplicated as connector properties.
+        ConfigKeySpec::optional(
+            "max.buffered.events",
+            "Maximum decoded events buffered before backpressure",
+            "100000",
         ),
         ConfigKeySpec::optional(
-            "table.exclude",
-            "Comma-separated list of tables to exclude",
-            "",
+            "backpressure.high.watermark",
+            "Buffer ratio at which reader-channel draining pauses",
+            "0.8",
         ),
-        ConfigKeySpec::optional("database.filter", "Database name filter pattern", ""),
-        // Tuning settings
-        ConfigKeySpec::optional(
-            "poll.timeout.ms",
-            "Timeout for polling binlog events (milliseconds)",
-            "1000",
-        ),
-        ConfigKeySpec::optional("max.poll.records", "Maximum records per poll batch", "1000"),
-        ConfigKeySpec::optional(
-            "heartbeat.interval.ms",
-            "Heartbeat interval (milliseconds)",
-            "30000",
-        ),
-        ConfigKeySpec::optional(
-            "connect.timeout.ms",
-            "Connection timeout (milliseconds)",
-            "10000",
-        ),
-        ConfigKeySpec::optional("read.timeout.ms", "Read timeout (milliseconds)", "60000"),
     ]
 }
 
@@ -167,19 +145,18 @@ mod tests {
     fn test_mysql_cdc_config_keys() {
         let specs = mysql_cdc_config_keys();
 
-        // Should have all expected keys
-        assert!(specs.len() >= 15);
+        assert_eq!(specs.len(), 13);
 
         // Required keys
         let required: Vec<_> = specs.iter().filter(|s| s.required).collect();
         assert!(required.iter().any(|s| s.key == "username"));
-        assert!(required.iter().any(|s| s.key == "password"));
         assert!(required.iter().any(|s| s.key == "server.id"));
+        assert!(required.iter().any(|s| s.key == "table.include"));
 
-        // Optional with defaults
+        // Optional executed settings with honest defaults.
         let host_spec = specs.iter().find(|s| s.key == "host").unwrap();
-        assert!(!host_spec.required);
-        assert_eq!(host_spec.default, Some("localhost".to_string()));
+        assert!(host_spec.required);
+        assert_eq!(host_spec.default, None);
 
         let port_spec = specs.iter().find(|s| s.key == "port").unwrap();
         assert!(!port_spec.required);
@@ -188,6 +165,21 @@ mod tests {
         let ssl_spec = specs.iter().find(|s| s.key == "ssl.mode").unwrap();
         assert!(!ssl_spec.required);
         assert_eq!(ssl_spec.default, Some("preferred".to_string()));
+
+        let password_spec = specs.iter().find(|s| s.key == "password").unwrap();
+        assert!(!password_spec.required);
+
+        for removed in [
+            "database",
+            "snapshot.mode",
+            "poll.timeout.ms",
+            "max.poll.records",
+            "heartbeat.interval.ms",
+            "connect.timeout.ms",
+            "read.timeout.ms",
+        ] {
+            assert!(specs.iter().all(|spec| spec.key != removed));
+        }
     }
 
     #[test]
@@ -195,7 +187,6 @@ mod tests {
         // Verify all expected types are exported
         let _config = MySqlCdcConfig::default();
         let _ssl = SslMode::Preferred;
-        let _snapshot = SnapshotMode::Initial;
         let _metrics = MySqlCdcMetrics::new(None);
         let _cache = TableCache::new();
         let _op = CdcOperation::Insert;

@@ -17,7 +17,9 @@ use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
+use crate::connector::{
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+};
 use crate::error::ConnectorError;
 
 use super::fanout::FanoutManager;
@@ -43,8 +45,6 @@ pub struct WebSocketSinkServer {
     state: ConnectorState,
     /// Metrics.
     metrics: Arc<WebSocketSinkMetrics>,
-    /// Current epoch.
-    current_epoch: u64,
     /// Shutdown signal sender.
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Acceptor task handle.
@@ -90,7 +90,6 @@ impl WebSocketSinkServer {
             fanout,
             state: ConnectorState::Created,
             metrics: Arc::new(WebSocketSinkMetrics::new(registry)),
-            current_epoch: 0,
             shutdown_tx: None,
             acceptor_handle: None,
             sequence: Arc::new(AtomicU64::new(0)),
@@ -119,6 +118,24 @@ impl WebSocketSinkServer {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SinkConnector for WebSocketSinkServer {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            WebSocketSinkConfig::from_config(config)?
+        };
+        if !matches!(cfg.mode, SinkMode::Server { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "WebSocketSinkServer requires mode = 'server'".into(),
+            ));
+        }
+        Ok(SinkContract::new(
+            SinkConsistency::Ephemeral,
+            SinkTopology::NodeLocalEgress,
+            SinkInputMode::AppendOnly,
+        ))
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -397,18 +414,9 @@ impl SinkConnector for WebSocketSinkServer {
         self.schema.clone()
     }
 
-    fn capabilities(&self) -> SinkConnectorCapabilities {
+    fn suggested_write_timeout(&self) -> Duration {
         // In-memory fanout — timeout is effectively unreachable.
-        SinkConnectorCapabilities::new(Duration::from_secs(10))
-    }
-
-    async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        self.current_epoch = epoch;
-        Ok(())
-    }
-
-    async fn commit_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        Ok(())
+        Duration::from_secs(10)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -434,7 +442,6 @@ impl std::fmt::Debug for WebSocketSinkServer {
             .field("state", &self.state)
             .field("connected_clients", &self.connected_clients())
             .field("format", &self.config.format)
-            .field("current_epoch", &self.current_epoch)
             .finish_non_exhaustive()
     }
 }
@@ -485,10 +492,12 @@ mod tests {
     }
 
     #[test]
-    fn test_capabilities() {
+    fn test_contract() {
         let sink = WebSocketSinkServer::new(test_schema(), test_config(), None);
-        let caps = sink.capabilities();
-        assert!(!caps.exactly_once);
-        assert!(!caps.upsert);
+        let contract = sink.contract(&ConnectorConfig::new("websocket")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
+        assert_eq!(contract.topology, SinkTopology::NodeLocalEgress);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(10));
     }
 }

@@ -55,3 +55,16 @@ INTO ICEBERG (
 [server]
 bind         = "127.0.0.1:7777"
 pgwire_bind  = "127.0.0.1:5432"
+delivery     = "exactly_once"
+
+# Exactly-once is a pipeline-wide setting. In embedded/single-node mode it
+# requires state that survives a process restart; connector-local delivery and
+# writer-ID options are intentionally not exposed.
+[state]
+backend      = "local"
+path         = "./.laminardb/state"
+instance_id  = "kafka-iceberg-demo"
+
+[checkpoint]
+url      = "file://./.laminardb/checkpoints"
+interval = "10s"

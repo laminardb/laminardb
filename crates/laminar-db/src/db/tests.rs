@@ -15,6 +15,24 @@ async fn test_open_default() {
 }
 
 #[tokio::test]
+async fn manual_checkpoint_before_start_fails_closed() {
+    let db = LaminarDB::open_with_config(LaminarConfig {
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let error = db.checkpoint().await.unwrap_err();
+    assert!(
+        matches!(&error, DbError::Checkpoint(message) if message.contains("not running")),
+        "manual checkpoint without a live coordinator must fail closed, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_create_source() {
     let db = LaminarDB::open().unwrap();
     let result = db
@@ -905,8 +923,8 @@ async fn fake_source_db(
     use arrow::datatypes::Schema as ArrowSchema;
     use async_trait::async_trait;
     use laminar_connectors::checkpoint::SourceCheckpoint;
-    use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
-    use laminar_connectors::connector::{SourceBatch, SourceConnector};
+    use laminar_connectors::config::ConnectorInfo;
+    use laminar_connectors::connector::{SourceBatch, SourceConnector, SourceStart};
     use laminar_connectors::error::ConnectorError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -918,7 +936,7 @@ async fn fake_source_db(
 
     #[async_trait]
     impl SourceConnector for FakeSource {
-        async fn open(&mut self, _: &ConnectorConfig) -> Result<(), ConnectorError> {
+        async fn start(&mut self, _: SourceStart) -> Result<(), ConnectorError> {
             Ok(())
         }
         async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
@@ -938,10 +956,7 @@ async fn fake_source_db(
             Arc::clone(&self.schema)
         }
         fn checkpoint(&self) -> SourceCheckpoint {
-            SourceCheckpoint::new(0)
-        }
-        async fn restore(&mut self, _: &SourceCheckpoint) -> Result<(), ConnectorError> {
-            Ok(())
+            SourceCheckpoint::new()
         }
         async fn close(&mut self) -> Result<(), ConnectorError> {
             Ok(())

@@ -14,7 +14,9 @@ use tracing::{debug, info, warn};
 
 use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
+use crate::connector::{
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+};
 use crate::error::ConnectorError;
 use crate::serde::{self, Format, RecordSerializer};
 
@@ -25,15 +27,13 @@ use super::partitioner::{
 use super::schema_registry::SchemaRegistryClient;
 use super::sink_config::{KafkaSinkConfig, PartitionStrategy, SinkEnvelope};
 use super::sink_metrics::KafkaSinkMetrics;
-use crate::connector::DeliveryGuarantee;
 
 /// Fallback partition count used only when broker metadata query fails.
 const FALLBACK_PARTITION_COUNT: i32 = 1;
 
 /// Short deadline used by `SinkConnector::flush` — kept well below any
 /// outer tokio timeout so a `spawn_blocking` flush can't outlive its
-/// caller and leak a blocking thread. Thorough drains go through
-/// `pre_commit` / `commit_epoch` / `close` with their own budgets.
+/// caller and leak a blocking thread. Shutdown uses its own longer budget.
 const PERIODIC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Contiguous key buffer — stores all key bytes in a single allocation
@@ -90,11 +90,12 @@ impl std::ops::Index<usize> for KeyBuffer {
 ///
 /// 1. Create with [`KafkaSink::new`]
 /// 2. Call `open()` to create the producer and connect to Kafka
-/// 3. For each epoch:
-///    - `begin_epoch()` starts a Kafka transaction (exactly-once only)
-///    - `write_batch()` serializes and produces records
-///    - `commit_epoch()` commits the transaction
+/// 3. `write_batch()` serializes and produces records; checkpoint flushes provide
+///    durable at-least-once delivery
 /// 4. Call `close()` for clean shutdown
+///
+/// This connector deliberately rejects exactly-once admission because it does
+/// not expose a coordinated external checkpoint namespace/cursor.
 pub struct KafkaSink {
     /// rdkafka producer (set during `open()`).
     producer: Option<FutureProducer>,
@@ -106,12 +107,6 @@ pub struct KafkaSink {
     partitioner: Box<dyn KafkaPartitioner>,
     /// Connector lifecycle state.
     state: ConnectorState,
-    /// Current `LaminarDB` epoch.
-    current_epoch: u64,
-    /// Last successfully committed epoch.
-    last_committed_epoch: u64,
-    /// Whether a Kafka transaction is currently active.
-    transaction_active: bool,
     /// Dead letter queue producer (separate, non-transactional).
     dlq_producer: Option<FutureProducer>,
     /// Production metrics.
@@ -151,9 +146,6 @@ impl KafkaSink {
             serializer,
             partitioner,
             state: ConnectorState::Created,
-            current_epoch: 0,
-            last_committed_epoch: 0,
-            transaction_active: false,
             dlq_producer: None,
             metrics: KafkaSinkMetrics::new(registry),
             schema,
@@ -192,9 +184,6 @@ impl KafkaSink {
             serializer,
             partitioner,
             state: ConnectorState::Created,
-            current_epoch: 0,
-            last_committed_epoch: 0,
-            transaction_active: false,
             dlq_producer: None,
             metrics: KafkaSinkMetrics::new(None),
             schema,
@@ -214,18 +203,6 @@ impl KafkaSink {
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
-    }
-
-    /// Active epoch (incremented by checkpoint coordinator).
-    #[must_use]
-    pub fn current_epoch(&self) -> u64 {
-        self.current_epoch
-    }
-
-    /// Last epoch that was successfully committed to Kafka.
-    #[must_use]
-    pub fn last_committed_epoch(&self) -> u64 {
-        self.last_committed_epoch
     }
 
     /// Ensures the sink schema and SR registration match the actual data.
@@ -367,8 +344,6 @@ impl KafkaSink {
             })
             .as_millis()
             .to_string();
-        let epoch_str = self.current_epoch.to_string();
-
         let headers = OwnedHeaders::new()
             .insert(rdkafka::message::Header {
                 key: "__dlq.error",
@@ -381,10 +356,6 @@ impl KafkaSink {
             .insert(rdkafka::message::Header {
                 key: "__dlq.timestamp",
                 value: Some(now.as_bytes()),
-            })
-            .insert(rdkafka::message::Header {
-                key: "__dlq.epoch",
-                value: Some(epoch_str.as_bytes()),
             });
 
         let mut record = FutureRecord::to(dlq_topic)
@@ -446,20 +417,6 @@ impl KafkaSink {
                 Err(rdkafka::error::KafkaError::Canceled)
             }
         }
-    }
-
-    /// Run a blocking producer operation on the thread pool. All
-    /// librdkafka transaction calls (`begin_transaction`,
-    /// `commit_transaction`, `abort_transaction`) are synchronous FFI.
-    async fn producer_blocking<F, R>(producer: &FutureProducer, op: F) -> R
-    where
-        F: FnOnce(&FutureProducer) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let p = producer.clone();
-        tokio::task::spawn_blocking(move || op(&p))
-            .await
-            .expect("producer_blocking: blocking task panicked")
     }
 
     /// Upsert-envelope produce: collapse the Z-set changelog to one record per merge key, then
@@ -592,6 +549,28 @@ impl KafkaSink {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SinkConnector for KafkaSink {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            KafkaSinkConfig::from_config(config)?
+        };
+        let consistency = if cfg.acks == super::sink_config::Acks::All {
+            // Kafka acknowledges these writes durably, but this connector does
+            // not produce an external checkpoint commit descriptor/cursor.
+            SinkConsistency::DurableAtLeastOnce
+        } else {
+            SinkConsistency::Ephemeral
+        };
+        let topology = SinkTopology::MultiWriter;
+        let input_mode = if cfg.envelope == SinkEnvelope::Upsert {
+            SinkInputMode::FullChangelog
+        } else {
+            SinkInputMode::AppendOnly
+        };
+        Ok(SinkContract::new(consistency, topology, input_mode))
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -606,12 +585,10 @@ impl SinkConnector for KafkaSink {
             )?;
             self.partitioner = select_partitioner(self.config.partitioner);
         }
-
         info!(
             brokers = %self.config.bootstrap_servers,
             topic = %self.config.topic,
             format = %self.config.format,
-            delivery = %self.config.delivery_guarantee,
             "opening Kafka sink connector"
         );
 
@@ -620,16 +597,7 @@ impl SinkConnector for KafkaSink {
             ConnectorError::ConnectionFailed(format!("failed to create producer: {e}"))
         })?;
 
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            producer
-                .init_transactions(self.config.transaction_timeout)
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!("failed to init transactions: {e}"))
-                })?;
-        }
-
-        // DLQ producer is non-transactional: error routing bypasses the exactly-once
-        // transaction so it stays decoupled from the main data path.
+        // Keep DLQ production decoupled from the main producer.
         if self.config.dlq_topic.is_some() {
             let dlq_config = self.config.to_dlq_rdkafka_config();
             let dlq_producer: FutureProducer = dlq_config.create().map_err(|e| {
@@ -802,8 +770,8 @@ impl SinkConnector for KafkaSink {
                     keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
                 if let Err(dlq_err) = self.route_to_dlq(&payloads[i], key, &err_msg).await {
                     // The DLQ send failed too (often correlated — the broker is down), so the
-                    // record exists nowhere. Count it so the epoch is poisoned rather than
-                    // committed around a lost record (CN-5).
+                    // record exists nowhere. Count it so the checkpoint interval is poisoned
+                    // rather than committed around a lost record (CN-5).
                     dlq_failed += 1;
                     warn!(
                         original_error = %err_msg,
@@ -825,8 +793,9 @@ impl SinkConnector for KafkaSink {
         );
 
         // A failed record is tolerated only if it was durably re-routed: no DLQ configured means
-        // every failure must poison the epoch; with a DLQ, only failures whose DLQ send ALSO
-        // failed (record lost) escalate (CN-5). Otherwise the sink task poisons the epoch.
+        // every failure must poison the checkpoint interval; with a DLQ, only failures whose DLQ
+        // send ALSO failed (record lost) escalate (CN-5). Otherwise the sink task records the
+        // failure for checkpoint admission.
         if failed > 0 && (self.dlq_producer.is_none() || dlq_failed > 0) {
             return Err(ConnectorError::WriteError(format!(
                 "Kafka produce: {failed}/{} records failed ({dlq_failed} also failed DLQ routing), \
@@ -843,191 +812,10 @@ impl SinkConnector for KafkaSink {
         self.schema.clone()
     }
 
-    async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        self.current_epoch = epoch;
-
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let producer = self
-                .producer
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "Running".into(),
-                    actual: self.state.to_string(),
-                })?;
-
-            // An already-open transaction is the continuation case: an
-            // abandoned epoch keeps its pending rows and the next
-            // epoch's commit covers them. Aborting here would lose them
-            // (a live abort is never replayed).
-            if self.transaction_active {
-                debug!(
-                    epoch,
-                    "transaction already open — pending rows ride into this epoch"
-                );
-                self.partitioner.reset();
-                return Ok(());
-            }
-
-            Self::producer_blocking(producer, FutureProducer::begin_transaction)
-                .await
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to begin transaction for epoch {epoch}: {e}"
-                    ))
-                })?;
-
-            self.transaction_active = true;
-        }
-
-        self.partitioner.reset();
-        debug!(epoch, "began epoch");
-        Ok(())
-    }
-
-    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
-        // Monotonic, not strict equality: the coordinator abandons
-        // failed epochs (ids are never reused), so the epoch sealing
-        // the currently open transaction may skip past the one
-        // `begin_epoch` was called with. Only a STALE epoch is an
-        // error — there is one open transaction and it always holds
-        // the rows since the last barrier.
-        if epoch < self.current_epoch {
-            return Err(ConnectorError::TransactionError(format!(
-                "stale epoch in pre_commit: current {}, got {epoch}",
-                self.current_epoch
-            )));
-        }
-        self.current_epoch = epoch;
-
-        // Flush all pending messages to Kafka brokers (phase 1).
-        if let Some(ref producer) = self.producer {
-            Self::flush_producer_async(producer, self.config.delivery_timeout)
-                .await
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to flush before pre-commit for epoch {epoch}: {e}"
-                    ))
-                })?;
-        }
-
-        debug!(epoch, "pre-committed epoch (flushed)");
-        Ok(None)
-    }
-
-    async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        // Monotonic for the same reason as `pre_commit`.
-        if epoch < self.current_epoch {
-            return Err(ConnectorError::TransactionError(format!(
-                "stale epoch in commit: current {}, got {epoch}",
-                self.current_epoch
-            )));
-        }
-        self.current_epoch = epoch;
-
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let producer = self
-                .producer
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "Running".into(),
-                    actual: self.state.to_string(),
-                })?;
-
-            Self::flush_producer_async(producer, self.config.delivery_timeout)
-                .await
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!("failed to flush before commit: {e}"))
-                })?;
-
-            let txn_timeout = self.config.transaction_timeout;
-            Self::producer_blocking(producer, move |p| p.commit_transaction(txn_timeout))
-                .await
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to commit transaction for epoch {epoch}: {e}"
-                    ))
-                })?;
-
-            self.transaction_active = false;
-        } else {
-            // At-least-once: just flush pending messages.
-            if let Some(ref producer) = self.producer {
-                Self::flush_producer_async(producer, self.config.delivery_timeout)
-                    .await
-                    .map_err(|e| {
-                        ConnectorError::TransactionError(format!(
-                            "failed to flush for epoch {epoch}: {e}"
-                        ))
-                    })?;
-            }
-        }
-
-        self.last_committed_epoch = epoch;
-        self.metrics.record_commit();
-        debug!(epoch, "committed epoch");
-        Ok(())
-    }
-
-    async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && self.transaction_active
-        {
-            let producer = self
-                .producer
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "Running".into(),
-                    actual: self.state.to_string(),
-                })?;
-
-            let txn_timeout = self.config.transaction_timeout;
-            Self::producer_blocking(producer, move |p| p.abort_transaction(txn_timeout))
-                .await
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to abort transaction for epoch {epoch}: {e}"
-                    ))
-                })?;
-
-            self.transaction_active = false;
-        }
-
-        self.metrics.record_rollback();
-        debug!(epoch, "rolled back epoch");
-        Ok(())
-    }
-
-    fn capabilities(&self) -> SinkConnectorCapabilities {
+    fn suggested_write_timeout(&self) -> Duration {
         // Catch stuck-broker scenarios faster than librdkafka's
         // delivery.timeout.ms (default 5min).
-        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(10))
-            .with_idempotent()
-            .with_partitioned();
-
-        // Upsert collapses a Z-set changelog to key-unique records + tombstones, so it can consume
-        // an incremental MV's changelog (append-only mode drops retractions). `with_changelog`
-        // keeps `prepare_for_sink` from stripping retracts before the sink, so deletes still become
-        // tombstones.
-        if self.config.envelope == SinkEnvelope::Upsert {
-            caps = caps.with_upsert().with_changelog();
-        }
-
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            // The single open transaction holds all rows since the last
-            // commit, so an abandoned epoch's rows ride into the next
-            // epoch's commit — no rollback needed (or wanted) on a live
-            // coordination failure.
-            caps = caps
-                .with_exactly_once()
-                .with_two_phase_commit()
-                .with_preserves_pending_on_abandon();
-        }
-
-        if self.schema_registry.is_some() {
-            caps = caps.with_schema_evolution();
-        }
-
-        caps
+        Duration::from_secs(10)
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
@@ -1041,13 +829,6 @@ impl SinkConnector for KafkaSink {
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka sink connector");
-
-        // Abort any active transaction.
-        if self.transaction_active {
-            if let Err(e) = self.rollback_epoch(self.current_epoch).await {
-                warn!(error = %e, "failed to abort active transaction on close");
-            }
-        }
 
         let mut first_err: Option<ConnectorError> = None;
 
@@ -1085,11 +866,7 @@ impl std::fmt::Debug for KafkaSink {
         f.debug_struct("KafkaSink")
             .field("state", &self.state)
             .field("topic", &self.config.topic)
-            .field("delivery", &self.config.delivery_guarantee)
             .field("format", &self.config.format)
-            .field("current_epoch", &self.current_epoch)
-            .field("last_committed_epoch", &self.last_committed_epoch)
-            .field("transaction_active", &self.transaction_active)
             .finish_non_exhaustive()
     }
 }
@@ -1150,9 +927,6 @@ mod tests {
         let sink = KafkaSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
         assert!(sink.producer.is_none());
-        assert_eq!(sink.current_epoch(), 0);
-        assert_eq!(sink.last_committed_epoch(), 0);
-        assert!(!sink.transaction_active);
     }
 
     #[test]
@@ -1163,24 +937,13 @@ mod tests {
     }
 
     #[test]
-    fn test_capabilities_at_least_once() {
+    fn contract_is_multi_writer_durable_at_least_once() {
         let sink = KafkaSink::new(test_schema(), test_config(), None);
-        let caps = sink.capabilities();
-        assert!(!caps.exactly_once);
-        assert!(caps.idempotent);
-        assert!(caps.partitioned);
-        assert!(!caps.schema_evolution);
-    }
-
-    #[test]
-    fn test_capabilities_exactly_once() {
-        let mut cfg = test_config();
-        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let sink = KafkaSink::new(test_schema(), cfg, None);
-        let caps = sink.capabilities();
-        assert!(caps.exactly_once);
-        assert!(caps.idempotent);
-        assert!(caps.partitioned);
+        let contract = sink.contract(&ConnectorConfig::new("kafka")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+        assert_eq!(contract.topology, SinkTopology::MultiWriter);
+        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(10));
     }
 
     #[test]
@@ -1207,8 +970,6 @@ mod tests {
         let sink = KafkaSink::with_schema_registry(test_schema(), cfg, sr);
         assert!(sink.has_schema_registry());
         assert_eq!(sink.serializer.format(), Format::Avro);
-        let caps = sink.capabilities();
-        assert!(caps.schema_evolution);
     }
 
     #[test]

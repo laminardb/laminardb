@@ -10,6 +10,8 @@
 pub mod changelog;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
+/// Crash-durable same-directory file publication primitives.
+pub mod durable_fs;
 /// Compatibility alias for checkpoint storage
 pub use checkpoint as storage;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.

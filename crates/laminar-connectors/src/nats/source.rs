@@ -1,9 +1,7 @@
-//! NATS source: `JetStream` pull consumer with ack-on-commit, or core
-//! subscribe (at-most-once). A background task forwards messages through
-//! an `mpsc` channel; JS message handles are retained until
-//! `notify_epoch_committed` fires, then acked in bulk.
+//! NATS source: `JetStream` pull consumer with bounded asynchronous acknowledgement, or core
+//! subscribe (at-most-once). Messages are acknowledged only after successful deserialization;
+//! the source remains explicitly ephemeral and does not couple broker acks to checkpoints.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,18 +12,25 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crossfire::{mpsc, AsyncRx, MAsyncTx, TryRecvError};
 use futures_util::StreamExt;
-use rustc_hash::FxHashMap;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc as tokio_mpsc, Notify};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 use super::config::{build_connect_options, AckPolicy, DeliverPolicy, Mode, NatsSourceConfig};
 use super::metrics::NatsSourceMetrics;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
-use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
+use crate::connector::{
+    PartitionInfo, SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition,
+    SourceStart, SourceTopology,
+};
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
+
+const ACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACK_CONCURRENCY: usize = 64;
+const MAX_ACK_BACKLOG: usize = 16_384;
 
 /// `ack` is `Some` only on the `JetStream` path.
 struct Incoming {
@@ -35,11 +40,26 @@ struct Incoming {
     ack: Option<jetstream::Message>,
 }
 
+struct AckRuntime {
+    tx: tokio_mpsc::Sender<jetstream::Message>,
+    handle: JoinHandle<()>,
+}
+
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
     rx: AsyncRx<mpsc::Array<Incoming>>,
     shutdown: Arc<Notify>,
     handle: JoinHandle<()>,
+    ack_runtime: Option<AckRuntime>,
+}
+
+impl AckRuntime {
+    fn spawn(cfg: &NatsSourceConfig, metrics: NatsSourceMetrics) -> Self {
+        let (backlog, concurrency) = ack_runtime_limits(cfg);
+        let (tx, rx) = tokio_mpsc::channel(backlog);
+        let handle = tokio::spawn(run_ack_worker(rx, concurrency, metrics));
+        Self { tx, handle }
+    }
 }
 
 /// NATS source — core and `JetStream` modes.
@@ -49,12 +69,6 @@ pub struct NatsSource {
     data_ready: Arc<Notify>,
     metrics: NatsSourceMetrics,
     running: Option<Running>,
-
-    // Interior mutability so `checkpoint()` (takes `&self`) can seal
-    // `pending` into `sealed` atomically with offset capture.
-    pending: parking_lot::Mutex<Vec<jetstream::Message>>,
-    sealed: parking_lot::Mutex<VecDeque<Vec<jetstream::Message>>>,
-    offsets: parking_lot::Mutex<FxHashMap<String, u64>>,
 }
 
 impl NatsSource {
@@ -67,19 +81,10 @@ impl NatsSource {
             data_ready: Arc::new(Notify::new()),
             metrics: NatsSourceMetrics::new(registry),
             running: None,
-            pending: parking_lot::Mutex::new(Vec::new()),
-            sealed: parking_lot::Mutex::new(VecDeque::new()),
-            offsets: parking_lot::Mutex::new(FxHashMap::default()),
         }
     }
 
-    fn update_pending_gauge(&self) {
-        let pending_len = self.pending.lock().len();
-        let sealed_total: usize = self.sealed.lock().iter().map(Vec::len).sum();
-        self.metrics.set_pending_acks(pending_len + sealed_total);
-    }
-
-    /// Available after [`SourceConnector::open`].
+    /// Available after [`SourceConnector::start`].
     #[must_use]
     pub fn config(&self) -> Option<&NatsSourceConfig> {
         self.config.as_ref()
@@ -120,6 +125,8 @@ impl NatsSource {
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(Notify::new());
+        let requires_ack = cfg.ack_policy == AckPolicy::Explicit;
+        let ack_runtime = requires_ack.then(|| AckRuntime::spawn(cfg, self.metrics.clone()));
 
         let reader = JsReader {
             consumer,
@@ -131,6 +138,7 @@ impl NatsSource {
             batch_size: cfg.fetch_batch,
             max_wait: cfg.fetch_max_wait,
             lag_poll_interval: cfg.lag_poll_interval,
+            requires_ack,
         };
         let handle = tokio::spawn(reader.run());
 
@@ -139,6 +147,7 @@ impl NatsSource {
             rx,
             shutdown,
             handle,
+            ack_runtime,
         });
         Ok(())
     }
@@ -181,6 +190,7 @@ impl NatsSource {
             rx,
             shutdown,
             handle,
+            ack_runtime: None,
         });
         Ok(())
     }
@@ -188,7 +198,27 @@ impl NatsSource {
 
 #[async_trait]
 impl SourceConnector for NatsSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        // Neither Core NATS nor the current JetStream implementation can
+        // rewind an abandoned checkpoint attempt deterministically. Durable
+        // consumers alone are insufficient for LaminarDB replay semantics.
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::Singleton,
+        ))
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "NATS is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
+
         let cfg = NatsSourceConfig::from_config(config)?;
         // SQL DDL schema overrides the registry placeholder.
         if let Some(schema) = config.arrow_schema() {
@@ -215,15 +245,18 @@ impl SourceConnector for NatsSource {
         let mut payloads: Vec<Bytes> = Vec::new();
         let mut partition: Option<PartitionInfo> = None;
         let mut new_acks: Vec<jetstream::Message> = Vec::new();
-        let mut offset_updates: Vec<(String, u64)> = Vec::new();
+        let mut reader_disconnected = false;
 
         while payloads.len() < max_records {
             let incoming = match running.rx.try_recv() {
                 Ok(m) => m,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    reader_disconnected = true;
+                    break;
+                }
             };
             if let Some(seq) = incoming.stream_seq {
-                offset_updates.push((incoming.subject.clone(), seq));
                 if partition.is_none() {
                     partition = Some(PartitionInfo::new(&incoming.subject, seq.to_string()));
                 }
@@ -235,34 +268,27 @@ impl SourceConnector for NatsSource {
         }
 
         if payloads.is_empty() {
+            if reader_disconnected {
+                return Err(ConnectorError::ReadError(
+                    "NATS reader task terminated unexpectedly".into(),
+                ));
+            }
             return Ok(None);
         }
 
         let records: Vec<&[u8]> = payloads.iter().map(Bytes::as_ref).collect();
         let bytes_total: u64 = records.iter().map(|r| r.len() as u64).sum();
-        // Deserialize before parking acks: on failure the handles drop
-        // un-acked and the broker redelivers after ack_wait.
+        // Deserialize before scheduling acks: on failure the handles drop unacked and the broker
+        // redelivers after ack_wait. Ack enqueue is non-blocking to keep this poll path bounded.
         let batch = running
             .deserializer
             .deserialize_batch(&records, &self.schema)
             .map_err(|e| err(&format!("deserialize batch: {e}")))?;
 
-        if !offset_updates.is_empty() {
-            let mut offsets = self.offsets.lock();
-            for (subject, seq) in offset_updates {
-                offsets
-                    .entry(subject)
-                    .and_modify(|s| *s = (*s).max(seq))
-                    .or_insert(seq);
-            }
-        }
-        if !new_acks.is_empty() {
-            self.pending.lock().extend(new_acks);
-        }
+        enqueue_acks(running.ack_runtime.as_ref(), new_acks, &self.metrics);
 
         self.metrics
             .record_poll(batch.num_rows() as u64, bytes_total);
-        self.update_pending_gauge();
 
         Ok(Some(SourceBatch {
             records: batch,
@@ -275,69 +301,58 @@ impl SourceConnector for NatsSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Seal now-pending acks into this epoch; anything arriving after
-        // goes into a fresh batch committed with a later epoch. Without
-        // this split, an ack could fire before its manifest record lands.
-        {
-            let mut pending = self.pending.lock();
-            if !pending.is_empty() {
-                let batch = std::mem::take(&mut *pending);
-                self.sealed.lock().push_back(batch);
-            }
-        }
-        let mut cp = SourceCheckpoint::default();
-        for (subject, seq) in &*self.offsets.lock() {
-            cp.set_offset(subject.as_str(), seq.to_string());
-        }
-        cp
-    }
-
-    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        // Durable consumer ack floor on the server is authoritative.
-        Ok(())
+        // Ephemeral sources deliberately expose no recovery cursor. JetStream acknowledgements
+        // are delivery progress, not checkpoint-owned state.
+        SourceCheckpoint::new()
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         let Some(running) = self.running.take() else {
             return Ok(());
         };
-        running.shutdown.notify_one();
-        let _ = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
+        let Running {
+            deserializer: _,
+            rx,
+            shutdown,
+            mut handle,
+            ack_runtime,
+        } = running;
+        let close_deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
+        shutdown.notify_one();
+        match tokio::time::timeout_at(close_deadline, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "NATS reader task failed while closing"),
+            Err(_) => {
+                warn!("NATS reader did not stop before close deadline; aborting task");
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        // Drop unread messages only after the reader has stopped. Their unacked JetStream
+        // handles remain eligible for broker redelivery.
+        drop(rx);
+
+        if let Some(AckRuntime { tx, mut handle }) = ack_runtime {
+            drop(tx);
+            match tokio::time::timeout_at(close_deadline, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(%error, "NATS ack worker failed while closing");
+                    self.metrics.record_abandoned_acks();
+                }
+                Err(_) => {
+                    warn!("NATS ack worker did not drain before close deadline; aborting task");
+                    handle.abort();
+                    let _ = handle.await;
+                    self.metrics.record_abandoned_acks();
+                }
+            }
+        }
         Ok(())
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
-    }
-
-    fn supports_replay(&self) -> bool {
-        // JetStream is replayable (durable consumer); core NATS is not.
-        !matches!(self.config.as_ref().map(|c| c.mode), Some(Mode::Core))
-    }
-
-    async fn notify_epoch_committed(
-        &mut self,
-        _epoch: u64,
-        _checkpoint: &crate::checkpoint::SourceCheckpoint,
-    ) -> Result<(), ConnectorError> {
-        // Per-msg ack errors don't roll the epoch back; the broker
-        // redelivers on ack_wait.
-        loop {
-            let Some(batch) = self.sealed.lock().pop_front() else {
-                break;
-            };
-            for msg in batch {
-                match msg.ack().await {
-                    Ok(()) => self.metrics.record_ack(),
-                    Err(e) => {
-                        self.metrics.record_ack_error();
-                        warn!(error = %e, "JetStream ack failed; broker will redeliver");
-                    }
-                }
-            }
-        }
-        self.update_pending_gauge();
-        Ok(())
     }
 }
 
@@ -345,6 +360,111 @@ impl SourceConnector for NatsSource {
 
 fn err(msg: &str) -> ConnectorError {
     ConnectorError::ConfigurationError(msg.to_string())
+}
+
+fn ack_runtime_limits(cfg: &NatsSourceConfig) -> (usize, usize) {
+    let broker_limit = usize::try_from(cfg.max_ack_pending)
+        .ok()
+        .filter(|limit| *limit > 0);
+    let fallback = cfg.fetch_batch.saturating_mul(2);
+    let backlog = broker_limit.unwrap_or(fallback).clamp(1, MAX_ACK_BACKLOG);
+    let concurrency = cfg.fetch_batch.clamp(1, MAX_ACK_CONCURRENCY).min(backlog);
+    (backlog, concurrency)
+}
+
+fn enqueue_acks(
+    runtime: Option<&AckRuntime>,
+    messages: Vec<jetstream::Message>,
+    metrics: &NatsSourceMetrics,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let Some(runtime) = runtime else {
+        metrics.record_ack_enqueue_errors(messages.len());
+        warn!(
+            rejected = messages.len(),
+            "JetStream ack worker is unavailable; broker will redeliver"
+        );
+        return;
+    };
+
+    let mut rejected = 0usize;
+    for message in messages {
+        // Increment before publication: a fast worker may complete immediately after try_send.
+        metrics.record_ack_enqueued();
+        if runtime.tx.try_send(message).is_err() {
+            metrics.record_ack_error();
+            rejected += 1;
+        }
+    }
+    if rejected > 0 {
+        warn!(
+            rejected,
+            "JetStream ack backlog is full or closed; broker will redeliver"
+        );
+    }
+}
+
+async fn run_ack_worker(
+    mut rx: tokio_mpsc::Receiver<jetstream::Message>,
+    concurrency: usize,
+    metrics: NatsSourceMetrics,
+) {
+    let mut in_flight = JoinSet::new();
+    loop {
+        while in_flight.len() >= concurrency {
+            if let Some(result) = in_flight.join_next().await {
+                observe_ack_task(result, &metrics);
+            }
+        }
+
+        tokio::select! {
+            biased;
+            result = in_flight.join_next(), if !in_flight.is_empty() => {
+                if let Some(result) = result {
+                    observe_ack_task(result, &metrics);
+                }
+            }
+            message = rx.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let task_metrics = metrics.clone();
+                in_flight.spawn(async move {
+                    acknowledge_message(message, &task_metrics).await;
+                });
+            }
+        }
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        observe_ack_task(result, &metrics);
+    }
+}
+
+fn observe_ack_task(result: Result<(), tokio::task::JoinError>, metrics: &NatsSourceMetrics) {
+    if let Err(error) = result {
+        metrics.record_ack_error();
+        warn!(%error, "JetStream ack task failed; broker will redeliver");
+    }
+}
+
+async fn acknowledge_message(message: jetstream::Message, metrics: &NatsSourceMetrics) {
+    match tokio::time::timeout(ACK_IO_TIMEOUT, message.ack()).await {
+        Ok(Ok(())) => metrics.record_ack(),
+        Ok(Err(error)) => {
+            metrics.record_ack_error();
+            warn!(%error, "JetStream ack failed; broker will redeliver");
+        }
+        Err(_) => {
+            metrics.record_ack_error();
+            warn!(
+                timeout_ms = ACK_IO_TIMEOUT.as_millis(),
+                "JetStream ack timed out; broker will redeliver"
+            );
+        }
+    }
 }
 
 async fn connect(cfg: &NatsSourceConfig) -> Result<async_nats::Client, ConnectorError> {
@@ -476,6 +596,7 @@ struct JsReader {
     max_wait: Duration,
     /// `Duration::ZERO` disables the poll.
     lag_poll_interval: Duration,
+    requires_ack: bool,
 }
 
 impl JsReader {
@@ -490,6 +611,7 @@ impl JsReader {
             batch_size,
             max_wait,
             lag_poll_interval,
+            requires_ack,
         } = self;
 
         let mut last_lag_poll = Instant::now();
@@ -542,11 +664,14 @@ impl JsReader {
                         continue;
                     }
                 };
+                let subject = msg.subject.to_string();
+                let payload = msg.payload.clone();
+                let stream_seq = msg.info().ok().map(|info| info.stream_sequence);
                 let incoming = Incoming {
-                    subject: msg.subject.to_string(),
-                    payload: msg.payload.clone(),
-                    stream_seq: msg.info().ok().map(|i| i.stream_sequence),
-                    ack: Some(msg),
+                    subject,
+                    payload,
+                    stream_seq,
+                    ack: requires_ack.then_some(msg),
                 };
                 if tx.send(incoming).await.is_err() {
                     debug!("nats reader: downstream channel closed");
@@ -617,6 +742,9 @@ impl CoreReader {
             }
             data_ready.notify_one();
         }
+        // Wake the coordinator so it observes the now-disconnected channel immediately instead
+        // of treating a terminated Core subscription as an indefinitely idle source.
+        data_ready.notify_one();
     }
 }
 
@@ -626,13 +754,48 @@ mod tests {
     use arrow_schema::Schema;
 
     #[test]
-    fn checkpoint_empty_pending_is_noop() {
-        // `jetstream::Message` can't be constructed without a server,
-        // so we only cover the empty path here; non-empty sealing is
-        // exercised in `tests/nats_integration.rs`.
+    fn source_contract_is_ephemeral_even_for_jetstream_config() {
+        let source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let mut config = ConnectorConfig::new("nats");
+        config.set("mode", "jetstream");
+        let contract = source.contract(&config).expect("static NATS contract");
+        assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
+
+    #[test]
+    fn ephemeral_source_checkpoint_has_no_protocol_state() {
         let src = NatsSource::new(Arc::new(Schema::empty()), None);
-        let _ = src.checkpoint();
-        assert!(src.sealed.lock().is_empty());
+        assert!(src.checkpoint().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_reader_drains_queued_payload_before_terminal_error() {
+        let mut src = NatsSource::new(Arc::new(Schema::empty()), None);
+        let (tx, rx) = mpsc::bounded_async::<Incoming>(2);
+        assert!(tx
+            .try_send(Incoming {
+                subject: "core.events".into(),
+                payload: Bytes::from_static(b"one"),
+                stream_seq: None,
+                ack: None,
+            })
+            .is_ok());
+        drop(tx);
+        src.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx,
+            shutdown: Arc::new(Notify::new()),
+            handle: tokio::spawn(async {}),
+            ack_runtime: None,
+        });
+
+        let final_batch = src.poll_batch(10).await.unwrap().unwrap();
+        assert_eq!(final_batch.records.num_rows(), 1);
+
+        let error = src.poll_batch(10).await.unwrap_err();
+        assert!(matches!(error, ConnectorError::ReadError(_)));
+        assert!(error.to_string().contains("reader task terminated"));
     }
 
     #[test]

@@ -386,7 +386,7 @@ impl ReferenceTableSource for DeltaReferenceTableSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset("delta_version", self.current_version.to_string());
         cp
     }
@@ -455,7 +455,7 @@ mod tests {
     async fn test_restore_from_checkpoint() {
         let config = DeltaSourceConfig::new("/tmp/test");
         let mut src = DeltaReferenceTableSource::from_source_config(config);
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset("delta_version", "17");
         src.restore(&cp).await.unwrap();
         assert_eq!(src.current_version, 17);
@@ -465,7 +465,7 @@ mod tests {
     async fn test_restore_invalid_version() {
         let config = DeltaSourceConfig::new("/tmp/test");
         let mut src = DeltaReferenceTableSource::from_source_config(config);
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset("delta_version", "not_a_number");
         assert!(src.restore(&cp).await.is_err());
     }

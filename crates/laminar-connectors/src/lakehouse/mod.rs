@@ -32,9 +32,7 @@ pub mod metrics;
 
 // Re-export Delta Lake types at module level.
 pub use delta::DeltaLakeSink;
-pub use delta_config::{
-    CompactionConfig, DeliveryGuarantee, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode,
-};
+pub use delta_config::{CompactionConfig, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode};
 pub use delta_metrics::DeltaLakeSinkMetrics;
 pub use delta_source::DeltaSource;
 pub use delta_source_config::{DeltaReadMode, DeltaSourceConfig, SchemaEvolutionAction};
@@ -67,8 +65,11 @@ pub fn register_delta_lake_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "delta-lake",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(DeltaLakeSink::new(DeltaLakeSinkConfig::default(), registry))
+        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+            Ok(Box::new(DeltaLakeSink::new(
+                DeltaLakeSinkConfig::from_config(config)?,
+                registry,
+            )))
         }),
     );
 }
@@ -168,7 +169,6 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
 }
 
 /// Registers the Iceberg sink connector with the given registry.
-#[allow(clippy::missing_panics_doc)]
 pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "iceberg".to_string(),
@@ -182,23 +182,16 @@ pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "iceberg",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            // Default config with placeholder values — real config arrives via open().
-            let mut cfg = crate::config::ConnectorConfig::new("iceberg");
-            cfg.set("catalog.uri", "http://localhost:8181");
-            cfg.set("warehouse", "s3://default/wh");
-            cfg.set("namespace", "default");
-            cfg.set("table.name", "default");
-            Box::new(IcebergSink::new(
-                IcebergSinkConfig::from_config(&cfg).expect("default iceberg sink config"),
+        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+            Ok(Box::new(IcebergSink::new(
+                IcebergSinkConfig::from_config(config)?,
                 registry,
-            ))
+            )))
         }),
     );
 }
 
 /// Registers the Iceberg source connector with the given registry.
-#[allow(clippy::missing_panics_doc)]
 pub fn register_iceberg_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "iceberg".to_string(),
@@ -213,13 +206,21 @@ pub fn register_iceberg_source(registry: &ConnectorRegistry) {
         "iceberg",
         info.clone(),
         Arc::new(|registry: Option<&prometheus::Registry>| {
-            let mut cfg = crate::config::ConnectorConfig::new("iceberg");
-            cfg.set("catalog.uri", "http://localhost:8181");
-            cfg.set("warehouse", "s3://default/wh");
-            cfg.set("namespace", "default");
-            cfg.set("table.name", "default");
             Box::new(IcebergSource::new(
-                IcebergSourceConfig::from_config(&cfg).expect("default iceberg source config"),
+                IcebergSourceConfig {
+                    catalog: IcebergCatalogConfig {
+                        catalog_type: IcebergCatalogType::Rest,
+                        catalog_uri: "http://localhost:8181".to_string(),
+                        warehouse: "s3://default/wh".to_string(),
+                        storage_type: None,
+                        namespace: "default".to_string(),
+                        table_name: "default".to_string(),
+                        properties: std::collections::HashMap::new(),
+                    },
+                    poll_interval: std::time::Duration::from_secs(60),
+                    snapshot_id: None,
+                    select_columns: Vec::new(),
+                },
                 registry,
             ))
         }),
@@ -342,11 +343,6 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         ConfigKeySpec::optional(
-            "delivery.guarantee",
-            "exactly-once or at-least-once",
-            "at-least-once",
-        ),
-        ConfigKeySpec::optional(
             "compaction.enabled",
             "Enable background OPTIMIZE compaction",
             "true",
@@ -375,11 +371,6 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "vacuum.retention.hours",
             "Hours to retain old files during VACUUM",
             "168",
-        ),
-        ConfigKeySpec::optional(
-            "writer.id",
-            "Writer ID for exactly-once deduplication (auto UUID if not set)",
-            "",
         ),
         // ── Catalog configuration ──
         ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
@@ -605,11 +596,6 @@ fn iceberg_sink_config_keys() -> Vec<ConfigKeySpec> {
             "zstd",
         ),
         ConfigKeySpec::optional("auto.create", "Auto-create table if not exists", "false"),
-        ConfigKeySpec::optional(
-            "writer.id",
-            "Writer ID for exactly-once deduplication (auto UUID if not set)",
-            "",
-        ),
     ]
 }
 
@@ -693,13 +679,13 @@ mod tests {
         assert!(optional.contains(&"partition.columns"));
         assert!(optional.contains(&"target.file.size"));
         assert!(optional.contains(&"write.mode"));
-        assert!(optional.contains(&"delivery.guarantee"));
+        assert!(!optional.contains(&"delivery.guarantee"));
         assert!(optional.contains(&"merge.key.columns"));
         assert!(optional.contains(&"schema.evolution"));
         assert!(optional.contains(&"compaction.enabled"));
         assert!(optional.contains(&"compaction.z-order.columns"));
         assert!(optional.contains(&"vacuum.retention.hours"));
-        assert!(optional.contains(&"writer.id"));
+        assert!(!optional.contains(&"writer.id"));
         // Catalog keys
         assert!(optional.contains(&"catalog.type"));
         assert!(optional.contains(&"catalog.database"));

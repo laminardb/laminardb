@@ -156,7 +156,7 @@ pub const OFFSET_METADATA_MISSING: &str = "LDB-6011";
 /// rolls back sinks and retries on the next checkpoint.
 pub const DURABILITY_GATE_MISS: &str = "LDB-6020";
 /// Sink rollback failed after a durability-gate miss. Sinks may be in an
-/// inconsistent state; recovery uses `sink_commit_statuses` to resolve.
+/// inconsistent state; recovery uses the exact durable commit decision to resolve.
 pub const DURABILITY_GATE_ROLLBACK_FAILED: &str = "LDB-6021";
 /// State backend returned an error during the durability gate (backend
 /// unreachable, permission denied). Treated as a gate miss; sinks rolled

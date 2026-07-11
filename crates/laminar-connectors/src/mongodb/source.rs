@@ -26,13 +26,24 @@ use tokio::sync::Notify;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{SourceBatch, SourceConnector, SourceContract, SourceStart};
+#[cfg(feature = "mongodb-cdc")]
+use crate::connector::{SourceConsistency, SourcePosition, SourceTopology};
 use crate::error::ConnectorError;
 
 use super::change_event::{MongoDbChangeEvent, OperationType};
 use super::config::MongoDbSourceConfig;
 use super::metrics::MongoDbCdcMetrics;
 use super::resume_token::{InMemoryResumeTokenStore, ResumeToken, ResumeTokenStore};
+
+#[cfg(not(feature = "mongodb-cdc"))]
+fn mongodb_source_feature_error() -> ConnectorError {
+    ConnectorError::ConfigurationError(
+        "MongoDB CDC source requires the 'mongodb-cdc' feature flag. Rebuild with \
+         `--features mongodb-cdc` to enable change-stream ingestion."
+            .into(),
+    )
+}
 
 /// Returns the Arrow schema for `MongoDB` CDC envelope records.
 ///
@@ -304,48 +315,64 @@ fn events_to_record_batch(
 
 #[async_trait]
 impl SourceConnector for MongoDbCdcSource {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        self.config.validate()?;
-
-        // Load any persisted resume token.
-        let persisted_token = self
-            .resume_token_store
-            .load()
-            .await
-            .map_err(|e| ConnectorError::Internal(format!("load resume token: {e}")))?;
-
-        if let Some(token) = persisted_token {
-            tracing::info!(resume_token = %token, "resuming from persisted token");
-            self.last_resume_token = Some(token);
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            let _ = request;
+            return Err(mongodb_source_feature_error());
         }
 
-        // Feature-gated: start the background change stream reader.
         #[cfg(feature = "mongodb-cdc")]
         {
+            if let SourcePosition::Resume { attempt, .. } = request.position {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "MongoDB CDC is an ephemeral source and cannot resume checkpoint attempt \
+                     {attempt:?}"
+                )));
+            }
+            self.config.validate()?;
+
+            // Load any persisted resume token.
+            let persisted_token = self
+                .resume_token_store
+                .load()
+                .await
+                .map_err(|e| ConnectorError::Internal(format!("load resume token: {e}")))?;
+
+            if let Some(token) = persisted_token {
+                tracing::info!(resume_token = %token, "resuming from persisted token");
+                self.last_resume_token = Some(token);
+            }
+
             self.start_change_stream_reader().await?;
+
+            self.state = ConnectorState::Running;
+            tracing::info!(
+                database = %self.config.database,
+                collection = %self.config.collection,
+                full_document_mode = ?self.config.full_document_mode,
+                "MongoDB CDC source opened"
+            );
+
+            Ok(())
         }
-
-        self.state = ConnectorState::Running;
-        tracing::info!(
-            database = %self.config.database,
-            collection = %self.config.collection,
-            full_document_mode = ?self.config.full_document_mode,
-            "MongoDB CDC source opened"
-        );
-
-        Ok(())
     }
 
     async fn poll_batch(
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            let _ = max_records;
+            return Err(mongodb_source_feature_error());
+        }
+
         #[cfg(feature = "mongodb-cdc")]
         {
             self.drain_channel()?;
+            self.drain_to_batch(max_records)
         }
-
-        self.drain_to_batch(max_records)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -353,7 +380,7 @@ impl SourceConnector for MongoDbCdcSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         if let Some(ref token) = self.last_resume_token {
             cp.set_offset("resume_token", token.as_str());
         }
@@ -361,19 +388,6 @@ impl SourceConnector for MongoDbCdcSource {
         cp.set_metadata("database", &self.config.database);
         cp.set_metadata("collection", &self.config.collection);
         cp
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        if let Some(token_str) = checkpoint.get_offset("resume_token") {
-            let token = ResumeToken::new(token_str.to_string());
-            tracing::info!(resume_token = %token, "restoring from checkpoint");
-            self.last_resume_token = Some(token.clone());
-            self.resume_token_store
-                .save(&token)
-                .await
-                .map_err(|e| ConnectorError::Internal(format!("save resume token: {e}")))?;
-        }
-        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -404,9 +418,21 @@ impl SourceConnector for MongoDbCdcSource {
         Some(Arc::clone(&self.data_ready))
     }
 
-    fn supports_replay(&self) -> bool {
-        // MongoDB change streams support resume from a token.
-        true
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            // Resume tokens are currently persisted outside LaminarDB's exact checkpoint attempt.
+            // They may advance past the durable engine cut, so this source cannot promise replay.
+            Ok(SourceContract {
+                consistency: SourceConsistency::Ephemeral,
+                topology: SourceTopology::Singleton,
+            })
+        }
+
+        #[cfg(not(feature = "mongodb-cdc"))]
+        {
+            Err(mongodb_source_feature_error())
+        }
     }
 }
 
@@ -969,19 +995,65 @@ mod tests {
         assert_eq!(cp.get_offset("resume_token"), Some("tok123"));
     }
 
+    #[cfg(feature = "mongodb-cdc")]
     #[tokio::test]
-    async fn test_restore_checkpoint() {
+    async fn resume_fails_before_opening_the_ephemeral_source() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
         let mut source = MongoDbCdcSource::new(config, None);
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("mongodb-cdc"),
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(7, 11),
+                    checkpoint: SourceCheckpoint::new(),
+                },
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .expect_err("ephemeral MongoDB CDC must reject recovery");
+        assert!(error.to_string().contains("ephemeral"));
+        assert_eq!(source.state, ConnectorState::Created);
+        assert!(source.last_resume_token().is_none());
+    }
 
-        let mut cp = SourceCheckpoint::new(0);
-        cp.set_offset("resume_token", "restored_token");
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn enabled_contract_is_conservatively_ephemeral_singleton() {
+        let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
+        let source = MongoDbCdcSource::new(config, None);
+        let contract = source
+            .contract(&ConnectorConfig::new("mongodb-cdc"))
+            .unwrap();
+        assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
 
-        source.restore(&cp).await.unwrap();
-        assert_eq!(
-            source.last_resume_token().unwrap().as_str(),
-            "restored_token"
-        );
+    #[cfg(not(feature = "mongodb-cdc"))]
+    #[tokio::test]
+    async fn missing_feature_fails_contract_and_start() {
+        let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
+        let mut source = MongoDbCdcSource::new(config, None);
+        let connector_config = ConnectorConfig::new("mongodb-cdc");
+        let contract_error = source
+            .contract(&connector_config)
+            .expect_err("contract must fail closed");
+        assert!(contract_error.to_string().contains("mongodb-cdc"));
+
+        let start_error = source
+            .start(SourceStart {
+                config: connector_config,
+                position: crate::connector::SourcePosition::Initial,
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .expect_err("start must fail closed");
+        assert!(start_error.to_string().contains("mongodb-cdc"));
+        let poll_error = source
+            .poll_batch(1)
+            .await
+            .expect_err("poll must fail closed");
+        assert!(poll_error.to_string().contains("mongodb-cdc"));
+        assert_eq!(source.state, ConnectorState::Created);
     }
 
     #[test]

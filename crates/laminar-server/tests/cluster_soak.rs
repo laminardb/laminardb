@@ -132,18 +132,6 @@ fn eo_topic(id: usize) -> String {
 
 fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -> PathBuf {
     let depth = env_u64("LAMINAR_SOAK_DEPTH", 4);
-    // `LAMINAR_SOAK_GATE_POLL_MS` sets the durability-gate poll initial (and cap, unless
-    // `_MAX_MS` overrides). Unset = engine default.
-    let gate_poll = std::env::var("LAMINAR_SOAK_GATE_POLL_MS").map_or(String::new(), |ms| {
-        let initial: u64 = ms
-            .parse()
-            .expect("LAMINAR_SOAK_GATE_POLL_MS must be a u64 (ms)");
-        let max: u64 = std::env::var("LAMINAR_SOAK_GATE_POLL_MAX_MS").map_or(initial, |v| {
-            v.parse()
-                .expect("LAMINAR_SOAK_GATE_POLL_MAX_MS must be a u64 (ms)")
-        });
-        format!("restorable_gate_poll_initial_ms = {initial}\nrestorable_gate_poll_max_ms = {max}")
-    });
     // Vnode partials go through [state], not [checkpoint]: without a SHARED state store the leader
     // durability gate (which lists the full registry) can never seal an epoch.
     let state_url = std::env::var("LAMINAR_SOAK_STATE_URL").unwrap_or_else(|_| {
@@ -179,6 +167,9 @@ fn write_config(dir: &Path, id: usize, interval_ms: u64, checkpoint_url: &str) -
         if std::env::var("LAMINAR_SOAK_STATE_TIER_GROUP").is_ok() {
             server_extra.push_str("state_tier_group_demotion = true\n");
         }
+    }
+    if std::env::var("LAMINAR_SOAK_KAFKA_BROKERS").is_ok() {
+        server_extra.push_str("delivery = \"exactly_once\"\n");
     }
 
     let mut storage = String::new();
@@ -244,7 +235,6 @@ url = "{url}"
 interval = "{interval_ms}ms"
 max_retained = 5
 max_in_flight_epochs = {depth}
-{gate_poll}
 {delta_line}
 
 [checkpoint.storage]
@@ -321,13 +311,11 @@ sql = "SELECT (seq / {span}) % {groups} AS k, COUNT(*) AS n FROM gen GROUP BY (s
 name = "soak_sink"
 pipeline = "soak_stream"
 connector = "kafka"
-delivery = "exactly_once"
 
 [sink.properties]
 "bootstrap.servers" = "{brokers}"
 topic = "{topic}"
 format = "json"
-"delivery.guarantee" = "exactly-once"
 "#,
             topic = eo_topic(id),
         ));
@@ -905,6 +893,7 @@ storage_dir = "{data}"
 [server]
 mode = "cluster"
 bind = "127.0.0.1:{http}"
+delivery = "exactly_once"
 
 [discovery]
 strategy = "gossip"
@@ -950,12 +939,10 @@ sql = "SELECT seq FROM kin"
 name = "kout"
 pipeline = "passthrough"
 connector = "kafka"
-delivery = "exactly_once"
 [sink.properties]
 "bootstrap.servers" = "{brokers}"
 topic = "{topic}"
 format = "json"
-"delivery.guarantee" = "exactly-once"
 "#,
         data = data_dir.display().to_string().replace('\\', "/"),
         seeds = seeds.join(", "),

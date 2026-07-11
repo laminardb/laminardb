@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
-use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 use crate::serde::Format;
 
@@ -261,12 +260,9 @@ pub struct NatsSinkConfig {
     pub tls: TlsConfig,
     pub stream: Option<String>,
     pub subject: SubjectSpec,
-    pub expected_stream: Option<String>,
-    pub delivery_guarantee: DeliveryGuarantee,
     pub dedup_id_column: Option<String>,
-    /// Stream's `duplicate_window` must be at least this long under
-    /// exactly-once — else rollback redelivery can land outside the
-    /// dedup horizon.
+    /// Stream's `duplicate_window` must be at least this long when bounded
+    /// `Nats-Msg-Id` deduplication is enabled.
     pub min_duplicate_window: Duration,
     pub max_pending: usize,
     pub ack_timeout: Duration,
@@ -299,9 +295,6 @@ impl NatsSinkConfig {
             }
         };
 
-        let delivery_guarantee =
-            parse_or_default::<DeliveryGuarantee>(config, "delivery.guarantee")
-                .map_err(|_| cfg_err("[LDB-5052] invalid delivery.guarantee"))?;
         let dedup_id_column = config.get("dedup.id.column").map(str::to_string);
 
         let cfg = Self {
@@ -309,10 +302,12 @@ impl NatsSinkConfig {
             mode,
             auth,
             tls,
-            stream: config.get("stream").map(str::to_string),
+            stream: config
+                .get("stream")
+                .map(str::trim)
+                .filter(|stream| !stream.is_empty())
+                .map(str::to_string),
             subject,
-            expected_stream: config.get("expected.stream").map(str::to_string),
-            delivery_guarantee,
             dedup_id_column,
             min_duplicate_window: require_positive_duration(
                 config,
@@ -336,25 +331,16 @@ impl NatsSinkConfig {
     }
 
     fn validate(&self) -> Result<(), ConnectorError> {
-        if self.mode == Mode::Core && self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+        if self.mode == Mode::Core && self.dedup_id_column.is_some() {
             return Err(cfg_err(
-                "[LDB-5053] delivery.guarantee=exactly_once is not supported in mode=core \
-                 (no server-side dedup); use mode=jetstream",
+                "[LDB-5053] 'dedup.id.column' requires mode=jetstream because core NATS has no \
+                 server-side Nats-Msg-Id deduplication",
             ));
         }
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && self.dedup_id_column.is_none()
-        {
+        if self.dedup_id_column.is_some() && self.stream.is_none() {
             return Err(cfg_err(
-                "[LDB-5054] delivery.guarantee=exactly_once requires 'dedup.id.column' — \
-                 msg-id dedup with epoch-row hashing is not supported (deterministic replay \
-                 is too fragile; name a unique-per-row column)",
-            ));
-        }
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce && self.stream.is_none() {
-            return Err(cfg_err(
-                "[LDB-5055] delivery.guarantee=exactly_once requires 'stream' so the sink \
-                 can validate its duplicate_window at startup",
+                "[LDB-5055] 'dedup.id.column' requires 'stream' so the sink can validate its \
+                 duplicate_window at startup",
             ));
         }
         for h in &self.header_columns {
@@ -365,12 +351,26 @@ impl NatsSinkConfig {
                 )));
             }
         }
+        match self.mode {
+            Mode::JetStream if self.stream.is_none() => {
+                return Err(cfg_err(
+                    "[LDB-5071] mode=jetstream requires an explicit 'stream' so durable storage, \
+                     replica count, and publish routing can be validated",
+                ));
+            }
+            Mode::Core if self.stream.is_some() => {
+                return Err(cfg_err(
+                    "[LDB-5071] 'stream' is valid only in mode=jetstream; remove it for core NATS",
+                ));
+            }
+            Mode::Core | Mode::JetStream => {}
+        }
         Ok(())
     }
 }
 
 /// Header names the sink manages itself; a user header with the same
-/// name would otherwise silently clobber exactly-once semantics.
+/// name would otherwise silently clobber bounded dedup or stream fencing.
 fn is_reserved_header(name: &str) -> bool {
     const RESERVED: &[&str] = &["Nats-Msg-Id", "Nats-Expected-Stream"];
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
@@ -748,12 +748,12 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_core_with_exactly_once() {
+    fn sink_rejects_core_with_dedup() {
         let err = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
             ("mode", "core"),
             ("subject", "x"),
-            ("delivery.guarantee", "exactly_once"),
+            ("dedup.id.column", "event_id"),
         ]))
         .unwrap_err()
         .to_string();
@@ -761,11 +761,10 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_exactly_once_without_stream() {
+    fn sink_rejects_dedup_without_stream() {
         let err = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
             ("subject", "x"),
-            ("delivery.guarantee", "exactly_once"),
             ("dedup.id.column", "event_id"),
         ]))
         .unwrap_err()
@@ -774,31 +773,51 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_exactly_once_without_dedup_column() {
-        let err = NatsSinkConfig::from_config(&cfg(&[
-            ("servers", "nats://a:4222"),
-            ("stream", "OUT"),
-            ("subject", "x.processed"),
-            ("delivery.guarantee", "exactly_once"),
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("LDB-5054"), "got: {err}");
+    fn jetstream_sink_requires_named_stream() {
+        let err =
+            NatsSinkConfig::from_config(&cfg(&[("servers", "nats://a:4222"), ("subject", "x")]))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("LDB-5071"), "got: {err}");
     }
 
     #[test]
-    fn sink_happy_path_exactly_once() {
+    fn jetstream_sink_rejects_blank_stream() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("stream", "   "),
+            ("subject", "x"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5071"), "got: {err}");
+    }
+
+    #[test]
+    fn core_sink_rejects_ignored_stream() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("mode", "core"),
+            ("stream", "OUT"),
+            ("subject", "x"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5071"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_happy_path_bounded_dedup() {
         let parsed = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
             ("stream", "OUT"),
             ("subject.column", "out_subject"),
-            ("delivery.guarantee", "exactly_once"),
             ("dedup.id.column", "event_id"),
             ("header.columns", "trace_id,tenant"),
         ]))
         .unwrap();
+        assert_eq!(parsed.stream.as_deref(), Some("OUT"));
         assert_eq!(parsed.subject, SubjectSpec::Column("out_subject".into()));
-        assert_eq!(parsed.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
         assert_eq!(parsed.dedup_id_column.as_deref(), Some("event_id"));
         assert_eq!(parsed.header_columns, vec!["trace_id", "tenant"]);
     }
@@ -1016,6 +1035,7 @@ mod tests {
     fn auth_and_tls_on_sink() {
         let parsed = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
+            ("stream", "OUT"),
             ("subject", "x"),
             ("auth.mode", "user_pass"),
             ("user", "alice"),

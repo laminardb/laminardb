@@ -61,14 +61,8 @@ pub struct PostgresSinkConfig {
     /// Whether to handle changelog/retraction records.
     pub changelog_mode: bool,
 
-    /// Delivery guarantee level.
-    pub delivery_guarantee: DeliveryGuarantee,
-
     /// Per-query statement timeout (default: 30s).
     pub statement_timeout: Duration,
-
-    /// Sink ID for offset tracking (auto-generated if empty).
-    pub sink_id: String,
 }
 
 impl Default for PostgresSinkConfig {
@@ -90,9 +84,7 @@ impl Default for PostgresSinkConfig {
             ssl_mode: SslMode::Prefer,
             auto_create_table: false,
             changelog_mode: false,
-            delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             statement_timeout: Duration::from_secs(30),
-            sink_id: String::new(),
         }
     }
 }
@@ -191,18 +183,6 @@ impl PostgresSinkConfig {
             })?;
             cfg.statement_timeout = Duration::from_millis(ms);
         }
-        if let Some(v) = config.get("delivery.guarantee") {
-            cfg.delivery_guarantee = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid delivery.guarantee: '{v}' \
-                     (expected 'at_least_once' or 'exactly_once')"
-                ))
-            })?;
-        }
-        if let Some(v) = config.get("sink.id") {
-            cfg.sink_id = v.to_string();
-        }
-
         cfg.validate()?;
         Ok(cfg)
     }
@@ -221,15 +201,9 @@ impl PostgresSinkConfig {
                 "upsert mode requires 'primary.key' to be set".into(),
             ));
         }
-        // Exactly-once append (COPY) is not idempotent: a replay under a fresh epoch id re-inserts
-        // every row. Only upsert is PK-idempotent under replay, so reject EO+append (CN-6).
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && self.write_mode == WriteMode::Append
-        {
+        if self.changelog_mode && self.write_mode != WriteMode::Upsert {
             return Err(ConnectorError::ConfigurationError(
-                "exactly-once delivery requires write.mode = 'upsert' (append/COPY is not \
-                 idempotent under replay)"
-                    .into(),
+                "changelog mode requires write.mode = 'upsert'".into(),
             ));
         }
         if self.batch_size == 0 {
@@ -255,16 +229,6 @@ impl PostgresSinkConfig {
     pub fn qualified_table_name(&self) -> String {
         format!("{}.{}", self.schema_name, self.table_name)
     }
-
-    /// Returns the effective sink ID, auto-generating from table name if empty.
-    #[must_use]
-    pub fn effective_sink_id(&self) -> String {
-        if self.sink_id.is_empty() {
-            format!("laminardb-sink-{}", self.qualified_table_name())
-        } else {
-            self.sink_id.clone()
-        }
-    }
 }
 
 /// Write mode for the `PostgreSQL` sink.
@@ -283,7 +247,6 @@ str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
     Upsert => "upsert", "insert"
 );
 
-pub use crate::connector::DeliveryGuarantee;
 pub use crate::connector::PostgresSslMode as SslMode;
 
 #[cfg(test)]
@@ -318,28 +281,6 @@ mod tests {
         assert_eq!(cfg.port, 5432);
         assert_eq!(cfg.schema_name, "public");
         assert_eq!(cfg.write_mode, WriteMode::Append);
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
-    }
-
-    #[test]
-    fn test_exactly_once_append_rejected() {
-        // write.mode defaults to append; EO+append is not idempotent under replay (CN-6).
-        let mut pairs = required_pairs();
-        pairs.push(("delivery.guarantee", "exactly_once"));
-        let err = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
-        assert!(
-            err.to_string().contains("upsert"),
-            "EO+append must be rejected, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_exactly_once_upsert_accepted() {
-        let mut pairs = required_pairs();
-        pairs.push(("delivery.guarantee", "exactly_once"));
-        pairs.push(("write.mode", "upsert"));
-        pairs.push(("primary.key", "id"));
-        assert!(PostgresSinkConfig::from_config(&make_config(&pairs)).is_ok());
     }
 
     #[test]
@@ -382,8 +323,6 @@ mod tests {
             ("ssl.mode", "require"),
             ("auto.create.table", "true"),
             ("changelog.mode", "true"),
-            ("delivery.guarantee", "exactly_once"),
-            ("sink.id", "my-sink"),
         ]);
         let config = make_config(&pairs);
         let cfg = PostgresSinkConfig::from_config(&config).unwrap();
@@ -400,8 +339,6 @@ mod tests {
         assert_eq!(cfg.ssl_mode, SslMode::Require);
         assert!(cfg.auto_create_table);
         assert!(cfg.changelog_mode);
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
-        assert_eq!(cfg.sink_id, "my-sink");
     }
 
     #[test]
@@ -413,6 +350,14 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("primary.key"), "error: {err}");
+    }
+
+    #[test]
+    fn test_changelog_requires_upsert() {
+        let mut pairs = required_pairs();
+        pairs.push(("changelog.mode", "true"));
+        let error = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(error.to_string().contains("write.mode = 'upsert'"));
     }
 
     #[test]
@@ -442,16 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_sink_id() {
-        let cfg = PostgresSinkConfig::new("localhost", "db", "events");
-        assert_eq!(cfg.effective_sink_id(), "laminardb-sink-public.events");
-
-        let mut cfg2 = cfg;
-        cfg2.sink_id = "custom-sink".to_string();
-        assert_eq!(cfg2.effective_sink_id(), "custom-sink");
-    }
-
-    #[test]
     fn test_defaults() {
         let cfg = PostgresSinkConfig::default();
         assert_eq!(cfg.hostname, "localhost");
@@ -463,7 +398,6 @@ mod tests {
         assert_eq!(cfg.ssl_mode, SslMode::Prefer);
         assert!(!cfg.auto_create_table);
         assert!(!cfg.changelog_mode);
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
     }
 
     #[test]
@@ -479,29 +413,6 @@ mod tests {
     fn test_write_mode_display() {
         assert_eq!(WriteMode::Append.to_string(), "append");
         assert_eq!(WriteMode::Upsert.to_string(), "upsert");
-    }
-
-    #[test]
-    fn test_delivery_guarantee_parse() {
-        assert_eq!(
-            "at_least_once".parse::<DeliveryGuarantee>().unwrap(),
-            DeliveryGuarantee::AtLeastOnce
-        );
-        assert_eq!(
-            "at-least-once".parse::<DeliveryGuarantee>().unwrap(),
-            DeliveryGuarantee::AtLeastOnce
-        );
-        assert_eq!(
-            "exactly_once".parse::<DeliveryGuarantee>().unwrap(),
-            DeliveryGuarantee::ExactlyOnce
-        );
-        assert!("unknown".parse::<DeliveryGuarantee>().is_err());
-    }
-
-    #[test]
-    fn test_delivery_guarantee_display() {
-        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
-        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
     }
 
     #[test]

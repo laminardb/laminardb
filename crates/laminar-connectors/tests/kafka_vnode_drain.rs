@@ -21,7 +21,9 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use tokio::time::sleep;
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SourceConnector;
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart,
+};
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription};
 use laminar_core::state::{NodeId, VnodeRegistry};
 
@@ -114,7 +116,14 @@ async fn source_pauses_draining_vnode_partitions() {
     };
     let mut source = KafkaSource::new(schema(), cfg, None);
     source.set_vnode_assignment(Arc::clone(&registry), NodeId(0));
-    source.open(&ConnectorConfig::new("kafka")).await.unwrap();
+    source
+        .start(SourceStart {
+            config: ConnectorConfig::new("kafka"),
+            position: SourcePosition::Initial,
+            delivery: DeliveryGuarantee::BestEffort,
+        })
+        .await
+        .unwrap();
 
     // Consume the initial batch across all partitions.
     poll_for(&mut source, Duration::from_secs(4)).await;

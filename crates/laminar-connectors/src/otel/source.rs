@@ -23,7 +23,10 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Trac
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+};
+use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
 
 use super::config::{OtelSignal, OtelSourceConfig};
@@ -70,7 +73,16 @@ impl OtelSource {
 
 #[async_trait]
 impl SourceConnector for OtelSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "OTLP is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
         self.state = ConnectorState::Initializing;
         self.config = OtelSourceConfig::from_config(config)?;
 
@@ -85,7 +97,7 @@ impl SourceConnector for OtelSource {
 
         let addr = self.config.socket_addr();
 
-        // Bind the TCP listener here so port conflicts fail open(),
+        // Bind the TCP listener here so port conflicts fail start(),
         // not silently inside the background task.
         let listener = TcpListener::bind(&addr)
             .await
@@ -212,7 +224,8 @@ impl SourceConnector for OtelSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(self.checkpoint_seq);
+        let mut cp = SourceCheckpoint::new();
+        cp.set_offset("batch_sequence", self.checkpoint_seq.to_string());
         cp.set_offset(
             "records_received",
             self.records_received.load(Ordering::Relaxed).to_string(),
@@ -224,13 +237,6 @@ impl SourceConnector for OtelSource {
         cp.set_metadata("connector", "otel");
         cp.set_metadata("signals", format!("{:?}", self.config.signals));
         cp
-    }
-
-    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        tracing::warn!(
-            "OTel source restore: push-only transport, data gap expected since last checkpoint"
-        );
-        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -259,8 +265,11 @@ impl SourceConnector for OtelSource {
         Some(Arc::clone(&self.data_ready))
     }
 
-    fn supports_replay(&self) -> bool {
-        false
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract {
+            consistency: SourceConsistency::Ephemeral,
+            topology: SourceTopology::NodeLocalIngress,
+        })
     }
 }
 

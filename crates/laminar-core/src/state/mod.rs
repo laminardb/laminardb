@@ -9,7 +9,10 @@ pub mod in_process;
 pub mod object_store;
 pub mod vnode;
 
-pub use backend::{StateBackend, StateBackendError};
+pub use backend::{
+    CheckpointAttempt, CheckpointSealInventory, SealedVnodePartial, StateBackend,
+    StateBackendDurability, StateBackendError,
+};
 pub use config::{
     DiscoveryMode, StateBackendBuildError, StateBackendConfig, DEFAULT_VNODE_CAPACITY,
 };

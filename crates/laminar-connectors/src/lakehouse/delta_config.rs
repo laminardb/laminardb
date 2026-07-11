@@ -7,6 +7,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::connector::DeliveryGuarantee;
+
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::storage::{
@@ -58,7 +60,8 @@ pub struct DeltaLakeSinkConfig {
     /// Delivery guarantee: `AtLeastOnce` or `ExactlyOnce`.
     pub delivery_guarantee: DeliveryGuarantee,
 
-    /// Writer ID for exactly-once deduplication.
+    /// Internal writer-local transaction ID. Coordinated exactly-once uses the runtime-owned
+    /// deployment/pipeline/sink namespace instead; this ID is never a public correctness knob.
     pub writer_id: String,
 
     /// Catalog type for table discovery.
@@ -243,12 +246,12 @@ impl DeltaLakeSinkConfig {
             })?;
             cfg.vacuum_retention = Duration::from_secs(hours * 3600);
         }
-        if let Some(v) = config.get("writer.id") {
-            cfg.writer_id = v.to_string();
-        } else if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+        if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && cfg.write_mode != DeltaWriteMode::Append
+        {
             return Err(ConnectorError::ConfigurationError(
-                "exactly-once delivery requires an explicit 'writer.id' for stable \
-                 recovery across restarts"
+                "Delta exactly-once is supported only for coordinated append mode; \
+                 upsert/overwrite do not expose a certified distributed committable"
                     .into(),
             ));
         }
@@ -575,8 +578,6 @@ impl fmt::Display for DeltaWriteMode {
     }
 }
 
-pub use crate::connector::DeliveryGuarantee;
-
 /// Delta Lake catalog type for table discovery.
 ///
 /// Catalogs enable referencing tables by logical names instead of raw paths.
@@ -849,7 +850,6 @@ mod tests {
             ("compaction.z-order.columns", "customer_id, product_id"),
             ("compaction.min-files", "20"),
             ("vacuum.retention.hours", "336"),
-            ("writer.id", "my-writer"),
             ("storage.aws_access_key_id", "AKID123"),
             ("storage.aws_region", "us-east-1"),
         ]);
@@ -872,7 +872,7 @@ mod tests {
         );
         assert_eq!(cfg.compaction.min_files_for_compaction, 20);
         assert_eq!(cfg.vacuum_retention, Duration::from_secs(1209600));
-        assert_eq!(cfg.writer_id, "my-writer");
+        assert!(!cfg.writer_id.is_empty());
         assert_eq!(
             cfg.storage_options.get("aws_access_key_id"),
             Some(&"AKID123".to_string())
@@ -963,22 +963,12 @@ mod tests {
     }
 
     #[test]
-    fn test_exactly_once_requires_writer_id() {
+    fn test_coordinated_exactly_once_owns_its_namespace() {
         let mut pairs = required_pairs();
         pairs.push(("delivery.guarantee", "exactly-once"));
-        let config = make_config(&pairs);
-        let err = DeltaLakeSinkConfig::from_config(&config).unwrap_err();
-        assert!(err.to_string().contains("writer.id"), "error: {err}");
-    }
-
-    #[test]
-    fn test_exactly_once_with_writer_id_ok() {
-        let mut pairs = required_pairs();
-        pairs.push(("delivery.guarantee", "exactly-once"));
-        pairs.push(("writer.id", "my-stable-writer"));
         let config = make_config(&pairs);
         let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.writer_id, "my-stable-writer");
+        assert!(!cfg.writer_id.is_empty());
     }
 
     #[test]

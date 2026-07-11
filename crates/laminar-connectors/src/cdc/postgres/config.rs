@@ -234,6 +234,11 @@ impl PostgresCdcConfig {
         crate::config::require_non_empty(&self.database, "database")?;
         crate::config::require_non_empty(&self.slot_name, "slot.name")?;
         crate::config::require_non_empty(&self.publication, "publication")?;
+        if self.port == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "port must be > 0".to_string(),
+            ));
+        }
         if self.max_poll_records == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "max.poll.records must be > 0".to_string(),
@@ -243,6 +248,24 @@ impl PostgresCdcConfig {
             return Err(ConnectorError::ConfigurationError(
                 "max.buffered.events must be > 0".to_string(),
             ));
+        }
+        if !(self.backpressure_high_watermark.is_finite()
+            && 0.0 < self.backpressure_high_watermark
+            && self.backpressure_high_watermark <= 1.0)
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "backpressure.high.watermark must be finite and in (0, 1]".to_string(),
+            ));
+        }
+        for (name, timeout) in [
+            ("poll.timeout.ms", self.poll_timeout),
+            ("keepalive.interval.ms", self.keepalive_interval),
+        ] {
+            if timeout.is_zero() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "{name} must be > 0"
+                )));
+            }
         }
         // VerifyCa/VerifyFull require a CA certificate path
         if matches!(self.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull)

@@ -102,25 +102,34 @@ fn build_connector_config(
 }
 
 pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorConfig, DbError> {
-    build_connector_config(
+    let mut config = build_connector_config(
         "Source",
         &reg.name,
         reg.connector_type.as_deref(),
         &reg.connector_options,
         reg.format.as_deref(),
         &reg.format_options,
-    )
+    )?;
+    config.set("laminar.source.name", reg.name.clone());
+    Ok(config)
 }
 
-pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfig, DbError> {
-    build_connector_config(
+pub(crate) fn build_sink_config(
+    reg: &SinkRegistration,
+    delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+) -> Result<ConnectorConfig, DbError> {
+    let mut config = build_connector_config(
         "Sink",
         &reg.name,
         reg.connector_type.as_deref(),
         &reg.connector_options,
         reg.format.as_deref(),
         &reg.format_options,
-    )
+    )?;
+    // Delivery is an end-to-end pipeline contract, not a per-sink option. Always overwrite a
+    // DDL-provided value so connector behaviour and runtime admission cannot diverge.
+    config.set("delivery.guarantee", delivery_guarantee.to_string());
+    Ok(config)
 }
 
 pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorConfig, DbError> {
@@ -669,15 +678,27 @@ mod tests {
             name: "output".to_string(),
             input: "events".to_string(),
             connector_type: Some("KAFKA".to_string()),
-            connector_options: HashMap::from([("topic".to_string(), "output".to_string())]),
+            connector_options: HashMap::from([
+                ("topic".to_string(), "output".to_string()),
+                ("delivery.guarantee".to_string(), "exactly_once".to_string()),
+            ]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             filter_expr: Some("id > 10".to_string()),
         };
-        let config = build_sink_config(&reg).unwrap();
+        let config = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
         assert_eq!(config.connector_type(), "kafka");
         assert_eq!(config.get("topic"), Some("output"));
         assert_eq!(config.get("format"), Some("json"));
+        assert_eq!(
+            config.get("delivery.guarantee"),
+            Some("at-least-once"),
+            "pipeline-wide delivery must override a per-sink DDL option"
+        );
     }
 
     #[test]
@@ -691,7 +712,11 @@ mod tests {
             format_options: HashMap::new(),
             filter_expr: None,
         };
-        let err = build_sink_config(&reg).unwrap_err();
+        let err = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no connector type"));
     }
 
@@ -706,7 +731,11 @@ mod tests {
             format_options: HashMap::new(),
             filter_expr: None,
         };
-        let err = build_sink_config(&reg).unwrap_err();
+        let err = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Invalid format"));
     }
 
@@ -845,7 +874,11 @@ mod tests {
             format_options: HashMap::new(),
             filter_expr: None,
         };
-        let config = build_sink_config(&reg).unwrap();
+        let config = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
         assert_eq!(config.connector_type(), "delta-lake");
     }
 }

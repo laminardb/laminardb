@@ -37,6 +37,155 @@ fn default_ping_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
+fn require_non_empty(config: &ConnectorConfig, key: &str) -> Result<String, ConnectorError> {
+    let value = config.require(key)?.trim();
+    if value.is_empty() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "WebSocket sink option '{key}' must not be empty"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_server_mode(config: &ConnectorConfig) -> Result<SinkMode, ConnectorError> {
+    let bind_address = require_non_empty(config, "bind.address")?;
+    bind_address.parse::<std::net::SocketAddr>().map_err(|e| {
+        ConnectorError::ConfigurationError(format!(
+            "invalid WebSocket server bind.address '{bind_address}': {e}"
+        ))
+    })?;
+    let max_connections = config
+        .get_parsed("max.connections")?
+        .unwrap_or(default_max_connections());
+    if max_connections == 0 {
+        return Err(ConnectorError::ConfigurationError(
+            "WebSocket server max.connections must be greater than zero".into(),
+        ));
+    }
+    let per_client_buffer = config
+        .get_parsed("per.client.buffer")?
+        .unwrap_or(default_per_client_buffer());
+    if per_client_buffer == 0 {
+        return Err(ConnectorError::ConfigurationError(
+            "WebSocket server per.client.buffer must be greater than zero".into(),
+        ));
+    }
+    let ping_interval_ms = config.get_parsed("ping.interval.ms")?.unwrap_or(30_000);
+    let ping_timeout_ms = config.get_parsed("ping.timeout.ms")?.unwrap_or(10_000);
+    if ping_interval_ms == 0 || ping_timeout_ms == 0 {
+        return Err(ConnectorError::ConfigurationError(
+            "WebSocket server ping intervals must be greater than zero".into(),
+        ));
+    }
+    let replay_buffer_size = config.get_parsed("replay.buffer.size")?;
+    let path = config.get("path").map(ToString::to_string);
+
+    let slow_client_policy = match config
+        .get("slow.client.policy")
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        None | Some("drop_oldest") => SlowClientPolicy::DropOldest,
+        Some("drop_newest") => SlowClientPolicy::DropNewest,
+        Some("disconnect") => {
+            let threshold_pct = config
+                .get_parsed("slow.client.threshold.pct")?
+                .unwrap_or(90);
+            if !(1..=100).contains(&threshold_pct) {
+                return Err(ConnectorError::ConfigurationError(
+                    "slow.client.threshold.pct must be between 1 and 100".into(),
+                ));
+            }
+            SlowClientPolicy::Disconnect { threshold_pct }
+        }
+        Some(other) => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "invalid slow.client.policy '{other}': expected drop_oldest, drop_newest, or disconnect"
+            )));
+        }
+    };
+
+    Ok(SinkMode::Server {
+        bind_address,
+        path,
+        max_connections,
+        per_client_buffer,
+        slow_client_policy,
+        ping_interval: Duration::from_millis(ping_interval_ms),
+        ping_timeout: Duration::from_millis(ping_timeout_ms),
+        enable_subscription_filter: false,
+        replay_buffer_size,
+    })
+}
+
+fn parse_client_mode(config: &ConnectorConfig) -> Result<SinkMode, ConnectorError> {
+    let url = require_non_empty(config, "url")?;
+    let parsed_url = url::Url::parse(&url).map_err(|e| {
+        ConnectorError::ConfigurationError(format!("invalid WebSocket client URL '{url}': {e}"))
+    })?;
+    if !matches!(parsed_url.scheme(), "ws" | "wss") || parsed_url.host().is_none() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "invalid WebSocket client URL '{url}': expected ws:// or wss:// with a host"
+        )));
+    }
+    let buffer_on_disconnect = config.get_parsed("buffer.on.disconnect")?;
+    let batch_max_size = config.get_parsed("batch.max.size")?;
+    let batch_interval_ms = config.get_parsed("batch.interval.ms")?;
+    if batch_max_size == Some(0) {
+        return Err(ConnectorError::ConfigurationError(
+            "WebSocket client batch.max.size must be greater than zero".into(),
+        ));
+    }
+    if batch_interval_ms == Some(0) {
+        return Err(ConnectorError::ConfigurationError(
+            "WebSocket client batch.interval.ms must be greater than zero".into(),
+        ));
+    }
+
+    Ok(SinkMode::Client {
+        url,
+        reconnect: ReconnectConfig::default(),
+        buffer_on_disconnect,
+        batch_interval: batch_interval_ms.map(Duration::from_millis),
+        batch_max_size,
+    })
+}
+
+fn parse_sink_format(config: &ConnectorConfig) -> Result<SinkFormat, ConnectorError> {
+    match config.get("format").map(str::to_lowercase) {
+        Some(ref value) if value == "json" => Ok(SinkFormat::Json),
+        Some(ref value) if value == "jsonlines" || value == "json_lines" => {
+            Ok(SinkFormat::JsonLines)
+        }
+        Some(ref value) if value == "arrow_ipc" => Ok(SinkFormat::ArrowIpc),
+        Some(ref value) if value == "binary" => Ok(SinkFormat::Binary),
+        Some(other) => Err(ConnectorError::ConfigurationError(format!(
+            "invalid sink format '{other}': expected json, jsonlines, arrow_ipc, or binary"
+        ))),
+        None => Ok(SinkFormat::Json),
+    }
+}
+
+fn parse_auth(config: &ConnectorConfig) -> Result<Option<WsAuthConfig>, ConnectorError> {
+    match config.get("auth.type").map(str::to_lowercase).as_deref() {
+        None | Some("none") => Ok(None),
+        Some("bearer") => Ok(Some(WsAuthConfig::Bearer {
+            token: require_non_empty(config, "auth.token")?,
+        })),
+        Some("basic") => Ok(Some(WsAuthConfig::Basic {
+            username: require_non_empty(config, "auth.username")?,
+            password: require_non_empty(config, "auth.password")?,
+        })),
+        Some("hmac") => Ok(Some(WsAuthConfig::Hmac {
+            api_key: require_non_empty(config, "auth.api.key")?,
+            secret: require_non_empty(config, "auth.secret")?,
+        })),
+        Some(other) => Err(ConnectorError::ConfigurationError(format!(
+            "invalid WebSocket auth.type '{other}': expected none, bearer, basic, or hmac"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
@@ -65,61 +214,14 @@ impl WebSocketSinkConfig {
     /// Returns `ConnectorError::ConfigurationError` if a required key is missing
     /// or a value cannot be parsed.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let mode_str = config.get("mode").unwrap_or("server");
-        let mode = match mode_str.to_lowercase().as_str() {
-            "server" => {
-                let bind_address = config.require("bind.address").map(ToString::to_string)?;
-                let max_connections: usize = config
-                    .get_parsed("max.connections")?
-                    .unwrap_or(default_max_connections());
-                let per_client_buffer: usize = config
-                    .get_parsed("per.client.buffer")?
-                    .unwrap_or(default_per_client_buffer());
-                let ping_interval_ms: u64 =
-                    config.get_parsed("ping.interval.ms")?.unwrap_or(30_000);
-                let ping_timeout_ms: u64 = config.get_parsed("ping.timeout.ms")?.unwrap_or(10_000);
-                let replay_buffer_size: Option<usize> = config.get_parsed("replay.buffer.size")?;
-                let path = config.get("path").map(ToString::to_string);
-
-                let slow_client_policy =
-                    match config.get("slow.client.policy").map(str::to_lowercase) {
-                        Some(ref s) if s == "drop_oldest" => SlowClientPolicy::DropOldest,
-                        Some(ref s) if s == "drop_newest" => SlowClientPolicy::DropNewest,
-                        Some(ref s) if s == "disconnect" => SlowClientPolicy::Disconnect {
-                            threshold_pct: config
-                                .get_parsed("slow.client.threshold.pct")?
-                                .unwrap_or(90),
-                        },
-                        _ => SlowClientPolicy::default(),
-                    };
-
-                SinkMode::Server {
-                    bind_address,
-                    path,
-                    max_connections,
-                    per_client_buffer,
-                    slow_client_policy,
-                    ping_interval: Duration::from_millis(ping_interval_ms),
-                    ping_timeout: Duration::from_millis(ping_timeout_ms),
-                    enable_subscription_filter: false,
-                    replay_buffer_size,
-                }
-            }
-            "client" => {
-                let url = config.require("url").map(ToString::to_string)?;
-                let buffer_on_disconnect: Option<usize> =
-                    config.get_parsed("buffer.on.disconnect")?;
-                let batch_max_size: Option<usize> = config.get_parsed("batch.max.size")?;
-                let batch_interval_ms: Option<u64> = config.get_parsed("batch.interval.ms")?;
-
-                SinkMode::Client {
-                    url,
-                    reconnect: ReconnectConfig::default(),
-                    buffer_on_disconnect,
-                    batch_interval: batch_interval_ms.map(Duration::from_millis),
-                    batch_max_size,
-                }
-            }
+        let mode = match config
+            .get("mode")
+            .unwrap_or("server")
+            .to_lowercase()
+            .as_str()
+        {
+            "server" => parse_server_mode(config)?,
+            "client" => parse_client_mode(config)?,
             other => {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "invalid WebSocket sink mode '{other}': expected 'server' or 'client'"
@@ -127,38 +229,11 @@ impl WebSocketSinkConfig {
             }
         };
 
-        let format = match config.get("format").map(str::to_lowercase) {
-            Some(ref s) if s == "json" => SinkFormat::Json,
-            Some(ref s) if s == "jsonlines" || s == "json_lines" => SinkFormat::JsonLines,
-            Some(ref s) if s == "arrow_ipc" || s == "arowipc" => SinkFormat::ArrowIpc,
-            Some(ref s) if s == "binary" => SinkFormat::Binary,
-            Some(ref other) => {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "invalid sink format '{other}': expected json, jsonlines, arrow_ipc, or binary"
-                )));
-            }
-            None => SinkFormat::Json,
-        };
-
-        let auth = match config.get("auth.type").map(str::to_lowercase) {
-            Some(ref s) if s == "bearer" => {
-                let token = config.require("auth.token").map(ToString::to_string)?;
-                Some(WsAuthConfig::Bearer { token })
-            }
-            Some(ref s) if s == "basic" => {
-                let username = config.require("auth.username").map(ToString::to_string)?;
-                let password = config.require("auth.password").map(ToString::to_string)?;
-                Some(WsAuthConfig::Basic { username, password })
-            }
-            Some(ref s) if s == "hmac" => {
-                let api_key = config.require("auth.api.key").map(ToString::to_string)?;
-                let secret = config.require("auth.secret").map(ToString::to_string)?;
-                Some(WsAuthConfig::Hmac { api_key, secret })
-            }
-            _ => None,
-        };
-
-        Ok(Self { mode, format, auth })
+        Ok(Self {
+            mode,
+            format: parse_sink_format(config)?,
+            auth: parse_auth(config)?,
+        })
     }
 }
 

@@ -7,7 +7,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use laminar_core::state::StateBackendConfig;
+use laminar_core::state::{StateBackendConfig, StateBackendDurability};
+use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -202,6 +203,20 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     }
 
     if config.server.mode == "cluster" {
+        match config.server.delivery {
+            DeliveryGuarantee::BestEffort => errors.push(
+                "cluster mode requires at_least_once delivery; best_effort has no defined \
+                 rebalance/state-loss contract"
+                    .to_string(),
+            ),
+            DeliveryGuarantee::AtLeastOnce => {}
+            DeliveryGuarantee::ExactlyOnce => errors.push(
+                "[LDB-0013] cluster exactly-once is not admitted: the durable leader lease is \
+                 not atomically bound to checkpoint decisions or sink commits. Use cluster \
+                 at_least_once, or exactly_once in embedded/single-node mode"
+                    .to_string(),
+            ),
+        }
         if config.discovery.is_none() {
             errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
         }
@@ -218,13 +233,84 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 config.checkpoint.interval,
             ));
         }
+        let scope = config.state.durability_scope();
+        if !scope.satisfies(StateBackendDurability::ClusterShared) {
+            errors.push(format!(
+                "mode = \"cluster\" requires ClusterShared [state] storage; configured scope is \
+                 {scope:?}. Use s3://, gs://, or az:// storage; local paths and file:// are \
+                 node-local"
+            ));
+        }
+        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
+        if !checkpoint_scope.satisfies(StateBackendDurability::ClusterShared) {
+            errors.push(format!(
+                "mode = \"cluster\" requires ClusterShared [checkpoint] storage for manifests \
+                 and decisions; configured scope is {checkpoint_scope:?}. Use s3://, gs://, or \
+                 az:// storage"
+            ));
+        }
+    } else if config.server.delivery == DeliveryGuarantee::ExactlyOnce {
+        if !config.checkpoint.url.starts_with("file://") {
+            errors.push(
+                "[LDB-0014] embedded/single-node exactly-once currently requires a local \
+                 file:// checkpoint namespace protected by an exclusive process lock; shared \
+                 object-store checkpoints require a term-fenced deployment lease"
+                    .to_string(),
+            );
+        }
+        let scope = config.state.durability_scope();
+        if !scope.satisfies(StateBackendDurability::NodeDurable) {
+            errors.push(format!(
+                "exactly-once delivery requires at least NodeDurable [state] storage; configured \
+                 scope is {scope:?}"
+            ));
+        }
+        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
+        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+            errors.push(format!(
+                "exactly-once delivery requires at least NodeDurable [checkpoint] storage; \
+                 configured scope is {checkpoint_scope:?}"
+            ));
+        }
+    } else if config.server.delivery == DeliveryGuarantee::AtLeastOnce {
+        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
+        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+            errors.push(format!(
+                "at-least-once delivery requires at least NodeDurable [checkpoint] storage \
+                 before source acknowledgements can advance; configured scope is \
+                 {checkpoint_scope:?}"
+            ));
+        }
     }
     // 0 would pause barrier admission permanently, silently wedging checkpointing.
+    if config.checkpoint.interval.is_zero() {
+        errors.push("checkpoint.interval must be > 0".to_string());
+    }
+    if config.checkpoint.timeout.is_zero() {
+        errors.push("checkpoint.timeout must be > 0".to_string());
+    }
     if config.checkpoint.max_staged_bytes == Some(0) {
         errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
     }
+    if config.checkpoint.max_retained == 0 {
+        errors.push("checkpoint.max_retained must be > 0".to_string());
+    }
     if config.checkpoint.max_in_flight_epochs == Some(0) {
         errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
+    }
+    if let Some(chain_max) = config.checkpoint.delta_chain_max {
+        if config.server.mode != "cluster" {
+            errors.push("checkpoint.delta_chain_max is supported only in cluster mode".to_string());
+        }
+        if chain_max == 0
+            || config.checkpoint.max_retained < 2
+            || chain_max as usize >= config.checkpoint.max_retained
+        {
+            errors.push(format!(
+                "checkpoint.delta_chain_max must be > 0 and < max_retained ({})",
+                config.checkpoint.max_retained
+            ));
+        }
     }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
@@ -261,7 +347,11 @@ fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
     #[cfg(feature = "state-tier")]
     {
         // Cold tier needs a durable backend (survives restart) and a memory budget (drives demotion).
-        if !config.state.is_durable() {
+        if !config
+            .state
+            .durability_scope()
+            .satisfies(StateBackendDurability::NodeDurable)
+        {
             errors.push(
                 "state_tier_dir requires a durable [state] backend (a local path or \
                  object store); an in-process backend would lose demoted state on restart"
@@ -326,6 +416,12 @@ pub struct ServerSection {
     pub mode: String,
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// End-to-end pipeline delivery contract. Connector protocols are derived from this value.
+    #[serde(default = "default_delivery")]
+    pub delivery: DeliveryGuarantee,
+    /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
+    #[serde(default = "default_incremental_emit")]
+    pub incremental_emit: bool,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
@@ -398,6 +494,8 @@ impl Default for ServerSection {
         Self {
             mode: default_mode(),
             bind: default_bind(),
+            delivery: default_delivery(),
+            incremental_emit: default_incremental_emit(),
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -473,12 +571,16 @@ impl std::fmt::Debug for Secret {
 
 /// `[checkpoint]` section.
 #[derive(Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointSection {
     /// Storage URL: file:///path, s3://bucket/prefix, gs://bucket/prefix.
     #[serde(default = "default_checkpoint_url")]
     pub url: String,
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
+    /// One end-to-end checkpoint-attempt deadline.
+    #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
     /// Number of recent checkpoints to retain before pruning.
     #[serde(default = "default_max_retained")]
     pub max_retained: usize,
@@ -493,30 +595,10 @@ pub struct CheckpointSection {
     /// upload; admission pauses at the cap. Default 512 MiB.
     #[serde(default)]
     pub max_staged_bytes: Option<u64>,
-    /// Coordinated-committer lag (sealed-but-uncommitted epochs) past which the
-    /// committer warns; the hard cap when `uncommitted_epochs_backpressure` is
-    /// on. Default 1024.
-    #[serde(default)]
-    pub max_uncommitted_epochs: Option<u64>,
-    /// Fail checkpoints once the coordinated committer lag exceeds
-    /// `max_uncommitted_epochs`, bounding object-storage growth. Default false.
-    #[serde(default)]
-    pub uncommitted_epochs_backpressure: bool,
-    /// Durability-gate poll first interval in ms (default 100). Tighten on a
-    /// low-latency object store to cut poll quantization.
-    #[serde(default)]
-    pub restorable_gate_poll_initial_ms: Option<u64>,
-    /// Durability-gate poll backoff cap in ms (default 1000).
-    #[serde(default)]
-    pub restorable_gate_poll_max_ms: Option<u64>,
     /// Enable incremental delta checkpoints (cluster-only) with this re-base chain bound.
-    /// Default off; clamped `< max_retained` so a chain base never ages out of the prune window.
+    /// Default off; must be `< max_retained` so a chain base never ages out of the prune window.
     #[serde(default)]
     pub delta_chain_max: Option<u32>,
-    /// Incremental emit for non-windowed running-state aggregate MVs: a dirty-only changelog into
-    /// a keyed upsert store instead of re-materializing every group each cycle. Default ON.
-    #[serde(default = "default_incremental_emit")]
-    pub incremental_emit: bool,
 }
 
 impl Default for CheckpointSection {
@@ -524,16 +606,12 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
+            timeout: default_checkpoint_timeout(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
             max_in_flight_epochs: None,
             max_staged_bytes: None,
-            max_uncommitted_epochs: None,
-            uncommitted_epochs_backpressure: false,
-            restorable_gate_poll_initial_ms: None,
-            restorable_gate_poll_max_ms: None,
             delta_chain_max: None,
-            incremental_emit: default_incremental_emit(),
         }
     }
 }
@@ -544,6 +622,7 @@ impl std::fmt::Debug for CheckpointSection {
         f.debug_struct("CheckpointSection")
             .field("url", &self.url)
             .field("interval", &self.interval)
+            .field("timeout", &self.timeout)
             .field("max_retained", &self.max_retained)
             .field(
                 "storage",
@@ -816,13 +895,12 @@ pub struct PipelineConfig {
 
 /// `[[sink]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     pub name: String,
     pub pipeline: String,
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
-    #[serde(default = "default_delivery")]
-    pub delivery: String,
     #[serde(default)]
     pub properties: toml::Table,
 }
@@ -915,6 +993,9 @@ fn default_incremental_emit() -> bool {
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)
 }
+fn default_checkpoint_timeout() -> Duration {
+    Duration::from_secs(120)
+}
 fn default_format() -> String {
     "json".to_string()
 }
@@ -933,8 +1014,8 @@ fn default_cache_size() -> u64 {
 fn default_cache_ttl() -> Duration {
     Duration::from_secs(300)
 }
-fn default_delivery() -> String {
-    "at_least_once".to_string()
+fn default_delivery() -> DeliveryGuarantee {
+    DeliveryGuarantee::AtLeastOnce
 }
 fn default_gossip_port() -> u16 {
     7946
@@ -1103,6 +1184,8 @@ task = "classify"
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.server.mode, "embedded");
         assert_eq!(config.server.bind, "127.0.0.1:8080");
+        assert!(config.server.incremental_emit);
+        assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert!(config.sources.is_empty());
         assert!(config.pipelines.is_empty());
         assert!(config.sinks.is_empty());
@@ -1121,7 +1204,6 @@ backend = "in_process"
 [checkpoint]
 url = "file:///tmp/checkpoints"
 interval = "10s"
-mode = "aligned"
 
 [[source]]
 name = "trades"
@@ -1175,16 +1257,17 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+delivery = "at_least_once"
 
 [state]
-backend = "local"
-path = "/data/state"
+backend = "object_store"
+url = "s3://bucket/state"
+instance_id = "star-1"
 vnode_capacity = 256
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
 interval = "30s"
-snapshot_strategy = "fork_cow"
 
 [discovery]
 strategy = "static"
@@ -1213,13 +1296,20 @@ parallelism = 8
 name = "output"
 pipeline = "enrichment"
 connector = "kafka"
-delivery = "exactly_once"
 "#;
 
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
         assert_eq!(config.server.mode, "cluster");
-        assert!(matches!(config.state, StateBackendConfig::Local { .. }));
+        assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
+        assert!(matches!(
+            &config.state,
+            StateBackendConfig::ObjectStore { .. }
+        ));
+        assert_eq!(
+            config.state.durability_scope(),
+            StateBackendDurability::ClusterShared
+        );
         assert!(config.discovery.is_some());
         assert!(config.coordination.is_some());
 
@@ -1235,6 +1325,154 @@ delivery = "exactly_once"
         assert_eq!(coord.heartbeat_interval, Duration::from_millis(300));
 
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn test_runtime_durability_scope_is_fail_closed() {
+        let local_exact: ServerConfig = toml::from_str(
+            r#"
+[server]
+delivery = "exactly_once"
+
+[state]
+backend = "in_process"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&local_exact).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("NodeDurable")));
+
+        let local_cluster: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+
+[state]
+backend = "local"
+path = "/tmp/laminar-state"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+[coordination]
+strategy = "raft"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&local_cluster).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("ClusterShared")));
+
+        let cluster_exact: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+delivery = "exactly_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+[coordination]
+strategy = "raft"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&cluster_exact).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("[LDB-0013]")));
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("ClusterShared [checkpoint]") }));
+
+        let cluster_best_effort: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+delivery = "best_effort"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+[coordination]
+strategy = "raft"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } =
+            validate_config(&cluster_best_effort).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| {
+            error.contains("cluster mode requires at_least_once") && error.contains("best_effort")
+        }));
+
+        let volatile_checkpoint: ServerConfig = toml::from_str(
+            r#"
+[server]
+delivery = "at_least_once"
+
+[checkpoint]
+url = "memory://checkpoint"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } =
+            validate_config(&volatile_checkpoint).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| {
+            error.contains("NodeDurable [checkpoint]") && error.contains("source acknowledgements")
+        }));
+
+        let shared_local_exact: ServerConfig = toml::from_str(
+            r#"
+[server]
+delivery = "exactly_once"
+
+[state]
+backend = "local"
+path = "/tmp/laminar-state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } =
+            validate_config(&shared_local_exact).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("[LDB-0014]")));
     }
 
     #[test]
@@ -1656,6 +1894,7 @@ alice = "wonderland-key"
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
+        assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
     }
 
     #[test]
@@ -1663,9 +1902,11 @@ alice = "wonderland-key"
         let toml = r#"
 [checkpoint]
 interval = "30s"
+timeout = "2m"
 "#;
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.checkpoint.interval, Duration::from_secs(30));
+        assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
 
         let toml2 = r#"
 [checkpoint]
@@ -1680,6 +1921,46 @@ interval = "500ms"
 "#;
         let config3: ServerConfig = toml::from_str(toml3).unwrap();
         assert_eq!(config3.checkpoint.interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn incremental_emit_is_server_execution_policy() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[server]
+incremental_emit = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.server.incremental_emit);
+    }
+
+    #[test]
+    fn checkpoint_rejects_removed_mechanism_knobs() {
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+[checkpoint]
+snapshot_strategy = "incremental"
+"#,
+        )
+        .expect_err("removed checkpoint knobs must not be silently ignored");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn sink_rejects_per_connector_delivery_dimension() {
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+[[sink]]
+name = "out"
+pipeline = "p"
+connector = "kafka"
+delivery = "exactly_once"
+"#,
+        )
+        .expect_err("delivery is a pipeline-wide server contract");
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     #[test]

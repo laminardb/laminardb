@@ -28,15 +28,6 @@ pub struct FileSourceConfig {
     /// Whether to append a `_metadata` struct column.
     pub include_metadata: bool,
 
-    /// Whether to allow re-ingesting files whose size has changed.
-    pub allow_overwrites: bool,
-
-    /// Maximum active entries in the file ingestion manifest.
-    pub manifest_retention_count: usize,
-
-    /// Maximum age (days) for manifest entries before eviction.
-    pub manifest_retention_age_days: u64,
-
     /// Safety limit for reading a single file (bytes). Primarily for Parquet.
     pub max_file_bytes: usize,
 
@@ -74,11 +65,29 @@ impl FileSourceConfig {
         let stabilisation_delay =
             parse_duration(props, "stabilisation_delay", Duration::from_secs(1))?;
         let max_files_per_poll = parse_usize(props, "max_files_per_poll", 100)?;
+        if max_files_per_poll == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "'max_files_per_poll' must be greater than zero".into(),
+            ));
+        }
         let include_metadata = parse_bool(props, "include_metadata", false)?;
-        let allow_overwrites = parse_bool(props, "allow_overwrites", false)?;
-        let manifest_retention_count = parse_usize(props, "manifest_retention_count", 100_000)?;
-        let manifest_retention_age_days = parse_u64(props, "manifest_retention_age_days", 90)?;
+        for removed in [
+            "allow_overwrites",
+            "manifest_retention_count",
+            "manifest_retention_age_days",
+        ] {
+            if props.contains_key(removed) {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file source option '{removed}' was removed; processed paths are immutable and retained in one exact checkpoint inventory"
+                )));
+            }
+        }
         let max_file_bytes = parse_usize(props, "max_file_bytes", 256 * 1024 * 1024)?;
+        if max_file_bytes == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "'max_file_bytes' must be greater than zero".into(),
+            ));
+        }
         let glob_pattern = props.get("glob_pattern").cloned();
 
         // Default delimiter: tab for tsv, comma otherwise.
@@ -98,9 +107,6 @@ impl FileSourceConfig {
             stabilisation_delay,
             max_files_per_poll,
             include_metadata,
-            allow_overwrites,
-            manifest_retention_count,
-            manifest_retention_age_days,
             max_file_bytes,
             glob_pattern,
             csv_delimiter,
@@ -118,10 +124,7 @@ pub struct FileSinkConfig {
     /// Output format.
     pub format: FileFormat,
 
-    /// Write mode.
-    pub mode: SinkMode,
-
-    /// File name prefix for rolling mode.
+    /// File name prefix for immutable output files.
     pub prefix: String,
 
     /// Maximum file size before rotation (row formats only).
@@ -130,8 +133,8 @@ pub struct FileSinkConfig {
     /// Parquet compression codec.
     pub compression: String,
 
-    /// Maximum batches to buffer per epoch for Parquet (default: 10,000).
-    pub max_epoch_batches: usize,
+    /// Maximum batches to buffer between bulk-format flushes (default: 10,000).
+    pub max_buffered_batches: usize,
 }
 
 impl FileSinkConfig {
@@ -156,20 +159,27 @@ impl FileSinkConfig {
             })
             .and_then(|s| FileFormat::parse(s))?;
 
-        let mode = match props.get("mode").map(String::as_str) {
-            Some("append") => SinkMode::Append,
-            Some("rolling") | None => SinkMode::Rolling,
-            Some(other) => {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "unknown sink mode: '{other}' (expected 'append' or 'rolling')"
-                )));
-            }
-        };
+        if props.contains_key("mode") {
+            return Err(ConnectorError::ConfigurationError(
+                "file sink option 'mode' was removed; files are always published as immutable rolling files"
+                    .into(),
+            ));
+        }
 
         let prefix = props
             .get("prefix")
             .cloned()
             .unwrap_or_else(|| "part".to_string());
+        if prefix.is_empty()
+            || prefix == "."
+            || prefix == ".."
+            || prefix.contains('/')
+            || prefix.contains('\\')
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "file sink 'prefix' must be a non-empty file-name component".into(),
+            ));
+        }
 
         let max_file_size = props
             .get("max_file_size")
@@ -185,29 +195,34 @@ impl FileSinkConfig {
             .cloned()
             .unwrap_or_else(|| "snappy".to_string());
 
-        let max_epoch_batches = props
-            .get("max_epoch_batches")
+        if props.contains_key("max_epoch_batches") {
+            return Err(ConnectorError::ConfigurationError(
+                "file sink option 'max_epoch_batches' was replaced by 'max_buffered_batches'"
+                    .into(),
+            ));
+        }
+        let max_buffered_batches = props
+            .get("max_buffered_batches")
             .map(|s| {
                 s.parse::<usize>().map_err(|e| {
-                    ConnectorError::ConfigurationError(format!("invalid max_epoch_batches: {e}"))
+                    ConnectorError::ConfigurationError(format!("invalid max_buffered_batches: {e}"))
                 })
             })
             .transpose()?
             .unwrap_or(10_000);
-        if max_epoch_batches == 0 {
+        if max_buffered_batches == 0 {
             return Err(ConnectorError::ConfigurationError(
-                "max_epoch_batches must be > 0".into(),
+                "max_buffered_batches must be > 0".into(),
             ));
         }
 
         Ok(Self {
             path,
             format,
-            mode,
             prefix,
             max_file_size,
             compression,
-            max_epoch_batches,
+            max_buffered_batches,
         })
     }
 }
@@ -278,15 +293,6 @@ impl FileFormat {
     }
 }
 
-/// Sink write mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SinkMode {
-    /// Append to a single file.
-    Append,
-    /// Create a new file per epoch (with optional mid-epoch rotation for row formats).
-    Rolling,
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn parse_duration(
@@ -307,19 +313,6 @@ fn parse_usize(
     key: &str,
     default: usize,
 ) -> Result<usize, ConnectorError> {
-    match props.get(key) {
-        Some(s) => s
-            .parse()
-            .map_err(|e| ConnectorError::ConfigurationError(format!("invalid {key}: {e}"))),
-        None => Ok(default),
-    }
-}
-
-fn parse_u64(
-    props: &HashMap<String, String>,
-    key: &str,
-    default: u64,
-) -> Result<u64, ConnectorError> {
     match props.get(key) {
         Some(s) => s
             .parse()
@@ -427,7 +420,36 @@ mod tests {
         assert_eq!(src.format, Some(FileFormat::Csv));
         assert_eq!(src.max_files_per_poll, 50);
         assert!(src.include_metadata);
-        assert!(!src.allow_overwrites);
+    }
+
+    #[test]
+    fn removed_probabilistic_manifest_options_are_rejected() {
+        for option in [
+            "allow_overwrites",
+            "manifest_retention_count",
+            "manifest_retention_age_days",
+        ] {
+            let mut config = ConnectorConfig::new("files");
+            config.set("path", "/data/logs");
+            config.set("format", "text");
+            config.set(option, "1");
+            let error = FileSourceConfig::from_connector_config(&config)
+                .expect_err("removed lossy manifest option must fail closed");
+            assert!(error.to_string().contains(option));
+        }
+    }
+
+    #[test]
+    fn source_poll_bounds_must_be_nonzero() {
+        for option in ["max_files_per_poll", "max_file_bytes"] {
+            let mut config = ConnectorConfig::new("files");
+            config.set("path", "/data/logs");
+            config.set("format", "text");
+            config.set(option, "0");
+            let error = FileSourceConfig::from_connector_config(&config)
+                .expect_err("zero source bound must fail closed");
+            assert!(error.to_string().contains(option));
+        }
     }
 
     #[test]
@@ -441,13 +463,11 @@ mod tests {
         let mut config = ConnectorConfig::new("files");
         config.set("path", "/output");
         config.set("format", "parquet");
-        config.set("mode", "rolling");
         config.set("compression", "zstd");
 
         let sink = FileSinkConfig::from_connector_config(&config).unwrap();
         assert_eq!(sink.path, "/output");
         assert_eq!(sink.format, FileFormat::Parquet);
-        assert_eq!(sink.mode, SinkMode::Rolling);
         assert_eq!(sink.compression, "zstd");
     }
 
@@ -469,11 +489,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sink_mode_default() {
-        let mut config = ConnectorConfig::new("files");
-        config.set("path", "/output");
-        config.set("format", "csv");
-        let sink = FileSinkConfig::from_connector_config(&config).unwrap();
-        assert_eq!(sink.mode, SinkMode::Rolling);
+    fn test_removed_sink_mode_option_is_rejected() {
+        for old_mode in ["append", "rolling"] {
+            let mut config = ConnectorConfig::new("files");
+            config.set("path", "/output");
+            config.set("format", "csv");
+            config.set("mode", old_mode);
+
+            let error = FileSinkConfig::from_connector_config(&config).unwrap_err();
+            assert!(error.to_string().contains("option 'mode' was removed"));
+        }
     }
 }

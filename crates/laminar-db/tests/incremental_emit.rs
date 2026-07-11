@@ -19,9 +19,9 @@ use laminar_db::{ExecuteResult, LaminarConfig, LaminarDB};
 fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
     LaminarConfig {
         storage_dir: Some(dir.to_path_buf()),
+        incremental_emit: incremental,
         checkpoint: Some(StreamCheckpointConfig {
             interval_ms: None, // manual checkpoints only
-            incremental_emit: incremental,
             ..StreamCheckpointConfig::default()
         }),
         ..LaminarConfig::default()

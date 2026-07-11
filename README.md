@@ -8,7 +8,7 @@
 
 # LaminarDB
 
-A streaming SQL engine for Rust. Embed it as a library or run the standalone server. Continuous queries, event-time windows, exactly-once checkpoints. No JVM, no cluster required.
+A streaming SQL engine for Rust. Embed it as a library or run the standalone server. Continuous queries, event-time windows, and checkpointed recovery. No JVM, no cluster required.
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ conn.close()
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
 | Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
-| Cluster | Multi-node deployment. Gossip discovery, Raft coordination, dynamic partition/vnode rebalance, distributed 2PC checkpointer. |
+| Cluster | Multi-node deployment. Gossip discovery, Raft coordination, dynamic partition/vnode rebalance, and distributed checkpoints. |
 
 ### Prebuilt binaries
 
@@ -141,18 +141,24 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
 * **Coordination**: Raft consensus manages metadata and leases. A consensus group elects a leader, tracks node lease lifecycles, and maintains the partition layout table (`AssignmentSnapshotStore`).
 * **Dynamic Rebalancing**: A total of 256 virtual nodes (vnodes) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the vnode assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its vnodes before the node terminates.
-* **Distributed Checkpoints & 2PC**: Checkpoint barriers flow through the distributed operator graph. Exactly-once sink commits are governed by a distributed two-phase commit (2PC) protocol managed by the leader node. Checkpoints require a minimum interval of 2 seconds to ensure manifest durability gates and sink commit coordination.
-* **State Store**: Requires a shared storage backend (`object_store` mode, e.g., S3, GCS, Azure Blob, or a shared filesystem) to allow nodes to read and recover state partitions.
+* **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Cluster delivery is currently admitted only as `at_least_once`.
+* **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
+
+> [!IMPORTANT]
+> Cluster exactly-once currently fails closed with `[LDB-0013]`. The renewable leader lease is not yet atomically bound to both checkpoint decisions and external sink commits, so a term change cannot be fenced end to end. Use cluster `at_least_once`, or use `exactly_once` in embedded/single-node mode with node-durable state and compatible connectors.
+> Embedded/single-node exactly-once also requires a local checkpoint directory, held under an OS-released exclusive deployment lock. Pointing two local runtimes at one shared object-store checkpoint namespace fails closed with `[LDB-0014]` until an end-to-end term-fenced deployment lease is available.
 
 ### Cluster Configuration Example
 
 To deploy in cluster mode, configure the `[discovery]` and `[coordination]` sections in `laminardb.toml`, and set `server.mode` to `"cluster"`.
 
 ```toml
+node_id = "node-1" # Required and unique per node
+
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
-node_id = "node-1" # Unique node identifier (auto-generated if omitted)
+delivery = "at_least_once"
 
 [discovery]
 strategy = "gossip" # "gossip" or "static"
@@ -173,6 +179,11 @@ instance_id = "node-1"
 vnode_capacity = 256
 discovery = "dynamic"
 seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
+
+[checkpoint]
+url = "s3://my-bucket/laminardb/checkpoints"
+interval = "30s"
+timeout = "120s"
 ```
 
 > [!NOTE]
@@ -330,7 +341,7 @@ Local models are encoder-only (BERT / DistilBERT / MiniLM family) and run on **O
 
 ## Connectors
 
-Feature-gated connectors for external systems. Each implements `SourceConnector` or `SinkConnector` with two-phase commit for exactly-once semantics.
+Feature-gated connectors for external systems. Each advertises a typed recovery, durability, topology, and input contract; startup rejects combinations that cannot uphold the pipeline-wide delivery guarantee.
 
 ### Sources
 
@@ -338,7 +349,7 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 |-----------|-------------|-------|--------|
 | Kafka | `kafka` | Consumer group, Schema Registry, Avro/JSON/CSV/Debezium | ✅ |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
-| MySQL CDC | `mysql-cdc` | Binlog replication, GTID position tracking | ✅ |
+| MySQL CDC | `mysql-cdc` | Single-table binlog capture; best-effort only (checkpoint resume is not certified) | ✅ |
 | MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | ✅ |
 | OpenTelemetry OTLP | `otel` | OTLP/gRPC receiver for traces, metrics, and logs | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
@@ -353,11 +364,11 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 
 | Connector | Feature Flag | Notes | Status |
 |-----------|-------------|-------|--------|
-| Kafka | `kafka` | Exactly-once transactions, configurable partitioning | ✅ |
-| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | ✅ |
+| Kafka | `kafka` | Durable at-least-once, configurable partitioning | ✅ |
+| PostgreSQL | `postgres-sink` | COPY BINARY and upsert, durable at-least-once | ✅ |
 | MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | ✅ |
-| Delta Lake | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | ✅ |
-| Iceberg | `iceberg` | Apache Iceberg sink (REST/Glue/Hive catalogs) | ✅ |
+| Delta Lake | `delta-lake` | S3/Azure/GCS, coordinated checkpoint commits | ✅ |
+| Iceberg | `iceberg` | Coordinated Apache Iceberg checkpoint commits | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
@@ -379,11 +390,14 @@ CREATE SOURCE trades (
 );
 
 CREATE SINK trade_archive INTO DELTA_LAKE (
-    path = 's3://my-bucket/trade_summary',
-    write_mode = 'append',
-    delivery.guarantee = 'exactly-once'
+    "table.path" = 's3://my-bucket/trade_summary',
+    "write.mode" = 'append'
 ) AS SELECT * FROM trade_summary;
 ```
+
+Delivery is one pipeline-wide runtime setting (`[server].delivery` for the standalone server or
+`LaminarDbBuilder::delivery_guarantee` when embedded). Per-sink delivery flags are rejected rather
+than silently creating mixed checkpoint semantics.
 
 Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
 
@@ -678,23 +692,23 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 ### Checkpointing and Recovery
 
 1. **Coordinated snapshots.** Chandy-Lamport barriers injected at sources; operators with multiple inputs align before snapshotting.
-2. **Two-phase commit.** Exactly-once sinks participate in pre-commit / commit phases coordinated by `CheckpointCoordinator`.
-3. **Atomic manifest.** Each checkpoint writes a JSON manifest (operator state + connector offsets) via temp-file-plus-rename, to filesystem or object store (S3 / GCS / Azure).
-4. **Recovery.** `RecoveryManager` loads the latest manifest, restores operator state, rolls back exactly-once sinks, and resumes connectors from committed offsets.
+2. **External commit.** In embedded/single-node exactly-once mode, checkpoint-committable sinks stage output and publish it only after the durable checkpoint decision.
+3. **Durable decision.** Prepared and finalized manifests bind the deployment, pipeline, exact attempt, state seals, connector positions, and participants. Filesystem/object-store writes use create/CAS boundaries appropriate to the backend.
+4. **Recovery.** `RecoveryManager` accepts the latest finalized identity-matching manifest, restores state and source positions, and reconciles coordinated sinks from their exact external cursor.
 
 ```rust
 // Note: StreamCheckpointConfig is from laminar-core (add as a dependency)
 let db = LaminarDB::builder()
     .storage_dir("./data")
     .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-        interval: std::time::Duration::from_secs(30),
+        interval_ms: Some(30_000),
         ..Default::default()
     })
     .build()
     .await?;
 ```
 
-On crash, events between the last completed checkpoint and the crash are lost. Checkpoint interval is configurable; shorter intervals reduce the data loss window at the cost of higher I/O overhead.
+Recovery resumes from the latest finalized checkpoint. Replayable sources may resend records after that cut under at-least-once delivery; a certified single-node exactly-once pipeline suppresses duplicate external visibility through coordinated sink commits. Non-replayable sources are admitted only under `best_effort`, where failure can lose accepted events. Shorter checkpoint intervals reduce replay work but increase storage and coordination I/O.
 
 ### Compiled Query Execution
 

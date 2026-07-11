@@ -3,25 +3,65 @@
 //! Watches a directory or cloud path for new files, decodes them using the
 //! configured format (CSV, JSON, text, Parquet), and produces `RecordBatch`es.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
+    SourceTopology,
+};
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
 use super::config::{FileFormat, FileSourceConfig};
-use super::discovery::{DiscoveryConfig, FileDiscoveryEngine};
-use super::manifest::{FileEntry, FileIngestionManifest};
+use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
+use super::manifest::FileIngestionManifest;
 use super::text_decoder::TextLineDecoder;
+
+#[async_trait]
+trait FileReader: Send + Sync {
+    async fn read(&self, path: &str) -> Result<Vec<u8>, ConnectorError>;
+}
+
+struct LocalFileReader;
+
+#[async_trait]
+impl FileReader for LocalFileReader {
+    async fn read(&self, path: &str) -> Result<Vec<u8>, ConnectorError> {
+        read_file_bytes(path).await
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FileProgress {
+    path: String,
+    size: u64,
+    modified_ms: u64,
+    content_sha256: String,
+    next_row: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFile {
+    discovered: DiscoveredFile,
+    resume: Option<FileProgress>,
+}
+
+#[derive(Debug)]
+struct DecodedFile {
+    discovered: DiscoveredFile,
+    content_sha256: String,
+    records: RecordBatch,
+    next_row: usize,
+}
 
 /// AutoLoader-style file source connector.
 ///
@@ -30,15 +70,22 @@ use super::text_decoder::TextLineDecoder;
 pub struct FileSource {
     /// Parsed configuration.
     config: Option<FileSourceConfig>,
-    /// Output Arrow schema (resolved in `open()`).
+    /// Output Arrow schema (resolved in `start()`).
     schema: SchemaRef,
-    /// Format decoder (created in `open()`).
+    /// Format decoder (created in `start()`).
     decoder: Option<Box<dyn FormatDecoder>>,
-    /// File discovery engine (started in `open()`).
+    /// File discovery engine (started in `start()` after cursor validation).
     discovery: Option<FileDiscoveryEngine>,
     /// File ingestion manifest (tracks processed files).
     manifest: FileIngestionManifest,
-    /// Whether the connector is open.
+    /// Discovered files staged in connector-owned memory. The front entry is
+    /// retained across cancellation until it has been published or rejected.
+    pending_files: VecDeque<PendingFile>,
+    /// Decoded file being emitted in `max_records`-bounded slices.
+    current_file: Option<DecodedFile>,
+    /// File bytes provider. Local filesystem I/O in production; injectable in tests.
+    reader: Arc<dyn FileReader>,
+    /// Whether the connector has started.
     is_open: bool,
 }
 
@@ -59,6 +106,9 @@ impl FileSource {
             decoder: None,
             discovery: None,
             manifest: FileIngestionManifest::new(),
+            pending_files: VecDeque::new(),
+            current_file: None,
+            reader: Arc::new(LocalFileReader),
             is_open: false,
         }
     }
@@ -75,18 +125,73 @@ impl std::fmt::Debug for FileSource {
         f.debug_struct("FileSource")
             .field("is_open", &self.is_open)
             .field("schema_fields", &self.schema.fields().len())
-            .field("manifest_count", &self.manifest.active_count())
+            .field("manifest_count", &self.manifest.processed_count())
+            .field("pending_files", &self.pending_files.len())
+            .field("has_current_file", &self.current_file.is_some())
             .finish()
     }
 }
 
 #[async_trait]
 impl SourceConnector for FileSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        let src_config = FileSourceConfig::from_connector_config(config)?;
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        // Replayability is backed by an exact processed-path inventory plus an
+        // exact file/row cursor for a partially emitted file.
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+        ))
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        let src_config = FileSourceConfig::from_connector_config(&config)?;
+
+        // Decode and validate the durable manifest before discovery can observe a
+        // single path. A corrupt engine checkpoint is fatal: starting from an empty
+        // manifest would rediscover and duplicate every previously ingested file.
+        let (manifest, progress) = match position {
+            SourcePosition::Initial => (FileIngestionManifest::new(), None),
+            SourcePosition::Resume {
+                attempt,
+                checkpoint,
+            } => {
+                if checkpoint.get_offset("manifest").is_none() {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "file checkpoint {attempt:?} is missing required manifest state"
+                    )));
+                }
+                let manifest =
+                    FileIngestionManifest::from_checkpoint(&checkpoint).map_err(|e| {
+                        ConnectorError::ConfigurationError(format!(
+                            "invalid file manifest in checkpoint {attempt:?}: {e}"
+                        ))
+                    })?;
+                let progress = checkpoint
+                    .get_offset("file_progress")
+                    .map(serde_json::from_str::<FileProgress>)
+                    .transpose()
+                    .map_err(|e| {
+                        ConnectorError::ConfigurationError(format!(
+                            "invalid file progress in checkpoint {attempt:?}: {e}"
+                        ))
+                    })?;
+                if progress
+                    .as_ref()
+                    .is_some_and(|p| manifest.contains(&p.path) || p.next_row == 0)
+                {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "file checkpoint {attempt:?} contains contradictory progress"
+                    )));
+                }
+                (manifest, progress)
+            }
+        };
 
         // Cloud read isn't implemented in `read_file_bytes`; rejecting at
-        // open() is the only honest answer. Silently accepting and then
+        // start() is the only honest answer. Silently accepting and then
         // erroring on first poll leaves the connector "registered but
         // dead" — far worse than a clear configuration error up front.
         if is_cloud_url(&src_config.path) {
@@ -107,7 +212,7 @@ impl SourceConnector for FileSource {
         };
 
         // Build decoder and resolve schema.
-        let (decoder, schema) = build_decoder_and_schema(format, &src_config, config)?;
+        let (decoder, schema) = build_decoder_and_schema(format, &src_config, &config)?;
 
         // Optionally append _metadata struct column.
         let final_schema = if src_config.include_metadata {
@@ -142,13 +247,26 @@ impl SourceConnector for FileSource {
             stabilisation_delay: src_config.stabilisation_delay,
             glob_pattern: src_config.glob_pattern.clone(),
         };
-        let known = Arc::new(self.manifest.snapshot_for_dedup());
+        let known = Arc::new(manifest.snapshot_for_dedup());
         let discovery = FileDiscoveryEngine::start(discovery_config, known);
 
         self.config = Some(src_config);
         self.schema = final_schema;
         self.decoder = Some(decoder);
         self.discovery = Some(discovery);
+        self.manifest = manifest;
+        self.pending_files.clear();
+        self.current_file = None;
+        if let Some(progress) = progress {
+            self.pending_files.push_back(PendingFile {
+                discovered: DiscoveredFile {
+                    path: progress.path.clone(),
+                    size: progress.size,
+                    modified_ms: progress.modified_ms,
+                },
+                resume: Some(progress),
+            });
+        }
         self.is_open = true;
 
         info!(
@@ -158,129 +276,162 @@ impl SourceConnector for FileSource {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // One state machine keeps the post-I/O cursor transition await-free.
     async fn poll_batch(
         &mut self,
-        _max_records: usize,
+        max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
+        if max_records == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "file source poll max_records must be greater than zero".into(),
+            ));
+        }
+
         let config = self
             .config
-            .as_ref()
+            .clone()
             .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open".into(),
+                expected: "started".into(),
                 actual: "closed".into(),
             })?;
-        let discovery = self
-            .discovery
-            .as_mut()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "discovery running".into(),
-                actual: "no discovery".into(),
-            })?;
-        let decoder = self
-            .decoder
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
+        if self.decoder.is_none() {
+            return Err(ConnectorError::InvalidState {
                 expected: "decoder ready".into(),
                 actual: "no decoder".into(),
-            })?;
-
-        let files = discovery.drain(config.max_files_per_poll);
-        if files.is_empty() {
-            return Ok(None);
+            });
         }
 
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
+        loop {
+            if let Some(mut decoded) = self.current_file.take() {
+                let rows_left = decoded.records.num_rows() - decoded.next_row;
+                let row_count = rows_left.min(max_records);
+                let result = decoded.records.slice(decoded.next_row, row_count);
+                decoded.next_row += row_count;
 
-        for file in &files {
-            // Size-change guard.
-            if !config.allow_overwrites && self.manifest.size_changed(&file.path, file.size) {
-                warn!(
-                    "file source: skipping '{}' — size changed (was {}, now {})",
-                    file.path,
-                    self.manifest
-                        .active_entries()
-                        .find(|(p, _)| *p == file.path)
-                        .map(|(_, e)| e.size)
-                        .unwrap_or(0),
-                    file.size
-                );
-                continue;
-            }
-
-            // Already ingested check (belt-and-suspenders with discovery dedup).
-            if self.manifest.contains(&file.path) {
-                continue;
-            }
-
-            // Max file size guard (primarily for Parquet).
-            if file.size > config.max_file_bytes as u64 {
-                warn!(
-                    "file source: skipping '{}' — size {} exceeds max_file_bytes {}",
-                    file.path, file.size, config.max_file_bytes
-                );
-                continue;
-            }
-
-            // Read file contents.
-            let bytes = match read_file_bytes(&file.path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("file source: cannot read '{}': {e}", file.path);
-                    continue;
+                if decoded.next_row == decoded.records.num_rows() {
+                    self.manifest.insert(decoded.discovered.path);
+                } else {
+                    self.current_file = Some(decoded);
                 }
+
+                // No await is permitted between advancing the row/file cursor
+                // above and returning the corresponding zero-copy slice.
+                return Ok(Some(SourceBatch::new(result)));
+            }
+
+            if self.pending_files.is_empty() {
+                let discovery =
+                    self.discovery
+                        .as_mut()
+                        .ok_or_else(|| ConnectorError::InvalidState {
+                            expected: "discovery running".into(),
+                            actual: "no discovery".into(),
+                        })?;
+                self.pending_files.extend(
+                    discovery
+                        .drain(config.max_files_per_poll)
+                        .into_iter()
+                        .map(|discovered| PendingFile {
+                            discovered,
+                            resume: None,
+                        }),
+                );
+            }
+
+            let Some(pending) = self.pending_files.front().cloned() else {
+                return Ok(None);
             };
 
-            // Decode.
-            let record = RawRecord::new(bytes);
-            match decoder.decode_batch(&[record]) {
-                Ok(batch) if batch.num_rows() > 0 => {
-                    let batch = if config.include_metadata {
-                        append_metadata_column(&batch, &file.path, file.size, file.modified_ms)?
-                    } else {
-                        batch
-                    };
-                    all_batches.push(batch);
-                }
-                Ok(_) => {
-                    debug!("file source: empty batch from '{}'", file.path);
-                }
-                Err(e) => {
-                    warn!("file source: decode error for '{}': {e}", file.path);
-                    continue;
-                }
+            if self.manifest.contains(&pending.discovered.path) {
+                self.pending_files.pop_front();
+                continue;
             }
 
-            // Record in manifest.
-            self.manifest.insert(
-                file.path.clone(),
-                FileEntry {
-                    size: file.size,
-                    discovered_at: file.modified_ms,
-                    ingested_at: now_millis(),
-                },
-            );
+            if pending.discovered.size > config.max_file_bytes as u64 {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file '{}' size {} exceeds max_file_bytes {}",
+                    pending.discovered.path, pending.discovered.size, config.max_file_bytes
+                )));
+            }
+
+            let bytes = Arc::clone(&self.reader)
+                .read(&pending.discovered.path)
+                .await?;
+            if bytes.len() > config.max_file_bytes {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file '{}' actual size {} exceeds max_file_bytes {}",
+                    pending.discovered.path,
+                    bytes.len(),
+                    config.max_file_bytes
+                )));
+            }
+            if u64::try_from(bytes.len()).ok() != Some(pending.discovered.size) {
+                return Err(ConnectorError::ReadError(format!(
+                    "file '{}' changed size after discovery (expected {}, read {})",
+                    pending.discovered.path,
+                    pending.discovered.size,
+                    bytes.len()
+                )));
+            }
+
+            let content_sha256 = sha256_hex(&bytes);
+            let next_row = if let Some(progress) = &pending.resume {
+                if progress.content_sha256 != content_sha256 {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "file '{}' changed content since its checkpointed partial read",
+                        pending.discovered.path
+                    )));
+                }
+                usize::try_from(progress.next_row).map_err(|_| {
+                    ConnectorError::ConfigurationError(format!(
+                        "file '{}' checkpoint row {} exceeds this runtime's address space",
+                        pending.discovered.path, progress.next_row
+                    ))
+                })?
+            } else {
+                0
+            };
+
+            let mut records = self
+                .decoder
+                .as_ref()
+                .expect("decoder checked above")
+                .decode_batch(&[RawRecord::new(bytes)])
+                .map_err(ConnectorError::from)?;
+            if config.include_metadata {
+                records = append_metadata_column(
+                    &records,
+                    &pending.discovered.path,
+                    pending.discovered.size,
+                    pending.discovered.modified_ms,
+                )?;
+            }
+            if pending.resume.is_some() && next_row >= records.num_rows() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file '{}' checkpoint row {} is outside decoded row count {}",
+                    pending.discovered.path,
+                    next_row,
+                    records.num_rows()
+                )));
+            }
+
+            self.pending_files.pop_front();
+            if records.num_rows() == 0 {
+                debug!(
+                    "file source: empty batch from '{}'",
+                    pending.discovered.path
+                );
+                self.manifest.insert(pending.discovered.path);
+                return Ok(None);
+            }
+            self.current_file = Some(DecodedFile {
+                discovered: pending.discovered,
+                content_sha256,
+                records,
+                next_row,
+            });
+            // Loop once without awaiting to publish the first bounded slice.
         }
-
-        // Evict old manifest entries if needed.
-        if let Some(cfg) = &self.config {
-            let max_age_ms = cfg.manifest_retention_age_days * 24 * 60 * 60 * 1000;
-            self.manifest
-                .maybe_evict(cfg.manifest_retention_count, max_age_ms);
-        }
-
-        if all_batches.is_empty() {
-            return Ok(None);
-        }
-
-        // Concatenate all batches.
-        let combined = if all_batches.len() == 1 {
-            all_batches.into_iter().next().unwrap()
-        } else {
-            arrow_select::concat::concat_batches(&self.schema, &all_batches)
-                .map_err(|e| ConnectorError::ReadError(format!("batch concat error: {e}")))?
-        };
-
-        Ok(Some(SourceBatch::new(combined)))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -288,38 +439,34 @@ impl SourceConnector for FileSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         self.manifest.to_checkpoint(&mut cp);
-        cp
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        match FileIngestionManifest::from_checkpoint(checkpoint) {
-            Ok(manifest) => {
-                info!(
-                    "file source: restored manifest with {} active entries",
-                    manifest.active_count()
-                );
-                self.manifest = manifest;
-            }
-            Err(e) => {
-                warn!("file source: manifest restore failed: {e} — starting fresh");
-                self.manifest = FileIngestionManifest::new();
-            }
+        if let Some(file) = &self.current_file {
+            let progress = FileProgress {
+                path: file.discovered.path.clone(),
+                size: file.discovered.size,
+                modified_ms: file.discovered.modified_ms,
+                content_sha256: file.content_sha256.clone(),
+                next_row: u64::try_from(file.next_row)
+                    .expect("Arrow record counts are representable as u64"),
+            };
+            cp.set_offset(
+                "file_progress",
+                serde_json::to_string(&progress)
+                    .expect("file progress contains only infallibly serializable fields"),
+            );
         }
-        Ok(())
+        cp
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.discovery = None;
         self.decoder = None;
+        self.pending_files.clear();
+        self.current_file = None;
         self.is_open = false;
         info!("file source closed");
         Ok(())
-    }
-
-    fn supports_replay(&self) -> bool {
-        true
     }
 }
 
@@ -386,11 +533,17 @@ fn is_cloud_url(path: &str) -> bool {
     CLOUD_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 async fn read_file_bytes(path: &str) -> Result<Vec<u8>, ConnectorError> {
-    // Cloud paths are rejected at `open()`; this path is local-only.
+    // Cloud paths are rejected at `start()`; this path is local-only.
     debug_assert!(
         !is_cloud_url(path),
-        "cloud paths must be rejected at open()"
+        "cloud paths must be rejected at start()"
     );
     tokio::fs::read(path)
         .await
@@ -469,30 +622,81 @@ fn append_metadata_column(
         .map_err(|e| ConnectorError::ReadError(format!("metadata append error: {e}")))
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
+    use laminar_core::state::CheckpointAttempt;
+    use std::collections::BTreeMap;
+    use tokio::sync::Notify;
+
+    struct TestFileReader {
+        files: BTreeMap<String, Vec<u8>>,
+        blocked_path: Option<String>,
+        read_started: Notify,
+        release_read: Notify,
+    }
+
+    #[async_trait]
+    impl FileReader for TestFileReader {
+        async fn read(&self, path: &str) -> Result<Vec<u8>, ConnectorError> {
+            if self.blocked_path.as_deref() == Some(path) {
+                self.read_started.notify_one();
+                self.release_read.notified().await;
+            }
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| ConnectorError::ReadError(format!("missing test file '{path}'")))
+        }
+    }
+
+    fn start_request(config: ConnectorConfig, position: SourcePosition) -> SourceStart {
+        SourceStart {
+            config,
+            position,
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        }
+    }
+
+    async fn started_text_source(
+        directory: &std::path::Path,
+        position: SourcePosition,
+    ) -> FileSource {
+        let mut config = ConnectorConfig::new("files");
+        config.set("path", directory.to_string_lossy().to_string());
+        config.set("format", "text");
+        config.set("stabilisation_delay", "60s");
+        let mut source = FileSource::new();
+        source.start(start_request(config, position)).await.unwrap();
+        source
+    }
+
+    fn staged(path: &str, bytes: &[u8]) -> PendingFile {
+        PendingFile {
+            discovered: DiscoveredFile {
+                path: path.into(),
+                size: u64::try_from(bytes.len()).unwrap(),
+                modified_ms: 1234,
+            },
+            resume: None,
+        }
+    }
 
     #[test]
     fn test_file_source_default() {
         let source = FileSource::new();
         assert!(!source.is_open);
-        assert_eq!(source.manifest.active_count(), 0);
+        assert_eq!(source.manifest.processed_count(), 0);
     }
 
     #[tokio::test]
     async fn test_open_missing_path() {
         let mut source = FileSource::new();
         let config = ConnectorConfig::new("files");
-        let result = source.open(&config).await;
+        let result = source
+            .start(start_request(config, SourcePosition::Initial))
+            .await;
         assert!(result.is_err());
     }
 
@@ -502,7 +706,9 @@ mod tests {
         let mut config = ConnectorConfig::new("files");
         config.set("path", "/tmp");
         config.set("format", "text");
-        let result = source.open(&config).await;
+        let result = source
+            .start(start_request(config, SourcePosition::Initial))
+            .await;
         assert!(result.is_ok());
         assert!(source.is_open);
         assert_eq!(source.schema().field(0).name(), "line");
@@ -510,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_batch_when_not_open() {
+    async fn test_poll_batch_when_not_started() {
         let mut source = FileSource::new();
         let result = source.poll_batch(100).await;
         assert!(result.is_err());
@@ -519,37 +725,162 @@ mod tests {
     #[test]
     fn test_checkpoint_roundtrip() {
         let mut source = FileSource::new();
-        source.manifest.insert(
-            "test.csv".into(),
-            FileEntry {
-                size: 100,
-                discovered_at: 1000,
-                ingested_at: 2000,
-            },
-        );
+        source.manifest.insert("test.csv".into());
         let cp = source.checkpoint();
         assert!(cp.get_offset("manifest").is_some());
     }
 
     #[tokio::test]
-    async fn test_restore_from_checkpoint() {
+    async fn test_resume_from_checkpoint() {
         let mut source = FileSource::new();
 
         // Build a checkpoint with manifest data.
-        let mut cp = SourceCheckpoint::new(1);
-        cp.set_offset(
-            "manifest",
-            r#"{"a.csv":{"size":100,"discovered_at":900,"ingested_at":1000}}"#,
-        );
+        let mut cp = SourceCheckpoint::new();
+        cp.set_offset("manifest", r#"["a.csv"]"#);
 
-        source.restore(&cp).await.unwrap();
-        assert_eq!(source.manifest.active_count(), 1);
+        let mut config = ConnectorConfig::new("files");
+        config.set("path", "/tmp");
+        config.set("format", "text");
+        source
+            .start(start_request(
+                config,
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::new(1, 1),
+                    checkpoint: cp,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(source.manifest.processed_count(), 1);
         assert!(source.manifest.contains("a.csv"));
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_resume_manifest_fails_before_discovery_starts() {
+        let mut cp = SourceCheckpoint::new();
+        cp.set_offset("manifest", "{not-json");
+        let mut config = ConnectorConfig::new("files");
+        config.set("path", "/tmp");
+        config.set("format", "text");
+        let mut source = FileSource::new();
+        let error = source
+            .start(start_request(
+                config,
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::new(1, 1),
+                    checkpoint: cp,
+                },
+            ))
+            .await
+            .expect_err("corrupt durable manifest must fail closed");
+        assert!(error.to_string().contains("invalid file manifest"));
+        assert!(source.discovery.is_none());
+        assert!(!source.is_open);
+    }
+
+    #[tokio::test]
+    async fn cancelled_poll_retains_unpublished_file_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = started_text_source(directory.path(), SourcePosition::Initial).await;
+        let first_path = "staged-first.txt";
+        let second_path = "staged-second.txt";
+        let first = b"first\n".to_vec();
+        let second = b"second\n".to_vec();
+        let reader = Arc::new(TestFileReader {
+            files: BTreeMap::from([
+                (first_path.into(), first.clone()),
+                (second_path.into(), second.clone()),
+            ]),
+            blocked_path: Some(second_path.into()),
+            read_started: Notify::new(),
+            release_read: Notify::new(),
+        });
+        source.reader = reader.clone();
+        source.pending_files.push_back(staged(first_path, &first));
+        source.pending_files.push_back(staged(second_path, &second));
+
+        let batch = source.poll_batch(10).await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert!(source.manifest.contains(first_path));
+
+        {
+            let poll = source.poll_batch(10);
+            tokio::pin!(poll);
+            let read_started = reader.read_started.notified();
+            tokio::pin!(read_started);
+            tokio::select! {
+                biased;
+                result = &mut poll => panic!("blocked read unexpectedly completed: {result:?}"),
+                () = &mut read_started => {}
+            }
+            // Dropping `poll` here models the runtime cancelling an in-flight
+            // source poll to service shutdown/control work.
+        }
+
+        assert!(source.manifest.contains(first_path));
+        assert!(!source.manifest.contains(second_path));
+        assert_eq!(
+            source
+                .pending_files
+                .front()
+                .map(|pending| pending.discovered.path.as_str()),
+            Some(second_path)
+        );
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_records_cursor_resumes_exactly_within_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = "bounded.txt";
+        let bytes = b"one\ntwo\nthree\n".to_vec();
+        let reader = Arc::new(TestFileReader {
+            files: BTreeMap::from([(path.into(), bytes.clone())]),
+            blocked_path: None,
+            read_started: Notify::new(),
+            release_read: Notify::new(),
+        });
+
+        let mut source = started_text_source(directory.path(), SourcePosition::Initial).await;
+        source.reader = reader.clone();
+        source.pending_files.push_back(staged(path, &bytes));
+        let first = source.poll_batch(2).await.unwrap().unwrap();
+        assert_eq!(first.num_rows(), 2);
+        assert!(!source.manifest.contains(path));
+        let checkpoint = source.checkpoint();
+        let progress: FileProgress = serde_json::from_str(
+            checkpoint
+                .get_offset("file_progress")
+                .expect("partial file cursor must be checkpointed"),
+        )
+        .unwrap();
+        assert_eq!(progress.next_row, 2);
+        source.close().await.unwrap();
+
+        let mut resumed = started_text_source(
+            directory.path(),
+            SourcePosition::Resume {
+                attempt: CheckpointAttempt::new(7, 11),
+                checkpoint,
+            },
+        )
+        .await;
+        resumed.reader = reader;
+        let remaining = resumed.poll_batch(2).await.unwrap().unwrap();
+        assert_eq!(remaining.num_rows(), 1);
+        assert!(resumed.manifest.contains(path));
+        assert!(resumed.checkpoint().get_offset("file_progress").is_none());
+        resumed.close().await.unwrap();
     }
 
     #[test]
-    fn test_supports_replay() {
+    fn test_source_contract() {
         let source = FileSource::new();
-        assert!(source.supports_replay());
+        let contract = source
+            .contract(&ConnectorConfig::new("files"))
+            .expect("static file contract");
+        assert_eq!(contract.consistency, SourceConsistency::Replayable);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
     }
 }

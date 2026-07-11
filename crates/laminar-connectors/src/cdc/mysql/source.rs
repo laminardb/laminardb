@@ -13,7 +13,10 @@ use tokio::sync::Notify;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
+    SourceTopology,
+};
 use crate::error::ConnectorError;
 
 use super::changelog::ChangeEvent;
@@ -25,7 +28,13 @@ use super::schema::{cdc_envelope_schema, TableCache, TableInfo};
 
 /// Single-consumer async receiver for the binlog reader → `poll_batch` queue.
 #[cfg(feature = "mysql-cdc")]
-type BinlogMessageRx = crossfire::AsyncRx<crossfire::mpsc::Array<BinlogMessage>>;
+type BinlogMessageRx = crossfire::AsyncRx<crossfire::mpsc::Array<BinlogReaderMessage>>;
+
+#[cfg(feature = "mysql-cdc")]
+enum BinlogReaderMessage {
+    Event(BinlogMessage),
+    Terminal(String),
+}
 
 /// MySQL binlog CDC source connector. Reads change events from the MySQL
 /// binary log via replication protocol; supports GTID-based and
@@ -70,6 +79,10 @@ pub struct MySqlCdcSource {
     /// Channel receiver for decoded binlog messages from the background reader task.
     #[cfg(feature = "mysql-cdc")]
     msg_rx: Option<BinlogMessageRx>,
+
+    /// Terminal reader failure, reported only after already-decoded rows have been emitted.
+    #[cfg(feature = "mysql-cdc")]
+    reader_error: Option<String>,
 
     /// Background binlog reader task handle.
     #[cfg(feature = "mysql-cdc")]
@@ -118,6 +131,8 @@ impl MySqlCdcSource {
             data_ready: Arc::new(Notify::new()),
             #[cfg(feature = "mysql-cdc")]
             msg_rx: None,
+            #[cfg(feature = "mysql-cdc")]
+            reader_error: None,
             #[cfg(feature = "mysql-cdc")]
             reader_handle: None,
             #[cfg(feature = "mysql-cdc")]
@@ -183,33 +198,10 @@ impl MySqlCdcSource {
         self.connected
     }
 
-    /// Restores the position from a checkpoint.
-    ///
-    /// Parses the checkpoint offset to extract GTID set or file/position.
-    pub fn restore_position(&mut self, checkpoint: &SourceCheckpoint) {
-        // Try GTID from offset key first
-        if let Some(gtid_str) = checkpoint.get_offset("gtid") {
-            if let Ok(gtid_set) = gtid_str.parse::<GtidSet>() {
-                self.gtid_set = Some(gtid_set);
-                return;
-            }
-        }
-
-        // Try binlog file/position
-        if let (Some(filename), Some(pos_str)) = (
-            checkpoint.get_offset("binlog_file"),
-            checkpoint.get_offset("binlog_position"),
-        ) {
-            if let Ok(pos) = pos_str.parse::<u64>() {
-                self.position = Some(BinlogPosition::new(filename.to_string(), pos));
-            }
-        }
-    }
-
     /// Creates a checkpoint representing the current position.
     #[must_use]
     pub fn create_checkpoint(&self) -> SourceCheckpoint {
-        let mut checkpoint = SourceCheckpoint::new(0);
+        let mut checkpoint = SourceCheckpoint::new();
 
         if self.config.use_gtid {
             if let Some(ref gtid_set) = self.gtid_set {
@@ -244,17 +236,85 @@ impl MySqlCdcSource {
             return Ok(None);
         }
 
-        let events: Vec<_> = self.event_buffer.drain(..).collect();
-        let batch = super::changelog::events_to_record_batch(&events, table_info)
+        let expected_table = table_info.full_name();
+        if self
+            .event_buffer
+            .iter()
+            .any(|event| event.table != expected_table)
+        {
+            return Err(ConnectorError::Internal(format!(
+                "MySQL CDC buffered events span multiple table schemas; expected only \
+                 '{expected_table}'"
+            )));
+        }
+        // Convert before removal. A schema/conversion failure must preserve the events so the
+        // source faults and recovery can replay instead of silently advancing past them.
+        let batch = super::changelog::events_to_record_batch(&self.event_buffer, table_info)
             .map_err(|e| ConnectorError::Internal(e.to_string()))?;
+        self.event_buffer.clear();
         Ok(Some(batch))
+    }
+
+    fn buffered_table_info(&self) -> Result<Option<TableInfo>, ConnectorError> {
+        let Some(event) = self.event_buffer.first() else {
+            return Ok(None);
+        };
+        let (database, table) = event.table.split_once('.').ok_or_else(|| {
+            ConnectorError::Internal(format!(
+                "invalid MySQL CDC event table identity '{}'",
+                event.table
+            ))
+        })?;
+        self.table_cache
+            .get_by_name(database, table)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                ConnectorError::Internal(format!(
+                    "missing TABLE_MAP schema for buffered MySQL table '{}'",
+                    event.table
+                ))
+            })
     }
 }
 
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for MySqlCdcSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        #[cfg(not(feature = "mysql-cdc"))]
+        {
+            let _ = config;
+            Err(ConnectorError::ConfigurationError(
+                "MySQL CDC source requires the `mysql-cdc` feature flag".into(),
+            ))
+        }
+
+        #[cfg(feature = "mysql-cdc")]
+        {
+            if config.properties().is_empty() {
+                self.config.validate()?;
+            } else {
+                MySqlCdcConfig::from_config(config)?.validate()?;
+            }
+            Ok(SourceContract {
+                consistency: SourceConsistency::Ephemeral,
+                topology: SourceTopology::Singleton,
+            })
+        }
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "MySQL CDC is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
+
         // Parse and update config if provided
         if !config.properties().is_empty() {
             self.config = MySqlCdcConfig::from_config(config)?;
@@ -274,7 +334,7 @@ impl SourceConnector for MySqlCdcSource {
             }
         }
 
-        // Without mysql-cdc feature, open() must fail loudly to prevent
+        // Without mysql-cdc feature, start() must fail loudly to prevent
         // silent data loss (poll_batch would return Ok(None) forever).
         #[cfg(not(feature = "mysql-cdc"))]
         {
@@ -289,6 +349,7 @@ impl SourceConnector for MySqlCdcSource {
         // and spawn a background reader task for event-driven wake-up.
         #[cfg(feature = "mysql-cdc")]
         {
+            self.reader_error = None;
             let conn = super::mysql_io::connect(&self.config).await?;
             let stream = super::mysql_io::start_binlog_stream(
                 conn,
@@ -298,7 +359,7 @@ impl SourceConnector for MySqlCdcSource {
             )
             .await?;
 
-            let (msg_tx, msg_rx) = crossfire::mpsc::bounded_async::<BinlogMessage>(4096);
+            let (msg_tx, msg_rx) = crossfire::mpsc::bounded_async::<BinlogReaderMessage>(4096);
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
             let data_ready = Arc::clone(&self.data_ready);
 
@@ -315,7 +376,7 @@ impl SourceConnector for MySqlCdcSource {
                         Some(Ok(raw_event)) => {
                             match super::mysql_io::decode_binlog_event(&raw_event, &stream) {
                                 Ok(Some(msg)) => {
-                                    if msg_tx.send(msg).await.is_err() {
+                                    if msg_tx.send(BinlogReaderMessage::Event(msg)).await.is_err() {
                                         break;
                                     }
                                     data_ready.notify_one();
@@ -323,15 +384,35 @@ impl SourceConnector for MySqlCdcSource {
                                 Ok(None) => {}
                                 Err(e) => {
                                     tracing::warn!(error = %e, "binlog decode error");
+                                    let _ = msg_tx
+                                        .send(BinlogReaderMessage::Terminal(format!(
+                                            "binlog decode failed: {e}"
+                                        )))
+                                        .await;
+                                    data_ready.notify_one();
                                     break;
                                 }
                             }
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "binlog stream error");
+                            let _ = msg_tx
+                                .send(BinlogReaderMessage::Terminal(format!(
+                                    "binlog stream failed: {e}"
+                                )))
+                                .await;
+                            data_ready.notify_one();
                             break;
                         }
-                        None => break,
+                        None => {
+                            let _ = msg_tx
+                                .send(BinlogReaderMessage::Terminal(
+                                    "binlog stream ended unexpectedly".into(),
+                                ))
+                                .await;
+                            data_ready.notify_one();
+                            break;
+                        }
                     }
                 }
                 if let Err(e) = stream.close().await {
@@ -368,6 +449,20 @@ impl SourceConnector for MySqlCdcSource {
         // applies TCP backpressure to the replication connection.
         #[cfg(feature = "mysql-cdc")]
         {
+            // A prior poll may have drained messages but been unable to return its batch (for
+            // example because the configured record budget was reached). Publish that exact
+            // single-table buffer before advancing the reader again.
+            if let Some(table_info) = self.buffered_table_info()? {
+                if let Some(batch) = self.flush_events(&table_info)? {
+                    self.schema = Some(self.build_envelope_schema(&table_info.arrow_schema));
+                    return Ok(Some(SourceBatch::new(batch)));
+                }
+            }
+            if let Some(error) = self.reader_error.take() {
+                self.connected = false;
+                return Err(ConnectorError::ReadError(error));
+            }
+
             let high_watermark = self.config.backpressure_high_watermark();
 
             if self.event_buffer.len() >= high_watermark {
@@ -383,7 +478,7 @@ impl SourceConnector for MySqlCdcSource {
                     && self.event_buffer.len() < high_watermark
                 {
                     match rx.try_recv() {
-                        Ok(msg) => {
+                        Ok(BinlogReaderMessage::Event(msg)) => {
                             self.metrics.inc_events_received();
                             match msg {
                                 BinlogMessage::TableMap(tme) => {
@@ -397,6 +492,16 @@ impl SourceConnector for MySqlCdcSource {
                                     ) {
                                         continue;
                                     }
+                                    let table_info = self
+                                        .table_cache
+                                        .get(insert_msg.table_id)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            ConnectorError::Internal(format!(
+                                                "missing TABLE_MAP schema for {}.{}",
+                                                insert_msg.database, insert_msg.table
+                                            ))
+                                        })?;
                                     let row_count = insert_msg.rows.len() as u64;
                                     let events = super::changelog::insert_to_events(
                                         &insert_msg,
@@ -405,8 +510,7 @@ impl SourceConnector for MySqlCdcSource {
                                     );
                                     self.event_buffer.extend(events);
                                     self.metrics.inc_inserts(row_count);
-                                    last_table_info =
-                                        self.table_cache.get(insert_msg.table_id).cloned();
+                                    last_table_info = Some(table_info);
                                 }
                                 BinlogMessage::Update(update_msg) => {
                                     if !self.config.should_include_table(
@@ -415,6 +519,16 @@ impl SourceConnector for MySqlCdcSource {
                                     ) {
                                         continue;
                                     }
+                                    let table_info = self
+                                        .table_cache
+                                        .get(update_msg.table_id)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            ConnectorError::Internal(format!(
+                                                "missing TABLE_MAP schema for {}.{}",
+                                                update_msg.database, update_msg.table
+                                            ))
+                                        })?;
                                     let row_count = update_msg.rows.len() as u64;
                                     let events = super::changelog::update_to_events(
                                         &update_msg,
@@ -423,8 +537,7 @@ impl SourceConnector for MySqlCdcSource {
                                     );
                                     self.event_buffer.extend(events);
                                     self.metrics.inc_updates(row_count);
-                                    last_table_info =
-                                        self.table_cache.get(update_msg.table_id).cloned();
+                                    last_table_info = Some(table_info);
                                 }
                                 BinlogMessage::Delete(delete_msg) => {
                                     if !self.config.should_include_table(
@@ -433,6 +546,16 @@ impl SourceConnector for MySqlCdcSource {
                                     ) {
                                         continue;
                                     }
+                                    let table_info = self
+                                        .table_cache
+                                        .get(delete_msg.table_id)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            ConnectorError::Internal(format!(
+                                                "missing TABLE_MAP schema for {}.{}",
+                                                delete_msg.database, delete_msg.table
+                                            ))
+                                        })?;
                                     let row_count = delete_msg.rows.len() as u64;
                                     let events = super::changelog::delete_to_events(
                                         &delete_msg,
@@ -441,8 +564,7 @@ impl SourceConnector for MySqlCdcSource {
                                     );
                                     self.event_buffer.extend(events);
                                     self.metrics.inc_deletes(row_count);
-                                    last_table_info =
-                                        self.table_cache.get(delete_msg.table_id).cloned();
+                                    last_table_info = Some(table_info);
                                 }
                                 BinlogMessage::Begin(begin_msg) => {
                                     if let Some(ref gtid) = begin_msg.gtid {
@@ -482,7 +604,16 @@ impl SourceConnector for MySqlCdcSource {
                                 }
                             }
                         }
-                        Err(_) => break,
+                        Ok(BinlogReaderMessage::Terminal(error)) => {
+                            self.reader_error = Some(error);
+                            break;
+                        }
+                        Err(crossfire::TryRecvError::Empty) => break,
+                        Err(crossfire::TryRecvError::Disconnected) => {
+                            self.reader_error =
+                                Some("binlog reader task stopped without a terminal status".into());
+                            break;
+                        }
                     }
                 }
 
@@ -494,6 +625,11 @@ impl SourceConnector for MySqlCdcSource {
                         self.schema = Some(schema);
                         return Ok(Some(SourceBatch::new(batch)));
                     }
+                }
+
+                if let Some(error) = self.reader_error.take() {
+                    self.connected = false;
+                    return Err(ConnectorError::ReadError(error));
                 }
 
                 return Ok(None);
@@ -522,11 +658,6 @@ impl SourceConnector for MySqlCdcSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         self.create_checkpoint()
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        self.restore_position(checkpoint);
-        Ok(())
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
@@ -561,10 +692,10 @@ mod tests {
         MySqlCdcConfig {
             host: "localhost".to_string(),
             port: 3306,
-            database: Some("testdb".to_string()),
             username: "root".to_string(),
             password: Some("test".to_string()),
             server_id: 12345,
+            table_include: vec!["testdb.users".to_string()],
             ..Default::default()
         }
     }
@@ -588,6 +719,7 @@ mod tests {
         config.set("username", "repl");
         config.set("password", "secret");
         config.set("server.id", "999");
+        config.set("table.include", "app.users");
 
         let source = MySqlCdcSource::from_config(&config).unwrap();
         assert_eq!(source.config().host, "mysql.example.com");
@@ -601,31 +733,6 @@ mod tests {
 
         let result = MySqlCdcSource::from_config(&config);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_restore_position_gtid() {
-        let mut source = MySqlCdcSource::new(test_config(), None);
-
-        let mut checkpoint = SourceCheckpoint::new(1);
-        checkpoint.set_offset("gtid", "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5");
-
-        source.restore_position(&checkpoint);
-        assert!(source.gtid_set().is_some());
-    }
-
-    #[test]
-    fn test_restore_position_file() {
-        let mut source = MySqlCdcSource::new(test_config(), None);
-
-        let mut checkpoint = SourceCheckpoint::new(1);
-        checkpoint.set_offset("binlog_file", "mysql-bin.000003");
-        checkpoint.set_offset("binlog_position", "12345");
-
-        source.restore_position(&checkpoint);
-        let pos = source.position().unwrap();
-        assert_eq!(pos.filename, "mysql-bin.000003");
-        assert_eq!(pos.position, 12345);
     }
 
     #[test]
@@ -669,22 +776,66 @@ mod tests {
     #[test]
     fn test_table_filtering() {
         let mut config = test_config();
-        config.table_include = vec!["users".to_string(), "orders".to_string()];
+        config.table_include = vec!["testdb.users".to_string()];
 
         let source = MySqlCdcSource::new(config, None);
 
         assert!(source.should_include_table("testdb", "users"));
-        assert!(source.should_include_table("testdb", "orders"));
+        assert!(!source.should_include_table("testdb", "orders"));
         assert!(!source.should_include_table("testdb", "other"));
+        assert!(!source.should_include_table("other", "users"));
     }
 
-    // Without mysql-cdc feature, open() must return an error to prevent silent data loss.
+    #[test]
+    fn mixed_table_flush_fails_without_discarding_events() {
+        use super::super::decoder::RowData;
+
+        let mut source = MySqlCdcSource::new(test_config(), None);
+        source.event_buffer = vec![
+            ChangeEvent::insert(
+                "testdb.users".into(),
+                1,
+                "mysql-bin.000001".into(),
+                10,
+                None,
+                RowData { columns: vec![] },
+            ),
+            ChangeEvent::insert(
+                "testdb.orders".into(),
+                1,
+                "mysql-bin.000001".into(),
+                11,
+                None,
+                RowData { columns: vec![] },
+            ),
+        ];
+        let table_info = TableInfo {
+            table_id: 1,
+            database: "testdb".into(),
+            table: "users".into(),
+            columns: vec![],
+            arrow_schema: Schema::empty(),
+        };
+
+        let error = source.flush_events(&table_info).unwrap_err();
+
+        assert!(error.to_string().contains("multiple table schemas"));
+        assert_eq!(source.event_buffer.len(), 2);
+    }
+
+    // Without mysql-cdc feature, start() must return an error to prevent silent data loss.
     #[cfg(not(feature = "mysql-cdc"))]
     #[tokio::test]
-    async fn test_open_fails_without_feature() {
+    async fn test_start_fails_without_feature() {
         let mut source = MySqlCdcSource::new(test_config(), None);
 
-        let result = source.open(&ConnectorConfig::default()).await;
+        let result = source
+            .start(SourceStart {
+                config: ConnectorConfig::default(),
+                position: SourcePosition::Initial,
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -701,21 +852,64 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Without mysql-cdc feature, open() returns an error, so poll is unreachable.
-    // With mysql-cdc, open() needs a real MySQL server. Covered by integration tests.
+    #[cfg(feature = "mysql-cdc")]
+    #[tokio::test]
+    async fn terminal_reader_status_is_not_silently_treated_as_an_empty_poll() {
+        let mut source = MySqlCdcSource::new(test_config(), None);
+        let (tx, rx) = crossfire::mpsc::bounded_async::<BinlogReaderMessage>(1);
+        tx.send(BinlogReaderMessage::Terminal(
+            "injected reader failure".into(),
+        ))
+        .await
+        .unwrap();
+        source.msg_rx = Some(rx);
+        source.connected = true;
+
+        let error = source.poll_batch(100).await.unwrap_err();
+
+        assert!(error.to_string().contains("injected reader failure"));
+        assert!(!source.connected);
+    }
+
+    #[cfg(feature = "mysql-cdc")]
+    #[tokio::test]
+    async fn unreported_reader_task_loss_is_terminal() {
+        let mut source = MySqlCdcSource::new(test_config(), None);
+        let (tx, rx) = crossfire::mpsc::bounded_async::<BinlogReaderMessage>(1);
+        drop(tx);
+        source.msg_rx = Some(rx);
+        source.connected = true;
+
+        let error = source.poll_batch(100).await.unwrap_err();
+
+        assert!(error.to_string().contains("without a terminal status"));
+        assert!(!source.connected);
+    }
+
+    // Without mysql-cdc feature, start() returns an error, so poll is unreachable.
+    // With mysql-cdc, start() needs a real MySQL server. Covered by integration tests.
 
     #[tokio::test]
-    async fn test_restore_async() {
+    async fn resume_is_rejected_before_mutating_ephemeral_source_position() {
         let mut source = MySqlCdcSource::new(test_config(), None);
 
-        let mut checkpoint = SourceCheckpoint::new(1);
+        let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset("binlog_file", "mysql-bin.000005");
         checkpoint.set_offset("binlog_position", "54321");
 
-        source.restore(&checkpoint).await.unwrap();
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::default(),
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint,
+                },
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .expect_err("ephemeral MySQL CDC must reject recovery");
 
-        let pos = source.position().unwrap();
-        assert_eq!(pos.filename, "mysql-bin.000005");
-        assert_eq!(pos.position, 54321);
+        assert!(error.to_string().contains("ephemeral"));
+        assert!(source.position().is_none());
     }
 }

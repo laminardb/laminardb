@@ -18,7 +18,11 @@ use tokio::sync::Notify;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
+use crate::connector::{
+    PartitionInfo, SourceBatch, SourceConnector, SourceContract, SourcePosition, SourceStart,
+};
+#[cfg(feature = "postgres-cdc")]
+use crate::connector::{SourceConsistency, SourceTopology};
 use crate::error::ConnectorError;
 
 use super::changelog::{events_to_record_batch, tuple_to_json, CdcOperation, ChangeEvent};
@@ -501,22 +505,90 @@ impl PostgresCdcSource {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for PostgresCdcSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+
+        // Parse all configuration and validate the exact engine cursor before
+        // changing lifecycle state or opening either the control or replication
+        // connection. This keeps startup atomic from the connector's perspective.
+        let parsed_config = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            PostgresCdcConfig::from_config(&config)?
+        };
+
+        let (start_lsn, _has_resume) = match position {
+            SourcePosition::Initial => (parsed_config.start_lsn.unwrap_or(Lsn::ZERO), false),
+            SourcePosition::Resume {
+                attempt,
+                checkpoint,
+            } => {
+                let slot_name = checkpoint.get_metadata("slot_name").ok_or_else(|| {
+                    ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} is missing required slot identity"
+                    ))
+                })?;
+                if slot_name != parsed_config.slot_name {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} belongs to slot '{slot_name}', not configured slot '{}'",
+                        parsed_config.slot_name
+                    )));
+                }
+                let publication = checkpoint.get_metadata("publication").ok_or_else(|| {
+                    ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} is missing required publication identity"
+                    ))
+                })?;
+                if publication != parsed_config.publication {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} belongs to publication '{publication}', not configured publication '{}'",
+                        parsed_config.publication
+                    )));
+                }
+                let database = checkpoint.get_metadata("database").ok_or_else(|| {
+                    ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} is missing required database identity"
+                    ))
+                })?;
+                if database != parsed_config.database {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} belongs to database '{database}', not configured database '{}'",
+                        parsed_config.database
+                    )));
+                }
+                let lsn_str = checkpoint.get_offset("lsn").ok_or_else(|| {
+                    ConnectorError::ConfigurationError(format!(
+                        "PostgreSQL CDC checkpoint {attempt:?} is missing required 'lsn' offset"
+                    ))
+                })?;
+                let lsn = lsn_str.parse::<Lsn>().map_err(|e| {
+                    ConnectorError::ConfigurationError(format!(
+                        "invalid LSN '{lsn_str}' in PostgreSQL CDC checkpoint {attempt:?}: {e}"
+                    ))
+                })?;
+                // `write_lsn` describes data received but not necessarily emitted at
+                // the durable cut. Validate it when present, but never start from it.
+                if let Some(write_lsn) = checkpoint.get_offset("write_lsn") {
+                    write_lsn.parse::<Lsn>().map_err(|e| {
+                        ConnectorError::ConfigurationError(format!(
+                            "invalid write LSN '{write_lsn}' in PostgreSQL CDC checkpoint {attempt:?}: {e}"
+                        ))
+                    })?;
+                }
+                (lsn, true)
+            }
+        };
+
+        self.config = parsed_config;
+        self.confirmed_flush_lsn = start_lsn;
+        self.write_lsn = start_lsn;
+        self.polled_lsn = start_lsn;
+        self.metrics.set_confirmed_flush_lsn(start_lsn.as_u64());
         self.state = ConnectorState::Initializing;
 
-        // If config has properties, re-parse (supports runtime config via SQL WITH).
-        if !config.properties().is_empty() {
-            self.config = PostgresCdcConfig::from_config(config)?;
-        }
-
-        // Set start LSN if configured
-        if let Some(lsn) = self.config.start_lsn {
-            self.confirmed_flush_lsn = lsn;
-            self.write_lsn = lsn;
-            self.polled_lsn = lsn;
-        }
-
-        // Without postgres-cdc feature, open() must fail loudly to prevent
+        // Without postgres-cdc feature, start() must fail loudly to prevent
         // silent data loss (poll_batch would return Ok(None) forever).
         #[cfg(not(feature = "postgres-cdc"))]
         {
@@ -533,24 +605,50 @@ impl SourceConnector for PostgresCdcSource {
 
             // 1. Connect control-plane for slot management
             let (client, handle) = postgres_io::connect(&self.config).await?;
-            self.connection_handle = Some(handle);
 
             // 2. Ensure replication slot exists
-            let slot_lsn = postgres_io::ensure_replication_slot(
+            let slot_lsn = match postgres_io::ensure_replication_slot(
                 &client,
                 &self.config.slot_name,
                 &self.config.output_plugin,
             )
-            .await?;
+            .await
+            {
+                Ok(lsn) => lsn,
+                Err(error) => {
+                    handle.abort();
+                    return Err(error);
+                }
+            };
 
-            // Use slot's confirmed_flush_lsn if no explicit start LSN
-            if self.config.start_lsn.is_none() {
+            if _has_resume {
+                let Some(resume_slot_lsn) = slot_lsn.as_ref() else {
+                    handle.abort();
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "cannot resume PostgreSQL CDC slot '{}': the slot has no retained durable position",
+                        self.config.slot_name
+                    )));
+                };
+                if resume_slot_lsn.as_u64() > self.confirmed_flush_lsn.as_u64() {
+                    handle.abort();
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "cannot resume PostgreSQL CDC checkpoint at {}: slot '{}' has already advanced to {}; required WAL may have been reclaimed",
+                        self.confirmed_flush_lsn, self.config.slot_name, resume_slot_lsn
+                    )));
+                }
+            }
+
+            // On a first start with no configured LSN, the durable slot cursor is
+            // authoritative. An engine Resume is always more precise and must never
+            // be overwritten by independently advanced slot state.
+            if !_has_resume && self.config.start_lsn.is_none() {
                 if let Some(lsn) = slot_lsn {
                     self.confirmed_flush_lsn = lsn;
                     self.write_lsn = lsn;
                     self.polled_lsn = lsn;
                 }
             }
+            self.connection_handle = Some(handle);
 
             // 3. Build pgwire-replication config and start WAL streaming
             let mut repl_config = postgres_io::build_replication_config(&self.config);
@@ -817,7 +915,7 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         // polled_lsn = latest position drained into a batch — the resumable point recorded in the
         // manifest. The PG slot is NOT advanced here: doing so per poll lets PG reclaim WAL for
         // data that is only in-pipeline, so a crash loses an LSN range recovery still needs.
@@ -826,58 +924,85 @@ impl SourceConnector for PostgresCdcSource {
         cp.set_offset("write_lsn", self.write_lsn.to_string());
         cp.set_metadata("slot_name", &self.config.slot_name);
         cp.set_metadata("publication", &self.config.publication);
+        cp.set_metadata("database", &self.config.database);
         cp
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        if let Some(lsn_str) = checkpoint.get_offset("lsn") {
-            let lsn: Lsn = lsn_str
-                .parse()
-                .map_err(|e| ConnectorError::Internal(format!("invalid LSN in checkpoint: {e}")))?;
-            self.confirmed_flush_lsn = lsn;
-            self.polled_lsn = lsn;
-            self.metrics.set_confirmed_flush_lsn(lsn.as_u64());
-        }
-        if let Some(write_lsn_str) = checkpoint.get_offset("write_lsn") {
-            if let Ok(lsn) = write_lsn_str.parse::<Lsn>() {
-                self.write_lsn = lsn;
-            }
-        }
-        Ok(())
     }
 
     async fn notify_epoch_committed(
         &mut self,
-        _epoch: u64,
+        epoch: u64,
         checkpoint: &SourceCheckpoint,
     ) -> Result<(), ConnectorError> {
         // Advance the PG replication slot ONLY after the epoch is durably committed (manifest
         // persisted + sinks committed), so PG never reclaims WAL for data still in-pipeline (CN-1).
         // The checkpoint carries the exact LSN persisted for this epoch; a timer-driven empty
         // checkpoint has no "lsn" offset and is a no-op.
-        #[cfg(feature = "postgres-cdc")]
-        if let Some(lsn_str) = checkpoint.get_offset("lsn") {
-            match lsn_str.parse::<Lsn>() {
-                Ok(lsn) => {
-                    if let Some(ref tx) = self.confirmed_lsn_tx {
-                        let _ = tx.send(lsn.as_u64());
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    lsn = %lsn_str,
-                    error = %e,
-                    "notify_epoch_committed: unparseable committed LSN; slot not advanced"
-                ),
-            }
+        let Some(lsn_str) = checkpoint.get_offset("lsn") else {
+            return Ok(());
+        };
+        let lsn = lsn_str.parse::<Lsn>().map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "committed PostgreSQL CDC epoch {epoch} contains invalid LSN '{lsn_str}': {error}"
+            ))
+        })?;
+        // A strictly stale notification is already satisfied and must never regress either cursor.
+        // An equal notification is handed off again: that is idempotent and repairs feedback after
+        // a reader restart whose local cursor was restored before its channel was created.
+        if lsn.as_u64() < self.confirmed_flush_lsn.as_u64() {
+            return Ok(());
         }
-        Ok(())
+
+        #[cfg(feature = "postgres-cdc")]
+        {
+            let tx =
+                self.confirmed_lsn_tx
+                    .as_ref()
+                    .ok_or_else(|| ConnectorError::InvalidState {
+                        expected: "running PostgreSQL CDC confirmed-LSN feedback channel".into(),
+                        actual: "feedback channel is missing".into(),
+                    })?;
+            tx.send(lsn.as_u64()).map_err(|_| {
+                ConnectorError::ConnectionFailed(
+                    "PostgreSQL CDC confirmed-LSN feedback channel is closed".into(),
+                )
+            })?;
+            // The local cursor is authoritative only after the reader accepted the handoff.
+            self.confirmed_flush_lsn = lsn;
+            self.metrics.set_confirmed_flush_lsn(lsn.as_u64());
+            Ok(())
+        }
+        #[cfg(not(feature = "postgres-cdc"))]
+        {
+            Err(ConnectorError::ConfigurationError(
+                "PostgreSQL CDC durable commit feedback requires the `postgres-cdc` feature flag"
+                    .into(),
+            ))
+        }
     }
 
-    fn requires_checkpointing_for_progress(&self) -> bool {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         // The replication slot's WAL is reclaimed only as the confirmed-flush LSN advances, which
-        // now happens on durable commit (CN-1). Without checkpointing the slot never advances and
-        // the source database's WAL fills without bound, so the pipeline rejects this combination.
-        true
+        // happens on durable commit. Without checkpointing the slot never advances and the source
+        // database's WAL fills without bound, so this source is commit-coupled.
+        #[cfg(feature = "postgres-cdc")]
+        {
+            if config.properties().is_empty() {
+                self.config.validate()?;
+            } else {
+                PostgresCdcConfig::from_config(config)?.validate()?;
+            }
+            Ok(SourceContract {
+                consistency: SourceConsistency::CommitCoupled,
+                topology: SourceTopology::Singleton,
+            })
+        }
+        #[cfg(not(feature = "postgres-cdc"))]
+        {
+            let _ = config;
+            Err(ConnectorError::ConfigurationError(
+                "PostgreSQL CDC source requires the `postgres-cdc` feature flag".into(),
+            ))
+        }
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
@@ -1094,11 +1219,25 @@ mod tests {
         assert_eq!(src.schema().fields().len(), 6);
     }
 
+    #[cfg(feature = "postgres-cdc")]
     #[test]
-    fn test_requires_checkpointing_for_progress() {
+    fn test_source_contract_is_commit_coupled_singleton() {
         // The replication slot's WAL only advances on durable commit, so the pipeline must reject a
         // CDC source without checkpointing (or its WAL grows without bound) (CN-1).
-        assert!(default_source().requires_checkpointing_for_progress());
+        let contract = default_source()
+            .contract(&ConnectorConfig::new("postgres-cdc"))
+            .unwrap();
+        assert_eq!(contract.consistency, SourceConsistency::CommitCoupled);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
+
+    #[cfg(not(feature = "postgres-cdc"))]
+    #[test]
+    fn test_source_contract_fails_without_postgres_feature() {
+        let error = default_source()
+            .contract(&ConnectorConfig::new("postgres-cdc"))
+            .unwrap_err();
+        assert!(error.to_string().contains("feature flag"), "{error}");
     }
 
     #[test]
@@ -1122,13 +1261,19 @@ mod tests {
 
     // ── Lifecycle ──
 
-    // Without postgres-cdc feature, open() must return an error.
+    // Without postgres-cdc feature, start() must return an error.
     #[cfg(not(feature = "postgres-cdc"))]
     #[tokio::test]
-    async fn test_open_fails_without_feature() {
+    async fn test_start_fails_without_feature() {
         let mut src = default_source();
         let config = ConnectorConfig::new("postgres-cdc");
-        let result = src.open(&config).await;
+        let result = src
+            .start(SourceStart {
+                config,
+                position: SourcePosition::Initial,
+                delivery: crate::connector::DeliveryGuarantee::BestEffort,
+            })
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1169,25 +1314,152 @@ mod tests {
         assert_eq!(cp.get_metadata("slot_name"), Some("laminar_slot"));
     }
 
-    #[tokio::test]
-    async fn test_restore() {
-        let mut src = default_source();
-        let mut cp = SourceCheckpoint::new(1);
-        cp.set_offset("lsn", "2/FF00");
-        cp.set_offset("write_lsn", "2/FF10");
-
-        src.restore(&cp).await.unwrap();
-        assert_eq!(src.confirmed_flush_lsn.as_u64(), 0x2_0000_FF00);
-        assert_eq!(src.write_lsn.as_u64(), 0x2_0000_FF10);
+    fn committed_lsn_checkpoint(lsn: &str) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("lsn", lsn);
+        checkpoint
     }
 
     #[tokio::test]
-    async fn test_restore_invalid_lsn() {
-        let mut src = default_source();
-        let mut cp = SourceCheckpoint::new(1);
-        cp.set_offset("lsn", "not_an_lsn");
+    async fn committed_epoch_rejects_malformed_durable_lsn() {
+        let mut source = default_source();
+        let error = source
+            .notify_epoch_committed(7, &committed_lsn_checkpoint("not-an-lsn"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid LSN"), "{error}");
+        assert!(source.confirmed_flush_lsn.is_zero());
+    }
 
-        assert!(src.restore(&cp).await.is_err());
+    #[cfg(feature = "postgres-cdc")]
+    #[tokio::test]
+    async fn committed_epoch_rejects_missing_feedback_channel() {
+        let mut source = default_source();
+        let error = source
+            .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("feedback channel is missing"),
+            "{error}"
+        );
+        assert!(source.confirmed_flush_lsn.is_zero());
+    }
+
+    #[cfg(feature = "postgres-cdc")]
+    #[tokio::test]
+    async fn committed_epoch_rejects_closed_feedback_without_advancing_local_lsn() {
+        let mut source = default_source();
+        let (feedback_tx, feedback_rx) = tokio::sync::watch::channel(0);
+        drop(feedback_rx);
+        source.confirmed_lsn_tx = Some(feedback_tx);
+
+        let error = source
+            .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("feedback channel is closed"),
+            "{error}"
+        );
+        assert!(source.confirmed_flush_lsn.is_zero());
+    }
+
+    #[cfg(feature = "postgres-cdc")]
+    #[tokio::test]
+    async fn committed_epoch_advances_local_lsn_only_after_feedback_handoff() {
+        let mut source = default_source();
+        let (feedback_tx, mut feedback_rx) = tokio::sync::watch::channel(0);
+        source.confirmed_lsn_tx = Some(feedback_tx);
+
+        source
+            .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
+            .await
+            .unwrap();
+        let expected = "1/10".parse::<Lsn>().unwrap();
+        assert_eq!(source.confirmed_flush_lsn, expected);
+        assert_eq!(*feedback_rx.borrow_and_update(), expected.as_u64());
+    }
+
+    #[tokio::test]
+    async fn committed_epoch_never_regresses_confirmed_lsn() {
+        let mut source = default_source();
+        source.confirmed_flush_lsn = "2/20".parse().unwrap();
+
+        source
+            .notify_epoch_committed(6, &committed_lsn_checkpoint("1/10"))
+            .await
+            .unwrap();
+        assert_eq!(source.confirmed_flush_lsn, "2/20".parse().unwrap());
+    }
+
+    #[cfg(not(feature = "postgres-cdc"))]
+    #[tokio::test]
+    async fn committed_epoch_fails_without_postgres_feature() {
+        let mut source = default_source();
+        let error = source
+            .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("feature flag"), "{error}");
+        assert!(source.confirmed_flush_lsn.is_zero());
+    }
+
+    #[tokio::test]
+    async fn test_resume_installs_exact_engine_lsn() {
+        let mut src = default_source();
+        let mut cp = SourceCheckpoint::new();
+        cp.set_offset("lsn", "2/FF00");
+        cp.set_offset("write_lsn", "2/FF10");
+        cp.set_metadata("slot_name", "laminar_slot");
+        cp.set_metadata("publication", "laminar_pub");
+        cp.set_metadata("database", "postgres");
+
+        let result = src
+            .start(SourceStart {
+                config: ConnectorConfig::new("postgres-cdc"),
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint: cp,
+                },
+                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
+            })
+            .await;
+        #[cfg(feature = "postgres-cdc")]
+        result.unwrap();
+        #[cfg(not(feature = "postgres-cdc"))]
+        assert!(result.unwrap_err().to_string().contains("feature flag"));
+        assert_eq!(src.confirmed_flush_lsn.as_u64(), 0x2_0000_FF00);
+        assert_eq!(src.polled_lsn.as_u64(), 0x2_0000_FF00);
+        assert_eq!(
+            src.write_lsn.as_u64(),
+            0x2_0000_FF00,
+            "received-but-not-emitted write_lsn must not move recovery ahead"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resume_invalid_lsn_fails_before_replication() {
+        let mut src = default_source();
+        let mut cp = SourceCheckpoint::new();
+        cp.set_offset("lsn", "not_an_lsn");
+        cp.set_metadata("slot_name", "laminar_slot");
+        cp.set_metadata("publication", "laminar_pub");
+        cp.set_metadata("database", "postgres");
+
+        let error = src
+            .start(SourceStart {
+                config: ConnectorConfig::new("postgres-cdc"),
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint: cp,
+                },
+                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("invalid durable LSN must fail closed");
+        assert!(error.to_string().contains("invalid LSN"));
+        assert_eq!(src.state, ConnectorState::Created);
     }
 
     // ── Poll (empty) ──
@@ -1655,19 +1927,28 @@ mod tests {
         assert_eq!(cp.get_offset("lsn"), Some("0/500"));
     }
 
-    // ── Restore sets polled_lsn ──
+    // ── Resume identity validation ──
 
     #[tokio::test]
-    async fn test_restore_sets_polled_lsn() {
+    async fn test_resume_rejects_slot_identity_mismatch() {
         let mut src = default_source();
-        let mut cp = SourceCheckpoint::new(1);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset("lsn", "2/FF00");
-        cp.set_offset("write_lsn", "2/FF10");
+        cp.set_metadata("slot_name", "different_slot");
 
-        src.restore(&cp).await.unwrap();
-        assert_eq!(src.confirmed_flush_lsn.as_u64(), 0x2_0000_FF00);
-        assert_eq!(src.polled_lsn.as_u64(), 0x2_0000_FF00);
-        assert_eq!(src.write_lsn.as_u64(), 0x2_0000_FF10);
+        let error = src
+            .start(SourceStart {
+                config: ConnectorConfig::new("postgres-cdc"),
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint: cp,
+                },
+                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("checkpoint for another slot must fail closed");
+        assert!(error.to_string().contains("different_slot"));
+        assert_eq!(src.state, ConnectorState::Created);
     }
 
     // ── Backpressure (no event dropping) ──

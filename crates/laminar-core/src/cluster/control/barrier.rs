@@ -25,6 +25,12 @@ pub const ACK_KEY: &str = "control:barrier-ack";
 #[cfg(feature = "cluster")]
 pub const BARRIER_ADDR_KEY: &str = "barrier:addr";
 
+/// Upper bound for a non-Prepare phase notification round. The durable KV
+/// announcement is authoritative; direct gRPC delivery is only the low-latency
+/// path and must never hold the checkpoint coordinator indefinitely.
+#[cfg(feature = "cluster")]
+const PHASE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Barrier phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
@@ -492,59 +498,86 @@ async fn send_phase_rpc(
     kv: Arc<dyn ClusterKv>,
     ann: BarrierAnnouncement,
     local_id: Option<NodeId>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), String> {
-    let mut client = get_barrier_client(peer, &clients_pool, &kv)
-        .await
-        .ok_or_else(|| format!("failed to get client for peer {}", peer.0))?;
-    let result = match ann.phase {
-        Phase::Aligned => {
-            let mut req = tonic::Request::new(barrier_v1::AlignedRequest {
-                epoch: ann.epoch,
-                checkpoint_id: ann.checkpoint_id,
-                flags: ann.flags,
-                min_watermark_ms: ann.min_watermark_ms,
-            });
-            stamp_leader_id(&mut req, local_id);
-            client
-                .aligned(req)
-                .await
-                .map(|_| ())
-                .map_err(|e| ("aligned", e))
-        }
-        Phase::Commit => {
-            let mut req = tonic::Request::new(barrier_v1::CommitRequest {
-                epoch: ann.epoch,
-                checkpoint_id: ann.checkpoint_id,
-                flags: ann.flags,
-                min_watermark_ms: ann.min_watermark_ms,
-            });
-            stamp_leader_id(&mut req, local_id);
-            client
-                .commit(req)
-                .await
-                .map(|_| ())
-                .map_err(|e| ("commit", e))
-        }
-        Phase::Abort => {
-            let mut req = tonic::Request::new(barrier_v1::AbortRequest {
-                epoch: ann.epoch,
-                checkpoint_id: ann.checkpoint_id,
-                flags: ann.flags,
-            });
-            stamp_leader_id(&mut req, local_id);
-            client
-                .abort(req)
-                .await
-                .map(|_| ())
-                .map_err(|e| ("abort", e))
-        }
-        // Prepare RPCs are issued by wait_for_quorum, not here.
-        Phase::Prepare => Ok(()),
+    let rpc = match ann.phase {
+        Phase::Aligned => "aligned",
+        Phase::Commit => "commit",
+        Phase::Abort => "abort",
+        Phase::Prepare => "prepare",
     };
-    result.map_err(|(rpc, e)| {
-        clients_pool.lock().remove(&peer);
-        format!("{rpc} RPC to peer {} failed: {e}", peer.0)
+
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut client = get_barrier_client(peer, &clients_pool, &kv)
+            .await
+            .ok_or_else(|| format!("failed to get client for peer {}", peer.0))?;
+        let request_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+
+        match ann.phase {
+            Phase::Aligned => {
+                let mut req = tonic::Request::new(barrier_v1::AlignedRequest {
+                    epoch: ann.epoch,
+                    checkpoint_id: ann.checkpoint_id,
+                    flags: ann.flags,
+                    min_watermark_ms: ann.min_watermark_ms,
+                });
+                stamp_leader_id(&mut req, local_id);
+                req.set_timeout(request_timeout);
+                client
+                    .aligned(req)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            Phase::Commit => {
+                let mut req = tonic::Request::new(barrier_v1::CommitRequest {
+                    epoch: ann.epoch,
+                    checkpoint_id: ann.checkpoint_id,
+                    flags: ann.flags,
+                    min_watermark_ms: ann.min_watermark_ms,
+                });
+                stamp_leader_id(&mut req, local_id);
+                req.set_timeout(request_timeout);
+                client
+                    .commit(req)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            Phase::Abort => {
+                let mut req = tonic::Request::new(barrier_v1::AbortRequest {
+                    epoch: ann.epoch,
+                    checkpoint_id: ann.checkpoint_id,
+                    flags: ann.flags,
+                });
+                stamp_leader_id(&mut req, local_id);
+                req.set_timeout(request_timeout);
+                client
+                    .abort(req)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            // Prepare RPCs are issued by wait_for_quorum, not here.
+            Phase::Prepare => Ok(()),
+        }
     })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            clients_pool.lock().remove(&peer);
+            Err(format!("{rpc} RPC to peer {} failed: {error}", peer.0))
+        }
+        Err(_) => {
+            clients_pool.lock().remove(&peer);
+            Err(format!(
+                "{rpc} RPC to peer {} exceeded its request deadline",
+                peer.0
+            ))
+        }
+    }
 }
 
 /// Typed prepare-failure classification for the quorum wait:
@@ -769,12 +802,23 @@ impl BarrierCoordinator {
                         expected.push(node_id);
                     }
 
+                    // One absolute deadline bounds the whole concurrent fan-out.
+                    // Reusing it for every peer prevents a slow address lookup or
+                    // live handler from extending the round one timeout at a time.
+                    let rpc_deadline = tokio::time::Instant::now() + PHASE_RPC_TIMEOUT;
                     let mut futures = Vec::new();
                     for peer in expected {
                         let clients_pool = Arc::clone(&state.clients);
                         let kv = Arc::clone(&self.kv);
                         let ann_clone = ann.clone();
-                        futures.push(send_phase_rpc(peer, clients_pool, kv, ann_clone, local_id));
+                        futures.push(send_phase_rpc(
+                            peer,
+                            clients_pool,
+                            kv,
+                            ann_clone,
+                            local_id,
+                            rpc_deadline,
+                        ));
                     }
                     let results = futures::future::join_all(futures).await;
                     for res in results {
@@ -1107,6 +1151,40 @@ mod tests {
     mod grpc_tests {
         use super::*;
         use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowBarrierAddressScanKv {
+            inner: Arc<InMemoryKv>,
+            delay: Duration,
+            scan_started: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ClusterKv for SlowBarrierAddressScanKv {
+            async fn write(&self, key: &str, value: String) {
+                self.inner.write(key, value).await;
+            }
+
+            async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+                self.inner.read_from(who, key).await
+            }
+
+            async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+                if key == BARRIER_ADDR_KEY {
+                    self.scan_started.store(true, Ordering::Release);
+                    tokio::time::sleep(self.delay).await;
+                }
+                self.inner.scan(key).await
+            }
+
+            async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
+                self.inner.scan_prefix(prefix).await
+            }
+
+            fn supports_subscription_routing(&self) -> bool {
+                self.inner.supports_subscription_routing()
+            }
+        }
 
         /// Observation is latest-wins (non-destructive), so wait for the
         /// expected phase specifically — earlier phases may linger.
@@ -1224,6 +1302,57 @@ mod tests {
             }
 
             follower_task.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn phase_rpc_deadline_bounds_a_live_handler() {
+            let scan_started = Arc::new(AtomicBool::new(false));
+            let follower_kv: Arc<dyn ClusterKv> = Arc::new(SlowBarrierAddressScanKv {
+                inner: kv(NodeId(2)),
+                delay: Duration::from_secs(5),
+                scan_started: Arc::clone(&scan_started),
+            });
+            let follower_coord = BarrierCoordinator::new(follower_kv);
+            let slot = Arc::new(parking_lot::RwLock::new(None));
+            let bound_addr = follower_coord
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot)
+                .await
+                .unwrap();
+
+            let leader_kv = kv(NodeId(1));
+            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
+            let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+            let started = tokio::time::Instant::now();
+            let error = send_phase_rpc(
+                NodeId(2),
+                Arc::clone(&clients),
+                leader_kv,
+                BarrierAnnouncement {
+                    epoch: 7,
+                    checkpoint_id: 9,
+                    phase: Phase::Commit,
+                    flags: 0,
+                    min_watermark_ms: None,
+                },
+                Some(NodeId(1)),
+                started + Duration::from_millis(500),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                scan_started.load(Ordering::Acquire),
+                "the request must reach the live handler before timing out"
+            );
+            assert!(error.contains("request deadline"), "{error}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "phase RPC exceeded its absolute deadline"
+            );
+            assert!(
+                clients.lock().is_empty(),
+                "a timed-out client must be evicted"
+            );
         }
     }
 

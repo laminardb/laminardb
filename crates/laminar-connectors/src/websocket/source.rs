@@ -20,7 +20,10 @@ use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+};
+use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
 
 use crate::schema::json::decoder::JsonDecoderConfig;
@@ -296,7 +299,16 @@ async fn send_with_backpressure(
 
 #[async_trait]
 impl SourceConnector for WebSocketSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let SourceStart {
+            config, position, ..
+        } = request;
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket client is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
         self.state = ConnectorState::Initializing;
 
         // If config has properties, re-parse (supports runtime config via SQL WITH).
@@ -482,35 +494,18 @@ impl SourceConnector for WebSocketSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Epoch is managed by the checkpoint coordinator, not individual
-        // sources. Pass 0 here; the coordinator stamps the real epoch on
-        // the manifest. SourceCheckpoint.epoch is informational only.
-        self.checkpoint_state.to_source_checkpoint(0)
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        info!(
-            epoch = checkpoint.epoch(),
-            "restoring WebSocket source from checkpoint (best-effort)"
-        );
-        self.checkpoint_state = WebSocketSourceCheckpoint::from_source_checkpoint(checkpoint);
-
-        // WebSocket is non-replayable — log the gap.
-        warn!(
-            last_sequence = ?self.checkpoint_state.last_sequence,
-            last_event_time = ?self.checkpoint_state.last_event_time,
-            "WebSocket source restored; data gap expected (non-replayable transport)"
-        );
-
-        Ok(())
+        self.checkpoint_state.to_source_checkpoint()
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
 
-    fn supports_replay(&self) -> bool {
-        false
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract {
+            consistency: SourceConsistency::Ephemeral,
+            topology: SourceTopology::NodeLocalIngress,
+        })
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

@@ -212,6 +212,27 @@ impl ClusterController {
         true
     }
 
+    /// Whether this controller is wired to a durable leader lease. Gossip-only leadership is
+    /// adequate for best-effort coordination but cannot certify exactly-once cluster decisions.
+    #[must_use]
+    #[cfg(feature = "cluster")]
+    pub fn has_leader_lease_fencing(&self) -> bool {
+        self.leader_lease.get().is_some()
+    }
+
+    /// Current live fencing token when this node owns the durable lease.
+    ///
+    /// This is an observation for detecting that an operation crossed leadership terms. Reading
+    /// it does **not** fence a later object-store write: a durable mutation is fenced only when
+    /// the storage operation atomically validates the token. Callers must not stamp this value
+    /// into an otherwise unconditional write and treat that as a correctness boundary.
+    #[must_use]
+    #[cfg(feature = "cluster")]
+    pub fn leader_fencing_token(&self) -> Option<u64> {
+        let lease = self.leader_lease.get()?.borrow().clone()?;
+        super::lease_currently_grants(&Some(lease.clone()), self.instance_id).then_some(lease.token)
+    }
+
     /// Wire the leader-lease watch so leadership is lease-fenced. Set once at
     /// startup; later calls are ignored.
     #[cfg(feature = "cluster")]
@@ -680,20 +701,27 @@ mod tests {
 
         let c = ctl(1, vec![info(5)]); // lowest id → gossip candidate
         assert!(c.is_leader(), "gossip-only leadership when no lease wired");
+        assert!(!c.has_leader_lease_fencing());
+        assert_eq!(c.leader_fencing_token(), None);
 
         let (tx, rx) = watch::channel(None);
         c.set_leader_lease_watch(rx);
+        assert!(c.has_leader_lease_fencing());
         assert!(!c.is_leader(), "fenced out until a lease is held");
+        assert_eq!(c.leader_fencing_token(), None);
 
         tx.send(Some(lease(2, i64::MAX))).unwrap();
         assert!(!c.is_leader(), "another node holds the lease");
+        assert_eq!(c.leader_fencing_token(), None);
 
         tx.send(Some(lease(1, i64::MAX))).unwrap();
         assert!(c.is_leader(), "we hold an unexpired lease");
+        assert_eq!(c.leader_fencing_token(), Some(1));
 
         assert!(c.is_gossip_leader());
         tx.send(Some(lease(1, 0))).unwrap();
         assert!(!c.is_leader(), "our lease expired");
+        assert_eq!(c.leader_fencing_token(), None);
     }
 
     #[test]

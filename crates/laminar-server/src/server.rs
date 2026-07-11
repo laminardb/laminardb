@@ -21,6 +21,7 @@ use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 #[cfg(all(test, any(feature = "otel", feature = "kafka")))]
 use laminar_core::state::StateBackendConfig;
+use laminar_core::state::StateBackendDurability;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub enum ServerHandle {
@@ -122,6 +123,7 @@ pub async fn run_server(
 
     // Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
+    builder = builder.delivery_guarantee(config.server.delivery);
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
@@ -137,7 +139,10 @@ pub async fn run_server(
     }
 
     let storage_dir = config.state.local_storage_dir();
-    let has_storage = config.state.is_durable();
+    let has_storage = config
+        .state
+        .durability_scope()
+        .satisfies(StateBackendDurability::NodeDurable);
     if let Some(path) = storage_dir {
         builder = builder.storage_dir(path);
     }
@@ -150,6 +155,7 @@ pub async fn run_server(
     };
     builder = builder.profile(profile);
     builder = builder.restart_policy(config.supervision.to_policy());
+    builder = builder.incremental_emit(config.server.incremental_emit);
     builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint, false);
 
     // Build the state backend + single-owner vnode registry from config so
@@ -278,10 +284,9 @@ pub async fn run_server(
 
 /// Apply checkpoint settings to a `LaminarDB` builder.
 ///
-/// `cluster` routes `file://` checkpoints through the object store so they are
-/// namespaced per node and readable cross-node. Single-node mode keeps `file://`
-/// on the local `FileSystemCheckpointStore` (stable on-disk layout); only
-/// remote schemes (`s3://`, …) go to the object store there.
+/// Cluster configuration validation admits only shared cloud URLs. Single-node
+/// mode keeps `file://` on the local `FileSystemCheckpointStore` (stable on-disk
+/// layout); remote schemes (`s3://`, …) use the object-store implementation.
 pub(crate) fn apply_checkpoint_config(
     mut builder: laminar_db::LaminarDbBuilder,
     checkpoint_url: &str,
@@ -289,19 +294,13 @@ pub(crate) fn apply_checkpoint_config(
     cluster: bool,
 ) -> laminar_db::LaminarDbBuilder {
     let cfg = StreamCheckpointConfig {
-        interval_ms: Some(checkpoint.interval.as_millis() as u64),
+        interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
+        timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
         data_dir: file_url_to_path(checkpoint_url),
         max_retained: Some(checkpoint.max_retained),
-        // Not yet exposed in the server TOML; keeps the 30s default.
-        alignment_timeout_ms: None,
         max_in_flight_epochs: checkpoint.max_in_flight_epochs,
         max_staged_bytes: checkpoint.max_staged_bytes,
-        max_uncommitted_epochs: checkpoint.max_uncommitted_epochs,
-        uncommitted_epochs_backpressure: checkpoint.uncommitted_epochs_backpressure,
-        restorable_gate_poll_initial_ms: checkpoint.restorable_gate_poll_initial_ms,
-        restorable_gate_poll_max_ms: checkpoint.restorable_gate_poll_max_ms,
         delta_chain_max: checkpoint.delta_chain_max,
-        incremental_emit: checkpoint.incremental_emit,
     };
     builder = builder.checkpoint(cfg);
 
@@ -448,10 +447,13 @@ pub(crate) fn spawn_config_watcher(
 
 /// Extract a local filesystem path from a `file://` URL, or `None` for cloud URLs.
 fn file_url_to_path(url: &str) -> Option<PathBuf> {
-    if !url.starts_with("file:///") {
+    let raw = url.strip_prefix("file://")?;
+    // Accept both absolute file URLs and the explicitly relative form used by
+    // portable examples (`file://./state`). A host-style URL remains rejected;
+    // local checkpoint storage must not silently reinterpret a hostname.
+    if !raw.starts_with('/') && !raw.starts_with("./") && !raw.starts_with("../") {
         return None;
     }
-    let raw = url.strip_prefix("file://").unwrap_or(url);
     #[cfg(windows)]
     let raw = {
         let b = raw.as_bytes();
@@ -519,7 +521,7 @@ pub fn pipeline_to_ddl(pipeline: &PipelineConfig) -> String {
 
 pub fn sink_to_ddl(sink: &SinkConfig) -> String {
     let connector_keyword = sink.connector.replace('-', "_").to_uppercase();
-    let mut opts: Vec<String> = sink
+    let opts: Vec<String> = sink
         .properties
         .iter()
         .map(|(key, value)| {
@@ -530,9 +532,6 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
             }
         })
         .collect();
-    if sink.delivery != "at_least_once" {
-        opts.push(format!("delivery = '{}'", sink.delivery));
-    }
 
     if opts.is_empty() {
         format!(
@@ -646,6 +645,15 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_checkpoint_url_preserves_explicit_relative_path() {
+        assert_eq!(
+            file_url_to_path("file://./.laminardb/checkpoints"),
+            Some(PathBuf::from("./.laminardb/checkpoints"))
+        );
+        assert!(file_url_to_path("file://checkpoint-host/path").is_none());
+    }
     use crate::config::*;
 
     fn make_source(name: &str, connector: &str) -> SourceConfig {
@@ -827,28 +835,26 @@ mod tests {
             name: "output_sink".to_string(),
             pipeline: "vwap".to_string(),
             connector: "kafka".to_string(),
-            delivery: "at_least_once".to_string(),
             properties: props,
         };
         let ddl = sink_to_ddl(&sink);
         assert!(ddl.starts_with("CREATE SINK output_sink FROM vwap INTO KAFKA"));
         assert!(ddl.contains("topic = 'output'"));
         assert!(ddl.contains("brokers = 'localhost:9092'"));
-        // at_least_once is default, should not appear
+        // Delivery is injected from the pipeline-wide engine contract at connector build time.
         assert!(!ddl.contains("delivery"));
     }
 
     #[test]
-    fn test_sink_to_ddl_exactly_once() {
+    fn test_sink_to_ddl_has_no_per_sink_delivery_dimension() {
         let sink = SinkConfig {
             name: "out".to_string(),
             pipeline: "p".to_string(),
             connector: "kafka".to_string(),
-            delivery: "exactly_once".to_string(),
             properties: toml::Table::new(),
         };
         let ddl = sink_to_ddl(&sink);
-        assert!(ddl.contains("delivery = 'exactly_once'"));
+        assert!(!ddl.contains("delivery"));
     }
 
     #[test]

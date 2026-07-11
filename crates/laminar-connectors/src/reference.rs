@@ -116,7 +116,7 @@ impl MockReferenceTableSource {
             snapshot_complete: false,
             restored: false,
             closed: false,
-            mock_checkpoint: SourceCheckpoint::new(0),
+            mock_checkpoint: SourceCheckpoint::new(),
         }
     }
 
@@ -216,14 +216,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_checkpoint_round_trip() {
-        let mut cp = SourceCheckpoint::new(5);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset("lsn", "0/ABCD");
 
         let mut src = MockReferenceTableSource::empty();
         src.mock_checkpoint = cp.clone();
 
         let returned = src.checkpoint();
-        assert_eq!(returned.epoch(), 5);
         assert_eq!(returned.get_offset("lsn"), Some("0/ABCD"));
     }
 
@@ -232,7 +231,7 @@ mod tests {
         let mut src = MockReferenceTableSource::empty();
         assert!(!src.restored);
 
-        let cp = SourceCheckpoint::new(1);
+        let cp = SourceCheckpoint::new();
         src.restore(&cp).await.unwrap();
         assert!(src.restored);
     }
@@ -273,7 +272,7 @@ mod tests {
         let _cp = src.checkpoint();
 
         // Restore
-        let cp = SourceCheckpoint::new(0);
+        let cp = SourceCheckpoint::new();
         src.restore(&cp).await.unwrap();
 
         // Close

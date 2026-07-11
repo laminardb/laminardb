@@ -101,9 +101,9 @@ pub struct EngineMetrics {
     pub cycle_duration: Histogram,
     /// Checkpoint cycle duration.
     pub checkpoint_duration: Histogram,
-    /// Pipeline stall per barrier: time the pipeline task is blocked by
-    /// a checkpoint (shuffle alignment + state capture + the Aligned
-    /// resume gate), excluding the background durable tail.
+    /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, and the
+    /// Aligned resume gate. Exactly-once mode also includes its inline durable tail; other modes
+    /// resume at Aligned while that tail remains supervised in the background.
     pub checkpoint_pipeline_stall_duration: Histogram,
     /// Time the leader's restorable gate spends polling for vnode
     /// partials (failed gates that burn the timeout are observed too).
@@ -119,8 +119,6 @@ pub struct EngineMetrics {
     pub coordinated_committer_lag_epochs: IntGauge,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
-    /// Sink commit round-trip (2PC phase 2).
-    pub sink_commit_duration: Histogram,
     /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
     pub lookup_cache_hits: IntCounterVec,
     /// On-demand lookup cache misses (not in cache). Label: `table`.
@@ -415,16 +413,10 @@ impl EngineMetrics {
                 "Vnode partials written as unchanged-base references"
             )
             .unwrap()),
-            // pre_commit_timeout=30s. 0.005 * 2^13 = 40.96s.
+            // The one attempt deadline defaults to 120s. 0.005 * 2^15 = 163.84s.
             sink_precommit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_precommit_duration_seconds", "Sink pre-commit latency")
-                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 14).unwrap()),
-            )
-            .unwrap()),
-            // commit_timeout=60s. 0.005 * 2^14 = 81.92s.
-            sink_commit_duration: reg!(Histogram::with_opts(
-                HistogramOpts::new("sink_commit_duration_seconds", "Sink commit latency")
-                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 15).unwrap()),
+                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
             )
             .unwrap()),
             // Labels are bound to the registered lookup tables, so cardinality is finite.

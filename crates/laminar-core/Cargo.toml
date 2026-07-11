@@ -24,7 +24,6 @@ azure = ["object_store/azure"]
 [dependencies]
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
-xorf = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 quick_cache = { workspace = true }
@@ -34,6 +33,7 @@ equivalent = "1"
 smallvec = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
+uuid = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }
@@ -80,6 +80,9 @@ prost = { version = "0.14", optional = true }
 tracing = { workspace = true }
 
 crossfire = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
 
 [build-dependencies]
 # Generates the gRPC client/server stubs from proto/*.proto. Build-dependencies

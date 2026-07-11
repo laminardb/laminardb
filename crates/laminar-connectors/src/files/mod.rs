@@ -13,8 +13,8 @@ pub mod sink;
 pub mod source;
 pub mod text_decoder;
 
-pub use config::{FileFormat, FileSinkConfig, FileSourceConfig, SinkMode};
-pub use manifest::{FileEntry, FileIngestionManifest};
+pub use config::{FileFormat, FileSinkConfig, FileSourceConfig};
+pub use manifest::FileIngestionManifest;
 pub use sink::FileSink;
 pub use source::FileSource;
 pub use text_decoder::TextLineDecoder;
@@ -69,15 +69,14 @@ pub fn register_file_sink(registry: &ConnectorRegistry) {
         config_keys: vec![
             ConfigKeySpec::required("path", "Output directory path"),
             ConfigKeySpec::required("format", "Output format (csv, json, text, parquet, arrow)"),
-            ConfigKeySpec::optional("mode", "Write mode (append, rolling)", "rolling"),
-            ConfigKeySpec::optional("prefix", "File name prefix for rolling mode", "part"),
+            ConfigKeySpec::optional("prefix", "Immutable output file name prefix", "part"),
         ],
     };
     registry.register_sink(
         "files",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(FileSink::with_registry(registry))
+        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
+            Ok(Box::new(FileSink::with_registry(registry)))
         }),
     );
 }

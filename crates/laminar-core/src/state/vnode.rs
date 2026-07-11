@@ -82,12 +82,14 @@ impl VnodeLifecycleState {
     }
 }
 
-/// Opaque source-checkpoint offsets (connector-defined `"key" -> "value"`
-/// strings) staged for a rotation handoff. A private alias keeps the single
+/// Source-instance → opaque connector offsets staged for a rotation handoff. Source namespacing
+/// prevents common keys such as `lsn` or `topic-partition` from colliding across connectors. A private alias keeps the single
 /// `disallowed_types` exception (cold path, mirrors the checkpoint map shape) in
 /// one place rather than blanket-allowing this perf-sensitive module.
 #[allow(clippy::disallowed_types)]
-type ResumeOffsets = std::collections::HashMap<String, String>;
+type SourceResumeOffsets = std::collections::HashMap<String, String>;
+#[allow(clippy::disallowed_types)]
+type ResumeOffsets = std::collections::HashMap<String, SourceResumeOffsets>;
 
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
@@ -188,21 +190,25 @@ impl VnodeRegistry {
 
     /// Stage opaque source-checkpoint offsets for the next rebind. MUST be called
     /// before [`set_assignment_and_version`](Self::set_assignment_and_version) so
-    /// the source observes them. Replaces any prior staging; an empty map is
-    /// ignored so a transient load failure can't clobber a good snapshot.
+    /// the source observes them. Replaces any prior staging, including with an
+    /// empty successful cut. Callers propagate load failures and must not invoke
+    /// this method for a failed read; retaining an older non-empty cut when the
+    /// authoritative cut is empty would seek acquired partitions to stale data.
     pub fn stage_resume_offsets(&self, offsets: ResumeOffsets) {
-        if offsets.is_empty() {
-            return;
-        }
         *self.resume_offsets.lock() = Arc::new(offsets);
     }
 
-    /// The staged source-checkpoint offsets (see
-    /// [`stage_resume_offsets`](Self::stage_resume_offsets)). Reads (does not
-    /// drain), so every source on this node sees the same snapshot on rebind.
+    /// The staged offsets for one source instance. Reads do not drain, so repeated partition
+    /// assignment callbacks for that source observe the same committed snapshot.
     #[must_use]
-    pub fn resume_offsets(&self) -> Arc<ResumeOffsets> {
-        Arc::clone(&self.resume_offsets.lock())
+    pub fn resume_offsets_for(&self, source: &str) -> Arc<SourceResumeOffsets> {
+        Arc::new(
+            self.resume_offsets
+                .lock()
+                .get(source)
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     /// Number of vnodes.
@@ -519,7 +525,7 @@ pub fn owners_per_domain(
 ///
 /// Used by the checkpoint coordinator to decide which vnodes' durability
 /// markers it is responsible for writing each epoch, and by the leader's
-/// `epoch_complete` gate to know the full set to check.
+/// `seal_checkpoint` gate to know the full set to check.
 #[must_use]
 pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
     (0..registry.vnode_count())
@@ -593,6 +599,26 @@ mod tests {
     fn owner_out_of_range_returns_unassigned() {
         let r = VnodeRegistry::single_owner(4, NodeId(1));
         assert!(r.owner(10).is_unassigned());
+    }
+
+    #[test]
+    fn empty_resume_cut_replaces_stale_handoff_offsets() {
+        let r = VnodeRegistry::new(4);
+        let mut offsets = ResumeOffsets::new();
+        offsets.insert(
+            "orders".into(),
+            SourceResumeOffsets::from([("orders-0".into(), "41".into())]),
+        );
+        r.stage_resume_offsets(offsets);
+        assert_eq!(
+            r.resume_offsets_for("orders")
+                .get("orders-0")
+                .map(String::as_str),
+            Some("41")
+        );
+
+        r.stage_resume_offsets(ResumeOffsets::new());
+        assert!(r.resume_offsets_for("orders").is_empty());
     }
 
     #[test]

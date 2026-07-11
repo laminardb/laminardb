@@ -113,22 +113,32 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     for (id, reason) in &report.skipped {
         info!("  INVALID checkpoint {id}: {reason}");
     }
-    match report.chosen_id {
-        Some(id) => info!("  VALID checkpoint {id} selected for recovery"),
-        None if report.examined == 0 => info!("  No checkpoints found (fresh start)"),
-        None => info!("  WARNING: No valid checkpoint found — recovery would start fresh"),
-    }
-
-    // Also run orphan detection
-    let orphans = store
-        .cleanup_orphans()
-        .await
-        .map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e}"))?;
-    if orphans > 0 {
-        info!("Cleaned up {orphans} orphaned state file(s)");
+    match checkpoint_validation_outcome(&report)? {
+        CheckpointValidationOutcome::StructurallyValid(id) => {
+            info!("  STRUCTURALLY VALID checkpoint {id} selected for recovery");
+        }
+        CheckpointValidationOutcome::Empty => info!("  No checkpoints found (fresh start)"),
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CheckpointValidationOutcome {
+    Empty,
+    StructurallyValid(u64),
+}
+
+fn checkpoint_validation_outcome(
+    report: &laminar_core::storage::checkpoint_store::RecoveryReport,
+) -> Result<CheckpointValidationOutcome> {
+    match report.chosen_id {
+        Some(id) => Ok(CheckpointValidationOutcome::StructurallyValid(id)),
+        None if report.examined == 0 => Ok(CheckpointValidationOutcome::Empty),
+        None => Err(anyhow::anyhow!(
+            "[LDB-6041] checkpoint history exists but no valid checkpoint is recoverable"
+        )),
+    }
 }
 
 /// Build the checkpoint store for `--validate-checkpoints`. Errors
@@ -145,9 +155,29 @@ fn build_checkpoint_store(
             .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
 
     let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
+    let participant = if config.server.mode == "cluster" {
+        #[cfg(feature = "cluster")]
+        {
+            let node_id = config
+                .node_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("cluster checkpoint validation requires node_id"))?;
+            Some(cluster::numeric_node_id(node_id))
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(anyhow::anyhow!(
+                "cluster checkpoint validation requires a binary built with --features cluster"
+            ));
+        }
+    } else {
+        None
+    };
+    let participant_id = participant.unwrap_or(0);
 
-    // file:// URLs use the local FS path directly; cloud URLs need a prefix.
-    if url.starts_with("file://") {
+    // Cluster runtime always uses the object-store layout, including file://, because every
+    // participant has an isolated prefix on the shared base store.
+    if participant.is_none() && url.starts_with("file://") {
         // Shared normalization handles the Windows drive-letter slash
         // (`file:///C:/x` must become `C:/x`, not `/C:/x`).
         let path = laminar_core::storage::object_store_builder::file_url_path(url)
@@ -155,20 +185,56 @@ fn build_checkpoint_store(
         Ok(Box::new(
             laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
-                3,
             )
-            .with_vnode_count(vnode_count),
+            .with_vnode_count(vnode_count)
+            .with_participant_id(participant_id),
         ))
     } else {
-        // Cloud URL: the builder already rooted the store at the URL's
-        // path prefix.
+        // The builder already rooted the store at the URL's path prefix.
         Ok(Box::new(
             laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                 obj_store,
-                String::new(),
-                3,
+                participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
             )
-            .with_vnode_count(vnode_count),
+            .with_vnode_count(vnode_count)
+            .with_participant_id(participant_id),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checkpoint_validation_outcome, CheckpointValidationOutcome};
+    use laminar_core::storage::checkpoint_store::RecoveryReport;
+
+    fn report(chosen_id: Option<u64>, examined: usize) -> RecoveryReport {
+        RecoveryReport {
+            chosen_id,
+            skipped: Vec::new(),
+            examined,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn validation_outcome_is_empty_only_without_checkpoint_history() {
+        assert_eq!(
+            checkpoint_validation_outcome(&report(None, 0)).unwrap(),
+            CheckpointValidationOutcome::Empty
+        );
+    }
+
+    #[test]
+    fn validation_outcome_returns_structurally_valid_checkpoint() {
+        assert_eq!(
+            checkpoint_validation_outcome(&report(Some(42), 3)).unwrap(),
+            CheckpointValidationOutcome::StructurallyValid(42)
+        );
+    }
+
+    #[test]
+    fn validation_outcome_rejects_nonempty_unusable_history() {
+        let error = checkpoint_validation_outcome(&report(None, 2)).unwrap_err();
+        assert!(error.to_string().contains("[LDB-6041]"));
     }
 }

@@ -524,7 +524,11 @@ async fn read_committed_cut(db: &LaminarDB) -> Result<Option<u64>, String> {
     // Bind the clone before awaiting — an if-let scrutinee would hold the lock guard across it.
     let ds = db.decision_store.lock().clone();
     match ds {
-        Some(ds) => ds.highest_committed().await.map_err(|e| e.to_string()),
+        Some(ds) => ds
+            .highest_committed()
+            .await
+            .map(|decision| decision.map(|d| d.epoch))
+            .map_err(|e| e.to_string()),
         None => Ok(None),
     }
 }

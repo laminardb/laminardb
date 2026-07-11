@@ -22,10 +22,20 @@ pub type SourceFactory =
 
 /// Factory function type for creating sink connectors.
 ///
+/// The connector config is available during construction so factories can
+/// select a concrete implementation and reject invalid mode-specific options
+/// before `open()` performs external I/O.
+///
 /// The optional `&prometheus::Registry` allows connectors to register
 /// their metrics on the shared Prometheus registry when one is available.
-pub type SinkFactory =
-    Arc<dyn Fn(Option<&prometheus::Registry>) -> Box<dyn SinkConnector> + Send + Sync>;
+pub type SinkFactory = Arc<
+    dyn Fn(
+            &ConnectorConfig,
+            Option<&prometheus::Registry>,
+        ) -> Result<Box<dyn SinkConnector>, ConnectorError>
+        + Send
+        + Sync,
+>;
 
 /// Factory function type for creating reference table sources.
 pub type TableSourceFactory = Arc<
@@ -164,8 +174,8 @@ impl ConnectorRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` if the connector type
-    /// is not registered.
+    /// Returns `ConnectorError::ConfigurationError` if the connector type is
+    /// not registered, or the selected sink configuration is invalid.
     pub fn create_sink(
         &self,
         config: &ConnectorConfig,
@@ -178,7 +188,7 @@ impl ConnectorRegistry {
                 config.connector_type()
             ))
         })?;
-        Ok(factory(registry))
+        factory(config, registry)
     }
 
     /// Registers a reference table source factory.
@@ -350,12 +360,40 @@ mod tests {
         registry.register_sink(
             "mock",
             mock_info("mock", false, true),
-            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSinkConnector::new())),
+            Arc::new(|_config, _registry| Ok(Box::new(MockSinkConnector::new()))),
         );
 
         let config = ConnectorConfig::new("mock");
         let connector = registry.create_sink(&config, None);
         assert!(connector.is_ok());
+    }
+
+    #[test]
+    fn sink_factory_receives_config_and_propagates_validation_errors() {
+        let registry = ConnectorRegistry::new();
+        registry.register_sink(
+            "validated",
+            mock_info("validated", false, true),
+            Arc::new(|config, _registry| {
+                if config.get("enabled") == Some("true") {
+                    Ok(Box::new(MockSinkConnector::new()))
+                } else {
+                    Err(ConnectorError::ConfigurationError(
+                        "validated sink requires enabled = true".into(),
+                    ))
+                }
+            }),
+        );
+
+        let mut config = ConnectorConfig::new("validated");
+        let error = match registry.create_sink(&config, None) {
+            Ok(_) => panic!("expected factory validation error"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("enabled = true"));
+
+        config.set("enabled", "true");
+        assert!(registry.create_sink(&config, None).is_ok());
     }
 
     #[test]
@@ -378,7 +416,7 @@ mod tests {
         registry.register_sink(
             "delta",
             mock_info("delta", false, true),
-            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSinkConnector::new())),
+            Arc::new(|_config, _registry| Ok(Box::new(MockSinkConnector::new()))),
         );
 
         let sources = registry.list_sources();

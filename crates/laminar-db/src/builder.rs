@@ -275,6 +275,13 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Select dirty-only changelog emission for keyed running aggregates.
+    #[must_use]
+    pub fn incremental_emit(mut self, enabled: bool) -> Self {
+        self.config.incremental_emit = enabled;
+        self
+    }
+
     /// Set the deployment profile.
     ///
     /// See [`Profile`] for the available tiers.
@@ -419,6 +426,8 @@ impl LaminarDbBuilder {
             .validate_config(&self.config, self.config.object_store_url.as_deref())
             .map_err(|e| DbError::Config(e.to_string()))?;
 
+        Self::validate_cluster_delivery(self.profile, self.config.delivery_guarantee)?;
+
         Self::validate_backpressure(&self.config)?;
 
         // state_backend and vnode_registry must be paired or both absent.
@@ -524,6 +533,38 @@ impl LaminarDbBuilder {
         }
         Ok(())
     }
+
+    /// Validate delivery semantics whose correctness depends on the runtime mode.
+    ///
+    /// A durable leader lease currently fences leader election, but checkpoint decisions and
+    /// sink commits are separate unconditional operations: neither can atomically validate the
+    /// lease token. Boundary rechecks reduce the stale-leader window but cannot prove exactly-once
+    /// across a term change, so cluster EO remains closed until those storage protocols accept a
+    /// real fencing precondition.
+    fn validate_cluster_delivery(
+        profile: Profile,
+        guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    ) -> Result<(), DbError> {
+        use laminar_connectors::connector::DeliveryGuarantee;
+
+        if profile != Profile::Cluster {
+            return Ok(());
+        }
+        match guarantee {
+            DeliveryGuarantee::BestEffort => Err(DbError::Config(
+                "cluster mode requires at_least_once delivery; best_effort has no defined \
+                 rebalance/state-loss contract"
+                    .into(),
+            )),
+            DeliveryGuarantee::AtLeastOnce => Ok(()),
+            DeliveryGuarantee::ExactlyOnce => Err(DbError::Config(
+                "[LDB-0013] cluster exactly-once is not admitted: the durable leader lease is \
+                 not atomically bound to checkpoint decisions or sink commits. Use cluster \
+                 at_least_once, or exactly_once in embedded/single-node mode"
+                    .into(),
+            )),
+        }
+    }
 }
 
 impl Default for LaminarDbBuilder {
@@ -585,6 +626,48 @@ mod tests {
             .await
             .expect_err("ShedOldest + ExactlyOnce must be rejected");
         assert!(err.to_string().contains("exactly-once"), "{err}");
+    }
+
+    #[test]
+    fn cluster_delivery_admission_fails_closed_without_durable_term_binding() {
+        use laminar_connectors::connector::DeliveryGuarantee;
+
+        assert!(LaminarDbBuilder::validate_cluster_delivery(
+            Profile::Cluster,
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .is_ok());
+
+        let error = LaminarDbBuilder::validate_cluster_delivery(
+            Profile::Cluster,
+            DeliveryGuarantee::ExactlyOnce,
+        )
+        .expect_err("cluster EO must remain closed until decisions and sinks consume the fence");
+        assert!(error.to_string().contains("[LDB-0013]"), "{error}");
+        assert!(
+            error.to_string().contains("not atomically bound"),
+            "{error}"
+        );
+
+        assert!(LaminarDbBuilder::validate_cluster_delivery(
+            Profile::Durable,
+            DeliveryGuarantee::ExactlyOnce,
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn cluster_exactly_once_build_is_rejected_before_runtime_start() {
+        use laminar_connectors::connector::DeliveryGuarantee;
+
+        let error = LaminarDbBuilder::new()
+            .profile(Profile::Cluster)
+            .object_store_url("memory://checkpoint-test")
+            .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
+            .build()
+            .await
+            .expect_err("cluster EO must fail at database admission");
+        assert!(error.to_string().contains("[LDB-0013]"), "{error}");
     }
 
     #[tokio::test]

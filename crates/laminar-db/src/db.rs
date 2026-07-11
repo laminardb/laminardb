@@ -112,11 +112,22 @@ pub struct LaminarDB {
     /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
     /// keeps it from racing a normal stop/shutdown, which finalize themselves.
     pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes start/stop/shutdown ownership across awaits. Runtime-handle `None` means an
+    /// owner is currently joining only while this lock is held; another caller must never treat
+    /// it as completed teardown.
+    pub(crate) lifecycle_lock: tokio::sync::Mutex<()>,
     /// Set at pipeline start when a sink is exactly-once; gates the rotation drain.
     pub(crate) rotation_drain_required: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Decoupled coordinated-commit committer task; aborted on shutdown.
     pub(crate) committer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// OS-released exclusive lock for a local exactly-once checkpoint namespace. Deployment
+    /// identity prevents reuse after reset; this lock prevents two live processes from writing
+    /// divergent cuts into the same deployment.
+    pub(crate) exact_deployment_lock: parking_lot::Mutex<Option<std::fs::File>>,
+    /// Sink tasks created during `start_inner`; retained until startup commits so
+    /// any later error can close them instead of detaching external connectors.
+    pub(crate) startup_sink_handles: parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
@@ -191,9 +202,8 @@ pub struct LaminarDB {
     /// in-memory state so a later re-acquire merges into empty state (no additive double-count).
     #[cfg(feature = "cluster")]
     pub(crate) pending_revoke_vnodes: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<u32>>>,
-    /// Routes `db.checkpoint()` requests to the pipeline callback so operator
-    /// state is captured. When `None`, the coordinator is driven directly
-    /// (stateless / pre-start path).
+    /// Routes `db.checkpoint()` requests to the streaming coordinator for exact-attempt
+    /// barrier admission. `None` means no running pipeline can produce a valid cut.
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
     /// stream/MV name → subscribing node ids; refreshed from gossip by the router task.
@@ -203,6 +213,19 @@ pub struct LaminarDB {
     /// Resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
+}
+
+#[cfg(feature = "cluster")]
+fn checkpoint_participant_for_runtime(db: &LaminarDB) -> Option<u64> {
+    db.cluster_controller
+        .lock()
+        .as_ref()
+        .map(|controller| controller.instance_id().0)
+}
+
+#[cfg(not(feature = "cluster"))]
+const fn checkpoint_participant_for_runtime(_db: &LaminarDB) -> Option<u64> {
+    None
 }
 
 /// Reply channel for a single `db.checkpoint()` request.
@@ -403,9 +426,12 @@ impl LaminarDB {
             supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
             restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lifecycle_lock: tokio::sync::Mutex::new(()),
             rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
             committer_handle: parking_lot::Mutex::new(None),
+            exact_deployment_lock: parking_lot::Mutex::new(None),
+            startup_sink_handles: parking_lot::Mutex::new(Vec::new()),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             engine_metrics: parking_lot::Mutex::new(None),
             prometheus_registry: parking_lot::Mutex::new(None),
@@ -633,21 +659,25 @@ impl LaminarDB {
     ///
     /// Rehydration runs after the coordinator lock is released so a slow
     /// object-store read can't stall the checkpoint cadence.
+    ///
+    /// # Errors
+    /// Returns a checkpoint error when source-offset handoff or vnode-state rehydration fails.
+    /// The assignment is not published in that case, so the same snapshot remains retryable.
     #[cfg(feature = "cluster")]
     #[allow(clippy::too_many_lines)] // sequential rotation steps read better inline
     pub async fn adopt_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
-    ) -> SnapshotAdoption {
+    ) -> Result<SnapshotAdoption, DbError> {
         let Some(registry) = self.vnode_registry.lock().clone() else {
-            return SnapshotAdoption::default();
+            return Ok(SnapshotAdoption::default());
         };
         if snapshot.version <= registry.assignment_version() {
-            return SnapshotAdoption {
+            return Ok(SnapshotAdoption {
                 adopted: false,
                 version: snapshot.version,
                 ..SnapshotAdoption::default()
-            };
+            });
         }
         let vnode_count = registry.vnode_count();
         let new_assignment: Arc<[laminar_core::state::NodeId]> =
@@ -662,15 +692,15 @@ impl LaminarDB {
             });
 
         // Hold the coord mutex so registry + fence updates land between epochs.
-        let mut guard = self.coordinator.lock().await;
+        let guard = self.coordinator.lock().await;
         // Re-check under the lock: a concurrent adopt may have advanced the version,
         // which we must not regress.
         if snapshot.version <= registry.assignment_version() {
-            return SnapshotAdoption {
+            return Ok(SnapshotAdoption {
                 adopted: false,
                 version: snapshot.version,
                 ..SnapshotAdoption::default()
-            };
+            });
         }
 
         let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
@@ -686,23 +716,52 @@ impl LaminarDB {
         // Stage the sealed source offsets before the version bump (acquiring source
         // resumes from the previous owner's cut). A handoff-read failure defers the
         // rotation — exactly-once must not fall back to startup and re-emit.
+        let source_handoff = if newly_acquired.is_empty() {
+            None
+        } else if let Some(coord) = guard.as_ref() {
+            coord.acquired_source_handoff().await.map_err(|e| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6052] source-offset handoff read failed for assignment {}: {e}",
+                    snapshot.version
+                ))
+            })?
+        } else {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6052] cannot acquire vnodes for assignment {} without a live checkpoint coordinator",
+                snapshot.version
+            )));
+        };
+
+        // Read all newly-owned state before publishing the assignment. A failed object-store read
+        // therefore leaves the current version intact and the watcher can retry the same snapshot.
+        drop(guard);
+        let rehydration = if let Some((attempt, _)) = source_handoff.as_ref() {
+            let backend = self.state_backend.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6050] cluster assignment adoption requires a state backend".into(),
+                )
+            })?;
+            crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+                .rehydrate_at(&newly_acquired, *attempt)
+                .await?
+        } else {
+            crate::recovery_manager::VnodeRehydration::default()
+        };
+
+        // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won.
+        let mut guard = self.coordinator.lock().await;
+        if snapshot.version <= registry.assignment_version() {
+            return Ok(SnapshotAdoption {
+                adopted: false,
+                version: snapshot.version,
+                ..SnapshotAdoption::default()
+            });
+        }
         if !newly_acquired.is_empty() {
-            if let Some(coord) = guard.as_ref() {
-                match coord.acquired_source_offsets().await {
-                    Ok(offsets) => registry.stage_resume_offsets(offsets),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e, version = snapshot.version,
-                            "source-offset handoff read failed; deferring rotation"
-                        );
-                        return SnapshotAdoption {
-                            adopted: false,
-                            version: snapshot.version,
-                            ..SnapshotAdoption::default()
-                        };
-                    }
-                }
-            }
+            // A successful no-seal/empty cut must clear any prior rotation's
+            // offsets. Failures returned above never reach this mutation.
+            let offsets = source_handoff.map_or_else(HashMap::new, |(_, offsets)| offsets);
+            registry.stage_resume_offsets(offsets);
         }
 
         // Mark Restoring before the ownership flip so emission stays suppressed as the
@@ -753,32 +812,24 @@ impl LaminarDB {
                 .retain(|v, _| owned_set.contains(v));
         }
 
-        // Clone the Arc before the await so the lock guard drops first.
-        let backend = self.state_backend.lock().clone();
-        if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {
-            let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-                .rehydrate(&newly_acquired)
-                .await;
-            adoption.rehydrated = report.restored.len();
-            adoption.rehydration_epoch = report.epoch;
-            // No durable state → serve immediately; don't gate emission forever.
-            let no_state: Vec<u32> = newly_acquired
-                .iter()
-                .copied()
-                .filter(|v| !report.restored.contains_key(v))
-                .collect();
-            if !no_state.is_empty() {
-                registry.mark_active(&no_state);
-            }
-            if let Some(epoch) = report.epoch {
+        if !newly_acquired.is_empty() {
+            adoption.rehydrated = rehydration.restored.len();
+            adoption.rehydration_epoch = rehydration.attempt.map(|a| a.epoch);
+            if let Some(attempt) = rehydration.attempt {
                 let mut staged = self.rehydrated_vnode_state.lock();
-                for (vnode, chain) in report.restored {
-                    staged.insert(vnode, RehydratedVnode { epoch, chain });
+                for (vnode, chain) in rehydration.restored {
+                    staged.insert(
+                        vnode,
+                        RehydratedVnode {
+                            epoch: attempt.epoch,
+                            chain,
+                        },
+                    );
                 }
+            } else {
+                // No sealed epoch means this is cluster genesis; there is no prior state to apply.
+                registry.mark_active(&newly_acquired);
             }
-        } else if !newly_acquired.is_empty() {
-            // No backend — clear the optimistic Restoring marks.
-            registry.mark_active(&newly_acquired);
         }
 
         tracing::info!(
@@ -788,7 +839,7 @@ impl LaminarDB {
             rehydration_epoch = ?adoption.rehydration_epoch,
             "adopted assignment snapshot",
         );
-        adoption
+        Ok(adoption)
     }
 
     /// Mark the vnodes this node is about to lose as draining (source pauses their
@@ -2260,14 +2311,24 @@ impl LaminarDB {
         self.config.checkpoint.is_some()
     }
 
+    /// Stable participant identity used to namespace checkpoint manifests.
+    ///
+    /// Local runtimes return `None` and keep the historical unprefixed layout. Cluster runtimes
+    /// use the controller's numeric instance id; decision markers intentionally do not use this
+    /// namespace because they are cluster-wide.
+    pub(crate) fn checkpoint_participant(&self) -> Option<u64> {
+        checkpoint_participant_for_runtime(self)
+    }
+
     /// Return a checkpoint store for the current configuration, if any.
     pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_core::storage::CheckpointStore>> {
         let cp_config = self.config.checkpoint.as_ref()?;
-        let max_retained = cp_config.max_retained.unwrap_or(3);
         let vnode_count = self.vnode_registry.lock().as_ref().map_or(
             laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
             |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
         );
+        let participant = self.checkpoint_participant();
+        let participant_id = participant.unwrap_or(0);
 
         if let Some(ref url) = self.config.object_store_url {
             let obj_store = laminar_core::storage::object_store_builder::build_object_store(
@@ -2278,10 +2339,10 @@ impl LaminarDB {
             Some(Box::new(
                 laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     obj_store,
-                    String::new(),
-                    max_retained,
+                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
-                .with_vnode_count(vnode_count),
+                .with_vnode_count(vnode_count)
+                .with_participant_id(participant_id),
             ))
         } else {
             let data_dir = cp_config
@@ -2289,12 +2350,15 @@ impl LaminarDB {
                 .clone()
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
+                data_dir.join("nodes").join(id.to_string())
+            });
             Some(Box::new(
                 laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    &data_dir,
-                    max_retained,
+                    checkpoint_dir,
                 )
-                .with_vnode_count(vnode_count),
+                .with_vnode_count(vnode_count)
+                .with_participant_id(participant_id),
             ))
         }
     }
@@ -2303,8 +2367,9 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError::Checkpoint` if checkpointing is disabled, the
-    /// coordinator is not initialized, or the checkpoint fails.
+    /// Returns `DbError::Checkpoint` if checkpointing is disabled, no live
+    /// manual-checkpoint route exists, cluster leadership cannot be resolved,
+    /// or the checkpoint fails.
     pub async fn checkpoint(
         &self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
@@ -2316,24 +2381,37 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         {
-            let leader_opt = {
+            let leader_rpc: Result<Option<String>, DbError> = {
                 let cc_guard = self.cluster_controller.lock();
-                cc_guard.as_ref().and_then(|cc| {
-                    if cc.is_leader() {
-                        None
-                    } else {
-                        cc.current_leader().and_then(|leader_id| {
-                            let watch = cc.members_watch();
-                            let members = watch.borrow();
-                            members
-                                .iter()
-                                .find(|m| m.id == leader_id)
-                                .map(|m| m.rpc_address.clone())
-                        })
+                match cc_guard.as_ref() {
+                    // Embedded and single-node runtimes do not install a cluster
+                    // controller, so their manual checkpoint remains local.
+                    None => Ok(None),
+                    Some(cc) if cc.is_leader() => Ok(None),
+                    Some(cc) => {
+                        let leader_id = cc.current_leader().ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "cannot route checkpoint: cluster leader is unresolved".into(),
+                            )
+                        })?;
+                        let watch = cc.members_watch();
+                        let members = watch.borrow();
+                        let address = members
+                            .iter()
+                            .find(|member| member.id == leader_id)
+                            .map(|member| member.rpc_address.trim())
+                            .filter(|address| !address.is_empty())
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "cannot route checkpoint: RPC address for cluster leader \
+                                     {leader_id} is unresolved"
+                                ))
+                            })?;
+                        Ok(Some(address.to_owned()))
                     }
-                })
+                }
             };
-            if let Some(leader_rpc) = leader_opt {
+            if let Some(leader_rpc) = leader_rpc? {
                 tracing::info!(
                     "Forwarding checkpoint request to leader node at HTTP address {}",
                     leader_rpc
@@ -2342,31 +2420,22 @@ impl LaminarDB {
             }
         }
 
-        // Route through the callback so it captures operator state the same way
-        // the periodic timer does; direct coordinator calls produce an empty
-        // operator_states map and lose accumulator state on restart.
-        let tx = self.force_ckpt_tx.lock().clone();
-        let result = if let Some(tx) = tx {
-            let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
-            tx.send(reply_tx).await.map_err(|_| {
-                DbError::Checkpoint(
-                    "pipeline callback receiver closed — engine may be shutting down".into(),
-                )
-            })?;
-            reply_rx.await.map_err(|_| {
-                DbError::Checkpoint("pipeline callback dropped oneshot before replying".into())
-            })?
-        } else {
-            // No running pipeline; drive the coordinator directly. Operator state
-            // will be empty — safe when there is nothing to restore yet.
-            let mut guard = self.coordinator.lock().await;
-            let coord = guard.as_mut().ok_or_else(|| {
-                DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
-            })?;
-            coord
-                .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
-                .await
-        };
+        // Route through the live streaming coordinator so the manual checkpoint observes the
+        // same source, operator, and sink cut as a periodic barrier checkpoint.
+        let tx = self.force_ckpt_tx.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "manual checkpoint coordinator is not running — call start() first".into(),
+            )
+        })?;
+        let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
+        tx.send(reply_tx).await.map_err(|_| {
+            DbError::Checkpoint(
+                "manual checkpoint receiver closed — engine may be shutting down".into(),
+            )
+        })?;
+        let result = reply_rx.await.map_err(|_| {
+            DbError::Checkpoint("manual checkpoint ended without a terminal reply".into())
+        })?;
 
         #[cfg(feature = "cluster")]
         if matches!(&result, Ok(r) if r.success) {

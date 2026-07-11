@@ -1,3 +1,4 @@
+#[cfg(feature = "delta-lake")]
 use super::super::delta_config::DeltaCatalogType;
 use super::*;
 use arrow_array::{Float64Array, Int64Array, StringArray};
@@ -58,7 +59,6 @@ fn test_new_defaults() {
     let sink = DeltaLakeSink::new(test_config(), None);
     assert_eq!(sink.state(), ConnectorState::Created);
     assert_eq!(sink.current_epoch(), 0);
-    assert_eq!(sink.last_committed_epoch(), 0);
     assert_eq!(sink.buffered_rows(), 0);
     assert_eq!(sink.buffered_bytes(), 0);
     assert_eq!(sink.delta_version(), 0);
@@ -86,6 +86,7 @@ fn test_deferred_init_flag_default_false() {
     assert!(!sink.needs_deferred_delta_init);
 }
 
+#[cfg(feature = "delta-lake")]
 fn unity_config() -> DeltaLakeSinkConfig {
     let mut config = test_config();
     config.catalog_type = DeltaCatalogType::Unity {
@@ -159,6 +160,7 @@ async fn test_write_batch_accepts_initializing_state() {
     assert!(sink.schema.is_some());
 }
 
+#[cfg(feature = "delta-lake")]
 #[test]
 fn test_no_deferred_init_without_catalog_storage_location() {
     // Unity catalog without catalog.storage.location should NOT defer.
@@ -169,6 +171,7 @@ fn test_no_deferred_init_without_catalog_storage_location() {
     assert!(!sink.needs_deferred_delta_init);
 }
 
+#[cfg(feature = "delta-lake")]
 #[test]
 fn test_no_deferred_init_with_schema() {
     // Unity catalog with schema already set should NOT defer.
@@ -377,9 +380,7 @@ async fn test_rollback_after_pre_commit_discards_staged() {
     assert_eq!(sink.delta_version(), 0); // no Delta write occurred
 }
 
-/// Staged data is preserved across `pre_commit` → failed commit → rollback.
-/// This verifies that `pre_commit` does not destroy staged state, so a
-/// subsequent rollback can discard it cleanly.
+/// Staged data remains available for rollback until preparation completes.
 #[tokio::test]
 async fn test_staged_data_preserved_until_commit_or_rollback() {
     let mut config = test_config();
@@ -397,29 +398,11 @@ async fn test_staged_data_preserved_until_commit_or_rollback() {
     assert_eq!(sink.staged_batches.len(), 2);
     assert_eq!(sink.buffered_rows(), 0);
 
-    // Simulate: commit_epoch would write to Delta, but without the
-    // feature we exercise the local path. Verify staged state is
-    // consumed only on success.
-    // (Without delta-lake feature, commit_epoch calls commit_local
-    // which succeeds.)
-
-    // Instead, test rollback: staged data should be discarded.
+    // A failed preparation is followed by rollback, which discards the cut.
     sink.rollback_epoch(1).await.unwrap();
     assert!(sink.staged_batches.is_empty());
     assert_eq!(sink.staged_rows, 0);
     assert_eq!(sink.staged_bytes, 0);
-}
-
-#[tokio::test]
-async fn test_commit_empty_epoch() {
-    let mut sink = DeltaLakeSink::new(test_config(), None);
-    sink.state = ConnectorState::Running;
-
-    sink.begin_epoch(1).await.unwrap();
-    // No writes
-    sink.commit_epoch(1).await.unwrap();
-    assert_eq!(sink.last_committed_epoch(), 1);
-    assert_eq!(sink.delta_version(), 0); // No version bump (no files)
 }
 
 // ── Flush tests ──
@@ -458,57 +441,34 @@ async fn test_close() {
     assert_eq!(sink.state(), ConnectorState::Closed);
 }
 
-// ── Capabilities tests ──
+// ── Contract tests ──
 
 #[test]
-fn test_capabilities_append_exactly_once() {
+fn test_contract_append_exactly_once() {
     let mut config = test_config();
     config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
     let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(caps.exactly_once);
-    assert!(caps.idempotent);
-    assert!(!caps.upsert);
-    assert!(!caps.changelog);
-    assert!(!caps.schema_evolution);
-    assert!(!caps.partitioned);
+    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
+    assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(180));
 }
 
 #[test]
-fn test_capabilities_upsert() {
+fn test_contract_upsert() {
     let sink = DeltaLakeSink::new(upsert_config(), None);
-    let caps = sink.capabilities();
-    assert!(caps.upsert);
-    assert!(caps.changelog);
-    assert!(caps.idempotent);
+    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+    assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
 }
 
 #[test]
-fn test_capabilities_schema_evolution() {
-    let mut config = test_config();
-    config.schema_evolution = true;
-    let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(caps.schema_evolution);
-}
-
-#[test]
-fn test_capabilities_partitioned() {
-    let mut config = test_config();
-    config.partition_columns = vec!["trade_date".to_string()];
-    let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(caps.partitioned);
-}
-
-#[test]
-fn test_capabilities_at_least_once() {
+fn test_contract_at_least_once() {
     let mut config = test_config();
     config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(!caps.exactly_once);
-    assert!(caps.idempotent);
+    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
 }
 
 // ── Changelog splitting tests ──
@@ -677,13 +637,11 @@ fn zset_changelog(rows: &[(&str, i64, i64)]) -> RecordBatch {
     .unwrap()
 }
 
-/// Drive one full epoch through the exactly-once sink lifecycle.
+/// Land one at-least-once write cut through the durable flush path.
 #[cfg(feature = "delta-lake")]
-async fn run_epoch(sink: &mut DeltaLakeSink, epoch: u64, batch: &RecordBatch) {
-    sink.begin_epoch(epoch).await.unwrap();
+async fn flush_batch(sink: &mut DeltaLakeSink, batch: &RecordBatch) {
     sink.write_batch(batch).await.unwrap();
-    sink.pre_commit(epoch).await.unwrap();
-    sink.commit_epoch(epoch).await.unwrap();
+    sink.flush().await.unwrap();
 }
 
 /// Read the table back and return its current `(region, total)` rows, sorted.
@@ -746,9 +704,7 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
     let mut cfg = DeltaLakeSinkConfig::new(&path);
     cfg.write_mode = DeltaWriteMode::Upsert;
     cfg.merge_key_columns = vec!["region".to_string()];
-    // Exactly-once buffers the whole epoch and flushes once at commit, so
-    // each epoch's changelog is collapsed together (deterministic).
-    cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
 
     // No explicit schema: the schema (and table) is derived from the first
     // batch, exactly like the production pipeline — exercising the
@@ -758,10 +714,9 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         .await
         .unwrap();
 
-    // Epoch 1: two brand-new groups.
-    run_epoch(
+    // First cut: two brand-new groups.
+    flush_batch(
         &mut sink,
-        1,
         &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
     )
     .await;
@@ -770,10 +725,9 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         vec![("east".into(), 10), ("west".into(), 5)]
     );
 
-    // Epoch 2: update east (retract 10 + insert 30), drop west, add north.
-    run_epoch(
+    // Second cut: update east (retract 10 + insert 30), drop west, add north.
+    flush_batch(
         &mut sink,
-        2,
         &zset_changelog(&[
             ("east", 10, -1),
             ("east", 30, 1),
@@ -787,12 +741,11 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         vec![("east".into(), 30), ("north".into(), 7)]
     );
 
-    // Epoch 3: two consecutive updates to "east" in one epoch. Without
+    // Third cut: two consecutive updates to "east" in one batch. Without
     // collapse this is multiple source rows for one merge key → delta-rs
     // cardinality violation. With collapse it folds to the final value.
-    run_epoch(
+    flush_batch(
         &mut sink,
-        3,
         &zset_changelog(&[
             ("east", 30, -1),
             ("east", 40, 1),
@@ -809,105 +762,13 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
     // The target table never carried the Z-set weight column.
     assert!(sink.schema.as_ref().unwrap().index_of("__weight").is_err());
 
-    // Collapse observability fired across the three epochs.
+    // Collapse observability fired across the three durable flushes.
     let m = sink.sink_metrics();
     assert_eq!(m.collapse_rows_in.get(), 10);
     assert!(m.collapse_deletes_out.get() >= 1, "west was dropped");
     assert!(m.collapse_upserts_out.get() >= 4);
 
     sink.close().await.unwrap();
-}
-
-/// Exactly-once replay: a writer that recovers an already-committed epoch
-/// (from Delta `txn` metadata) and re-applies it must leave the table
-/// byte-for-byte unchanged — no new snapshot, same per-key state.
-#[cfg(feature = "delta-lake")]
-#[tokio::test]
-async fn upsert_replay_of_committed_epoch_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
-    let table_dir = dir.path().join("agg_replay");
-    std::fs::create_dir_all(&table_dir).unwrap();
-    let path = table_dir.to_string_lossy().to_string();
-
-    let mk_cfg = || {
-        let mut cfg = DeltaLakeSinkConfig::new(&path);
-        cfg.write_mode = DeltaWriteMode::Upsert;
-        cfg.merge_key_columns = vec!["region".to_string()];
-        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        // Exactly-once recovery keys off a STABLE writer_id (default is a
-        // random UUID); a restart must reuse it to find its prior epoch.
-        cfg.writer_id = "replay-writer".to_string();
-        cfg
-    };
-    let epoch2 = || {
-        zset_changelog(&[
-            ("east", 10, -1),
-            ("east", 30, 1),
-            ("west", 5, -1),
-            ("north", 7, 1),
-        ])
-    };
-
-    // Writer A commits epochs 1 and 2, then "crashes" (close).
-    let mut sink_a = DeltaLakeSink::new(mk_cfg(), None);
-    sink_a
-        .open(&ConnectorConfig::new("delta-lake"))
-        .await
-        .unwrap();
-    run_epoch(
-        &mut sink_a,
-        1,
-        &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
-    )
-    .await;
-    run_epoch(&mut sink_a, 2, &epoch2()).await;
-    let expected = vec![("east".to_string(), 30), ("north".to_string(), 7)];
-    assert_eq!(read_regions(&path).await, expected);
-    let version_after_2 = sink_a.delta_version();
-    sink_a.close().await.unwrap();
-
-    // Writer B recovers against the same table + writer_id.
-    let mut sink_b = DeltaLakeSink::new(mk_cfg(), None);
-    sink_b
-        .open(&ConnectorConfig::new("delta-lake"))
-        .await
-        .unwrap();
-    assert_eq!(
-        sink_b.last_committed_epoch(),
-        2,
-        "epoch must be recovered from Delta txn metadata"
-    );
-
-    // Replay the already-committed epoch 2: it must be skipped end-to-end.
-    sink_b.begin_epoch(2).await.unwrap();
-    sink_b.write_batch(&epoch2()).await.unwrap();
-    sink_b.pre_commit(2).await.unwrap();
-    sink_b.commit_epoch(2).await.unwrap();
-
-    assert_eq!(
-        read_regions(&path).await,
-        expected,
-        "replay must not change state"
-    );
-    assert_eq!(
-        sink_b.delta_version(),
-        version_after_2,
-        "replayed epoch must not create a new Delta version"
-    );
-
-    // The recovered writer continues normally with a fresh epoch.
-    run_epoch(
-        &mut sink_b,
-        3,
-        &zset_changelog(&[("east", 30, -1), ("east", 55, 1)]),
-    )
-    .await;
-    assert_eq!(
-        read_regions(&path).await,
-        vec![("east".to_string(), 55), ("north".to_string(), 7)]
-    );
-
-    sink_b.close().await.unwrap();
 }
 
 // ── Coordinated-commit (designated-committer) regressions ──
@@ -921,11 +782,31 @@ fn coordinated_config(path: &str) -> DeltaLakeSinkConfig {
     cfg
 }
 
-/// `is_coordinated()` drives the recovery-id selection; it must be true only
-/// for append + exactly-once (the path where the committer, not the writer,
-/// owns the Delta txn id).
+#[cfg(feature = "delta-lake")]
+async fn coordinated_row_count(path: &str) -> usize {
+    let ctx = datafusion::prelude::SessionContext::new();
+    crate::lakehouse::delta_table_provider::register_delta_table(
+        &ctx,
+        "t",
+        path,
+        std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap();
+    ctx.sql("SELECT id FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
+}
+
+/// Exactly-once Delta is admitted only for coordinated append.
 #[test]
-fn coordinated_only_for_append_exactly_once() {
+fn exactly_once_is_coordinated_append_only() {
     let mut cfg = test_config();
     cfg.write_mode = DeltaWriteMode::Append;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
@@ -939,24 +820,36 @@ fn coordinated_only_for_append_exactly_once() {
     let mut cfg = test_config();
     cfg.write_mode = DeltaWriteMode::Upsert;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    assert!(!DeltaLakeSink::new(cfg, None).is_coordinated());
+    let sink = DeltaLakeSink::new(cfg, None);
+    assert!(sink.contract(&ConnectorConfig::new("delta-lake")).is_err());
 }
 
-/// Finding A: a coordinated sink recovering against an already-committed table
-/// must read the committer's txn id, not the (never-committed) `writer_id`. Before
-/// the fix recovery always saw 0 and re-staged sealed epochs into orphan files.
+/// The designated cursor is scoped by pipeline + sink and stores the globally
+/// unique checkpoint id, independently of the writer-local epoch field.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn coordinated_recovery_reads_committer_epoch() {
-    use crate::connector::CoordinatedCommitter;
+async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+        CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_recover");
     std::fs::create_dir_all(&table_dir).unwrap();
     let path = table_dir.to_string_lossy().to_string();
 
-    // Writer stages epoch 1 and 2; the designated committer seals them under
-    // COORDINATED_COMMITTER_ID (nothing is ever committed under "writer-A").
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+
+    // Writer stages epochs 1 and 2; the designated committer advances the
+    // exact checkpoint-id cursor under `namespace`.
     let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     writer
         .open(&ConnectorConfig::new("delta-lake"))
@@ -971,35 +864,138 @@ async fn coordinated_recovery_reads_committer_epoch() {
             .await
             .unwrap()
             .expect("coordinated pre_commit returns a descriptor");
-        writer.commit_epoch(epoch).await.unwrap();
+        let attempt = CheckpointAttempt::new(epoch, 100 + epoch);
         writer
-            .commit_aggregated(epoch, vec![descriptor])
+            .commit_aggregated(CoordinatedCommitBatch {
+                namespace: namespace.clone(),
+                expected_predecessor: if epoch == 1 { 0 } else { 100 + epoch - 1 },
+                target: attempt,
+                entries: vec![CoordinatedCommitPayload {
+                    attempt,
+                    participant_id: 0,
+                    payload: Some(descriptor),
+                }],
+            })
             .await
             .unwrap();
     }
     writer.close().await.unwrap();
 
-    // A fresh writer (same writer_id) recovers from the table. The committer
-    // never used "writer-A", so reading writer_id would yield 0.
+    // A fresh connector reads the exact external cursor independently of its
+    // writer-local preparation lifecycle.
     let mut recovered = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     recovered
         .open(&ConnectorConfig::new("delta-lake"))
         .await
         .unwrap();
     assert_eq!(
-        recovered.last_committed_epoch(),
-        2,
-        "coordinated recovery must read the committer's sealed epoch"
-    );
-
-    // Replaying a sealed epoch must be a no-op: pre_commit returns no descriptor.
-    recovered.begin_epoch(2).await.unwrap();
-    recovered.write_batch(&test_batch(3)).await.unwrap();
-    assert!(
-        recovered.pre_commit(2).await.unwrap().is_none(),
-        "sealed epoch must not re-stage Parquet"
+        recovered.committed_checkpoint_id(&namespace).await.unwrap(),
+        Some(102)
     );
     recovered.close().await.unwrap();
+}
+
+/// A new designated leader may construct its batch before observing a late
+/// commit from the old leader. The fresh external cursor read must filter the
+/// already-published attempt while still publishing the new attempt and
+/// advancing the cursor to the batch target.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+        CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_failover_overlap");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let first_attempt = CheckpointAttempt::new(1, 101);
+    let second_attempt = CheckpointAttempt::new(2, 102);
+
+    let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    writer
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+
+    writer.begin_epoch(1).await.unwrap();
+    writer.write_batch(&test_batch(3)).await.unwrap();
+    let first_descriptor = writer
+        .pre_commit(1)
+        .await
+        .unwrap()
+        .expect("first coordinated descriptor");
+    writer
+        .commit_aggregated(CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: 0,
+            target: first_attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt: first_attempt,
+                participant_id: 0,
+                payload: Some(first_descriptor.clone()),
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(coordinated_row_count(&path).await, 3);
+    assert_eq!(
+        writer.committed_checkpoint_id(&namespace).await.unwrap(),
+        Some(101)
+    );
+
+    writer.begin_epoch(2).await.unwrap();
+    writer.write_batch(&test_batch(2)).await.unwrap();
+    let second_descriptor = writer
+        .pre_commit(2)
+        .await
+        .unwrap()
+        .expect("second coordinated descriptor");
+
+    // Simulate leadership overlap: the replacement leader assembled this
+    // batch before learning that checkpoint 101 had just committed.
+    writer
+        .commit_aggregated(CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: 0,
+            target: second_attempt,
+            entries: vec![
+                CoordinatedCommitPayload {
+                    attempt: first_attempt,
+                    participant_id: 0,
+                    payload: Some(first_descriptor),
+                },
+                CoordinatedCommitPayload {
+                    attempt: second_attempt,
+                    participant_id: 0,
+                    payload: Some(second_descriptor),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        coordinated_row_count(&path).await,
+        5,
+        "the already-committed three-row descriptor must not be appended twice"
+    );
+    assert_eq!(
+        writer.committed_checkpoint_id(&namespace).await.unwrap(),
+        Some(102),
+        "the overlapping batch must still advance the external cursor"
+    );
+    writer.close().await.unwrap();
 }
 
 /// Finding B: the coordinated descriptor write must honor configured Parquet

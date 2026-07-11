@@ -41,17 +41,17 @@ async fn open_with(
     group_demotion: bool,
 ) -> LaminarDB {
     let store = Arc::new(LocalFileSystem::new_with_prefix(state_dir).unwrap());
-    let backend = Arc::new(ObjectStoreBackend::new(store, "node-0", VNODES));
+    let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", VNODES));
     let registry = Arc::new(VnodeRegistry::new(VNODES));
     registry.set_assignment((0..VNODES).map(|_| NodeId(0)).collect::<Vec<_>>().into());
 
     let db = LaminarDB::builder()
         .storage_dir(ckpt)
         .checkpoint(StreamCheckpointConfig {
-            interval_ms: None,      // manual checkpoints
-            incremental_emit: true, // changelog agg + queryable Upsert snapshot
+            interval_ms: None, // manual checkpoints
             ..StreamCheckpointConfig::default()
         })
+        .incremental_emit(true) // changelog agg + queryable Upsert snapshot
         .state_backend(backend)
         .vnode_registry(registry)
         .state_tier_dir(tier_dir)

@@ -51,15 +51,6 @@ pub struct KafkaSinkConfig {
     pub schema_compatibility: Option<CompatibilityLevel>,
     /// Schema Registry SSL CA certificate path.
     pub schema_registry_ssl_ca_location: Option<String>,
-    /// Delivery guarantee level.
-    pub delivery_guarantee: DeliveryGuarantee,
-    /// Transactional ID prefix for exactly-once.
-    ///
-    // TODO(distributed): embed the lease epoch here so a new lease holder
-    // fences the previous one via Kafka's producer epoch.
-    pub transactional_id: Option<String>,
-    /// Transaction timeout.
-    pub transaction_timeout: Duration,
     /// Acknowledgment level.
     pub acks: Acks,
     /// Maximum number of in-flight requests per connection.
@@ -107,7 +98,6 @@ impl std::fmt::Debug for KafkaSinkConfig {
             .field("bootstrap_servers", &self.bootstrap_servers)
             .field("topic", &self.topic)
             .field("format", &self.format)
-            .field("delivery_guarantee", &self.delivery_guarantee)
             .field("security_protocol", &self.security_protocol)
             .field("sasl_mechanism", &self.sasl_mechanism)
             .field("sasl_password", &self.sasl_password.as_ref().map(|_| "***"))
@@ -139,9 +129,6 @@ impl Default for KafkaSinkConfig {
             schema_registry_auth: None,
             schema_compatibility: None,
             schema_registry_ssl_ca_location: None,
-            delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-            transactional_id: None,
-            transaction_timeout: Duration::from_secs(60),
             acks: Acks::All,
             max_in_flight: 5,
             delivery_timeout: Duration::from_secs(120),
@@ -219,23 +206,6 @@ impl KafkaSinkConfig {
         cfg.schema_registry_ssl_ca_location = config
             .get("schema.registry.ssl.ca.location")
             .map(String::from);
-
-        if let Some(dg) = config.get("delivery.guarantee") {
-            cfg.delivery_guarantee = dg.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid delivery.guarantee: '{dg}' (expected 'at-least-once' or 'exactly-once')"
-                ))
-            })?;
-        }
-
-        cfg.transactional_id = config.get("transactional.id").map(String::from);
-
-        if let Some(v) = config.get("transaction.timeout.ms") {
-            let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid transaction.timeout.ms: '{v}'"))
-            })?;
-            cfg.transaction_timeout = Duration::from_millis(ms);
-        }
 
         if let Some(a) = config.get("acks") {
             cfg.acks = a.parse().map_err(|_| {
@@ -399,19 +369,12 @@ impl KafkaSinkConfig {
             ));
         }
 
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce && self.max_in_flight > 5 {
-            return Err(ConnectorError::ConfigurationError(
-                "exactly-once requires max.in.flight.requests <= 5".into(),
-            ));
-        }
-
         Ok(())
     }
 
     /// Builds an rdkafka [`ClientConfig`] from this configuration.
     ///
-    /// Always sets `enable.idempotence=true`. For exactly-once delivery,
-    /// also sets `transactional.id` and `transaction.timeout.ms`.
+    /// Always sets `enable.idempotence=true` for durable at-least-once writes.
     #[must_use]
     pub fn to_rdkafka_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
@@ -447,17 +410,6 @@ impl KafkaSinkConfig {
             config.set("ssl.key.password", key_pass);
         }
 
-        // librdkafka rejects a transactional producer whose
-        // message.timeout.ms exceeds transaction.timeout.ms (a message
-        // outliving its transaction could never commit) — and the
-        // defaults conflict (delivery 120s > transaction 60s), so an
-        // unclamped exactly-once config fails producer creation.
-        let message_timeout = if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            self.delivery_timeout.min(self.transaction_timeout)
-        } else {
-            self.delivery_timeout
-        };
-
         config
             .set("enable.idempotence", "true")
             .set("acks", self.acks.as_rdkafka_str())
@@ -470,23 +422,11 @@ impl KafkaSinkConfig {
             )
             .set(
                 "message.timeout.ms",
-                message_timeout.as_millis().to_string(),
+                self.delivery_timeout.as_millis().to_string(),
             );
 
         if let Some(num_msgs) = self.batch_num_messages {
             config.set("batch.num.messages", num_msgs.to_string());
-        }
-
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let txn_id = self
-                .transactional_id
-                .clone()
-                .unwrap_or_else(|| format!("laminardb-sink-{}", self.topic));
-            config.set("transactional.id", txn_id);
-            config.set(
-                "transaction.timeout.ms",
-                self.transaction_timeout.as_millis().to_string(),
-            );
         }
 
         // Apply pass-through properties, blocking security-critical keys
@@ -500,30 +440,6 @@ impl KafkaSinkConfig {
                 continue;
             }
             config.set(key, value);
-        }
-
-        // Re-apply the transactional invariant AFTER pass-throughs: a
-        // user override of either timeout must not reintroduce
-        // message.timeout.ms > transaction.timeout.ms, which librdkafka
-        // rejects at producer creation.
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let get_ms = |cfg: &ClientConfig, key: &str| -> Option<u64> {
-                cfg.get(key).and_then(|v| v.parse().ok())
-            };
-            if let (Some(msg), Some(txn)) = (
-                get_ms(&config, "message.timeout.ms"),
-                get_ms(&config, "transaction.timeout.ms"),
-            ) {
-                if msg > txn {
-                    tracing::warn!(
-                        msg,
-                        txn,
-                        "clamping message.timeout.ms to transaction.timeout.ms \
-                         (librdkafka rejects transactional producers otherwise)"
-                    );
-                    config.set("message.timeout.ms", txn.to_string());
-                }
-            }
         }
 
         config
@@ -588,8 +504,6 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "transactional.id"
         )
 }
-
-pub use crate::connector::DeliveryGuarantee;
 
 /// Partitioning strategy for distributing records across Kafka partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,7 +625,6 @@ mod tests {
         let cfg = KafkaSinkConfig::from_config(&config).unwrap();
         assert_eq!(cfg.bootstrap_servers, "localhost:9092");
         assert_eq!(cfg.topic, "output-events");
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
         assert_eq!(cfg.format, Format::Json);
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
     }
@@ -726,15 +639,6 @@ mod tests {
     fn test_missing_topic() {
         let config = make_config(&[("bootstrap.servers", "b:9092")]);
         assert!(KafkaSinkConfig::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_parse_delivery_guarantee() {
-        let mut pairs = required_pairs();
-        pairs.push(("delivery.guarantee", "exactly-once"));
-        let config = make_config(&pairs);
-        let cfg = KafkaSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
     }
 
     #[test]
@@ -788,9 +692,6 @@ mod tests {
         let mut pairs = required_pairs();
         pairs.extend_from_slice(&[
             ("format", "avro"),
-            ("delivery.guarantee", "exactly-once"),
-            ("transactional.id", "my-txn"),
-            ("transaction.timeout.ms", "30000"),
             ("key.column", "order_id"),
             ("partitioner", "round-robin"),
             ("linger.ms", "10"),
@@ -811,9 +712,6 @@ mod tests {
         let cfg = KafkaSinkConfig::from_config(&config).unwrap();
 
         assert_eq!(cfg.format, Format::Avro);
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
-        assert_eq!(cfg.transactional_id.as_deref(), Some("my-txn"));
-        assert_eq!(cfg.transaction_timeout, Duration::from_secs(30));
         assert_eq!(cfg.key_column.as_deref(), Some("order_id"));
         assert_eq!(cfg.partitioner, PartitionStrategy::RoundRobin);
         assert_eq!(cfg.linger_ms, 10);
@@ -839,16 +737,6 @@ mod tests {
         cfg.bootstrap_servers = "b:9092".into();
         cfg.topic = "t".into();
         cfg.format = Format::Avro;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_exactly_once_max_in_flight() {
-        let mut cfg = KafkaSinkConfig::default();
-        cfg.bootstrap_servers = "b:9092".into();
-        cfg.topic = "t".into();
-        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        cfg.max_in_flight = 10;
         assert!(cfg.validate().is_err());
     }
 
@@ -882,22 +770,6 @@ mod tests {
         assert_eq!(rdk.get("enable.idempotence"), Some("true"));
         assert!(rdk.get("transactional.id").is_none());
         assert_eq!(rdk.get("security.protocol"), Some("plaintext"));
-    }
-
-    #[test]
-    fn test_rdkafka_config_exactly_once() {
-        let mut cfg = KafkaSinkConfig::default();
-        cfg.bootstrap_servers = "b:9092".into();
-        cfg.topic = "t".into();
-        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let rdk = cfg.to_rdkafka_config();
-        assert_eq!(rdk.get("enable.idempotence"), Some("true"));
-        assert!(rdk.get("transactional.id").is_some());
-        // librdkafka rejects message.timeout.ms > transaction.timeout.ms;
-        // the default 120s delivery timeout must clamp to the 60s
-        // transaction timeout or producer creation fails outright.
-        assert_eq!(rdk.get("message.timeout.ms"), Some("60000"));
-        assert_eq!(rdk.get("transaction.timeout.ms"), Some("60000"));
     }
 
     #[test]
@@ -946,7 +818,6 @@ mod tests {
     #[test]
     fn test_defaults() {
         let cfg = KafkaSinkConfig::default();
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
         assert_eq!(cfg.partitioner, PartitionStrategy::KeyHash);
         assert_eq!(cfg.compression, CompressionType::None);
         assert_eq!(cfg.acks, Acks::All);
@@ -961,8 +832,6 @@ mod tests {
 
     #[test]
     fn test_enum_display() {
-        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
-        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
         assert_eq!(PartitionStrategy::KeyHash.to_string(), "key-hash");
         assert_eq!(PartitionStrategy::RoundRobin.to_string(), "round-robin");
         assert_eq!(PartitionStrategy::Sticky.to_string(), "sticky");
@@ -972,14 +841,6 @@ mod tests {
 
     #[test]
     fn test_enum_parse() {
-        assert_eq!(
-            "at-least-once".parse::<DeliveryGuarantee>().unwrap(),
-            DeliveryGuarantee::AtLeastOnce
-        );
-        assert_eq!(
-            "exactly-once".parse::<DeliveryGuarantee>().unwrap(),
-            DeliveryGuarantee::ExactlyOnce
-        );
         assert_eq!(
             "key-hash".parse::<PartitionStrategy>().unwrap(),
             PartitionStrategy::KeyHash

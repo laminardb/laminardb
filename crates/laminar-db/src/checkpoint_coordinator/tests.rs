@@ -1,23 +1,72 @@
 use super::*;
 use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
-async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
-    let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
-    CheckpointCoordinator::new(CheckpointConfig::default(), store)
+fn at_least_once_sink_contract() -> laminar_connectors::connector::SinkContract {
+    laminar_connectors::connector::SinkContract::new(
+        laminar_connectors::connector::SinkConsistency::DurableAtLeastOnce,
+        laminar_connectors::connector::SinkTopology::MultiWriter,
+        laminar_connectors::connector::SinkInputMode::AppendOnly,
+    )
+}
+
+fn checkpoint_committable_sink_contract() -> laminar_connectors::connector::SinkContract {
+    laminar_connectors::connector::SinkContract::new(
+        laminar_connectors::connector::SinkConsistency::CheckpointCommittable,
+        laminar_connectors::connector::SinkTopology::MultiWriter,
+        laminar_connectors::connector::SinkInputMode::AppendOnly,
+    )
+}
+
+fn in_memory_decision_store() -> Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore> {
+    Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    )
+}
+
+async fn bind_in_memory_decision_store(coord: &mut CheckpointCoordinator) {
+    let store = in_memory_decision_store();
+    let deployment_id = store.load_or_create_deployment_id().await.unwrap();
+    coord.set_decision_store(store).unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
+}
+
+async fn make_coordinator_with_decision_store(
+    dir: &std::path::Path,
+) -> (
+    CheckpointCoordinator,
+    Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+) {
+    let store = Box::new(FileSystemCheckpointStore::new(dir));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
-        .unwrap()
+        .unwrap();
+    let decision_store = in_memory_decision_store();
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
+    (coord, decision_store)
+}
+
+async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
+    make_coordinator_with_decision_store(dir).await.0
 }
 
 /// Coordinator whose restorable gate gives up quickly — for tests
 /// that exercise a gate *miss* (the default 30s poll would stall
 /// the suite).
 async fn make_coordinator_with_fast_gate(dir: &std::path::Path) -> CheckpointCoordinator {
-    let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir));
     let config = CheckpointConfig {
         restorable_gate_timeout: Duration::from_millis(250),
         ..CheckpointConfig::default()
     };
-    CheckpointCoordinator::new(config, store).await.unwrap()
+    let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
+    coord
 }
 
 #[tokio::test]
@@ -26,8 +75,27 @@ async fn test_coordinator_new() {
     let coord = make_coordinator(dir.path()).await;
 
     assert_eq!(coord.epoch(), 1);
-    assert_eq!(coord.next_checkpoint_id(), 1);
     assert_eq!(coord.phase(), CheckpointPhase::Idle);
+}
+
+#[tokio::test]
+async fn retention_requests_coalesce_into_one_owned_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend: Arc<dyn StateBackend> = Arc::new(laminar_core::state::InProcessBackend::new(1));
+    let decision_store = coord.decision_store.clone();
+
+    for horizon in 1..=32 {
+        coord.schedule_retention_prune(
+            Some(Arc::clone(&backend)),
+            decision_store.clone(),
+            horizon,
+            horizon + 3,
+        );
+    }
+
+    assert_eq!(coord.retention_requested_horizon, 32);
+    assert_eq!(coord.maintenance_tasks.len(), 1);
 }
 
 #[tokio::test]
@@ -35,14 +103,14 @@ async fn test_coordinator_resumes_from_stored_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
 
     // Save a checkpoint manually
-    let store = FileSystemCheckpointStore::new(dir.path(), 3);
+    let store = FileSystemCheckpointStore::new(dir.path());
     let m = CheckpointManifest::new(5, 10);
     store.save(&m).await.unwrap();
 
-    // Coordinator should resume from epoch 11, checkpoint_id 6
+    // Manifest history seeds the local epoch. Durable decision-store reservations independently
+    // own checkpoint ID continuity.
     let coord = make_coordinator(dir.path()).await;
     assert_eq!(coord.epoch(), 11);
-    assert_eq!(coord.next_checkpoint_id(), 6);
 }
 
 #[test]
@@ -51,31 +119,43 @@ fn test_checkpoint_phase_display() {
     assert_eq!(CheckpointPhase::Snapshotting.to_string(), "Snapshotting");
     assert_eq!(CheckpointPhase::PreCommitting.to_string(), "PreCommitting");
     assert_eq!(CheckpointPhase::Persisting.to_string(), "Persisting");
-    assert_eq!(CheckpointPhase::Committing.to_string(), "Committing");
+    assert_eq!(CheckpointPhase::Deciding.to_string(), "Deciding");
 }
 
 #[test]
 fn test_source_to_connector_checkpoint() {
-    let mut cp = SourceCheckpoint::new(5);
+    let mut cp = SourceCheckpoint::new();
     cp.set_offset("partition-0", "1234");
     cp.set_metadata("topic", "events");
 
     let cc = source_to_connector_checkpoint(&cp);
-    assert_eq!(cc.epoch, 5);
     assert_eq!(cc.offsets.get("partition-0"), Some(&"1234".into()));
     assert_eq!(cc.metadata.get("topic"), Some(&"events".into()));
+}
+
+#[test]
+fn persistent_source_offset_materializes_at_durable_conversion() {
+    let mut inventory = laminar_connectors::checkpoint::PersistentOffset::new("[", ",", "]");
+    inventory.push_fragment(r#""a.csv""#);
+    inventory.push_fragment(r#""b.csv""#);
+    let mut source = SourceCheckpoint::new();
+    source.set_persistent_offset("manifest", inventory);
+
+    let durable = source_to_connector_checkpoint(&source);
+    assert_eq!(
+        durable.offsets.get("manifest").map(String::as_str),
+        Some(r#"["a.csv","b.csv"]"#)
+    );
 }
 
 #[test]
 fn test_connector_to_source_checkpoint() {
     let cc = ConnectorCheckpoint {
         offsets: HashMap::from([("lsn".into(), "0/ABCD".into())]),
-        epoch: 3,
         metadata: HashMap::from([("type".into(), "postgres".into())]),
     };
 
     let cp = connector_to_source_checkpoint(&cc);
-    assert_eq!(cp.epoch(), 3);
     assert_eq!(cp.get_offset("lsn"), Some("0/ABCD"));
     assert_eq!(cp.get_metadata("type"), Some("postgres"));
 }
@@ -134,6 +214,29 @@ async fn test_checkpoint_no_sources_no_sinks() {
     let stats = coord.stats();
     assert_eq!(stats.completed, 2);
     assert_eq!(stats.failed, 0);
+}
+
+#[tokio::test]
+async fn checkpoint_without_decision_store_fails_before_epoch_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+
+    let error = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("checkpoint ID allocation requires a durable decision store"));
+    assert_eq!(
+        coord.epoch(),
+        1,
+        "failed reservation must not burn an epoch"
+    );
+    assert!(coord.store().list_ids().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -321,17 +424,17 @@ fn test_histogram_wraps_ring_buffer() {
 #[tokio::test]
 async fn test_sidecar_round_trip() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-    let config = CheckpointConfig {
-        state_inline_threshold: 100, // 100 bytes threshold
-        ..CheckpointConfig::default()
-    };
-    let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
 
     // Small state stays inline, large state goes to sidecar
     let mut ops = HashMap::new();
     ops.insert("small".into(), bytes::Bytes::from(vec![0xAAu8; 50]));
-    ops.insert("large".into(), bytes::Bytes::from(vec![0xBBu8; 200]));
+    let large_len = STATE_INLINE_THRESHOLD + 1;
+    ops.insert("large".into(), bytes::Bytes::from(vec![0xBBu8; large_len]));
 
     let result = coord
         .checkpoint(CheckpointRequest {
@@ -350,20 +453,21 @@ async fn test_sidecar_round_trip() {
 
     let large_op = loaded.operator_states.get("large").unwrap();
     assert!(large_op.external, "large state should be external");
-    assert_eq!(large_op.external_length, 200);
+    assert_eq!(large_op.external_length, large_len as u64);
 
     // Verify sidecar file exists and has correct data
     let state_data = coord.store().load_state_data(1).await.unwrap().unwrap();
-    assert_eq!(state_data.len(), 200);
+    assert_eq!(state_data.len(), large_len);
     assert!(state_data.iter().all(|&b| b == 0xBB));
 }
 
 #[tokio::test]
 async fn test_all_inline_no_sidecar() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let config = CheckpointConfig::default(); // 1MB threshold
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
 
     let mut ops = HashMap::new();
     ops.insert("op1".into(), bytes::Bytes::from_static(b"small-state"));
@@ -412,53 +516,13 @@ async fn bridge_writes_markers_and_gate_passes() {
         .unwrap();
     assert!(result.success, "bridge writes markers → gate passes");
     // Every owned vnode has a marker for the completed epoch.
+    let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
     for v in 0..4 {
         assert!(
-            backend.read_partial(v, 1).await.unwrap().is_some(),
+            backend.read_partial(attempt, v).await.unwrap().is_some(),
             "bridge should have written marker for vnode {v}",
         );
     }
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn reconcile_announces_abort_when_no_decision_store() {
-    // Fallback path: if no decision store is wired (e.g. legacy
-    // deployments), absence of a marker == Abort. This is the
-    // pre-decision-store behavior preserved for compatibility.
-    use laminar_core::cluster::control::{
-        BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
-    };
-    use laminar_core::cluster::discovery::NodeId;
-    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
-    use tokio::sync::watch;
-
-    let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-    let mut orphan = CheckpointManifest::new(42, 7);
-    orphan
-        .sink_commit_statuses
-        .insert("kafka_out".into(), SinkCommitStatus::Pending);
-    store.save_with_state(&orphan, None).await.unwrap();
-
-    let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
-    let self_id = NodeId(1);
-    let kv = Arc::new(InMemoryKv::new(self_id));
-    let kv_trait: Arc<dyn ClusterKv> = kv.clone();
-    let (_tx, rx) = watch::channel(Vec::new());
-    let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
-    let mut coord = coord;
-    coord.set_cluster_controller(controller);
-
-    coord.reconcile_prepared_on_init().await;
-
-    let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
-    let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
-    assert_eq!(ann.phase, Phase::Abort);
-    assert_eq!(ann.epoch, 7);
-    assert_eq!(ann.checkpoint_id, 42);
 }
 
 #[cfg(feature = "cluster")]
@@ -469,23 +533,20 @@ async fn reconcile_announces_commit_when_marker_present() {
         Phase, ANNOUNCEMENT_KEY,
     };
     use laminar_core::cluster::discovery::NodeId;
-    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
     use object_store::local::LocalFileSystem;
     use tokio::sync::watch;
 
     let ckpt_dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
-    let mut orphan = CheckpointManifest::new(42, 7);
-    orphan
-        .sink_commit_statuses
-        .insert("kafka_out".into(), SinkCommitStatus::Pending);
-    store.save_with_state(&orphan, None).await.unwrap();
-
+    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()));
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
     let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
-    decision_store.record_committed(7).await.unwrap();
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let mut orphan = CheckpointManifest::new(42, 7);
+    orphan.deployment_id.clone_from(&deployment_id);
+    store.save_with_state(&orphan, None).await.unwrap();
+    decision_store.record_committed(7, 42).await.unwrap();
 
     let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
@@ -497,9 +558,9 @@ async fn reconcile_announces_commit_when_marker_present() {
     let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
     let mut coord = coord;
     coord.set_cluster_controller(controller);
-    coord.set_decision_store(decision_store);
+    coord.set_decision_store(decision_store).unwrap();
 
-    coord.reconcile_prepared_on_init().await;
+    coord.reconcile_prepared_on_init().await.unwrap();
 
     let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
     let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
@@ -518,22 +579,19 @@ async fn reconcile_announces_abort_when_marker_missing() {
         Phase, ANNOUNCEMENT_KEY,
     };
     use laminar_core::cluster::discovery::NodeId;
-    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
     use object_store::local::LocalFileSystem;
     use tokio::sync::watch;
 
     let ckpt_dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
-    let mut orphan = CheckpointManifest::new(11, 3);
-    orphan
-        .sink_commit_statuses
-        .insert("out".into(), SinkCommitStatus::Pending);
-    store.save_with_state(&orphan, None).await.unwrap();
-
+    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()));
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
     let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let mut orphan = CheckpointManifest::new(11, 3);
+    orphan.deployment_id.clone_from(&deployment_id);
+    store.save_with_state(&orphan, None).await.unwrap();
 
     let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
@@ -545,49 +603,14 @@ async fn reconcile_announces_abort_when_marker_missing() {
     let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
     let mut coord = coord;
     coord.set_cluster_controller(controller);
-    coord.set_decision_store(decision_store);
+    coord.set_decision_store(decision_store).unwrap();
 
-    coord.reconcile_prepared_on_init().await;
+    coord.reconcile_prepared_on_init().await.unwrap();
 
     let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
     let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
     assert_eq!(ann.phase, Phase::Abort);
     assert_eq!(ann.epoch, 3);
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn reconcile_silent_when_manifest_clean() {
-    use laminar_core::cluster::control::{
-        ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
-    };
-    use laminar_core::cluster::discovery::NodeId;
-    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
-    use tokio::sync::watch;
-
-    let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-    let mut clean = CheckpointManifest::new(5, 3);
-    clean
-        .sink_commit_statuses
-        .insert("out".into(), SinkCommitStatus::Committed);
-    store.save_with_state(&clean, None).await.unwrap();
-
-    let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
-    let self_id = NodeId(1);
-    let kv = Arc::new(InMemoryKv::new(self_id));
-    let kv_trait: Arc<dyn ClusterKv> = kv.clone();
-    let (_tx, rx) = watch::channel(Vec::new());
-    let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
-    let mut coord = coord;
-    coord.set_cluster_controller(controller);
-
-    coord.reconcile_prepared_on_init().await;
-
-    // No announcement emitted.
-    assert!(kv.read_from(self_id, ANNOUNCEMENT_KEY).await.is_none());
 }
 
 #[cfg(feature = "cluster")]
@@ -601,7 +624,8 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let (mut coord, decision_store) = make_coordinator_with_decision_store(dir.path()).await;
+    decision_store.record_committed(1, 1).await.unwrap();
 
     let leader_id = NodeId(1);
     let follower_id = NodeId(7);
@@ -670,6 +694,108 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     // Follower's manifest is on disk at the leader's epoch.
     let stored = coord.store().load_latest().await.unwrap().unwrap();
     assert_eq!(stored.epoch, 1);
+}
+
+#[cfg(feature = "cluster")]
+fn follower_decision_controller() -> (
+    Arc<laminar_core::cluster::control::ClusterController>,
+    Arc<laminar_core::cluster::control::InMemoryKv>,
+    laminar_core::cluster::discovery::NodeId,
+) {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+    use tokio::sync::watch;
+
+    let leader_id = NodeId(1);
+    let follower_id = NodeId(7);
+    let kv = Arc::new(InMemoryKv::new(follower_id));
+    let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+    let leader_info = NodeInfo {
+        id: leader_id,
+        name: "leader".into(),
+        rpc_address: String::new(),
+        raft_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    };
+    let (_tx, rx) = watch::channel(vec![leader_info]);
+    (
+        Arc::new(ClusterController::new(follower_id, kv_trait, None, rx)),
+        kv,
+        leader_id,
+    )
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
+    use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+    let (controller, kv, leader_id) = follower_decision_controller();
+    let decision_store = in_memory_decision_store();
+    decision_store.load_or_create_deployment_id().await.unwrap();
+    let prepare = serde_json::to_string(&BarrierAnnouncement {
+        epoch: 12,
+        checkpoint_id: 34,
+        phase: Phase::Prepare,
+        flags: 0,
+        min_watermark_ms: None,
+    })
+    .unwrap();
+    kv.seed(leader_id, ANNOUNCEMENT_KEY, prepare);
+
+    let writer = Arc::clone(&decision_store);
+    let record = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        writer.record_committed(12, 34).await.unwrap();
+    });
+    let committed = CheckpointCoordinator::await_follower_decision(
+        &controller,
+        Some(decision_store.as_ref()),
+        12,
+        34,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    record.await.unwrap();
+
+    assert!(
+        committed,
+        "the exact durable marker must commit even when control remains at Prepare"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn exact_decision_wins_over_abort_announcement() {
+    use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+    let (controller, kv, leader_id) = follower_decision_controller();
+    let decision_store = in_memory_decision_store();
+    decision_store.record_committed(21, 55).await.unwrap();
+    let abort = serde_json::to_string(&BarrierAnnouncement {
+        epoch: 21,
+        checkpoint_id: 55,
+        phase: Phase::Abort,
+        flags: 0,
+        min_watermark_ms: None,
+    })
+    .unwrap();
+    kv.seed(leader_id, ANNOUNCEMENT_KEY, abort);
+
+    let committed = CheckpointCoordinator::await_follower_decision(
+        &controller,
+        Some(decision_store.as_ref()),
+        21,
+        55,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert!(committed, "Abort cannot override an exact durable decision");
 }
 
 #[cfg(feature = "cluster")]
@@ -758,6 +884,188 @@ impl laminar_core::cluster::control::ClusterKv for RecordingKv {
     ) -> Vec<(laminar_core::cluster::discovery::NodeId, String, String)> {
         self.inner.scan_prefix(prefix).await
     }
+}
+
+/// Object-store middleware that transfers the watched lease immediately after a checkpoint
+/// decision create lands. It makes the decision/lease TOCTOU deterministic for the coordinator
+/// test below.
+#[cfg(feature = "cluster")]
+struct LeaseDroppingObjectStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    lease_tx: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
+}
+
+#[cfg(feature = "cluster")]
+impl std::fmt::Debug for LeaseDroppingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseDroppingObjectStore")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl std::fmt::Display for LeaseDroppingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LeaseDroppingObjectStore")
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl object_store::ObjectStore for LeaseDroppingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let result = self.inner.put_opts(location, payload, opts).await;
+        if result.is_ok() && location.as_ref().starts_with("checkpoint-decisions/epoch=") {
+            self.lease_tx
+                .send_replace(Some(laminar_core::cluster::control::LeaderLease {
+                    seq: 2,
+                    token: 2,
+                    owner: laminar_core::cluster::discovery::NodeId(2),
+                    expires_at_ms: i64::MAX,
+                }));
+        }
+        result
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn leader_loss_after_durable_decision_never_finalizes_or_reports_success() {
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, LeaderLease, Phase,
+        ANNOUNCEMENT_KEY,
+    };
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let store = Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, members_rx));
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(Some(LeaderLease {
+        seq: 1,
+        token: 1,
+        owner: self_id,
+        expires_at_ms: i64::MAX,
+    }));
+    controller.set_leader_lease_watch(lease_rx);
+    coord.set_cluster_controller(controller);
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
+            LeaseDroppingObjectStore {
+                inner: backing,
+                lease_tx,
+            },
+        )),
+    );
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
+
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(!result.success, "a stale leader must not report completion");
+    assert!(
+        result.error.as_deref().is_some_and(|error| {
+            error.contains("[LDB-6054]") && error.contains("manifest finalization")
+        }),
+        "unexpected result: {result:?}"
+    );
+
+    assert_eq!(
+        decision_store
+            .decision(result.epoch)
+            .await
+            .unwrap()
+            .unwrap()
+            .checkpoint_id,
+        result.checkpoint_id,
+        "the test transfers the lease only after the decision is durable"
+    );
+    let manifest = coord
+        .store()
+        .load_by_id(result.checkpoint_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.durable_phase, DurableCheckpointPhase::Prepared);
+    assert_eq!(coord.stats().completed, 0);
+
+    let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+    let announcement: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        announcement.phase,
+        Phase::Aligned,
+        "the stale task must publish neither Commit nor Abort after observing lease loss"
+    );
 }
 
 /// Two-level completion: the leader must announce `Aligned`
@@ -886,11 +1194,16 @@ async fn leader_publishes_cluster_min_watermark_to_controller() {
 
     let dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
 
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    coord.set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)));
+    coord
+        .set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)))
+        .unwrap();
 
     let self_id = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(self_id));
@@ -946,11 +1259,16 @@ async fn leader_announces_prepare_and_commit_on_solo_cluster() {
 
     let dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
 
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    coord.set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)));
+    coord
+        .set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)))
+        .unwrap();
 
     let self_id = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(self_id));
@@ -1021,32 +1339,45 @@ async fn source_offset_handoff_round_trip() {
     let mut source_offsets = HashMap::new();
     source_offsets.insert(
         "kafka".to_string(),
-        ConnectorCheckpoint::with_offsets(
-            5,
-            HashMap::from([("events-0".to_string(), "100".to_string())]),
-        ),
+        ConnectorCheckpoint::with_offsets(HashMap::from([(
+            "events-0".to_string(),
+            "100".to_string(),
+        )])),
     );
+    let attempt = CheckpointAttempt::new(5, 5);
     coord
-        .persist_source_offset_handoff(5, &source_offsets)
+        .persist_source_offset_handoff(attempt, &source_offsets)
         .await
         .unwrap();
 
     // Seal epoch 5 so it becomes the latest committed epoch.
     for v in 0u32..4 {
         backend
-            .write_partial(v, 5, 1, Bytes::from_static(b"x"))
+            .write_partial(attempt, v, 1, Bytes::from_static(b"x"))
             .await
             .unwrap();
     }
-    assert!(backend.epoch_complete(5, &[0, 1, 2, 3], &[]).await.unwrap());
+    assert!(backend
+        .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[])
+        .await
+        .unwrap());
 
     // A node acquiring events-0 on rotation recovers the committed offset.
-    let acquired = coord.acquired_source_offsets().await.unwrap();
-    assert_eq!(acquired.get("events-0"), Some(&"100".to_string()));
+    let (acquired_attempt, acquired) = coord
+        .acquired_source_handoff()
+        .await
+        .unwrap()
+        .expect("sealed handoff");
+    assert_eq!(acquired_attempt, attempt);
+    assert_eq!(
+        acquired.get("kafka").and_then(|m| m.get("events-0")),
+        Some(&"100".to_string())
+    );
 }
 
 /// Recovery must read the handoff at the epoch it restored to, not the latest, or a coordinated
 /// recovery to an earlier epoch would resume re-acquired partitions past what it recovered.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn source_offsets_at_reads_the_requested_epoch() {
     use bytes::Bytes;
@@ -1060,37 +1391,56 @@ async fn source_offsets_at_reads_the_requested_epoch() {
     let handoff = |off: &str| {
         HashMap::from([(
             "kafka".to_string(),
-            ConnectorCheckpoint::with_offsets(
-                0,
-                HashMap::from([("events-0".to_string(), off.to_string())]),
-            ),
+            ConnectorCheckpoint::with_offsets(HashMap::from([(
+                "events-0".to_string(),
+                off.to_string(),
+            )])),
         )])
     };
+    let attempt5 = CheckpointAttempt::new(5, 5);
+    let attempt8 = CheckpointAttempt::new(8, 8);
     coord
-        .persist_source_offset_handoff(5, &handoff("100"))
+        .persist_source_offset_handoff(attempt5, &handoff("100"))
         .await
         .unwrap();
     coord
-        .persist_source_offset_handoff(8, &handoff("200"))
+        .persist_source_offset_handoff(attempt8, &handoff("200"))
         .await
         .unwrap();
-    for e in [5u64, 8] {
+    for attempt in [attempt5, attempt8] {
         for v in 0u32..4 {
             backend
-                .write_partial(v, e, 1, Bytes::from_static(b"x"))
+                .write_partial(attempt, v, 1, Bytes::from_static(b"x"))
                 .await
                 .unwrap();
         }
-        assert!(backend.epoch_complete(e, &[0, 1, 2, 3], &[]).await.unwrap());
+        assert!(backend
+            .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[])
+            .await
+            .unwrap());
     }
 
     // Latest picks the newest; an epoch-scoped read pins the exact recovered cut.
-    let latest = coord.acquired_source_offsets().await.unwrap();
-    assert_eq!(latest.get("events-0"), Some(&"200".to_string()));
-    let at5 = coord.source_offsets_at(5).await.unwrap();
-    assert_eq!(at5.get("events-0"), Some(&"100".to_string()));
-    let at8 = coord.source_offsets_at(8).await.unwrap();
-    assert_eq!(at8.get("events-0"), Some(&"200".to_string()));
+    let (latest_attempt, latest) = coord
+        .acquired_source_handoff()
+        .await
+        .unwrap()
+        .expect("latest sealed handoff");
+    assert_eq!(latest_attempt, attempt8);
+    assert_eq!(
+        latest.get("kafka").and_then(|m| m.get("events-0")),
+        Some(&"200".to_string())
+    );
+    let at5 = coord.source_offsets_at(attempt5).await.unwrap();
+    assert_eq!(
+        at5.get("kafka").and_then(|m| m.get("events-0")),
+        Some(&"100".to_string())
+    );
+    let at8 = coord.source_offsets_at(attempt8).await.unwrap();
+    assert_eq!(
+        at8.get("kafka").and_then(|m| m.get("events-0")),
+        Some(&"200".to_string())
+    );
 }
 
 /// Followers ack at capture and upload partials
@@ -1106,19 +1456,20 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
     // Leader's own partials are present; the "follower's" vnodes
     // {2, 3} land only after a delay, simulating its background
     // upload completing while the leader polls.
+    let attempt = CheckpointAttempt::new(1, 1);
     backend
-        .write_partial(0, 1, 0, Bytes::from_static(b"leader"))
+        .write_partial(attempt, 0, 0, Bytes::from_static(b"leader"))
         .await
         .unwrap();
     backend
-        .write_partial(1, 1, 0, Bytes::from_static(b"leader"))
+        .write_partial(attempt, 1, 0, Bytes::from_static(b"leader"))
         .await
         .unwrap();
     let late = Arc::clone(&backend);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         for v in [2u32, 3] {
-            late.write_partial(v, 1, 0, Bytes::from_static(b"follower"))
+            late.write_partial(attempt, v, 0, Bytes::from_static(b"follower"))
                 .await
                 .unwrap();
         }
@@ -1129,7 +1480,7 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
 
     let start = std::time::Instant::now();
     coord
-        .await_restorable_gate(1, &[])
+        .await_restorable_gate(attempt, &[])
         .await
         .expect("gate must seal once the late partials land");
     assert!(
@@ -1150,12 +1501,13 @@ async fn gate_passes_when_all_registry_markers_present() {
     let backend = Arc::new(InProcessBackend::new(4));
     // Simulate the follower's prior write on vnodes {2, 3} for the
     // epoch the leader is about to use (fresh store starts at 1).
+    let attempt = CheckpointAttempt::new(1, 1);
     backend
-        .write_partial(2, 1, 0, Bytes::from_static(b"follower"))
+        .write_partial(attempt, 2, 0, Bytes::from_static(b"follower"))
         .await
         .unwrap();
     backend
-        .write_partial(3, 1, 0, Bytes::from_static(b"follower"))
+        .write_partial(attempt, 3, 0, Bytes::from_static(b"follower"))
         .await
         .unwrap();
     coord.set_state_backend(backend);
@@ -1204,8 +1556,9 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         max_retained: 2, // reference age cap = 2 epochs
         ..CheckpointConfig::default()
     };
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
     let backend = Arc::new(InProcessBackend::new(2));
     coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
     coord.set_vnode_set(vec![0]);
@@ -1226,11 +1579,12 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r1.success);
+    let a1 = CheckpointAttempt::new(r1.epoch, r1.checkpoint_id);
     let p1 = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, r1.epoch).await.unwrap().unwrap(),
+        &backend.read_partial(a1, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p1.base_epoch, None, "first upload must be full");
+    assert_eq!(p1.base, None, "first upload must be full");
     assert!(!p1.operators.is_empty());
 
     // Epoch 2: identical slices → reference to epoch 1.
@@ -1240,15 +1594,12 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r2.success);
+    let a2 = CheckpointAttempt::new(r2.epoch, r2.checkpoint_id);
     let p2 = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, r2.epoch).await.unwrap().unwrap(),
+        &backend.read_partial(a2, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        p2.base_epoch,
-        Some(r1.epoch),
-        "unchanged slice must reference its base"
-    );
+    assert_eq!(p2.base, Some(a1), "unchanged slice must reference its base");
     assert!(p2.operators.is_empty());
 
     // Epoch 3: still identical, but the base would hit the age cap —
@@ -1259,12 +1610,13 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r3.success);
+    let a3 = CheckpointAttempt::new(r3.epoch, r3.checkpoint_id);
     let p3 = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, r3.epoch).await.unwrap().unwrap(),
+        &backend.read_partial(a3, 0).await.unwrap().unwrap(),
     )
     .unwrap();
     assert_eq!(
-        p3.base_epoch, None,
+        p3.base, None,
         "reference age cap must force a full re-upload",
     );
 
@@ -1282,11 +1634,12 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r4.success);
+    let a4 = CheckpointAttempt::new(r4.epoch, r4.checkpoint_id);
     let p4 = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, r4.epoch).await.unwrap().unwrap(),
+        &backend.read_partial(a4, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p4.base_epoch, None);
+    assert_eq!(p4.base, None);
     assert!(!p4.operators.is_empty());
 }
 
@@ -1311,8 +1664,9 @@ async fn cold_slice_references_then_tier_fetch_on_forced_full() {
         max_retained: 2, // reference age cap = 2 epochs
         ..CheckpointConfig::default()
     };
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
     let backend = Arc::new(InProcessBackend::new(2));
     coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
     coord.set_vnode_set(vec![0]);
@@ -1330,6 +1684,7 @@ async fn cold_slice_references_then_tier_fetch_on_forced_full() {
         .await
         .unwrap();
     assert!(r1.success);
+    let a1 = CheckpointAttempt::new(r1.epoch, r1.checkpoint_id);
 
     // Demote: release the in-memory pin; subsequent captures stage Cold.
     assert_eq!(coord.demotion_candidates(), vec![(0, b"state-v1".len())]);
@@ -1351,11 +1706,12 @@ async fn cold_slice_references_then_tier_fetch_on_forced_full() {
         .await
         .unwrap();
     assert!(r2.success);
+    let a2 = CheckpointAttempt::new(r2.epoch, r2.checkpoint_id);
     let p2 = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, r2.epoch).await.unwrap().unwrap(),
+        &backend.read_partial(a2, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p2.base_epoch, Some(r1.epoch), "cold slice must reference");
+    assert_eq!(p2.base, Some(a1), "cold slice must reference");
 
     // Epoch 3: still cold, base ages out → full re-upload from the tier.
     coord.set_pending_vnode_states(cold());
@@ -1368,11 +1724,12 @@ async fn cold_slice_references_then_tier_fetch_on_forced_full() {
         "forced full must fetch from the tier: {:?}",
         r3.error
     );
+    let a3 = CheckpointAttempt::new(r3.epoch, r3.checkpoint_id);
     let p3 = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, r3.epoch).await.unwrap().unwrap(),
+        &backend.read_partial(a3, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p3.base_epoch, None);
+    assert_eq!(p3.base, None);
     assert_eq!(p3.operators.len(), 1);
     assert_eq!(p3.operators[0].0, "agg");
     assert_eq!(
@@ -1401,8 +1758,9 @@ async fn cold_slice_missing_from_tier_fails_epoch() {
         max_retained: 2,
         ..CheckpointConfig::default()
     };
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
     let backend = Arc::new(InProcessBackend::new(2));
     coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
     coord.set_vnode_set(vec![0]);
@@ -1462,65 +1820,84 @@ struct FaultBackend {
 impl StateBackend for FaultBackend {
     async fn write_partial(
         &self,
+        attempt: CheckpointAttempt,
         vnode: u32,
-        epoch: u64,
         assignment_version: u64,
         bytes: bytes::Bytes,
     ) -> Result<(), laminar_core::state::StateBackendError> {
         tokio::time::sleep(self.write_delay).await;
-        if self.fail.lock().contains(&(epoch, vnode)) {
+        if self.fail.lock().contains(&(attempt.epoch, vnode)) {
             return Err(laminar_core::state::StateBackendError::Io(
                 "injected write failure".into(),
             ));
         }
         self.inner
-            .write_partial(vnode, epoch, assignment_version, bytes)
+            .write_partial(attempt, vnode, assignment_version, bytes)
             .await
     }
 
     async fn read_partial(
         &self,
+        attempt: CheckpointAttempt,
         vnode: u32,
-        epoch: u64,
     ) -> Result<Option<bytes::Bytes>, laminar_core::state::StateBackendError> {
-        self.inner.read_partial(vnode, epoch).await
+        self.inner.read_partial(attempt, vnode).await
     }
 
     async fn write_commit_descriptor(
         &self,
-        epoch: u64,
+        attempt: CheckpointAttempt,
         key: &str,
         assignment_version: u64,
         bytes: bytes::Bytes,
     ) -> Result<(), laminar_core::state::StateBackendError> {
         self.inner
-            .write_commit_descriptor(epoch, key, assignment_version, bytes)
+            .write_commit_descriptor(attempt, key, assignment_version, bytes)
             .await
     }
 
     async fn read_commit_descriptors(
         &self,
-        epoch: u64,
+        attempt: CheckpointAttempt,
     ) -> Result<Vec<(String, bytes::Bytes)>, laminar_core::state::StateBackendError> {
-        self.inner.read_commit_descriptors(epoch).await
+        self.inner.read_commit_descriptors(attempt).await
     }
 
-    async fn epoch_complete(
+    async fn read_commit_descriptor(
         &self,
-        epoch: u64,
+        attempt: CheckpointAttempt,
+        key: &str,
+    ) -> Result<Option<bytes::Bytes>, laminar_core::state::StateBackendError> {
+        self.inner.read_commit_descriptor(attempt, key).await
+    }
+
+    async fn seal_checkpoint(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_version: u64,
         vnodes: &[u32],
         required_descriptors: &[String],
     ) -> Result<bool, laminar_core::state::StateBackendError> {
         self.inner
-            .epoch_complete(epoch, vnodes, required_descriptors)
+            .seal_checkpoint(attempt, assignment_version, vnodes, required_descriptors)
             .await
     }
 
-    async fn sealed_epochs(
+    async fn sealed_checkpoints(
         &self,
-        after: u64,
-    ) -> Result<Vec<u64>, laminar_core::state::StateBackendError> {
-        self.inner.sealed_epochs(after).await
+        after_checkpoint_id: u64,
+    ) -> Result<Vec<CheckpointAttempt>, laminar_core::state::StateBackendError> {
+        self.inner.sealed_checkpoints(after_checkpoint_id).await
+    }
+
+    async fn checkpoint_seal_inventory(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<
+        Option<laminar_core::state::CheckpointSealInventory>,
+        laminar_core::state::StateBackendError,
+    > {
+        self.inner.checkpoint_seal_inventory(attempt).await
     }
 
     async fn prune_before(
@@ -1530,10 +1907,10 @@ impl StateBackend for FaultBackend {
         self.inner.prune_before(before).await
     }
 
-    async fn latest_committed_epoch(
+    async fn latest_sealed_checkpoint(
         &self,
-    ) -> Result<Option<u64>, laminar_core::state::StateBackendError> {
-        self.inner.latest_committed_epoch().await
+    ) -> Result<Option<CheckpointAttempt>, laminar_core::state::StateBackendError> {
+        self.inner.latest_sealed_checkpoint().await
     }
 
     fn set_authoritative_version(&self, version: u64) {
@@ -1560,10 +1937,11 @@ impl StateBackend for FaultBackend {
 #[allow(clippy::too_many_lines)] // four-epoch fault sequence reads better unsplit
 async fn overlapping_epoch_failure_is_isolated() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
     let backend = Arc::new(FaultBackend {
         inner: laminar_core::state::InProcessBackend::new(2),
         fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -1576,11 +1954,19 @@ async fn overlapping_epoch_failure_is_isolated() {
     let coordinator = Arc::new(tokio::sync::Mutex::new(Some(coord)));
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<CheckpointResult>();
 
+    // Reserve every attempt before spawning the tails, matching barrier admission. Reservation
+    // is async because checkpoint IDs are create-only objects in the durable decision store.
+    let attempts = [
+        allocator.allocate().await.unwrap(),
+        allocator.allocate().await.unwrap(),
+        allocator.allocate().await.unwrap(),
+        allocator.allocate().await.unwrap(),
+    ];
+
     // Admit an epoch exactly as the pipeline callback does: claim
-    // ids lock-free, spawn the tail; the FIFO mutex serializes the
-    // durable work.
-    let admit = |tag: &'static [u8]| {
-        let (epoch, checkpoint_id) = allocator.allocate();
+    // an attempt, then spawn the tail; the FIFO mutex serializes
+    // the durable work.
+    let admit = |tag: &'static [u8], attempt: CheckpointAttempt| {
         let coordinator = Arc::clone(&coordinator);
         let done = done_tx.clone();
         let states = std::collections::HashMap::from([
@@ -1604,31 +1990,31 @@ async fn overlapping_epoch_failure_is_isolated() {
             let coord = guard.as_mut().unwrap();
             coord.set_pending_vnode_states(states);
             let result = coord
-                .checkpoint_preallocated(
+                .checkpoint_preallocated_started(
                     CheckpointRequest::default(),
-                    epoch,
-                    checkpoint_id,
+                    attempt,
                     QuorumStage::RunInline,
+                    Instant::now(),
                 )
                 .await
                 .unwrap();
             done.send(result).unwrap();
         });
-        epoch
+        attempt.epoch
     };
 
     // All four admitted while epoch A's tail is still uploading
     // (each write sleeps 100ms; admissions are microseconds apart,
     // paced just enough that lock-queue order is admission order).
-    let a = admit(b"v1");
+    let a = admit(b"v1", attempts[0]);
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let b = admit(b"v1"); // unchanged → reference to A
+    let b = admit(b"v1", attempts[1]); // unchanged → reference to A
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let (c_epoch, _) = allocator.peek();
+    let c_epoch = attempts[2].epoch;
     backend.fail.lock().insert((c_epoch, 1)); // vnode 0 lands, vnode 1 fails
-    let c = admit(b"v2"); // changed → full attempt, partially fails
+    let c = admit(b"v2", attempts[2]); // changed → full attempt, partially fails
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let d = admit(b"v2"); // same state as the failed epoch
+    let d = admit(b"v2", attempts[3]); // same state as the failed epoch
 
     let mut results = Vec::new();
     for _ in 0..4 {
@@ -1649,11 +2035,14 @@ async fn overlapping_epoch_failure_is_isolated() {
         .error
         .as_deref()
         .is_some_and(|e| e.contains("vnode partial write failed")));
+    let attempt_a = CheckpointAttempt::new(results[0].epoch, results[0].checkpoint_id);
+    let attempt_b = CheckpointAttempt::new(results[1].epoch, results[1].checkpoint_id);
+    let attempt_d = CheckpointAttempt::new(results[3].epoch, results[3].checkpoint_id);
 
     // Recovery point: the failed epoch was never sealed.
     assert_eq!(
-        backend.latest_committed_epoch().await.unwrap(),
-        Some(d),
+        backend.latest_sealed_checkpoint().await.unwrap(),
+        Some(attempt_d),
         "the last successful epoch is the recovery point",
     );
 
@@ -1662,54 +2051,58 @@ async fn overlapping_epoch_failure_is_isolated() {
     // injected failure — D must not reference it (bases are
     // recorded only after every write in an epoch lands).
     let p_b = crate::vnode_partial::VnodePartial::decode(
-        &backend.read_partial(0, b).await.unwrap().unwrap(),
+        &backend.read_partial(attempt_b, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p_b.base_epoch, Some(a));
+    assert_eq!(p_b.base, Some(attempt_a));
     for vnode in [0u32, 1] {
         let p_d = crate::vnode_partial::VnodePartial::decode(
-            &backend.read_partial(vnode, d).await.unwrap().unwrap(),
+            &backend
+                .read_partial(attempt_d, vnode)
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(
-            p_d.base_epoch, None,
+            p_d.base, None,
             "vnode {vnode}: a successor of a failed epoch must re-upload full, \
                  never reference the failed epoch's stray partial",
         );
         assert_eq!(p_d.operators[0].1, b"v2");
     }
-    assert_eq!(c, d - 1, "abandoned epoch's id is burned, not reused");
+    assert_eq!(c, d - 1, "abandoned epoch is burned, not reused");
 }
 
-/// A follower persists its manifest before learning the leader
-/// aborted, so an aborted epoch's Pending manifest can be the
-/// highest on disk at restart. Construction seeds ids from it
-/// (high is safe); recovery then restores from the older committed
-/// epoch and must NOT walk the ids back down — that would
-/// re-allocate the aborted epoch over its stale artifacts.
+/// A follower persists its Prepared manifest before learning the leader aborted, so an aborted
+/// epoch can be the highest on disk at restart. Recovery from an older committed cut
+/// must not walk the local epoch backwards. Checkpoint ID continuity is independent and comes
+/// solely from durable reservations.
 #[tokio::test]
-async fn recovery_never_walks_ids_back_onto_aborted_epochs() {
-    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
-
+async fn recovery_never_walks_epoch_back_onto_aborted_attempt() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FileSystemCheckpointStore::new(dir.path(), 5);
+    let store = FileSystemCheckpointStore::new(dir.path());
+    let decision_store = Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    );
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     // Committed epoch 3.
     let mut committed = CheckpointManifest::new(3, 3);
-    committed
-        .sink_commit_statuses
-        .insert("out".into(), SinkCommitStatus::Committed);
+    committed.deployment_id.clone_from(&deployment_id);
     store.save(&committed).await.unwrap();
     // Aborted epoch 5: persisted by a follower before the leader's
     // Abort, never committed.
     let mut aborted = CheckpointManifest::new(5, 5);
-    aborted
-        .sink_commit_statuses
-        .insert("out".into(), SinkCommitStatus::Pending);
+    aborted.deployment_id.clone_from(&deployment_id);
     store.save(&aborted).await.unwrap();
 
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store))
         .await
         .unwrap();
+    decision_store.record_committed(3, 3).await.unwrap();
+    coord.set_decision_store(decision_store).unwrap();
     assert_eq!(coord.epoch(), 6, "seeds from the highest loadable manifest");
 
     let recovered = coord.recover().await.unwrap().expect("recovers");
@@ -1721,18 +2114,108 @@ async fn recovery_never_walks_ids_back_onto_aborted_epochs() {
     );
 }
 
-#[test]
-fn epoch_allocator_allocates_monotonic_pairs() {
-    let a = EpochAllocator::new(5, 9);
-    assert_eq!(a.peek(), (5, 9));
-    assert_eq!(a.allocate(), (5, 9));
-    assert_eq!(a.allocate(), (6, 10));
-    assert_eq!(a.peek(), (7, 11));
-    a.advance_to(20, 30);
-    assert_eq!(a.allocate(), (20, 30));
-    // Monotonic: never walks backwards.
-    a.advance_to(5, 5);
-    assert_eq!(a.peek(), (21, 31));
+#[tokio::test]
+async fn epoch_allocator_reservations_survive_restart() {
+    use object_store::ObjectStore;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let first_store = Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(&object_store)),
+    );
+    let first = EpochAllocator::new(5, Duration::from_secs(1));
+    first.bind_decision_store(Arc::clone(&first_store)).unwrap();
+    // Same handle can safely be bound by repeated lifecycle wiring.
+    first.bind_decision_store(first_store).unwrap();
+    assert_eq!(first.peek_epoch(), 5);
+    assert_eq!(
+        first.allocate().await.unwrap(),
+        CheckpointAttempt::new(5, 1)
+    );
+    assert_eq!(first.peek_epoch(), 6);
+
+    // A new process/store instance discovers the durable reservation instead of deriving the ID
+    // from manifests, which may be stale, corrupt, or retained on a different cadence.
+    let restarted = EpochAllocator::new(1, Duration::from_secs(1));
+    restarted
+        .bind_decision_store(Arc::new(
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(object_store),
+        ))
+        .unwrap();
+    assert_eq!(
+        restarted.allocate().await.unwrap(),
+        CheckpointAttempt::new(1, 2)
+    );
+
+    restarted.advance_epoch_to(20);
+    restarted.advance_epoch_to(5); // Monotonic: never walks backwards.
+    assert_eq!(restarted.peek_epoch(), 20);
+}
+
+#[tokio::test]
+async fn epoch_allocator_concurrent_stores_reserve_unique_ids() {
+    use object_store::ObjectStore;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let mut tasks = Vec::new();
+    for epoch in 1..=16_u64 {
+        let allocator = Arc::new(EpochAllocator::new(epoch, Duration::from_secs(1)));
+        allocator
+            .bind_decision_store(Arc::new(
+                laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(
+                    &object_store,
+                )),
+            ))
+            .unwrap();
+        tasks.push(tokio::spawn(
+            async move { allocator.allocate().await.unwrap() },
+        ));
+    }
+
+    let mut ids = Vec::new();
+    for task in tasks {
+        ids.push(task.await.unwrap().checkpoint_id);
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=16).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn epoch_allocator_error_does_not_advance_epoch() {
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    object_store
+        .put(
+            &object_store::path::Path::from("checkpoint-id-reservations/malformed"),
+            PutPayload::from(bytes::Bytes::from_static(b"bad")),
+        )
+        .await
+        .unwrap();
+    let allocator = EpochAllocator::new(41, Duration::from_secs(1));
+    allocator
+        .bind_decision_store(Arc::new(
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(object_store),
+        ))
+        .unwrap();
+
+    let error = allocator.allocate().await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("durable checkpoint ID reservation failed"));
+    assert_eq!(allocator.peek_epoch(), 41);
+}
+
+#[tokio::test]
+async fn epoch_allocator_uses_one_absolute_admission_deadline() {
+    let allocator = EpochAllocator::new(9, Duration::from_secs(30));
+    let guard = allocator.allocation_lock.lock().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+
+    let error = allocator.allocate_until(deadline).await.unwrap_err();
+
+    drop(guard);
+    assert!(error.to_string().contains("admission deadline"));
+    assert_eq!(allocator.peek_epoch(), 9);
 }
 
 /// Ids are allocated at the start of an attempt: a failed epoch is
@@ -1741,11 +2224,12 @@ fn epoch_allocator_allocates_monotonic_pairs() {
 async fn failed_epoch_is_abandoned_not_retried() {
     let dir = tempfile::tempdir().unwrap();
     let config = CheckpointConfig {
-        max_checkpoint_bytes: Some(16),
+        max_staged_bytes: 16,
         ..CheckpointConfig::default()
     };
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
 
     // Oversized state → size-cap rejection.
     let mut ops = HashMap::new();
@@ -1842,21 +2326,14 @@ impl laminar_connectors::connector::SinkConnector for FailingPreCommitSink {
         Arc::clone(&self.schema)
     }
 
-    fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
-        laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
-            .with_exactly_once()
-            .with_two_phase_commit()
-            .with_preserves_pending_on_abandon()
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
     }
 }
 
-/// A pre-commit failure abandons the epoch but must NOT hard-roll
-/// back a connector that preserves pending output (see
-/// `SinkCommand::RollbackEpoch`): the pending rows ride into the
-/// next epoch's commit. Connectors without the capability ARE
-/// rolled back.
+/// A failed coordinated prepare has no decision and must discard its local staged state.
 #[tokio::test]
-async fn pre_commit_failure_abandons_without_connector_rollback() {
+async fn pre_commit_failure_rolls_back_coordinated_prepare() {
     use arrow::datatypes::{DataType, Field, Schema};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1875,14 +2352,14 @@ async fn pre_commit_failure_abandons_without_connector_rollback() {
         name: "failing-sink".into(),
         sink_id: Arc::from("failing-sink"),
         connector: Box::new(sink),
-        exactly_once: true,
-        coordinated_commit: false,
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
         channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
     });
-    coord.register_sink("failing-sink", handle, true, false);
+    coord.register_sink("failing-sink", handle);
 
     coord.begin_initial_epoch().await.unwrap();
 
@@ -1902,18 +2379,16 @@ async fn pre_commit_failure_abandons_without_connector_rollback() {
     );
     assert_eq!(
         rollback_count.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "a healthy sink must keep its pending output on a live abandon"
+        1,
+        "an undecided coordinated prepare must be rolled back"
     );
 }
 
-/// Records flush/commit counts. Its `pre_commit` rejects at-least-once use (like Postgres, which
+/// Records flush counts. Its `pre_commit` rejects at-least-once use (like Postgres, which
 /// asserts the epoch was opened by `begin_epoch`), so a checkpoint that wrongly routes an ALO sink
 /// through `pre_commit` instead of a plain flush fails the test (guards CP-5 / B-1).
 struct RecordingSink {
     flush_count: Arc<std::sync::atomic::AtomicU64>,
-    commit_count: Arc<std::sync::atomic::AtomicU64>,
-    exactly_once: bool,
     schema: arrow::datatypes::SchemaRef,
 }
 
@@ -1944,22 +2419,87 @@ impl laminar_connectors::connector::SinkConnector for RecordingSink {
         &mut self,
         _epoch: u64,
     ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
-        if !self.exactly_once {
-            return Err(laminar_connectors::error::ConnectorError::TransactionError(
-                "pre_commit called on an at-least-once sink (no begin_epoch)".into(),
-            ));
-        }
-        self.flush_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(None)
+        Err(laminar_connectors::error::ConnectorError::TransactionError(
+            "pre_commit called on an at-least-once sink (no begin_epoch)".into(),
+        ))
     }
 
-    async fn commit_epoch(
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+}
+
+fn spawn_recording_sink(
+    name: &str,
+    schema: arrow::datatypes::SchemaRef,
+) -> (
+    crate::sink_task::SinkTaskHandle,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let flush_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sink = RecordingSink {
+        flush_count: Arc::clone(&flush_count),
+        schema,
+    };
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: name.into(),
+        sink_id: Arc::from(name),
+        connector: Box::new(sink),
+        contract: at_least_once_sink_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+    });
+    // The tests below drive no writes, so no SinkEvents are emitted; dropping the receiver is
+    // harmless (event sends are best-effort).
+    (handle, flush_count)
+}
+
+#[cfg(feature = "cluster")]
+struct LeaseDroppingAloSink {
+    lease_tx: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for LeaseDroppingAloSink {
+    async fn open(
         &mut self,
-        _epoch: u64,
+        _config: &laminar_connectors::config::ConnectorConfig,
     ) -> Result<(), laminar_connectors::error::ConnectorError> {
-        self.commit_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::array::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn flush(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.lease_tx
+            .send_replace(Some(laminar_core::cluster::control::LeaderLease {
+                seq: 2,
+                token: 2,
+                owner: laminar_core::cluster::discovery::NodeId(2),
+                expires_at_ms: i64::MAX,
+            }));
         Ok(())
     }
 
@@ -1971,51 +2511,81 @@ impl laminar_connectors::connector::SinkConnector for RecordingSink {
         Arc::clone(&self.schema)
     }
 
-    fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
-        let caps =
-            laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5));
-        if self.exactly_once {
-            caps.with_exactly_once().with_two_phase_commit()
-        } else {
-            caps
-        }
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
     }
 }
 
-fn spawn_recording_sink(
-    name: &str,
-    exactly_once: bool,
-    schema: arrow::datatypes::SchemaRef,
-) -> (
-    crate::sink_task::SinkTaskHandle,
-    Arc<std::sync::atomic::AtomicU64>,
-    Arc<std::sync::atomic::AtomicU64>,
-) {
-    let flush_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let commit_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let sink = RecordingSink {
-        flush_count: Arc::clone(&flush_count),
-        commit_count: Arc::clone(&commit_count),
-        exactly_once,
-        schema,
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn leader_loss_during_phase_one_prevents_sink_commit_and_decision() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, LeaderLease, Phase,
+        ANNOUNCEMENT_KEY,
     };
+    use laminar_core::cluster::discovery::NodeId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut coord, decision_store) = make_coordinator_with_decision_store(dir.path()).await;
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, members_rx));
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(Some(LeaderLease {
+        seq: 1,
+        token: 1,
+        owner: self_id,
+        expires_at_ms: i64::MAX,
+    }));
+    controller.set_leader_lease_watch(lease_rx);
+    coord.set_cluster_controller(controller);
+
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let sink = LeaseDroppingAloSink { lease_tx, schema };
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
     >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
     let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
-        name: name.into(),
-        sink_id: Arc::from(name),
+        name: "lease-drop-alo".into(),
+        sink_id: Arc::from("lease-drop-alo"),
         connector: Box::new(sink),
-        exactly_once,
-        coordinated_commit: false,
+        contract: at_least_once_sink_contract(),
+        requires_recovery_on_error: true,
         channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
     });
-    // The tests below drive no writes, so no SinkEvents are emitted; dropping the receiver is
-    // harmless (event sends are best-effort).
-    (handle, flush_count, commit_count)
+    coord.register_sink("lease-drop-alo", handle);
+
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert!(
+        result.error.as_deref().is_some_and(|error| {
+            error.contains("[LDB-6054]") && error.contains("manifest persistence")
+        }),
+        "unexpected result: {result:?}"
+    );
+    assert!(decision_store
+        .decision(result.epoch)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(coord
+        .store()
+        .load_by_id(result.checkpoint_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+    let announcement: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
+    assert_eq!(announcement.phase, Phase::Aligned);
 }
 
 /// CP-5: an at-least-once sink must be flushed at checkpoint, or the manifest records offsets
@@ -2028,8 +2598,8 @@ async fn at_least_once_sink_flushed_at_checkpoint() {
     let mut coord = make_coordinator(dir.path()).await;
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let (handle, flush_count, _commit_count) = spawn_recording_sink("alo_sink", false, schema);
-    coord.register_sink("alo_sink", handle, false, false);
+    let (handle, flush_count) = spawn_recording_sink("alo_sink", schema);
+    coord.register_sink("alo_sink", handle);
     coord.begin_initial_epoch().await.unwrap();
 
     let result = coord
@@ -2048,47 +2618,89 @@ async fn at_least_once_sink_flushed_at_checkpoint() {
     );
 }
 
-/// CP-3a / CP-2: reconcile runs after sinks are registered and re-drives a Failed sink status
-/// when the commit marker is present (previously it ignored Failed and, at the old call site,
-/// had no sinks to drive at all).
-#[tokio::test]
-async fn reconcile_redrives_failed_sink_when_marker_present() {
+struct SlowCheckpointFlushSink {
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for SlowCheckpointFlushSink {
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::array::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn flush(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoint_deadline_cancels_actor_flush_before_sink_write_timeout() {
     use arrow::datatypes::{DataType, Field, Schema};
-    use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
-    use object_store::local::LocalFileSystem;
 
-    let ckpt_dir = tempfile::tempdir().unwrap();
-    let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
-
-    // A partial commit recorded a Failed status after the commit decision.
-    let mut manifest = CheckpointManifest::new(42, 7);
-    manifest
-        .sink_commit_statuses
-        .insert("eo_sink".into(), SinkCommitStatus::Failed("partial".into()));
-    store.save_with_state(&manifest, None).await.unwrap();
-
-    let decision_os: Arc<dyn object_store::ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    let decision_store =
-        Arc::new(laminar_core::checkpoint_decision::CheckpointDecisionStore::new(decision_os));
-    decision_store.record_committed(7).await.unwrap();
-
-    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
-    coord.set_decision_store(decision_store);
+    let dir = tempfile::tempdir().unwrap();
+    let config = CheckpointConfig {
+        checkpoint_timeout: Duration::from_millis(50),
+        ..CheckpointConfig::default()
+    };
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let (handle, _flush_count, commit_count) = spawn_recording_sink("eo_sink", true, schema);
-    coord.register_sink("eo_sink", handle, true, false);
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "slow-attempt-flush".into(),
+        sink_id: Arc::from("slow-attempt-flush"),
+        connector: Box::new(SlowCheckpointFlushSink { schema }),
+        contract: at_least_once_sink_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        // Deliberately much longer than the whole checkpoint attempt.
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+    });
+    coord.register_sink("slow-attempt-flush", handle.clone());
 
-    coord.reconcile_prepared_on_init().await;
+    let started = tokio::time::Instant::now();
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(!result.success);
 
-    assert_eq!(
-        commit_count.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "reconcile must re-drive a Failed sink status when the commit marker is present (CP-3a)"
+    // The actor must have cancelled the connector flush at the attempt deadline. If the command
+    // retained its independent 5s timeout, this fence would remain queued behind it.
+    handle.sync().await.unwrap();
+    assert!(
+        tokio::time::Instant::now() - started < Duration::from_secs(1),
+        "sink actor outlived the checkpoint attempt deadline"
     );
 }
 
@@ -2144,10 +2756,8 @@ impl laminar_connectors::connector::SinkConnector for StuckRollbackSink {
         Arc::clone(&self.schema)
     }
 
-    fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
-        laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
-            .with_exactly_once()
-            .with_two_phase_commit()
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
     }
 }
 
@@ -2157,13 +2767,14 @@ async fn test_rollback_sinks_bounded_by_timeout() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = CheckpointConfig {
-        rollback_timeout: Duration::from_millis(100),
+        cleanup_timeout: Duration::from_millis(100),
         ..Default::default()
     };
     let store = Box::new(
-        laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path(), 3),
+        laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path()),
     );
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let sink = StuckRollbackSink { schema };
@@ -2174,14 +2785,14 @@ async fn test_rollback_sinks_bounded_by_timeout() {
         name: "stuck-sink".into(),
         sink_id: Arc::from("stuck-sink"),
         connector: Box::new(sink),
-        exactly_once: true,
-        coordinated_commit: false,
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
         channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
     });
-    coord.register_sink("stuck-sink", handle.clone(), true, false);
+    coord.register_sink("stuck-sink", handle.clone());
     coord.begin_initial_epoch().await.unwrap();
 
     // Poison the epoch with a failing write — only a poisoned sink
@@ -2196,7 +2807,7 @@ async fn test_rollback_sinks_bounded_by_timeout() {
     handle.sync().await.unwrap();
 
     // Poisoned pre_commit fails → rollback_sinks fires → connector
-    // rollback hangs → 100ms rollback_timeout fires → coordinator
+    // rollback hangs → the 100ms internal cleanup budget fires → coordinator
     // returns instead of wedging.
     let result = coord
         .checkpoint(CheckpointRequest::default())
@@ -2257,16 +2868,13 @@ impl laminar_connectors::connector::SinkConnector for CoordinatedMockSink {
         Arc::clone(&self.schema)
     }
 
-    fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
-        laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
-            .with_exactly_once()
-            .with_two_phase_commit()
-            .with_coordinated_commit()
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
     }
 }
 
-/// An idle coordinated sink (no descriptor this epoch) must not stall the
-/// gate — regression for the empty-epoch hang.
+/// An idle coordinated sink persists an explicit empty participant marker and
+/// seals normally — absence is never overloaded as an empty cut.
 #[tokio::test]
 async fn coordinated_sink_idle_epoch_still_seals() {
     use arrow::datatypes::{DataType, Field, Schema};
@@ -2287,15 +2895,16 @@ async fn coordinated_sink_idle_epoch_still_seals() {
             schema,
             descriptor: Vec::new(), // idle: pre_commit returns None
         }),
-        exactly_once: true,
-        coordinated_commit: true,
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
         channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
     });
-    coord.register_sink("ice", handle, true, true);
+    coord.register_sink("ice", handle);
     coord.begin_initial_epoch().await.unwrap();
+    let committer_notify = coord.committer_notify();
 
     let result = coord
         .checkpoint(CheckpointRequest::default())
@@ -2305,6 +2914,37 @@ async fn coordinated_sink_idle_epoch_still_seals() {
         result.success,
         "idle coordinated epoch must seal, not hang: {:?}",
         result.error
+    );
+    tokio::time::timeout(Duration::from_millis(50), committer_notify.notified())
+        .await
+        .expect("sealed coordinated checkpoint must wake the designated committer");
+    let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
+    let namespace = laminar_connectors::connector::CoordinatedCommitNamespace::try_new(
+        laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty(),
+        coord.expected_deployment_id().unwrap(),
+        "ice",
+    )
+    .unwrap();
+    let key = crate::coordinated_committer::descriptor_key(&namespace, 0);
+    let descriptors = coord
+        .state_backend
+        .as_ref()
+        .unwrap()
+        .read_commit_descriptors(attempt)
+        .await
+        .unwrap();
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].0, key);
+    assert_eq!(
+        crate::coordinated_committer::decode_prepared_marker(
+            &descriptors[0].0,
+            &descriptors[0].1,
+            attempt,
+            &namespace,
+        )
+        .unwrap()
+        .payload,
+        None
     );
 }
 
@@ -2331,14 +2971,14 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
             schema,
             descriptor: b"datafiles".to_vec(),
         }),
-        exactly_once: true,
-        coordinated_commit: true,
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
         channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
     });
-    coord.register_sink("ice", handle, true, true);
+    coord.register_sink("ice", handle);
     coord.begin_initial_epoch().await.unwrap();
 
     let result = coord
@@ -2347,14 +2987,38 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
         .unwrap();
     assert!(result.success, "checkpoint failed: {:?}", result.error);
 
-    let descs = backend.read_commit_descriptors(result.epoch).await.unwrap();
+    let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
+    let descs = backend.read_commit_descriptors(attempt).await.unwrap();
+    let namespace = laminar_connectors::connector::CoordinatedCommitNamespace::try_new(
+        laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty(),
+        coord.expected_deployment_id().unwrap(),
+        "ice",
+    )
+    .unwrap();
+    let key = crate::coordinated_committer::descriptor_key(&namespace, 0);
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].0, key);
+    let marker = crate::coordinated_committer::decode_prepared_marker(
+        &descs[0].0,
+        &descs[0].1,
+        attempt,
+        &namespace,
+    )
+    .unwrap();
+    assert_eq!(marker.payload, Some(b"datafiles".to_vec()));
+    assert_eq!(marker.participant_id, 0);
     assert_eq!(
-        descs,
-        vec![("node=0/sink=ice".to_string(), b"datafiles".to_vec().into())]
+        backend
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .required_descriptors,
+        vec![key]
     );
     assert_eq!(
-        backend.latest_committed_epoch().await.unwrap(),
-        Some(result.epoch),
+        backend.latest_sealed_checkpoint().await.unwrap(),
+        Some(attempt),
         "epoch must seal once the descriptor is durable"
     );
 }
@@ -2373,7 +3037,6 @@ fn iceberg_e2e_config(
     cc.set("namespace", "laminar_test");
     cc.set("table.name", table);
     cc.set("auto.create", "true");
-    cc.set("writer.id", "w0");
     cc.set("catalog.property.s3.endpoint", "http://localhost:9000");
     cc.set("catalog.property.s3.access-key-id", "minioadmin");
     cc.set("catalog.property.s3.secret-access-key", "minioadmin");
@@ -2401,8 +3064,8 @@ async fn spawn_iceberg_sink(
         name: "ice".into(),
         sink_id: std::sync::Arc::from("ice"),
         connector: Box::new(sink),
-        exactly_once: true,
-        coordinated_commit: true,
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
         channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(60),
@@ -2495,7 +3158,7 @@ async fn coordinated_iceberg_commits_through_committer() {
     let mut coord = make_coordinator(dir.path()).await;
     let backend = Arc::new(InProcessBackend::new(2));
     coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
-    coord.register_sink("ice", handle.clone(), true, true);
+    coord.register_sink("ice", handle.clone());
     coord.begin_initial_epoch().await.unwrap();
 
     // Three separate batches in one epoch — they must coalesce into ONE Parquet
@@ -2520,6 +3183,7 @@ async fn coordinated_iceberg_commits_through_committer() {
     // The designated committer commits the sealed epoch to the real catalog.
     let mut committer = coord
         .coordinated_committer()
+        .unwrap()
         .expect("coordinated committer");
     committer.commit_ready().await.unwrap();
     assert_eq!(
@@ -2582,7 +3246,7 @@ async fn coordinated_iceberg_recovers_uncommitted_epoch_after_restart() {
     let mut coord = make_coordinator(ckpt_dir.path()).await;
     let backend1 = Arc::new(ObjectStoreBackend::new(Arc::clone(&store), "node0", 2));
     coord.set_state_backend(Arc::clone(&backend1) as Arc<dyn StateBackend>);
-    coord.register_sink("ice", handle1.clone(), true, true);
+    coord.register_sink("ice", handle1.clone());
     coord.begin_initial_epoch().await.unwrap();
 
     // Epoch 1: write, checkpoint, commit.
@@ -2595,7 +3259,7 @@ async fn coordinated_iceberg_recovers_uncommitted_epoch_after_restart() {
             .unwrap()
             .success
     );
-    let mut committer1 = coord.coordinated_committer().expect("committer");
+    let mut committer1 = coord.coordinated_committer().unwrap().expect("committer");
     committer1.commit_ready().await.unwrap();
     assert_eq!(iceberg_state(&cc, &table).await, (1, 3));
 
@@ -2609,6 +3273,7 @@ async fn coordinated_iceberg_recovers_uncommitted_epoch_after_restart() {
             .unwrap()
             .success
     );
+    let deployment_id = coord.expected_deployment_id().unwrap().to_owned();
     drop(committer1);
     drop(coord);
     drop(handle1);
@@ -2619,6 +3284,8 @@ async fn coordinated_iceberg_recovers_uncommitted_epoch_after_restart() {
     let mut committer2 = crate::coordinated_committer::CoordinatedCommitter::new(
         Arc::clone(&backend2) as Arc<dyn StateBackend>,
         vec![("ice".into(), handle2)],
+        laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty(),
+        deployment_id,
         Arc::new(AtomicU64::new(0)),
     );
     committer2.commit_ready().await.unwrap();

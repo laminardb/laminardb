@@ -2,15 +2,16 @@ replicaCount: 3
 
 laminardb:
   mode: cluster
+  delivery: at_least_once
   logLevel: debug
   workers: 4
   state:
-    backend: local
-    path: "/var/lib/laminardb/state"
+    backend: object_store
+    url: "s3://laminardb-ci/state"
   checkpoint:
     interval: "30s"
-    mode: aligned
-    snapshotStrategy: incremental
+    timeout: "120s"
+    url: "s3://laminardb-ci/checkpoints"
   cluster:
     discovery:
       strategy: dns
@@ -53,7 +54,6 @@ sinks:
   - name: output
     pipeline: trade-volumes
     connector: kafka
-    delivery: at_least_once
     properties:
       brokers: "kafka:9092"
       topic: trade-volumes

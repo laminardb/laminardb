@@ -33,6 +33,8 @@ testConnection:
 laminardb:
   # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering)
   mode: embedded
+  # -- Pipeline-wide delivery contract. Cluster mode currently requires at_least_once.
+  delivery: at_least_once
   # -- Log level: trace, debug, info, warn, error
   logLevel: info
   # -- HTTP API bind address
@@ -71,17 +73,13 @@ laminardb:
 
   # -- Checkpoint configuration
   checkpoint:
-    # -- Enable checkpointing
-    enabled: true
     # -- Checkpoint interval (Go/humantime duration)
     interval: "30s"
+    # -- One end-to-end checkpoint attempt deadline
+    timeout: "120s"
     # -- Checkpoint storage URL. Use an object store (s3://, gs://, az://) for durable
     # checkpoints; empty falls back to a local path (non-durable unless checkpoints PVC enabled).
     url: ""
-    # -- Checkpoint mode: "aligned" or "unaligned"
-    mode: aligned
-    # -- Snapshot strategy: "full", "incremental", or "fork_cow"
-    snapshotStrategy: full
 
   # -- PostgreSQL wire protocol (SUBSCRIBE + queries via psql/JDBC/psycopg).
   pgwire:
@@ -198,7 +196,6 @@ sinks: []
 # - name: output
 #   pipeline: trade-volumes
 #   connector: kafka
-#   delivery: at_least_once
 #   properties:
 #     brokers: "kafka:9092"
 #     topic: trade-volumes

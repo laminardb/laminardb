@@ -11,6 +11,7 @@ use rdkafka::Offset;
 use rdkafka::TopicPartitionList;
 
 use crate::checkpoint::SourceCheckpoint;
+use crate::error::ConnectorError;
 
 /// Tracks consumed offsets per topic-partition.
 ///
@@ -104,49 +105,79 @@ impl OffsetTracker {
                 })
             })
             .collect();
-        let mut cp = SourceCheckpoint::with_offsets(0, offsets);
+        let mut cp = SourceCheckpoint::with_offsets(offsets);
         cp.set_metadata("connector", "kafka");
         cp
     }
 
-    /// Restores offset state from a [`SourceCheckpoint`]. See
-    /// [`from_offset_map`](Self::from_offset_map) for the key format.
-    #[must_use]
-    pub fn from_checkpoint(cp: &SourceCheckpoint) -> Self {
-        Self::from_offset_map(cp.offsets())
-    }
-
-    /// Builds a tracker from a raw `"{topic}-{partition}" -> offset` map (the
-    /// connector-agnostic source-checkpoint representation). Topic names may
-    /// contain `-`, so the partition is split off the last `-`. Unparseable
-    /// entries are logged and skipped rather than silently dropped.
-    #[must_use]
-    pub fn from_offset_map(offsets: &HashMap<String, String>) -> Self {
-        let mut tracker = Self::new();
-        for (key, value) in offsets {
-            let Ok(offset) = value.parse::<i64>() else {
-                tracing::warn!(
-                    key,
-                    value,
-                    "skipping checkpoint entry with unparseable offset"
-                );
-                continue;
-            };
-            let Some(dash_pos) = key.rfind('-') else {
-                tracing::warn!(
-                    key,
-                    "skipping checkpoint entry without topic-partition separator"
-                );
-                continue;
-            };
-            match key[dash_pos + 1..].parse::<i32>() {
-                Ok(partition) => tracker.update_force(&key[..dash_pos], partition, offset),
-                Err(_) => {
-                    tracing::warn!(key, "skipping checkpoint entry with unparseable partition");
-                }
+    /// Strictly restores offset state from a durable Kafka checkpoint.
+    ///
+    /// A malformed entry is corruption, not a partition that can safely be
+    /// omitted: skipping it would let that partition fall back to a broker or
+    /// startup cursor from a different engine timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the connector identity, partition
+    /// key, or offset value is malformed.
+    pub fn try_from_checkpoint(cp: &SourceCheckpoint) -> Result<Self, ConnectorError> {
+        if let Some(connector) = cp.get_metadata("connector") {
+            if connector != "kafka" {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "Kafka checkpoint belongs to connector '{connector}'"
+                )));
             }
         }
-        tracker
+        Self::try_from_offset_map(cp.offsets())
+    }
+
+    /// Strictly builds a tracker from a raw `"{topic}-{partition}" -> offset`
+    /// map. Topic names may contain `-`, so the partition is split off the last
+    /// `-`. Keys and values must use their canonical non-negative decimal form.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when a key cannot be split into a non-empty
+    /// topic and canonical partition, or an offset is not canonical and non-negative.
+    pub fn try_from_offset_map(offsets: &HashMap<String, String>) -> Result<Self, ConnectorError> {
+        let mut tracker = Self::new();
+        for (key, value) in offsets {
+            let (topic, partition_text) = key.rsplit_once('-').ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka offset key '{key}': expected '<topic>-<partition>'"
+                ))
+            })?;
+            if topic.is_empty() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka offset key '{key}': topic is empty"
+                )));
+            }
+
+            let partition = partition_text.parse::<i32>().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka partition in '{key}': '{partition_text}'"
+                ))
+            })?;
+            if partition < 0 || partition.to_string() != partition_text {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka partition in '{key}': expected a canonical non-negative integer"
+                )));
+            }
+
+            let offset = value.parse::<i64>().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka offset for '{key}': '{value}'"
+                ))
+            })?;
+            if offset < 0 || offset == i64::MAX || offset.to_string() != value.as_str() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka offset for '{key}': expected a canonical non-negative integer below i64::MAX"
+                )));
+            }
+
+            tracker.update_force(topic, partition, offset);
+        }
+        Ok(tracker)
     }
 
     /// Builds an rdkafka [`TopicPartitionList`] for committing.
@@ -228,7 +259,7 @@ impl OffsetTracker {
                 })
             })
             .collect();
-        let mut cp = SourceCheckpoint::with_offsets(0, offsets);
+        let mut cp = SourceCheckpoint::with_offsets(offsets);
         cp.set_metadata("connector", "kafka");
         cp
     }
@@ -323,7 +354,7 @@ mod tests {
         tracker.update("orders", 0, 50);
 
         let cp = tracker.to_checkpoint();
-        let restored = OffsetTracker::from_checkpoint(&cp);
+        let restored = OffsetTracker::try_from_checkpoint(&cp).unwrap();
 
         assert_eq!(restored.get("events", 0), Some(100));
         assert_eq!(restored.get("events", 1), Some(200));
@@ -338,28 +369,34 @@ mod tests {
             ("events-5".to_string(), "100".to_string()),
             ("my-topic-2".to_string(), "7".to_string()),
         ]);
-        let tracker = OffsetTracker::from_offset_map(&map);
+        let tracker = OffsetTracker::try_from_offset_map(&map).unwrap();
         assert_eq!(tracker.get("events", 5), Some(100));
         assert_eq!(tracker.get("my-topic", 2), Some(7));
         assert_eq!(tracker.partition_count(), 2);
     }
 
     #[test]
-    fn from_offset_map_skips_malformed_entries() {
-        let map = HashMap::from([
-            ("good-0".to_string(), "10".to_string()),
-            ("bad-partition-x".to_string(), "10".to_string()), // partition not an int
-            ("nodashseparator".to_string(), "10".to_string()), // no '-'
-            ("offset-0".to_string(), "notanumber".to_string()), // offset not an int
-        ]);
-        let tracker = OffsetTracker::from_offset_map(&map);
-        assert_eq!(tracker.get("good", 0), Some(10));
-        assert_eq!(tracker.partition_count(), 1);
+    fn try_from_offset_map_rejects_malformed_entries() {
+        for (key, value) in [
+            ("bad-partition-x", "10"),
+            ("nodashseparator", "10"),
+            ("offset-0", "notanumber"),
+            ("negative-partition--1", "10"),
+            ("negative-offset-0", "-1"),
+            ("noncanonical-partition-00", "10"),
+            ("noncanonical-offset-0", "010"),
+        ] {
+            let map = HashMap::from([(key.to_string(), value.to_string())]);
+            assert!(
+                OffsetTracker::try_from_offset_map(&map).is_err(),
+                "malformed handoff entry {key}={value} was accepted"
+            );
+        }
     }
 
     #[test]
     fn from_offset_map_empty_is_empty() {
-        let tracker = OffsetTracker::from_offset_map(&HashMap::new());
+        let tracker = OffsetTracker::try_from_offset_map(&HashMap::new()).unwrap();
         assert_eq!(tracker.partition_count(), 0);
     }
 
@@ -405,7 +442,7 @@ mod tests {
         tracker.update("topic-b", 0, 20);
 
         let cp = tracker.to_checkpoint();
-        let restored = OffsetTracker::from_checkpoint(&cp);
+        let restored = OffsetTracker::try_from_checkpoint(&cp).unwrap();
 
         assert_eq!(restored.get("topic-a", 0), Some(10));
         assert_eq!(restored.get("topic-b", 0), Some(20));

@@ -1,12 +1,10 @@
-# LaminarDB demo — payments + fraud-check stream-to-stream join.
+# ARCHIVED CONTRACT FIXTURE — not a runnable server configuration.
 #
-# Build:
-#   cargo build --release -p laminar-server \
-#       --no-default-features --features mimalloc,nats,iceberg,websocket
+# NATS Core sources are non-replayable and require global best_effort, while
+# the Iceberg sinks require global exactly_once. LaminarDB deliberately rejects
+# that mixed contract before external I/O. Retain this file only as a pipeline
+# design fixture until the sources move to a certified replayable protocol.
 #
-# Run:
-#   ./target/release/laminardb --config examples/nats-payments/config.toml
-
 [server]
 mode = "embedded"
 bind = "127.0.0.1:8080"

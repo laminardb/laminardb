@@ -1,5 +1,10 @@
 # Performance & Correctness Audit — 2026-07-03
 
+> Historical audit of `f4abe07b`. Its checkpoint/inline-2PC recommendations are superseded by
+> [Checkpoint Production Correctness — 2026 Order](checkpoint-production-correctness-2026.md),
+> which uses exact sealed decisions plus coordinated external commit and rejects legacy inline
+> exactly-once sinks.
+
 Five-subsystem audit (execution hot path, checkpoint/EO, cluster/shuffle, connectors,
 state tier) of main @ `f4abe07b`. All P0/P1 findings below were verified against source;
 file:line references are to that commit. Findings the audit explicitly checked and found
@@ -186,8 +191,9 @@ commits.
 `postgres/sink.rs:860-898` — pre_commit does BEGIN…COMMIT before the manifest persists;
 crash-in-window + epoch-id never reused → dedup check passes and replays. Upsert mode is
 PK-idempotent; append (COPY) mode duplicates.
-**Fix:** `PREPARE TRANSACTION` (commit in commit_epoch), or store source-offset
-high-water in `_laminardb_sink_offsets` for content dedup, or reject EO+append at open().
+**Resolution:** PostgreSQL is admitted as a durable at-least-once sink. Exactly-once admission now
+requires the coordinated sealed-descriptor protocol, so the legacy inline PostgreSQL EO path is
+rejected before connector I/O.
 
 ### CN-7 (P2) PG CDC poll error drops already-drained WAL payloads
 `cdc/postgres/source.rs:759-761` — decode failure on payload k drops k+1..n from the

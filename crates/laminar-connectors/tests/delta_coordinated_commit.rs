@@ -14,9 +14,14 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{CoordinatedCommitter, DeliveryGuarantee, SinkConnector};
+use laminar_connectors::connector::{
+    CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    CoordinatedCommitter, DeliveryGuarantee, SinkConnector,
+};
 use laminar_connectors::lakehouse::delta_table_provider::register_delta_table;
 use laminar_connectors::lakehouse::{DeltaLakeSink, DeltaLakeSinkConfig};
+use laminar_core::state::CheckpointAttempt;
+use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
@@ -130,13 +135,31 @@ async fn designated_committer_one_commit_from_many_writers() {
 
     // One designated commit for all writers' files.
     let committer = open_writer(path, "committer", &storage).await;
-    committer
-        .commit_aggregated(1, descriptors.clone())
-        .await
-        .unwrap();
+    let attempt = CheckpointAttempt::new(1, 101);
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let commit = CoordinatedCommitBatch {
+        namespace,
+        expected_predecessor: 0,
+        target: attempt,
+        entries: descriptors
+            .into_iter()
+            .enumerate()
+            .map(|(participant_id, payload)| CoordinatedCommitPayload {
+                attempt,
+                participant_id: participant_id as u64,
+                payload: Some(payload),
+            })
+            .collect(),
+    };
+    committer.commit_aggregated(commit.clone()).await.unwrap();
     assert_eq!(count_rows(path, storage.clone()).await, 30);
 
     // Re-commit the same epoch — idempotent, no duplicate rows.
-    committer.commit_aggregated(1, descriptors).await.unwrap();
+    committer.commit_aggregated(commit).await.unwrap();
     assert_eq!(count_rows(path, storage).await, 30);
 }

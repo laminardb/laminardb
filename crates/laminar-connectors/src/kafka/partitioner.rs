@@ -16,9 +16,6 @@ pub trait KafkaPartitioner: Send + Sync {
     /// Returns `None` if the partitioner defers to the broker (librdkafka)
     /// default partitioning.
     fn partition(&mut self, key: Option<&[u8]>, num_partitions: i32) -> Option<i32>;
-
-    /// Resets the partitioner state (e.g., on epoch boundary).
-    fn reset(&mut self);
 }
 
 /// Key-hash partitioner using Murmur2 (Kafka-compatible).
@@ -49,8 +46,6 @@ impl KafkaPartitioner for KeyHashPartitioner {
             partition
         })
     }
-
-    fn reset(&mut self) {}
 }
 
 /// Round-robin partitioner distributing records evenly across partitions.
@@ -80,8 +75,6 @@ impl KafkaPartitioner for RoundRobinPartitioner {
         self.counter += 1;
         Some(partition)
     }
-
-    fn reset(&mut self) {}
 }
 
 /// Sticky partitioner that batches records to the same partition.
@@ -115,10 +108,6 @@ impl KafkaPartitioner for StickyPartitioner {
         }
         self.records_in_batch += 1;
         Some(self.current_partition)
-    }
-
-    fn reset(&mut self) {
-        self.records_in_batch = 0;
     }
 }
 
@@ -246,20 +235,5 @@ mod tests {
 
         // 7th record rotates to partition 2
         assert_eq!(p.partition(None, 4), Some(2));
-    }
-
-    #[test]
-    fn test_sticky_partitioner_reset() {
-        let mut p = StickyPartitioner::new(2);
-        p.partition(None, 3);
-        p.partition(None, 3);
-
-        p.reset(); // resets count but keeps current partition
-
-        // After reset, stays on current partition
-        assert_eq!(p.partition(None, 3), Some(0));
-        assert_eq!(p.partition(None, 3), Some(0));
-        // Now rotates
-        assert_eq!(p.partition(None, 3), Some(1));
     }
 }

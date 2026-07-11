@@ -33,7 +33,7 @@ async fn single_node_demotes_and_promotes_without_a_controller() {
     std::fs::create_dir_all(&state_dir).unwrap();
 
     let store = Arc::new(LocalFileSystem::new_with_prefix(&state_dir).unwrap());
-    let backend = Arc::new(ObjectStoreBackend::new(store, "node-0", VNODES));
+    let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", VNODES));
 
     // Single-owner registry: all vnodes owned by this node, no controller. This
     // is the documented single-instance path — the durability gate wires the

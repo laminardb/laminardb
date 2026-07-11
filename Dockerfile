@@ -132,8 +132,6 @@ path = "/var/lib/laminardb/state"
 [checkpoint]
 url = "file:///var/lib/laminardb/checkpoints"
 interval = "30s"
-mode = "aligned"
-snapshot_strategy = "full"
 EOF
 
 # Expose ports
