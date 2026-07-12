@@ -562,7 +562,14 @@ impl SinkConnector for KafkaSink {
         } else {
             SinkConsistency::Ephemeral
         };
-        let topology = SinkTopology::MultiWriter;
+        // Append records from independent writers compose safely. Upsert records do not carry a
+        // fenced generation, so an old writer can otherwise overwrite a newer value for the same
+        // compacted key after ownership handoff.
+        let topology = if cfg.envelope == SinkEnvelope::Upsert {
+            SinkTopology::Singleton
+        } else {
+            SinkTopology::MultiWriter
+        };
         let input_mode = if cfg.envelope == SinkEnvelope::Upsert {
             SinkInputMode::FullChangelog
         } else {
@@ -944,6 +951,20 @@ mod tests {
         assert_eq!(contract.topology, SinkTopology::MultiWriter);
         assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
         assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn upsert_contract_requires_singleton_writer() {
+        let mut config = test_config();
+        config.envelope = SinkEnvelope::Upsert;
+        config.key_column = Some("id".into());
+        let sink = KafkaSink::new(test_schema(), config, None);
+
+        let contract = sink.contract(&ConnectorConfig::new("kafka")).unwrap();
+
+        assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+        assert_eq!(contract.topology, SinkTopology::Singleton);
+        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
     }
 
     #[test]

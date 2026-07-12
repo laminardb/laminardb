@@ -139,15 +139,6 @@ laminardb:
       # -- Host peers use to reach this node. Empty = the pod's headless-service
       # -- DNS name (override only for non-standard network setups)
       advertiseHost: ""
-    coordination:
-      # -- Coordination strategy (only "raft" supported)
-      strategy: raft
-      # -- Raft port
-      raftPort: 7947
-      # -- Raft election timeout
-      electionTimeout: "1500ms"
-      # -- Raft heartbeat interval
-      heartbeatInterval: "300ms"
 
 # -- Pipeline definitions (rendered into laminardb.toml [[pipeline]] sections)
 # -- Each entry needs: name, sql, and optionally parallelism
@@ -239,8 +230,6 @@ service:
   pgPort: 5432
   # -- Gossip port for cluster mode discovery
   gossipPort: 7946
-  # -- Raft port for cluster mode coordination
-  raftPort: 7947
   # -- Service annotations
   annotations: {}
 

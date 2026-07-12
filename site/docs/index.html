@@ -727,7 +727,7 @@ log_level = "info"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:641</a></div>
 
       <p>
-        When <code>mode = "cluster"</code>, the server requires both the <code>[discovery]</code> and <code>[coordination]</code> sections to be defined.
+        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared state store; there is no separate <code>[coordination]</code> section or embedded Raft service.
       </p>
       <p>
         Cluster mode requires <code>delivery = "at_least_once"</code> and cluster-shared state on S3, GCS, or Azure. Cluster exactly-once fails closed with <code>[LDB-0013]</code> until the leader term is atomically fenced through both checkpoint decisions and external sink commits. Local paths and <code>file://</code> state are rejected because peers cannot recover them.
@@ -764,37 +764,6 @@ log_level = "info"</code></pre>
         </tbody>
       </table>
 
-      <h3>[coordination]</h3>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">strategy</td>
-            <td class="field-type">String</td>
-            <td class="field-default">"raft"</td>
-            <td>Consensus coordinator strategy. Currently supports <code>"raft"</code>.</td>
-          </tr>
-          <tr>
-            <td class="field-name">raft_port</td>
-            <td class="field-type">u16</td>
-            <td class="field-default">8888</td>
-            <td>The port used for Raft consensus group communications.</td>
-          </tr>
-          <tr>
-            <td class="field-name">election_timeout</td>
-            <td class="field-type">Duration</td>
-            <td class="field-default">"3s"</td>
-            <td>Raft leader election timeout (supports humantime format).</td>
-          </tr>
-          <tr>
-            <td class="field-name">heartbeat_interval</td>
-            <td class="field-type">Duration</td>
-            <td class="field-default">"500ms"</td>
-            <td>Raft leader heartbeat interval.</td>
-          </tr>
-        </tbody>
-      </table>
-
       <div class="toml-block">
         <div class="toml-header">laminardb.toml (Cluster sections)</div>
         <pre><code class="language-toml">node_id = "node-1"
@@ -803,13 +772,7 @@ log_level = "info"</code></pre>
 strategy = "gossip"
 gossip_port = 7946
 advertise_host = "10.0.0.1"
-seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
-
-[coordination]
-strategy = "raft"
-raft_port = 8888
-election_timeout = "3s"
-heartbeat_interval = "500ms"</code></pre>
+seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
       </div>
 
       <!-- STATE -->
@@ -1049,7 +1012,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <ul>
         <li><code>GET /api/v1/cluster/nodes</code> &mdash; Returns list of cluster members, including their node IDs, network addresses, and states (<code>Active</code>, <code>Draining</code>, <code>Suspected</code>, <code>Left</code>).</li>
         <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current assignment map mapping the 256 virtual nodes (vnodes) to active cluster nodes.</li>
-        <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active Raft leader lease holder.</li>
+        <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active durable leader-lease holder.</li>
         <li><code>GET /api/v1/cluster/checkpoints</code> &mdash; Returns history and completion metadata of recent coordinator checkpoints.</li>
       </ul>
 

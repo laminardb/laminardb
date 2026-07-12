@@ -13,6 +13,10 @@ use rdkafka::TopicPartitionList;
 use crate::checkpoint::SourceCheckpoint;
 use crate::error::ConnectorError;
 
+/// Reserved source-offset key prefix for a partition's durable numeric next-to-read baseline.
+/// `@` and `:` are invalid in Kafka topic names, so a real topic-partition key cannot collide.
+pub(super) const KAFKA_PARTITION_BASELINE_PREFIX: &str = "@laminar.kafka.next.v1:";
+
 /// Tracks consumed offsets per topic-partition.
 ///
 /// Offsets stored are the last-consumed offset (not the next offset to fetch).
@@ -85,6 +89,20 @@ impl OffsetTracker {
             .copied()
     }
 
+    /// Removes a tracked partition position.
+    ///
+    /// Vnode handoff uses this to discard a stale position from an earlier
+    /// ownership stint before folding records from the rehydrated handoff cut.
+    pub fn remove(&mut self, topic: &str, partition: i32) {
+        let remove_topic = self.topics.get_mut(topic).is_some_and(|partitions| {
+            partitions.remove(&partition);
+            partitions.is_empty()
+        });
+        if remove_topic {
+            self.topics.remove(topic);
+        }
+    }
+
     /// Returns the total number of tracked partitions across all topics.
     #[must_use]
     pub fn partition_count(&self) -> usize {
@@ -146,6 +164,9 @@ impl OffsetTracker {
     pub fn try_from_offset_map(offsets: &HashMap<String, String>) -> Result<Self, ConnectorError> {
         let mut tracker = Self::new();
         for (key, value) in offsets {
+            if key.starts_with(KAFKA_PARTITION_BASELINE_PREFIX) {
+                continue;
+            }
             let (topic, partition_text) = key.rsplit_once(':').ok_or_else(|| {
                 ConnectorError::ConfigurationError(format!(
                     "invalid Kafka offset key '{key}': expected '<topic>:<partition>'"
@@ -383,6 +404,26 @@ mod tests {
         assert_eq!(tracker.get("my-topic", 2), Some(7));
         assert_eq!(tracker.get("trailing-hyphen-", 3), Some(9));
         assert_eq!(tracker.partition_count(), 3);
+    }
+
+    #[test]
+    fn from_offset_map_ignores_reserved_partition_baselines() {
+        let map = HashMap::from([
+            ("events:0".to_string(), "100".to_string()),
+            (
+                format!("{KAFKA_PARTITION_BASELINE_PREFIX}events:0"),
+                "7".to_string(),
+            ),
+            (
+                format!("{KAFKA_PARTITION_BASELINE_PREFIX}events:1"),
+                "9".to_string(),
+            ),
+        ]);
+
+        let tracker = OffsetTracker::try_from_offset_map(&map).unwrap();
+        assert_eq!(tracker.get("events", 0), Some(100));
+        assert_eq!(tracker.get("events", 1), None);
+        assert_eq!(tracker.partition_count(), 1);
     }
 
     #[test]

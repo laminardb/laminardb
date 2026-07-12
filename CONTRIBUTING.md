@@ -77,7 +77,7 @@ Most connectors are behind feature flags so the default build stays fast. Here a
 | `parquet-lookup` | Parquet file lookup table source |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `ffi` | C FFI layer and Arrow C Data Interface |
-| `delta` | Distributed delta mode (Raft, gossip, gRPC) |
+| `delta` | Delta Lake connector bundle (local, S3, Azure, GCS, Unity, and Glue) |
 
 To run tests with a specific connector:
 

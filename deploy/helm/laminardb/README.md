@@ -20,17 +20,17 @@ helm install my-laminardb deploy/helm/laminardb
 
 ---
 
-## 🌐 Production Clustered Setup (`cluster` mode)
+## 🌐 Durable Clustered Setup (`cluster` mode)
 
 LaminarDB supports distributed execution where query processing and subscription routing are coordinated across multiple nodes.
 
-To run a production-ready, durable 3-node cluster:
+Cluster mode is still pre-production while the open security and operability work is completed. To run a durable 3-node cluster configuration for evaluation:
 
 1. **Set `laminardb.mode` to `"cluster"`**
 2. **Increase `replicaCount` to `3` (or more)**
 3. **Configure durable state and checkpoints**
 
-Here is an example production values file (`prod-values.yaml`):
+Here is an example cluster values file (`cluster-values.yaml`):
 
 ```yaml
 replicaCount: 3
@@ -56,11 +56,6 @@ laminardb:
       gossipPort: 7946
       # seeds are generated from replicaCount (per-pod headless DNS names);
       # set `seeds` explicitly only for non-standard topologies
-    coordination:
-      strategy: raft
-      raftPort: 7947
-      electionTimeout: "1500ms"
-      heartbeatInterval: "300ms"
 
 persistence:
   state:
@@ -101,7 +96,7 @@ topologySpreadConstraints:
 
 Apply this via:
 ```bash
-helm install my-laminardb deploy/helm/laminardb -f prod-values.yaml
+helm install my-laminardb deploy/helm/laminardb -f cluster-values.yaml
 ```
 
 ---
@@ -175,7 +170,6 @@ prometheusRule:
 | `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
-| `laminardb.cluster.coordination.strategy` | Clustering controller coordination (`raft`) | `raft` |
 | `persistence.state.enabled` | Keep local state in Persistent Volume | `true` |
 | `persistence.state.storageClass` | K8s storage class for state PVC | `""` (default) |
 | `persistence.checkpoints.enabled` | Provision a dedicated checkpoints PVC. Off by default — prefer an object store via `laminardb.checkpoint.url`. | `false` |

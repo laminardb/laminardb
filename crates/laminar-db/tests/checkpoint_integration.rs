@@ -11,11 +11,12 @@ fn in_memory_decision_store() -> std::sync::Arc<DecisionStore> {
     )
 }
 
-fn bind_in_memory_decision_store(
+async fn bind_in_memory_decision_store(
     coordinator: &mut laminar_db::checkpoint_coordinator::CheckpointCoordinator,
 ) {
     coordinator
-        .set_decision_store(in_memory_decision_store())
+        .bind_durable_decision_store(in_memory_decision_store())
+        .await
         .unwrap();
 }
 
@@ -467,7 +468,7 @@ mod exactly_once {
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        super::bind_in_memory_decision_store(&mut coord);
+        super::bind_in_memory_decision_store(&mut coord).await;
 
         let mut operator_states = HashMap::new();
         operator_states.insert(
@@ -743,7 +744,7 @@ mod performance {
         let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        super::bind_in_memory_decision_store(&mut coordinator);
+        super::bind_in_memory_decision_store(&mut coordinator).await;
 
         let (tx, rx) = crossfire::mpsc::bounded_async::<Duration>(100);
 
@@ -803,7 +804,7 @@ mod performance {
         let mut config = CheckpointConfig::default();
         config.checkpoint_timeout = Duration::from_millis(100);
         let mut coordinator = CheckpointCoordinator::new(config, store).await.unwrap();
-        super::bind_in_memory_decision_store(&mut coordinator);
+        super::bind_in_memory_decision_store(&mut coordinator).await;
 
         let started = tokio::time::Instant::now();
         let result = coordinator
@@ -838,12 +839,17 @@ mod recovery {
         FileSystemCheckpointStore::new(dir)
     }
 
+    async fn save_finalized(store: &FileSystemCheckpointStore, manifest: &CheckpointManifest) {
+        store.save_with_state(manifest, None).await.unwrap();
+        store.finalize(manifest.checkpoint_id).await.unwrap();
+    }
+
     async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
         let store = Box::new(make_store(dir));
         let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        super::bind_in_memory_decision_store(&mut coordinator);
+        super::bind_in_memory_decision_store(&mut coordinator).await;
         coordinator
     }
 
@@ -899,7 +905,7 @@ mod recovery {
         for i in 1..=3 {
             let mut m = CheckpointManifest::new(i, i);
             m.watermark = Some(i as i64 * 1000);
-            store.save(&m).await.unwrap();
+            save_finalized(&store, &m).await;
         }
 
         let manifest = store.load_latest().await.unwrap().unwrap();
@@ -931,7 +937,7 @@ mod recovery {
                 metadata: HashMap::from([("slot".into(), "laminar_slot".into())]),
             },
         );
-        store.save(&manifest).await.unwrap();
+        save_finalized(&store, &manifest).await;
 
         let manifest = store.load_latest().await.unwrap().unwrap();
 
@@ -960,7 +966,7 @@ mod recovery {
         manifest
             .operator_states
             .insert("filter".into(), OperatorCheckpoint::inline(&filter_state));
-        store.save(&manifest).await.unwrap();
+        save_finalized(&store, &manifest).await;
 
         let manifest = store.load_latest().await.unwrap().unwrap();
 
@@ -1009,11 +1015,12 @@ mod recovery {
                 .await
                 .unwrap();
             coord
-                .set_decision_store(std::sync::Arc::new(
+                .bind_durable_decision_store(std::sync::Arc::new(
                     laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
                         std::sync::Arc::clone(&reservation_objects),
                     ),
                 ))
+                .await
                 .unwrap();
 
             let first = coord
@@ -1043,11 +1050,12 @@ mod recovery {
             .await
             .unwrap();
         restarted
-            .set_decision_store(std::sync::Arc::new(
+            .bind_durable_decision_store(std::sync::Arc::new(
                 laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
                     reservation_objects,
                 ),
             ))
+            .await
             .unwrap();
 
         let third = restarted
@@ -1077,7 +1085,7 @@ mod recovery {
                 metadata: HashMap::new(),
             },
         );
-        store.save(&manifest).await.unwrap();
+        save_finalized(&store, &manifest).await;
 
         let manifest = store.load_latest().await.unwrap().unwrap();
 

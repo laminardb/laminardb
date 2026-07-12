@@ -119,9 +119,14 @@ pub fn slice_batch_by_targets(
 
     let mut local_groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut remote_groups: FxHashMap<NodeId, (Vec<u32>, Vec<u32>)> = FxHashMap::default();
+    let assignment = registry.snapshot();
 
     for (row_idx, &vnode) in row_vnodes.iter().enumerate() {
-        let owner = registry.owner(vnode);
+        let owner = usize::try_from(vnode)
+            .ok()
+            .and_then(|vnode| assignment.get(vnode))
+            .copied()
+            .unwrap_or(NodeId::UNASSIGNED);
         if owner == self_id {
             local_groups.entry(vnode).or_default().push(row_idx as u32);
         } else if !owner.is_unassigned() {

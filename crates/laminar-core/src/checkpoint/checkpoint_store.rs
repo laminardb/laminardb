@@ -284,11 +284,13 @@ pub trait CheckpointStore: Send + Sync {
     /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
     async fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError>;
 
-    /// Loads the most recent checkpoint manifest, or `Ok(None)` on a
-    /// fresh store.
+    /// Loads the most recent checkpoint manifest, or `Ok(None)` when the
+    /// recovery pointer does not exist in a fresh store.
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure.
+    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure, or
+    /// when an existing recovery pointer is malformed, dangling, or references
+    /// anything other than the matching Finalized manifest.
     async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
     /// Loads a specific manifest, or `Ok(None)` if absent.
@@ -376,8 +378,10 @@ pub trait CheckpointStore: Send + Sync {
         }
         if manifest.durable_phase == DurableCheckpointPhase::Prepared {
             manifest.durable_phase = DurableCheckpointPhase::Finalized;
-            self.save(&manifest).await?;
         }
+        // Save even when the manifest was already Finalized: a crash may have landed that phase
+        // transition but not its recovery pointer, and finalize is the repair operation.
+        self.save(&manifest).await?;
         Ok(manifest)
     }
 
@@ -717,18 +721,10 @@ impl FileSystemCheckpointStore {
     /// Read the recovery pointer without loading its manifest. Retention must
     /// preserve this exact ID even if newer prepared attempts sort after it.
     async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
-        let content = match tokio::fs::read_to_string(self.latest_path()).await {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let id = Self::parse_checkpoint_id(content.trim()).ok_or_else(|| {
-            CheckpointStoreError::Invalid(format!(
-                "invalid checkpoint recovery pointer {:?}",
-                content.trim()
-            ))
-        })?;
-        Ok(Some(id))
+        Ok(self
+            .load_latest()
+            .await?
+            .map(|manifest| manifest.checkpoint_id))
     }
 
     /// Parses a checkpoint ID from a directory name like `checkpoint_000042`.
@@ -844,6 +840,16 @@ impl CheckpointStore for FileSystemCheckpointStore {
         }
 
         // Update latest.txt pointer only after a finalized manifest is durable.
+        if let Some(existing) = self.load_latest().await? {
+            if existing.checkpoint_id > manifest.checkpoint_id {
+                tracing::warn!(
+                    current = existing.checkpoint_id,
+                    ours = manifest.checkpoint_id,
+                    "[LDB-6010] latest.txt already points at a newer checkpoint; skipping stale pointer update"
+                );
+                return Ok(());
+            }
+        }
         let latest = self.latest_path();
         let latest_dir = latest.parent().unwrap_or(Path::new(".")).to_path_buf();
         tokio::fs::create_dir_all(&latest_dir).await?;
@@ -864,14 +870,39 @@ impl CheckpointStore for FileSystemCheckpointStore {
             Err(e) => return Err(e.into()),
         };
         let dir_name = content.trim();
-        if dir_name.is_empty() {
-            return Ok(None);
+        let checkpoint_id = Self::parse_checkpoint_id(dir_name).ok_or_else(|| {
+            CheckpointStoreError::Invalid(format!(
+                "invalid checkpoint recovery pointer {dir_name:?}"
+            ))
+        })?;
+        let manifest = self.load_by_id(checkpoint_id).await?.ok_or_else(|| {
+            CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer references missing checkpoint {checkpoint_id}"
+            ))
+        })?;
+        if manifest.checkpoint_id != checkpoint_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer {checkpoint_id} references manifest {}",
+                manifest.checkpoint_id
+            )));
         }
-
-        match Self::parse_checkpoint_id(dir_name) {
-            Some(id) => self.load_by_id(id).await,
-            None => Ok(None),
+        if manifest.durable_phase != DurableCheckpointPhase::Finalized {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer references non-finalized checkpoint {checkpoint_id}"
+            )));
         }
+        let errors = manifest.validate(self.vnode_count());
+        if !errors.is_empty() {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer {checkpoint_id} references an invalid manifest: {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
+        Ok(Some(manifest))
     }
 
     async fn load_by_id(
@@ -1136,11 +1167,10 @@ impl ObjectStoreCheckpointStore {
     /// Read the recovery pointer without loading its manifest. Retention must
     /// preserve this exact ID even if newer prepared attempts sort after it.
     async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
-        let Some(data) = self.get_bytes(&self.latest_pointer_path()).await? else {
-            return Ok(None);
-        };
-        let pointer: LatestPointer = serde_json::from_slice(&data)?;
-        Ok(Some(pointer.checkpoint_id))
+        Ok(self
+            .load_latest()
+            .await?
+            .map(|manifest| manifest.checkpoint_id))
     }
 
     // ── Helpers ──
@@ -1342,17 +1372,15 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         // still race past this check, but cross-leader stomps from a
         // delayed ex-leader are caught.
         let latest = self.latest_pointer_path();
-        if let Some(current) = self.get_bytes(&latest).await? {
-            if let Ok(existing) = serde_json::from_slice::<LatestPointer>(&current) {
-                if existing.checkpoint_id > manifest.checkpoint_id {
-                    tracing::warn!(
-                        current = existing.checkpoint_id,
-                        ours = manifest.checkpoint_id,
-                        "[LDB-6010] latest.json already points at a newer checkpoint — \
-                         skipping pointer update (possible split-brain or delayed writer)"
-                    );
-                    return Ok(());
-                }
+        if let Some(existing) = self.load_latest().await? {
+            if existing.checkpoint_id > manifest.checkpoint_id {
+                tracing::warn!(
+                    current = existing.checkpoint_id,
+                    ours = manifest.checkpoint_id,
+                    "[LDB-6010] latest.json already points at a newer checkpoint — \
+                     skipping pointer update (possible split-brain or delayed writer)"
+                );
+                return Ok(());
             }
         }
         let pointer = serde_json::to_string(&LatestPointer {
@@ -1393,26 +1421,22 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
                     .join("; "),
             ));
         }
-        if manifest.durable_phase == DurableCheckpointPhase::Finalized {
-            return Ok(manifest);
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            manifest.durable_phase = DurableCheckpointPhase::Finalized;
+            let json = serde_json::to_string_pretty(&manifest)?;
+            let path = self.manifest_path(manifest.checkpoint_id);
+            let payload = PutPayload::from_bytes(bytes::Bytes::from(json));
+
+            // Unconditional PUT — this is the one allowed Prepared → Finalized transition.
+            self.store
+                .put_opts(&path, payload, PutOptions::default())
+                .await?;
         }
 
-        manifest.durable_phase = DurableCheckpointPhase::Finalized;
-        let json = serde_json::to_string_pretty(&manifest)?;
-        let path = self.manifest_path(manifest.checkpoint_id);
-        let payload = PutPayload::from_bytes(bytes::Bytes::from(json));
-
-        // Unconditional PUT — overwrites the existing manifest.
-        self.store
-            .put_opts(&path, payload, PutOptions::default())
-            .await?;
-
         let latest = self.latest_pointer_path();
-        if let Some(current) = self.get_bytes(&latest).await? {
-            if let Ok(existing) = serde_json::from_slice::<LatestPointer>(&current) {
-                if existing.checkpoint_id > manifest.checkpoint_id {
-                    return Ok(manifest);
-                }
+        if let Some(existing) = self.load_latest().await? {
+            if existing.checkpoint_id > manifest.checkpoint_id {
+                return Ok(manifest);
             }
         }
         let pointer = serde_json::to_string(&LatestPointer {
@@ -1431,7 +1455,40 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
         if let Some(data) = self.get_bytes(&self.latest_pointer_path()).await? {
             let pointer: LatestPointer = serde_json::from_slice(&data)?;
-            return self.load_by_id(pointer.checkpoint_id).await;
+            let manifest = self
+                .load_by_id(pointer.checkpoint_id)
+                .await?
+                .ok_or_else(|| {
+                    CheckpointStoreError::Invalid(format!(
+                        "checkpoint recovery pointer references missing checkpoint {}",
+                        pointer.checkpoint_id
+                    ))
+                })?;
+            if manifest.checkpoint_id != pointer.checkpoint_id {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint recovery pointer {} references manifest {}",
+                    pointer.checkpoint_id, manifest.checkpoint_id
+                )));
+            }
+            if manifest.durable_phase != DurableCheckpointPhase::Finalized {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint recovery pointer references non-finalized checkpoint {}",
+                    pointer.checkpoint_id
+                )));
+            }
+            let errors = manifest.validate(self.vnode_count());
+            if !errors.is_empty() {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint recovery pointer {} references an invalid manifest: {}",
+                    pointer.checkpoint_id,
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )));
+            }
+            return Ok(Some(manifest));
         }
 
         Ok(None)
@@ -1639,7 +1696,9 @@ mod tests {
         let finalized = store.finalize(1).await.unwrap();
         assert_eq!(finalized.durable_phase, DurableCheckpointPhase::Finalized);
         assert_eq!(store.load_latest().await.unwrap().unwrap().checkpoint_id, 1);
+        std::fs::remove_file(dir.path().join("checkpoints/latest.txt")).unwrap();
         assert_eq!(store.finalize(1).await.unwrap(), finalized);
+        assert_eq!(store.load_latest().await.unwrap(), Some(finalized));
     }
 
     #[tokio::test]
@@ -1783,7 +1842,7 @@ mod tests {
             .insert("window".into(), OperatorCheckpoint::inline(b"data"));
         m.watermark = Some(999_000);
 
-        store.save(&m).await.unwrap();
+        store.save_with_state(&m, None).await.unwrap();
 
         let loaded = store.load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint_id, 1);
@@ -1801,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_latest_txt() {
+    async fn test_empty_latest_txt_is_invalid() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
@@ -1809,7 +1868,10 @@ mod tests {
         std::fs::create_dir_all(&cp_dir).unwrap();
         std::fs::write(cp_dir.join("latest.txt"), "").unwrap();
 
-        assert!(store.load_latest().await.unwrap().is_none());
+        let error = store.load_latest().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid checkpoint recovery pointer"));
     }
 
     #[tokio::test]
@@ -1821,7 +1883,10 @@ mod tests {
         std::fs::create_dir_all(&cp_dir).unwrap();
         std::fs::write(cp_dir.join("latest.txt"), "checkpoint_000099").unwrap();
 
-        assert!(store.load_latest().await.unwrap().is_none());
+        let error = store.load_latest().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("recovery pointer references missing checkpoint 99"));
     }
 
     #[tokio::test]
@@ -2134,6 +2199,14 @@ mod tests {
         let finalized = store.finalize(7).await.unwrap();
 
         assert_eq!(finalized.durable_phase, DurableCheckpointPhase::Finalized);
+        assert_eq!(store.load_latest().await.unwrap(), Some(finalized.clone()));
+        store
+            .store
+            .delete(&store.latest_pointer_path())
+            .await
+            .unwrap();
+        assert!(store.load_latest().await.unwrap().is_none());
+        assert_eq!(store.finalize(7).await.unwrap(), finalized);
         assert_eq!(store.load_latest().await.unwrap(), Some(finalized));
     }
 
@@ -2177,6 +2250,47 @@ mod tests {
 
         let pointer: super::LatestPointer = serde_json::from_slice(&data).unwrap();
         assert_eq!(pointer.checkpoint_id, 5);
+    }
+
+    #[tokio::test]
+    async fn test_obj_latest_pointing_to_missing_checkpoint_is_invalid() {
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
+        let pointer = serde_json::to_vec(&LatestPointer { checkpoint_id: 99 }).unwrap();
+        inner
+            .put_opts(
+                &object_store::path::Path::from("manifests/latest.json"),
+                PutPayload::from_bytes(bytes::Bytes::from(pointer)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let error = store.load_latest().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("recovery pointer references missing checkpoint 99"));
+    }
+
+    #[tokio::test]
+    async fn test_obj_latest_pointing_to_prepared_checkpoint_is_invalid() {
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
+        store.save(&CheckpointManifest::new(7, 7)).await.unwrap();
+        let pointer = serde_json::to_vec(&LatestPointer { checkpoint_id: 7 }).unwrap();
+        inner
+            .put_opts(
+                &object_store::path::Path::from("manifests/latest.json"),
+                PutPayload::from_bytes(bytes::Bytes::from(pointer)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let error = store.load_latest().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("recovery pointer references non-finalized checkpoint 7"));
     }
 
     #[tokio::test]

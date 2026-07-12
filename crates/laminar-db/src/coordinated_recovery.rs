@@ -1,10 +1,10 @@
 //! Leader-coordinated global restart-to-epoch on a fatal fault (cluster mode; always on).
 //!
 //! Two-phase, stop-the-world: the leader announces `Prepare` (every node stops and acks), reads
-//! the rewind target from the now-quiesced decision store, truncates every durable artifact above
-//! it (the resumed pipeline reuses epoch numbers, so the abandoned timeline must not survive),
-//! then announces `Start`. No committed epoch means target 0 — a fresh start from initial offsets.
-//! No node resumes intake until the whole round has restored and the assignment has settled.
+//! the recovery target from the now-quiesced decision store, then announces `Start`. Prepared
+//! artifacts above that decision are unusable without a matching decision and normal retention
+//! collects them. No committed epoch means target 0 — a fresh start from initial offsets. No node
+//! resumes intake until the whole round has restored and the assignment has settled.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -35,7 +35,7 @@ const SELF_RESTORE_ATTEMPTS: u32 = 3;
 /// Recovery generation, max-wins across leader change so a round keeps a stable id.
 const RECOVERY_GEN_KEY: &str = "control:recovery-gen";
 
-/// Rewind target meaning "no committed cut exists": truncate everything and start fresh.
+/// Recovery target meaning "no committed cut exists": start fresh.
 const GENESIS: u64 = 0;
 
 /// Boot-unique so a second kill of a node never reports the value the leader already handled
@@ -118,7 +118,13 @@ impl RecoveryMonitor {
                 if gen > self.applied_gen && self.stopped_for.map(|(g, _)| g) != Some(gen) =>
             {
                 controller.set_recovering(true);
-                stop_and_purge(db).await;
+                if !stop_and_purge(db).await {
+                    tracing::error!(
+                        gen,
+                        "recovery prepare could not quiesce this node; withholding stopped acknowledgement"
+                    );
+                    return;
+                }
                 controller.announce_stopped(gen).await;
                 self.stopped_for = Some((gen, tokio::time::Instant::now()));
                 tracing::warn!(gen, "stopped for recovery round; awaiting target");
@@ -131,7 +137,13 @@ impl RecoveryMonitor {
                     db.purge_shuffle_receiver_buffers();
                 } else {
                     // Missed the prepare (joined late / slow poll) — stop now.
-                    stop_and_purge(db).await;
+                    if !stop_and_purge(db).await {
+                        tracing::error!(
+                            gen,
+                            "recovery start could not quiesce this node; refusing restore"
+                        );
+                        return;
+                    }
                 }
                 if self.restore_and_ack(db, controller, epoch, gen).await {
                     // Nobody emits at the new generation until everyone is at it, so a peer's
@@ -146,7 +158,7 @@ impl RecoveryMonitor {
                     // Unfence before the settle wait: the rotation it waits on must checkpoint.
                     controller.set_recovering(false);
                     if !quorum || !await_assignment_settled(db, controller).await {
-                        hold_intake(db, gen, quorum);
+                        hold_intake_and_request_retry(db, controller, gen, quorum).await;
                         return;
                     }
                     log_release_diagnostic(db, controller, gen, epoch);
@@ -187,11 +199,9 @@ impl RecoveryMonitor {
         pending
     }
 
-    /// Leader: stop the world, fix the target against the quiesced store, truncate the
-    /// abandoned timeline, then restart the world. Always releases the fence and retires the
-    /// announcement on exit (so an incomplete round can't leave a stale target for a later
-    /// restart to replay); an incomplete round bumps `coordinated_recovery_failures_total`
-    /// and relies on a still-faulted node re-triggering.
+    /// Leader: stop the world, fix the target against the quiesced decision store, then restart
+    /// the world. An incomplete round retains the intake fence, bumps
+    /// `coordinated_recovery_failures_total`, and leaves its fault pending for a complete retry.
     #[allow(clippy::too_many_lines)]
     async fn drive_round(
         &mut self,
@@ -217,7 +227,14 @@ impl RecoveryMonitor {
         controller.set_recovering(true);
         controller.announce_recover_prepare(gen_id).await;
         tracing::warn!(gen = gen_id, "leader announced recovery prepare");
-        stop_and_purge(db).await;
+        if !stop_and_purge(db).await {
+            tracing::error!(
+                gen = gen_id,
+                "leader could not quiesce its decision writer; abandoning recovery round"
+            );
+            self.abandon_round(db, controller, gen_id).await;
+            return;
+        }
         controller.announce_stopped(gen_id).await;
         // Peers must observe `Prepare` and ack `stopped` before `Start`, or a driver with a stale
         // membership view races the whole round through in under a poll interval.
@@ -230,12 +247,19 @@ impl RecoveryMonitor {
         )
         .await
         {
-            // Bounded wait: a straggler catches up at `Start` or via its orphan fallback.
-            tracing::warn!(gen = gen_id, "stop quorum timed out; proceeding");
+            // A straggler can still publish an ambiguous decision/state write, so selecting a
+            // recovery cut without every round participant stopped would violate the exact-cut
+            // premise and could resurrect a live timeline.
+            tracing::error!(
+                gen = gen_id,
+                "stop quorum timed out; abandoning recovery round"
+            );
+            self.abandon_round(db, controller, gen_id).await;
+            return;
         }
 
-        // The world is stopped: the decision store is quiescent, so this read IS the cut —
-        // no seal fallback, no probe. No committed epoch means a fresh start.
+        // The world is stopped: the decision store is quiescent, so this read IS the cut — no
+        // seal fallback and no probe. No committed epoch means a fresh start.
         let target = match read_committed_cut(db).await {
             Ok(cut) => cut.unwrap_or(GENESIS),
             Err(e) => {
@@ -244,16 +268,9 @@ impl RecoveryMonitor {
                 return;
             }
         };
-        // Truncation must succeed before anyone restarts: the resumed pipeline reuses epoch
-        // numbers above the target, and the adopt path's offset cut reads the durable seal.
-        let backend = db.state_backend.lock().clone();
-        if let Some(b) = backend {
-            if let Err(e) = b.truncate_after(target).await {
-                tracing::error!(error = %e, gen = gen_id, target, "truncate failed; abandoning round");
-                self.abandon_round(db, controller, gen_id).await;
-                return;
-            }
-        }
+        // Prepared state above the decision is harmless: every object is namespaced by its
+        // globally unique checkpoint ID and every recovery/adoption read is decision-bound.
+        // Background retention collects abandoned attempts without an O(store) rewind scan.
         for (node, seq) in pending {
             self.handled_faults.insert(node, seq);
         }
@@ -295,7 +312,7 @@ impl RecoveryMonitor {
         // Sources stay gated across the rotation so vnodes move with no data in flight. Releasing
         // without a full restore would emit at a generation the stragglers haven't reached.
         if !quorum_met || !await_assignment_settled(db, controller).await {
-            hold_intake(db, gen_id, quorum_met);
+            hold_intake_and_request_retry(db, controller, gen_id, quorum_met).await;
             controller.clear_recover().await;
             return;
         }
@@ -320,8 +337,9 @@ impl RecoveryMonitor {
         );
     }
 
-    /// Undo a round that failed before `Start`: retire the announcement, restart the leader
-    /// plainly. Faults were not marked handled, so the next poll retries with a fresh gen.
+    /// Retire a round that failed before `Start` and restart only the leader's control loop.
+    /// Intake remains fenced because peers may already be stopped. Faults are not marked handled,
+    /// so the next poll retries the complete round with a fresh generation.
     async fn abandon_round(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -332,12 +350,12 @@ impl RecoveryMonitor {
             m.coordinated_recovery_failures_total.inc();
         }
         controller.clear_recover().await;
+        db.set_source_gate(true);
         start_pipeline(db, None).await;
-        db.set_source_gate(false);
         controller.set_recovering(false);
         tracing::error!(
             gen = gen_id,
-            "coordinated recovery round abandoned before start"
+            "coordinated recovery round abandoned before start; intake remains fenced"
         );
     }
 
@@ -354,7 +372,8 @@ impl RecoveryMonitor {
         // node that restarts first would shuffle into peers whose receivers haven't rebound.
         db.set_source_gate(true);
         if !start_pipeline(db, Some(target)).await {
-            db.set_source_gate(false);
+            // Starting from the selected cut failed. Keep intake fenced while `Start` remains
+            // visible so the next monitor tick can retry without exposing pre-recovery state.
             return false;
         }
         // Bump before the gate opens so a peer's pre-rewind frames are discarded on arrival rather
@@ -373,16 +392,16 @@ impl RecoveryMonitor {
 }
 
 /// Stop the pipeline and drop buffered shuffle input, on a dedicated thread (lifecycle
-/// futures are `!Send`). A faulted node is already stopped, so stop errors are ignored.
-async fn stop_and_purge(db: &Arc<LaminarDB>) {
+/// futures are `!Send`). `true` means the runtime and every owned decision writer are quiescent.
+async fn stop_and_purge(db: &Arc<LaminarDB>) -> bool {
     run_lifecycle(db, |db| async move {
-        let _ = db.stop_pipeline().await;
+        db.stop_pipeline().await?;
         // Pre-rewind shuffle slices are stale: their senders rewind and replay them, so
         // folding a buffered copy after the rewind double-counts.
         db.purge_shuffle_receiver_buffers();
         Ok(())
     })
-    .await;
+    .await
 }
 
 /// Start the pipeline, rewinding to `target` when given. `true` on a clean start.
@@ -437,8 +456,8 @@ fn assignment_reflects_membership(db: &Arc<LaminarDB>, controller: &ClusterContr
         return true;
     };
     let mut owners: FxHashSet<u64> = FxHashSet::default();
-    for v in 0..reg.vnode_count() {
-        let owner = reg.owner(v);
+    let assignment = reg.snapshot();
+    for owner in assignment.iter().copied() {
         if owner.0 == 0 {
             return false; // unassigned vnode: rotation still in flight
         }
@@ -474,17 +493,26 @@ async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterContr
     false
 }
 
-/// Fail closed: resuming without the whole round restored, or against a stale assignment, either
-/// drops this node's frames at rewound peers or double-counts them. Holding is the safe half.
-fn hold_intake(db: &Arc<LaminarDB>, gen_id: u64, quorum: bool) {
+/// Fail closed and make the hold live: resuming without the whole round restored, or against a
+/// stale assignment, either drops this node's frames at rewound peers or double-counts them. A
+/// fresh fault forces a new stop/restore generation; otherwise a fully restored round whose
+/// assignment never settled could retire its announcement and leave every source gated forever.
+async fn hold_intake_and_request_retry(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    gen_id: u64,
+    quorum: bool,
+) {
+    db.set_source_gate(true);
     if let Some(m) = db.engine_metrics.lock().clone() {
         m.coordinated_recovery_failures_total.inc();
     }
     tracing::error!(
         gen = gen_id,
         restore_quorum = quorum,
-        "holding intake shut: the round did not fully restore, or the rotation never landed"
+        "holding intake shut and requesting a fresh recovery round"
     );
+    report_fresh_fault(controller).await;
 }
 
 /// Per-node snapshot at gate release; a cross-node diff at the same `gen` shows whether every node
@@ -524,12 +552,17 @@ async fn read_committed_cut(db: &LaminarDB) -> Result<Option<u64>, String> {
     // Bind the clone before awaiting — an if-let scrutinee would hold the lock guard across it.
     let ds = db.decision_store.lock().clone();
     match ds {
-        Some(ds) => ds
-            .highest_committed()
-            .await
-            .map(|decision| decision.map(|d| d.epoch))
-            .map_err(|e| e.to_string()),
-        None => Ok(None),
+        Some(ds) => {
+            // A durable intent is emitted only after the exact seal. Completing its idempotent
+            // commit create is therefore the only safe way to make progress; merely returning
+            // InDoubt here wedges automatic recovery before startup reconciliation can run.
+            ds.resolve_in_doubt().await.map_err(|e| e.to_string())?;
+            ds.highest_committed()
+                .await
+                .map(|decision| decision.map(|d| d.epoch))
+                .map_err(|e| e.to_string())
+        }
+        None => Err("checkpoint decision store is not configured".into()),
     }
 }
 

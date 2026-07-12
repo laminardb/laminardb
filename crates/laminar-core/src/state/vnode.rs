@@ -18,7 +18,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a node. Also the owner id for vnodes; cluster
@@ -91,10 +91,98 @@ type SourceResumeOffsets = std::collections::HashMap<String, String>;
 #[allow(clippy::disallowed_types)]
 type ResumeOffsets = std::collections::HashMap<String, SourceResumeOffsets>;
 
+#[derive(Clone)]
+enum ResumeHandoff {
+    NoCommittedCut,
+    Committed(Arc<ResumeOffsets>),
+}
+
+/// One immutable publication of vnode ownership and the source cursors that
+/// belong to the same assignment version.
+#[derive(Clone)]
+pub struct VnodeAssignmentSnapshot {
+    version: u64,
+    owners: Arc<[NodeId]>,
+    owner_changed_versions: Arc<[u64]>,
+    resume_handoff: ResumeHandoff,
+}
+
+impl VnodeAssignmentSnapshot {
+    /// Monotonic assignment version for this publication.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Immutable vnode-owner vector for this publication.
+    #[must_use]
+    pub fn owners(&self) -> &[NodeId] {
+        &self.owners
+    }
+
+    /// Version of the last ownership change for `vnode`.
+    #[must_use]
+    pub fn owner_changed_version(&self, vnode: u32) -> Option<u64> {
+        self.owner_changed_versions.get(vnode as usize).copied()
+    }
+
+    /// Whether this publication carries a durable decided checkpoint cut.
+    #[must_use]
+    pub const fn has_committed_handoff(&self) -> bool {
+        matches!(self.resume_handoff, ResumeHandoff::Committed(_))
+    }
+
+    /// Connector-defined handoff offsets for one source, bound to this version.
+    #[must_use]
+    pub fn resume_offsets_for(&self, source: &str) -> Arc<SourceResumeOffsets> {
+        let offsets = match &self.resume_handoff {
+            ResumeHandoff::NoCommittedCut => None,
+            ResumeHandoff::Committed(offsets) => offsets.get(source),
+        };
+        Arc::new(offsets.cloned().unwrap_or_default())
+    }
+}
+
+/// Read guard that pins one assignment publication while a source captures a
+/// data batch or checkpoint cursor.
+pub struct VnodeAssignmentReadGuard<'a>(RwLockReadGuard<'a, VnodeAssignmentSnapshot>);
+
+impl std::ops::Deref for VnodeAssignmentReadGuard<'_> {
+    type Target = VnodeAssignmentSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+fn changed_owner_versions(
+    current: &VnodeAssignmentSnapshot,
+    next_owners: &[NodeId],
+    next_version: u64,
+) -> Arc<[u64]> {
+    current
+        .owners
+        .iter()
+        .zip(next_owners)
+        .enumerate()
+        .map(|(vnode, (current_owner, next_owner))| {
+            if current_owner == next_owner {
+                current.owner_changed_versions[vnode]
+            } else {
+                next_version
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
     vnode_count: u32,
-    assignment: RwLock<Arc<[NodeId]>>,
+    assignment: RwLock<VnodeAssignmentSnapshot>,
+    /// Lock-free observation fence for hot runtime readiness checks. The
+    /// authoritative version also lives inside `assignment`, where it is bound
+    /// to owners and handoff cursors.
     assignment_version: AtomicU64,
     /// Per-vnode lifecycle, indexed by vnode id. `0` = `Active`,
     /// `1` = `Restoring`. Lock-free: rebalance flips individual entries
@@ -109,12 +197,6 @@ pub struct VnodeRegistry {
     /// change lock-free without an assignment-version bump.
     draining: Arc<[AtomicBool]>,
     draining_generation: AtomicU64,
-    /// Opaque source-checkpoint offsets (connector-defined key/value strings)
-    /// staged by the engine just before an assignment-version bump. A partitioned
-    /// source reads them on rebind to resume partitions it is acquiring from the
-    /// previous owner's sealed position instead of `auto.offset.reset`. The engine
-    /// stays connector-agnostic; the source interprets the keys.
-    resume_offsets: parking_lot::Mutex<Arc<ResumeOffsets>>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -144,12 +226,18 @@ impl VnodeRegistry {
                 .into();
         Self {
             vnode_count,
-            assignment: RwLock::new(assignment),
+            assignment: RwLock::new(VnodeAssignmentSnapshot {
+                version: 1,
+                owners: assignment,
+                owner_changed_versions: std::iter::repeat_n(1, vnode_count as usize)
+                    .collect::<Vec<_>>()
+                    .into(),
+                resume_handoff: ResumeHandoff::NoCommittedCut,
+            }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
             draining: new_draining(vnode_count),
             draining_generation: AtomicU64::new(0),
-            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
     }
 
@@ -161,6 +249,13 @@ impl VnodeRegistry {
     #[must_use]
     pub fn new_unassigned(vnode_count: u32) -> Self {
         let registry = Self::new(vnode_count);
+        {
+            let mut initial = registry.assignment.write();
+            initial.version = 0;
+            initial.owner_changed_versions = std::iter::repeat_n(0, vnode_count as usize)
+                .collect::<Vec<_>>()
+                .into();
+        }
         registry.assignment_version.store(0, Ordering::Release);
         registry
     }
@@ -179,36 +274,19 @@ impl VnodeRegistry {
             .into();
         Self {
             vnode_count,
-            assignment: RwLock::new(assignment),
+            assignment: RwLock::new(VnodeAssignmentSnapshot {
+                version: 1,
+                owners: assignment,
+                owner_changed_versions: std::iter::repeat_n(1, vnode_count as usize)
+                    .collect::<Vec<_>>()
+                    .into(),
+                resume_handoff: ResumeHandoff::NoCommittedCut,
+            }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
             draining: new_draining(vnode_count),
             draining_generation: AtomicU64::new(0),
-            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
-    }
-
-    /// Stage opaque source-checkpoint offsets for the next rebind. MUST be called
-    /// before [`set_assignment_and_version`](Self::set_assignment_and_version) so
-    /// the source observes them. Replaces any prior staging, including with an
-    /// empty successful cut. Callers propagate load failures and must not invoke
-    /// this method for a failed read; retaining an older non-empty cut when the
-    /// authoritative cut is empty would seek acquired partitions to stale data.
-    pub fn stage_resume_offsets(&self, offsets: ResumeOffsets) {
-        *self.resume_offsets.lock() = Arc::new(offsets);
-    }
-
-    /// The staged offsets for one source instance. Reads do not drain, so repeated partition
-    /// assignment callbacks for that source observe the same committed snapshot.
-    #[must_use]
-    pub fn resume_offsets_for(&self, source: &str) -> Arc<SourceResumeOffsets> {
-        Arc::new(
-            self.resume_offsets
-                .lock()
-                .get(source)
-                .cloned()
-                .unwrap_or_default(),
-        )
     }
 
     /// Number of vnodes.
@@ -230,14 +308,26 @@ impl VnodeRegistry {
         if vnode >= self.vnode_count {
             return NodeId::UNASSIGNED;
         }
-        self.assignment.read()[vnode as usize]
+        self.assignment.read().owners[vnode as usize]
     }
 
     /// Snapshot the current assignment vector. Cheap — internally an
     /// `Arc::clone`.
     #[must_use]
     pub fn snapshot(&self) -> Arc<[NodeId]> {
-        Arc::clone(&self.assignment.read())
+        Arc::clone(&self.assignment.read().owners)
+    }
+
+    /// Consistent ownership, version, and source-handoff publication.
+    #[must_use]
+    pub fn versioned_snapshot(&self) -> VnodeAssignmentSnapshot {
+        self.assignment.read().clone()
+    }
+
+    /// Pin the current publication for a short, non-blocking source capture.
+    #[must_use]
+    pub fn read_assignment(&self) -> VnodeAssignmentReadGuard<'_> {
+        VnodeAssignmentReadGuard(self.assignment.read())
     }
 
     /// Replace the full assignment and bump the version.
@@ -252,8 +342,20 @@ impl VnodeRegistry {
             new_assignment.len(),
             self.vnode_count,
         );
-        *self.assignment.write() = new_assignment;
-        self.assignment_version.fetch_add(1, Ordering::AcqRel);
+        let mut current = self.assignment.write();
+        let version = current
+            .version
+            .checked_add(1)
+            .expect("assignment version overflow");
+        let owner_changed_versions = changed_owner_versions(&current, &new_assignment, version);
+        *current = VnodeAssignmentSnapshot {
+            version,
+            owners: new_assignment,
+            owner_changed_versions,
+            resume_handoff: ResumeHandoff::NoCommittedCut,
+        };
+        self.assignment_version
+            .store(current.version, Ordering::Release);
     }
 
     /// Replace the full assignment and set the version to `version`
@@ -264,6 +366,43 @@ impl VnodeRegistry {
     /// Panics on length mismatch, or if `version` is less than the
     /// current one (assignment versions are monotonic).
     pub fn set_assignment_and_version(&self, new_assignment: Arc<[NodeId]>, version: u64) {
+        self.publish_assignment(new_assignment, version, Some(ResumeHandoff::NoCommittedCut));
+    }
+
+    /// Atomically publish ownership, its monotonic version, and the sealed
+    /// connector cursors used by sources acquiring partitions in that version.
+    ///
+    /// # Panics
+    /// Panics on length mismatch or version regression.
+    pub fn set_assignment_and_version_with_resume_offsets(
+        &self,
+        new_assignment: Arc<[NodeId]>,
+        version: u64,
+        resume_offsets: ResumeOffsets,
+    ) {
+        self.publish_assignment(
+            new_assignment,
+            version,
+            Some(ResumeHandoff::Committed(Arc::new(resume_offsets))),
+        );
+    }
+
+    /// Publish a version that does not acquire local ownership while retaining
+    /// the prior version-bound handoff until the source has reconciled it.
+    pub fn set_assignment_and_version_carrying_resume_offsets(
+        &self,
+        new_assignment: Arc<[NodeId]>,
+        version: u64,
+    ) {
+        self.publish_assignment(new_assignment, version, None);
+    }
+
+    fn publish_assignment(
+        &self,
+        new_assignment: Arc<[NodeId]>,
+        version: u64,
+        resume_handoff: Option<ResumeHandoff>,
+    ) {
         assert_eq!(
             new_assignment.len(),
             self.vnode_count as usize,
@@ -272,12 +411,19 @@ impl VnodeRegistry {
             self.vnode_count,
         );
         let mut guard = self.assignment.write();
-        let current = self.assignment_version.load(Ordering::Acquire);
+        let current = guard.version;
         assert!(
-            version >= current,
-            "assignment version must be monotonic: got {version}, current {current}",
+            version > current,
+            "assignment version must advance: got {version}, current {current}",
         );
-        *guard = new_assignment;
+        let owner_changed_versions = changed_owner_versions(&guard, &new_assignment, version);
+        let resume_handoff = resume_handoff.unwrap_or_else(|| guard.resume_handoff.clone());
+        *guard = VnodeAssignmentSnapshot {
+            version,
+            owners: new_assignment,
+            owner_changed_versions,
+            resume_handoff,
+        };
         self.assignment_version.store(version, Ordering::Release);
     }
 
@@ -528,8 +674,12 @@ pub fn owners_per_domain(
 /// `seal_checkpoint` gate to know the full set to check.
 #[must_use]
 pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
-    (0..registry.vnode_count())
-        .filter(|&v| registry.owner(v) == owner)
+    let assignment = registry.snapshot();
+    assignment
+        .iter()
+        .enumerate()
+        .filter(|(_, assigned)| **assigned == owner)
+        .filter_map(|(vnode, _)| u32::try_from(vnode).ok())
         .collect()
 }
 
@@ -537,8 +687,10 @@ pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
 /// node fans checkpoint barriers and shuffle data out to.
 #[must_use]
 pub fn peer_owners(registry: &VnodeRegistry, self_id: NodeId) -> Vec<NodeId> {
-    let mut peers: Vec<NodeId> = (0..registry.vnode_count())
-        .map(|v| registry.owner(v))
+    let assignment = registry.snapshot();
+    let mut peers: Vec<NodeId> = assignment
+        .iter()
+        .copied()
         .filter(|o| !o.is_unassigned() && *o != self_id)
         .collect();
     peers.sort_unstable();
@@ -603,22 +755,69 @@ mod tests {
 
     #[test]
     fn empty_resume_cut_replaces_stale_handoff_offsets() {
-        let r = VnodeRegistry::new(4);
+        let r = VnodeRegistry::new_unassigned(4);
+        let owners = r.snapshot();
         let mut offsets = ResumeOffsets::new();
         offsets.insert(
             "orders".into(),
             SourceResumeOffsets::from([("orders:0".into(), "41".into())]),
         );
-        r.stage_resume_offsets(offsets);
+        r.set_assignment_and_version_with_resume_offsets(Arc::clone(&owners), 1, offsets);
+        let version_one = r.versioned_snapshot();
+        assert_eq!(version_one.version(), 1);
+        assert!(version_one.has_committed_handoff());
         assert_eq!(
-            r.resume_offsets_for("orders")
+            version_one
+                .resume_offsets_for("orders")
                 .get("orders:0")
                 .map(String::as_str),
             Some("41")
         );
 
-        r.stage_resume_offsets(ResumeOffsets::new());
-        assert!(r.resume_offsets_for("orders").is_empty());
+        r.set_assignment_and_version_with_resume_offsets(owners, 2, ResumeOffsets::new());
+        let published = r.versioned_snapshot();
+        assert_eq!(published.version(), 2);
+        assert!(published.resume_offsets_for("orders").is_empty());
+        assert_eq!(
+            version_one
+                .resume_offsets_for("orders")
+                .get("orders:0")
+                .map(String::as_str),
+            Some("41"),
+            "older immutable publications keep their version-bound handoff"
+        );
+    }
+
+    #[test]
+    fn owner_generations_and_handoff_survive_skipped_publications() {
+        let r = VnodeRegistry::new_unassigned(1);
+        let self_id = NodeId(7);
+        let other = NodeId(8);
+        let offsets = ResumeOffsets::from([(
+            "events".to_string(),
+            SourceResumeOffsets::from([("events:0".to_string(), "41".to_string())]),
+        )]);
+        r.set_assignment_and_version_with_resume_offsets(vec![self_id].into(), 1, offsets);
+        r.set_assignment_and_version_carrying_resume_offsets(vec![other].into(), 2);
+        r.set_assignment_and_version_carrying_resume_offsets(vec![self_id].into(), 3);
+
+        let published = r.versioned_snapshot();
+        assert_eq!(published.owner_changed_version(0), Some(3));
+        assert!(published.has_committed_handoff());
+        assert_eq!(
+            published
+                .resume_offsets_for("events")
+                .get("events:0")
+                .map(String::as_str),
+            Some("41")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assignment version must advance")]
+    fn assignment_publication_rejects_equal_version_mutation() {
+        let r = VnodeRegistry::new(1);
+        r.set_assignment_and_version(vec![NodeId(9)].into(), 1);
     }
 
     #[test]

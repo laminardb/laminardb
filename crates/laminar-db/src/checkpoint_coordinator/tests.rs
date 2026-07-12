@@ -55,6 +55,42 @@ async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
     make_coordinator_with_decision_store(dir).await.0
 }
 
+#[tokio::test(start_paused = true)]
+async fn teardown_timeout_retains_owned_decision_task_until_retry_settles_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let task_release = Arc::clone(&release);
+    coord.pending_decision_write = Some(PendingDecisionWrite {
+        epoch: 9,
+        checkpoint_id: 90,
+        handle: tokio::spawn(async move {
+            task_release.notified().await;
+            Ok::<bool, laminar_core::checkpoint_decision::DecisionError>(true)
+        }),
+    });
+
+    let error = coord
+        .quiesce_pending_decision_write_until(
+            tokio::time::Instant::now() + Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a live remote decision writer must retain the teardown fence");
+    assert!(error.to_string().contains("[LDB-6038]"), "{error}");
+    assert!(
+        coord.pending_decision_write.is_some(),
+        "timeout must retain task ownership rather than detach it"
+    );
+
+    release.notify_one();
+    coord
+        .quiesce_pending_decision_write_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(coord.pending_decision_write.is_none());
+    assert_eq!(coord.highest_decided, 9);
+}
+
 #[cfg(feature = "cluster")]
 async fn make_cluster_coordinator(
     dir: &std::path::Path,
@@ -82,6 +118,27 @@ fn attach_solo_cluster_controller(coord: &mut CheckpointCoordinator, participant
     coord.set_cluster_controller(Arc::new(ClusterController::new(self_id, kv, None, rx)));
 }
 
+#[cfg(feature = "cluster")]
+async fn record_solo_cluster_decision(
+    coord: &CheckpointCoordinator,
+    attempt: CheckpointAttempt,
+    assignment_version: u64,
+) {
+    coord
+        .decision_store
+        .as_ref()
+        .expect("decision store")
+        .record_committed_for_participants(
+            attempt.epoch,
+            attempt.checkpoint_id,
+            &[0],
+            0,
+            assignment_version,
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn test_coordinator_new() {
     let dir = tempfile::tempdir().unwrap();
@@ -89,6 +146,122 @@ async fn test_coordinator_new() {
 
     assert_eq!(coord.epoch(), 1);
     assert_eq!(coord.phase(), CheckpointPhase::Idle);
+}
+
+#[tokio::test]
+async fn kafka_source_cut_must_match_coordinator_assignment_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    coord.set_assignment_version(9);
+
+    let mut kafka = ConnectorCheckpoint::new();
+    kafka.metadata.insert("connector".into(), "kafka".into());
+    let mut request = CheckpointRequest {
+        source_offset_overrides: HashMap::from([("events".to_string(), kafka)]),
+        ..CheckpointRequest::default()
+    };
+    let error = coord
+        .validate_source_assignment_cuts(&request)
+        .expect_err("an unstamped cluster Kafka cut must fail closed");
+    assert!(error.to_string().contains("missing its assignment-version"));
+
+    request
+        .source_offset_overrides
+        .get_mut("events")
+        .unwrap()
+        .metadata
+        .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "8".into());
+    let error = coord
+        .validate_source_assignment_cuts(&request)
+        .expect_err("a stale assignment cut must fail closed");
+    assert!(error.to_string().contains("coordinator requires 9"));
+
+    request
+        .source_offset_overrides
+        .get_mut("events")
+        .unwrap()
+        .metadata
+        .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "9".into());
+    coord
+        .validate_source_assignment_cuts(&request)
+        .expect("matching source and coordinator fences are admissible");
+}
+
+#[cfg(feature = "cluster")]
+async fn assert_follower_kafka_cut_rejected_without_readiness(
+    assignment_fence: Option<&str>,
+    expected_detail: &str,
+) {
+    const PARTICIPANT_ID: u64 = 7;
+    const ASSIGNMENT_VERSION: u64 = 9;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_cluster_coordinator(dir.path(), PARTICIPANT_ID).await;
+    coord.set_assignment_version(ASSIGNMENT_VERSION);
+    let backend = Arc::clone(coord.state_backend.as_ref().expect("state backend"));
+
+    let mut kafka = ConnectorCheckpoint::new();
+    kafka.metadata.insert("connector".into(), "kafka".into());
+    if let Some(fence) = assignment_fence {
+        kafka
+            .metadata
+            .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), fence.into());
+    }
+    let request = CheckpointRequest {
+        source_offset_overrides: HashMap::from([("events".to_string(), kafka)]),
+        ..CheckpointRequest::default()
+    };
+    let attempt = CheckpointAttempt::new(4, 5);
+
+    let error = coord
+        .follower_prepare_acked_until(
+            request,
+            attempt.epoch,
+            attempt.checkpoint_id,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("follower must reject a Kafka cut from another assignment generation");
+    let message = error.to_string();
+    assert!(message.contains("[LDB-6055]"), "{message}");
+    assert!(message.contains(expected_detail), "{message}");
+    assert!(
+        backend
+            .read_commit_descriptor(attempt, &participant_ready_key(PARTICIPANT_ID))
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected follower cut must not publish participant readiness"
+    );
+    assert!(
+        coord
+            .store()
+            .load_by_id(attempt.checkpoint_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "validation must run before the follower manifest is persisted"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_prepare_rejects_unstamped_kafka_cut_before_readiness() {
+    assert_follower_kafka_cut_rejected_without_readiness(
+        None,
+        "missing its assignment-version fence",
+    )
+    .await;
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_prepare_rejects_stale_kafka_cut_before_readiness() {
+    assert_follower_kafka_cut_rejected_without_readiness(
+        Some("8"),
+        "captured assignment version 8, coordinator requires 9",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -849,6 +1022,18 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     let store =
         Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    let decision_store = Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    );
+    for epoch in 1..=4 {
+        decision_store.record_committed(epoch, epoch).await.unwrap();
+    }
+    assert_eq!(decision_store.prune_before(3).await.unwrap(), 3);
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
 
     assert!(coord.follower_finish(4, 4, true).await.unwrap());
     assert_eq!(
@@ -856,11 +1041,28 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
         "local follower retention must not advance the shared state/decision GC horizon"
     );
     assert_eq!(coord.local_manifest_retention_requested_horizon, 3);
+    assert_eq!(
+        decision_store.gc_floor_horizon().await.unwrap(),
+        3,
+        "follower retention must only read, never advance, the shared floor"
+    );
 
     let reader = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
     let ids = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let ids = reader.list_ids().await.unwrap();
+            let ids = match reader.list_ids().await {
+                Ok(ids) => ids,
+                // Windows can report a transient sharing violation while the owned retention
+                // worker removes a directory already returned by ReadDirectoryChanges. Retry the
+                // observation; any persistent or unrelated I/O error still fails the test.
+                Err(CheckpointStoreError::Io(error))
+                    if error.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => panic!("local manifest inventory failed: {error}"),
+            };
             if ids == vec![3, 4] {
                 break ids;
             }
@@ -1621,7 +1823,7 @@ async fn source_offset_handoff_round_trip() {
         .await
         .unwrap();
 
-    // Seal epoch 5 so it becomes the latest committed epoch.
+    // Seal the prepared state, then publish the durable decision that makes it recoverable.
     for v in 0u32..4 {
         backend
             .write_partial(attempt, v, 1, Bytes::from_static(b"x"))
@@ -1632,18 +1834,165 @@ async fn source_offset_handoff_round_trip() {
         .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[participant_ready_key(0)],)
         .await
         .unwrap());
+    record_solo_cluster_decision(&coord, attempt, 1).await;
 
     // A node acquiring events partition 0 on rotation recovers the committed offset.
-    let (acquired_attempt, acquired) = coord
+    let (decision, acquired) = coord
         .acquired_source_handoff()
         .await
         .unwrap()
         .expect("sealed handoff");
-    assert_eq!(acquired_attempt, attempt);
+    assert_eq!(decision.epoch, attempt.epoch);
+    assert_eq!(decision.checkpoint_id, attempt.checkpoint_id);
     assert_eq!(
         acquired.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"100".to_string())
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn source_handoff_ignores_a_newer_undecided_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let decided = CheckpointAttempt::new(4, 5);
+    let prepared = CheckpointAttempt::new(8, 9);
+    let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(1);
+    coord.set_vnode_set(Vec::new());
+    attach_solo_cluster_controller(&mut coord, 0);
+
+    for (attempt, offset) in [(decided, "100"), (prepared, "200")] {
+        let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
+        manifest.participant_id = 0;
+        manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+        manifest.pipeline_identity = coord.expected_pipeline_identity();
+        manifest.source_offsets.insert(
+            "kafka".into(),
+            ConnectorCheckpoint::with_offsets(HashMap::from([("events:0".into(), offset.into())])),
+        );
+        coord
+            .persist_participant_ready_until(
+                attempt,
+                &manifest,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(backend
+            .seal_checkpoint(attempt, 1, &[], &[participant_ready_key(0)])
+            .await
+            .unwrap());
+    }
+    record_solo_cluster_decision(&coord, decided, 1).await;
+
+    let (decision, offsets) = coord
+        .acquired_source_handoff()
+        .await
+        .unwrap()
+        .expect("the decided cut should satisfy handoff");
+    assert_eq!(decision.epoch, decided.epoch);
+    assert_eq!(decision.checkpoint_id, decided.checkpoint_id);
+    assert_eq!(
+        offsets.get("kafka").and_then(|keys| keys.get("events:0")),
+        Some(&"100".to_string())
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn source_handoff_rejects_a_highest_decision_without_its_exact_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let valid = CheckpointAttempt::new(4, 5);
+    let missing = CheckpointAttempt::new(8, 9);
+    let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(1);
+    coord.set_vnode_set(Vec::new());
+    attach_solo_cluster_controller(&mut coord, 0);
+
+    let mut manifest = CheckpointManifest::new(valid.checkpoint_id, valid.epoch);
+    manifest.participant_id = 0;
+    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+    manifest.pipeline_identity = coord.expected_pipeline_identity();
+    coord
+        .persist_participant_ready_until(
+            valid,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(valid, 1, &[], &[participant_ready_key(0)])
+        .await
+        .unwrap());
+    record_solo_cluster_decision(&coord, valid, 1).await;
+    record_solo_cluster_decision(&coord, missing, 1).await;
+
+    let error = coord
+        .acquired_source_handoff()
+        .await
+        .expect_err("the highest decision cannot fall back to an older sealed cut");
+    assert!(error.to_string().contains("decided checkpoint 9 epoch 8"));
+    assert!(error.to_string().contains("no exact state seal"));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn source_handoff_never_falls_back_from_corrupt_highest_decided_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let valid = CheckpointAttempt::new(4, 5);
+    let corrupt = CheckpointAttempt::new(8, 9);
+    let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(1);
+    coord.set_vnode_set(Vec::new());
+    attach_solo_cluster_controller(&mut coord, 0);
+
+    let mut manifest = CheckpointManifest::new(valid.checkpoint_id, valid.epoch);
+    manifest.participant_id = 0;
+    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+    manifest.pipeline_identity = coord.expected_pipeline_identity();
+    coord
+        .persist_participant_ready_until(
+            valid,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(valid, 1, &[], &[participant_ready_key(0)])
+        .await
+        .unwrap());
+    record_solo_cluster_decision(&coord, valid, 1).await;
+
+    let ready_key = participant_ready_key(0);
+    backend
+        .write_commit_descriptor(
+            corrupt,
+            &ready_key,
+            1,
+            bytes::Bytes::from_static(b"corrupt-readiness"),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(corrupt, 1, &[], std::slice::from_ref(&ready_key))
+        .await
+        .unwrap());
+    record_solo_cluster_decision(&coord, corrupt, 1).await;
+
+    let error = coord
+        .acquired_source_handoff()
+        .await
+        .expect_err("corrupt highest decided readiness must fail closed");
+    assert!(error.to_string().contains("readiness marker"));
+    assert!(error.to_string().contains("corrupt"));
 }
 
 /// Recovery must read the handoff at the epoch it restored to, not the latest, or a coordinated
@@ -1698,15 +2047,17 @@ async fn source_offsets_at_reads_the_requested_epoch() {
             .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[participant_ready_key(0)],)
             .await
             .unwrap());
+        record_solo_cluster_decision(&coord, attempt, 1).await;
     }
 
-    // Latest picks the newest; an epoch-scoped read pins the exact recovered cut.
-    let (latest_attempt, latest) = coord
+    // The highest decision drives handoff; an epoch-scoped read still pins an exact recovery cut.
+    let (latest_decision, latest) = coord
         .acquired_source_handoff()
         .await
         .unwrap()
-        .expect("latest sealed handoff");
-    assert_eq!(latest_attempt, attempt8);
+        .expect("highest decided handoff");
+    assert_eq!(latest_decision.epoch, attempt8.epoch);
+    assert_eq!(latest_decision.checkpoint_id, attempt8.checkpoint_id);
     assert_eq!(
         latest.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"200".to_string())
@@ -2379,13 +2730,6 @@ impl StateBackend for FaultBackend {
             .await
     }
 
-    async fn read_commit_descriptors(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<(String, bytes::Bytes)>, laminar_core::state::StateBackendError> {
-        self.inner.read_commit_descriptors(attempt).await
-    }
-
     async fn read_commit_descriptor(
         &self,
         attempt: CheckpointAttempt,
@@ -2406,13 +2750,6 @@ impl StateBackend for FaultBackend {
             .await
     }
 
-    async fn sealed_checkpoints(
-        &self,
-        after_checkpoint_id: u64,
-    ) -> Result<Vec<CheckpointAttempt>, laminar_core::state::StateBackendError> {
-        self.inner.sealed_checkpoints(after_checkpoint_id).await
-    }
-
     async fn checkpoint_seal_inventory(
         &self,
         attempt: CheckpointAttempt,
@@ -2428,12 +2765,6 @@ impl StateBackend for FaultBackend {
         before: u64,
     ) -> Result<(), laminar_core::state::StateBackendError> {
         self.inner.prune_before(before).await
-    }
-
-    async fn latest_sealed_checkpoint(
-        &self,
-    ) -> Result<Option<CheckpointAttempt>, laminar_core::state::StateBackendError> {
-        self.inner.latest_sealed_checkpoint().await
     }
 
     fn set_authoritative_version(&self, version: u64) {
@@ -2560,14 +2891,20 @@ async fn overlapping_epoch_failure_is_isolated() {
         .is_some_and(|e| e.contains("vnode partial write failed")));
     let attempt_a = CheckpointAttempt::new(results[0].epoch, results[0].checkpoint_id);
     let attempt_b = CheckpointAttempt::new(results[1].epoch, results[1].checkpoint_id);
+    let attempt_c = CheckpointAttempt::new(results[2].epoch, results[2].checkpoint_id);
     let attempt_d = CheckpointAttempt::new(results[3].epoch, results[3].checkpoint_id);
 
-    // Recovery point: the failed epoch was never sealed.
-    assert_eq!(
-        backend.latest_sealed_checkpoint().await.unwrap(),
-        Some(attempt_d),
-        "the last successful epoch is the recovery point",
-    );
+    // The failed epoch was never sealed; its successful successor has an exact inventory.
+    assert!(backend
+        .checkpoint_seal_inventory(attempt_c)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(backend
+        .checkpoint_seal_inventory(attempt_d)
+        .await
+        .unwrap()
+        .is_some());
 
     // B was unchanged from A → reference. D matches the FAILED
     // epoch's state, and C's vnode-0 write landed before the
@@ -3452,19 +3789,22 @@ async fn coordinated_sink_idle_epoch_still_seals() {
     )
     .unwrap();
     let key = crate::coordinated_committer::descriptor_key(&namespace, 0);
-    let descriptors = coord
-        .state_backend
-        .as_ref()
-        .unwrap()
-        .read_commit_descriptors(attempt)
+    let backend = coord.state_backend.as_ref().unwrap();
+    let inventory = backend
+        .checkpoint_seal_inventory(attempt)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].0, key);
+    assert_eq!(inventory.required_descriptors, vec![key.clone()]);
+    let descriptor = backend
+        .read_commit_descriptor(attempt, &key)
+        .await
+        .unwrap()
+        .expect("sealed idle descriptor");
     assert_eq!(
         crate::coordinated_committer::decode_prepared_marker(
-            &descriptors[0].0,
-            &descriptors[0].1,
+            &key,
+            &descriptor,
             attempt,
             &namespace,
         )
@@ -3514,7 +3854,6 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
     assert!(result.success, "checkpoint failed: {:?}", result.error);
 
     let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
-    let descs = backend.read_commit_descriptors(attempt).await.unwrap();
     let namespace = laminar_connectors::connector::CoordinatedCommitNamespace::try_new(
         laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty(),
         coord.expected_deployment_id().unwrap(),
@@ -3522,11 +3861,14 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
     )
     .unwrap();
     let key = crate::coordinated_committer::descriptor_key(&namespace, 0);
-    assert_eq!(descs.len(), 1);
-    assert_eq!(descs[0].0, key);
+    let descriptor = backend
+        .read_commit_descriptor(attempt, &key)
+        .await
+        .unwrap()
+        .expect("sealed coordinated descriptor");
     let marker = crate::coordinated_committer::decode_prepared_marker(
-        &descs[0].0,
-        &descs[0].1,
+        &key,
+        &descriptor,
         attempt,
         &namespace,
     )
@@ -3541,11 +3883,6 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
             .unwrap()
             .required_descriptors,
         vec![key]
-    );
-    assert_eq!(
-        backend.latest_sealed_checkpoint().await.unwrap(),
-        Some(attempt),
-        "epoch must seal once the descriptor is durable"
     );
 }
 

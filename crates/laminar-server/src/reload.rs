@@ -134,10 +134,6 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("sql field changed — requires restart".to_string());
     }
-    if old.coordination != new.coordination {
-        diff.warnings
-            .push("[coordination] section changed — requires restart".to_string());
-    }
     // Restart policy / coordinated recovery is captured once at startup (to_policy /
     // enable_supervision), so a live edit needs a restart rather than being silently dropped.
     if old.supervision != new.supervision {
@@ -431,7 +427,6 @@ mod tests {
             pipelines: vec![],
             sinks: vec![],
             discovery: None,
-            coordination: None,
             node_id: None,
             sql: None,
             ai: Default::default(),

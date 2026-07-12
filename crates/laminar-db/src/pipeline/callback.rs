@@ -246,7 +246,8 @@ pub trait PipelineCallback: Send + 'static {
     fn record_checkpoint_admission_failure(&mut self, _reason: &str) {}
 
     /// Join tracked asynchronous checkpoint tails before connector teardown. When `abort` is
-    /// true, cancel them first because the bounded graceful-drain budget has expired.
+    /// true, request cancellation and detach them because the bounded graceful-drain budget has
+    /// expired and cancellation may be cooperative.
     fn settle_checkpoint_tail_tasks(
         &mut self,
         _abort: bool,

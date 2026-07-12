@@ -48,7 +48,7 @@ laminar-db
 | `files` | File source (AutoLoader) and sink (rolling files) |
 | `parquet-lookup` | Parquet lookup source for reference tables |
 | `otel` | OpenTelemetry OTLP/gRPC source |
-| `cluster` | Full distributed mode scaffolding (gRPC, gossip, Raft). Not production-ready. |
+| `cluster` | Pre-production distributed mode (gRPC control plane and gossip/static discovery; at-least-once only). |
 | `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-core) |
 
 ## Internal Architecture

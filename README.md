@@ -86,7 +86,7 @@ conn.close()
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
 | Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
-| Cluster | Multi-node deployment. Gossip discovery, Raft coordination, dynamic partition/vnode rebalance, and distributed checkpoints. |
+| Cluster | Multi-node deployment. Static or gossip discovery, lease-fenced control paths, dynamic partition/vnode rebalance, and distributed checkpoints. |
 
 ### Prebuilt binaries
 
@@ -139,18 +139,18 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 ### Architecture & Dynamics
 
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
-* **Coordination**: Raft consensus manages metadata and leases. A consensus group elects a leader, tracks node lease lifecycles, and maintains the partition layout table (`AssignmentSnapshotStore`).
+* **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
 * **Dynamic Rebalancing**: A total of 256 virtual nodes (vnodes) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the vnode assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its vnodes before the node terminates.
 * **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Cluster delivery is currently admitted only as `at_least_once`.
 * **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
 
 > [!IMPORTANT]
-> Cluster exactly-once currently fails closed with `[LDB-0013]`. The renewable leader lease is not yet atomically bound to both checkpoint decisions and external sink commits, so a term change cannot be fenced end to end. Use cluster `at_least_once`, or use `exactly_once` in embedded/single-node mode with node-durable state and compatible connectors.
-> Embedded/single-node exactly-once also requires a local checkpoint directory, held under an OS-released exclusive deployment lock. Pointing two local runtimes at one shared object-store checkpoint namespace fails closed with `[LDB-0014]` until an end-to-end term-fenced deployment lease is available.
+> Cluster exactly-once currently fails closed with `[LDB-0013]`. The renewable leader lease is not yet atomically bound to both checkpoint decisions and external sink commits, so a term change cannot be fenced end to end. Use cluster `at_least_once`; local `exactly_once` remains limited to compatible connectors and the built-in local checkpoint/decision store.
+> Embedded/single-node exactly-once requires node-durable state and that built-in local store, held under an OS-released exclusive deployment lock. Any configured checkpoint/object-store URL (including `file://`) or injected decision store fails closed with `[LDB-0014]` because its writer-fencing provenance cannot be proved.
 
 ### Cluster Configuration Example
 
-To deploy in cluster mode, configure the `[discovery]` and `[coordination]` sections in `laminardb.toml`, and set `server.mode` to `"cluster"`.
+To deploy in cluster mode, configure `[discovery]` in `laminardb.toml` and set `server.mode` to `"cluster"`.
 
 ```toml
 node_id = "node-1" # Required and unique per node
@@ -165,12 +165,6 @@ strategy = "gossip" # "gossip" or "static"
 gossip_port = 7946
 advertise_host = "10.0.0.1"
 seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
-
-[coordination]
-strategy = "raft"
-raft_port = 8888
-election_timeout = "3s"
-heartbeat_interval = "500ms"
 
 [state]
 backend = "object_store"
@@ -187,7 +181,7 @@ timeout = "120s"
 ```
 
 > [!NOTE]
-> If `server.mode` is set to `"embedded"` (the default), no cluster services (Gossip, Raft) are started or bound, avoiding interference with any existing cluster configurations, even if the server binary was built with the cluster feature flag enabled.
+> If `server.mode` is set to `"embedded"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.
 
 
 ---
@@ -442,7 +436,7 @@ The HTTP API binds to `bind` configured under `[server]`. It serves the followin
 * **Cluster Management**:
   * `GET /api/v1/cluster/nodes` returns the list of active/draining/suspected nodes.
   * `GET /api/v1/cluster/vnodes` returns the 256 vnode partition assignments.
-  * `GET /api/v1/cluster/leader` returns the current Raft leader lease holder.
+  * `GET /api/v1/cluster/leader` returns the current durable leader-lease holder.
   * `GET /api/v1/cluster/checkpoints` returns completed checkpoint metadata.
 * **Pipeline Administration**:
   * `GET /api/v1/sources` | `/api/v1/sinks` | `/api/v1/streams` | `/api/v1/mvs` to inspect existing entities.
@@ -573,13 +567,13 @@ graph TD
 ```
 
 ### 4. Cluster Mode (Distributed Deployment)
-Runs as a distributed cluster of cooperative nodes. Nodes discover one another peer-to-peer using **Chitchat Gossip**, coordinate virtual node assignments (VNodes) and metadata leases via **Raft Consensus** (OpenRaft), exchange partition streams via high-performance **gRPC & Arrow-Flight** shuffles, and persist coordinated checkpoints to a shared object store.
+Runs as a distributed cluster of cooperative nodes. Nodes use static membership or **Chitchat Gossip**, fence leader-only work with a renewable shared-store lease, publish VNode assignments through create/CAS operations, exchange partition streams via high-performance **gRPC & Arrow-Flight** shuffles, and persist coordinated checkpoints to shared object storage.
 
 ```mermaid
 graph TD
     classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
     classDef engineClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-    classDef raftClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef controlClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
     classDef gossipClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
     classDef vnodeClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
     classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
@@ -589,7 +583,7 @@ graph TD
     subgraph Node1["LaminarDB Node 1 (Coordinator Leader)"]
         direction TB
         E1["Streaming Engine"]:::engineClass
-        Raft1["Raft Consensus<br/>(OpenRaft)"]:::raftClass
+        Control1["Lease-Fenced<br/>Control Plane"]:::controlClass
         Gossip1["Chitchat Gossip"]:::gossipClass
         VNodes1["Virtual Nodes<br/>(VNodes 1 - 128)"]:::vnodeClass
         E1 <--> VNodes1
@@ -598,7 +592,7 @@ graph TD
     subgraph Node2["LaminarDB Node 2 (Follower)"]
         direction TB
         E2["Streaming Engine"]:::engineClass
-        Raft2["Raft Consensus<br/>(OpenRaft)"]:::raftClass
+        Control2["Cluster Control<br/>Follower"]:::controlClass
         Gossip2["Chitchat Gossip"]:::gossipClass
         VNodes2["Virtual Nodes<br/>(VNodes 129 - 256)"]:::vnodeClass
         E2 <--> VNodes2
@@ -610,11 +604,12 @@ graph TD
 
     %% Node Communication
     Gossip1 ---|"Peer Discovery"| Gossip2
-    Raft1 ---|"Metadata and<br/>Partition Leases"| Raft2
     E1 ---|"gRPC and Arrow-Flight<br/>Data Shuffle"| E2
 
     %% Distributed Durability
-    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Control1 -->|"Leader Lease and<br/>Assignment CAS"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Control2 -->|"Read Shared<br/>Control State"| SharedStore
+    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore
     Node2 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore:::storageClass
 
     style Node1 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px

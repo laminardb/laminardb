@@ -91,10 +91,12 @@ path = "./data/state"       # required when backend = "local"
 # When backend = "object_store": url = "s3://bucket/state" (same schemes as
 # [checkpoint]) and instance_id = "node-0" (required, unique per node);
 # credentials from provider env vars or [state.storage].
-# Local paths and file:// are node-durable and valid for embedded/single-node
-# exactly-once; an exclusive OS lock prevents two live local writers. A shared
-# checkpoint URL under local exactly-once fails with LDB-0014 until it has a
-# term-fenced deployment lease. Cluster mode requires cloud object storage shared by every node.
+# Local state paths are node-durable and valid for embedded/single-node
+# exactly-once. The checkpoint/decision store must be the built-in local
+# directory protected by its exclusive OS lock; any configured checkpoint URL
+# (including file://) or injected decision store fails with LDB-0014 because
+# its writer-fencing provenance cannot be proved. Cluster mode requires cloud
+# object storage shared by every node.
 # Cluster exactly-once currently fails closed with LDB-0013 because the leader
 # term is not atomically bound to checkpoint decisions and external sink commits.
 

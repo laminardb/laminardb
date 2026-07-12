@@ -65,9 +65,6 @@ spec:
             - name: gossip
               containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
               protocol: TCP
-            - name: raft
-              containerPort: {{ ($cluster.coordination | default dict).raftPort | default 7947 }}
-              protocol: TCP
             {{- end }}
           startupProbe:
             httpGet:

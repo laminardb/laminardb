@@ -15,7 +15,3 @@ interval = "10s"
 strategy = "static"
 seeds = ["127.0.0.1:7946", "127.0.0.1:7956"]
 gossip_port = 7956
-
-[coordination]
-strategy = "raft"
-raft_port = 7957

@@ -28,7 +28,6 @@ pub(crate) struct CatalogSourceConnector {
     subscription: streaming::Subscription<ArrowRecord>,
     schema: SchemaRef,
     data_notify: Arc<Notify>,
-    records_polled: u64,
 }
 
 impl CatalogSourceConnector {
@@ -41,7 +40,6 @@ impl CatalogSourceConnector {
             subscription,
             schema,
             data_notify,
-            records_polled: 0,
         }
     }
 }
@@ -92,8 +90,6 @@ impl SourceConnector for CatalogSourceConnector {
                 .map_err(|e| ConnectorError::ReadError(format!("Failed to concat batches: {e}")))?
         };
 
-        self.records_polled += u64::try_from(records.num_rows()).unwrap_or(u64::MAX);
-
         Ok(Some(SourceBatch {
             records,
             partition: None,
@@ -105,12 +101,11 @@ impl SourceConnector for CatalogSourceConnector {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new();
-        cp.set_offset(
-            "records_polled".to_string(),
-            self.records_polled.to_string(),
-        );
-        cp
+        // `db.insert()` is process-local ingress backed by an in-memory subscription. A row
+        // count cannot reproduce accepted events after restart, so exposing it as a recovery
+        // cursor would contradict the connector's Ephemeral contract. Empty checkpoints still
+        // let this source participate in barrier alignment without entering durable handoff.
+        SourceCheckpoint::new()
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

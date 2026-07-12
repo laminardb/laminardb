@@ -155,7 +155,7 @@ fn build_checkpoint_store(
             .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
 
     let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
-    let participant = if config.server.mode == "cluster" {
+    let participant = if config.server.mode == config::ServerMode::Cluster {
         #[cfg(feature = "cluster")]
         {
             let node_id = config

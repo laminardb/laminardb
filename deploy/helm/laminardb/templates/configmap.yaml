@@ -93,13 +93,6 @@ data:
     # Generated from replicaCount: every node lists the full cluster (self included).
     seeds = [{{ range $i := until (int .Values.replicaCount) }}{{ if $i }}, {{ end }}"{{ include "laminardb.fullname" $ }}-{{ $i }}.{{ $podDomain }}:{{ $gossipPort }}"{{ end }}]
     {{- end }}
-
-    [coordination]
-    {{- $coordination := $cluster.coordination | default dict }}
-    strategy = "{{ $coordination.strategy }}"
-    raft_port = {{ $coordination.raftPort }}
-    election_timeout = "{{ $coordination.electionTimeout }}"
-    heartbeat_interval = "{{ $coordination.heartbeatInterval }}"
     {{- end }}
 
     {{- range .Values.sources }}

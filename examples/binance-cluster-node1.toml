@@ -95,9 +95,3 @@ seeds = [
     ]
 gossip_port = 7946
 advertise_host = "127.0.0.1"
-
-[coordination]
-strategy = "raft"
-raft_port = 7947
-election_timeout = "1500ms"
-heartbeat_interval = "300ms"

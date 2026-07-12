@@ -22,7 +22,7 @@ pub mod keys {
     pub const NODE_STATE: &str = "node:state";
     /// RPC address key.
     pub const RPC_ADDRESS: &str = "node:rpc_addr";
-    /// Raft address key.
+    /// Legacy wire key; current runtimes publish an empty value.
     pub const RAFT_ADDRESS: &str = "node:raft_addr";
     /// Node name key.
     pub const NODE_NAME: &str = "node:name";

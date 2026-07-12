@@ -444,9 +444,6 @@ seeds = [{seeds}]
 gossip_port = {gossip}
 advertise_host = "127.0.0.1"
 
-[coordination]
-strategy = "raft"
-
 [state]
 backend = "object_store"
 url = "{state_url}"

@@ -502,6 +502,7 @@ impl LaminarDB {
         &self,
         graph: &mut crate::operator_graph::OperatorGraph,
         cold_map: &[(String, Vec<u32>)],
+        recovered_attempt: laminar_core::state::CheckpointAttempt,
     ) -> Result<(), DbError> {
         let Some(backend) = self.state_backend.lock().clone() else {
             return Err(DbError::Checkpoint(
@@ -517,7 +518,7 @@ impl LaminarDB {
         all_cold.sort_unstable();
         all_cold.dedup();
         let rehy = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-            .rehydrate(&all_cold)
+            .rehydrate_at(&all_cold, recovered_attempt)
             .await?;
 
         let (mut applied, mut lost) = (0usize, 0usize);
@@ -760,9 +761,32 @@ impl LaminarDB {
     }
 
     /// Close resources created by an unsuccessful `start_inner` attempt.
-    async fn cleanup_failed_start(&self) {
+    async fn cleanup_failed_start(&self) -> Result<(), DbError> {
+        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
         if let Some(handle) = self.committer_handle.lock().take() {
             handle.abort();
+        }
+        self.quiesce_checkpoint_decision_until(deadline).await?;
+        {
+            let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "failed-start cleanup could not reacquire checkpoint coordinator ownership; durability fences remain held"
+                            .into(),
+                    )
+                })?;
+            if let Some(coordinator) = coordinator.as_mut() {
+                tokio::time::timeout_at(deadline, coordinator.reconcile_prepared_on_init())
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "failed-start checkpoint reconciliation exceeded {CLEANUP_TIMEOUT:?}; durability fences remain held"
+                        ))
+                    })??;
+                coordinator.clear_sinks();
+            }
         }
         let handles = std::mem::take(&mut *self.startup_sink_handles.lock());
         for handle in handles {
@@ -774,12 +798,29 @@ impl LaminarDB {
                 );
             }
         }
-        if let Some(coordinator) = self.coordinator.lock().await.as_mut() {
-            coordinator.clear_sinks();
-        }
         *self.control_tx.lock() = None;
         *self.force_ckpt_tx.lock() = None;
         *self.exact_deployment_lock.lock() = None;
+        Ok(())
+    }
+
+    /// Publish `Running` only if the compute watcher did not fault during startup.
+    ///
+    /// The compute thread publishes a competing `Starting -> Faulted` transition before exit and
+    /// the watcher reinforces it. Ignoring a lost CAS here would let coordinated recovery
+    /// acknowledge a process whose compute loop has already died.
+    fn finish_start_transition(&self) -> Result<(), DbError> {
+        match DbState::compare_exchange(DbState::Starting, DbState::Running, &self.state) {
+            Ok(_) => Ok(()),
+            Err(DbState::Faulted) => Err(DbError::Pipeline(format!(
+                "pipeline faulted while entering the runtime control loop: {}",
+                self.last_fault()
+                    .unwrap_or_else(|| "compute loop exited without a fault reason".into())
+            ))),
+            Err(observed) => Err(DbError::InvalidOperation(format!(
+                "pipeline startup completed from an unexpected lifecycle state: {observed:?}"
+            ))),
+        }
     }
 
     /// Start the streaming pipeline. Idempotent if already running. On failure
@@ -789,10 +830,12 @@ impl LaminarDB {
     ///
     /// Returns an error if the pipeline cannot be started.
     pub async fn start(&self) -> Result<(), DbError> {
+        const FAULT_RESTART_QUIESCE_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(10);
         let _lifecycle = self.lifecycle_lock.lock().await;
         // CAS-claim the start so a supervisor racing a manual start can't both enter
         // start_inner and spawn two pipelines over the same state.
-        loop {
+        let starting_from_fault = loop {
             match DbState::load(&self.state) {
                 DbState::Running | DbState::Starting => return Ok(()),
                 DbState::Stopped => {
@@ -808,19 +851,25 @@ impl LaminarDB {
                 // Faulted and Created are both startable; a lost CAS re-reads.
                 claimed @ (DbState::Created | DbState::Faulted) => {
                     if DbState::compare_exchange(claimed, DbState::Starting, &self.state).is_ok() {
-                        break;
+                        break claimed == DbState::Faulted;
                     }
                 }
+            }
+        };
+
+        if starting_from_fault {
+            let deadline = tokio::time::Instant::now() + FAULT_RESTART_QUIESCE_TIMEOUT;
+            if let Err(error) = self.quiesce_checkpoint_decision_until(deadline).await {
+                // Retain the old coordinator and deployment fence. A supervisor/manual retry may
+                // resume once the owned decision write reaches a terminal state.
+                DbState::Faulted.store(&self.state);
+                return Err(error);
             }
         }
 
         // Clear on entry, not after start_inner — otherwise a panic during this
         // startup (watcher → Faulted + reason) would be immediately overwritten.
         *self.last_fault.lock() = None;
-        // Drop any stale flag from a prior run so this run's watcher doesn't finalize spuriously.
-        self.stop_timed_out
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-
         {
             let mut guard = self.engine_metrics.lock();
             if guard.is_none() {
@@ -842,17 +891,36 @@ impl LaminarDB {
         }
 
         match self.start_inner().await {
-            // CAS, not store: don't clobber a Faulted set by the watcher if the
-            // compute thread already panicked during startup.
             Ok(()) => {
-                let _ = DbState::compare_exchange(DbState::Starting, DbState::Running, &self.state);
-                Ok(())
+                // CAS, not store: don't clobber a Faulted set by the watcher if the compute thread
+                // already panicked during startup. Losing that CAS is a failed start, not success.
+                match self.finish_start_transition() {
+                    Ok(()) => Ok(()),
+                    Err(error) => match self.cleanup_failed_start().await {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => {
+                            DbState::Faulted.store(&self.state);
+                            Err(DbError::Pipeline(format!(
+                                "{error}; failed-start cleanup remains fenced: {cleanup_error}"
+                            )))
+                        }
+                    },
+                }
             }
             Err(e) => {
-                self.cleanup_failed_start().await;
-                // Reset so a retry re-runs startup rather than silently returning Ok.
-                DbState::Created.store(&self.state);
-                Err(e)
+                match self.cleanup_failed_start().await {
+                    Ok(()) => {
+                        // Reset so a retry re-runs startup rather than silently returning Ok.
+                        DbState::Created.store(&self.state);
+                        Err(e)
+                    }
+                    Err(cleanup_error) => {
+                        DbState::Faulted.store(&self.state);
+                        Err(DbError::Pipeline(format!(
+                            "{e}; failed-start cleanup remains fenced: {cleanup_error}"
+                        )))
+                    }
+                }
             }
         }
     }
@@ -902,14 +970,19 @@ impl LaminarDB {
                     .into(),
             ));
         }
+        #[cfg(feature = "cluster")]
+        let has_injected_decision_store = self.decision_store.lock().is_some();
+        #[cfg(not(feature = "cluster"))]
+        let has_injected_decision_store = false;
         if startup_runtime == RuntimeMode::Local
             && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && self.config.object_store_url.is_some()
+            && (self.config.object_store_url.is_some() || has_injected_decision_store)
         {
             return Err(DbError::Config(
                 "[LDB-0014] local exactly-once with a shared/object-store checkpoint namespace \
-                 is not admitted until the deployment lease is term-fenced. Use a local \
-                 checkpoint directory (node-durable), or at_least_once delivery"
+                 or an injected decision store is not admitted until the deployment lease is \
+                 term-fenced. Use the built-in local checkpoint directory (node-durable), or \
+                 at_least_once delivery"
                     .into(),
             ));
         }
@@ -1349,6 +1422,7 @@ impl LaminarDB {
                 });
                 graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
                 graph.set_revoke_handle(Arc::clone(&self.pending_revoke_vnodes));
+                graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
                 // With a durable backend, per-vnode partials are the authoritative agg checkpoint;
                 // the whole-node manifest copy is one node's slices and traps boot recovery.
                 if self.state_backend.lock().is_some() {
@@ -1625,32 +1699,12 @@ impl LaminarDB {
             ) {
                 source.set_vnode_assignment(registry, self_id);
             }
-            // Connector-property watermark wiring: `event.time.column` (Kafka)
-            // and `event.time.field` (WebSocket) as an alternative to `WATERMARK FOR`.
+            // WebSocket extraction can synthesize event time from an inbound JSON field. Kafka
+            // uses the SQL `WATERMARK FOR` declaration as its single event-time authority.
             if let Some(entry) = self.catalog.get_source(name) {
                 if entry.source.event_time_column().is_none() {
-                    if let Some(col) = config.get("event.time.column") {
+                    if let Some(col) = config.get("event.time.field") {
                         entry.source.set_event_time_column(col);
-                    } else if let Some(col) = config.get("event.time.field") {
-                        entry.source.set_event_time_column(col);
-                    }
-                }
-                if let Some(ms_str) = config.get("max.out.of.orderness.ms") {
-                    match ms_str.parse::<u64>() {
-                        Ok(ms) => {
-                            entry
-                                .source
-                                .set_max_out_of_orderness(std::time::Duration::from_millis(ms));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                source = %name,
-                                value = %ms_str,
-                                error = %e,
-                                "ignoring unparseable max.out.of.orderness.ms — \
-                                 watermark will use Duration::ZERO"
-                            );
-                        }
                     }
                 }
             }
@@ -1935,6 +1989,16 @@ impl LaminarDB {
             }
         };
 
+        {
+            let guard = self.coordinator.lock().await;
+            if let Some(ref coord) = *guard {
+                // Sinks are registered, so resolve an unambiguous prior prepare before choosing
+                // the recovery cut. Finalizing or rolling back after recovery could change the
+                // durable frontier underneath state/source restoration.
+                coord.reconcile_prepared_on_init().await?;
+            }
+        }
+
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
         // Hoist watermarks now so generators are seeded before watermark-state construction;
         // without this, generators restart at i64::MIN while offsets resume mid-stream.
@@ -2103,7 +2167,12 @@ impl LaminarDB {
                         {
                             let cold_map = graph.take_tier_cold_vnodes();
                             if !cold_map.is_empty() {
-                                self.rehydrate_cold_vnodes(&mut graph, &cold_map).await?;
+                                self.rehydrate_cold_vnodes(
+                                    &mut graph,
+                                    &cold_map,
+                                    recovered_attempt,
+                                )
+                                .await?;
                             }
                         }
 
@@ -2182,11 +2251,7 @@ impl LaminarDB {
         {
             let guard = self.coordinator.lock().await;
             if let Some(ref coord) = *guard {
-                // Reconcile after sinks are registered and state is recovered: at the old call
-                // site the coordinator's sink set was empty, so marker-committed Pending epochs
-                // were never re-driven and unmarked Pending epochs never rolled back (CP-2).
-                // Must precede begin_initial_epoch, which opens the next epoch on those sinks.
-                coord.reconcile_prepared_on_init().await?;
+                // Reconciliation already ran after sink registration and before recovery.
                 coord.begin_initial_epoch().await?;
             }
         }
@@ -2779,6 +2844,7 @@ impl LaminarDB {
             // Captured by the compute thread so an operator panic is recorded
             // (surfaced via pipeline status) rather than only logged.
             let fault_slot = Arc::clone(&self.last_fault);
+            let fault_state = Arc::clone(&self.state);
             let fault_metrics = self.engine_metrics.lock().clone();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
@@ -2787,18 +2853,22 @@ impl LaminarDB {
                         .enable_all()
                         .build()
                     {
-                        Ok(rt) => {
-                            startup_tx.send(Ok(()));
-                            rt
-                        }
+                        Ok(rt) => rt,
                         Err(e) => {
                             startup_tx.send(Err(format!("compute runtime: {e}")));
                             return;
                         }
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rt.block_on(async move { coordinator.run(callback).await })
+                        rt.block_on(async move {
+                            coordinator.run_with_ready(callback, startup_tx).await
+                        })
                     }));
+                    // Runtime shutdown waits for non-abortable `spawn_blocking` filesystem work.
+                    // Publish neither clean completion nor a fault until those workers are gone;
+                    // otherwise lifecycle teardown could release the exact namespace lock while
+                    // an old local decision hard-link was still able to appear.
+                    drop(rt);
                     // Panic and fault both drop `done_tx` unsent so the watcher faults.
                     let fault_reason = match result {
                         Ok(crate::pipeline::ExitReason::Shutdown) => None,
@@ -2820,8 +2890,11 @@ impl LaminarDB {
                         }
                     };
                     if let Some(reason) = fault_reason {
-                        // Record before dropping done_tx so the watcher sees it.
+                        // Publish the fault before dropping `done_tx`. In particular, this closes
+                        // the ready-send -> watcher-scheduled window in which start() could
+                        // otherwise report Running after the compute loop had already exited.
                         *fault_slot.lock() = Some(reason);
+                        DbState::Faulted.store(&fault_state);
                         if let Some(ref m) = fault_metrics {
                             m.pipeline_faults_total.inc();
                         }
@@ -2842,7 +2915,7 @@ impl LaminarDB {
                 Ok(Err(e)) => return Err(DbError::Config(e)),
                 Err(_) => {
                     return Err(DbError::Config(
-                        "compute thread exited before starting runtime".into(),
+                        "compute thread exited before entering the runtime control loop".into(),
                     ));
                 }
             }
@@ -2850,7 +2923,6 @@ impl LaminarDB {
             let watcher_state = Arc::clone(&self.state);
             let watcher_shutdown = Arc::clone(&self.shutdown_signal);
             let watcher_fault = Arc::clone(&self.last_fault);
-            let watcher_stop_timed_out = Arc::clone(&self.stop_timed_out);
             let watcher_supervisor = Arc::clone(&self.supervisor_self);
             let watcher_restart_history = Arc::clone(&self.restart_history);
             let watcher_metrics = self.engine_metrics.lock().clone();
@@ -2858,15 +2930,9 @@ impl LaminarDB {
             let watcher_controller = self.cluster_controller.lock().clone();
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_ok() {
-                    // Only finalize for a timed-out stop. A normal stop/shutdown caller is
-                    // still awaiting this handle and sets the terminal state itself.
-                    if watcher_stop_timed_out.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        let _ = DbState::compare_exchange(
-                            DbState::ShuttingDown,
-                            DbState::Created,
-                            &watcher_state,
-                        );
-                    }
+                    // Lifecycle ownership finalizes the state only after every remote decision
+                    // writer has settled. The watcher cannot prove that merely because the
+                    // compute thread exited, so a timed-out stop remains ShuttingDown until retry.
                 } else {
                     tracing::error!("laminar-compute thread exited unexpectedly");
                     watcher_fault
@@ -2952,6 +3018,26 @@ impl LaminarDB {
         Ok(())
     }
 
+    async fn quiesce_checkpoint_decision_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6038] teardown could not acquire checkpoint coordinator ownership; durable decision writes remain fenced"
+                        .into(),
+                )
+            })?;
+        if let Some(coordinator) = coordinator.as_mut() {
+            coordinator
+                .quiesce_pending_decision_write_until(deadline)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Shut down the streaming pipeline gracefully. Idempotent.
     ///
     /// # Errors
@@ -3016,6 +3102,11 @@ impl LaminarDB {
                 tracing::info!("Pipeline shut down cleanly");
             }
         }
+
+        // Compute has stopped producing new checkpoint work. Keep every deployment/state fence
+        // until an already-issued remote decision create reaches a terminal client-side state.
+        self.quiesce_checkpoint_decision_until(deadline).await?;
+
         let committer = self.committer_handle.lock().take();
         if let Some(handle) = committer {
             handle.abort();
@@ -3045,36 +3136,42 @@ impl LaminarDB {
                         .into(),
                 )
             })?;
-        match DbState::compare_exchange(DbState::Running, DbState::ShuttingDown, &self.state) {
-            Ok(_) => {}
-            Err(DbState::Created | DbState::Stopped) => return Ok(()),
-            Err(_) => {
-                return Err(DbError::InvalidOperation(
-                    "cannot stop pipeline: not running (starting, or a stop already in progress)"
-                        .into(),
-                ));
+        let first_stop = loop {
+            match DbState::load(&self.state) {
+                DbState::Running | DbState::Faulted => {
+                    let observed = DbState::load(&self.state);
+                    if DbState::compare_exchange(observed, DbState::ShuttingDown, &self.state)
+                        .is_ok()
+                    {
+                        break true;
+                    }
+                }
+                DbState::ShuttingDown => break false,
+                DbState::Created | DbState::Stopped => return Ok(()),
+                DbState::Starting => {
+                    return Err(DbError::InvalidOperation(
+                        "cannot stop pipeline while startup is in progress".into(),
+                    ));
+                }
             }
+        };
+
+        if first_stop {
+            *self.force_ckpt_tx.lock() = None;
+            // Clear up front so DDL during/after shutdown registers for the next start()
+            // instead of hot-adding into the dying coordinator's channel.
+            *self.control_tx.lock() = None;
+            self.shutdown_signal.notify_one();
         }
-
-        *self.force_ckpt_tx.lock() = None;
-        // Clear up front so DDL during/after shutdown registers for the next start()
-        // instead of hot-adding into the dying coordinator's channel.
-        *self.control_tx.lock() = None;
-
-        self.shutdown_signal.notify_one();
 
         let handle = self.runtime_handle.lock().take();
         if let Some(mut handle) = handle {
-            // Set before awaiting: the watcher can wake on another thread the instant the
-            // coordinator exits, so it must already see the flag if we time out.
-            self.stop_timed_out
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             match tokio::time::timeout_at(deadline, &mut handle).await {
                 Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
                 Err(_) => {
-                    // Still draining; the watcher finalizes ShuttingDown→Created when the
-                    // coordinator exits. Re-store its handle; start() refuses meanwhile.
+                    // Still draining. Re-store the watcher handle and retain ShuttingDown plus
+                    // every durability fence; a later stop call resumes the join and quiescence.
                     tracing::warn!(
                         "Pipeline stop still draining after 10s; will finalize when the coordinator exits"
                     );
@@ -3087,6 +3184,10 @@ impl LaminarDB {
                 }
             }
         }
+
+        // Do not announce Created or release the exclusive deployment lock while a timed-out
+        // decision create can still mutate the recovery frontier. A later stop retry resumes here.
+        self.quiesce_checkpoint_decision_until(deadline).await?;
 
         let committer = self.committer_handle.lock().take();
         if let Some(handle) = committer {
@@ -3102,12 +3203,12 @@ impl LaminarDB {
 
 #[cfg(test)]
 mod connector_admission_tests {
-    #[cfg(feature = "cluster")]
     use super::LaminarDB;
     use super::{
         admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
         open_prepared_sinks, PreparedSink, RuntimeMode, SinkAdmissionContext, EXACT_SINK_PROTOCOL,
     };
+    use crate::db::DbState;
     use crate::pipeline::PipelineConfig;
     use arrow_array::RecordBatch;
     use arrow_schema::{Schema, SchemaRef};
@@ -3124,6 +3225,31 @@ mod connector_admission_tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn startup_transition_publishes_running_from_starting() {
+        let db = LaminarDB::open().unwrap();
+        DbState::Starting.store(&db.state);
+
+        db.finish_start_transition().unwrap();
+
+        assert_eq!(DbState::load(&db.state), DbState::Running);
+    }
+
+    #[test]
+    fn startup_transition_fails_closed_when_compute_loop_faulted() {
+        let db = LaminarDB::open().unwrap();
+        DbState::Faulted.store(&db.state);
+        *db.last_fault.lock() = Some("injected startup fault".into());
+
+        let error = db.finish_start_transition().unwrap_err();
+
+        assert!(
+            error.to_string().contains("injected startup fault"),
+            "unexpected startup error: {error}"
+        );
+        assert_eq!(DbState::load(&db.state), DbState::Faulted);
+    }
 
     #[cfg(feature = "cluster")]
     #[test]
@@ -3929,7 +4055,7 @@ mod exact_deployment_lock_tests {
     use laminar_connectors::connector::DeliveryGuarantee;
     use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
 
-    async fn exact_db(root: &std::path::Path) -> crate::db::LaminarDB {
+    fn exact_builder(root: &std::path::Path) -> crate::builder::LaminarDbBuilder {
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let store: Arc<dyn object_store::ObjectStore> =
@@ -3945,9 +4071,10 @@ mod exact_deployment_lock_tests {
             .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
             .state_backend(backend)
             .vnode_registry(Arc::new(VnodeRegistry::single_owner(4, NodeId(0))))
-            .build()
-            .await
-            .unwrap()
+    }
+
+    async fn exact_db(root: &std::path::Path) -> crate::db::LaminarDB {
+        exact_builder(root).build().await.unwrap()
     }
 
     #[tokio::test]
@@ -3969,6 +4096,46 @@ mod exact_deployment_lock_tests {
             .await
             .expect("OS lock must be released by clean shutdown");
         second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_exact_file_url_is_rejected_until_its_root_is_lock_fenced() {
+        let root = tempfile::tempdir().unwrap();
+        let object_root = root.path().join("remote-shaped-checkpoints");
+        std::fs::create_dir_all(&object_root).unwrap();
+        let db = exact_builder(root.path())
+            .object_store_url(format!("file://{}", object_root.display()))
+            .build()
+            .await
+            .unwrap();
+
+        let error = db
+            .start()
+            .await
+            .expect_err("file:// is not protected by the data-dir deployment lock");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn local_exact_rejects_an_injected_decision_store_with_erased_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let decision_store = Arc::new(
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+        );
+        let db = exact_builder(root.path())
+            .decision_store(decision_store)
+            .build()
+            .await
+            .unwrap();
+
+        let error = db
+            .start()
+            .await
+            .expect_err("custom decision-store provenance cannot prove local process fencing");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
     }
 }
 

@@ -443,6 +443,36 @@ pub trait SourceConnector: Send {
     /// current position after a restart.
     fn checkpoint(&self) -> SourceCheckpoint;
 
+    /// Atomically attempt to capture a source cursor. `Ok(None)` means a
+    /// transient control-plane publication is not reconciled yet; the runtime
+    /// retains the barrier and retries without advancing it.
+    ///
+    /// # Errors
+    /// Returns a connector error when the source cannot produce a valid cursor for the current
+    /// ownership/configuration state.
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        Ok(Some(self.checkpoint()))
+    }
+
+    /// Whether this source's data-plane cursor is reconciled with the current
+    /// control-plane ownership publication. The runtime does not poll records
+    /// or admit checkpoint barriers while this is false.
+    ///
+    /// Non-partitioned and local sources are always ready. Cluster-aware
+    /// sources override this with a lock-free version fence.
+    ///
+    /// # Errors
+    /// Returns a connector error when control-plane reconciliation detects invalid or lost
+    /// ownership state that cannot be retried safely.
+    fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+        Ok(true)
+    }
+
+    /// Start or advance connector-side control-plane work needed to become
+    /// [`checkpoint_ready`](Self::checkpoint_ready). Called even while data
+    /// polling and barriers are fenced.
+    fn drive_control_plane(&mut self) {}
+
     /// Install the cluster vnode assignment so a partitioned source can bind
     /// its input partitions to vnodes (`partition % vnode_count`) and consume
     /// only those it owns, re-binding when the assignment rotates. Called by

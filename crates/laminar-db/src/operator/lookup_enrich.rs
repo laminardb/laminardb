@@ -566,8 +566,13 @@ impl LookupEnrichOperator {
             // Hash by the same key columns the cache uses so vnode ownership and cache slot agree.
             let key_indices = &self.resolved.as_ref().expect("resolved").key_indices;
             let vnodes = laminar_core::shuffle::row_vnodes(batch, key_indices, vnode_count);
+            let assignment = cfg.registry.snapshot();
             for &v in &vnodes {
-                let owner = cfg.registry.owner(v);
+                let owner = usize::try_from(v)
+                    .ok()
+                    .and_then(|vnode| assignment.get(vnode))
+                    .copied()
+                    .unwrap_or(laminar_core::state::NodeId::UNASSIGNED);
                 if owner.is_unassigned() {
                     // Must NOT defer: this operator has already drained completed async lookups this
                     // cycle (removed from self.pending, pushed to `enriched`), so deferring would

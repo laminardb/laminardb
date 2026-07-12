@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
 use laminar_core::cluster::control::{
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointDecisionStore,
 };
@@ -154,6 +155,20 @@ impl ClusterEngineHarness {
         // Lowest id wins leader election; tests rely on nodes[0].
         assert!(cluster.nodes[0].controller.is_leader());
 
+        // Mirror production cluster startup: the barrier and remote-query services share one
+        // control-plane listener, and its address is published through the cluster KV. Starting
+        // it before the DB is built is safe because the query service reads the handler slot per
+        // request; `LaminarDB::builder().build()` registers the handler below.
+        for node in &cluster.nodes {
+            node.controller
+                .start_barrier_server(
+                    "127.0.0.1:0".parse().expect("loopback control-plane bind"),
+                    Some("127.0.0.1".to_string()),
+                )
+                .await
+                .expect("cluster control-plane server start");
+        }
+
         let shared_store: Arc<dyn ObjectStore> = Arc::new(
             LocalFileSystem::new_with_prefix(shared_state_dir.path())
                 .expect("LocalFileSystem over shared state dir"),
@@ -202,7 +217,7 @@ impl ClusterEngineHarness {
                     vnode_count,
                 ));
 
-            let registry = Arc::new(VnodeRegistry::new(vnode_count));
+            let registry = Arc::new(VnodeRegistry::new_unassigned(vnode_count));
             registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
 
             let cp_cfg = StreamCheckpointConfig {
@@ -291,23 +306,39 @@ impl ClusterEngineHarness {
             node.rebalance_tasks.push(watcher);
             node.rebalance_tasks.push(controller);
         }
-        // Gate on every controller seeing full membership: discovery polls
-        // chitchat on its own cadence, so without this a checkpoint can fire
-        // before `members_rx` is populated and the leader skips the prepare quorum.
+        // Gate on every controller seeing full membership and every peer's published
+        // control-plane address. Discovery polls chitchat on its own cadence, so without this a
+        // checkpoint can fire before `members_rx` is populated or a distributed scan can observe
+        // a member before its query service is resolvable.
         let expected = self.cluster.nodes.len();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
-            if self
+            let membership_ready = self
                 .cluster
                 .nodes
                 .iter()
-                .all(|n| n.controller.live_instances().len() == expected)
-            {
+                .all(|n| n.controller.live_instances().len() == expected);
+            let mut control_plane_ready = true;
+            'observers: for observer in &self.cluster.nodes {
+                for peer in &self.cluster.nodes {
+                    if observer
+                        .controller
+                        .kv()
+                        .read_from(peer.instance_id, BARRIER_ADDR_KEY)
+                        .await
+                        .is_none()
+                    {
+                        control_plane_ready = false;
+                        break 'observers;
+                    }
+                }
+            }
+            if membership_ready && control_plane_ready {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "controllers never converged on full membership",
+                "controllers never converged on membership and control-plane addresses",
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -486,14 +517,12 @@ pub async fn manifest_epoch(db: &LaminarDB) -> u64 {
         .map_or(0, |m| m.epoch)
 }
 
-/// `SELECT key, total FROM <mv>` on one engine, returning `(key, total)` rows
-/// sorted by key.
-///
-/// Goes through the engine's `SessionContext` so it hits `MvTableProvider::scan`
-/// (a one-shot snapshot) rather than subscribing to the per-cycle stream.
-pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
+async fn collect_mv_sums(
+    context: &datafusion::prelude::SessionContext,
+    mv: &str,
+) -> Vec<(i64, i64)> {
     let sql = format!("SELECT key, total FROM {mv}");
-    let df = db.session_context().sql(&sql).await.expect("plan SELECT");
+    let df = context.sql(&sql).await.expect("plan SELECT");
     let batches = df.collect().await.expect("collect SELECT");
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for batch in batches {
@@ -513,4 +542,34 @@ pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
     }
     rows.sort_by_key(|(k, _)| *k);
     rows
+}
+
+/// Read the node-local materialized-view slice, sorted by key.
+///
+/// Cluster user queries intentionally fan out to every live peer. Placement and rehydration tests
+/// need the wrapped provider's local slice so duplicate ownership cannot be hidden by querying a
+/// second node and unioning the same distributed result twice.
+pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
+    let provider = db
+        .session_context()
+        .table_provider(mv)
+        .await
+        .expect("materialized-view provider");
+    let local = match provider
+        .as_any()
+        .downcast_ref::<laminar_sql::datafusion::DistributedTableProvider>()
+    {
+        Some(distributed) => distributed.local_table_provider(),
+        None => provider,
+    };
+    let local_context = datafusion::prelude::SessionContext::new();
+    local_context
+        .register_table(mv, local)
+        .expect("register node-local materialized-view provider");
+    collect_mv_sums(&local_context, mv).await
+}
+
+/// Read the production distributed materialized-view view from one coordinator.
+pub async fn read_distributed_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
+    collect_mv_sums(db.session_context(), mv).await
 }

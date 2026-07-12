@@ -148,7 +148,7 @@ pub struct NodeInfo {
     pub name: String,
     /// Address for gRPC communication.
     pub rpc_address: String,
-    /// Address for Raft communication.
+    /// Legacy wire-schema field; current runtimes publish it empty and do not bind a Raft service.
     pub raft_address: String,
     /// Current lifecycle state.
     pub state: NodeState,

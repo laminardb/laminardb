@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 
 /// Exact identity of one checkpoint attempt.
 ///
-/// `epoch` is logical pipeline progress and may be reused after a coordinated
-/// rewind. `checkpoint_id` is the never-reused attempt identity that prevents
-/// artifacts from an abandoned timeline satisfying a later checkpoint.
+/// `epoch` is logical pipeline progress. `checkpoint_id` is the never-reused
+/// attempt identity and authoritative order that prevents artifacts from an
+/// abandoned timeline satisfying a later checkpoint.
 #[derive(
     Debug,
     Clone,
@@ -123,9 +123,9 @@ pub struct CheckpointSealInventory {
 
 /// Structured body of an exact-attempt state seal.
 ///
-/// This remains crate-private because callers consume exact attempts through
-/// [`StateBackend::sealed_checkpoints`]; the additional fields are durability
-/// audit and fencing metadata owned by backend implementations.
+/// This remains crate-private because callers consume only the canonical
+/// [`CheckpointSealInventory`]; the additional fields are durability audit and
+/// fencing metadata owned by backend implementations.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CheckpointSeal {
     pub version: u32,
@@ -393,16 +393,6 @@ pub trait StateBackend: Send + Sync + 'static {
         key: &str,
     ) -> Result<Option<Bytes>, StateBackendError>;
 
-    /// Every coordinated-commit descriptor written for `attempt`, as `(key, bytes)`.
-    ///
-    /// This bulk inventory API is intended for diagnostics and validation. The
-    /// production committer uses [`read_commit_descriptor`](Self::read_commit_descriptor)
-    /// with the exact keys recorded in the checkpoint seal.
-    async fn read_commit_descriptors(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<(String, Bytes)>, StateBackendError>;
-
     /// Durability barrier: true once every `vnode` partial and every
     /// `required_descriptors` key for `attempt` is persisted, sealing that exact attempt.
     /// Sinks do not commit until it returns `Ok(true)`. In cluster mode,
@@ -416,13 +406,6 @@ pub trait StateBackend: Send + Sync + 'static {
         required_descriptors: &[String],
     ) -> Result<bool, StateBackendError>;
 
-    /// Sealed checkpoint attempts whose `checkpoint_id` is strictly greater
-    /// than `after_checkpoint_id`, ascending by checkpoint ID.
-    async fn sealed_checkpoints(
-        &self,
-        after_checkpoint_id: u64,
-    ) -> Result<Vec<CheckpointAttempt>, StateBackendError>;
-
     /// Read the canonical artifact inventory for an exact sealed attempt.
     /// Returns `None` only when that attempt has no seal.
     async fn checkpoint_seal_inventory(
@@ -433,7 +416,8 @@ pub trait StateBackend: Send + Sync + 'static {
     /// Garbage-collect every partial and state seal whose epoch is
     /// strictly less than `before`. Called by the checkpoint
     /// coordinator after a successful checkpoint commit so the backend
-    /// does not retain state for epochs that can never be recovered.
+    /// does not retain state for epochs that can never be recovered. Implementations must
+    /// unpublish each seal before deleting any artifact it attests.
     ///
     /// Required — there is intentionally no default. Without it an
     /// in-memory backend leaks a `Bytes` per vnode per checkpoint
@@ -441,35 +425,6 @@ pub trait StateBackend: Send + Sync + 'static {
     /// forever. Test backends that truly do not accumulate state should
     /// implement `Ok(())` explicitly so the choice is visible.
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
-
-    /// Delete every artifact (partials, seals, and commit/readiness descriptors) whose epoch
-    /// is strictly greater than `after`. A coordinated rewind to epoch `after` calls this
-    /// while the cluster is stopped. Exact attempt namespaces prevent overwrite collisions,
-    /// while truncation removes abandoned seals so `latest_sealed_checkpoint` reflects the
-    /// rewound timeline. Default no-op for backends that never serve a coordinated rewind.
-    async fn truncate_after(&self, after: u64) -> Result<(), StateBackendError> {
-        let _ = after;
-        Ok(())
-    }
-
-    /// Exact attempt with the highest checkpoint ID sealed by a durable state marker, or `None`.
-    ///
-    /// This is the epoch a node rehydrates from when it acquires a
-    /// vnode during a rebalance: every owner agreed the epoch's
-    /// per-vnode partials were durable before [`seal_checkpoint`] sealed
-    /// it, so reading `partial.bin` at this epoch restores the last
-    /// cluster-consistent state rather than starting empty.
-    ///
-    /// Default is `None` — backends that cannot enumerate committed
-    /// epochs report "no committed state" and the caller treats every
-    /// affected vnode as a fresh start.
-    ///
-    /// [`seal_checkpoint`]: Self::seal_checkpoint
-    async fn latest_sealed_checkpoint(
-        &self,
-    ) -> Result<Option<CheckpointAttempt>, StateBackendError> {
-        Ok(None)
-    }
 
     /// Failure scope survived by this backend.
     ///

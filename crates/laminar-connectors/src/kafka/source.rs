@@ -4,13 +4,14 @@
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use super::rebalance::LaminarConsumerContext;
@@ -42,10 +43,9 @@ use super::config::{
     TopicSubscription,
 };
 use super::metrics::KafkaSourceMetrics;
-use super::offsets::OffsetTracker;
+use super::offsets::{OffsetTracker, KAFKA_PARTITION_BASELINE_PREFIX};
 use super::rebalance::RebalanceState;
 use super::schema_registry::SchemaRegistryClient;
-use super::watermarks::KafkaWatermarkTracker;
 
 use crate::schema::evolution::SchemaEvolution;
 use crate::schema::traits::{CompatibilityMode, EvolutionVerdict};
@@ -61,19 +61,65 @@ struct KafkaPayload {
     headers_json: Option<String>,
 }
 
-const BROKER_COMMIT_REQUEST_CAPACITY: usize = 1;
-const BROKER_COMMIT_ACK_TIMEOUT_MS: u64 = 30_000;
-const BROKER_COMMIT_ACK_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(BROKER_COMMIT_ACK_TIMEOUT_MS);
+const KAFKA_BACKGROUND_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const KAFKA_PARTITION_INVENTORY_METADATA: &str = "kafka.partition.inventory.v1";
+const KAFKA_ASSIGNMENT_VERSION_METADATA: &str = "kafka.assignment.version.v1";
+const KAFKA_POSITION_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const KAFKA_POSITION_LOOKUP_CONCURRENCY: usize = 32;
 
-struct BrokerCommitRequest {
-    epoch: u64,
-    offsets: TopicPartitionList,
-    acknowledgement: oneshot::Sender<Result<(), String>>,
+type KafkaPartitionSet = std::collections::HashSet<(String, i32)>;
+type KafkaPartitionBaselines = std::collections::HashMap<(String, i32), i64>;
+type KafkaRotationBaselines =
+    std::collections::HashMap<Arc<str>, std::collections::HashMap<i32, i64>>;
+
+#[derive(Clone, Default)]
+struct KafkaRotationPublication {
+    assignment_version: u64,
+    baselines: KafkaRotationBaselines,
 }
 
-const fn commit_epoch_already_satisfied(last_committed_epoch: Option<u64>, requested: u64) -> bool {
-    matches!(last_committed_epoch, Some(committed) if committed >= requested)
+async fn join_background_task(
+    mut handle: tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+    task: &'static str,
+) {
+    match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(task, %error, "Kafka background task failed during shutdown"),
+        Err(_) => {
+            warn!(
+                task,
+                "Kafka background task shutdown timed out; aborting it"
+            );
+            handle.abort();
+            // The task may be inside a synchronous librdkafka call and cannot observe
+            // cancellation yet. Dropping the handle keeps close() within its deadline.
+        }
+    }
+}
+
+/// Keep one owner on Tokio's blocking pool until all async task owners drain, then perform the
+/// potentially blocking final drop there. Timing out detaches the reaper; it must not be aborted,
+/// or a later async task could become the last owner and block a runtime worker in librdkafka.
+async fn reap_last_arc_off_runtime<T: Send + Sync + 'static>(
+    owner: Arc<T>,
+    deadline: tokio::time::Instant,
+    resource: &'static str,
+) {
+    let mut reaper = tokio::task::spawn_blocking(move || {
+        while Arc::strong_count(&owner) > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(owner);
+    });
+    match tokio::time::timeout_at(deadline, &mut reaper).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(resource, %error, "Kafka blocking reaper failed"),
+        Err(_) => warn!(
+            resource,
+            "Kafka resource cleanup exceeded close deadline; detached blocking reaper"
+        ),
+    }
 }
 
 /// Single-consumer async receiver for the reader → `poll_batch` queue.
@@ -92,12 +138,12 @@ type KafkaPayloadRx = crossfire::AsyncRx<crossfire::mpsc::Array<KafkaPayload>>;
 /// 4. Call `checkpoint()` for fault tolerance
 /// 5. Call `close()` for clean shutdown
 ///
-/// `ExactlyOnce` startup requires engine-managed vnode assignment. Broker
-/// consumer-group ownership can revoke a partition before the asynchronous
-/// engine checkpoint captures its final offset, so that ownership mode is
-/// intentionally limited to `BestEffort` and `AtLeastOnce` delivery.
+/// Guaranteed delivery uses engine-owned manual assignment: the complete explicit topic inventory
+/// in embedded/single-node mode or the owned vnode subset in cluster mode. Broker consumer-group
+/// ownership can revoke a partition before an asynchronous engine checkpoint captures its final
+/// offset, so dynamic group ownership is intentionally limited to `BestEffort`.
 pub struct KafkaSource {
-    consumer: Option<StreamConsumer<LaminarConsumerContext>>,
+    consumer: Option<Arc<StreamConsumer<LaminarConsumerContext>>>,
     config: KafkaSourceConfig,
     deserializer: Box<dyn RecordDeserializer>,
     offsets: OffsetTracker,
@@ -120,16 +166,7 @@ pub struct KafkaSource {
     checkpoint_request: Arc<AtomicBool>,
     msg_rx: Option<KafkaPayloadRx>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
-    commit_handle: Option<tokio::task::JoinHandle<()>>,
-    hwm_handle: Option<tokio::task::JoinHandle<()>>,
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
-    /// Bounded request channel for broker commits. Every request carries a completion ack so a
-    /// durable engine epoch is never reported upstream before Kafka accepts its exact offsets.
-    commit_tx: Option<mpsc::Sender<BrokerCommitRequest>>,
-    watermark_tracker: Option<KafkaWatermarkTracker>,
-    /// `(topic, partition, high_watermark)` from the reader task, for lag computation.
-    #[allow(clippy::type_complexity)]
-    high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
     /// Offset snapshot for the rebalance callback's seek-on-assign, refreshed
     /// once per `poll_batch()` cycle.
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
@@ -153,11 +190,33 @@ pub struct KafkaSource {
     /// `(topic, partition_count)` from `start()`, so the reader can recompute
     /// owned partitions on rotation without re-fetching metadata.
     vnode_topic_meta: Vec<(Arc<str>, i32)>,
+    /// Canonical non-vnode manual assignment used by local guaranteed, specific, and timestamp
+    /// starts. Checkpointing trusts this engine-owned inventory, never a fallible broker query.
+    manual_topic_partitions: KafkaPartitionSet,
+    /// Concrete next-to-read position captured before intake for every engine-owned partition.
+    /// It remains authoritative until that partition has an accepted-record offset.
+    manual_partition_baselines: KafkaPartitionBaselines,
+    /// Durable handoff positions for newly acquired vnode partitions. These
+    /// override stale offsets from an earlier ownership stint until this source
+    /// accepts a record at or after the handoff cut.
+    rotation_partition_baselines: Arc<Mutex<Arc<KafkaRotationPublication>>>,
+    /// Zero-cost steady-state fast path: avoids locking the rotation snapshot
+    /// when no acquired partition is waiting for its first accepted record.
+    rotation_partition_baseline_count: Arc<AtomicUsize>,
+    /// Rotation publication whose stale local offsets have already been removed.
+    /// Baseline publication is immutable within one assignment version, so this
+    /// keeps that cleanup off the steady-state poll path.
+    applied_rotation_baseline_version: Option<u64>,
+    /// Assignment version whose Kafka consumer rebind and durable cursor
+    /// validation have completed. Barriers stay fenced while this trails the
+    /// registry's atomically published version.
+    reconciled_assignment_version: Arc<AtomicU64>,
 
     /// Previous Avro writer schema, diffed against the next for evolution detection.
     last_avro_schema: Option<SchemaRef>,
 
     // Reusable poll_batch buffers — cleared each cycle, capacity retained.
+    poll_payloads: Vec<KafkaPayload>,
     poll_payload_buf: Vec<u8>,
     poll_payload_offsets: Vec<(usize, usize)>,
     poll_meta_partitions: Vec<i32>,
@@ -232,15 +291,6 @@ impl KafkaSource {
         let deserializer = deser_factory(config.format);
         let channel_len = Arc::new(AtomicUsize::new(0));
 
-        let watermark_tracker = if config.enable_watermark_tracking {
-            Some(
-                KafkaWatermarkTracker::new(0, config.idle_timeout)
-                    .with_max_out_of_orderness(config.max_out_of_orderness),
-            )
-        } else {
-            None
-        };
-
         Self {
             consumer: None,
             config,
@@ -260,18 +310,22 @@ impl KafkaSource {
             checkpoint_request: Arc::new(AtomicBool::new(false)),
             msg_rx: None,
             reader_handle: None,
-            commit_handle: None,
-            hwm_handle: None,
             reader_shutdown: None,
-            commit_tx: None,
-            watermark_tracker,
-            high_watermarks_rx: None,
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
             deterministic_unrecorded_position: Arc::new(AtomicBool::new(false)),
             source_name: Arc::from(""),
             vnode_assignment: None,
             vnode_topic_meta: Vec::new(),
+            manual_topic_partitions: std::collections::HashSet::new(),
+            manual_partition_baselines: std::collections::HashMap::new(),
+            rotation_partition_baselines: Arc::new(Mutex::new(Arc::new(
+                KafkaRotationPublication::default(),
+            ))),
+            rotation_partition_baseline_count: Arc::new(AtomicUsize::new(0)),
+            applied_rotation_baseline_version: None,
+            reconciled_assignment_version: Arc::new(AtomicU64::new(0)),
             last_avro_schema: None,
+            poll_payloads: Vec::new(),
             poll_payload_buf: Vec::new(),
             poll_payload_offsets: Vec::new(),
             poll_meta_partitions: Vec::new(),
@@ -312,137 +366,27 @@ impl KafkaSource {
         self.schema_registry.is_some()
     }
 
-    /// Current combined watermark from the watermark tracker.
-    ///
-    /// Returns `None` if watermark tracking is disabled or no partitions
-    /// have received data yet.
-    #[must_use]
-    pub fn current_watermark(&self) -> Option<i64> {
-        self.watermark_tracker
-            .as_ref()
-            .and_then(KafkaWatermarkTracker::current_watermark)
-    }
-
-    /// Returns the configured event-time column name, if any.
-    ///
-    /// Used by the pipeline to identify which column contains event timestamps
-    /// for watermark generation, instead of hardcoding `event_time`/`timestamp`.
-    #[must_use]
-    pub fn event_time_column(&self) -> Option<&str> {
-        self.config.event_time_column.as_deref()
-    }
-
-    /// Spawns the background reader, commit, and HWM tasks on the first
-    /// `poll_batch()`. The startup cursor has already been installed by
-    /// `start()` before this task can observe the consumer.
+    /// Spawns the background reader task on the first `poll_batch()`.
+    /// The startup cursor has already been installed by `start()` before these
+    /// tasks can observe the consumer.
     #[allow(clippy::too_many_lines)]
     fn ensure_reader_started(&mut self) {
         if self.reader_handle.is_some() || self.consumer.is_none() {
             return;
         }
 
-        let consumer = Arc::new(self.consumer.take().unwrap());
+        let consumer = Arc::clone(self.consumer.as_ref().unwrap());
         let (msg_tx, msg_rx) =
             crossfire::mpsc::bounded_async::<KafkaPayload>(self.config.reader_channel_capacity);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let (commit_tx, mut commit_rx) =
-            mpsc::channel::<BrokerCommitRequest>(BROKER_COMMIT_REQUEST_CAPACITY);
-        let (hwm_tx, hwm_rx) = tokio::sync::watch::channel(Vec::new());
-        // Channel for the reader to publish seen partitions to the HWM task.
-        let (seen_tx, seen_rx) = tokio::sync::watch::channel(Vec::<(Arc<str>, i32)>::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
         let reader_channel_capacity = self.config.reader_channel_capacity;
-        let revoke_generation = Arc::clone(&self.revoke_generation);
         let assign_generation = Arc::clone(&self.assign_generation);
         let rebalance_state = Arc::clone(&self.rebalance_state);
         let pause_threshold = self.config.backpressure_high_watermark;
         let resume_threshold = self.config.backpressure_low_watermark;
-
-        // Broker commit task: applies one bounded, acknowledged durable request at a time. The
-        // epoch fence prevents a delayed/stale notification from regressing broker offsets after a
-        // newer engine cut was already accepted. Dropping commit_tx lets the task drain then exit.
-        let commit_consumer = Arc::clone(&consumer);
-        let commit_metrics = self.metrics.clone();
-        let commit_handle = tokio::spawn(async move {
-            let mut last_committed_epoch = None;
-            while let Some(request) = commit_rx.recv().await {
-                if commit_epoch_already_satisfied(last_committed_epoch, request.epoch) {
-                    let _ = request.acknowledgement.send(Ok(()));
-                    continue;
-                }
-                let start = std::time::Instant::now();
-                let c = Arc::clone(&commit_consumer);
-                let offsets = request.offsets;
-                let result =
-                    tokio::task::spawn_blocking(move || c.commit(&offsets, CommitMode::Sync)).await;
-                commit_metrics.observe_broker_commit_duration(start.elapsed().as_secs_f64());
-
-                let result = match result {
-                    Ok(Ok(())) => {
-                        last_committed_epoch = Some(request.epoch);
-                        Ok(())
-                    }
-                    Ok(Err(e)) => {
-                        // Failure counting is centralized in
-                        // LaminarConsumerContext::commit_callback (which
-                        // librdkafka fires for both sync and async
-                        // commits) — bumping here would double-count.
-                        warn!(error = %e, "broker offset commit rejected");
-                        Err(format!("broker offset commit rejected: {e}"))
-                    }
-                    Err(e) => {
-                        // The callback does not fire for spawn_blocking
-                        // panics, so this is the only path that records
-                        // them.
-                        commit_metrics.commit_failures_panic.inc();
-                        warn!(error = %e, "broker offset commit task panicked");
-                        Err(format!("broker offset commit task panicked: {e}"))
-                    }
-                };
-                let _ = request.acknowledgement.send(result);
-            }
-        });
-
-        // -- HWM task: periodic high watermark queries for lag monitoring --
-        let hwm_consumer = Arc::clone(&consumer);
-        let mut hwm_shutdown = shutdown_rx.clone();
-        let hwm_handle = tokio::spawn(async move {
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
-            timer.tick().await; // skip first
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = hwm_shutdown.changed() => break,
-                    _ = timer.tick() => {
-                        let partitions: Vec<_> = seen_rx.borrow().clone();
-                        if partitions.is_empty() { continue; }
-                        let c = Arc::clone(&hwm_consumer);
-                        let watermarks = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            tokio::task::spawn_blocking(move || {
-                                let mut results = Vec::with_capacity(partitions.len());
-                                for (topic, partition) in &partitions {
-                                    match c.fetch_watermarks(topic, *partition, std::time::Duration::from_secs(1)) {
-                                        Ok((_low, high)) => results.push((Arc::clone(topic), *partition, high)),
-                                        Err(e) => debug!(%topic, partition, error = %e, "HWM fetch failed"),
-                                    }
-                                }
-                                results
-                            }),
-                        )
-                        .await
-                        .unwrap_or(Ok(Vec::new()))
-                        .unwrap_or_default();
-                        if !watermarks.is_empty() {
-                            let _ = hwm_tx.send(watermarks);
-                        }
-                    }
-                }
-            }
-        });
 
         // -- Reader task: message consumption, backpressure, revoke pruning --
         // Engine-controlled re-assignment inputs (cluster mode; `None` otherwise).
@@ -452,6 +396,11 @@ impl KafkaSource {
             .map(|(r, s)| (Arc::clone(r), *s));
         let vnode_topic_meta = self.vnode_topic_meta.clone();
         let reassign_snapshot = Arc::clone(&self.offset_snapshot);
+        let reassign_baselines = self.manual_partition_baselines.clone();
+        let rotation_baselines = Arc::clone(&self.rotation_partition_baselines);
+        let rotation_baseline_count = Arc::clone(&self.rotation_partition_baseline_count);
+        let reconciled_assignment_version = Arc::clone(&self.reconciled_assignment_version);
+        let require_durable_baselines = !reassign_baselines.is_empty();
         let reassign_default_offset = startup_default_offset(&self.config.startup_mode);
         let deterministic_unrecorded = Arc::clone(&self.deterministic_unrecorded_position);
         let source_name = Arc::clone(&self.source_name);
@@ -460,17 +409,12 @@ impl KafkaSource {
         let mut reader_shutdown = shutdown_rx;
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
-            let mut seen_partitions: std::collections::HashSet<(Arc<str>, i32)> =
-                std::collections::HashSet::new();
             let mut is_paused = false;
-            let mut last_revoke_gen: u64 = 0;
             let mut last_assign_gen: u64 = 0;
-            // Start at 0, NOT the current registry version: a restarted node boots unassigned
-            // and its startup adopt races this task's spawn — capturing the already-bumped
-            // version here would silently skip the rebind and the node would never consume its
-            // re-acquired partitions. A spurious first pass reconciles current-vs-owned and
-            // no-ops when start() already assigned for the live version.
-            let mut last_assignment_version = 0u64;
+            // start() records the exact publication used for its initial Kafka assignment.
+            // Starting from that fence detects even a self→other→self sequence that lands before
+            // this lazy reader gets its first turn; boot-unassigned sources legitimately start 0.
+            let mut last_assignment_version = reconciled_assignment_version.load(Ordering::Acquire);
             // Same race for drains; a stale first pass re-applies the current drain state,
             // which is idempotent.
             let mut last_drain_gen = 0u64;
@@ -483,9 +427,21 @@ impl KafkaSource {
                 // already buffered ahead, re-emitting committed rows. Newly-acquired
                 // partitions seek to their handoff offset; kept ones are untouched.
                 if let Some((registry, self_id)) = &vnode_reassign {
-                    let version = registry.assignment_version();
+                    let published = registry.versioned_snapshot();
+                    let version = published.version();
                     if version != last_assignment_version {
-                        let current = consumer.assignment().unwrap_or_default();
+                        let current = match consumer.assignment() {
+                            Ok(current) => current,
+                            Err(error) => {
+                                warn!(
+                                    version,
+                                    %error,
+                                    "Kafka source could not inspect its current assignment; rotation will retry"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                continue;
+                            }
+                        };
                         let current_set: std::collections::HashSet<(String, i32)> = current
                             .elements()
                             .iter()
@@ -495,24 +451,46 @@ impl KafkaSource {
                         let mut owned_set: std::collections::HashSet<(String, i32)> =
                             std::collections::HashSet::new();
                         for (topic, count) in &vnode_topic_meta {
-                            for p in crate::partition_assignment::owned_partitions(
-                                *count, registry, *self_id,
+                            for p in crate::partition_assignment::owned_partitions_in_assignment(
+                                *count,
+                                published.owners(),
+                                *self_id,
                             ) {
                                 owned_set.insert((topic.to_string(), p));
                             }
                         }
 
+                        // A source can miss an intermediate self→other→self publication while
+                        // fenced (for example consecutive dead-node shedding). The latest owner
+                        // set then matches the live Kafka assignment even though the partition
+                        // must be unassigned and re-seeked to the latest durable handoff.
+                        let reacquired: KafkaPartitionSet = vnode_topic_meta
+                            .iter()
+                            .flat_map(|(topic, count)| {
+                                (0..*count)
+                                    .filter(|partition| {
+                                        partition_reacquired_after(
+                                            &published,
+                                            *partition,
+                                            *self_id,
+                                            last_assignment_version,
+                                        )
+                                    })
+                                    .map(|partition| (topic.to_string(), partition))
+                            })
+                            .collect();
+
                         let mut to_remove = TopicPartitionList::new();
                         for e in current.elements() {
-                            if !owned_set.contains(&(e.topic().to_string(), e.partition())) {
+                            let partition = (e.topic().to_string(), e.partition());
+                            if !owned_set.contains(&partition) || reacquired.contains(&partition) {
                                 let _ = to_remove.add_partition(e.topic(), e.partition());
                             }
                         }
 
                         let offsets = lock_or_recover(&reassign_snapshot).clone();
-                        let resume = match OffsetTracker::try_from_offset_map(
-                            &registry.resume_offsets_for(source_name.as_ref()),
-                        ) {
+                        let resume_raw = published.resume_offsets_for(source_name.as_ref());
+                        let resume = match OffsetTracker::try_from_offset_map(&resume_raw) {
                             Ok(resume) => resume,
                             Err(error) => {
                                 warn!(
@@ -524,27 +502,68 @@ impl KafkaSource {
                                 return;
                             }
                         };
+                        let resume_baselines =
+                            match decode_partition_baselines_from_offsets(&resume_raw) {
+                                Ok(baselines) => baselines,
+                                Err(error) => {
+                                    warn!(
+                                        version,
+                                        source = source_name.as_ref(),
+                                        error = %error,
+                                        "Kafka source rejected malformed durable handoff baselines"
+                                    );
+                                    return;
+                                }
+                            };
                         let mut to_add = TopicPartitionList::new();
+                        let mut acquired_positions = KafkaPartitionBaselines::new();
                         for (topic, count) in &vnode_topic_meta {
-                            for p in crate::partition_assignment::owned_partitions(
-                                *count, registry, *self_id,
+                            for p in crate::partition_assignment::owned_partitions_in_assignment(
+                                *count,
+                                published.owners(),
+                                *self_id,
                             ) {
-                                if current_set.contains(&(topic.to_string(), p)) {
+                                if current_set.contains(&(topic.to_string(), p))
+                                    && !reacquired.contains(&(topic.to_string(), p))
+                                {
                                     continue; // kept — leave untouched
                                 }
-                                let offset = if let Some(o) =
-                                    acquired_resume_offset(&resume, &offsets, topic.as_ref(), p)
-                                {
-                                    // The replay start per acquired partition; a soak compares it
-                                    // against the rehydrated state's epoch cut.
+                                let offset = if let Some(next) = match acquired_numeric_position(
+                                    &resume,
+                                    &resume_baselines,
+                                    &offsets,
+                                    &reassign_baselines,
+                                    topic.as_ref(),
+                                    p,
+                                    !require_durable_baselines
+                                        || !published.has_committed_handoff(),
+                                ) {
+                                    Ok(position) => position,
+                                    Err(error) => {
+                                        warn!(
+                                            topic = topic.as_ref(),
+                                            partition = p,
+                                            %error,
+                                            "Kafka source rejected an invalid handoff position"
+                                        );
+                                        return;
+                                    }
+                                } {
                                     info!(
                                         topic = topic.as_ref(),
                                         partition = p,
-                                        resume = o + 1,
-                                        from_handoff = resume.get(topic.as_ref(), p).is_some(),
-                                        "acquired partition resume offset"
+                                        resume = next,
+                                        "acquired partition uses durable numeric position"
                                     );
-                                    rdkafka::Offset::Offset(o + 1)
+                                    acquired_positions.insert((topic.to_string(), p), next);
+                                    rdkafka::Offset::Offset(next)
+                                } else if require_durable_baselines {
+                                    warn!(
+                                        topic = topic.as_ref(),
+                                        partition = p,
+                                        "acquired Kafka partition has no durable next-to-read baseline"
+                                    );
+                                    return;
                                 } else if deterministic_unrecorded.load(Ordering::Acquire) {
                                     let Some(initial_offset) = deterministic_default else {
                                         warn!(
@@ -554,12 +573,6 @@ impl KafkaSource {
                                         );
                                         return;
                                     };
-                                    info!(
-                                        topic = topic.as_ref(),
-                                        partition = p,
-                                        "acquired partition starts at the configured deterministic \
-                                         initial position"
-                                    );
                                     initial_offset
                                 } else {
                                     warn!(
@@ -570,7 +583,70 @@ impl KafkaSource {
                                     );
                                     reassign_default_offset
                                 };
-                                let _ = to_add.add_partition_offset(topic.as_ref(), p, offset);
+                                if let Err(error) =
+                                    to_add.add_partition_offset(topic.as_ref(), p, offset)
+                                {
+                                    warn!(
+                                        topic = topic.as_ref(),
+                                        partition = p,
+                                        %error,
+                                        "failed to build Kafka rotation assignment"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Registry ownership is already committed. Publish the handoff cut before
+                        // the first await so a concurrent checkpoint cannot resurrect a stale
+                        // position from this node's earlier ownership stint.
+                        {
+                            let mut overrides = lock_or_recover(&rotation_baselines);
+                            let updated = update_rotation_baselines(
+                                &overrides.baselines,
+                                &owned_set,
+                                &acquired_positions,
+                            );
+                            let count = rotation_baselines_len(&updated);
+                            *overrides = Arc::new(KafkaRotationPublication {
+                                assignment_version: version,
+                                baselines: updated,
+                            });
+                            rotation_baseline_count.store(count, Ordering::Release);
+                        }
+
+                        if !acquired_positions.is_empty() {
+                            let acquired: KafkaPartitionSet =
+                                acquired_positions.keys().cloned().collect();
+                            let low_watermarks = match fetch_partition_low_watermarks(
+                                Arc::clone(&consumer),
+                                &acquired,
+                            )
+                            .await
+                            {
+                                Ok(low_watermarks) => low_watermarks,
+                                Err(error) => {
+                                    warn!(
+                                        version,
+                                        %error,
+                                        "Kafka source could not validate acquired handoff positions; rotation will retry"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    continue;
+                                }
+                            };
+                            if let Err(error) = validate_positions_not_expired(
+                                &OffsetTracker::new(),
+                                &acquired_positions,
+                                &low_watermarks,
+                                &acquired,
+                            ) {
+                                warn!(
+                                    version,
+                                    %error,
+                                    "Kafka source rejected an expired handoff position"
+                                );
+                                return;
                             }
                         }
 
@@ -604,6 +680,8 @@ impl KafkaSource {
                             lock_or_recover(&reassign_snapshot).retain_assigned(&owned_set);
                             last_drain_gen = registry.draining_generation();
                             last_assignment_version = version;
+                            reconciled_assignment_version.store(version, Ordering::Release);
+                            data_ready.notify_one();
                         }
                     }
                 }
@@ -615,12 +693,15 @@ impl KafkaSource {
                     let drain_gen = registry.draining_generation();
                     if drain_gen != last_drain_gen {
                         let vnode_count = registry.vnode_count();
+                        let assignment = registry.snapshot();
                         let want: std::collections::HashSet<(Arc<str>, i32)> = vnode_topic_meta
                             .iter()
                             .flat_map(|(topic, count)| {
                                 let topic = Arc::clone(topic);
-                                crate::partition_assignment::owned_partitions(
-                                    *count, registry, *self_id,
+                                crate::partition_assignment::owned_partitions_in_assignment(
+                                    *count,
+                                    &assignment,
+                                    *self_id,
                                 )
                                 .into_iter()
                                 .filter(|&p| {
@@ -658,17 +739,6 @@ impl KafkaSource {
                     }
                 }
 
-                // Prune seen_partitions on revoke so HWM task stops querying them.
-                let current_gen = revoke_generation.load(Ordering::Acquire);
-                if current_gen != last_revoke_gen {
-                    last_revoke_gen = current_gen;
-                    let assigned = lock_or_recover(&rebalance_state)
-                        .assigned_partitions()
-                        .clone();
-                    seen_partitions.retain(|(t, p)| assigned.contains(&(t.to_string(), *p)));
-                    let _ = seen_tx.send(seen_partitions.iter().cloned().collect());
-                }
-
                 // Newly-assigned partitions were paused by the callback. Seek to the
                 // checkpointed offsets HERE, in the poll loop where the assignment is
                 // fetch-ready (the in-callback seek fails `Local: Erroneous state`),
@@ -700,7 +770,13 @@ impl KafkaSource {
                     let seek_tpl = match assignment_seek_tpl(
                         &lock_or_recover(&reassign_snapshot),
                         &assigned,
+                        if reassign_baselines.is_empty() {
+                            None
+                        } else {
+                            Some(&reassign_baselines)
+                        },
                         deterministic_fallback,
+                        deterministic_unrecorded.load(Ordering::Acquire),
                     ) {
                         Ok(tpl) => tpl,
                         Err(e) => {
@@ -711,9 +787,16 @@ impl KafkaSource {
                     let seek_ok = if seek_tpl.count() == 0 {
                         true // fresh start: nothing checkpointed to seek to
                     } else {
-                        match consumer.seek_partitions(seek_tpl, std::time::Duration::from_secs(5))
+                        let seek_consumer = Arc::clone(&consumer);
+                        match tokio::task::spawn_blocking(move || {
+                            seek_consumer
+                                .seek_partitions(seek_tpl, std::time::Duration::from_secs(5))
+                        })
+                        .await
                         {
-                            Ok(result) => {
+                            Ok(Ok(result))
+                                if assign_generation.load(Ordering::Acquire) == cur_assign_gen =>
+                            {
                                 let failed = result
                                     .elements()
                                     .iter()
@@ -731,8 +814,13 @@ impl KafkaSource {
                                     false
                                 }
                             }
-                            Err(e) => {
+                            Ok(Ok(_)) => false,
+                            Ok(Err(e)) => {
                                 debug!(error = %e, "assign-seek failed; will retry");
+                                false
+                            }
+                            Err(error) => {
+                                warn!(%error, "Kafka assign-seek worker failed");
                                 false
                             }
                         }
@@ -813,10 +901,6 @@ impl KafkaSource {
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
-                            if seen_partitions.insert((Arc::clone(&cached_topic), msg.partition()))
-                            {
-                                let _ = seen_tx.send(seen_partitions.iter().cloned().collect());
-                            }
                             let timestamp_ms = match msg.timestamp() {
                                 rdkafka::Timestamp::CreateTime(ts)
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
@@ -879,26 +963,117 @@ impl KafkaSource {
                             data_ready.notify_one();
                         }
                     }
+                    Err(e) if !kafka_reader_error_is_terminal(&e) => {
+                        debug!(error = %e, "Kafka consumer poll event");
+                    }
                     Err(e) => {
                         warn!(error = %e, "Kafka consumer error");
+                        break;
                     }
                 }
             }
 
-            // Reader does NOT commit on shutdown. With on-checkpoint
-            // semantics the only durable broker offsets are those that
-            // belong to a committed epoch; close() drains the commit-request
-            // channel before unsubscribing, ensuring nothing is lost.
-            consumer.unsubscribe();
+            // Reader does not commit or unsubscribe on shutdown. `close()`
+            // owns the connector's single final unsubscribe.
+            // Wake a parked runtime so an unexpected exit is observed as a
+            // disconnected channel on the next poll instead of a silent stall.
+            data_ready.notify_one();
         });
 
         self.msg_rx = Some(msg_rx);
         self.reader_handle = Some(reader_handle);
-        self.commit_handle = Some(commit_handle);
-        self.hwm_handle = Some(hwm_handle);
         self.reader_shutdown = Some(shutdown_tx);
-        self.commit_tx = Some(commit_tx);
-        self.high_watermarks_rx = Some(hwm_rx);
+    }
+
+    fn capture_vnode_checkpoint(
+        &self,
+        published: &laminar_core::state::VnodeAssignmentSnapshot,
+        self_id: laminar_core::state::NodeId,
+        rotation: &KafkaRotationPublication,
+    ) -> SourceCheckpoint {
+        let owned: KafkaPartitionSet = self
+            .vnode_topic_meta
+            .iter()
+            .flat_map(|(topic, count)| {
+                crate::partition_assignment::owned_partitions_in_assignment(
+                    *count,
+                    published.owners(),
+                    self_id,
+                )
+                .into_iter()
+                .map(move |partition| (topic.to_string(), partition))
+            })
+            .collect();
+        let offset_owned: KafkaPartitionSet = owned
+            .iter()
+            .filter(|(topic, partition)| {
+                rotation_partition_baseline(&rotation.baselines, topic, *partition).is_none()
+            })
+            .cloned()
+            .collect();
+        let mut checkpoint = self.offsets.to_checkpoint_filtered(&offset_owned);
+        attach_partition_baselines(&mut checkpoint, &self.manual_partition_baselines, &owned);
+        attach_rotation_baselines(&mut checkpoint, &rotation.baselines, &owned);
+        checkpoint.set_metadata(
+            KAFKA_ASSIGNMENT_VERSION_METADATA,
+            published.version().to_string(),
+        );
+        checkpoint
+    }
+
+    fn capture_non_vnode_checkpoint(&self) -> SourceCheckpoint {
+        if !self.manual_topic_partitions.is_empty() {
+            let mut checkpoint = self
+                .offsets
+                .to_checkpoint_filtered(&self.manual_topic_partitions);
+            attach_partition_baselines(
+                &mut checkpoint,
+                &self.manual_partition_baselines,
+                &self.manual_topic_partitions,
+            );
+            checkpoint.set_metadata(
+                KAFKA_PARTITION_INVENTORY_METADATA,
+                encode_partition_inventory(&self.manual_topic_partitions),
+            );
+            return checkpoint;
+        }
+        let assigned = lock_or_recover(&self.rebalance_state)
+            .assigned_partitions()
+            .clone();
+        self.offsets.to_checkpoint_filtered(&assigned)
+    }
+
+    fn try_capture_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        let Some((registry, self_id)) = &self.vnode_assignment else {
+            return Ok(Some(self.capture_non_vnode_checkpoint()));
+        };
+        if self.vnode_topic_meta.is_empty() {
+            return Ok(Some(self.capture_non_vnode_checkpoint()));
+        }
+        if self
+            .reader_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(ConnectorError::Internal(
+                "Kafka reader task exited while capturing its checkpoint cursor".into(),
+            ));
+        }
+
+        // The read guard is the linearization point: ownership cannot publish a
+        // new version between the reconciliation check and cursor capture.
+        let published = registry.read_assignment();
+        let version = published.version();
+        if self.reconciled_assignment_version.load(Ordering::Acquire) != version {
+            return Ok(None);
+        }
+        let rotation = Arc::clone(&lock_or_recover(&self.rotation_partition_baselines));
+        if rotation.assignment_version != version {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.capture_vnode_checkpoint(&published, *self_id, &rotation),
+        ))
     }
 }
 
@@ -915,48 +1090,95 @@ fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitio
 /// Partition list for the initial `start()` assignment of a vnode-assigned source:
 /// owned partitions (`partition % vnode_count`) at their checkpointed offset + 1,
 /// else `default_offset`. Rotations rebind incrementally in the reader loop.
+#[derive(Clone, Copy)]
+struct VnodeResumeCursors<'a> {
+    local_offsets: &'a OffsetTracker,
+    handoff_offsets: &'a OffsetTracker,
+    local_baselines: &'a KafkaPartitionBaselines,
+    handoff_baselines: &'a KafkaPartitionBaselines,
+}
+
 fn build_vnode_assignment_tpl(
-    registry: &laminar_core::state::VnodeRegistry,
+    assignment: &[laminar_core::state::NodeId],
     self_id: laminar_core::state::NodeId,
     topic_meta: &[(Arc<str>, i32)],
-    offsets: &OffsetTracker,
-    resume: &OffsetTracker,
+    cursors: VnodeResumeCursors<'_>,
     default_offset: rdkafka::Offset,
-) -> TopicPartitionList {
+) -> Result<TopicPartitionList, ConnectorError> {
     let mut tpl = TopicPartitionList::new();
     for (topic, count) in topic_meta {
-        for partition in crate::partition_assignment::owned_partitions(*count, registry, self_id) {
-            let offset = match offsets
+        for partition in
+            crate::partition_assignment::owned_partitions_in_assignment(*count, assignment, self_id)
+        {
+            let offset = match cursors
+                .local_offsets
                 .get(topic.as_ref(), partition)
                 // No local offset → handed to us in a rotation; fall back to the
                 // previous owner's staged position, not auto.offset.reset.
-                .or_else(|| resume.get(topic.as_ref(), partition))
+                .or_else(|| cursors.handoff_offsets.get(topic.as_ref(), partition))
             {
-                Some(o) => rdkafka::Offset::Offset(o + 1),
-                None => default_offset,
+                Some(offset) => {
+                    rdkafka::Offset::Offset(offset.checked_add(1).ok_or_else(|| {
+                        ConnectorError::ConfigurationError(format!(
+                            "Kafka checkpoint offset overflow for '{topic}-{partition}'"
+                        ))
+                    })?)
+                }
+                None => cursors
+                    .handoff_baselines
+                    .get(&(topic.to_string(), partition))
+                    .or_else(|| cursors.local_baselines.get(&(topic.to_string(), partition)))
+                    .map_or(default_offset, |next| rdkafka::Offset::Offset(*next)),
             };
-            if let Err(e) = tpl.add_partition_offset(topic.as_ref(), partition, offset) {
-                warn!(
-                    topic = %topic, partition, error = %e,
-                    "failed to add vnode-owned partition to assignment"
-                );
-            }
+            tpl.add_partition_offset(topic.as_ref(), partition, offset)
+                .map_err(|error| {
+                    ConnectorError::Internal(format!(
+                        "failed to add vnode-owned Kafka partition '{topic}-{partition}' to assignment: {error}"
+                    ))
+                })?;
         }
     }
-    tpl
+    Ok(tpl)
 }
 
-/// Acquired-partition resume: the staged handoff (the sealed cut rehydrated state was read at)
-/// outranks the stale local snapshot; local remains the first-rotation fallback.
-fn acquired_resume_offset(
+/// Resolves the numeric next-to-read position for an acquired vnode partition.
+/// Durable handoff state always outranks a stale cursor from this node's prior
+/// ownership stint. Guaranteed delivery never falls back to that local cursor.
+fn acquired_numeric_position(
     handoff: &OffsetTracker,
+    handoff_baselines: &KafkaPartitionBaselines,
     local: &OffsetTracker,
+    local_baselines: &KafkaPartitionBaselines,
     topic: &str,
     partition: i32,
-) -> Option<i64> {
-    handoff
-        .get(topic, partition)
-        .or_else(|| local.get(topic, partition))
+    allow_local: bool,
+) -> Result<Option<i64>, ConnectorError> {
+    if let Some(offset) = handoff.get(topic, partition) {
+        return offset.checked_add(1).map(Some).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "Kafka handoff offset overflow for '{topic}-{partition}'"
+            ))
+        });
+    }
+    if let Some(next) = handoff_baselines
+        .get(&(topic.to_string(), partition))
+        .copied()
+    {
+        return Ok(Some(next));
+    }
+    if allow_local {
+        if let Some(offset) = local.get(topic, partition) {
+            return offset.checked_add(1).map(Some).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "Kafka local offset overflow for '{topic}-{partition}'"
+                ))
+            });
+        }
+        if let Some(next) = local_baselines.get(&(topic.to_string(), partition)) {
+            return Ok(Some(*next));
+        }
+    }
+    Ok(None)
 }
 
 /// Builds the seek applied after a group assignment. With a deterministic
@@ -966,7 +1188,9 @@ fn acquired_resume_offset(
 fn assignment_seek_tpl(
     offsets: &OffsetTracker,
     assigned: &[(String, i32)],
+    baselines: Option<&KafkaPartitionBaselines>,
     deterministic_fallback: Option<rdkafka::Offset>,
+    require_all: bool,
 ) -> Result<TopicPartitionList, ConnectorError> {
     let mut tpl = TopicPartitionList::new();
     for (topic, partition) in assigned {
@@ -976,10 +1200,21 @@ fn assignment_seek_tpl(
                     "Kafka checkpoint offset overflow for '{topic}-{partition}'"
                 ))
             })?),
-            None => match deterministic_fallback {
-                Some(offset) => offset,
-                None => continue,
-            },
+            None => {
+                if let Some(next) =
+                    baselines.and_then(|positions| positions.get(&(topic.clone(), *partition)))
+                {
+                    rdkafka::Offset::Offset(*next)
+                } else if let Some(offset) = deterministic_fallback {
+                    offset
+                } else if require_all {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "Kafka partition '{topic}-{partition}' has no durable next-to-read baseline"
+                    )));
+                } else {
+                    continue;
+                }
+            }
         };
         tpl.add_partition_offset(topic, *partition, position)
             .map_err(|e| {
@@ -1013,8 +1248,452 @@ fn deterministic_initial_offset(mode: &StartupMode, reset: OffsetReset) -> Optio
         (StartupMode::Latest, _) | (StartupMode::GroupOffsets, OffsetReset::Latest) => {
             Some(rdkafka::Offset::End)
         }
-        (StartupMode::GroupOffsets | StartupMode::Earliest, _) => Some(rdkafka::Offset::Beginning),
-        (StartupMode::SpecificOffsets(_) | StartupMode::Timestamp(_), _) => None,
+        (StartupMode::GroupOffsets, OffsetReset::None)
+        | (StartupMode::SpecificOffsets(_) | StartupMode::Timestamp(_), _) => None,
+        (StartupMode::GroupOffsets, OffsetReset::Earliest) | (StartupMode::Earliest, _) => {
+            Some(rdkafka::Offset::Beginning)
+        }
+    }
+}
+
+fn encode_partition_inventory(inventory: &KafkaPartitionSet) -> String {
+    let mut canonical: Vec<_> = inventory.iter().cloned().collect();
+    canonical.sort_unstable();
+    serde_json::to_string(&canonical).expect("Kafka partition inventory is serializable")
+}
+
+fn decode_partition_inventory(
+    checkpoint: &SourceCheckpoint,
+) -> Result<Option<KafkaPartitionSet>, ConnectorError> {
+    let Some(encoded) = checkpoint.get_metadata(KAFKA_PARTITION_INVENTORY_METADATA) else {
+        return Ok(None);
+    };
+    let canonical: Vec<(String, i32)> = serde_json::from_str(encoded).map_err(|error| {
+        ConnectorError::ConfigurationError(format!(
+            "invalid Kafka checkpoint partition inventory: {error}"
+        ))
+    })?;
+    if canonical
+        .iter()
+        .any(|(topic, partition)| topic.is_empty() || *partition < 0)
+        || canonical.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "invalid Kafka checkpoint partition inventory: entries must be canonical, unique, and non-negative"
+                .into(),
+        ));
+    }
+    Ok(Some(canonical.into_iter().collect()))
+}
+
+fn validate_resume_inventory(
+    checkpoint: Option<&KafkaPartitionSet>,
+    current: &KafkaPartitionSet,
+) -> Result<(), ConnectorError> {
+    let checkpoint = checkpoint.ok_or_else(|| {
+        ConnectorError::ConfigurationError(
+            "Kafka engine-owned resume checkpoint has no partition inventory".into(),
+        )
+    })?;
+    if checkpoint != current {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Kafka partition inventory changed across recovery: checkpoint={checkpoint:?}, current={current:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn partition_baseline_key(topic: &str, partition: i32) -> String {
+    format!("{KAFKA_PARTITION_BASELINE_PREFIX}{topic}:{partition}")
+}
+
+fn decode_partition_baselines_from_offsets(
+    offsets: &std::collections::HashMap<String, String>,
+) -> Result<KafkaPartitionBaselines, ConnectorError> {
+    let mut baselines = KafkaPartitionBaselines::new();
+    for (key, value) in offsets {
+        let Some(encoded) = key.strip_prefix(KAFKA_PARTITION_BASELINE_PREFIX) else {
+            continue;
+        };
+        let (topic, partition_text) = encoded.rsplit_once(':').ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid Kafka partition baseline key '{key}'"
+            ))
+        })?;
+        let partition = partition_text.parse::<i32>().map_err(|_| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid Kafka partition baseline key '{key}'"
+            ))
+        })?;
+        let next = value.parse::<i64>().map_err(|_| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid Kafka next-to-read baseline for '{topic}-{partition_text}': '{value}'"
+            ))
+        })?;
+        if topic.is_empty()
+            || topic.contains(':')
+            || partition < 0
+            || partition.to_string() != partition_text
+            || next < 0
+            || next == i64::MAX
+            || next.to_string() != value.as_str()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "invalid Kafka partition baseline '{key}' = '{value}'"
+            )));
+        }
+        if baselines
+            .insert((topic.to_string(), partition), next)
+            .is_some()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "duplicate Kafka partition baseline for '{topic}-{partition}'"
+            )));
+        }
+    }
+    Ok(baselines)
+}
+
+fn decode_partition_baselines(
+    checkpoint: &SourceCheckpoint,
+) -> Result<KafkaPartitionBaselines, ConnectorError> {
+    decode_partition_baselines_from_offsets(checkpoint.offsets())
+}
+
+fn attach_partition_baselines(
+    checkpoint: &mut SourceCheckpoint,
+    baselines: &KafkaPartitionBaselines,
+    included: &KafkaPartitionSet,
+) {
+    for ((topic, partition), next) in baselines {
+        if included.contains(&(topic.clone(), *partition)) {
+            checkpoint.set_offset(partition_baseline_key(topic, *partition), next.to_string());
+        }
+    }
+}
+
+fn rotation_partition_baseline(
+    baselines: &KafkaRotationBaselines,
+    topic: &str,
+    partition: i32,
+) -> Option<i64> {
+    baselines
+        .get(topic)
+        .and_then(|partitions| partitions.get(&partition))
+        .copied()
+}
+
+fn rotation_baselines_len(baselines: &KafkaRotationBaselines) -> usize {
+    baselines.values().map(std::collections::HashMap::len).sum()
+}
+
+fn update_rotation_baselines(
+    current: &KafkaRotationBaselines,
+    owned: &KafkaPartitionSet,
+    acquired: &KafkaPartitionBaselines,
+) -> KafkaRotationBaselines {
+    let mut updated = KafkaRotationBaselines::new();
+    for (topic, partition) in owned {
+        if let Some(next) = rotation_partition_baseline(current, topic, *partition) {
+            updated
+                .entry(Arc::from(topic.as_str()))
+                .or_default()
+                .insert(*partition, next);
+        }
+    }
+    for ((topic, partition), next) in acquired {
+        updated
+            .entry(Arc::from(topic.as_str()))
+            .or_default()
+            .insert(*partition, *next);
+    }
+    updated
+}
+
+fn attach_rotation_baselines(
+    checkpoint: &mut SourceCheckpoint,
+    baselines: &KafkaRotationBaselines,
+    included: &KafkaPartitionSet,
+) {
+    for (topic, partition) in included {
+        if let Some(next) = rotation_partition_baseline(baselines, topic, *partition) {
+            checkpoint.set_offset(partition_baseline_key(topic, *partition), next.to_string());
+        }
+    }
+}
+
+fn vnode_payload_is_current(
+    ownership: Option<(&[laminar_core::state::NodeId], laminar_core::state::NodeId)>,
+    required_next: Option<i64>,
+    partition: i32,
+    offset: i64,
+) -> bool {
+    let owned = ownership.is_none_or(|(assignment, self_id)| {
+        usize::try_from(partition).is_ok_and(|partition| {
+            !assignment.is_empty() && assignment[partition % assignment.len()] == self_id
+        })
+    });
+    owned && required_next.is_none_or(|next| offset >= next)
+}
+
+fn partition_reacquired_after(
+    published: &laminar_core::state::VnodeAssignmentSnapshot,
+    partition: i32,
+    self_id: laminar_core::state::NodeId,
+    reconciled_version: u64,
+) -> bool {
+    if reconciled_version == 0 || published.owners().is_empty() {
+        return false;
+    }
+    let Some(vnode) = usize::try_from(partition)
+        .ok()
+        .map(|partition| partition % published.owners().len())
+    else {
+        return false;
+    };
+    published.owners()[vnode] == self_id
+        && published
+            .owner_changed_version(u32::try_from(vnode).unwrap_or(u32::MAX))
+            .is_some_and(|changed| changed > reconciled_version)
+}
+
+fn retire_accepted_rotation_baselines(
+    baselines: &mut KafkaRotationBaselines,
+    accepted_offsets: &[(Arc<str>, i32, i64)],
+) {
+    let mut accepted = std::collections::HashMap::<(&str, i32), i64>::new();
+    for (topic, partition, offset) in accepted_offsets {
+        accepted
+            .entry((topic.as_ref(), *partition))
+            .and_modify(|current| *current = (*current).max(*offset))
+            .or_insert(*offset);
+    }
+    baselines.retain(|topic, partitions| {
+        partitions.retain(|partition, next| {
+            accepted
+                .get(&(topic.as_ref(), *partition))
+                .is_none_or(|offset| offset < next)
+        });
+        !partitions.is_empty()
+    });
+}
+
+fn validate_partition_baselines(
+    baselines: &KafkaPartitionBaselines,
+    inventory: &KafkaPartitionSet,
+) -> Result<(), ConnectorError> {
+    let baseline_inventory: KafkaPartitionSet = baselines.keys().cloned().collect();
+    if baseline_inventory != *inventory {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Kafka guaranteed recovery baseline inventory does not match its partition cut: baselines={baseline_inventory:?}, partitions={inventory:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_positions_not_expired(
+    offsets: &OffsetTracker,
+    baselines: &KafkaPartitionBaselines,
+    low_watermarks: &KafkaPartitionBaselines,
+    inventory: &KafkaPartitionSet,
+) -> Result<(), ConnectorError> {
+    for (topic, partition) in inventory {
+        let desired = match offsets.get(topic, *partition) {
+            Some(last) => last.checked_add(1).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "Kafka checkpoint offset overflow for '{topic}-{partition}'"
+                ))
+            })?,
+            None => *baselines.get(&(topic.clone(), *partition)).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "Kafka partition '{topic}-{partition}' has no durable next-to-read baseline"
+                ))
+            })?,
+        };
+        let low = *low_watermarks
+            .get(&(topic.clone(), *partition))
+            .ok_or_else(|| {
+                ConnectorError::ConnectionFailed(format!(
+                    "Kafka watermark response omitted partition '{topic}-{partition}'"
+                ))
+            })?;
+        if desired < low {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka retention advanced partition '{topic}-{partition}' to {low} past the durable next-to-read position {desired}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn kafka_reader_error_is_terminal(error: &KafkaError) -> bool {
+    use rdkafka::types::RDKafkaErrorCode;
+
+    matches!(
+        error,
+        KafkaError::MessageConsumptionFatal(_)
+            | KafkaError::MessageConsumption(
+                RDKafkaErrorCode::OffsetOutOfRange
+                    | RDKafkaErrorCode::AutoOffsetReset
+                    | RDKafkaErrorCode::LogTruncation
+            )
+    )
+}
+
+async fn fetch_explicit_topic_metadata(
+    consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
+    topics: Vec<String>,
+) -> Result<Vec<(Arc<str>, i32)>, ConnectorError> {
+    const METADATA_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + METADATA_BUDGET;
+    let mut task = tokio::task::spawn_blocking(move || {
+        let blocking_deadline = std::time::Instant::now() + METADATA_BUDGET;
+        let mut topic_meta = Vec::with_capacity(topics.len());
+        for topic in topics {
+            let remaining = blocking_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ConnectorError::Timeout(
+                    u64::try_from(METADATA_BUDGET.as_millis()).unwrap_or(u64::MAX),
+                ));
+            }
+            let metadata = consumer
+                .fetch_metadata(Some(topic.as_str()), remaining)
+                .map_err(|error| {
+                    ConnectorError::ConnectionFailed(format!(
+                        "metadata fetch for Kafka topic '{topic}': {error}"
+                    ))
+                })?;
+            let topic_metadata = metadata
+                .topics()
+                .iter()
+                .find(|candidate| candidate.name() == topic.as_str())
+                .ok_or_else(|| {
+                    ConnectorError::ConnectionFailed(format!(
+                        "metadata response omitted Kafka topic '{topic}'"
+                    ))
+                })?;
+            if let Some(error) = topic_metadata.error() {
+                return Err(ConnectorError::ConnectionFailed(format!(
+                    "metadata error for Kafka topic '{topic}': {error:?}"
+                )));
+            }
+            let partition_count = topic_metadata.partitions().len();
+            if partition_count == 0 {
+                return Err(ConnectorError::ConnectionFailed(format!(
+                    "Kafka topic '{topic}' has no partitions"
+                )));
+            }
+            topic_meta.push((
+                Arc::from(topic.as_str()),
+                i32::try_from(partition_count).unwrap_or(i32::MAX),
+            ));
+        }
+        Ok(topic_meta)
+    });
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(ConnectorError::Internal(format!(
+            "Kafka metadata worker failed: {error}"
+        ))),
+        Err(_) => Err(ConnectorError::Timeout(
+            u64::try_from(METADATA_BUDGET.as_millis()).unwrap_or(u64::MAX),
+        )),
+    }
+}
+
+async fn fetch_partition_low_watermarks(
+    consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
+    partitions: &KafkaPartitionSet,
+) -> Result<KafkaPartitionBaselines, ConnectorError> {
+    let deadline = tokio::time::Instant::now() + KAFKA_POSITION_LOOKUP_BUDGET;
+    let mut remaining = partitions.iter().cloned();
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut baselines = KafkaPartitionBaselines::with_capacity(partitions.len());
+
+    loop {
+        while jobs.len() < KAFKA_POSITION_LOOKUP_CONCURRENCY {
+            let Some((topic, partition)) = remaining.next() else {
+                break;
+            };
+            jobs.spawn(fetch_partition_low_watermark(
+                Arc::clone(&consumer),
+                topic,
+                partition,
+                deadline,
+            ));
+        }
+        let Some(result) = jobs.join_next().await else {
+            break;
+        };
+        let ((topic, partition), low) = result.map_err(|error| {
+            ConnectorError::Internal(format!("Kafka watermark worker failed: {error}"))
+        })??;
+        baselines.insert((topic, partition), low);
+    }
+
+    Ok(baselines)
+}
+
+async fn fetch_partition_low_watermark(
+    consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
+    topic: String,
+    partition: i32,
+    deadline: tokio::time::Instant,
+) -> Result<((String, i32), i64), ConnectorError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(ConnectorError::Timeout(
+            u64::try_from(KAFKA_POSITION_LOOKUP_BUDGET.as_millis()).unwrap_or(u64::MAX),
+        ));
+    }
+    let task_topic = topic.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        consumer
+            .fetch_watermarks(&task_topic, partition, remaining)
+            .map_err(|error| {
+                ConnectorError::ConnectionFailed(format!(
+                    "failed to fetch Kafka watermarks for '{task_topic}-{partition}': {error}"
+                ))
+            })
+    });
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(Ok((low, _high)))) if (0..i64::MAX).contains(&low) => Ok(((topic, partition), low)),
+        Ok(Ok(Ok((low, _)))) => Err(ConnectorError::ConnectionFailed(format!(
+            "Kafka returned invalid low watermark {low} for '{topic}-{partition}'"
+        ))),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => Err(ConnectorError::Internal(format!(
+            "Kafka watermark lookup task failed: {error}"
+        ))),
+        Err(_) => Err(ConnectorError::Timeout(
+            u64::try_from(KAFKA_POSITION_LOOKUP_BUDGET.as_millis()).unwrap_or(u64::MAX),
+        )),
+    }
+}
+
+async fn resolve_timestamp_offsets(
+    consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
+    requested: TopicPartitionList,
+) -> Result<TopicPartitionList, ConnectorError> {
+    const LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + LOOKUP_BUDGET;
+    let mut task = tokio::task::spawn_blocking(move || {
+        consumer
+            .offsets_for_times(requested, LOOKUP_BUDGET)
+            .map_err(|error| {
+                ConnectorError::ConnectionFailed(format!(
+                    "failed to resolve Kafka timestamp offsets: {error}"
+                ))
+            })
+    });
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(ConnectorError::Internal(format!(
+            "Kafka timestamp worker failed: {error}"
+        ))),
+        Err(_) => Err(ConnectorError::Timeout(
+            u64::try_from(LOOKUP_BUDGET.as_millis()).unwrap_or(u64::MAX),
+        )),
     }
 }
 
@@ -1042,6 +1721,12 @@ impl SourceConnector for KafkaSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        if self.state != ConnectorState::Created {
+            return Err(ConnectorError::InvalidState {
+                expected: ConnectorState::Created.to_string(),
+                actual: self.state.to_string(),
+            });
+        }
         let SourceStart {
             config,
             position,
@@ -1056,17 +1741,39 @@ impl SourceConnector for KafkaSource {
         } else {
             KafkaSourceConfig::from_config(&config)?
         };
-        let (installed_offsets, resume_attempt, is_resume) = match position {
-            SourcePosition::Initial => (OffsetTracker::new(), None, false),
-            SourcePosition::Resume {
-                attempt,
-                checkpoint,
-            } => (
-                OffsetTracker::try_from_checkpoint(&checkpoint)?,
-                Some(attempt),
-                true,
-            ),
-        };
+        let (installed_offsets, resume_attempt, is_resume, resume_inventory, resume_baselines) =
+            match position {
+                SourcePosition::Initial => (
+                    OffsetTracker::new(),
+                    None,
+                    false,
+                    None,
+                    KafkaPartitionBaselines::new(),
+                ),
+                SourcePosition::Resume {
+                    attempt,
+                    checkpoint,
+                } => {
+                    let inventory = decode_partition_inventory(&checkpoint)?;
+                    let baselines = decode_partition_baselines(&checkpoint)?;
+                    (
+                        OffsetTracker::try_from_checkpoint(&checkpoint)?,
+                        Some(attempt),
+                        true,
+                        inventory,
+                        baselines,
+                    )
+                }
+            };
+        if (self.vnode_assignment.is_some() || delivery != DeliveryGuarantee::BestEffort)
+            && matches!(&kafka_config.subscription, TopicSubscription::Pattern(_))
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka topic patterns are unsupported with engine-owned assignment; declare the \
+                 exact topic inventory so ownership and checkpoint cuts stay stable"
+                    .into(),
+            ));
+        }
         if matches!(
             &kafka_config.startup_mode,
             StartupMode::SpecificOffsets(_) | StartupMode::Timestamp(_)
@@ -1094,27 +1801,48 @@ impl SourceConnector for KafkaSource {
                 )));
             }
         }
-
-        // Broker-managed group rebalances can revoke a partition before the
-        // asynchronous engine checkpoint captures its final offset. The
-        // rebalance callback then removes that partition from the checkpoint,
-        // which cannot provide an exact cut. Fail before lifecycle mutation or
-        // StreamConsumer construction until synchronous revocation is wired to
-        // the engine. Manual vnode assignment has engine-owned, stable
-        // partition placement and does not use broker rebalance callbacks.
-        if delivery == DeliveryGuarantee::ExactlyOnce && self.vnode_assignment.is_none() {
+        if delivery != DeliveryGuarantee::BestEffort
+            && matches!(&kafka_config.startup_mode, StartupMode::GroupOffsets)
+        {
             return Err(ConnectorError::ConfigurationError(
-                "Kafka exactly-once delivery requires engine-managed vnode assignment; \
-                 broker-managed consumer-group rebalances cannot produce an exact checkpoint cut"
+                "Kafka guaranteed delivery cannot use broker group offsets as its initial recovery \
+                 authority; another group member can advance that cursor before LaminarDB seals \
+                 it. Use earliest or explicit specific offsets"
                     .into(),
             ));
         }
+        if delivery != DeliveryGuarantee::BestEffort
+            && matches!(
+                &kafka_config.startup_mode,
+                StartupMode::Latest | StartupMode::Timestamp(_)
+            )
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka guaranteed delivery requires a stable unrecorded-partition start; latest \
+                 and timestamp-with-no-match can move forward across recovery. Use earliest or \
+                 explicit specific offsets until checkpointed partition baselines are available"
+                    .into(),
+            ));
+        }
+
+        // Exactly-once never joins Kafka's rebalance protocol. Cluster mode assigns the vnode
+        // subset; embedded/single-node mode manually assigns the full explicit inventory. A
+        // topology change is picked up only by a fresh, checkpoint-positioned source instance.
 
         let deterministic_unrecorded = is_resume || delivery != DeliveryGuarantee::BestEffort;
         self.state = ConnectorState::Initializing;
         self.source_name = Arc::from(config.get("laminar.source.name").unwrap_or(""));
         self.config = kafka_config.clone();
         self.offsets = installed_offsets;
+        self.manual_topic_partitions.clear();
+        self.manual_partition_baselines.clear();
+        *lock_or_recover(&self.rotation_partition_baselines) =
+            Arc::new(KafkaRotationPublication::default());
+        self.rotation_partition_baseline_count
+            .store(0, Ordering::Release);
+        self.applied_rotation_baseline_version = None;
+        self.reconciled_assignment_version
+            .store(0, Ordering::Release);
         lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
         self.deterministic_unrecorded_position
             .store(deterministic_unrecorded, Ordering::Release);
@@ -1172,7 +1900,18 @@ impl SourceConnector for KafkaSource {
         );
 
         // Build rdkafka consumer with rebalance-aware context.
-        let rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
+        let mut rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
+        if delivery != DeliveryGuarantee::BestEffort
+            || matches!(
+                &kafka_config.startup_mode,
+                StartupMode::SpecificOffsets(_) | StartupMode::Timestamp(_)
+            )
+        {
+            // Once the engine owns the cursor, retention must surface as a fault. Allowing
+            // librdkafka to auto-reset would silently cross the sealed checkpoint cut after the
+            // preflight watermark validation (including a retention race while paused).
+            rdkafka_config.set("auto.offset.reset", "error");
+        }
         let context = LaminarConsumerContext::new(
             Arc::clone(&self.checkpoint_request),
             Arc::clone(&self.rebalance_state),
@@ -1183,12 +1922,17 @@ impl SourceConnector for KafkaSource {
             // metrics struct and bumped from librdkafka's background thread
             // inside `commit_callback`.
             self.metrics.commits.clone(),
-            self.metrics.commit_failures_rejected.clone(),
+            self.metrics.commit_failures.clone(),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
                 ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
             })?;
+        // Install ownership before any fallible activation work. If metadata, assignment, or
+        // subscription fails, the source task's cleanup path can move the final consumer drop to
+        // the bounded blocking reaper instead of running librdkafka Drop on a Tokio worker.
+        let consumer = Arc::new(consumer);
+        self.consumer = Some(Arc::clone(&consumer));
 
         // Engine-controlled partition assignment (cluster mode): bind each
         // partition to a vnode (`partition % vnode_count`) and manually
@@ -1206,40 +1950,50 @@ impl SourceConnector for KafkaSource {
             .map(|(r, s)| (Arc::clone(r), *s));
         let vnode_assigned = if let Some((registry, self_id)) = vnode {
             if let TopicSubscription::Topics(topics) = &kafka_config.subscription {
-                let mut topic_meta: Vec<(Arc<str>, i32)> = Vec::with_capacity(topics.len());
-                for topic in topics {
-                    let md = consumer
-                        .fetch_metadata(Some(topic.as_str()), std::time::Duration::from_secs(10))
-                        .map_err(|e| {
-                            ConnectorError::ConnectionFailed(format!(
-                                "metadata fetch for '{topic}': {e}"
-                            ))
-                        })?;
-                    let metadata = md
-                        .topics()
-                        .iter()
-                        .find(|t| t.name() == topic.as_str())
-                        .ok_or_else(|| {
-                            ConnectorError::ConnectionFailed(format!(
-                                "metadata response omitted Kafka topic '{topic}'"
-                            ))
-                        })?;
-                    if let Some(error) = metadata.error() {
-                        return Err(ConnectorError::ConnectionFailed(format!(
-                            "metadata error for Kafka topic '{topic}': {error:?}"
-                        )));
-                    }
-                    let count = metadata.partitions().len();
-                    if count == 0 {
-                        return Err(ConnectorError::ConnectionFailed(format!(
-                            "Kafka topic '{topic}' has no partitions"
-                        )));
-                    }
-                    topic_meta.push((
-                        Arc::from(topic.as_str()),
-                        i32::try_from(count).unwrap_or(i32::MAX),
-                    ));
+                let published = registry.versioned_snapshot();
+                let topic_meta =
+                    fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone()).await?;
+                let all_partitions: KafkaPartitionSet = topic_meta
+                    .iter()
+                    .flat_map(|(topic, count)| {
+                        (0..*count).map(move |partition| (topic.to_string(), partition))
+                    })
+                    .collect();
+                if let Some(unexpected) = self
+                    .offsets
+                    .to_topic_partition_list()
+                    .elements()
+                    .iter()
+                    .find(|entry| {
+                        !all_partitions.contains(&(entry.topic().to_string(), entry.partition()))
+                    })
+                {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "Kafka resume checkpoint references partition '{}-{}' absent from the explicit topic inventory",
+                        unexpected.topic(),
+                        unexpected.partition()
+                    )));
                 }
+                let requires_numeric_cut = delivery != DeliveryGuarantee::BestEffort;
+                if requires_numeric_cut {
+                    let low_watermarks =
+                        fetch_partition_low_watermarks(Arc::clone(&consumer), &all_partitions)
+                            .await?;
+                    let baselines = if is_resume {
+                        validate_partition_baselines(&resume_baselines, &all_partitions)?;
+                        resume_baselines.clone()
+                    } else {
+                        low_watermarks.clone()
+                    };
+                    validate_positions_not_expired(
+                        &self.offsets,
+                        &baselines,
+                        &low_watermarks,
+                        &all_partitions,
+                    )?;
+                    self.manual_partition_baselines = baselines;
+                }
+                self.manual_topic_partitions = all_partitions;
                 let default_offset = if self
                     .deterministic_unrecorded_position
                     .load(Ordering::Acquire)
@@ -1259,20 +2013,32 @@ impl SourceConnector for KafkaSource {
                 // start() already loaded committed offsets into self.offsets, so
                 // there are no rotation handoff offsets at initial assignment.
                 let no_resume = OffsetTracker::new();
+                let no_resume_baselines = KafkaPartitionBaselines::new();
                 let tpl = build_vnode_assignment_tpl(
-                    &registry,
+                    published.owners(),
                     self_id,
                     &topic_meta,
-                    &self.offsets,
-                    &no_resume,
+                    VnodeResumeCursors {
+                        local_offsets: &self.offsets,
+                        handoff_offsets: &no_resume,
+                        local_baselines: &self.manual_partition_baselines,
+                        handoff_baselines: &no_resume_baselines,
+                    },
                     default_offset,
-                );
+                )?;
                 let owned = tpl.count();
                 // Incremental from empty so rebinds can stay incremental — librdkafka
                 // rejects mixing a full assign() with incremental_assign/unassign.
                 consumer.incremental_assign(&tpl).map_err(|e| {
                     ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
                 })?;
+                *lock_or_recover(&self.rotation_partition_baselines) =
+                    Arc::new(KafkaRotationPublication {
+                        assignment_version: published.version(),
+                        baselines: KafkaRotationBaselines::new(),
+                    });
+                self.reconciled_assignment_version
+                    .store(published.version(), Ordering::Release);
                 self.vnode_topic_meta = topic_meta;
                 info!(
                     owned_partitions = owned,
@@ -1280,20 +2046,81 @@ impl SourceConnector for KafkaSource {
                 );
                 true
             } else {
-                warn!(
-                    "vnode-aware assignment is unsupported with topic patterns — \
-                     falling back to consumer-group subscribe()"
-                );
-                false
+                return Err(ConnectorError::ConfigurationError(
+                    "Kafka vnode assignment requires an explicit topic inventory".into(),
+                ));
             }
         } else {
             false
         };
 
+        let local_guaranteed_assignment = delivery != DeliveryGuarantee::BestEffort
+            && !vnode_assigned
+            && matches!(&kafka_config.startup_mode, StartupMode::Earliest);
+        if local_guaranteed_assignment {
+            let TopicSubscription::Topics(topics) = &kafka_config.subscription else {
+                return Err(ConnectorError::ConfigurationError(
+                    "Kafka guaranteed delivery requires an explicit topic inventory".into(),
+                ));
+            };
+            let topic_meta =
+                fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone()).await?;
+            let assigned: Vec<(String, i32)> = topic_meta
+                .iter()
+                .flat_map(|(topic, count)| {
+                    (0..*count).map(move |partition| (topic.to_string(), partition))
+                })
+                .collect();
+            let assigned_set: KafkaPartitionSet = assigned.iter().cloned().collect();
+            if let Some(unexpected) = self
+                .offsets
+                .to_topic_partition_list()
+                .elements()
+                .iter()
+                .find(|entry| {
+                    !assigned_set.contains(&(entry.topic().to_string(), entry.partition()))
+                })
+            {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "Kafka resume checkpoint references partition '{}-{}' absent from the explicit topic inventory",
+                    unexpected.topic(),
+                    unexpected.partition()
+                )));
+            }
+            let low_watermarks =
+                fetch_partition_low_watermarks(Arc::clone(&consumer), &assigned_set).await?;
+            let baselines = if is_resume {
+                validate_resume_inventory(resume_inventory.as_ref(), &assigned_set)?;
+                validate_partition_baselines(&resume_baselines, &assigned_set)?;
+                resume_baselines.clone()
+            } else {
+                low_watermarks.clone()
+            };
+            validate_positions_not_expired(
+                &self.offsets,
+                &baselines,
+                &low_watermarks,
+                &assigned_set,
+            )?;
+            let assignment =
+                assignment_seek_tpl(&self.offsets, &assigned, Some(&baselines), None, true)?;
+            consumer.assign(&assignment).map_err(|error| {
+                ConnectorError::ConnectionFailed(format!(
+                    "failed to install local guaranteed Kafka assignment: {error}"
+                ))
+            })?;
+            self.manual_topic_partitions = assigned_set;
+            self.manual_partition_baselines = baselines;
+            info!(
+                partition_count = assignment.count(),
+                "Kafka source assigned full explicit inventory (local guaranteed delivery)"
+            );
+        }
+
         // Group modes subscribe only after the engine position has been staged.
         // Specific/timestamp modes use a fully positioned manual assignment, so
         // they never briefly join the group at an unrelated broker cursor.
-        if !vnode_assigned {
+        if !vnode_assigned && !local_guaranteed_assignment {
             match &kafka_config.startup_mode {
                 StartupMode::GroupOffsets | StartupMode::Earliest | StartupMode::Latest => {
                     match &kafka_config.subscription {
@@ -1321,96 +2148,98 @@ impl SourceConnector for KafkaSource {
                 }
                 StartupMode::SpecificOffsets(offsets) => {
                     let TopicSubscription::Topics(topics) = &kafka_config.subscription else {
-                        unreachable!(
-                            "specific-offset pattern was rejected before consumer creation"
-                        )
+                        return Err(ConnectorError::ConfigurationError(
+                            "Kafka specific-offset startup requires an explicit topic inventory"
+                                .into(),
+                        ));
                     };
-                    let mut tpl = self.offsets.to_topic_partition_list();
-                    let allowed: std::collections::HashSet<&str> =
-                        topics.iter().map(String::as_str).collect();
-                    if let Some(unexpected) =
-                        tpl.elements().iter().find(|e| !allowed.contains(e.topic()))
-                    {
-                        return Err(ConnectorError::ConfigurationError(format!(
-                            "Kafka resume checkpoint contains unsubscribed topic '{}'",
-                            unexpected.topic()
-                        )));
-                    }
-                    for topic in topics {
-                        for (&partition, &offset) in offsets {
-                            if tpl.find_partition(topic, partition).is_none() {
-                                tpl.add_partition_offset(
-                                    topic,
-                                    partition,
-                                    rdkafka::Offset::Offset(offset),
-                                )
-                                .map_err(|e| {
-                                    ConnectorError::ConfigurationError(format!(
-                                        "invalid Kafka specific offset for '{topic}-{partition}': {e}"
-                                    ))
-                                })?;
-                            }
-                        }
-                    }
-                    if tpl.count() == 0 {
+                    let mut assigned: Vec<(String, i32)> = topics
+                        .iter()
+                        .flat_map(|topic| {
+                            offsets
+                                .keys()
+                                .copied()
+                                .map(move |partition| (topic.clone(), partition))
+                        })
+                        .collect();
+                    assigned.sort_unstable();
+                    if assigned.is_empty() {
                         return Err(ConnectorError::ConfigurationError(
                             "Kafka specific-offset startup resolved no partitions".into(),
                         ));
                     }
-                    consumer.assign(&tpl).map_err(|e| {
+                    let assigned_set: KafkaPartitionSet = assigned.iter().cloned().collect();
+                    let configured_baselines: KafkaPartitionBaselines = topics
+                        .iter()
+                        .flat_map(|topic| {
+                            offsets
+                                .iter()
+                                .map(move |(&partition, &next)| ((topic.clone(), partition), next))
+                        })
+                        .collect();
+                    let baselines = if is_resume {
+                        validate_resume_inventory(resume_inventory.as_ref(), &assigned_set)?;
+                        validate_partition_baselines(&resume_baselines, &assigned_set)?;
+                        if resume_baselines != configured_baselines {
+                            return Err(ConnectorError::ConfigurationError(
+                                "Kafka specific-offset configuration changed across recovery"
+                                    .into(),
+                            ));
+                        }
+                        resume_baselines.clone()
+                    } else {
+                        configured_baselines
+                    };
+                    let low_watermarks =
+                        fetch_partition_low_watermarks(Arc::clone(&consumer), &assigned_set)
+                            .await?;
+                    validate_positions_not_expired(
+                        &self.offsets,
+                        &baselines,
+                        &low_watermarks,
+                        &assigned_set,
+                    )?;
+                    let assignment = assignment_seek_tpl(
+                        &self.offsets,
+                        &assigned,
+                        Some(&baselines),
+                        None,
+                        true,
+                    )?;
+                    consumer.assign(&assignment).map_err(|e| {
                         ConnectorError::ConnectionFailed(format!(
                             "failed to assign specific offsets: {e}"
                         ))
                     })?;
+                    self.manual_topic_partitions = assigned_set;
+                    self.manual_partition_baselines = baselines;
                     info!(
-                        partition_count = tpl.count(),
+                        partition_count = assignment.count(),
                         "assigned consumer to exact checkpoint/specific offsets"
                     );
                 }
                 StartupMode::Timestamp(ts_ms) => {
                     let TopicSubscription::Topics(topics) = &kafka_config.subscription else {
-                        unreachable!("timestamp pattern was rejected before consumer creation")
+                        return Err(ConnectorError::ConfigurationError(
+                            "Kafka timestamp startup requires an explicit topic inventory".into(),
+                        ));
                     };
+                    let topic_meta =
+                        fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone())
+                            .await?;
                     let mut tpl = rdkafka::TopicPartitionList::new();
-                    for topic in topics {
-                        let metadata = consumer
-                            .fetch_metadata(
-                                Some(topic.as_str()),
-                                std::time::Duration::from_secs(10),
+                    for (topic, partition_count) in &topic_meta {
+                        for partition in 0..*partition_count {
+                            tpl.add_partition_offset(
+                                topic,
+                                partition,
+                                rdkafka::Offset::Offset(*ts_ms),
                             )
-                            .map_err(|e| {
-                                ConnectorError::ConnectionFailed(format!(
-                                    "metadata fetch for timestamp startup on '{topic}': {e}"
+                            .map_err(|error| {
+                                ConnectorError::Internal(format!(
+                                    "failed to build timestamp lookup for '{topic}-{partition}': {error}"
                                 ))
                             })?;
-                        for topic_meta in metadata.topics() {
-                            if let Some(error) = topic_meta.error() {
-                                return Err(ConnectorError::ConnectionFailed(format!(
-                                    "metadata error for Kafka topic '{}': {error:?}",
-                                    topic_meta.name()
-                                )));
-                            }
-                            for partition_meta in topic_meta.partitions() {
-                                if let Some(error) = partition_meta.error() {
-                                    return Err(ConnectorError::ConnectionFailed(format!(
-                                        "metadata error for Kafka partition '{}-{}': {error:?}",
-                                        topic_meta.name(),
-                                        partition_meta.id()
-                                    )));
-                                }
-                                tpl.add_partition_offset(
-                                    topic_meta.name(),
-                                    partition_meta.id(),
-                                    rdkafka::Offset::Offset(*ts_ms),
-                                )
-                                .map_err(|e| {
-                                    ConnectorError::Internal(format!(
-                                        "failed to build timestamp lookup for '{}-{}': {e}",
-                                        topic_meta.name(),
-                                        partition_meta.id()
-                                    ))
-                                })?;
-                            }
                         }
                     }
                     if tpl.count() == 0 {
@@ -1418,13 +2247,7 @@ impl SourceConnector for KafkaSource {
                             "Kafka timestamp startup discovered no partitions".into(),
                         ));
                     }
-                    let resolved = consumer
-                        .offsets_for_times(tpl, std::time::Duration::from_secs(10))
-                        .map_err(|e| {
-                            ConnectorError::ConnectionFailed(format!(
-                                "failed to resolve Kafka timestamp offsets: {e}"
-                            ))
-                        })?;
+                    let resolved = resolve_timestamp_offsets(Arc::clone(&consumer), tpl).await?;
                     let mut positioned = TopicPartitionList::new();
                     let mut restored = 0usize;
                     for elem in resolved.elements() {
@@ -1476,6 +2299,11 @@ impl SourceConnector for KafkaSource {
                             "failed to assign timestamp/checkpoint offsets: {e}"
                         ))
                     })?;
+                    self.manual_topic_partitions = positioned
+                        .elements()
+                        .iter()
+                        .map(|entry| (entry.topic().to_string(), entry.partition()))
+                        .collect();
                     info!(
                         timestamp_ms = ts_ms,
                         partition_count = positioned.count(),
@@ -1484,14 +2312,13 @@ impl SourceConnector for KafkaSource {
                     );
                 }
             }
-        } // end `if !vnode_assigned`
+        } // end `if !vnode_assigned && !local_guaranteed_assignment`
 
-        self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
 
-        // Reader startup stays deferred until the first poll. Group assignments
-        // are paused by the callback and explicitly seeked from the position
-        // installed above before any record can enter the channel.
+        // Reader startup stays deferred until the first poll. Group
+        // assignments are paused by the callback and explicitly seeked from
+        // the position installed above before any record can enter the channel.
 
         // Eagerly fetch the SR schema so the Arrow schema is available at
         // plan time (before the first poll_batch).
@@ -1626,18 +2453,11 @@ impl SourceConnector for KafkaSource {
         // Lazily spawn the background reader task on first poll.
         self.ensure_reader_started();
 
-        let rx = self
-            .msg_rx
-            .as_mut()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "reader initialized".into(),
-                actual: "reader is None".into(),
-            })?;
-
         let limit = max_records.min(self.config.max_poll_records);
 
         // Reuse struct-level buffers — clear without freeing capacity. Clearing staged offsets
         // here also discards any left by a prior poll whose batch failed to deserialize (CN-4).
+        self.poll_payloads.clear();
         self.poll_payload_buf.clear();
         self.poll_payload_offsets.clear();
         self.poll_staged_offsets.clear();
@@ -1653,55 +2473,142 @@ impl SourceConnector for KafkaSource {
         let include_metadata = self.config.include_metadata;
         let include_headers = self.config.include_headers;
 
-        while self.poll_payload_offsets.len() < limit {
-            match rx.try_recv() {
-                Ok(kp) => {
-                    self.channel_len.fetch_sub(1, Ordering::Release);
-                    total_bytes += kp.data.len() as u64;
-                    let start = self.poll_payload_buf.len();
-                    self.poll_payload_buf.extend_from_slice(&kp.data);
-                    self.poll_payload_offsets.push((start, kp.data.len()));
-
-                    // Stage the offset; it is folded into `self.offsets` only after this batch
-                    // deserializes (CN-4), so an escalated decode failure can't advance past it.
-                    self.poll_staged_offsets
-                        .push((Arc::clone(&kp.topic), kp.partition, kp.offset));
-
-                    if include_metadata {
-                        self.poll_meta_partitions.push(kp.partition);
-                        self.poll_meta_offsets.push(kp.offset);
-                        self.poll_meta_timestamps.push(kp.timestamp_ms);
-                    }
-                    if include_headers {
-                        self.poll_meta_headers.push(kp.headers_json);
-                    }
-
-                    // Update watermark tracker with event timestamp.
-                    if let Some(ref mut tracker) = self.watermark_tracker {
-                        if let Some(ts) = kp.timestamp_ms {
-                            tracker.update_partition(kp.partition, ts);
-                        }
-                    }
-
-                    if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
-                        last_topic = kp.topic.to_string();
-                        last_partition_id = kp.partition;
-                    }
-                    last_offset = kp.offset;
-                }
-                Err(crossfire::TryRecvError::Empty) => break,
-                Err(crossfire::TryRecvError::Disconnected) => {
-                    self.state = ConnectorState::Failed;
-                    return Err(ConnectorError::Internal(
-                        "Kafka reader task exited unexpectedly".into(),
-                    ));
+        // Pin one ownership publication only while draining the non-awaiting
+        // payload queue. An assignment writer waits for this short read-side
+        // critical section, so one drain cannot mix vnode owners from two versions.
+        let (drained_assignment_version, retires_rotation_baseline) = {
+            let vnode_registry = self
+                .vnode_assignment
+                .as_ref()
+                .map(|(registry, self_id)| (Arc::clone(registry), *self_id));
+            let vnode_publication = vnode_registry
+                .as_ref()
+                .map(|(registry, self_id)| (registry.read_assignment(), *self_id));
+            if let Some((published, _)) = vnode_publication.as_ref() {
+                if self.reconciled_assignment_version.load(Ordering::Acquire) != published.version()
+                {
+                    return Ok(None);
                 }
             }
-        }
 
-        // Check for idle partitions on each poll cycle.
-        if let Some(ref mut tracker) = self.watermark_tracker {
-            tracker.check_idle_partitions();
+            // A vnode acquired after rehydration may also have a stale local cursor from an earlier
+            // ownership stint. Keep the durable handoff baseline authoritative until this instance
+            // has actually accepted a record from the acquired assignment.
+            let rotation_baselines = if self
+                .rotation_partition_baseline_count
+                .load(Ordering::Acquire)
+                == 0
+            {
+                None
+            } else {
+                Some(Arc::clone(&lock_or_recover(
+                    &self.rotation_partition_baselines,
+                )))
+            };
+            if let Some(publication) = rotation_baselines.as_deref() {
+                if self.applied_rotation_baseline_version != Some(publication.assignment_version) {
+                    let mut snapshot = lock_or_recover(&self.offset_snapshot);
+                    for (topic, partitions) in &publication.baselines {
+                        for partition in partitions.keys() {
+                            self.offsets.remove(topic, *partition);
+                            snapshot.remove(topic, *partition);
+                        }
+                    }
+                    self.applied_rotation_baseline_version = Some(publication.assignment_version);
+                }
+            }
+            let vnode_ownership = vnode_publication
+                .as_ref()
+                .map(|(published, self_id)| (published.owners(), *self_id));
+
+            let rx = self
+                .msg_rx
+                .as_mut()
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "reader initialized".into(),
+                    actual: "reader is None".into(),
+                })?;
+
+            while self.poll_payloads.len() < limit {
+                match rx.try_recv() {
+                    Ok(kp) => {
+                        self.channel_len.fetch_sub(1, Ordering::Release);
+                        if !vnode_payload_is_current(
+                            vnode_ownership
+                                .as_ref()
+                                .map(|(assignment, self_id)| (*assignment, *self_id)),
+                            rotation_baselines.as_deref().and_then(|publication| {
+                                rotation_partition_baseline(
+                                    &publication.baselines,
+                                    kp.topic.as_ref(),
+                                    kp.partition,
+                                )
+                            }),
+                            kp.partition,
+                            kp.offset,
+                        ) {
+                            debug!(
+                                topic = kp.topic.as_ref(),
+                                partition = kp.partition,
+                                offset = kp.offset,
+                                "discarded Kafka payload outside the current vnode handoff cut"
+                            );
+                            continue;
+                        }
+                        self.poll_payloads.push(kp);
+                    }
+                    Err(crossfire::TryRecvError::Empty) => break,
+                    Err(crossfire::TryRecvError::Disconnected) => {
+                        self.state = ConnectorState::Failed;
+                        return Err(ConnectorError::Internal(
+                            "Kafka reader task exited unexpectedly".into(),
+                        ));
+                    }
+                }
+            }
+            let assignment_version = vnode_publication
+                .as_ref()
+                .map(|(published, _)| published.version());
+            let retires_baseline = rotation_baselines.as_deref().is_some_and(|publication| {
+                self.poll_payloads.iter().any(|payload| {
+                    rotation_partition_baseline(
+                        &publication.baselines,
+                        payload.topic.as_ref(),
+                        payload.partition,
+                    )
+                    .is_some_and(|next| payload.offset >= next)
+                })
+            });
+            (assignment_version, retires_baseline)
+        };
+        // Schema Registry resolution and decode can await or consume substantial CPU. They do not
+        // inspect ownership, so release the publication before either operation; otherwise a slow
+        // registry request would stall assignment activation for the full network timeout.
+        for kp in self.poll_payloads.drain(..) {
+            total_bytes += kp.data.len() as u64;
+            let start = self.poll_payload_buf.len();
+            self.poll_payload_buf.extend_from_slice(&kp.data);
+            self.poll_payload_offsets.push((start, kp.data.len()));
+
+            // Stage the offset; it is folded into `self.offsets` only after this batch
+            // deserializes (CN-4), so an escalated decode failure can't advance past it.
+            self.poll_staged_offsets
+                .push((Arc::clone(&kp.topic), kp.partition, kp.offset));
+
+            if include_metadata {
+                self.poll_meta_partitions.push(kp.partition);
+                self.poll_meta_offsets.push(kp.offset);
+                self.poll_meta_timestamps.push(kp.timestamp_ms);
+            }
+            if include_headers {
+                self.poll_meta_headers.push(kp.headers_json);
+            }
+
+            if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
+                last_topic = kp.topic.to_string();
+                last_partition_id = kp.partition;
+            }
+            last_offset = kp.offset;
         }
 
         // Sync rebalance counter → metrics (bridge from rdkafka background thread).
@@ -1722,6 +2629,7 @@ impl SourceConnector for KafkaSource {
                 .clone();
             let before = self.offsets.partition_count();
             self.offsets.retain_assigned(&assigned);
+            lock_or_recover(&self.offset_snapshot).retain_assigned(&assigned);
             let after = self.offsets.partition_count();
             if before != after {
                 debug!(
@@ -1729,31 +2637,6 @@ impl SourceConnector for KafkaSource {
                     after, "purged revoked partition offsets after rebalance"
                 );
             }
-        }
-
-        // A rebalance revoke purged self.offsets above; mirror it to the seek-on-assign snapshot
-        // now. This poll's own offsets are folded and mirrored only after the batch deserializes
-        // (below), so a decode failure doesn't leave the snapshot pointing past a lost batch (CN-4).
-        // No broker commit happens here — that's driven exclusively by `notify_epoch_committed`.
-        if had_revoke {
-            lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
-        }
-
-        // Compute consumer lag from high watermarks (moved from metrics()
-        // to avoid side-effects in a &self getter).
-        if let Some(ref hwm_rx) = self.high_watermarks_rx {
-            let watermarks = hwm_rx.borrow();
-            let mut total_lag: u64 = 0;
-            for (topic, partition, high_watermark) in watermarks.iter() {
-                if let Some(current_offset) = self.offsets.get(topic, *partition) {
-                    let lag = high_watermark.saturating_sub(current_offset + 1);
-                    #[allow(clippy::cast_sign_loss)]
-                    if lag > 0 {
-                        total_lag += lag as u64;
-                    }
-                }
-            }
-            self.metrics.set_lag(total_lag);
         }
 
         if self.poll_payload_offsets.is_empty() {
@@ -1926,11 +2809,29 @@ impl SourceConnector for KafkaSource {
         // below the error-rate threshold are intentionally dropped, so advancing past them is
         // correct. update_arc is monotonic, so fold order is irrelevant.
         if !self.poll_staged_offsets.is_empty() {
-            for (topic, partition, offset) in &self.poll_staged_offsets {
-                self.offsets.update_arc(topic, *partition, *offset);
+            {
+                let mut snapshot = lock_or_recover(&self.offset_snapshot);
+                for (topic, partition, offset) in &self.poll_staged_offsets {
+                    self.offsets.update_arc(topic, *partition, *offset);
+                    snapshot.update_arc(topic, *partition, *offset);
+                }
+            }
+            if retires_rotation_baseline {
+                if let Some(version) = drained_assignment_version {
+                    let mut published = lock_or_recover(&self.rotation_partition_baselines);
+                    if published.assignment_version == version {
+                        let publication = Arc::make_mut(&mut published);
+                        retire_accepted_rotation_baselines(
+                            &mut publication.baselines,
+                            &self.poll_staged_offsets,
+                        );
+                        let count = rotation_baselines_len(&publication.baselines);
+                        self.rotation_partition_baseline_count
+                            .store(count, Ordering::Release);
+                    }
+                }
             }
             self.poll_staged_offsets.clear();
-            lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
         }
 
         // If poison pill fallback filtered records, also filter metadata
@@ -2017,30 +2918,35 @@ impl SourceConnector for KafkaSource {
         self.schema.clone()
     }
 
-    fn checkpoint(&self) -> SourceCheckpoint {
-        // Engine-controlled vnode assignment uses manual `assign()`, which fires
-        // no rebalance callbacks — so `rebalance_state` stays empty and can't
-        // drive the filter. Filter by the partitions this node owns instead;
-        // otherwise every checkpoint would record zero offsets and recovery
-        // would replay each partition from `auto.offset.reset`.
-        if let Some((registry, self_id)) = &self.vnode_assignment {
-            if !self.vnode_topic_meta.is_empty() {
-                let owned: std::collections::HashSet<(String, i32)> = self
-                    .vnode_topic_meta
-                    .iter()
-                    .flat_map(|(topic, count)| {
-                        crate::partition_assignment::owned_partitions(*count, registry, *self_id)
-                            .into_iter()
-                            .map(move |p| (topic.to_string(), p))
-                    })
-                    .collect();
-                return self.offsets.to_checkpoint_filtered(&owned);
-            }
+    fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+        if self
+            .reader_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(ConnectorError::Internal(
+                "Kafka reader task exited while reconciling source ownership".into(),
+            ));
         }
-        let assigned = lock_or_recover(&self.rebalance_state)
-            .assigned_partitions()
-            .clone();
-        self.offsets.to_checkpoint_filtered(&assigned)
+        Ok(self.vnode_assignment.as_ref().is_none_or(|(registry, _)| {
+            self.reconciled_assignment_version.load(Ordering::Acquire)
+                == registry.assignment_version()
+        }))
+    }
+
+    fn drive_control_plane(&mut self) {
+        self.ensure_reader_started();
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        self.try_capture_checkpoint()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        self.try_capture_checkpoint()
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
@@ -2063,93 +2969,52 @@ impl SourceConnector for KafkaSource {
         if tpl.count() == 0 {
             return Ok(());
         }
-        let Some(handle) = self.commit_handle.as_ref() else {
-            self.metrics.commit_failures_enqueue_dropped.inc();
-            return Err(ConnectorError::InvalidState {
-                expected: "running Kafka broker commit task".into(),
-                actual: "commit task is missing".into(),
-            });
+        let Some(consumer) = self.consumer.as_ref() else {
+            // Engine recovery never uses broker-stored offsets. A missing consumer cannot
+            // invalidate the already-durable checkpoint, so report the observability failure
+            // without turning a committed epoch into a pipeline restart loop.
+            self.metrics.commit_failures.inc();
+            warn!(
+                epoch,
+                "Kafka progress commit skipped because the consumer is absent"
+            );
+            return Ok(());
         };
-        if handle.is_finished() {
-            self.metrics.commit_failures_enqueue_dropped.inc();
-            return Err(ConnectorError::InvalidState {
-                expected: "running Kafka broker commit task".into(),
-                actual: "commit task terminated".into(),
-            });
+
+        // The engine checkpoint is the recovery authority; Kafka's group offset is an
+        // observability cursor only. Enqueue it without blocking the checkpoint/recovery path.
+        // The consumer context records the eventual broker acknowledgement or rejection.
+        if let Err(error) = consumer.commit(&tpl, CommitMode::Async) {
+            self.metrics.commit_failures.inc();
+            warn!(epoch, %error, "Kafka progress commit was not accepted for enqueue");
         }
-        let Some(tx) = self.commit_tx.as_ref() else {
-            self.metrics.commit_failures_enqueue_dropped.inc();
-            return Err(ConnectorError::InvalidState {
-                expected: "Kafka broker commit request channel".into(),
-                actual: "commit channel is missing".into(),
-            });
-        };
-        let deadline = tokio::time::Instant::now() + BROKER_COMMIT_ACK_TIMEOUT;
-        let (acknowledgement, ack_rx) = oneshot::channel();
-        let request = BrokerCommitRequest {
-            epoch,
-            offsets: tpl,
-            acknowledgement,
-        };
-        match tokio::time::timeout_at(deadline, tx.send(request)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                self.metrics.commit_failures_enqueue_dropped.inc();
-                return Err(ConnectorError::ConnectionFailed(
-                    "Kafka broker commit task closed its request channel".into(),
-                ));
-            }
-            Err(_) => {
-                self.metrics.commit_failures_enqueue_dropped.inc();
-                return Err(ConnectorError::Timeout(BROKER_COMMIT_ACK_TIMEOUT_MS));
-            }
-        }
-        let response = tokio::time::timeout_at(deadline, ack_rx)
-            .await
-            .map_err(|_| ConnectorError::Timeout(BROKER_COMMIT_ACK_TIMEOUT_MS))?
-            .map_err(|_| {
-                self.metrics.commit_failures_panic.inc();
-                ConnectorError::ConnectionFailed(
-                    "Kafka broker commit task dropped its acknowledgement".into(),
-                )
-            })?;
-        response.map_err(ConnectorError::TransactionError)
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Close the commit-request channel so the commit task drains
-        // anything already queued, then exits. We do NOT issue a fresh
-        // commit here — under on-checkpoint semantics the only durable
-        // broker offsets are those tied to a committed epoch, and those
-        // were already enqueued from `notify_epoch_committed`.
-        self.commit_tx = None;
-
-        // Signal shutdown and wait for all background tasks to exit.
+        // Stop intake and give the reader plus final consumer reaper one shared cleanup budget
+        // below the coordinator's outer source-shutdown deadline.
         if let Some(tx) = self.reader_shutdown.take() {
             let _ = tx.send(true);
         }
-        let timeout = std::time::Duration::from_secs(5);
-        if let Some(handle) = self.reader_handle.take() {
-            let _ = tokio::time::timeout(timeout, handle).await;
-        }
-        if let Some(handle) = self.commit_handle.take() {
-            let _ = tokio::time::timeout(timeout, handle).await;
-        }
-        if let Some(handle) = self.hwm_handle.take() {
-            let _ = tokio::time::timeout(timeout, handle).await;
-        }
-        self.msg_rx = None;
-
-        // If consumer was never moved to the reader (e.g., close() called
-        // before any poll_batch()), unsubscribe directly. No commit:
-        // nothing has been processed, so there's no durable offset to ack.
+        // Wake assignment and poll work before joining. Any advisory async commit cleanup remains
+        // librdkafka-owned and is not allowed to extend the engine's source-shutdown deadline.
         if let Some(ref consumer) = self.consumer {
             consumer.unsubscribe();
         }
+        let deadline = tokio::time::Instant::now() + KAFKA_BACKGROUND_CLOSE_BUDGET;
+        if let Some(handle) = self.reader_handle.take() {
+            join_background_task(handle, deadline, "reader").await;
+        }
+        self.msg_rx = None;
+        self.channel_len.store(0, Ordering::Release);
+        self.checkpoint_request.store(false, Ordering::Release);
 
-        self.consumer = None;
+        if let Some(consumer) = self.consumer.take() {
+            reap_last_arc_off_runtime(consumer, deadline, "consumer").await;
+        }
         self.state = ConnectorState::Closed;
         info!("Kafka source connector closed");
         Ok(())
@@ -2237,12 +3102,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exactly_once_broker_ownership_fails_before_activation() {
+    async fn progress_commit_enqueues_before_first_poll() {
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .expect("consumer creation and subscription are non-blocking");
+
+        assert!(source.consumer.is_some());
+        assert!(source.reader_handle.is_none());
+        assert!(source.msg_rx.is_none());
+        source
+            .notify_epoch_committed(1, &durable_kafka_checkpoint())
+            .await
+            .expect("advisory commit enqueue must not depend on source polling");
+
+        source.channel_len.store(7, Ordering::Release);
+        source.checkpoint_request.store(true, Ordering::Release);
+        source.close().await.unwrap();
+        assert!(source.consumer.is_none());
+        assert_eq!(source.channel_len.load(Ordering::Acquire), 0);
+        assert!(!source.checkpoint_request.load(Ordering::Acquire));
+
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("a closed connector instance is not restartable");
+        assert!(matches!(error, ConnectorError::InvalidState { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_a_blocked_background_task_respects_the_close_deadline() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        started_rx.await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        join_background_task(
+            handle,
+            started + std::time::Duration::from_millis(10),
+            "blocked-test-task",
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "aborting a task in synchronous library code must not extend close()"
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_once_dynamic_broker_ownership_fails_before_activation() {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
         let mut request_config = ConnectorConfig::new("kafka");
         request_config.set("bootstrap.servers", "unreachable.invalid:9092");
         request_config.set("group.id", "replacement-group");
-        request_config.set("topic", "replacement-topic");
+        request_config.set("topic.pattern", "replacement-.*");
         request_config.set("laminar.source.name", "replacement-source");
 
         let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
@@ -2259,19 +3184,17 @@ mod tests {
                 delivery: DeliveryGuarantee::ExactlyOnce,
             })
             .await
-            .expect_err("broker-managed ownership must fail closed for exactly-once");
+            .expect_err("dynamic broker-managed ownership must fail closed for exactly-once");
 
         assert!(matches!(
             error,
             ConnectorError::ConfigurationError(message)
-                if message.contains("engine-managed vnode assignment")
+                if message.contains("topic patterns") && message.contains("engine-owned")
         ));
         assert_eq!(source.state(), ConnectorState::Created);
         assert!(source.consumer.is_none());
         assert!(source.msg_rx.is_none());
         assert!(source.reader_handle.is_none());
-        assert!(source.commit_handle.is_none());
-        assert!(source.hwm_handle.is_none());
         assert_eq!(source.config.group_id, "test-group");
         assert_eq!(source.offsets.partition_count(), 0);
         assert!(source.source_name.is_empty());
@@ -2280,25 +3203,195 @@ mod tests {
             .load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn vnode_assignment_rejects_dynamic_topic_patterns_before_activation() {
+        let mut config = test_config();
+        config.subscription = TopicSubscription::Pattern("events-.*".into());
+        let mut source = KafkaSource::new(test_schema(), config, None);
+        source.set_vnode_assignment(
+            Arc::new(laminar_core::state::VnodeRegistry::new(4)),
+            laminar_core::state::NodeId(0),
+        );
+
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::ExactlyOnce,
+            })
+            .await
+            .expect_err("dynamic topic inventory cannot be fenced by vnode assignment");
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("topic patterns") && message.contains("engine-owned")
+        ));
+        assert_eq!(source.state(), ConnectorState::Created);
+        assert!(source.consumer.is_none());
+    }
+
+    #[tokio::test]
+    async fn guaranteed_delivery_rejects_a_moving_latest_fallback_before_activation() {
+        let mut config = test_config();
+        config.startup_mode = StartupMode::Latest;
+        let mut source = KafkaSource::new(test_schema(), config, None);
+
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("a moving end offset can skip post-checkpoint records after recovery");
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("stable unrecorded-partition start")
+        ));
+        assert_eq!(source.state(), ConnectorState::Created);
+        assert!(source.consumer.is_none());
+    }
+
+    #[tokio::test]
+    async fn guaranteed_delivery_rejects_broker_group_offsets_before_activation() {
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("a mutable broker group cursor cannot define a guaranteed initial cut");
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("cannot use broker group offsets")
+        ));
+        assert_eq!(source.state(), ConnectorState::Created);
+        assert!(source.consumer.is_none());
+    }
+
     // A stale local position skips or double-folds against rehydrated state.
     #[test]
-    fn acquired_resume_prefers_handoff_over_local() {
+    fn acquired_position_prefers_every_handoff_form_over_local() {
         let map = |off: &str| {
             std::collections::HashMap::from([("events:0".to_string(), off.to_string())])
         };
         let handoff = OffsetTracker::try_from_offset_map(&map("100")).unwrap();
         let local = OffsetTracker::try_from_offset_map(&map("250")).unwrap();
         let empty = OffsetTracker::new();
+        let baseline = KafkaPartitionBaselines::from([(("events".to_string(), 0), 101)]);
 
         assert_eq!(
-            acquired_resume_offset(&handoff, &local, "events", 0),
-            Some(100)
+            acquired_numeric_position(
+                &handoff,
+                &KafkaPartitionBaselines::new(),
+                &local,
+                &KafkaPartitionBaselines::new(),
+                "events",
+                0,
+                false,
+            )
+            .unwrap(),
+            Some(101)
         );
         assert_eq!(
-            acquired_resume_offset(&empty, &local, "events", 0),
-            Some(250)
+            acquired_numeric_position(
+                &empty,
+                &baseline,
+                &local,
+                &KafkaPartitionBaselines::new(),
+                "events",
+                0,
+                false,
+            )
+            .unwrap(),
+            Some(101)
         );
-        assert_eq!(acquired_resume_offset(&empty, &empty, "events", 0), None);
+        assert_eq!(
+            acquired_numeric_position(
+                &empty,
+                &KafkaPartitionBaselines::new(),
+                &local,
+                &KafkaPartitionBaselines::new(),
+                "events",
+                0,
+                false,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            acquired_numeric_position(
+                &empty,
+                &KafkaPartitionBaselines::new(),
+                &local,
+                &KafkaPartitionBaselines::new(),
+                "events",
+                0,
+                true,
+            )
+            .unwrap(),
+            Some(251)
+        );
+        let genesis_baseline = KafkaPartitionBaselines::from([(("events".to_string(), 0), 7)]);
+        assert_eq!(
+            acquired_numeric_position(
+                &empty,
+                &KafkaPartitionBaselines::new(),
+                &empty,
+                &genesis_baseline,
+                "events",
+                0,
+                true,
+            )
+            .unwrap(),
+            Some(7),
+            "cluster genesis may use the numeric baseline captured by start()"
+        );
+    }
+
+    #[test]
+    fn vnode_payload_filter_rejects_revoked_and_pre_handoff_records() {
+        let node0 = laminar_core::state::NodeId(0);
+        let node1 = laminar_core::state::NodeId(1);
+        let assignment = [node0, node1];
+
+        assert!(vnode_payload_is_current(
+            Some((&assignment, node0)),
+            Some(10),
+            0,
+            10,
+        ));
+        assert!(!vnode_payload_is_current(
+            Some((&assignment, node0)),
+            Some(10),
+            0,
+            9,
+        ));
+        assert!(!vnode_payload_is_current(
+            Some((&assignment, node0)),
+            None,
+            1,
+            10,
+        ));
+    }
+
+    #[test]
+    fn owner_generation_detects_self_other_self_before_reader_turn() {
+        let self_id = laminar_core::state::NodeId(1);
+        let other = laminar_core::state::NodeId(2);
+        let registry = laminar_core::state::VnodeRegistry::new_unassigned(1);
+        registry.set_assignment_and_version(vec![self_id].into(), 1);
+        registry.set_assignment_and_version_carrying_resume_offsets(vec![other].into(), 2);
+        registry.set_assignment_and_version_carrying_resume_offsets(vec![self_id].into(), 3);
+
+        let published = registry.versioned_snapshot();
+        assert!(partition_reacquired_after(&published, 0, self_id, 1,));
+        assert!(!partition_reacquired_after(&published, 0, self_id, 3,));
     }
 
     #[test]
@@ -2352,6 +3445,21 @@ mod tests {
 
         source.vnode_assignment = Some((Arc::clone(&registry), node0));
         source.vnode_topic_meta = vec![(Arc::from("events"), 4)];
+        source.manual_partition_baselines = KafkaPartitionBaselines::from([
+            (("events".to_string(), 0), 10),
+            (("events".to_string(), 1), 20),
+            (("events".to_string(), 2), 30),
+            (("events".to_string(), 3), 40),
+        ]);
+        let version = registry.assignment_version();
+        source
+            .reconciled_assignment_version
+            .store(version, Ordering::Release);
+        *lock_or_recover(&source.rotation_partition_baselines) =
+            Arc::new(KafkaRotationPublication {
+                assignment_version: version,
+                baselines: KafkaRotationBaselines::new(),
+            });
 
         // rebalance_state is empty (no callbacks under manual assign): the old
         // code returned an empty checkpoint here.
@@ -2360,6 +3468,142 @@ mod tests {
         assert_eq!(cp.get_offset("events:1"), None); // vnode 1 → node1
         assert_eq!(cp.get_offset("events:2"), Some("300")); // vnode 2 → node0
         assert_eq!(cp.get_offset("events:3"), None); // vnode 3 → node1
+        assert_eq!(
+            decode_partition_baselines(&cp).unwrap(),
+            KafkaPartitionBaselines::from([
+                (("events".to_string(), 0), 10),
+                (("events".to_string(), 2), 30),
+            ])
+        );
+    }
+
+    #[test]
+    fn vnode_checkpoint_keeps_handoff_baseline_authoritative_until_accept() {
+        let node0 = laminar_core::state::NodeId(0);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node0));
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
+        source.offsets.update_force("events", 0, 250); // stale prior stint
+        source.manual_partition_baselines =
+            KafkaPartitionBaselines::from([(("events".to_string(), 0), 5)]);
+        let rotation = KafkaRotationBaselines::from([(
+            Arc::from("events"),
+            std::collections::HashMap::from([(0, 101)]),
+        )]);
+        *lock_or_recover(&source.rotation_partition_baselines) =
+            Arc::new(KafkaRotationPublication {
+                assignment_version: 1,
+                baselines: rotation,
+            });
+        source
+            .rotation_partition_baseline_count
+            .store(1, Ordering::Release);
+        source
+            .reconciled_assignment_version
+            .store(registry.assignment_version(), Ordering::Release);
+
+        let checkpoint = source.checkpoint();
+        assert_eq!(checkpoint.get_offset("events:0"), None);
+        assert_eq!(
+            decode_partition_baselines(&checkpoint).unwrap(),
+            KafkaPartitionBaselines::from([(("events".to_string(), 0), 101)])
+        );
+
+        let mut baselines = lock_or_recover(&source.rotation_partition_baselines)
+            .baselines
+            .clone();
+        retire_accepted_rotation_baselines(&mut baselines, &[(Arc::from("events"), 0, 100)]);
+        assert_eq!(
+            rotation_partition_baseline(&baselines, "events", 0),
+            Some(101)
+        );
+        retire_accepted_rotation_baselines(&mut baselines, &[(Arc::from("events"), 0, 101)]);
+        assert!(baselines.is_empty());
+    }
+
+    #[test]
+    fn assignment_flip_fences_checkpoint_until_exact_version_reconciles() {
+        let node0 = laminar_core::state::NodeId(1);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node0));
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
+        source
+            .reconciled_assignment_version
+            .store(registry.assignment_version(), Ordering::Release);
+        *lock_or_recover(&source.rotation_partition_baselines) =
+            Arc::new(KafkaRotationPublication {
+                assignment_version: registry.assignment_version(),
+                baselines: KafkaRotationBaselines::new(),
+            });
+        assert!(source.checkpoint_ready().unwrap());
+        assert!(source.try_checkpoint().unwrap().is_some());
+
+        let resume_offsets = std::collections::HashMap::from([(
+            String::new(),
+            std::collections::HashMap::from([(
+                partition_baseline_key("events", 0),
+                "101".to_string(),
+            )]),
+        )]);
+        registry.set_assignment_and_version_with_resume_offsets(
+            registry.snapshot(),
+            2,
+            resume_offsets,
+        );
+
+        assert!(
+            !source.checkpoint_ready().unwrap(),
+            "the runtime must not poll or consume a barrier against unreconciled ownership"
+        );
+        assert!(source.try_checkpoint().unwrap().is_none());
+        source
+            .reconciled_assignment_version
+            .store(2, Ordering::Release);
+        assert!(source.checkpoint_ready().unwrap());
+        assert!(
+            source.try_checkpoint().unwrap().is_none(),
+            "cursor publication must match even after the consumer version advances"
+        );
+        *lock_or_recover(&source.rotation_partition_baselines) =
+            Arc::new(KafkaRotationPublication {
+                assignment_version: 2,
+                baselines: KafkaRotationBaselines::new(),
+            });
+        let checkpoint = source.try_checkpoint().unwrap().unwrap();
+        assert_eq!(
+            checkpoint.get_metadata(KAFKA_ASSIGNMENT_VERSION_METADATA),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn manual_checkpoint_seals_partition_inventory_before_first_record() {
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.manual_topic_partitions =
+            std::collections::HashSet::from([("events".to_string(), 0), ("events".to_string(), 1)]);
+        source.manual_partition_baselines = KafkaPartitionBaselines::from([
+            (("events".to_string(), 0), 5),
+            (("events".to_string(), 1), 9),
+        ]);
+
+        let checkpoint = source.checkpoint();
+        assert_eq!(checkpoint.get_offset("events:0"), None);
+        assert_eq!(checkpoint.get_offset("events:1"), None);
+        let inventory = decode_partition_inventory(&checkpoint).unwrap();
+        assert_eq!(inventory, Some(source.manual_topic_partitions.clone()));
+        validate_resume_inventory(inventory.as_ref(), &source.manual_topic_partitions).unwrap();
+        assert_eq!(
+            decode_partition_baselines(&checkpoint).unwrap(),
+            source.manual_partition_baselines
+        );
+
+        let mut expanded = source.manual_topic_partitions;
+        expanded.insert(("events".to_string(), 2));
+        let expanded_inventory = decode_partition_inventory(&checkpoint).unwrap();
+        let error = validate_resume_inventory(expanded_inventory.as_ref(), &expanded).unwrap_err();
+        assert!(error.to_string().contains("partition inventory changed"));
     }
 
     #[test]
@@ -2377,14 +3621,20 @@ mod tests {
         resume.update_force("events", 1, 50); // p1: resume only
         resume.update_force("events", 2, 999); // p2: shadowed by local
 
+        let empty_baselines = KafkaPartitionBaselines::new();
         let tpl = build_vnode_assignment_tpl(
-            &registry,
+            &registry.snapshot(),
             node0,
             &topic_meta,
-            &local,
-            &resume,
+            VnodeResumeCursors {
+                local_offsets: &local,
+                handoff_offsets: &resume,
+                local_baselines: &empty_baselines,
+                handoff_baselines: &empty_baselines,
+            },
             rdkafka::Offset::Beginning,
-        );
+        )
+        .unwrap();
 
         let offset_of = |p: i32| tpl.find_partition("events", p).map(|e| e.offset());
         assert_eq!(offset_of(0), Some(rdkafka::Offset::Offset(101))); // local + 1
@@ -2412,6 +3662,10 @@ mod tests {
         assert_eq!(
             deterministic_initial_offset(&StartupMode::Earliest, OffsetReset::Latest),
             Some(rdkafka::Offset::Beginning)
+        );
+        assert_eq!(
+            deterministic_initial_offset(&StartupMode::GroupOffsets, OffsetReset::None),
+            None
         );
     }
 
@@ -2453,7 +3707,8 @@ mod tests {
         let mut offsets = OffsetTracker::new();
         offsets.update_force("events", 0, 100);
         let assigned = vec![("events".to_string(), 0), ("events".to_string(), 1)];
-        let tpl = assignment_seek_tpl(&offsets, &assigned, Some(rdkafka::Offset::Beginning))
+        let baselines = KafkaPartitionBaselines::from([(("events".to_string(), 1), 17)]);
+        let tpl = assignment_seek_tpl(&offsets, &assigned, Some(&baselines), None, true)
             .expect("valid seek list");
 
         assert_eq!(
@@ -2462,8 +3717,56 @@ mod tests {
         );
         assert_eq!(
             tpl.find_partition("events", 1).map(|e| e.offset()),
-            Some(rdkafka::Offset::Beginning)
+            Some(rdkafka::Offset::Offset(17))
         );
+    }
+
+    #[test]
+    fn guaranteed_resume_rejects_positions_expired_by_retention() {
+        let inventory = KafkaPartitionSet::from([("events".to_string(), 0)]);
+        let baselines = KafkaPartitionBaselines::from([(("events".to_string(), 0), 5)]);
+        let low_watermarks = KafkaPartitionBaselines::from([(("events".to_string(), 0), 6)]);
+
+        let error = validate_positions_not_expired(
+            &OffsetTracker::new(),
+            &baselines,
+            &low_watermarks,
+            &inventory,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("retention advanced"));
+
+        let mut consumed = OffsetTracker::new();
+        consumed.update_force("events", 0, 10);
+        let low_watermarks = KafkaPartitionBaselines::from([(("events".to_string(), 0), 12)]);
+        let error =
+            validate_positions_not_expired(&consumed, &baselines, &low_watermarks, &inventory)
+                .unwrap_err();
+        assert!(error.to_string().contains("position 11"));
+    }
+
+    #[test]
+    fn reader_error_classification_faults_fatal_errors() {
+        use rdkafka::types::RDKafkaErrorCode;
+
+        assert!(!kafka_reader_error_is_terminal(&KafkaError::PartitionEOF(
+            0
+        )));
+        assert!(!kafka_reader_error_is_terminal(
+            &KafkaError::NoMessageReceived
+        ));
+        assert!(!kafka_reader_error_is_terminal(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure)
+        ));
+        assert!(kafka_reader_error_is_terminal(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
+        ));
+        assert!(kafka_reader_error_is_terminal(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::LogTruncation)
+        ));
+        assert!(kafka_reader_error_is_terminal(
+            &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::OffsetOutOfRange)
+        ));
     }
 
     #[test]
@@ -2895,7 +4198,7 @@ mod tests {
     #[tokio::test]
     async fn test_notify_epoch_committed_empty_cp_is_noop() {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        // No reader, no commit channel — opt-out path. Empty cp must not panic.
+        // No active consumer — the empty-checkpoint opt-out path must not fail.
         source
             .notify_epoch_committed(1, &SourceCheckpoint::new())
             .await
@@ -2909,120 +4212,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notify_epoch_committed_rejects_missing_commit_task() {
+    async fn notify_epoch_committed_treats_missing_consumer_as_advisory_failure() {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        let error = source
-            .notify_epoch_committed(7, &durable_kafka_checkpoint())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("commit task is missing"),
-            "{error}"
-        );
-        assert_eq!(source.metrics.commit_failures_enqueue_dropped.get(), 1);
-    }
-
-    #[tokio::test]
-    async fn notify_epoch_committed_rejects_missing_commit_channel() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        source.commit_handle = Some(tokio::spawn(std::future::pending::<()>()));
-
-        let error = source
-            .notify_epoch_committed(7, &durable_kafka_checkpoint())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("commit channel is missing"),
-            "{error}"
-        );
-        source.commit_handle.take().unwrap().abort();
-    }
-
-    #[tokio::test]
-    async fn notify_epoch_committed_propagates_enqueue_failure() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        let (commit_tx, commit_rx) = mpsc::channel(BROKER_COMMIT_REQUEST_CAPACITY);
-        drop(commit_rx);
-        source.commit_tx = Some(commit_tx);
-        source.commit_handle = Some(tokio::spawn(std::future::pending::<()>()));
-
-        let error = source
-            .notify_epoch_committed(7, &durable_kafka_checkpoint())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("closed its request channel"),
-            "{error}"
-        );
-        source.commit_handle.take().unwrap().abort();
-    }
-
-    #[tokio::test]
-    async fn notify_epoch_committed_waits_for_worker_success() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        let (commit_tx, mut commit_rx) = mpsc::channel(BROKER_COMMIT_REQUEST_CAPACITY);
-        source.commit_tx = Some(commit_tx);
-        source.commit_handle = Some(tokio::spawn(async move {
-            let request = commit_rx.recv().await.unwrap();
-            assert_eq!(request.epoch, 7);
-            assert_eq!(request.offsets.count(), 1);
-            let _ = request.acknowledgement.send(Ok(()));
-        }));
-
         source
             .notify_epoch_committed(7, &durable_kafka_checkpoint())
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn notify_epoch_committed_propagates_worker_rejection() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        let (commit_tx, mut commit_rx) = mpsc::channel(BROKER_COMMIT_REQUEST_CAPACITY);
-        source.commit_tx = Some(commit_tx);
-        source.commit_handle = Some(tokio::spawn(async move {
-            let request = commit_rx.recv().await.unwrap();
-            let _ = request
-                .acknowledgement
-                .send(Err("injected broker rejection".into()));
-        }));
-
-        let error = source
-            .notify_epoch_committed(7, &durable_kafka_checkpoint())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("injected broker rejection"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn notify_epoch_committed_rejects_panicked_commit_worker() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        let (commit_tx, mut commit_rx) = mpsc::channel(BROKER_COMMIT_REQUEST_CAPACITY);
-        source.commit_tx = Some(commit_tx);
-        source.commit_handle = Some(tokio::spawn(async move {
-            let _request = commit_rx.recv().await.unwrap();
-            panic!("injected commit worker panic");
-        }));
-
-        let error = source
-            .notify_epoch_committed(7, &durable_kafka_checkpoint())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("dropped its acknowledgement"),
-            "{error}"
-        );
-        assert_eq!(source.metrics.commit_failures_panic.get(), 1);
-    }
-
-    #[test]
-    fn broker_commit_epoch_fence_is_monotonic_and_idempotent() {
-        assert!(!commit_epoch_already_satisfied(None, 7));
-        assert!(!commit_epoch_already_satisfied(Some(6), 7));
-        assert!(commit_epoch_already_satisfied(Some(7), 7));
-        assert!(commit_epoch_already_satisfied(Some(8), 7));
+        assert_eq!(source.metrics.commit_failures.get(), 1);
     }
 }

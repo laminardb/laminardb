@@ -12,7 +12,7 @@ use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
 #[cfg(feature = "cluster")]
 use crate::cluster_config::{ClusterConfig, ClusterConfigError};
 use crate::config::{
-    ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
+    ConfigError, LookupConfig, PipelineConfig, ServerConfig, ServerMode, SinkConfig, SourceConfig,
 };
 use crate::http;
 #[cfg(feature = "cluster")]
@@ -113,7 +113,7 @@ pub async fn run_server(
         }
     }
     #[cfg(not(feature = "cluster"))]
-    if config.server.mode == "cluster" {
+    if config.server.mode == ServerMode::Cluster {
         return Err(ServerError::Cluster(
             "Cluster mode requires the 'cluster' feature flag. \
              This mode is not yet production-ready."
@@ -147,11 +147,10 @@ pub async fn run_server(
         builder = builder.storage_dir(path);
     }
 
-    let profile = match config.server.mode.as_str() {
-        "embedded" if has_storage => Profile::Embedded,
-        "embedded" => Profile::BareMetal,
-        "cluster" => Profile::Cluster,
-        _ => Profile::BareMetal,
+    let profile = match config.server.mode {
+        ServerMode::Embedded if has_storage => Profile::Embedded,
+        ServerMode::Embedded => Profile::BareMetal,
+        ServerMode::Cluster => Profile::Cluster,
     };
     builder = builder.profile(profile);
     builder = builder.restart_policy(config.supervision.to_policy());
@@ -727,7 +726,6 @@ mod tests {
             sinks: vec![],
             sql: None,
             discovery: None,
-            coordination: None,
             node_id: None,
             ai: Default::default(),
             models: Default::default(),
@@ -765,7 +763,6 @@ mod tests {
             sinks: vec![],
             sql: None,
             discovery: None,
-            coordination: None,
             node_id: None,
             ai: Default::default(),
             models: Default::default(),

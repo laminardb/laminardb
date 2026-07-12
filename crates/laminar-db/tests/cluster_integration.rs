@@ -50,7 +50,8 @@ mod smoke {
     use tokio::time::sleep;
 
     use super::cluster_harness::{
-        input_batch, manifest_epoch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness,
+        input_batch, manifest_epoch, pick_keys_per_owner, read_distributed_mv_sums, read_mv_sums,
+        ClusterEngineHarness,
     };
 
     const VNODE_COUNT: u32 = 4;
@@ -151,6 +152,11 @@ mod smoke {
         assert_eq!(
             union, expected,
             "union of MVs does not match input:\n got  {union:?}\n want {expected:?}",
+        );
+        assert_eq!(
+            read_distributed_mv_sums(&leader_node.db, "sums").await,
+            expected,
+            "the production distributed scan must return every shard exactly once",
         );
 
         let leader_epoch = manifest_epoch(&leader_node.db).await;
@@ -1706,12 +1712,24 @@ mod rebalance {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rebalance_rehydrates_acquired_vnode_state() {
-        use bytes::Bytes;
-
-        const SEED_EPOCH: u64 = 50;
-        let seed_attempt = CheckpointAttempt::new(SEED_EPOCH, SEED_EPOCH);
-
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+
+        // Drive the production checkpoint path so the fixture contains a participant-ready
+        // inventory and durable decision as well as valid encoded vnode partials. A bare seal is
+        // only prepared state and must never be an assignment handoff cut.
+        for node in &harness.nodes {
+            node.db
+                .execute("CREATE SOURCE src (key BIGINT, value BIGINT)")
+                .await
+                .expect("CREATE SOURCE");
+            node.db
+                .execute(
+                    "CREATE MATERIALIZED VIEW sums AS \
+                     SELECT key, SUM(value) AS total FROM src GROUP BY key",
+                )
+                .await
+                .expect("CREATE MATERIALIZED VIEW");
+        }
         harness.start_all().await;
 
         let leader_idx = harness.leader_idx();
@@ -1720,22 +1738,35 @@ mod rebalance {
         let follower_vnodes = harness.nodes[follower_idx].owned_vnodes();
         assert!(!follower_vnodes.is_empty(), "follower must own some vnodes");
 
-        let backend = Arc::clone(&harness.nodes[leader_idx].state_backend);
-        let version = backend.authoritative_version();
-        let all_vnodes: Vec<u32> = (0..VNODE_COUNT).collect();
-        for &v in &all_vnodes {
-            backend
-                .write_partial(seed_attempt, v, version, Bytes::from(format!("vnode-{v}")))
-                .await
-                .expect("seed write_partial");
-        }
+        let checkpoint = harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("decision-bound seed checkpoint");
         assert!(
-            backend
-                .seal_checkpoint(seed_attempt, version, &all_vnodes, &[])
-                .await
-                .expect("seal seed epoch"),
-            "seed epoch must seal once every vnode partial is present",
+            checkpoint.success,
+            "seed checkpoint failed: {:?}",
+            checkpoint.error
         );
+        let decision = harness.nodes[leader_idx]
+            .decision_store
+            .decision(checkpoint.epoch)
+            .await
+            .expect("read seed decision")
+            .expect("seed checkpoint must have a durable decision");
+        assert_eq!(decision.checkpoint_id, checkpoint.checkpoint_id);
+
+        let seed_attempt = CheckpointAttempt::new(checkpoint.epoch, checkpoint.checkpoint_id);
+        let inventory = harness.nodes[leader_idx]
+            .state_backend
+            .checkpoint_seal_inventory(seed_attempt)
+            .await
+            .expect("read seed seal")
+            .expect("decided checkpoint must have an exact seal");
+        let all_vnodes: Vec<u32> = (0..VNODE_COUNT).collect();
+        assert_eq!(inventory.attempt, seed_attempt);
+        assert_eq!(inventory.required_vnodes, all_vnodes);
+        assert_eq!(inventory.assignment_version, decision.assignment_version);
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -1746,48 +1777,23 @@ mod rebalance {
             m.insert(v, leader);
         }
         let rotated = seed.next(m);
-        assert!(matches!(
-            store.save_if_version(&rotated, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
+        let adoption = harness.nodes[leader_idx]
+            .db
+            .adopt_assignment_snapshot(rotated.clone())
+            .await
+            .expect("adopt decision-bound assignment handoff");
 
-        wait_for(
-            || {
-                harness.nodes[leader_idx]
-                    .vnode_registry
-                    .assignment_version()
-                    >= rotated.version
-            },
-            "leader to adopt the rotation",
-        )
-        .await;
-
-        wait_for(
-            || {
-                let staged = harness.nodes[leader_idx].db.rehydrated_vnode_state();
-                follower_vnodes.iter().all(|v| staged.contains_key(v))
-            },
-            "leader to stage rehydrated state for acquired vnodes",
-        )
-        .await;
-
-        let staged = harness.nodes[leader_idx].db.rehydrated_vnode_state();
-        let staged_keys: std::collections::BTreeSet<u32> = staged.keys().copied().collect();
+        assert!(adoption.adopted);
+        assert_eq!(adoption.version, rotated.version);
+        let acquired: std::collections::BTreeSet<u32> =
+            adoption.newly_acquired.iter().copied().collect();
         let expected: std::collections::BTreeSet<u32> = follower_vnodes.iter().copied().collect();
         assert_eq!(
-            staged_keys, expected,
-            "leader must rehydrate exactly its newly-acquired vnodes",
+            acquired, expected,
+            "leader must acquire exactly the follower's prior vnodes",
         );
-        for &v in &follower_vnodes {
-            let entry = staged.get(&v).expect("acquired vnode staged");
-            assert_eq!(entry.epoch, SEED_EPOCH);
-            assert_eq!(
-                entry.chain.len(),
-                1,
-                "simple seed resolves to a single-link chain"
-            );
-            assert_eq!(&entry.chain[0][..], format!("vnode-{v}").as_bytes());
-        }
+        assert_eq!(adoption.rehydrated, follower_vnodes.len());
+        assert_eq!(adoption.rehydration_epoch, Some(checkpoint.epoch));
 
         harness.shutdown().await;
     }
@@ -1881,14 +1887,18 @@ mod two_pc {
         dir: &std::path::Path,
         backend: Arc<InProcessBackend>,
         vnodes: Vec<u32>,
+        assignment_version: u64,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) -> CheckpointCoordinator {
-        let store = Box::new(FileSystemCheckpointStore::new(dir));
+        let store = Box::new(
+            FileSystemCheckpointStore::new(dir).with_participant_id(controller.instance_id().0),
+        );
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
         coord.set_state_backend(backend);
         coord.set_vnode_set(vnodes);
+        coord.set_assignment_version(assignment_version);
         coord.set_cluster_controller(controller);
         coord
     }
@@ -1936,21 +1946,26 @@ mod two_pc {
             leader_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(leader_node.instance_id.0)),
+            registry.assignment_version(),
             Arc::clone(&leader_node.controller),
         )
         .await;
+        leader_coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
         leader_coord
-            .set_decision_store(Arc::clone(&decision_store))
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
             .unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            registry.assignment_version(),
             Arc::clone(&follower_node.controller),
         )
         .await;
         follower_coord
-            .set_decision_store(Arc::clone(&decision_store))
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
             .unwrap();
 
         let ann = BarrierAnnouncement {
@@ -2023,21 +2038,26 @@ mod two_pc {
             leader_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(leader_node.instance_id.0)),
+            registry.assignment_version(),
             Arc::clone(&leader_node.controller),
         )
         .await;
+        leader_coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
         leader_coord
-            .set_decision_store(Arc::clone(&decision_store))
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
             .unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            registry.assignment_version(),
             Arc::clone(&follower_node.controller),
         )
         .await;
         follower_coord
-            .set_decision_store(Arc::clone(&decision_store))
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
             .unwrap();
 
         let ann = BarrierAnnouncement {
@@ -2088,18 +2108,29 @@ mod two_pc {
 
         let decision_dir = tempfile::tempdir().unwrap();
         let decision_store = make_decision_store(&decision_dir);
-        decision_store.record_committed(42, 42).await.unwrap();
+        decision_store
+            .record_committed_for_participants(
+                42,
+                100,
+                &[follower_node.instance_id.0],
+                follower_node.instance_id.0,
+                registry.assignment_version(),
+            )
+            .await
+            .unwrap();
 
         let follower_dir = tempfile::tempdir().unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            registry.assignment_version(),
             Arc::clone(&follower_node.controller),
         )
         .await;
         follower_coord
-            .set_decision_store(Arc::clone(&decision_store))
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
             .unwrap();
 
         let ann = BarrierAnnouncement {
@@ -2123,7 +2154,7 @@ mod two_pc {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn follower_timeout_rolls_back_when_no_decision() {
+    async fn follower_timeout_stays_in_doubt_when_no_decision() {
         let cluster = MiniCluster::spawn(2).await;
         cluster.wait_for_convergence(CONVERGENCE).await.unwrap();
         let follower_node = if cluster.nodes[0].controller.is_leader() {
@@ -2144,11 +2175,13 @@ mod two_pc {
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            registry.assignment_version(),
             Arc::clone(&follower_node.controller),
         )
         .await;
         follower_coord
-            .set_decision_store(Arc::clone(&decision_store))
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
             .unwrap();
 
         let ann = BarrierAnnouncement {
@@ -2158,15 +2191,18 @@ mod two_pc {
             flags: 0,
             min_watermark_ms: None,
         };
-        let committed = follower_coord
+        let error = follower_coord
             .follower_checkpoint(
                 CheckpointRequest::default(),
                 ann,
                 Duration::from_millis(500),
             )
             .await
-            .unwrap();
-        assert!(!committed);
+            .expect_err("a prepared follower must not guess abort without a durable decision");
+        assert!(
+            error.to_string().contains("[LDB-6046]"),
+            "unexpected in-doubt error: {error}"
+        );
         cluster.shutdown().await;
     }
 }
@@ -2328,8 +2364,8 @@ mod minio {
     }
 
     /// Coordinated-commit descriptors written by two nodes to shared MinIO seal
-    /// the leader's gate only when both are present, and the leader reads both
-    /// back for the designated committer to aggregate.
+    /// the leader's gate only when both are present. The designated committer reads
+    /// the exact keys bound into that seal rather than listing the descriptor prefix.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_node_coordinated_descriptors_aggregate_on_leader() {
         use bytes::Bytes;
@@ -2390,15 +2426,25 @@ mod minio {
             .await
             .unwrap());
 
-        // The leader reads both nodes' descriptors for the committer to aggregate.
-        let mut descriptors = node1.read_commit_descriptors(attempt).await.unwrap();
-        descriptors.sort_by(|a, b| a.0.cmp(&b.0));
+        let inventory = node1
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inventory.required_descriptors, required);
+        let descriptor1 = node1
+            .read_commit_descriptor(attempt, "node=1/sink=s")
+            .await
+            .unwrap()
+            .expect("node 1 descriptor named by seal");
+        let descriptor2 = node1
+            .read_commit_descriptor(attempt, "node=2/sink=s")
+            .await
+            .unwrap()
+            .expect("node 2 descriptor named by seal");
         assert_eq!(
-            descriptors,
-            vec![
-                ("node=1/sink=s".to_string(), Bytes::from_static(b"d1")),
-                ("node=2/sink=s".to_string(), Bytes::from_static(b"d2")),
-            ]
+            (descriptor1, descriptor2),
+            (Bytes::from_static(b"d1"), Bytes::from_static(b"d2"))
         );
     }
 }

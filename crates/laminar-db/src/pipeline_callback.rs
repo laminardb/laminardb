@@ -2668,12 +2668,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn settle_checkpoint_tail_tasks(&mut self, abort: bool) -> Result<(), String> {
         if abort {
             self.checkpoint_tail_tasks.abort_all();
+            // Cancellation is cooperative and a tail may be inside blocking storage code. Drop
+            // the JoinSet after requesting abort instead of defeating the shutdown deadline by
+            // awaiting it. Exact attempt IDs make any detached ambiguous write unusable unless
+            // its matching durable decision exists.
+            self.checkpoint_tail_tasks = tokio::task::JoinSet::new();
+            return Ok(());
         }
         let mut failures = Vec::new();
         while let Some(result) = self.checkpoint_tail_tasks.join_next().await {
             match result {
                 Ok(()) => {}
-                Err(error) if abort && error.is_cancelled() => {}
                 Err(error) => failures.push(error.to_string()),
             }
         }
@@ -3911,6 +3916,14 @@ mod demotion_tests {
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store_box)
             .await
             .unwrap();
+        let decisions = Arc::new(
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+        );
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+        coord.set_decision_store(decisions).unwrap();
+        coord.bind_deployment_id(deployment_id).unwrap();
         coord.set_state_backend(Arc::new(InProcessBackend::new(VNODES)) as Arc<dyn StateBackend>);
         coord.set_vnode_set((0..VNODES).collect());
         coord.set_pending_vnode_states(states);

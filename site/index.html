@@ -372,7 +372,7 @@
             <div class="card-content">
               <h3>DISTRIBUTED MPP SCALING</h3>
               <p>
-                Scale execution across clusters using key-sharded data partitioners, distributed join rules, and raft-based coordination.
+                Scale execution across clusters using key-sharded data partitioners, distributed join rules, and lease-fenced coordination.
               </p>
             </div>
             <div class="card-illustration">
@@ -1131,7 +1131,7 @@ FROM tickets;</code></pre>
               <li>Support for interval, ASOF, lookup, and temporal probe joins.</li>
               <li>Dynamic partitioning and state store lookup indexing.</li>
               <li>Chandy-Lamport barrier checkpointing (2-phase commit).</li>
-              <li>Multi-node coordination, gossip discovery, and Raft consensus leases.</li>
+              <li>Multi-node coordination, gossip discovery, durable leader leases, and CAS-published assignments.</li>
             </ul>
           </div>
           <div class="status-column stable">

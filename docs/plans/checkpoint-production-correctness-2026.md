@@ -1,9 +1,9 @@
 # Checkpoint Production Correctness — 2026 Order
 
-**Status:** corrective fault cycle active on `feat/checkpoint-correctness-2026`; embedded and
-coordinated leader/follower hard-kill proofs passed. The rotating three-node run exposed an
-excluded-participant recovery gap, and its participant-bound corrective cycle is under validation;
-the full matrix rerun remains.
+**Status:** corrective fault cycle active on `feat/checkpoint-correctness-2026`. Earlier embedded
+and coordinated leader/follower hard-kill legs passed; the rotating three-node leg exposed further
+source-reconciliation, restore-activation, retention, and decision-ambiguity faults. Corrective
+code is not certified until the current deterministic gates and the full fault matrix both pass.
 **Decision date:** 2026-07-12
 
 This plan supersedes the older implementation order that treated connector phase-2 commits and
@@ -16,8 +16,10 @@ separation of fast alignment from durable completion described in the current
 [Apache Flink task lifecycle](https://nightlies.apache.org/flink/flink-docs-stable/docs/internals/task_lifecycle/),
 [Flink fault-tolerance model](https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/),
 and [Flink sink contract](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/sinks/).
-The latency design also incorporates recent work on decoupling the pipeline pause from remote
-checkpoint persistence ([arXiv:2403.13629](https://arxiv.org/abs/2403.13629)).
+Flink's asynchronous snapshot model is the basis for keeping remote persistence off the pipeline
+pause. [CheckMate](https://arxiv.org/abs/2403.13629) supports coordinated checkpoints as the
+production baseline under uniform load while showing that protocol choice is workload-sensitive;
+it does not by itself justify a universal latency claim.
 The release gates treat guarantees as empirical contracts, following the 2025 PVLDB work on
 end-to-end processing-guarantee validation under injected process and network faults
 ([PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf)); a clean unit-test model is not a
@@ -40,10 +42,13 @@ substitute for recovery-output validation.
 5. **Restorable seal.** Publish one canonical seal only after the complete vnode, descriptor, and
    participant-readiness inventory decodes and validates against one assignment generation.
    Presence without exact provenance or participant completeness is not sufficient.
-6. **Durable decision.** Record the exact decision after the seal, binding the canonical
-   participant set, assignment generation, and manifest owner. Starting this write is the
-   irrevocable boundary: timeout or transport failure is ambiguous and must never trigger live
-   rollback. A participant absent from the decision must roll back its late prepare.
+6. **Write-ahead decision intent, then durable decision.** After the seal, first CAS-create and
+   await an immutable intent containing the complete canonical decision. Only then CAS-create the
+   commit marker with the same bytes. An unmatched intent is explicitly in-doubt and blocks
+   ordinary inventory reads; startup idempotently completes that exact marker before recovery or
+   reconciliation rollback. This ordering makes a cancelled or timed-out commit-marker write
+   recoverably resolvable instead of invisible. A participant absent from the completed decision
+   must roll back its late prepare.
 7. **Completion and source acknowledgement.** Finalize the manifest and deliver the exact
    completion. Sources acknowledge only that validated attempt. A successor-epoch failure is a
    continuation fault, not a retroactive failure of the committed cut.
@@ -57,8 +62,15 @@ substitute for recovery-output validation.
    may borrow only a metadata-only peer manifest; participant-local operators, tables, or
    watermarks fail closed rather than being guessed from a donor.
 10. **Retention and shutdown.** Retention is one coalescing maintenance owner pinned by the
-    external-commit floor and newest decision. Shutdown first settles/cancels durable tails, then
-    tears down sources/sinks and finally releases deployment/control-plane ownership.
+    external-commit floor and newest decision. Before deleting any decision, manifest, or state
+    artifact, it audits every intent and publishes an immutable, deployment-scoped durable GC
+    floor. That floor embeds the full canonical decision immediately below the retained window as
+    its continuity anchor; readers treat every raw record below the floor as tombstoned even if a
+    stale writer recreates it. Shutdown retains ownership of every issued decision task and waits
+    for it to reach a terminal client-side state. A timeout leaves teardown retryable; it never
+    cancels or detaches the task and releases lifecycle fences behind it. Only after owned durable
+    tails settle does shutdown tear down sources/sinks and release deployment/control-plane
+    ownership.
 
 ## Configuration dimensions
 
@@ -76,42 +88,65 @@ checkpoint bound unknowable. The production model is:
 
 Polling intervals, sidecar thresholds, per-sink commit statuses, explicit writer IDs, store-local
 retention counts, and incremental-query emission policy are implementation details, obsolete
-dimensions, or belong outside checkpoint configuration.
+dimensions, or belong outside checkpoint configuration. Event-time policy has one SQL surface,
+`WATERMARK FOR`; Kafka-specific event-time and out-of-orderness aliases are removed.
 
 ## Runtime-mode policy
 
-| Runtime | Supported production semantics | Required durability/fencing |
+| Runtime | Admitted semantics | Required durability/fencing |
 |---|---|---|
-| Embedded/local | Best effort, at least once, and coordinated exactly once | Node-durable state/checkpoint storage and exclusive deployment lock for exactly once |
-| Single-node server | Same protocol as embedded/local | Same node-durable/exclusive-ownership requirements |
+| Embedded/local | Best effort, at least once, and connector-eligible coordinated exactly once | For exactly once: node-durable state plus the built-in local checkpoint/decision store under an exclusive OS deployment lock |
+| Single-node server | Same protocol as embedded/local | Same built-in local checkpoint/decision provenance and exclusive-ownership requirements |
+| Local exactly once with a configured checkpoint/object-store URL or injected decision store | **Rejected (`LDB-0014`)** | Provenance-erasing stores remain rejected until a deployment lease term fences decisions and external commits end to end |
 | Cluster | At least once only | Cluster-shared state/checkpoint storage, durable membership/lease during tail settlement |
 | Cluster exactly once | **Rejected (`LDB-0013`)** | Remains rejected until leader term is atomically consumed by both decision creation and external sink cursor commit |
 
-The rejection is intentional correctness, not a missing fallback: a renewable leader lease alone
-cannot prevent an expired leader from completing a separate object-store or catalog transaction.
+These rejections are intentional correctness, not missing fallbacks. A renewable leader lease
+alone cannot prevent an expired leader from completing a separate object-store or catalog
+transaction, and an arbitrary local object-store or injected decision-store handle erases the
+provenance needed to prove that the built-in OS lock fences every decision writer.
 
 ## Effective exactly-once scope and next order
 
 The contract audit on 2026-07-12 found a narrower reachable matrix than the runtime table alone
 suggests:
 
-- local Kafka sources reject exactly-once because engine-owned vnode assignment is currently
-  installed only when a cluster controller exists, while cluster exactly-once is rejected;
-- the Kafka sink is intentionally `DurableAtLeastOnce`: idempotent production and `acks=all` do
-  not make its output transaction recoverable from an exact LaminarDB decision;
+- local Kafka sources use engine-owned assignment for guaranteed delivery. `earliest` captures the
+  full explicit topic inventory; specific offsets bind exactly the configured partition set. Both
+  persist numeric next-to-read baselines before the first record and fail recovery on inventory,
+  configuration, or retention drift. Patterns, broker group cursors, moving latest, and timestamp
+  starts remain rejected for guaranteed delivery;
+- the Kafka sink is intentionally `DurableAtLeastOnce`, never `CheckpointCommittable`:
+  idempotent production and `acks=all` do not make its output transaction recoverable from an
+  exact LaminarDB decision;
 - commit-coupled CDC sources cannot yet align a checkpoint at an external transaction boundary;
 - only coordinated append-mode Delta Lake and Iceberg are checkpoint-committable sinks; and
 - Iceberg has no direct at-least-once flush path, so it is also unreachable under the default
   at-least-once setting.
 
-Consequently, the currently certified external exactly-once matrix is local file/generator input
-to append-mode Delta Lake or Iceberg. Documentation must not advertise Kafka as a certified local
-exact source until its single-owner assignment is wired and fault-tested.
+Consequently, append-mode Delta Lake and Iceberg are implemented/admitted local exactly-once
+candidates, not production-certified paths. Even those candidates are admitted only with the
+built-in local checkpoint/decision store; a configured remote or `file://` checkpoint URL and an
+injected decision store fail closed with `[LDB-0014]`. Their current connector tests do not replace
+a full engine process-death/output-oracle matrix. A local Kafka-to-Delta/Iceberg path is reachable
+in the implementation but remains **uncertified** until its pre-first-record, process-death,
+restart, and partition-topology cases pass. Kafka-to-Kafka remains at-least-once because the Kafka
+sink is not `CheckpointCommittable`. Kafka append is multi-writer; compacted upsert is singleton
+until writer-generation ordering is fenced across handoff.
+
+Kafka source group offsets are progress telemetry, not recovery authority. After a LaminarDB
+checkpoint commits, the source enqueues the corresponding broker offset asynchronously and records
+the eventual callback outcome as a metric. A broker-progress failure must not restart or invalidate
+the already-decided engine cut; recovery always uses the sealed source checkpoint. This follows the
+current Flink Kafka source contract, which likewise treats broker commits as monitoring progress
+rather than fault-tolerance state
+([Kafka source offset committing](https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/datastream/kafka/#consumer-offset-committing)).
 
 Do not restore the former inline Kafka transaction path. A process can die after the engine's
-durable decision but before `commit_transaction`; a new librdkafka producer fences and completes
-the old session, but LaminarDB has no durable committable from which to reproduce output that was
-aborted before publication. Kafka's transaction protocol requires stable transactional IDs and
+durable decision but before `commit_transaction`; a new producer with the same transactional ID
+fences the old session and Kafka aborts its unresolved transaction, but LaminarDB has no durable
+committable from which to reproduce output that was aborted before publication. Kafka's
+transaction protocol requires stable transactional IDs and
 atomic commit markers ([KIP-98](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging)); moving partition ownership also
 requires group-generation fencing ([KIP-447](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/103093950/KIP-447%2BProducer%2Bscalability%2Bfor%2Bexactly%2Bonce%2Bsemantics)). Flink likewise makes
 Kafka transactions checkpoint-owned, requires a stable transactional-ID prefix, and documents
@@ -119,7 +154,17 @@ checkpoint-bounded visibility and transaction-timeout constraints.
 
 Implement the remaining work in this order:
 
-1. **Build the canonical cluster recovery capsule.** This is the first remaining availability
+1. **Certify the current corrective protocol.** Prove write-ahead decision ambiguity, follower
+   assignment-cut validation, fail-closed vnode rehydration, batch/cursor rotation fencing, and
+   latest-pointer corruption before another feature is admitted. Run process-death output oracles,
+   not only unit models.
+2. **Make the existing matrix truthful and useful.** Use the typed `Embedded | Cluster` server
+   boundary and remove the unused Raft coordination settings; embedded and standalone API hosting
+   share the local checkpoint protocol. Keep consistency, topology, and input mode derived from
+   connector contracts. Certify local Kafka initial, pre-first-record, restart, and topology-drift
+   behavior. Give Iceberg a real direct-append at-least-once path (or prove that its coordinated
+   protocol is safe under an at-least-once request).
+3. **Build the canonical cluster recovery capsule.** This is the first remaining availability
    blocker because cluster at-least-once already admits stateful pipelines, while a replacement
    participant cannot safely reconstruct participant-local operator, table, or watermark state.
    Seal a decision-bound global recovery image, not an arbitrary participant's local manifest.
@@ -128,18 +173,11 @@ Implement the remaining work in this order:
    after ownership changes. Keep the current metadata-only peer bootstrap as a narrow
    optimization; reject non-portable donor state until this capsule is implemented and
    fault-tested.
-2. **Make the existing matrix truthful and useful.** Replace the free-form server mode string with
-   the actual protocol boundary (`Local` or `Cluster`); embedded and standalone hosting are both
-   local. Install a single-owner vnode registry for a local Kafka source before connector start,
-   then prove initial start, restart, and partition discovery under exact checkpoints. Give
-   Iceberg a real direct-append at-least-once path (or separately certify that running its stronger
-   coordinated protocol under an at-least-once label is safe) so the default configuration is
-   usable.
-3. **Certify source transaction cuts.** Add a deadline-bounded async barrier-prepare hook for
+4. **Certify source transaction cuts.** Add a deadline-bounded async barrier-prepare hook for
    commit-coupled CDC. PostgreSQL CDC must either drain through the current database transaction
    before emitting its barrier or persist the transaction identifier, event ordinal, and in-flight
    payload. Merely removing its admission rejection can replay a partially emitted transaction.
-4. **Add recoverable Kafka sink committables, local first.** Stage encoded record segments durably
+5. **Add recoverable Kafka sink committables, local first.** Stage encoded record segments durably
    before the seal and keep participant descriptors small and checksummed. After the exact engine
    decision, a designated committer opens a fresh Kafka transaction, publishes the staged records
    plus a namespaced exact cursor marker atomically, and resolves ambiguous commits by reading that
@@ -147,12 +185,12 @@ Implement the remaining work in this order:
    sink, and participant; do not add a public writer-ID dimension. Reject a non-transactional DLQ
    under exactly-once and validate transaction timeout against checkpoint plus recovery bounds.
    Preserve the current direct producer path for low-latency at-least-once operation.
-5. **Build a linearizable cluster decision authority.** Complete AD-0 from
+6. **Build a linearizable cluster decision authority.** Complete AD-0 from
    `cluster-production-readiness.md`: use the authoritative Postgres control store to insert the
    seal-bound decision in a transaction conditioned on the current owner and fencing term. The
-   existing `strategy = "raft"`/`raft_port` settings are not a Raft implementation and cannot
-   justify removing `LDB-0013`.
-6. **Fence and certify every external committer.** External cursors must carry the exact
+   removed legacy `strategy = "raft"`/`raft_port` settings never constituted a Raft implementation
+   and cannot justify removing `LDB-0013`.
+7. **Fence and certify every external committer.** External cursors must carry the exact
    predecessor, deployment namespace, and decision fence. Run stale-leader, network-partition,
    rebalance, process-death-before/after-decision, ambiguous Kafka commit, mixed-sink, and
    transaction-timeout matrices before admitting cluster exactly-once.
@@ -166,16 +204,18 @@ cannot be mistaken for broad exactly-once support.
 
 - All-target compilation for core, connectors, DB (local and `cluster`), and server.
 - Deterministic tests for decision ambiguity, exact seal inventory, cursor rollback/overlap,
-  successor-epoch failure, total attempt deadline, retention coalescing, and shutdown ownership.
+  successor-epoch failure, total attempt deadline, decision-floor monotonicity/continuity,
+  retention coalescing, and owned-task shutdown quiescence.
 - Fault-injection/soak runs for process death before/after seal, during decision creation, during
   external commit, and during shutdown.
 - Latency verification separates pipeline stall, restorable-gate wait, durable completion, and
   external-commit lag; retention work must never appear on the source-ack critical path.
 - Dead-code and configuration audit after every feature cycle.
 
-Code gates completed on 2026-07-11: strict all-target Clippy passes for core/connectors, DB in
-local and cluster feature builds, and server; connectors also pass with no default features;
-workspace rustfmt and `git diff --check` pass. Test targets compile through those all-target gates.
+The previous local gate counts are intentionally not reused as certification evidence: the current
+cycle changes decision persistence, follower preparation, source rotation, and rehydration. Strict
+Clippy, all-feature compilation, complete local suites, public cluster adoption, and the full Linux
+fault matrix must be rerun on the final commit and recorded with that exact SHA.
 The first Linux fault matrix (`29169226798`) completed four embedded kill-9 rounds with aggregate
 state continuity, 908 demotions, and 31,025 cold-state fetches. Its cluster legs exposed an
 unaligned rkyv vnode payload returned from object storage after the first fault; object-store reads

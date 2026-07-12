@@ -75,8 +75,13 @@ impl IntervalJoinOperator {
             })?;
             let key_indices = vec![key_idx];
             let vnodes = laminar_core::shuffle::row_vnodes(batch, &key_indices, vnode_count);
+            let assignment = cfg.registry.snapshot();
             for &v in &vnodes {
-                let owner = cfg.registry.owner(v);
+                let owner = usize::try_from(v)
+                    .ok()
+                    .and_then(|vnode| assignment.get(vnode))
+                    .copied()
+                    .unwrap_or(laminar_core::state::NodeId::UNASSIGNED);
                 if owner.is_unassigned() {
                     return Err(DbError::Pipeline(format!(
                         "interval join [{}]: shuffle vnode {v} is unassigned — refusing to drop rows",

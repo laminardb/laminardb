@@ -56,6 +56,15 @@ impl DistributedTableProvider {
             controller,
         }
     }
+
+    /// Return the node-local provider without the distributed fan-out wrapper.
+    ///
+    /// This is intended for node-local diagnostics and placement validation. User queries should
+    /// scan this wrapper so an unreachable shard fails closed instead of returning a partial view.
+    #[must_use]
+    pub fn local_table_provider(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.inner)
+    }
 }
 
 impl Debug for DistributedTableProvider {

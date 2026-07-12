@@ -288,8 +288,6 @@ pub async fn start_cluster(
     let node_id = NodeId(node_id_num);
 
     let bind_addr = &config.server.bind;
-    let coordination = &cluster_cfg.coordination;
-    let raft_port = coordination.raft_port;
     let http_port = if let Some(colon) = bind_addr.rfind(':') {
         bind_addr[colon + 1..].parse::<u16>().unwrap_or(8080)
     } else {
@@ -342,7 +340,9 @@ pub async fn start_cluster(
         id: node_id,
         name: node_id_str.clone(),
         rpc_address: format!("{advertise_host}:{http_port}"),
-        raft_address: format!("{advertise_host}:{raft_port}"),
+        // `NodeInfo` retains this legacy wire field, but LaminarDB has no Raft
+        // transport and must not advertise a service that is not bound.
+        raft_address: String::new(),
         state: NodeState::Joining,
         metadata: NodeMetadata {
             cores: num_cpus(),
@@ -867,7 +867,7 @@ async fn resolve_vnode_assignment(
             w
         }
     };
-    let registry = VnodeRegistry::new(vnode_count);
+    let registry = VnodeRegistry::new_unassigned(vnode_count);
     registry.set_assignment_and_version(winner.to_vnode_vec(vnode_count).into(), winner.version);
     Ok((Arc::new(registry), Some(snapshot_store)))
 }

@@ -456,6 +456,8 @@ pub(crate) struct OperatorGraph {
     // Staged set of vnodes lost on rebalance; drained at the top of each cycle to drop their state.
     #[cfg(feature = "cluster")]
     pending_revoke_vnodes: Option<Arc<parking_lot::Mutex<FxHashSet<u32>>>>,
+    #[cfg(feature = "cluster")]
+    rotation_execution_fence: Option<Arc<tokio::sync::RwLock<()>>>,
     // Stored so DDL-added operators also receive the tier channel.
     #[cfg(feature = "state-tier")]
     state_tier: Option<crate::state_tier::TierTx>,
@@ -506,6 +508,8 @@ impl OperatorGraph {
             rehydrated_vnode_state: None,
             #[cfg(feature = "cluster")]
             pending_revoke_vnodes: None,
+            #[cfg(feature = "cluster")]
+            rotation_execution_fence: None,
             #[cfg(feature = "state-tier")]
             state_tier: None,
             #[cfg(feature = "state-tier")]
@@ -741,6 +745,11 @@ impl OperatorGraph {
         self.pending_revoke_vnodes = Some(staged);
     }
 
+    #[cfg(feature = "cluster")]
+    pub fn set_rotation_execution_fence(&mut self, fence: Arc<tokio::sync::RwLock<()>>) {
+        self.rotation_execution_fence = Some(fence);
+    }
+
     /// Drop in-memory state for vnodes lost since the last cycle, before `apply_rehydrated_vnodes`
     /// merges any re-acquired ones — so a lose-then-reacquire merges into empty state. Disjoint from
     /// the rehydrated set per rotation; the ordering is defensive against rapid cross-rotation churn.
@@ -765,7 +774,7 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
-    fn apply_rehydrated_vnodes(&mut self) {
+    fn apply_rehydrated_vnodes(&mut self) -> Result<(), DbError> {
         // Clone owned handles out so no borrow of `self` survives into the
         // `self.nodes.iter_mut()` dispatch below.
         let (registry, self_id, staged_arc) = match (
@@ -775,7 +784,7 @@ impl OperatorGraph {
             (Some(cfg), Some(staged)) => {
                 (Arc::clone(&cfg.registry), cfg.self_id, Arc::clone(staged))
             }
-            _ => return,
+            _ => return Ok(()),
         };
 
         // Ownership may have changed again since staging; evict chains for vnodes we no longer own
@@ -784,7 +793,7 @@ impl OperatorGraph {
         let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
             let mut guard = staged_arc.lock();
             if guard.is_empty() {
-                return;
+                return Ok(());
             }
             let owned: FxHashSet<u32> = laminar_core::state::owned_vnodes(&registry, self_id)
                 .into_iter()
@@ -793,24 +802,23 @@ impl OperatorGraph {
             guard.drain().collect()
         };
         if drained.is_empty() {
-            return;
+            return Ok(());
         }
 
         for (vnode, rehydrated) in drained {
             let chain: Vec<crate::vnode_partial::VnodePartial> = rehydrated
                 .chain
                 .iter()
-                .filter_map(|b| crate::vnode_partial::VnodePartial::decode(b).ok())
-                .collect();
-            // A dropped link would leave a gapped chain → silently stale state on apply.
-            // Skip the vnode loudly instead (matches the state-tier rehydration path).
-            if chain.len() != rehydrated.chain.len() {
-                tracing::error!(
-                    vnode,
-                    "[LDB-6031] rehydration chain link decode failed; skipping vnode"
-                );
-                continue;
-            }
+                .enumerate()
+                .map(|(link, bytes)| {
+                    crate::vnode_partial::VnodePartial::decode(bytes).map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6051] vnode {vnode} rehydration chain link {link} is corrupt: \
+                             {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
             // Every operator present anywhere in the chain (full or delta), resolved independently.
             let mut op_names: Vec<String> = Vec::new();
             for p in &chain {
@@ -825,48 +833,56 @@ impl OperatorGraph {
                     }
                 }
             }
-            let mut applied = 0usize;
+
+            // Resolve and validate every required slice before mutating any operator. A missing
+            // FULL base or topology drift must fault the cycle; consuming the staged chain and
+            // starting fresh would silently lose committed state.
+            let mut resolved = Vec::with_capacity(op_names.len());
             for op_name in &op_names {
-                let Some((base, deltas)) =
-                    crate::recovery_manager::resolve_op_chain(&chain, op_name)
-                else {
-                    // The chain names this operator yet resolves no FULL base — it starts fresh.
-                    tracing::warn!(
-                        operator = %op_name, vnode,
-                        "rehydration chain has no FULL base for operator; starting fresh"
-                    );
-                    continue;
-                };
-                if let Some(node) = self
+                let (base, deltas) = crate::recovery_manager::resolve_op_chain(&chain, op_name)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6051] vnode {vnode} rehydration chain has no FULL base for \
+                             operator '{op_name}'"
+                        ))
+                    })?;
+                let node_idx = self
                     .nodes
-                    .iter_mut()
-                    .find(|n| !n.removed && &*n.name == op_name.as_str())
-                {
-                    if let Err(e) = node.operator.apply_vnode_chain(vnode, base, &deltas) {
-                        tracing::warn!(
-                            operator = %op_name, vnode, error = %e,
-                            "failed to apply rehydrated vnode chain"
-                        );
-                    } else {
-                        applied += 1;
-                    }
-                } else {
-                    // The chain is already consumed; a missing operator loses it permanently.
-                    tracing::warn!(
-                        operator = %op_name, vnode,
-                        "no live operator for rehydrated slice (topology drift)"
-                    );
-                }
+                    .iter()
+                    .position(|node| !node.removed && &*node.name == op_name.as_str())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6051] vnode {vnode} rehydration requires missing operator \
+                             '{op_name}' (topology drift)"
+                        ))
+                    })?;
+                resolved.push((node_idx, op_name, base, deltas));
+            }
+
+            let operator_count = resolved.len();
+            for (node_idx, op_name, base, deltas) in resolved {
+                self.nodes[node_idx]
+                    .operator
+                    .apply_vnode_chain(vnode, base, &deltas)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6051] failed to apply vnode {vnode} rehydration chain for \
+                             operator '{op_name}': {error}"
+                        ))
+                    })?;
             }
             tracing::info!(
                 vnode,
                 epoch = rehydrated.epoch,
-                operators = applied,
+                operators = operator_count,
                 links = chain.len(),
                 "applied rehydrated vnode chain"
             );
+            // This is the only Restoring→Active transition: every named operator slice above
+            // resolved to a FULL base and applied successfully.
             registry.mark_active(&[vnode]);
         }
+        Ok(())
     }
 
     fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
@@ -2212,9 +2228,15 @@ impl OperatorGraph {
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         #[cfg(feature = "cluster")]
+        let _rotation_guard = match self.rotation_execution_fence.as_ref() {
+            Some(fence) => Some(Arc::clone(fence).read_owned().await),
+            None => None,
+        };
+
+        #[cfg(feature = "cluster")]
         {
             self.apply_revoked_vnodes();
-            self.apply_rehydrated_vnodes();
+            self.apply_rehydrated_vnodes()?;
         }
 
         if self.topo_dirty {
@@ -2304,29 +2326,40 @@ impl OperatorGraph {
             }
         }
 
+        self.complete_cycle(&failed_domains, first_error)?;
+
+        Ok(results)
+    }
+
+    fn complete_cycle(
+        &mut self,
+        failed_domains: &FxHashSet<usize>,
+        first_error: Option<DbError>,
+    ) -> Result<(), DbError> {
         self.finish_cycle();
 
         #[cfg(debug_assertions)]
         self.debug_assert_byte_sums();
 
         self.sample_buffer_stats();
-
-        if !failed_domains.is_empty() {
-            self.cycle_any_failed = true;
-            let failed_names: Vec<Arc<str>> = self
-                .source_list
-                .iter()
-                .filter(|(_, node_id)| self.source_feeds_failed_domain(*node_id, &failed_domains))
-                .map(|(name, _)| Arc::clone(name))
-                .collect();
-            self.cycle_failed_sources.extend(failed_names);
-            // All domains failed → whole-cycle `Err` (keeps the single-query contract).
-            if failed_domains.len() == self.domain_count {
-                return Err(first_error.expect("failed_domains non-empty implies an error"));
-            }
+        if failed_domains.is_empty() {
+            return Ok(());
         }
 
-        Ok(results)
+        self.cycle_any_failed = true;
+        let failed_names: Vec<Arc<str>> = self
+            .source_list
+            .iter()
+            .filter(|(_, node_id)| self.source_feeds_failed_domain(*node_id, failed_domains))
+            .map(|(name, _)| Arc::clone(name))
+            .collect();
+        self.cycle_failed_sources.extend(failed_names);
+        if failed_domains.len() == self.domain_count {
+            return Err(first_error.unwrap_or_else(|| {
+                DbError::Pipeline("all operator failure domains failed without an error".into())
+            }));
+        }
+        Ok(())
     }
 
     /// `(any domain faulted, local source names whose domain faulted)` from the last
@@ -2891,6 +2924,81 @@ mod tests {
             self.0.lock().push(batch);
             Ok(())
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    struct RehydrationApplyOperator {
+        applied: Arc<parking_lot::Mutex<Vec<u32>>>,
+        failure: Option<&'static str>,
+    }
+
+    #[cfg(feature = "cluster")]
+    #[async_trait]
+    impl GraphOperator for RehydrationApplyOperator {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn apply_vnode_chain(
+            &mut self,
+            vnode: u32,
+            _base: &[u8],
+            _deltas: &[(&[u8], &[u8])],
+        ) -> Result<(), DbError> {
+            if let Some(message) = self.failure {
+                return Err(DbError::Pipeline(message.into()));
+            }
+            self.applied.lock().push(vnode);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn encoded_vnode_partial(partial: &crate::vnode_partial::VnodePartial) -> bytes::Bytes {
+        bytes::Bytes::from(partial.encode().expect("encode test vnode partial"))
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn rehydration_test_graph(
+        chain: Vec<bytes::Bytes>,
+    ) -> (OperatorGraph, Arc<laminar_core::state::VnodeRegistry>) {
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{NodeId, VnodeRegistry};
+
+        let self_id = NodeId(1);
+        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+        registry.mark_restoring(&[0]);
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("bind test shuffle receiver"),
+        );
+
+        let mut graph = test_graph();
+        graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+            registry: Arc::clone(&registry),
+            sender: Arc::new(ShuffleSender::new(1)),
+            receiver,
+            self_id,
+        });
+        #[allow(clippy::disallowed_types)] // matches the public rehydration-handle shape
+        let staged = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+            (0, crate::db::RehydratedVnode { epoch: 7, chain }),
+        ])));
+        graph.set_rehydration_handle(staged);
+        (graph, registry)
     }
 
     /// A peer ships a row + its barrier; alignment folds the row into the target
@@ -3556,6 +3664,190 @@ mod tests {
         assert!(
             handle.lock().is_empty(),
             "the revoke handle is drained after apply_revoked_vnodes",
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn corrupt_rehydration_chain_faults_and_keeps_vnode_restoring() {
+        let (mut graph, registry) =
+            rehydration_test_graph(vec![bytes::Bytes::from_static(b"not-rkyv")]).await;
+
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .expect_err("corrupt vnode state must fault the cycle");
+        let message = error.to_string();
+        assert!(message.contains("[LDB-6051]"), "{message}");
+        assert!(message.contains("link 0"), "{message}");
+        assert!(message.contains("corrupt"), "{message}");
+        assert!(
+            registry.is_restoring(0),
+            "a corrupt chain must not activate the vnode"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn rehydration_delta_without_full_base_faults_before_apply() {
+        let partial = crate::vnode_partial::VnodePartial {
+            operators: Vec::new(),
+            base: Some(laminar_core::state::CheckpointAttempt::new(1, 1)),
+            deltas: vec![(
+                "agg".to_string(),
+                crate::vnode_partial::OpDelta {
+                    changed: vec![1],
+                    tombstones_ipc: Vec::new(),
+                },
+            )],
+        };
+        let (mut graph, registry) =
+            rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+        let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        graph.push_test_node(
+            "agg",
+            Box::new(RehydrationApplyOperator {
+                applied: Arc::clone(&applied),
+                failure: None,
+            }),
+        );
+
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .expect_err("a delta-only chain must fault the cycle");
+        let message = error.to_string();
+        assert!(message.contains("no FULL base"), "{message}");
+        assert!(message.contains("agg"), "{message}");
+        assert!(applied.lock().is_empty(), "invalid state was applied");
+        assert!(registry.is_restoring(0));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn missing_rehydration_operator_faults_before_any_apply() {
+        let partial = crate::vnode_partial::VnodePartial {
+            operators: vec![
+                ("present".to_string(), vec![1]),
+                ("ghost".to_string(), vec![2]),
+            ],
+            base: None,
+            deltas: Vec::new(),
+        };
+        let (mut graph, registry) =
+            rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+        let present_applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        graph.push_test_node(
+            "present",
+            Box::new(RehydrationApplyOperator {
+                applied: Arc::clone(&present_applied),
+                failure: None,
+            }),
+        );
+
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .expect_err("topology drift must fault the cycle");
+        let message = error.to_string();
+        assert!(message.contains("missing operator"), "{message}");
+        assert!(message.contains("ghost"), "{message}");
+        assert!(
+            present_applied.lock().is_empty(),
+            "validation must finish before any operator is mutated"
+        );
+        assert!(registry.is_restoring(0));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn rehydration_apply_failure_faults_without_activating_vnode() {
+        let partial = crate::vnode_partial::VnodePartial {
+            operators: vec![
+                ("good".to_string(), vec![1]),
+                ("broken".to_string(), vec![2]),
+            ],
+            base: None,
+            deltas: Vec::new(),
+        };
+        let (mut graph, registry) =
+            rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+        let good_applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let broken_applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        graph.push_test_node(
+            "good",
+            Box::new(RehydrationApplyOperator {
+                applied: Arc::clone(&good_applied),
+                failure: None,
+            }),
+        );
+        graph.push_test_node(
+            "broken",
+            Box::new(RehydrationApplyOperator {
+                applied: Arc::clone(&broken_applied),
+                failure: Some("injected vnode apply failure"),
+            }),
+        );
+
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .expect_err("operator apply failure must fault the cycle");
+        let message = error.to_string();
+        assert!(message.contains("failed to apply"), "{message}");
+        assert!(message.contains("broken"), "{message}");
+        assert!(
+            message.contains("injected vnode apply failure"),
+            "{message}"
+        );
+        assert_eq!(&*good_applied.lock(), &[0]);
+        assert!(broken_applied.lock().is_empty());
+        assert!(
+            registry.is_restoring(0),
+            "partial application must not activate the vnode"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn successful_rehydration_activates_vnode_after_all_operators_apply() {
+        let partial = crate::vnode_partial::VnodePartial {
+            operators: vec![
+                ("left".to_string(), vec![1]),
+                ("right".to_string(), vec![2]),
+            ],
+            base: None,
+            deltas: Vec::new(),
+        };
+        let (mut graph, registry) =
+            rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+        let left_applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let right_applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        graph.push_test_node(
+            "left",
+            Box::new(RehydrationApplyOperator {
+                applied: Arc::clone(&left_applied),
+                failure: None,
+            }),
+        );
+        graph.push_test_node(
+            "right",
+            Box::new(RehydrationApplyOperator {
+                applied: Arc::clone(&right_applied),
+                failure: None,
+            }),
+        );
+
+        graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .expect("complete vnode state should apply");
+
+        assert_eq!(&*left_applied.lock(), &[0]);
+        assert_eq!(&*right_applied.lock(), &[0]);
+        assert!(
+            !registry.is_restoring(0),
+            "the vnode activates only after every operator applies"
         );
     }
 

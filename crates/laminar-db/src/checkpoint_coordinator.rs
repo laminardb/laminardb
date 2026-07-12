@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use futures::{StreamExt, TryStreamExt};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::CoordinatedCommitNamespace;
+#[cfg(feature = "cluster")]
+use laminar_core::state::CheckpointSealInventory;
 use laminar_core::state::{CheckpointAttempt, StateBackend};
 use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, PipelineIdentity,
@@ -19,6 +21,8 @@ use laminar_core::storage::checkpoint_store::{CheckpointStore, CheckpointStoreEr
 use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
+
+const KAFKA_ASSIGNMENT_VERSION_METADATA: &str = "kafka.assignment.version.v1";
 
 /// Which operator's blob codec a cold-group partial uses, dispatching the tier merge.
 #[cfg(feature = "state-tier")]
@@ -97,6 +101,27 @@ enum VnodeUploadUpdate {
     Retain,
     Replace(HashMap<String, UploadedSlice>),
     Remove,
+}
+
+struct PendingDecisionWrite {
+    epoch: u64,
+    checkpoint_id: u64,
+    handle: tokio::task::JoinHandle<Result<bool, laminar_core::checkpoint_decision::DecisionError>>,
+}
+
+enum PendingDecisionWait {
+    Completed {
+        epoch: u64,
+        checkpoint_id: u64,
+        outcome: Result<
+            Result<bool, laminar_core::checkpoint_decision::DecisionError>,
+            tokio::task::JoinError,
+        >,
+    },
+    TimedOut {
+        epoch: u64,
+        checkpoint_id: u64,
+    },
 }
 
 struct PreparedVnodePartial {
@@ -401,6 +426,92 @@ struct ParticipantReady {
     source_offsets: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
+/// Immutable handles needed to read one cluster recovery cut without holding the checkpoint
+/// coordinator mutex across decision-store or object-store I/O.
+#[cfg(feature = "cluster")]
+#[derive(Clone)]
+pub(crate) struct ClusterHandoffReader {
+    backend: Arc<dyn StateBackend>,
+    decision_store: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    pipeline_identity: PipelineIdentity,
+    deployment_id: Option<String>,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterHandoffReader {
+    pub(crate) async fn highest_commit_decision(
+        &self,
+    ) -> Result<Option<laminar_core::checkpoint_decision::CommitDecision>, DbError> {
+        self.decision_store
+            .highest_committed()
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "checkpoint decision inventory read failed: {error}"
+                ))
+            })
+    }
+
+    pub(crate) async fn acquired_source_handoff(
+        &self,
+    ) -> Result<
+        Option<(
+            laminar_core::checkpoint_decision::CommitDecision,
+            HashMap<String, HashMap<String, String>>,
+        )>,
+        DbError,
+    > {
+        let Some(decision) = self.highest_commit_decision().await? else {
+            return Ok(None);
+        };
+        let attempt = CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
+        let inventory = self
+            .backend
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "source-offset handoff seal read failed for checkpoint {} epoch {}: {error}",
+                    attempt.checkpoint_id, attempt.epoch
+                ))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] decided checkpoint {} epoch {} has no exact state seal",
+                    attempt.checkpoint_id, attempt.epoch
+                ))
+            })?;
+        CheckpointCoordinator::validate_cluster_decision_inventory(&decision, &inventory)?;
+        let deployment_id = self.deployment_id.as_deref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "coordinated commit requires a durable deployment identity before startup".into(),
+            )
+        })?;
+        let offsets = CheckpointCoordinator::source_offsets_from_inventory(
+            &self.backend,
+            deployment_id,
+            &self.pipeline_identity,
+            attempt,
+            inventory,
+        )
+        .await?;
+        info!(
+            epoch = attempt.epoch,
+            checkpoint_id = attempt.checkpoint_id,
+            sources = offsets.len(),
+            "decision-bound source-offset handoff staged for acquire"
+        );
+        Ok(Some((decision, offsets)))
+    }
+
+    pub(crate) fn same_namespace(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backend, &other.backend)
+            && Arc::ptr_eq(&self.decision_store, &other.decision_store)
+            && self.pipeline_identity == other.pipeline_identity
+            && self.deployment_id == other.deployment_id
+    }
+}
+
 #[cfg(feature = "cluster")]
 pub(crate) fn participant_ready_key(participant_id: u64) -> String {
     format!("{PARTICIPANT_READY_PREFIX}{participant_id}")
@@ -530,6 +641,71 @@ struct RetentionRequest {
     trigger_epoch: u64,
     state_backend: Option<Arc<dyn StateBackend>>,
     decision_store: Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
+    advance_decision_floor: bool,
+}
+
+async fn authorize_retention_horizon(
+    requested: u64,
+    trigger_epoch: u64,
+    decision_store: Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
+    advance_decision_floor: bool,
+    operation_timeout: Duration,
+) -> Option<u64> {
+    let Some(decision_store) = decision_store else {
+        if !advance_decision_floor {
+            warn!(
+                trigger_epoch,
+                horizon = requested,
+                "[LDB-6026] follower retention cannot verify the shared decision GC floor; skipping artifact prune"
+            );
+            return None;
+        }
+        return Some(requested);
+    };
+    let floor = if advance_decision_floor {
+        tokio::time::timeout(operation_timeout, decision_store.prune_before(requested)).await
+    } else {
+        tokio::time::timeout(operation_timeout, decision_store.gc_floor_horizon()).await
+    };
+    match floor {
+        Ok(Ok(effective)) if effective >= requested => Some(requested),
+        Ok(Ok(effective)) if !advance_decision_floor && effective > 0 => {
+            warn!(
+                trigger_epoch,
+                horizon = requested,
+                effective,
+                "[LDB-6026] follower decision GC floor trails the requested horizon; pruning only the proven-safe prefix"
+            );
+            Some(effective)
+        }
+        Ok(Ok(effective)) => {
+            warn!(
+                trigger_epoch,
+                horizon = requested,
+                effective,
+                "[LDB-6026] decision GC floor did not reach the requested horizon; skipping artifact prune"
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            warn!(
+                trigger_epoch,
+                horizon = requested,
+                %error,
+                "[LDB-6026] decision prune failed; skipping artifact prune"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                trigger_epoch,
+                horizon = requested,
+                ?operation_timeout,
+                "[LDB-6026] decision prune timed out; skipping artifact prune"
+            );
+            None
+        }
+    }
 }
 
 async fn run_retention_maintenance(
@@ -549,61 +725,66 @@ async fn run_retention_maintenance(
             trigger_epoch,
             state_backend,
             decision_store,
+            advance_decision_floor,
         } = request;
 
-        match tokio::time::timeout(operation_timeout, store.prune_before(horizon)).await {
+        // Publish/verify the authoritative tombstone before deleting any manifest/state artifact.
+        // If the floor cannot reach a safe prefix, an old decision could remain or reappear after
+        // its exact recovery data is gone, so the destructive phases are skipped.
+        let Some(artifact_horizon) = authorize_retention_horizon(
+            horizon,
+            trigger_epoch,
+            decision_store,
+            advance_decision_floor,
+            operation_timeout,
+        )
+        .await
+        else {
+            continue;
+        };
+
+        match tokio::time::timeout(operation_timeout, store.prune_before(artifact_horizon)).await {
             Ok(Ok(removed)) => {
                 debug!(
                     trigger_epoch,
-                    horizon, removed, "checkpoint manifests pruned"
+                    horizon = artifact_horizon,
+                    removed,
+                    "checkpoint manifests pruned"
                 );
             }
             Ok(Err(error)) => warn!(
                 trigger_epoch,
-                horizon,
+                horizon = artifact_horizon,
                 %error,
                 "[LDB-6026] checkpoint manifest prune failed"
             ),
             Err(_) => warn!(
                 trigger_epoch,
-                horizon,
+                horizon = artifact_horizon,
                 ?operation_timeout,
                 "[LDB-6026] checkpoint manifest prune timed out"
             ),
         }
 
         if let Some(state_backend) = state_backend {
-            match tokio::time::timeout(operation_timeout, state_backend.prune_before(horizon)).await
+            match tokio::time::timeout(
+                operation_timeout,
+                state_backend.prune_before(artifact_horizon),
+            )
+            .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => warn!(
                     trigger_epoch,
-                    horizon,
+                    horizon = artifact_horizon,
                     %error,
                     "[LDB-6026] state backend prune failed"
                 ),
                 Err(_) => warn!(
                     trigger_epoch,
-                    horizon,
+                    horizon = artifact_horizon,
                     ?operation_timeout,
                     "[LDB-6026] state backend prune timed out"
-                ),
-            }
-        }
-
-        if let Some(decision_store) = decision_store {
-            match tokio::time::timeout(operation_timeout, decision_store.prune_before(horizon))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!(trigger_epoch, horizon, %error, "[LDB-6026] decision prune failed");
-                }
-                Err(_) => warn!(
-                    trigger_epoch,
-                    horizon,
-                    ?operation_timeout,
-                    "[LDB-6026] decision prune timed out"
                 ),
             }
         }
@@ -621,6 +802,11 @@ pub struct CheckpointCoordinator {
     // Set before a decision write is issued. After this point a timeout/error is ambiguous and
     // cleanup must leave prepared artifacts intact for recovery instead of rolling sinks back.
     decision_write_started: bool,
+    // Owns an issued decision create until it reaches a terminal client-side state. A timeout
+    // faults the pipeline but must not detach the write: coordinated recovery may acknowledge a
+    // node as stopped only after this handle settles, otherwise it could choose a cut and then
+    // observe this process publish a newer decision behind that cut.
+    pending_decision_write: Option<PendingDecisionWrite>,
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
@@ -787,6 +973,7 @@ impl CheckpointCoordinator {
             allocator: Arc::new(EpochAllocator::new(epoch, allocation_timeout)),
             phase: CheckpointPhase::Idle,
             decision_write_started: false,
+            pending_decision_write: None,
             checkpoints_completed: 0,
             checkpoints_failed: 0,
             last_checkpoint_duration: None,
@@ -827,6 +1014,92 @@ impl CheckpointCoordinator {
         })
     }
 
+    async fn wait_pending_decision_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Option<PendingDecisionWait> {
+        let (epoch, checkpoint_id, outcome) = {
+            let pending = self.pending_decision_write.as_mut()?;
+            let epoch = pending.epoch;
+            let checkpoint_id = pending.checkpoint_id;
+            let outcome = tokio::time::timeout_at(deadline, &mut pending.handle).await;
+            (epoch, checkpoint_id, outcome)
+        };
+        match outcome {
+            Ok(outcome) => {
+                // The task is terminal, so removing its completed handle cannot detach I/O.
+                self.pending_decision_write.take();
+                Some(PendingDecisionWait::Completed {
+                    epoch,
+                    checkpoint_id,
+                    outcome,
+                })
+            }
+            Err(_) => Some(PendingDecisionWait::TimedOut {
+                epoch,
+                checkpoint_id,
+            }),
+        }
+    }
+
+    /// Wait for an ambiguous decision create to stop writing before releasing lifecycle fences.
+    ///
+    /// A terminal I/O or task error is still an ambiguous durable outcome, but it is quiescent:
+    /// startup/coordinated recovery resolves the write-ahead intent before choosing a recovery
+    /// frontier. A timeout retains the owned task and requires the caller to retry teardown.
+    pub(crate) async fn quiesce_pending_decision_write_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        match self.wait_pending_decision_until(deadline).await {
+            None => Ok(()),
+            Some(PendingDecisionWait::Completed {
+                epoch,
+                checkpoint_id,
+                outcome: Ok(Ok(_)),
+            }) => {
+                self.highest_decided = self.highest_decided.max(epoch);
+                debug!(
+                    epoch,
+                    checkpoint_id, "ambiguous decision write settled successfully during teardown"
+                );
+                Ok(())
+            }
+            Some(PendingDecisionWait::Completed {
+                epoch,
+                checkpoint_id,
+                outcome: Ok(Err(error)),
+            }) => {
+                warn!(
+                    epoch,
+                    checkpoint_id,
+                    %error,
+                    "[LDB-6038] decision write reached a terminal I/O error during teardown; recovery will resolve its durable intent"
+                );
+                Ok(())
+            }
+            Some(PendingDecisionWait::Completed {
+                epoch,
+                checkpoint_id,
+                outcome: Err(error),
+            }) => {
+                warn!(
+                    epoch,
+                    checkpoint_id,
+                    %error,
+                    "[LDB-6038] decision task terminated during teardown; recovery will audit its durable intent"
+                );
+                Ok(())
+            }
+            Some(PendingDecisionWait::TimedOut {
+                epoch,
+                checkpoint_id,
+            }) => Err(DbError::Checkpoint(format!(
+                "[LDB-6038] checkpoint {checkpoint_id} epoch {epoch} still has an in-flight durable decision write; teardown remains fenced and must be retried"
+            ))),
+        }
+    }
+
     fn schedule_retention_prune(
         &mut self,
         backend: Option<Arc<dyn StateBackend>>,
@@ -847,6 +1120,7 @@ impl CheckpointCoordinator {
             trigger_epoch: epoch,
             state_backend: backend,
             decision_store,
+            advance_decision_floor: true,
         };
         if self.retention_requests.send(Some(request)).is_err() {
             warn!(
@@ -877,7 +1151,8 @@ impl CheckpointCoordinator {
             horizon: self.local_manifest_retention_requested_horizon,
             trigger_epoch: epoch,
             state_backend: None,
-            decision_store: None,
+            decision_store: self.decision_store.clone(),
+            advance_decision_floor: false,
         };
         if self.retention_requests.send(Some(request)).is_err() {
             warn!(
@@ -910,6 +1185,37 @@ impl CheckpointCoordinator {
         self.allocator.bind_decision_store(Arc::clone(&store))?;
         self.decision_store = Some(store);
         Ok(())
+    }
+
+    /// Wire the durable commit-marker store and bind its create-once deployment identity.
+    ///
+    /// Direct coordinator users must call this before recovery or checkpointing. Loading the
+    /// identity from the store keeps the deployment fence tied to durable provenance rather than
+    /// accepting a caller-supplied value.
+    pub async fn bind_durable_decision_store(
+        &mut self,
+        store: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) -> Result<(), DbError> {
+        let deployment_id = store
+            .load_or_create_deployment_id()
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "load/create durable deployment identity before checkpoint startup: {error}"
+                ))
+            })?;
+        if self
+            .deployment_id
+            .as_ref()
+            .is_some_and(|existing| existing != &deployment_id)
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6043] deployment identity cannot change while checkpoint state is active"
+                    .into(),
+            ));
+        }
+        self.set_decision_store(store)?;
+        self.bind_deployment_id(deployment_id)
     }
 
     /// Bind the canonical pipeline identity before recovery or checkpointing.
@@ -1447,50 +1753,51 @@ impl CheckpointCoordinator {
         })
     }
 
-    /// The source-instance-namespaced offset map for the latest sealed checkpoint, unioned from
-    /// every participant's readiness attestation (opaque connector key/values). An acquiring
-    /// source resumes its newly-owned partitions from
-    /// the previous owner's sealed position. Empty backend / no sealed attempt yields an empty map;
-    /// a read FAILURE is propagated so the caller defers the rotation rather than re-emitting.
-    ///
-    /// The cut is `latest_sealed_checkpoint` (the exact state attempt), NOT `CheckpointDecisionStore::
-    /// highest_committed` (the 2PC decision) — deliberately. `RecoveryManager::rehydrate` picks the
-    /// adopt path's state cut from the same seal, and the two must agree: resuming offsets at the
-    /// decision cut while rehydrating state at the seal double-counts `[decision, seal)`. Moving
-    /// both together is `0fb07a90`, reverted in `6ab5e04e`; re-landing it is soak-gated on the
-    /// cluster kill-9 matrix. A coordinated rewind truncates the timeline to the decision cut
-    /// (`coordinated_recovery.rs`), so the seal cannot outlive a decision across a recovery.
-    #[cfg(feature = "cluster")]
+    /// The source-instance-namespaced offset map for the highest durable decision, unioned from
+    /// that exact attempt's participant readiness attestations. A seal is only a prepared state
+    /// cut; it is published before the irrevocable decision and therefore cannot independently
+    /// advance input recovery. Binding both source handoff and vnode rehydration to the decision
+    /// replays an abandoned `[decision, prepared-seal)` interval instead of skipping it.
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) async fn acquired_source_handoff(
         &self,
-    ) -> Result<Option<(CheckpointAttempt, HashMap<String, HashMap<String, String>>)>, DbError>
-    {
+    ) -> Result<
+        Option<(
+            laminar_core::checkpoint_decision::CommitDecision,
+            HashMap<String, HashMap<String, String>>,
+        )>,
+        DbError,
+    > {
+        let Some(reader) = self.cluster_handoff_reader()? else {
+            return Ok(None);
+        };
+        reader.acquired_source_handoff().await
+    }
+
+    /// Snapshot immutable recovery handles while the coordinator is at an epoch boundary. Remote
+    /// reads through the returned value do not hold the coordinator mutex or delay checkpoint
+    /// admission; assignment publication revalidates the namespace and durable decision.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cluster_handoff_reader(&self) -> Result<Option<ClusterHandoffReader>, DbError> {
         if self.cluster_controller.is_none() {
             return Ok(None);
         }
-        let Some(ref backend) = self.state_backend else {
-            return Ok(None);
-        };
-        let attempt = match backend.latest_sealed_checkpoint().await {
-            Ok(Some(attempt)) => attempt,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                return Err(DbError::Checkpoint(format!(
-                    "source-offset handoff: latest_sealed_checkpoint failed: {e}"
-                )));
-            }
-        };
-        let offsets = self.source_offsets_at(attempt).await?;
-        // Return the exact attempt with its offsets so assignment adoption can
-        // pin vnode state to this same cut even if a newer checkpoint seals
-        // while object-store rehydration is in progress.
-        info!(
-            epoch = attempt.epoch,
-            checkpoint_id = attempt.checkpoint_id,
-            sources = offsets.len(),
-            "source-offset handoff staged for acquire"
-        );
-        Ok(Some((attempt, offsets)))
+        let backend = self.state_backend.clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] cluster source-offset handoff requires a state backend".into(),
+            )
+        })?;
+        let decision_store = self.decision_store.clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] cluster recovery requires the durable decision store".into(),
+            )
+        })?;
+        Ok(Some(ClusterHandoffReader {
+            backend,
+            decision_store,
+            pipeline_identity: self.expected_pipeline_identity(),
+            deployment_id: self.deployment_id.clone(),
+        }))
     }
 
     #[cfg(feature = "cluster")]
@@ -1551,6 +1858,30 @@ impl CheckpointCoordinator {
                     attempt.checkpoint_id, attempt.epoch
                 ))
             })?;
+        Self::source_offsets_from_inventory(
+            backend,
+            self.expected_deployment_id()?,
+            &self.expected_pipeline_identity(),
+            attempt,
+            inventory,
+        )
+        .await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn source_offsets_from_inventory(
+        backend: &Arc<dyn StateBackend>,
+        expected_deployment: &str,
+        expected_identity: &PipelineIdentity,
+        attempt: CheckpointAttempt,
+        inventory: CheckpointSealInventory,
+    ) -> Result<HashMap<String, HashMap<String, String>>, DbError> {
+        if inventory.attempt != attempt {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] requested handoff attempt {attempt:?} does not match sealed inventory attempt {:?}",
+                inventory.attempt
+            )));
+        }
         let ready_keys: Vec<String> = inventory
             .required_descriptors
             .iter()
@@ -1564,8 +1895,6 @@ impl CheckpointCoordinator {
             )));
         }
 
-        let expected_deployment = self.expected_deployment_id()?;
-        let expected_identity = self.expected_pipeline_identity();
         let readiness = futures::stream::iter(ready_keys.into_iter().map(|key| async move {
             let key_participant = participant_from_ready_key(&key).ok_or_else(|| {
                 DbError::Checkpoint(format!("invalid participant readiness key '{key}'"))
@@ -1589,7 +1918,7 @@ impl CheckpointCoordinator {
                 || ready.participant_id != key_participant
                 || ready.assignment_version != inventory.assignment_version
                 || ready.deployment_id != expected_deployment
-                || ready.pipeline_identity != expected_identity
+                || ready.pipeline_identity != *expected_identity
                 || canonical_vnodes != ready.owned_vnodes
                 || !participants.insert(ready.participant_id)
             {
@@ -1735,7 +2064,23 @@ impl CheckpointCoordinator {
         quorum: QuorumStage,
         started: Instant,
     ) -> Result<CheckpointResult, DbError> {
+        if let Some(pending) = self.pending_decision_write.as_ref() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6038] cannot admit checkpoint {} epoch {} while checkpoint {} epoch {} still owns an ambiguous decision write",
+                attempt.checkpoint_id, attempt.epoch, pending.checkpoint_id, pending.epoch
+            )));
+        }
         self.decision_write_started = false;
+        if let Err(error) = self.validate_source_assignment_cuts(&request) {
+            return Ok(self
+                .fail_epoch(
+                    attempt.checkpoint_id,
+                    attempt.epoch,
+                    started,
+                    error.to_string(),
+                )
+                .await);
+        }
         let deadline = tokio::time::Instant::from_std(started) + self.config.checkpoint_timeout;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1788,6 +2133,37 @@ impl CheckpointCoordinator {
                 .await);
         };
         result
+    }
+
+    fn validate_source_assignment_cuts(&self, request: &CheckpointRequest) -> Result<(), DbError> {
+        if self.assignment_version == 0 {
+            return Ok(());
+        }
+        for (source, checkpoint) in &request.source_offset_overrides {
+            if checkpoint.metadata.get("connector").map(String::as_str) != Some("kafka") {
+                continue;
+            }
+            let encoded = checkpoint
+                .metadata
+                .get(KAFKA_ASSIGNMENT_VERSION_METADATA)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6055] Kafka source '{source}' checkpoint is missing its assignment-version fence"
+                    ))
+                })?;
+            let captured = encoded.parse::<u64>().map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6055] Kafka source '{source}' has invalid assignment-version fence '{encoded}'"
+                ))
+            })?;
+            if captured.to_string() != *encoded || captured != self.assignment_version {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6055] Kafka source '{source}' captured assignment version {encoded}, coordinator requires {}",
+                    self.assignment_version
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn pre_commit_sinks_until(
@@ -1858,35 +2234,47 @@ impl CheckpointCoordinator {
     ///
     /// Sidecar is written before the manifest: a failed sidecar write never leaves a
     /// manifest referencing missing state.
-    async fn save_manifest(
+    async fn save_manifest_until(
         &self,
         manifest: Arc<CheckpointManifest>,
         state_data: Option<Vec<bytes::Bytes>>,
+        deadline: tokio::time::Instant,
     ) -> Result<CheckpointManifest, DbError> {
-        let timeout_dur = self.config.checkpoint_timeout;
         let fut = self.store.save_with_state(&manifest, state_data.as_deref());
-        match tokio::time::timeout(timeout_dur, fut).await {
+        match tokio::time::timeout_at(deadline, fut).await {
             Ok(Ok(persisted)) => Ok(persisted),
             Ok(Err(e)) => Err(DbError::from(e)),
             Err(_elapsed) => Err(DbError::Checkpoint(format!(
-                "[LDB-6011] manifest persist timed out after {}s — \
-                 filesystem may be degraded",
-                timeout_dur.as_secs()
+                "[LDB-6011] manifest persist exhausted the checkpoint's {:?} end-to-end \
+                 deadline — filesystem may be degraded",
+                self.config.checkpoint_timeout
             ))),
         }
     }
 
-    async fn finalize_manifest(&self, checkpoint_id: u64) -> Result<CheckpointManifest, DbError> {
-        let timeout = self.config.checkpoint_timeout;
-        tokio::time::timeout(timeout, self.store.finalize(checkpoint_id))
+    async fn finalize_manifest_until(
+        &self,
+        checkpoint_id: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckpointManifest, DbError> {
+        tokio::time::timeout_at(deadline, self.store.finalize(checkpoint_id))
             .await
             .map_err(|_| {
                 DbError::Checkpoint(format!(
-                    "manifest finalization for checkpoint {checkpoint_id} timed out after \
-                     {timeout:?}"
+                    "manifest finalization for checkpoint {checkpoint_id} exhausted the \
+                     checkpoint's {:?} end-to-end deadline",
+                    self.config.checkpoint_timeout
                 ))
             })?
             .map_err(DbError::from)
+    }
+
+    async fn finalize_manifest(&self, checkpoint_id: u64) -> Result<CheckpointManifest, DbError> {
+        self.finalize_manifest_until(
+            checkpoint_id,
+            tokio::time::Instant::now() + self.config.checkpoint_timeout,
+        )
+        .await
     }
 
     /// This coordinator's node id for namespacing commit descriptors (0 without the cluster feature).
@@ -2301,7 +2689,9 @@ impl CheckpointCoordinator {
                     .await?,
                 UploadedSlice::Cold,
             )),
-            StagedSlice::Delta { .. } => unreachable!("delta routed before full-slice resolution"),
+            StagedSlice::Delta { .. } => Err(DbError::Checkpoint(format!(
+                "delta slice for operator '{operator}' vnode {vnode} reached full-slice resolution"
+            ))),
         }
     }
 
@@ -2571,19 +2961,22 @@ impl CheckpointCoordinator {
                     .into(),
             )
         })?;
-        let decision = tokio::time::timeout(
+        let decisions = tokio::time::timeout(
             self.config.checkpoint_timeout,
-            decision_store.decision(epoch),
+            decision_store.recovery_decisions(),
         )
         .await
         .map_err(|_| {
             DbError::Checkpoint(format!(
-                "[LDB-6040] decision read for prepared epoch {epoch} timed out after {:?}",
+                "[LDB-6040] decision inventory audit for prepared epoch {epoch} timed out after {:?}",
                 self.config.checkpoint_timeout
             ))
         })?
         .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
 
+        let decision = decisions
+            .into_iter()
+            .find(|decision| decision.epoch == epoch);
         match decision {
             Some(decision) if decision.checkpoint_id == checkpoint_id => {
                 #[cfg(feature = "cluster")]
@@ -2615,6 +3008,26 @@ impl CheckpointCoordinator {
     /// by the coordinated committer from sealed participant descriptors; the checkpoint
     /// coordinator only finalizes a decided manifest or force-rolls back an undecided prepare.
     pub async fn reconcile_prepared_on_init(&self) -> Result<(), DbError> {
+        if let Some(decision_store) = self.decision_store.as_ref() {
+            let resolved = tokio::time::timeout(
+                self.config.checkpoint_timeout,
+                decision_store.resolve_in_doubt(),
+            )
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6040] in-doubt decision resolution timed out after {:?}",
+                    self.config.checkpoint_timeout
+                ))
+            })?
+            .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
+            if resolved > 0 {
+                info!(
+                    resolved,
+                    "completed write-ahead checkpoint decisions on startup"
+                );
+            }
+        }
         let Some(last) = load_highest(self.store.as_ref())
             .await
             .map_err(DbError::from)?
@@ -3516,6 +3929,12 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        // Source cuts are captured before the deferred follower tail acquires the
+        // coordinator mutex. An assignment adoption may win that interval, so
+        // revalidate against the coordinator's now-current generation before any
+        // sink pre-commit, manifest persistence, or participant-readiness write.
+        self.validate_source_assignment_cuts(&request)?;
+
         let CheckpointRequest {
             operator_states,
             watermark,
@@ -3559,7 +3978,10 @@ impl CheckpointCoordinator {
             Self::pack_operator_states(&mut manifest, &operator_states, STATE_INLINE_THRESHOLD);
 
         self.phase = CheckpointPhase::Persisting;
-        let manifest = match self.save_manifest(Arc::new(manifest), state_data).await {
+        let manifest = match self
+            .save_manifest_until(Arc::new(manifest), state_data, deadline)
+            .await
+        {
             Ok(manifest) => manifest,
             Err(error) => {
                 self.pending_vnode_states.clear();
@@ -3748,7 +4170,10 @@ impl CheckpointCoordinator {
         }
 
         self.phase = CheckpointPhase::Persisting;
-        let persisted_manifest = match self.save_manifest(Arc::new(manifest), state_data).await {
+        let persisted_manifest = match self
+            .save_manifest_until(Arc::new(manifest), state_data, attempt_deadline)
+            .await
+        {
             Ok(persisted) => Arc::new(persisted),
             Err(e) => {
                 error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
@@ -3850,27 +4275,43 @@ impl CheckpointCoordinator {
             self.phase = CheckpointPhase::Deciding;
             // Set this before issuing I/O. A timeout/error cannot prove the create was absent.
             self.decision_write_started = true;
-            let timeout = self.config.checkpoint_timeout;
+            let decision_store = Arc::clone(ds);
             #[cfg(feature = "cluster")]
             let decision_participants = self.checkpoint_participant_ids(&quorum_participants);
-            let decision_write = async {
+            #[cfg(feature = "cluster")]
+            let cluster_decision = self.cluster_controller.is_some();
+            #[cfg(feature = "cluster")]
+            let manifest_participant_id = self.self_node_id();
+            #[cfg(feature = "cluster")]
+            let assignment_version = self.assignment_version;
+            let decision_write = tokio::spawn(async move {
                 #[cfg(feature = "cluster")]
-                if self.cluster_controller.is_some() {
-                    return ds
+                if cluster_decision {
+                    return decision_store
                         .record_committed_for_participants(
                             epoch,
                             checkpoint_id,
                             &decision_participants,
-                            self.self_node_id(),
-                            self.assignment_version,
+                            manifest_participant_id,
+                            assignment_version,
                         )
                         .await;
                 }
-                ds.record_committed(epoch, checkpoint_id).await
-            };
-            match tokio::time::timeout(timeout, decision_write).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
+                decision_store.record_committed(epoch, checkpoint_id).await
+            });
+            self.pending_decision_write = Some(PendingDecisionWrite {
+                epoch,
+                checkpoint_id,
+                handle: decision_write,
+            });
+            match self.wait_pending_decision_until(attempt_deadline).await {
+                Some(PendingDecisionWait::Completed {
+                    outcome: Ok(Ok(_)), ..
+                }) => {}
+                Some(PendingDecisionWait::Completed {
+                    outcome: Ok(Err(error)),
+                    ..
+                }) => {
                     error!(checkpoint_id, epoch, %error, "[LDB-6038] commit decision write failed ambiguously");
                     return Ok(self.fail_after_irrevocable_work(
                         checkpoint_id,
@@ -3879,14 +4320,37 @@ impl CheckpointCoordinator {
                         format!("commit decision write failed ambiguously: {error}"),
                     ));
                 }
-                Err(_) => {
-                    let error = format!("commit decision write timed out after {timeout:?}");
+                Some(PendingDecisionWait::Completed {
+                    outcome: Err(error),
+                    ..
+                }) => {
+                    error!(checkpoint_id, epoch, %error, "[LDB-6038] commit decision task failed ambiguously");
+                    return Ok(self.fail_after_irrevocable_work(
+                        checkpoint_id,
+                        epoch,
+                        start,
+                        format!("commit decision task failed ambiguously: {error}"),
+                    ));
+                }
+                Some(PendingDecisionWait::TimedOut { .. }) => {
+                    let error = format!(
+                        "commit decision write did not settle within the checkpoint's {:?} end-to-end deadline",
+                        self.config.checkpoint_timeout
+                    );
                     error!(checkpoint_id, epoch, %error, "[LDB-6038] commit decision write timed out ambiguously");
                     return Ok(self.fail_after_irrevocable_work(
                         checkpoint_id,
                         epoch,
                         start,
                         error,
+                    ));
+                }
+                None => {
+                    return Ok(self.fail_after_irrevocable_work(
+                        checkpoint_id,
+                        epoch,
+                        start,
+                        "[LDB-6038] decision task ownership disappeared before completion".into(),
                     ));
                 }
             }
@@ -3903,7 +4367,10 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        if let Err(e) = self.finalize_manifest(checkpoint_id).await {
+        if let Err(e) = self
+            .finalize_manifest_until(checkpoint_id, attempt_deadline)
+            .await
+        {
             // The exact decision is irrevocable and the Prepared manifest already contains the
             // source/state cut. Recovery finalizes this exact pair; live rollback is forbidden.
             error!(
@@ -4091,42 +4558,23 @@ impl CheckpointCoordinator {
     }
 
     #[cfg(feature = "cluster")]
-    async fn validate_recovered_cluster_cut(
-        &self,
-        recovered: &mut crate::recovery_manager::RecoveredState,
+    fn validate_cluster_decision_inventory(
+        decision: &laminar_core::checkpoint_decision::CommitDecision,
+        inventory: &CheckpointSealInventory,
     ) -> Result<(), DbError> {
-        if self.active_decision_scope()
-            != laminar_core::checkpoint_decision::CommitDecisionScope::Cluster
-        {
-            return Ok(());
+        let expected_attempt = CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
+        if inventory.attempt != expected_attempt {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] decided attempt {expected_attempt:?} does not match sealed inventory attempt {:?}",
+                inventory.attempt
+            )));
         }
-        let Some(decision) = recovered.decision() else {
-            return Ok(());
-        };
         if decision.scope != laminar_core::checkpoint_decision::CommitDecisionScope::Cluster {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6041] cluster recovery observed a {:?} durable decision",
                 decision.scope
             )));
         }
-        let backend = self.state_backend.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(
-                "[LDB-6050] cluster decision recovery requires the sealed state backend".into(),
-            )
-        })?;
-        let attempt = CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
-        let inventory = backend
-            .checkpoint_seal_inventory(attempt)
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!("checkpoint seal inventory read failed: {error}"))
-            })?
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6041] decided epoch {} checkpoint {} has no exact state seal",
-                    decision.epoch, decision.checkpoint_id
-                ))
-            })?;
         if inventory.assignment_version != decision.assignment_version {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6041] decided epoch {} checkpoint {} assignment version {} does not match \
@@ -4149,9 +4597,51 @@ impl CheckpointCoordinator {
                 "[LDB-6041] decided participants {decided_participants:?} do not match sealed readiness participants {sealed_participants:?}"
             )));
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn validate_recovered_cluster_cut(
+        &self,
+        recovered: &mut crate::recovery_manager::RecoveredState,
+    ) -> Result<(), DbError> {
+        if self.active_decision_scope()
+            != laminar_core::checkpoint_decision::CommitDecisionScope::Cluster
+        {
+            return Ok(());
+        }
+        let Some(decision) = recovered.decision() else {
+            return Ok(());
+        };
+        let backend = self.state_backend.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] cluster decision recovery requires the sealed state backend".into(),
+            )
+        })?;
+        let attempt = CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
+        let inventory = backend
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!("checkpoint seal inventory read failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] decided epoch {} checkpoint {} has no exact state seal",
+                    decision.epoch, decision.checkpoint_id
+                ))
+            })?;
+        Self::validate_cluster_decision_inventory(decision, &inventory)?;
         // Decode and validate every readiness payload even for pipelines without replayable
         // sources; the marker is also the manifest-completion attestation.
-        let handoff = self.source_offsets_at(attempt).await?;
+        let handoff = Self::source_offsets_from_inventory(
+            backend,
+            self.expected_deployment_id()?,
+            &self.expected_pipeline_identity(),
+            attempt,
+            inventory,
+        )
+        .await?;
         Self::validate_manifest_source_handoff(&recovered.manifest, &handoff)?;
         recovered.set_cluster_source_handoff(handoff);
         Ok(())

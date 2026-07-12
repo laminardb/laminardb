@@ -27,13 +27,25 @@ pub fn owned_partitions(
     registry: &VnodeRegistry,
     self_id: NodeId,
 ) -> Vec<i32> {
-    let vnode_count = registry.vnode_count();
+    let assignment = registry.snapshot();
+    owned_partitions_in_assignment(total_partitions, &assignment, self_id)
+}
+
+/// The Kafka partitions owned under one immutable vnode-owner publication.
+/// This avoids constructing a mixed ownership set if a rotation lands while
+/// the caller is enumerating partitions.
+#[must_use]
+pub fn owned_partitions_in_assignment(
+    total_partitions: i32,
+    assignment: &[NodeId],
+    self_id: NodeId,
+) -> Vec<i32> {
     (0..total_partitions)
         .filter(|&p| {
-            let Ok(pid) = u32::try_from(p) else {
+            let Ok(pid) = usize::try_from(p) else {
                 return false;
             };
-            registry.owner(pid % vnode_count) == self_id
+            !assignment.is_empty() && assignment[pid % assignment.len()] == self_id
         })
         .collect()
 }

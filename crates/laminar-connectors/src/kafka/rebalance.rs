@@ -100,9 +100,9 @@ pub struct LaminarConsumerContext {
     /// Bumped on each Assign; the reader task seeks the newly-assigned partitions
     /// from the poll loop (see the `KafkaSource` reader loop).
     assign_generation: Arc<AtomicU64>,
-    /// Counter bumped on every broker-confirmed commit. The on-checkpoint
-    /// commit path issues `CommitMode::Sync`, so this is the authoritative
-    /// success counter — `commit_callback` still fires for sync commits.
+    /// Counter bumped on every broker-confirmed advisory progress commit.
+    /// Engine recovery uses checkpoint state, so asynchronous broker commit
+    /// failures affect monitoring lag rather than the recovery guarantee.
     commits_counter: IntCounter,
     /// Counter bumped when the broker rejects a commit.
     commit_failures_counter: IntCounter,

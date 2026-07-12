@@ -83,8 +83,9 @@ aggregation** via a pre-agg row-shuffle bridge (`operator/sql_query.rs:450-538`,
 - **No inter-node security:** plaintext, unauthenticated `Hello(node_id)` (`transport.rs:211`).
 - **No graceful drain / rolling upgrade / scale-down** (`Draining` only logged,
   `server/cluster.rs:107`); admin API read-only (`http.rs:390-417`).
-- **No Raft:** `raft_port` is config theatre (`cluster_config.rs:150`, `cluster.rs:237-240`);
-  stale `Cargo.toml:14-16` comment claims rebalance "not yet implemented" (it is).
+- **No Raft:** the former `strategy = "raft"`/`raft_port` configuration and unbound service
+  advertisement were removed; the legacy `NodeInfo.raft_address` wire field is published empty.
+  A stale `Cargo.toml:14-16` comment still claims rebalance "not yet implemented" (it is).
 
 ## Goals
 
@@ -215,7 +216,8 @@ as backstop). Make Postgres optional/disabled for single-instance mode.
 ### Phase 6 — Recovery coordination & observability
 - Per-node + cluster metrics: per-partition lag, assignment map visibility, checkpoint
   alignment health, shuffle queue depth, barrier latency, fence rejections.
-- Runbooks; correct the misleading `raft` config surface and the stale `Cargo.toml` comment.
+- Runbooks; keep coordination documentation aligned with the lease/CAS implementation and correct
+  the stale `Cargo.toml` comment.
 - **Exit:** the cluster is operable and observable under production load.
 
 ---

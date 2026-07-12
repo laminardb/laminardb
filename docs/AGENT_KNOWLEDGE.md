@@ -36,7 +36,7 @@ The following issues were identified during code review of the legacy cluster im
    - *Refactor target*: Vectorized routing grouping batches by node rather than single rows.
 5. **Weak Leader Election**:
    - Heuristic "lowest-ID wins" election over gossip is vulnerable to split-brain.
-   - *Refactor target*: Standardize on single authoritative coordinator (or eventual Raft).
+   - *Refactor target*: Fence decisions through the authoritative shared coordination store.
 6. **Hand-Rolled TCP Shuffle Transport**:
    - Network shuffling of Arrow batches was built on raw TCP framing and custom sockets.
    - *Refactor target*: Refactor to client-streaming Tonic gRPC.

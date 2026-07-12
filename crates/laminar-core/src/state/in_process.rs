@@ -153,20 +153,6 @@ impl StateBackend for InProcessBackend {
             .cloned())
     }
 
-    async fn read_commit_descriptors(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<(String, Bytes)>, StateBackendError> {
-        let mut descriptors: Vec<_> = self
-            .descriptors
-            .read()
-            .get(&attempt)
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        descriptors.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        Ok(descriptors)
-    }
-
     async fn seal_checkpoint(
         &self,
         attempt: CheckpointAttempt,
@@ -236,21 +222,6 @@ impl StateBackend for InProcessBackend {
         }
     }
 
-    async fn sealed_checkpoints(
-        &self,
-        after_checkpoint_id: u64,
-    ) -> Result<Vec<CheckpointAttempt>, StateBackendError> {
-        let mut attempts: Vec<_> = self
-            .sealed
-            .read()
-            .keys()
-            .filter(|attempt| attempt.checkpoint_id > after_checkpoint_id)
-            .copied()
-            .collect();
-        attempts.sort_unstable_by_key(|attempt| attempt.checkpoint_id);
-        Ok(attempts)
-    }
-
     async fn checkpoint_seal_inventory(
         &self,
         attempt: CheckpointAttempt,
@@ -265,40 +236,16 @@ impl StateBackend for InProcessBackend {
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         // Without this, every checkpoint leaks one Bytes per vnode
         // forever.
+        self.sealed
+            .write()
+            .retain(|attempt, _| attempt.epoch >= before);
         self.partials
             .write()
             .retain(|&(attempt, _), _| attempt.epoch >= before);
         self.descriptors
             .write()
             .retain(|attempt, _| attempt.epoch >= before);
-        self.sealed
-            .write()
-            .retain(|attempt, _| attempt.epoch >= before);
         Ok(())
-    }
-
-    async fn truncate_after(&self, after: u64) -> Result<(), StateBackendError> {
-        self.partials
-            .write()
-            .retain(|&(attempt, _), _| attempt.epoch <= after);
-        self.descriptors
-            .write()
-            .retain(|attempt, _| attempt.epoch <= after);
-        self.sealed
-            .write()
-            .retain(|attempt, _| attempt.epoch <= after);
-        Ok(())
-    }
-
-    async fn latest_sealed_checkpoint(
-        &self,
-    ) -> Result<Option<CheckpointAttempt>, StateBackendError> {
-        Ok(self
-            .sealed
-            .read()
-            .keys()
-            .max_by_key(|attempt| attempt.checkpoint_id)
-            .copied())
     }
 }
 
@@ -360,6 +307,16 @@ mod tests {
                 .await,
             Err(StateBackendError::Conflict { .. })
         ));
+        assert_eq!(
+            b.read_commit_descriptor(checkpoint, "sink").await.unwrap(),
+            Some(Bytes::from_static(b"d"))
+        );
+        assert_eq!(
+            b.read_commit_descriptor(checkpoint, "missing")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -443,36 +400,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_sealed_checkpoint_follows_attempt_id() {
-        let b = InProcessBackend::new(4);
-        let vnodes = [0u32, 1];
-        assert_eq!(b.latest_sealed_checkpoint().await.unwrap(), None);
-
-        let first = CheckpointAttempt::new(2, 20);
-        b.write_partial(first, 0, 0, Bytes::from_static(b"a"))
-            .await
-            .unwrap();
-        assert!(!b.seal_checkpoint(first, 0, &vnodes, &[]).await.unwrap());
-        assert_eq!(b.latest_sealed_checkpoint().await.unwrap(), None);
-
-        b.write_partial(first, 1, 0, Bytes::from_static(b"b"))
-            .await
-            .unwrap();
-        assert!(b.seal_checkpoint(first, 0, &vnodes, &[]).await.unwrap());
-        assert_eq!(b.latest_sealed_checkpoint().await.unwrap(), Some(first));
-
-        let second = CheckpointAttempt::new(5, 50);
-        for v in &vnodes {
-            b.write_partial(second, *v, 0, Bytes::from_static(b"c"))
-                .await
-                .unwrap();
-        }
-        assert!(b.seal_checkpoint(second, 0, &vnodes, &[]).await.unwrap());
-        assert_eq!(b.latest_sealed_checkpoint().await.unwrap(), Some(second));
-        assert_eq!(b.sealed_checkpoints(20).await.unwrap(), vec![second]);
-    }
-
-    #[tokio::test]
     async fn out_of_range_vnode_errors() {
         let b = InProcessBackend::new(2);
         let r = b
@@ -485,38 +412,6 @@ mod tests {
     #[test]
     fn state_backend_is_object_safe() {
         let _: std::sync::Arc<dyn StateBackend> = std::sync::Arc::new(InProcessBackend::new(2));
-    }
-
-    #[tokio::test]
-    async fn truncate_after_drops_newer_epochs_and_seals() {
-        let b = InProcessBackend::new(4);
-        let vnodes = [0u32];
-        for epoch in 1..=5 {
-            b.write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"x"))
-                .await
-                .unwrap();
-            assert!(b
-                .seal_checkpoint(attempt(epoch), 0, &vnodes, &[])
-                .await
-                .unwrap());
-        }
-        assert_eq!(
-            b.latest_sealed_checkpoint().await.unwrap(),
-            Some(attempt(5))
-        );
-
-        b.truncate_after(3).await.unwrap();
-
-        for epoch in 1..=3 {
-            assert!(b.read_partial(attempt(epoch), 0).await.unwrap().is_some());
-        }
-        for epoch in 4..=5 {
-            assert!(b.read_partial(attempt(epoch), 0).await.unwrap().is_none());
-        }
-        assert_eq!(
-            b.latest_sealed_checkpoint().await.unwrap(),
-            Some(attempt(3))
-        );
     }
 
     #[tokio::test]

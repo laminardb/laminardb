@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use laminar_core::checkpoint_decision::{CommitDecision, CommitDecisionScope};
 use laminar_core::state::{CheckpointAttempt, StateBackend};
 use laminar_core::storage::checkpoint_manifest::{
@@ -15,6 +16,8 @@ use laminar_core::storage::ValidationResult;
 use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
+
+const VNODE_REHYDRATION_CONCURRENCY: usize = 32;
 
 /// Result of a successful recovery from a checkpoint.
 #[derive(Debug)]
@@ -57,7 +60,7 @@ impl RecoveredState {
 /// Outcome of rehydrating a set of vnodes from durable state.
 #[derive(Debug, Default)]
 pub struct VnodeRehydration {
-    /// Exact sealed attempt the partials were read from. `None` when the backend has no seal.
+    /// Exact sealed attempt the partials were read from. `None` only for an empty request.
     pub attempt: Option<CheckpointAttempt>,
     /// vnode → recovery chain (oldest→newest): a FULL base followed by any delta partials.
     pub restored: HashMap<u32, Vec<Bytes>>,
@@ -71,9 +74,8 @@ impl VnodeRehydration {
     }
 }
 
-/// Reads the latest committed `partial.bin` for each requested vnode so a
-/// newly-acquired node resumes from the last committed epoch rather than
-/// empty state. Applying the bytes is the caller's responsibility.
+/// Reads an exact decision-bound `partial.bin` chain for requested vnodes.
+/// Applying the bytes is the caller's responsibility.
 pub struct VnodeRehydrator<'a> {
     backend: &'a dyn StateBackend,
 }
@@ -83,37 +85,6 @@ impl<'a> VnodeRehydrator<'a> {
     #[must_use]
     pub fn new(backend: &'a dyn StateBackend) -> Self {
         Self { backend }
-    }
-
-    /// Read the latest committed partial for each vnode in `vnodes`.
-    ///
-    /// An empty report means the store has no committed epoch. Once an epoch is sealed, every
-    /// requested vnode must have a complete, decodable chain; partial recovery would combine
-    /// advanced source offsets with empty operator state.
-    ///
-    /// # Errors
-    /// Returns a checkpoint error for backend I/O, missing sealed partials, corrupt references,
-    /// undecodable payloads, or incomplete delta chains.
-    pub async fn rehydrate(&self, vnodes: &[u32]) -> Result<VnodeRehydration, DbError> {
-        if vnodes.is_empty() {
-            return Ok(VnodeRehydration::default());
-        }
-        let attempt = match self.backend.latest_sealed_checkpoint().await {
-            Ok(Some(attempt)) => attempt,
-            Ok(None) => {
-                debug!(
-                    vnodes = ?vnodes,
-                    "rehydrate: no committed epoch on backend — vnodes start fresh"
-                );
-                return Ok(VnodeRehydration::default());
-            }
-            Err(e) => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6050] failed to read the latest sealed state epoch: {e}"
-                )));
-            }
-        };
-        self.rehydrate_at(vnodes, attempt).await
     }
 
     /// Read each vnode's partial chain pinned at `epoch` (a committed cut chosen by the caller),
@@ -130,10 +101,46 @@ impl<'a> VnodeRehydrator<'a> {
         if vnodes.is_empty() {
             return Ok(report);
         }
+        let inventory = self
+            .backend
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] failed to read exact state seal for checkpoint {} epoch {}: {error}",
+                    attempt.checkpoint_id, attempt.epoch
+                ))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] checkpoint {} epoch {} has no exact state seal",
+                    attempt.checkpoint_id, attempt.epoch
+                ))
+            })?;
+        if inventory.attempt != attempt {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] requested state attempt {attempt:?} does not match seal inventory attempt {:?}",
+                inventory.attempt
+            )));
+        }
+        let sealed_vnodes: std::collections::HashSet<u32> =
+            inventory.required_vnodes.into_iter().collect();
+        if let Some(unsealed) = vnodes.iter().find(|vnode| !sealed_vnodes.contains(vnode)) {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] vnode {unsealed} is absent from the exact state seal for checkpoint {} epoch {}",
+                attempt.checkpoint_id, attempt.epoch
+            )));
+        }
         report.attempt = Some(attempt);
 
-        for &vnode in vnodes {
+        let chains = futures::stream::iter(vnodes.iter().copied().map(|vnode| async move {
             let chain = self.collect_chain(vnode, attempt).await?;
+            Ok::<_, DbError>((vnode, chain))
+        }))
+        .buffer_unordered(VNODE_REHYDRATION_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+        for (vnode, chain) in chains {
             debug!(
                 vnode,
                 epoch = attempt.epoch,
@@ -451,9 +458,61 @@ impl<'a> RecoveryManager<'a> {
         .await
     }
 
+    async fn validate_empty_decision_genesis(&self) -> Result<(), DbError> {
+        // Prepared-only inventory is normal residue from a crash before the first decision. A
+        // Finalized manifest, torn pointer, or unreadable inventory is different: it is evidence
+        // that authoritative decision history was lost, so genesis would replay visible output.
+        let published = self.store.load_latest().await.map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6041] checkpoint recovery pointer is invalid while the durable decision inventory is empty: {error}"
+            ))
+        })?;
+        if let Some(manifest) = published {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] published finalized checkpoint {} epoch {} exists but the durable decision inventory is empty",
+                manifest.checkpoint_id, manifest.epoch
+            )));
+        }
+        let checkpoint_ids = self.store.list_ids().await.map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6041] recovery inventory cannot be enumerated while the durable decision inventory is empty: {error}"
+            ))
+        })?;
+        for checkpoint_id in checkpoint_ids {
+            let manifest = self
+                .store
+                .load_by_id(checkpoint_id)
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6041] checkpoint {checkpoint_id} recovery inventory is unreadable while the durable decision inventory is empty: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6041] checkpoint {checkpoint_id} disappeared from recovery inventory while the durable decision inventory is empty"
+                    ))
+                })?;
+            if manifest.checkpoint_id != checkpoint_id {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] storage checkpoint {checkpoint_id} contains manifest checkpoint {} while the durable decision inventory is empty",
+                    manifest.checkpoint_id
+                )));
+            }
+            if manifest.durable_phase == DurableCheckpointPhase::Finalized {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] finalized checkpoint {} epoch {} exists in recovery inventory but the durable decision inventory is empty",
+                    manifest.checkpoint_id, manifest.epoch
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Recover from the latest committed, structurally valid checkpoint.
     ///
-    /// Returns `Ok(None)` only when the checkpoint store is empty.
+    /// Returns `Ok(None)` when no committed checkpoint exists. With a decision store, Prepared
+    /// artifacts before the first decision are explicitly ignored as abandoned attempts.
     ///
     /// # Errors
     ///
@@ -467,13 +526,19 @@ impl<'a> RecoveryManager<'a> {
         // highest decision first and require an exact participant-bound manifest. Corruption or
         // storage loss for an included participant is fatal rather than a reason to rewind.
         if let Some(ds) = decision_store {
-            if let Some(decision) = ds
+            let decision = ds
                 .highest_committed()
                 .await
-                .map_err(|error| DbError::Checkpoint(error.to_string()))?
-            {
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            if let Some(decision) = decision {
                 return self.restore_decided(&decision, ds).await;
             }
+
+            self.validate_empty_decision_genesis().await?;
+            info!(
+                "decision inventory is empty; ignoring any undecided Prepared artifacts and starting fresh"
+            );
+            return Ok(None);
         }
         let mut checkpoint_ids = self.store.list_ids().await.map_err(DbError::from)?;
         if checkpoint_ids.is_empty() {
@@ -500,13 +565,25 @@ impl<'a> RecoveryManager<'a> {
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> Result<Option<RecoveredState>, DbError> {
         if let Some(ds) = decision_store {
-            let decision = ds
-                .decision(target_epoch)
+            // Audit every write-ahead intent before selecting a target. Coordinated recovery's
+            // quiesced cut is the highest retained decision; accepting genesis or an older target
+            // would replay output already admitted at a newer durable frontier.
+            let decisions = ds
+                .recovery_decisions()
                 .await
                 .map_err(|e| DbError::Checkpoint(e.to_string()))?;
-            return match decision {
-                Some(decision) => self.restore_decided(&decision, ds).await,
-                None if target_epoch == 0 => Ok(None),
+            return match decisions.last() {
+                Some(decision) if decision.epoch == target_epoch => {
+                    self.restore_decided(decision, ds).await
+                }
+                Some(decision) => Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] recovery target epoch {target_epoch} is not the highest durable frontier: epoch {} checkpoint {} is authoritative",
+                    decision.epoch, decision.checkpoint_id
+                ))),
+                None if target_epoch == 0 => {
+                    self.validate_empty_decision_genesis().await?;
+                    Ok(None)
+                }
                 None => Err(DbError::Checkpoint(format!(
                     "[LDB-6041] recovery target epoch {target_epoch} has no commit decision"
                 ))),
@@ -548,9 +625,8 @@ impl<'a> RecoveryManager<'a> {
                 Err(e) => return Err(DbError::from(e)),
             }
         }
-        // Newest eligible first; id breaks epoch ties — a prior rewind reuses epoch numbers,
-        // so the same epoch can carry manifests from two timelines and the higher id is the
-        // live one.
+        // Newest eligible first. The globally unique checkpoint ID is the authoritative tie-break
+        // and prevents abandoned attempts from winning through store iteration order.
         checkpoints.sort_by_key(|&(id, epoch)| std::cmp::Reverse((epoch, id)));
         if checkpoints.is_empty() {
             return if target_epoch == 0 {
@@ -993,6 +1069,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_to_epoch_rejects_target_older_than_highest_durable_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+        decisions.record_committed(5, 1).await.unwrap();
+        decisions.record_committed(7, 2).await.unwrap();
+
+        let error = RecoveryManager::new(&store)
+            .recover_to_epoch(5, Some(&decisions))
+            .await
+            .expect_err("an older target must not rewind the durable decision frontier");
+
+        assert!(
+            error.to_string().contains(
+                "recovery target epoch 5 is not the highest durable frontier: epoch 7 checkpoint 2 is authoritative"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_to_genesis_rejects_finalized_inventory_without_latest_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&finalized_manifest(1, 1)).await.unwrap();
+        std::fs::remove_file(dir.path().join("checkpoints/latest.txt")).unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let error = RecoveryManager::new(&store)
+            .recover_to_epoch(0, Some(&decisions))
+            .await
+            .expect_err("finalized inventory cannot be discarded as genesis");
+
+        assert!(
+            error
+                .to_string()
+                .contains("finalized checkpoint 1 epoch 1 exists in recovery inventory"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_to_genesis_rejects_dangling_latest_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+        std::fs::write(
+            dir.path().join("checkpoints/latest.txt"),
+            "checkpoint_000099",
+        )
+        .unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let error = RecoveryManager::new(&store)
+            .recover_to_epoch(0, Some(&decisions))
+            .await
+            .expect_err("a dangling recovery pointer cannot be treated as genesis");
+
+        assert!(
+            error.to_string().contains(
+                "checkpoint recovery pointer is invalid while the durable decision inventory is empty"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_to_genesis_allows_prepared_only_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let recovered = RecoveryManager::new(&store)
+            .recover_to_epoch(0, Some(&decisions))
+            .await
+            .unwrap();
+
+        assert!(recovered.is_none());
+        assert_eq!(
+            store.load_by_id(1).await.unwrap().unwrap().durable_phase,
+            DurableCheckpointPhase::Prepared
+        );
+    }
+
+    #[tokio::test]
     async fn test_recover_with_watermark() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
@@ -1241,6 +1411,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_manifest_with_empty_decision_inventory_recovers_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let recovered = RecoveryManager::new(&store)
+            .recover(Some(&decisions))
+            .await
+            .unwrap();
+
+        assert!(recovered.is_none());
+        assert_eq!(
+            store.load_by_id(1).await.unwrap().unwrap().durable_phase,
+            DurableCheckpointPhase::Prepared
+        );
+    }
+
+    #[tokio::test]
+    async fn published_finalized_manifest_fails_with_empty_decision_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&finalized_manifest(1, 1)).await.unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let error = RecoveryManager::new(&store)
+            .recover(Some(&decisions))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "published finalized checkpoint 1 epoch 1 exists but the durable decision inventory is empty"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalized_manifest_without_latest_pointer_fails_with_empty_decision_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&finalized_manifest(1, 1)).await.unwrap();
+        std::fs::remove_file(dir.path().join("checkpoints/latest.txt")).unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let error = RecoveryManager::new(&store)
+            .recover(Some(&decisions))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("finalized checkpoint 1 epoch 1 exists in recovery inventory"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_latest_pointer_fails_with_empty_decision_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+        std::fs::write(
+            dir.path().join("checkpoints/latest.txt"),
+            "checkpoint_000099",
+        )
+        .unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let error = RecoveryManager::new(&store)
+            .recover(Some(&decisions))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "checkpoint recovery pointer is invalid while the durable decision inventory is empty"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_manifest_fails_with_empty_decision_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+        std::fs::write(
+            dir.path()
+                .join("checkpoints/checkpoint_000001/manifest.json"),
+            b"not-json",
+        )
+        .unwrap();
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+
+        let error = RecoveryManager::new(&store)
+            .recover(Some(&decisions))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint 1 recovery inventory is unreadable"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn decided_prepared_manifest_is_finalized_and_recovered() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
@@ -1287,7 +1578,9 @@ mod tests {
             .recover(Some(&decisions))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("checkpoint history exists"));
+        assert!(error
+            .to_string()
+            .contains("published finalized checkpoint 1 epoch 1 exists"));
     }
 
     #[tokio::test]
@@ -1587,7 +1880,7 @@ mod rehydration_tests {
         seal_epoch(&backend, 7, &[0, 1, 2], b"v7").await;
 
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate(&[0, 1])
+            .rehydrate_at(&[0, 1], CheckpointAttempt::new(7, 7))
             .await
             .unwrap();
 
@@ -1597,29 +1890,12 @@ mod rehydration_tests {
         assert_eq!(operator_payload(&report, 1), b"v7");
 
         let error = VnodeRehydrator::new(&backend)
-            .rehydrate(&[3])
+            .rehydrate_at(&[3], CheckpointAttempt::new(7, 7))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("missing at sealed epoch 7"));
-    }
-
-    #[tokio::test]
-    async fn rehydrate_reads_latest_sealed_attempt() {
-        let backend = InProcessBackend::new(4);
-        seal_epoch(&backend, 3, &[0, 1], b"old").await;
-        seal_epoch(&backend, 9, &[0, 1], b"new").await;
-
-        let report = VnodeRehydrator::new(&backend)
-            .rehydrate(&[0, 1])
-            .await
-            .unwrap();
-
-        assert_eq!(
-            report.attempt,
-            Some(CheckpointAttempt::new(9, 9)),
-            "must read the highest sealed checkpoint"
-        );
-        assert_eq!(operator_payload(&report, 0), b"new");
+        assert!(error
+            .to_string()
+            .contains("absent from the exact state seal"));
     }
 
     /// Boot recovery pins the read to the recovered manifest's epoch so state and source offsets
@@ -1681,7 +1957,7 @@ mod rehydration_tests {
             .unwrap());
 
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate(&[0])
+            .rehydrate_at(&[0], reference_attempt)
             .await
             .unwrap();
         assert_eq!(report.attempt, Some(reference_attempt));
@@ -1696,21 +1972,23 @@ mod rehydration_tests {
     }
 
     #[tokio::test]
-    async fn rehydrate_no_committed_epoch_is_fresh() {
+    async fn rehydrate_at_rejects_an_unsealed_attempt() {
         let backend = InProcessBackend::new(4);
-        let report = VnodeRehydrator::new(&backend)
-            .rehydrate(&[0, 1])
+        let error = VnodeRehydrator::new(&backend)
+            .rehydrate_at(&[0, 1], CheckpointAttempt::new(1, 1))
             .await
-            .unwrap();
-        assert_eq!(report.attempt, None);
-        assert!(report.restored.is_empty());
+            .unwrap_err();
+        assert!(error.to_string().contains("has no exact state seal"));
     }
 
     #[tokio::test]
     async fn rehydrate_empty_request_is_noop() {
         let backend = InProcessBackend::new(4);
         seal_epoch(&backend, 1, &[0], b"x").await;
-        let report = VnodeRehydrator::new(&backend).rehydrate(&[]).await.unwrap();
+        let report = VnodeRehydrator::new(&backend)
+            .rehydrate_at(&[], CheckpointAttempt::new(1, 1))
+            .await
+            .unwrap();
         assert_eq!(report.attempt, None);
         assert!(report.restored.is_empty());
     }
@@ -1727,7 +2005,7 @@ mod rehydration_tests {
         seal_epoch(&backend, 5, &[0, 1], b"durable").await;
 
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate(&[0, 1])
+            .rehydrate_at(&[0, 1], CheckpointAttempt::new(5, 5))
             .await
             .unwrap();
 

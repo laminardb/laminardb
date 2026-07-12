@@ -26,6 +26,7 @@ const VNODE_PARTIAL_MAGIC: &[u8; 8] = b"LDBVP1\0\0";
 const VNODE_PARTIAL_VERSION: u32 = 1;
 const VNODE_PARTIAL_HEADER_LEN: usize = 128;
 const PARTIAL_ATTESTATION_READ_CONCURRENCY: usize = 32;
+const SEAL_RETENTION_CONCURRENCY: usize = 32;
 
 /// Object-store-backed [`StateBackend`].
 pub struct ObjectStoreBackend {
@@ -332,6 +333,49 @@ impl ObjectStoreBackend {
             Err(error) => Err(StateBackendError::Io(error.to_string())),
         }
     }
+
+    /// Remove checkpoint publication markers before any object they attest. Readers may race a
+    /// retention pass, but they must never discover a still-published seal after its partials or
+    /// descriptors have been removed. A confirming HEAD deliberately treats a stale positive as
+    /// a failed pass; leaking old payloads until the next pass is safer than exposing a torn cut.
+    async fn unpublish_seals(&self, seals: &[OsPath]) -> Result<(), StateBackendError> {
+        use futures::stream::{self, StreamExt};
+
+        let deletes = stream::iter(seals.iter().cloned().map(|path| async move {
+            match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(error) => Err(StateBackendError::Io(format!(
+                    "failed to unpublish checkpoint seal '{path}': {error}"
+                ))),
+            }
+        }))
+        .buffer_unordered(SEAL_RETENTION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for result in deletes {
+            result?;
+        }
+
+        let confirmations = stream::iter(seals.iter().cloned().map(|path| async move {
+            match self.store.head(&path).await {
+                Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Ok(_) => Err(StateBackendError::Conflict {
+                    resource: path.to_string(),
+                    message: "checkpoint seal remained visible after retention delete".into(),
+                }),
+                Err(error) => Err(StateBackendError::Io(format!(
+                    "failed to confirm checkpoint seal removal for '{path}': {error}"
+                ))),
+            }
+        }))
+        .buffer_unordered(SEAL_RETENTION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for result in confirmations {
+            result?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -400,38 +444,6 @@ impl StateBackend for ObjectStoreBackend {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(StateBackendError::Io(error.to_string())),
         }
-    }
-
-    async fn read_commit_descriptors(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<(String, Bytes)>, StateBackendError> {
-        use tokio_stream::StreamExt;
-
-        let prefix_str = format!("{}commit/", Self::attempt_prefix(attempt));
-        let mut entries = self.store.list(Some(&OsPath::from(prefix_str.clone())));
-        let mut out = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let loc = entry
-                .map_err(|e| StateBackendError::Io(e.to_string()))?
-                .location;
-            let key = loc
-                .as_ref()
-                .strip_prefix(&prefix_str)
-                .unwrap_or(loc.as_ref())
-                .to_string();
-            let bytes = self
-                .store
-                .get(&loc)
-                .await
-                .map_err(|e| StateBackendError::Io(e.to_string()))?
-                .bytes()
-                .await
-                .map_err(|e| StateBackendError::Io(e.to_string()))?;
-            out.push((key, bytes));
-        }
-        out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        Ok(out)
     }
 
     async fn seal_checkpoint(
@@ -558,45 +570,6 @@ impl StateBackend for ObjectStoreBackend {
         }
     }
 
-    async fn sealed_checkpoints(
-        &self,
-        after_checkpoint_id: u64,
-    ) -> Result<Vec<CheckpointAttempt>, StateBackendError> {
-        use tokio_stream::StreamExt;
-
-        let mut entries = self.store.list(Some(&OsPath::from("state-v2/")));
-        let mut out = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let loc = entry
-                .map_err(|e| StateBackendError::Io(e.to_string()))?
-                .location;
-            if !loc.as_ref().ends_with("/_SEAL") {
-                continue;
-            }
-            let path_attempt = Self::attempt_from_path(loc.as_ref()).ok_or_else(|| {
-                StateBackendError::Serialization(format!(
-                    "invalid checkpoint seal path: {}",
-                    loc.as_ref()
-                ))
-            })?;
-            let seal = self.read_seal(&loc).await?;
-            if seal.attempt != path_attempt {
-                return Err(StateBackendError::Conflict {
-                    resource: loc.to_string(),
-                    message: format!(
-                        "seal body names {:?}, path names {path_attempt:?}",
-                        seal.attempt
-                    ),
-                });
-            }
-            if seal.attempt.checkpoint_id > after_checkpoint_id {
-                out.push(seal.attempt);
-            }
-        }
-        out.sort_unstable_by_key(|attempt| attempt.checkpoint_id);
-        Ok(out)
-    }
-
     async fn checkpoint_seal_inventory(
         &self,
         attempt: CheckpointAttempt,
@@ -604,10 +577,11 @@ impl StateBackend for ObjectStoreBackend {
         let path = Self::seal_path(attempt);
         match self.store.get(&path).await {
             Ok(result) => {
-                let bytes = result
-                    .bytes()
-                    .await
-                    .map_err(|error| StateBackendError::Io(error.to_string()))?;
+                let bytes = match result.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(error) => return Err(StateBackendError::Io(error.to_string())),
+                };
                 let seal = Self::decode_seal(&bytes)?;
                 if seal.attempt != attempt {
                     return Err(StateBackendError::Conflict {
@@ -662,12 +636,35 @@ impl StateBackend for ObjectStoreBackend {
             }
         }
 
+        // Listings are discovery hints, not publication authority. Derive every deterministic
+        // seal path from the attempts named by listed artifacts, so an omitted `_SEAL` entry
+        // cannot leave a readable seal published while its listed dependency is deleted.
+        let attempts: std::collections::BTreeSet<_> = victims
+            .iter()
+            .filter_map(|path| Self::attempt_from_path(path.as_ref()))
+            .collect();
+        let seals: Vec<_> = attempts.into_iter().map(Self::seal_path).collect();
+        let artifacts: Vec<_> = victims
+            .into_iter()
+            .filter(|path| {
+                Self::attempt_from_path(path.as_ref()).is_some()
+                    && !path.as_ref().ends_with("/_SEAL")
+            })
+            .collect();
+
+        // The seal is the publication boundary. Unpublish and confirm every selected seal before
+        // bulk-deleting anything it attests, otherwise a concurrent reader can observe a valid
+        // seal whose readiness or state has already vanished.
+        let mut delete_failed = false;
+        if let Err(error) = self.unpublish_seals(&seals).await {
+            delete_failed = true;
+            tracing::warn!(%error, "state backend prune: seal unpublish failed");
+        }
         // `delete_stream` coalesces into bulk-delete API calls where the store
         // supports them (S3 `DeleteObjects`); a missing object is a no-op.
-        let mut delete_failed = false;
-        if !victims.is_empty() {
+        if !delete_failed && !artifacts.is_empty() {
             let locations =
-                stream::iter(victims.into_iter().map(Ok::<OsPath, object_store::Error>)).boxed();
+                stream::iter(artifacts.into_iter().map(Ok::<OsPath, object_store::Error>)).boxed();
             let mut deletes = self.store.delete_stream(locations);
             while let Some(res) = deletes.next().await {
                 match res {
@@ -688,44 +685,6 @@ impl StateBackend for ObjectStoreBackend {
             self.latest_pruned_epoch.fetch_max(before, Ordering::AcqRel);
         }
         Ok(())
-    }
-
-    async fn truncate_after(&self, after: u64) -> Result<(), StateBackendError> {
-        use futures::stream::{self, StreamExt};
-
-        // Full state-v2 scan (dynamic `epoch=N` segment, same constraint as `prune_before`).
-        // Recovery-path only, and a truncation failure must fail the rewind closed —
-        // surviving artifacts would collide with the reused epoch numbers.
-        let mut entries = self.store.list(Some(&OsPath::from("state-v2/")));
-        let mut victims: Vec<OsPath> = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
-            let Some(attempt) = Self::attempt_from_path(entry.location.as_ref()) else {
-                continue;
-            };
-            if attempt.epoch > after {
-                victims.push(entry.location);
-            }
-        }
-        if victims.is_empty() {
-            return Ok(());
-        }
-        let locations =
-            stream::iter(victims.into_iter().map(Ok::<OsPath, object_store::Error>)).boxed();
-        let mut deletes = self.store.delete_stream(locations);
-        while let Some(res) = deletes.next().await {
-            match res {
-                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => return Err(StateBackendError::Io(e.to_string())),
-            }
-        }
-        Ok(())
-    }
-
-    async fn latest_sealed_checkpoint(
-        &self,
-    ) -> Result<Option<CheckpointAttempt>, StateBackendError> {
-        Ok(self.sealed_checkpoints(0).await?.into_iter().last())
     }
 
     fn set_authoritative_version(&self, version: u64) {
@@ -797,16 +756,27 @@ impl ObjectStoreBackend {
         }
     }
 
+    async fn read_seal_if_present(
+        &self,
+        path: &OsPath,
+    ) -> Result<Option<CheckpointSeal>, StateBackendError> {
+        let result = match self.store.get(path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(StateBackendError::Io(error.to_string())),
+        };
+        let bytes = match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(StateBackendError::Io(error.to_string())),
+        };
+        Self::decode_seal(&bytes).map(Some)
+    }
+
     async fn read_seal(&self, path: &OsPath) -> Result<CheckpointSeal, StateBackendError> {
-        let bytes = self
-            .store
-            .get(path)
-            .await
-            .map_err(|e| StateBackendError::Io(e.to_string()))?
-            .bytes()
-            .await
-            .map_err(|e| StateBackendError::Io(e.to_string()))?;
-        Self::decode_seal(&bytes)
+        self.read_seal_if_present(path).await?.ok_or_else(|| {
+            StateBackendError::Io(format!("checkpoint seal '{}' is absent", path.as_ref()))
+        })
     }
 
     fn decode_seal(bytes: &[u8]) -> Result<CheckpointSeal, StateBackendError> {
@@ -856,6 +826,99 @@ impl ObjectStoreBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
+
+    /// Records the order in which retention submits deletes while delegating all storage to the
+    /// real local backend. `ObjectStore::delete` is expressed through `delete_stream`, so this
+    /// observes both the seal-unpublish phase and the later bulk artifact phase.
+    struct DeletionLogStore {
+        inner: Arc<dyn ObjectStore>,
+        deletions: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl std::fmt::Debug for DeletionLogStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DeletionLogStore").finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Display for DeletionLogStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DeletionLogStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for DeletionLogStore {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            let inner = Arc::clone(&self.inner);
+            let deletions = Arc::clone(&self.deletions);
+            locations
+                .then(move |location| {
+                    let inner = Arc::clone(&inner);
+                    let deletions = Arc::clone(&deletions);
+                    async move {
+                        let location = location?;
+                        deletions.lock().push(location.to_string());
+                        inner.delete(&location).await?;
+                        Ok(location)
+                    }
+                })
+                .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn attempt(epoch: u64) -> CheckpointAttempt {
         CheckpointAttempt::new(epoch, epoch * 10)
@@ -1070,8 +1133,19 @@ mod tests {
             .await
             .unwrap());
 
-        let descs = backend.read_commit_descriptors(attempt(1)).await.unwrap();
-        assert_eq!(descs, vec![(key.to_string(), Bytes::from_static(b"df"))]);
+        let inventory = backend
+            .checkpoint_seal_inventory(attempt(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inventory.required_descriptors, need);
+        assert_eq!(
+            backend
+                .read_commit_descriptor(attempt(1), key)
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"df"))
+        );
     }
 
     /// The CAS-create `AlreadyExists` branch must not silently agree it committed:
@@ -1285,42 +1359,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_sealed_checkpoint_tracks_highest_attempt() {
-        let dir = tempdir().unwrap();
-        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
-
-        // Fresh store: nothing committed.
-        assert_eq!(backend.latest_sealed_checkpoint().await.unwrap(), None);
-
-        // Seal epochs 3 and 7 (out of order) by writing every vnode's
-        // partial and running the CAS commit gate.
-        let vnodes = [0u32, 1];
-        for &epoch in &[3u64, 7] {
-            for v in &vnodes {
-                backend
-                    .write_partial(attempt(epoch), *v, 0, Bytes::from_static(b"s"))
-                    .await
-                    .unwrap();
-            }
-            assert!(backend
-                .seal_checkpoint(attempt(epoch), 0, &vnodes, &[])
-                .await
-                .unwrap());
-        }
-
-        // Epoch 5 has partials but no state seal — it must be ignored.
-        backend
-            .write_partial(attempt(5), 0, 0, Bytes::from_static(b"uncommitted"))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            backend.latest_sealed_checkpoint().await.unwrap(),
-            Some(attempt(7))
-        );
-    }
-
-    #[tokio::test]
     async fn prune_before_deletes_old_epochs() {
         let dir = tempdir().unwrap();
         let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
@@ -1358,47 +1396,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncate_after_removes_abandoned_timeline() {
+    async fn retention_unpublishes_seals_before_deleting_attested_artifacts() {
         let dir = tempdir().unwrap();
-        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+        let deletions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let store: Arc<dyn ObjectStore> = Arc::new(DeletionLogStore {
+            inner: make_store(dir.path()),
+            deletions: Arc::clone(&deletions),
+        });
+        let backend = ObjectStoreBackend::new(store, "node-0", 4);
+        let ready_key = "participant-ready/0.json";
 
-        for epoch in 1..=5u64 {
+        for epoch in 1..=3u64 {
             backend
-                .write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"x"))
+                .write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"state"))
+                .await
+                .unwrap();
+            backend
+                .write_commit_descriptor(attempt(epoch), ready_key, 0, Bytes::from_static(b"ready"))
                 .await
                 .unwrap();
             assert!(backend
-                .seal_checkpoint(attempt(epoch), 0, &[0], &[])
+                .seal_checkpoint(attempt(epoch), 0, &[0], &[ready_key.to_string()])
                 .await
                 .unwrap());
         }
-        assert_eq!(
-            backend.latest_sealed_checkpoint().await.unwrap(),
-            Some(attempt(5))
-        );
 
-        backend.truncate_after(3).await.unwrap();
+        let assert_seal_first = |operation: &str| {
+            let recorded = deletions.lock().clone();
+            let last_seal = recorded
+                .iter()
+                .rposition(|path| path.ends_with("/_SEAL"))
+                .unwrap_or_else(|| panic!("{operation} did not delete a seal: {recorded:?}"));
+            let first_artifact = recorded
+                .iter()
+                .position(|path| !path.ends_with("/_SEAL"))
+                .unwrap_or_else(|| panic!("{operation} did not delete artifacts: {recorded:?}"));
+            assert!(
+                last_seal < first_artifact,
+                "{operation} exposed a torn checkpoint by deleting artifacts before all seals: {recorded:?}"
+            );
+        };
 
-        for epoch in 1..=3u64 {
-            assert!(backend
-                .read_partial(attempt(epoch), 0)
-                .await
-                .unwrap()
-                .is_some());
-        }
-        for epoch in 4..=5u64 {
-            assert!(backend
-                .read_partial(attempt(epoch), 0)
-                .await
-                .unwrap()
-                .is_none());
-        }
-        // The seal must rewind too — it feeds the adopt path's offset cut and the
-        // reused epoch numbers must not find a foreign `_SEAL` marker.
-        assert_eq!(
-            backend.latest_sealed_checkpoint().await.unwrap(),
-            Some(attempt(3))
-        );
+        backend.prune_before(2).await.unwrap();
+        assert_seal_first("prune_before");
     }
 
     /// The horizon cursor must advance so the second prune takes the

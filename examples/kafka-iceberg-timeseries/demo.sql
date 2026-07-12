@@ -19,9 +19,7 @@ CREATE SOURCE crypto_ticks (
     'bootstrap.servers'      = 'localhost:9092',
     'topic'                  = 'crypto.ticks',
     'group.id'               = 'laminar-ohlc-demo',
-    'startup.mode'           = 'earliest',
-    'event.time.column'      = 'ts',
-    'max.out.of.orderness.ms' = '5000'
+    'startup.mode'           = 'earliest'
 ) FORMAT JSON;
 
 -- ──────────────────────────────────────────────────────────────────────

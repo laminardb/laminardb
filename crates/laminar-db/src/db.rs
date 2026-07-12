@@ -109,9 +109,6 @@ pub struct LaminarDB {
     pub(crate) supervisor_self: Arc<parking_lot::Mutex<std::sync::Weak<LaminarDB>>>,
     /// Auto-restart timestamps within the sliding window; bounds restart storms.
     pub(crate) restart_history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
-    /// Set when a `stop_pipeline` times out so the watcher finalizes ShuttingDown→Created;
-    /// keeps it from racing a normal stop/shutdown, which finalize themselves.
-    pub(crate) stop_timed_out: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes start/stop/shutdown ownership across awaits. Runtime-handle `None` means an
     /// owner is currently joining only while this lock is held; another caller must never treat
     /// it as completed teardown.
@@ -202,6 +199,10 @@ pub struct LaminarDB {
     /// in-memory state so a later re-acquire merges into empty state (no additive double-count).
     #[cfg(feature = "cluster")]
     pub(crate) pending_revoke_vnodes: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<u32>>>,
+    /// Linearizes assignment publication with compute-cycle entry so staged
+    /// revoke/rehydration state is applied before any row observes new ownership.
+    #[cfg(feature = "cluster")]
+    pub(crate) rotation_execution_fence: Arc<tokio::sync::RwLock<()>>,
     /// Routes `db.checkpoint()` requests to the streaming coordinator for exact-attempt
     /// barrier admission. `None` means no running pipeline can produce a valid cut.
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
@@ -213,6 +214,27 @@ pub struct LaminarDB {
     /// Resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
+}
+
+impl Drop for LaminarDB {
+    fn drop(&mut self) {
+        if matches!(
+            DbState::load(&self.state),
+            DbState::Starting | DbState::Running | DbState::ShuttingDown | DbState::Faulted
+        ) {
+            // Dropping Tokio handles detaches their tasks. A local decision hard-link already in
+            // a blocking filesystem worker could therefore outlive this facade. Keep the OS lock
+            // until process exit rather than let another in-process deployment acquire the same
+            // exactly-once namespace while old work can still publish. Graceful stop/shutdown
+            // clears the lock before reaching a terminal state and does not leak it.
+            if let Some(lock) = self.exact_deployment_lock.get_mut().take() {
+                tracing::error!(
+                    "dropping an active exactly-once deployment; retaining its namespace lock until process exit"
+                );
+                std::mem::forget(lock);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -297,6 +319,25 @@ pub struct SnapshotAdoption {
     pub rehydrated: usize,
     /// Committed epoch the rehydration read from, if any.
     pub rehydration_epoch: Option<u64>,
+}
+
+#[cfg(feature = "cluster")]
+fn owned_vnode_indices(
+    assignment: &[laminar_core::state::NodeId],
+    self_id: laminar_core::state::NodeId,
+) -> Result<Vec<u32>, DbError> {
+    assignment
+        .iter()
+        .enumerate()
+        .filter(|(_, owner)| **owner == self_id)
+        .map(|(vnode, _)| {
+            u32::try_from(vnode).map_err(|_| {
+                DbError::Checkpoint(
+                    "vnode assignment is too large to encode a u32 vnode identifier".into(),
+                )
+            })
+        })
+        .collect()
 }
 
 impl LaminarDB {
@@ -425,7 +466,6 @@ impl LaminarDB {
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
             restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            stop_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle_lock: tokio::sync::Mutex::new(()),
             rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: parking_lot::Mutex::new(None),
@@ -475,6 +515,8 @@ impl LaminarDB {
             pending_revoke_vnodes: Arc::new(parking_lot::Mutex::new(
                 rustc_hash::FxHashSet::default(),
             )),
+            #[cfg(feature = "cluster")]
+            rotation_execution_fence: Arc::new(tokio::sync::RwLock::new(())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             #[cfg(feature = "cluster")]
@@ -703,7 +745,9 @@ impl LaminarDB {
             });
         }
 
-        let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        let prepared_assignment = registry.versioned_snapshot();
+        let prepared_from_version = prepared_assignment.version();
+        let old_owned = owned_vnode_indices(prepared_assignment.owners(), self_id)?;
         let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
         // Compute from the new assignment before publishing it, so the Restoring marks
         // below land before the ownership flip.
@@ -713,18 +757,18 @@ impl LaminarDB {
             })
             .collect();
 
-        // Stage the sealed source offsets before the version bump (acquiring source
-        // resumes from the previous owner's cut). A handoff-read failure defers the
-        // rotation — exactly-once must not fall back to startup and re-emit.
-        let source_handoff = if newly_acquired.is_empty() {
+        // Snapshot immutable recovery handles at the epoch boundary, then release the coordinator
+        // mutex before decision-store, seal, readiness, and vnode reads. Remote object-store
+        // latency must not stall checkpoint admission.
+        let handoff_reader = if newly_acquired.is_empty() {
             None
         } else if let Some(coord) = guard.as_ref() {
-            coord.acquired_source_handoff().await.map_err(|e| {
+            Some(coord.cluster_handoff_reader()?.ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "[LDB-6052] source-offset handoff read failed for assignment {}: {e}",
+                    "[LDB-6052] assignment {} requires an active cluster recovery namespace",
                     snapshot.version
                 ))
-            })?
+            })?)
         } else {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6052] cannot acquire vnodes for assignment {} without a live checkpoint coordinator",
@@ -732,58 +776,156 @@ impl LaminarDB {
             )));
         };
 
-        // Read all newly-owned state before publishing the assignment. A failed object-store read
-        // therefore leaves the current version intact and the watcher can retry the same snapshot.
         drop(guard);
-        let rehydration = if let Some((attempt, _)) = source_handoff.as_ref() {
+        // Stage the sealed source offsets and read all newly-owned state before publishing the
+        // assignment. Any failure leaves the current version intact and retryable.
+        let source_handoff = if let Some(reader) = handoff_reader.as_ref() {
+            reader.acquired_source_handoff().await.map_err(|e| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6052] source-offset handoff read failed for assignment {}: {e}",
+                    snapshot.version
+                ))
+            })?
+        } else {
+            None
+        };
+        let prepared_decision = source_handoff
+            .as_ref()
+            .map(|(decision, _)| decision.clone());
+        if let Some(decision) = prepared_decision.as_ref() {
+            if decision.assignment_version > snapshot.version {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6054] assignment {} is older than durable checkpoint fence {}; refresh the assignment snapshot before adoption",
+                    snapshot.version, decision.assignment_version
+                )));
+            }
+        }
+        let mut rehydration = if let Some((decision, _)) = source_handoff.as_ref() {
             let backend = self.state_backend.lock().clone().ok_or_else(|| {
                 DbError::Checkpoint(
                     "[LDB-6050] cluster assignment adoption requires a state backend".into(),
                 )
             })?;
+            let attempt =
+                laminar_core::state::CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
             crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-                .rehydrate_at(&newly_acquired, *attempt)
+                .rehydrate_at(&newly_acquired, attempt)
                 .await?
         } else {
             crate::recovery_manager::VnodeRehydration::default()
         };
 
-        // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won.
+        let observed_decision = if let Some(reader) = handoff_reader.as_ref() {
+            reader.highest_commit_decision().await?
+        } else {
+            None
+        };
+
+        // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won,
+        // the coordinator namespace changed, or a newer durable cut appeared during the reads.
+        let _execution_guard = Arc::clone(&self.rotation_execution_fence)
+            .write_owned()
+            .await;
         let mut guard = self.coordinator.lock().await;
-        if snapshot.version <= registry.assignment_version() {
+        let current_version = registry.assignment_version();
+        if snapshot.version <= current_version {
             return Ok(SnapshotAdoption {
                 adopted: false,
                 version: snapshot.version,
                 ..SnapshotAdoption::default()
             });
         }
-        if !newly_acquired.is_empty() {
-            // A successful no-seal/empty cut must clear any prior rotation's
-            // offsets. Failures returned above never reach this mutation.
-            let offsets = source_handoff.map_or_else(HashMap::new, |(_, offsets)| offsets);
-            registry.stage_resume_offsets(offsets);
+        if current_version != prepared_from_version {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] assignment base advanced from {prepared_from_version} to {current_version} while preparing target {}; retrying from the new owner set",
+                snapshot.version
+            )));
         }
-
-        // Mark Restoring before the ownership flip so emission stays suppressed as the
-        // shuffle starts routing rows here.
         if !newly_acquired.is_empty() {
+            let current_reader = guard
+                .as_ref()
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6052] checkpoint coordinator disappeared while preparing assignment {}",
+                        snapshot.version
+                    ))
+                })?
+                .cluster_handoff_reader()?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6052] cluster recovery namespace disappeared while preparing assignment {}",
+                        snapshot.version
+                    ))
+                })?;
+            let prepared_reader = handoff_reader.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6052] assignment {} lost its prepared cluster recovery namespace",
+                    snapshot.version
+                ))
+            })?;
+            if !prepared_reader.same_namespace(&current_reader) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] checkpoint recovery namespace changed while preparing assignment {}; retrying the complete source/state handoff",
+                    snapshot.version
+                )));
+            }
+            if observed_decision != prepared_decision {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] durable checkpoint decision advanced while preparing assignment {}; retrying the complete source/state handoff",
+                    snapshot.version
+                )));
+            }
+        }
+        let new_owned = owned_vnode_indices(&new_assignment, self_id)?;
+        let new_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
+        let revoked: Vec<u32> = old_set.difference(&new_set).copied().collect();
+        let rehydration_attempt = rehydration.attempt;
+        let adoption = SnapshotAdoption {
+            adopted: true,
+            version: snapshot.version,
+            newly_acquired: newly_acquired.clone(),
+            rehydrated: rehydration.restored.len(),
+            rehydration_epoch: rehydration_attempt.map(|attempt| attempt.epoch),
+        };
+
+        // Stage revoke and rehydration work while the compute-cycle write fence is held, then
+        // publish ownership before releasing either staging mutex. The next cycle must therefore
+        // apply both maps before any local or shuffled row can observe the new owner set.
+        let mut pending_revoke = self.pending_revoke_vnodes.lock();
+        let mut staged_rehydration = self.rehydrated_vnode_state.lock();
+        pending_revoke.extend(revoked);
+        staged_rehydration.retain(|vnode, _| new_set.contains(vnode));
+        if let Some(attempt) = rehydration_attempt {
+            for vnode in &newly_acquired {
+                staged_rehydration.insert(
+                    *vnode,
+                    RehydratedVnode {
+                        epoch: attempt.epoch,
+                        chain: rehydration.restored.remove(vnode).unwrap_or_default(),
+                    },
+                );
+            }
             registry.mark_restoring(&newly_acquired);
         }
 
-        registry.set_assignment_and_version(new_assignment, snapshot.version);
-        // Rotation committed — drop the drain marks (revoked partitions are gone).
-        registry.clear_draining();
-        let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
-        // Vnodes lost this rotation: stage them so operators drop the stale in-memory state next
-        // cycle (a later re-acquire's additive merge would otherwise double-count). Disjoint from
-        // `newly_acquired` per rotation.
-        {
-            let new_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
-            let revoked: Vec<u32> = old_set.difference(&new_set).copied().collect();
-            if !revoked.is_empty() {
-                self.pending_revoke_vnodes.lock().extend(revoked);
-            }
+        if newly_acquired.is_empty() {
+            registry.set_assignment_and_version_carrying_resume_offsets(
+                new_assignment,
+                snapshot.version,
+            );
+        } else if let Some((_, resume_offsets)) = source_handoff {
+            registry.set_assignment_and_version_with_resume_offsets(
+                new_assignment,
+                snapshot.version,
+                resume_offsets,
+            );
+        } else {
+            // Genesis has no decided cut. Keep that distinct from a decided
+            // empty cut so sources may use their start-captured numeric baseline.
+            registry.set_assignment_and_version(new_assignment, snapshot.version);
+            registry.mark_active(&newly_acquired);
         }
+        registry.clear_draining();
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
         }
@@ -792,45 +934,9 @@ impl LaminarDB {
             coord.set_vnode_set(new_owned.clone());
             coord.set_gate_vnode_set((0..vnode_count).collect());
         }
+        drop(staged_rehydration);
+        drop(pending_revoke);
         drop(guard);
-
-        let mut adoption = SnapshotAdoption {
-            adopted: true,
-            version: snapshot.version,
-            newly_acquired: newly_acquired.clone(),
-            rehydrated: 0,
-            rehydration_epoch: None,
-        };
-
-        // Drop staged rehydration chains for vnodes no longer owned. Otherwise an
-        // acquire→lose→re-acquire whose re-acquire finds no fresh committed chain would drain the
-        // stale pre-loss chain and resurrect retracted state, and the map would grow unbounded (CL-7).
-        {
-            let owned_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
-            self.rehydrated_vnode_state
-                .lock()
-                .retain(|v, _| owned_set.contains(v));
-        }
-
-        if !newly_acquired.is_empty() {
-            adoption.rehydrated = rehydration.restored.len();
-            adoption.rehydration_epoch = rehydration.attempt.map(|a| a.epoch);
-            if let Some(attempt) = rehydration.attempt {
-                let mut staged = self.rehydrated_vnode_state.lock();
-                for (vnode, chain) in rehydration.restored {
-                    staged.insert(
-                        vnode,
-                        RehydratedVnode {
-                            epoch: attempt.epoch,
-                            chain,
-                        },
-                    );
-                }
-            } else {
-                // No sealed epoch means this is cluster genesis; there is no prior state to apply.
-                registry.mark_active(&newly_acquired);
-            }
-        }
 
         tracing::info!(
             version = snapshot.version,
@@ -863,9 +969,11 @@ impl LaminarDB {
                 laminar_core::state::NodeId(c.instance_id().0)
             });
         let next = snapshot.to_vnode_vec(vnode_count);
+        let current = registry.snapshot();
         let revoking: Vec<u32> = (0..vnode_count)
             .filter(|&v| {
-                registry.owner(v) == self_id && next.get(v as usize).copied() != Some(self_id)
+                current.get(v as usize).copied() == Some(self_id)
+                    && next.get(v as usize).copied() != Some(self_id)
             })
             .collect();
         // Reset first so only this snapshot's revoking set stays marked (a newer
@@ -2376,6 +2484,12 @@ impl LaminarDB {
         if self.config.checkpoint.is_none() {
             return Err(DbError::Checkpoint(
                 "checkpointing is not enabled".to_string(),
+            ));
+        }
+        if DbState::load(&self.state) != DbState::Running {
+            return Err(DbError::Checkpoint(
+                "manual checkpoint coordinator is not running — a fully running pipeline is required"
+                    .into(),
             ));
         }
 

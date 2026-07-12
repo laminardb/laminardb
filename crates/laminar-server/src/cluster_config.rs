@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::config::{CoordinationSection, DiscoverySection, ServerConfig};
+use crate::config::{DiscoverySection, ServerConfig, ServerMode};
 
 /// Node identity for cluster mode (non-empty, max 64 chars).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +64,6 @@ impl fmt::Display for ClusterNodeId {
 pub struct ClusterConfig {
     pub node_id: ClusterNodeId,
     pub discovery: DiscoverySection,
-    pub coordination: CoordinationSection,
     pub formation_timeout: Duration,
 }
 
@@ -72,7 +71,7 @@ impl ClusterConfig {
     const DEFAULT_FORMATION_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub fn from_server_config(config: &ServerConfig) -> Result<Option<Self>, ClusterConfigError> {
-        if config.server.mode != "cluster" {
+        if config.server.mode != ServerMode::Cluster {
             return Ok(None);
         }
 
@@ -80,11 +79,6 @@ impl ClusterConfig {
             .discovery
             .clone()
             .ok_or_else(|| ClusterConfigError::MissingSection("[discovery]".to_string()))?;
-
-        let coordination = config
-            .coordination
-            .clone()
-            .ok_or_else(|| ClusterConfigError::MissingSection("[coordination]".to_string()))?;
 
         if discovery.seeds.is_empty() && discovery.strategy == "static" {
             return Err(ClusterConfigError::EmptySeeds);
@@ -98,7 +92,6 @@ impl ClusterConfig {
         Ok(Some(Self {
             node_id,
             discovery,
-            coordination,
             formation_timeout: Self::DEFAULT_FORMATION_TIMEOUT,
         }))
     }
@@ -130,7 +123,6 @@ mod tests {
             pipelines: vec![],
             sinks: vec![],
             discovery: None,
-            coordination: None,
             node_id: None,
             sql: None,
             ai: Default::default(),
@@ -140,7 +132,7 @@ mod tests {
 
     fn cluster_config() -> ServerConfig {
         let mut config = base_config();
-        config.server.mode = "cluster".to_string();
+        config.server.mode = ServerMode::Cluster;
         config.node_id = Some("test-node-1".to_string());
         config.discovery = Some(DiscoverySection {
             strategy: "static".to_string(),
@@ -154,12 +146,6 @@ mod tests {
             cluster_tls_client_ca: None,
             cluster_tls_server_name: None,
         });
-        config.coordination = Some(CoordinationSection {
-            strategy: "raft".to_string(),
-            raft_port: 7947,
-            election_timeout: Duration::from_millis(1500),
-            heartbeat_interval: Duration::from_millis(300),
-        });
         config
     }
 
@@ -170,7 +156,6 @@ mod tests {
         let cluster_cfg = result.expect("should return Some for cluster mode");
         assert_eq!(cluster_cfg.node_id.as_str(), "test-node-1");
         assert_eq!(cluster_cfg.discovery.strategy, "static");
-        assert_eq!(cluster_cfg.coordination.raft_port, 7947);
         assert_eq!(cluster_cfg.formation_timeout, Duration::from_secs(60));
     }
 
@@ -187,14 +172,6 @@ mod tests {
         config.discovery = None;
         let err = ClusterConfig::from_server_config(&config).unwrap_err();
         assert!(err.to_string().contains("[discovery]"));
-    }
-
-    #[test]
-    fn test_cluster_config_missing_coordination() {
-        let mut config = cluster_config();
-        config.coordination = None;
-        let err = ClusterConfig::from_server_config(&config).unwrap_err();
-        assert!(err.to_string().contains("[coordination]"));
     }
 
     #[test]

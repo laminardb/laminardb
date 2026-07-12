@@ -202,7 +202,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if config.server.mode == "cluster" {
+    if config.server.mode == ServerMode::Cluster {
         match config.server.delivery {
             DeliveryGuarantee::BestEffort => errors.push(
                 "cluster mode requires at_least_once delivery; best_effort has no defined \
@@ -219,9 +219,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
         if config.discovery.is_none() {
             errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
-        }
-        if config.coordination.is_none() {
-            errors.push("mode = \"cluster\" requires a [coordination] section".to_string());
         }
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
@@ -299,7 +296,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
     }
     if let Some(chain_max) = config.checkpoint.delta_chain_max {
-        if config.server.mode != "cluster" {
+        if config.server.mode != ServerMode::Cluster {
             errors.push("checkpoint.delta_chain_max is supported only in cluster mode".to_string());
         }
         if chain_max == 0
@@ -377,6 +374,7 @@ fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
 
 /// Top-level server configuration deserialized from `laminardb.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
     pub server: ServerSection,
@@ -399,7 +397,6 @@ pub struct ServerConfig {
     #[serde(default)]
     pub sql: Option<String>,
     pub discovery: Option<DiscoverySection>,
-    pub coordination: Option<CoordinationSection>,
     pub node_id: Option<String>,
     /// `[ai]` — AI provider wiring and per-task default models.
     #[serde(default)]
@@ -409,11 +406,22 @@ pub struct ServerConfig {
     pub models: std::collections::HashMap<String, ModelConfig>,
 }
 
+/// Runtime protocol boundary selected by `[server].mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerMode {
+    /// Embedded library or standalone single-node hosting.
+    #[default]
+    Embedded,
+    /// Multi-node runtime with discovery, durable leases, and shared state.
+    Cluster,
+}
+
 /// `[server]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerSection {
-    #[serde(default = "default_mode")]
-    pub mode: String,
+    #[serde(default)]
+    pub mode: ServerMode,
     #[serde(default = "default_bind")]
     pub bind: String,
     /// End-to-end pipeline delivery contract. Connector protocols are derived from this value.
@@ -492,7 +500,7 @@ impl ServerSection {
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
-            mode: default_mode(),
+            mode: ServerMode::default(),
             bind: default_bind(),
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
@@ -938,19 +946,6 @@ pub struct DiscoverySection {
     pub cluster_tls_server_name: Option<String>,
 }
 
-/// `[coordination]` section: cluster coordination.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct CoordinationSection {
-    #[serde(default = "default_coordination_strategy")]
-    pub strategy: String,
-    #[serde(default = "default_raft_port")]
-    pub raft_port: u16,
-    #[serde(default = "default_election_timeout", with = "humantime_serde")]
-    pub election_timeout: Duration,
-    #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
-    pub heartbeat_interval: Duration,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file '{}': {source}", path.display())]
@@ -969,9 +964,6 @@ pub enum ConfigError {
     ValidationErrors { errors: Vec<String> },
 }
 
-fn default_mode() -> String {
-    "embedded".to_string()
-}
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
@@ -1021,19 +1013,6 @@ fn default_delivery() -> DeliveryGuarantee {
 fn default_gossip_port() -> u16 {
     7946
 }
-fn default_coordination_strategy() -> String {
-    "raft".to_string()
-}
-fn default_raft_port() -> u16 {
-    7947
-}
-fn default_election_timeout() -> Duration {
-    Duration::from_millis(1500)
-}
-fn default_heartbeat_interval() -> Duration {
-    Duration::from_millis(300)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1183,13 +1162,35 @@ task = "classify"
     fn test_parse_minimal_config() {
         let toml = "[server]\n";
         let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.mode, "embedded");
+        assert_eq!(config.server.mode, ServerMode::Embedded);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(config.server.incremental_emit);
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert!(config.sources.is_empty());
         assert!(config.pipelines.is_empty());
         assert!(config.sinks.is_empty());
+    }
+
+    #[test]
+    fn test_server_mode_rejects_unknown_values() {
+        let error = toml::from_str::<ServerConfig>("[server]\nmode = \"cluser\"\n")
+            .expect_err("a mistyped runtime mode must not fall back to embedded");
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(
+            message.contains("embedded") && message.contains("cluster"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_removed_coordination_section_is_rejected() {
+        let error = toml::from_str::<ServerConfig>(
+            "[server]\nmode = \"cluster\"\n[coordination]\nstrategy = \"raft\"\n",
+        )
+        .expect_err("removed coordination settings must not be silently ignored");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(error.to_string().contains("coordination"), "{error}");
     }
 
     #[test]
@@ -1277,12 +1278,6 @@ gossip_port = 7946
 failure_domain = "region=us-east-1;zone=us-east-1a;rack=r17"
 placement_isolation_tier = 1
 
-[coordination]
-strategy = "raft"
-raft_port = 7947
-election_timeout = "1500ms"
-heartbeat_interval = "300ms"
-
 [[source]]
 name = "orders"
 connector = "kafka"
@@ -1301,7 +1296,7 @@ connector = "kafka"
 
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
-        assert_eq!(config.server.mode, "cluster");
+        assert_eq!(config.server.mode, ServerMode::Cluster);
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert!(matches!(
             &config.state,
@@ -1312,7 +1307,6 @@ connector = "kafka"
             StateBackendDurability::ClusterShared
         );
         assert!(config.discovery.is_some());
-        assert!(config.coordination.is_some());
 
         let disc = config.discovery.as_ref().unwrap();
         assert_eq!(
@@ -1320,10 +1314,6 @@ connector = "kafka"
             Some("region=us-east-1;zone=us-east-1a;rack=r17")
         );
         assert_eq!(disc.placement_isolation_tier, 1);
-
-        let coord = config.coordination.as_ref().unwrap();
-        assert_eq!(coord.election_timeout, Duration::from_millis(1500));
-        assert_eq!(coord.heartbeat_interval, Duration::from_millis(300));
 
         validate_config(&config).unwrap();
     }
@@ -1361,8 +1351,6 @@ path = "/tmp/laminar-state"
 strategy = "static"
 seeds = ["node-1:7946"]
 
-[coordination]
-strategy = "raft"
 "#,
         )
         .unwrap();
@@ -1383,13 +1371,12 @@ delivery = "exactly_once"
 [state]
 backend = "object_store"
 url = "s3://bucket/state"
+instance_id = "node-1"
 
 [discovery]
 strategy = "static"
 seeds = ["node-1:7946"]
 
-[coordination]
-strategy = "raft"
 "#,
         )
         .unwrap();
@@ -1413,6 +1400,7 @@ delivery = "best_effort"
 [state]
 backend = "object_store"
 url = "s3://bucket/state"
+instance_id = "node-1"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1421,8 +1409,6 @@ url = "s3://bucket/checkpoints"
 strategy = "static"
 seeds = ["node-1:7946"]
 
-[coordination]
-strategy = "raft"
 "#,
         )
         .unwrap();
@@ -1621,8 +1607,6 @@ interval = "50ms"
 strategy = "static"
 seeds = ["x:1"]
 
-[coordination]
-strategy = "raft"
 "#;
         let config: ServerConfig = toml::from_str(toml).unwrap();
         let err = validate_config(&config).unwrap_err();
@@ -1884,14 +1868,13 @@ alice = "wonderland-key"
             pipelines: vec![],
             sinks: vec![],
             discovery: None,
-            coordination: None,
             node_id: None,
             sql: None,
             ai: Default::default(),
             models: Default::default(),
         };
 
-        assert_eq!(config.server.mode, "embedded");
+        assert_eq!(config.server.mode, ServerMode::Embedded);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
@@ -2001,7 +1984,6 @@ interval = "10s"
         match err {
             ConfigError::ValidationErrors { errors } => {
                 assert!(errors.iter().any(|e| e.contains("[discovery]")));
-                assert!(errors.iter().any(|e| e.contains("[coordination]")));
                 assert!(errors.iter().any(|e| e.contains("node_id")));
             }
             _ => panic!("expected ValidationErrors"),

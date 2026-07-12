@@ -288,7 +288,7 @@ Pre-configured deployment tiers (`laminar_db::Profile`). Each tier includes all 
 | `BareMetal` | Default. In-memory only, no persistence. Fastest startup. |
 | `Embedded` | Local filesystem checkpoint persistence for single-node embedded use. |
 | `Durable` | Object-store checkpoints (S3/GCS/Azure) for recovery. |
-| `Cluster` | Distributed deployment with Chitchat gossip discovery, Raft partition metadata consensus, and gRPC/Arrow-Flight shuffles. |
+| `Cluster` | Distributed deployment with static/Chitchat discovery, shared-store assignment CAS plus a renewable leader lease, and gRPC/Arrow-Flight shuffles. |
 
 The builder can auto-detect the appropriate profile from the configured checkpoint URL and discovery settings.
 
@@ -359,7 +359,7 @@ node. Local paths and `file://` storage are node-durable only.
 
 ## Exactly-Once Semantics
 
-Certified exactly-once processing is currently an embedded/single-node mode and works through:
+Exactly-once admission is currently limited to embedded/single-node mode and works through:
 
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
 2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured
@@ -368,19 +368,26 @@ Certified exactly-once processing is currently an embedded/single-node mode and 
 5. **Recovery** -- `RecoveryManager` accepts an identity-matching Finalized manifest or an exact
    decided Prepared manifest (which it finalizes), restores state/source positions, and resumes
    external commits from their exact cursor
+6. **Decision retention** -- Before artifact deletion, the coordinator publishes a monotonic,
+   deployment-scoped durable GC floor containing the full canonical predecessor decision. That
+   anchor preserves external-cursor continuity after the corresponding raw decision is removed.
+7. **Shutdown ownership** -- An issued decision write remains owned until its task settles.
+   Teardown never cancels or detaches it before releasing deployment or recovery fences.
 
-Startup additionally requires node-durable state, a local checkpoint directory
-held by an exclusive OS deployment lock, replayable sources, and a
-checkpoint-committable sink. Shared-object-store local exact deployments fail
-closed with `[LDB-0014]` until their lease term can fence decisions and sink
-commits. Incompatible connectors fail before external I/O; there is no
-per-connector delivery override or public writer ID.
+Startup additionally requires node-durable state, the built-in local
+checkpoint/decision store held by an exclusive OS deployment lock, replayable
+sources, and a `CheckpointCommittable` sink. Any configured checkpoint/object-
+store URL (including `file://`) or injected decision store fails closed with
+`[LDB-0014]` because it erases the provenance needed to prove that the local
+lock fences every writer. Incompatible connectors fail before external I/O;
+there is no per-connector delivery override or public writer ID.
 
-The currently reachable certified external matrix is narrower: local file or
-generator input to append-mode Delta Lake or Iceberg. Kafka is replayable in
-principle, but its source requires engine-owned vnode assignment that is not yet
-wired in local mode; its sink is durable at-least-once and has no recoverable
-checkpoint committable. Kafka transactions must not be advertised as exact
+The reachable external matrix is narrow and not yet production-certified.
+Append-mode Delta Lake and Iceberg are the only implemented/admitted local
+`CheckpointCommittable` sinks, and still require process-death output-oracle
+certification. Local Kafka sources now use engine-owned assignment in supported
+guaranteed modes, but the Kafka sink is `DurableAtLeastOnce`, never
+`CheckpointCommittable`. Kafka transactions must not be advertised as exact
 until a crash after the engine decision can be recovered and committed from
 durable staged output.
 
@@ -388,8 +395,8 @@ durable staged output.
 
 With the `cluster` feature enabled, multi-node operation provides:
 
-- **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip is implemented.
-- **Coordination** -- Metadata/partition coordination and a renewable leader lease
+- **Discovery** -- Static seed configuration or Chitchat gossip membership.
+- **Coordination** -- Shared-store assignment CAS and a renewable leader lease; no embedded Raft service
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
 - **Distributed Checkpoints** -- Cross-node capture and shared durable state for at-least-once recovery
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out

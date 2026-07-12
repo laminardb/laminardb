@@ -701,7 +701,8 @@ mod tests {
         let registry = ConnectorRegistry::new();
         register_delta_lake_sink(&registry);
 
-        let config = crate::config::ConnectorConfig::new("delta-lake");
+        let mut config = crate::config::ConnectorConfig::new("delta-lake");
+        config.set("table.path", "/tmp/laminardb-factory-test");
         let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
@@ -828,7 +829,11 @@ mod tests {
         let registry = ConnectorRegistry::new();
         register_iceberg_sink(&registry);
 
-        let config = crate::config::ConnectorConfig::new("iceberg");
+        let mut config = crate::config::ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "http://localhost:8181");
+        config.set("warehouse", "s3://bucket/warehouse");
+        config.set("namespace", "default");
+        config.set("table.name", "events");
         let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }

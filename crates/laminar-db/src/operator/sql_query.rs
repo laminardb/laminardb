@@ -1209,8 +1209,14 @@ async fn shuffle_pre_agg_batches(
             continue;
         }
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
+        let assignment = cfg.registry.snapshot();
         for &v in &row_vn {
-            if cfg.registry.owner(v).is_unassigned() {
+            let owner = usize::try_from(v)
+                .ok()
+                .and_then(|vnode| assignment.get(vnode))
+                .copied()
+                .unwrap_or(laminar_core::state::NodeId::UNASSIGNED);
+            if owner.is_unassigned() {
                 // Formation/rebalance transient — defer (recoverable), don't drop. Nothing sent yet.
                 return Err(DbError::ShuffleNotReady(format!(
                     "[{op_name}] row-shuffle: vnode {v} is unassigned"

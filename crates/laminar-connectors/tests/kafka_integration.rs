@@ -14,8 +14,12 @@ use std::time::Duration;
 
 use arrow_array::{Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::{Offset, TopicPartitionList};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
@@ -63,6 +67,78 @@ async fn produce_messages(brokers: &str, topic: &str, count: usize) {
             )
             .await
             .expect("send failed");
+    }
+}
+
+async fn wait_for_group_offset(
+    brokers: &str,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    expected: i64,
+) {
+    let observer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group_id)
+        .create()
+        .expect("group offset observer creation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut requested = TopicPartitionList::new();
+        requested.add_partition(topic, partition);
+        let committed = observer
+            .committed_offsets(requested, Duration::from_secs(1))
+            .expect("committed offset query");
+        if committed
+            .find_partition(topic, partition)
+            .is_some_and(|entry| entry.offset() == Offset::Offset(expected))
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Kafka did not persist advisory group offset {topic}-{partition}@{expected}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn expand_topic_and_wait(brokers: &str, topic: &str, partition_count: usize) {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("Kafka admin creation");
+    let change = NewPartitions::new(topic, partition_count);
+    let results = admin
+        .create_partitions([&change], &AdminOptions::new())
+        .await
+        .expect("partition expansion request");
+    assert!(
+        results.into_iter().all(|result| result.is_ok()),
+        "Kafka rejected partition expansion"
+    );
+
+    let observer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", "partition-inventory-observer")
+        .create()
+        .expect("partition inventory observer creation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let observed = observer
+            .fetch_metadata(Some(topic), Duration::from_secs(1))
+            .expect("partition inventory metadata query")
+            .topics()
+            .first()
+            .map_or(0, |metadata| metadata.partitions().len());
+        if observed == partition_count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Kafka metadata did not expose {partition_count} partitions for {topic}"
+        );
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -182,37 +258,67 @@ async fn checkpoint_restore(brokers: &str) {
 
     produce_messages(brokers, topic, n).await;
 
-    let cfg = make_config(brokers, "test-checkpoint-group", topic);
+    let mut cfg = make_config(brokers, "test-checkpoint-group", topic);
+    cfg.startup_mode = laminar_connectors::kafka::StartupMode::Earliest;
     let connector_cfg = ConnectorConfig::new("kafka");
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
     source
-        .start(initial_source_start(&connector_cfg))
+        .start(SourceStart {
+            config: connector_cfg.clone(),
+            position: SourcePosition::Initial,
+            delivery: DeliveryGuarantee::ExactlyOnce,
+        })
+        .await
+        .unwrap();
+
+    // A checkpoint taken before the first accepted record still seals the complete partition
+    // inventory. Restarting from it must begin at the configured stable baseline, not a moving
+    // broker group cursor.
+    let before_first_record = source.checkpoint();
+    source.close().await.unwrap();
+    let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
+    source
+        .start(SourceStart {
+            config: connector_cfg.clone(),
+            position: SourcePosition::Resume {
+                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                checkpoint: before_first_record,
+            },
+            delivery: DeliveryGuarantee::ExactlyOnce,
+        })
         .await
         .unwrap();
 
     poll_all(&mut source, n, Duration::from_secs(30)).await;
     let checkpoint = source.checkpoint();
-    // The streaming coordinator drives broker commits by calling
-    // `notify_epoch_committed` after a barrier. Without it source 2
-    // joining the same group has no stored offsets and falls back to
-    // `auto.offset.reset`.
+    // The streaming coordinator drives this advisory monitoring cursor after a barrier. Engine
+    // recovery below remains bound to its explicit checkpoint and never trusts the group offset.
     source.notify_epoch_committed(1, &checkpoint).await.unwrap();
+    wait_for_group_offset(brokers, "test-checkpoint-group", topic, 0, n as i64).await;
     source.close().await.unwrap();
 
     let extra = 10;
     produce_messages(brokers, topic, extra).await;
 
-    let mut source2 = KafkaSource::new(test_schema(), cfg, None);
+    let mut source2 = KafkaSource::new(test_schema(), cfg.clone(), None);
     source2
         .start(SourceStart {
             config: connector_cfg,
             position: SourcePosition::Resume {
                 attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                checkpoint,
+                checkpoint: checkpoint.clone(),
             },
-            delivery: DeliveryGuarantee::AtLeastOnce,
+            delivery: DeliveryGuarantee::ExactlyOnce,
         })
+        .await
+        .unwrap();
+
+    // Coordinated recovery may complete a barrier while source intake remains
+    // gated. The advisory progress commit must enqueue before the resumed
+    // connector's first poll; the subsequent poll services its broker callback.
+    source2
+        .notify_epoch_committed(2, &checkpoint)
         .await
         .unwrap();
 
@@ -221,6 +327,24 @@ async fn checkpoint_restore(brokers: &str) {
     assert_eq!(total, extra);
 
     source2.close().await.unwrap();
+
+    // A new partition has no position in the decided checkpoint. Guaranteed recovery rejects the
+    // topology change instead of assigning that partition at a newer broker end and skipping it.
+    expand_topic_and_wait(brokers, topic, 2).await;
+    let mut changed = KafkaSource::new(test_schema(), cfg, None);
+    let error = changed
+        .start(SourceStart {
+            config: ConnectorConfig::new("kafka"),
+            position: SourcePosition::Resume {
+                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                checkpoint,
+            },
+            delivery: DeliveryGuarantee::ExactlyOnce,
+        })
+        .await
+        .expect_err("partition expansion must fail a guaranteed resume closed");
+    assert!(error.to_string().contains("partition inventory changed"));
+    changed.close().await.unwrap();
 }
 
 async fn poison_pill(brokers: &str) {

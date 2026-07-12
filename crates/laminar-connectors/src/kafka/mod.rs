@@ -7,7 +7,6 @@ pub mod metrics;
 pub mod offsets;
 pub mod rebalance;
 pub mod source;
-pub mod watermarks;
 
 // Sink modules
 pub mod avro_serializer;
@@ -29,7 +28,6 @@ pub use config::{
 pub use metrics::KafkaSourceMetrics;
 pub use offsets::OffsetTracker;
 pub use source::KafkaSource;
-pub use watermarks::{KafkaWatermarkTracker, WatermarkMetrics};
 
 // Sink re-exports
 pub use avro_serializer::AvroSerializer;
@@ -205,23 +203,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "false",
         ),
         ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
-        ConfigKeySpec::optional(
-            "event.time.column",
-            "Column name for event time extraction",
-            "",
-        ),
-        // Watermark
-        ConfigKeySpec::optional(
-            "max.out.of.orderness.ms",
-            "Max out-of-orderness for watermarks",
-            "5000",
-        ),
-        ConfigKeySpec::optional("idle.timeout.ms", "Idle partition timeout", "30000"),
-        ConfigKeySpec::optional(
-            "enable.watermark.tracking",
-            "Enable per-partition watermark tracking",
-            "false",
-        ),
         // Backpressure
         ConfigKeySpec::optional(
             "backpressure.high.watermark",

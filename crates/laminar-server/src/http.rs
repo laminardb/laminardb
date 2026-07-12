@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use laminar_db::{ConnectorInfo, LaminarDB, PipelineNodeType};
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, ServerMode};
 use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
@@ -809,7 +809,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = state.current_config.read();
-    if config.server.mode != "cluster" {
+    if config.server.mode != ServerMode::Cluster {
         return error_response(
             StatusCode::NOT_FOUND,
             "cluster endpoint is only available when server.mode = \"cluster\"",
@@ -1311,7 +1311,6 @@ mod tests {
                 pipelines: vec![],
                 sinks: vec![],
                 discovery: None,
-                coordination: None,
                 node_id: None,
                 sql: None,
                 ai: Default::default(),
@@ -1355,7 +1354,6 @@ mod tests {
                 pipelines: vec![],
                 sinks: vec![],
                 discovery: None,
-                coordination: None,
                 node_id: None,
                 sql: None,
                 ai: Default::default(),
@@ -1721,7 +1719,6 @@ mod tests {
                 pipelines: vec![],
                 sinks: vec![],
                 discovery: None,
-                coordination: None,
                 node_id: None,
                 sql: None,
                 ai: Default::default(),
