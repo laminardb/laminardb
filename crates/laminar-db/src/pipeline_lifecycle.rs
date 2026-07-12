@@ -38,6 +38,22 @@ const EXACT_SINK_PROTOCOL: &str =
     "exactly-once external sinks require checkpoint-committable consistency, coordinated phase \
      1, participant-complete sealed markers, and a namespaced exact external cursor";
 
+/// Hand a compute fault to cluster recovery without retaining pipeline lifecycle ownership.
+///
+/// Recovery stops the pipeline by joining its watcher, so this path must never wait for an active
+/// recovery announcement to clear. A successful restore clears the report; a failed round leaves
+/// it available for retry.
+#[cfg(feature = "cluster")]
+async fn report_cluster_compute_fault(
+    controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+) -> bool {
+    let Some(controller) = controller else {
+        return false;
+    };
+    crate::coordinated_recovery::report_local_fault(&controller).await;
+    true
+}
+
 /// Validate source durability and placement before the connector performs I/O.
 fn admit_source_contract(
     contract: SourceContract,
@@ -2945,26 +2961,7 @@ impl LaminarDB {
                     // restart; the monitor restores this node. A local restart would rewind
                     // only this node while peers advanced — an inconsistent cut.
                     #[cfg(feature = "cluster")]
-                    if let Some(controller) = watcher_controller {
-                        // Round churn self-heals: an active round's restore clears Faulted.
-                        // Delay past the round plus a settle window and re-check rather
-                        // than dropping the report — a round is a Faulted node's only
-                        // recovery path, so a dropped report is a permanently dead node.
-                        let deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(150);
-                        while controller.observe_recover().await.is_some()
-                            && tokio::time::Instant::now() < deadline
-                        {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        if matches!(DbState::load(&watcher_state), DbState::Faulted) {
-                            crate::coordinated_recovery::report_local_fault(&controller).await;
-                        } else {
-                            tracing::info!(
-                                "fault healed by an in-flight recovery round; not reporting"
-                            );
-                        }
+                    if report_cluster_compute_fault(watcher_controller).await {
                         return;
                     }
                     // Auto-restart if supervised; otherwise the pipeline stays Faulted.
@@ -4136,6 +4133,46 @@ mod exact_deployment_lock_tests {
             .await
             .expect_err("custom decision-store provenance cannot prove local process fencing");
         assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_fault_watcher_tests {
+    use super::report_cluster_compute_fault;
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv, RecoverPhase};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_recovery_does_not_block_compute_fault_handoff() {
+        let node_id = NodeId(7);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller.announce_recover_prepare(42).await;
+        assert!(matches!(
+            controller.observe_recover().await,
+            Some((RecoverPhase::Prepare, 42))
+        ));
+
+        let handed_off = tokio::time::timeout(
+            Duration::from_secs(1),
+            report_cluster_compute_fault(Some(Arc::clone(&controller))),
+        )
+        .await
+        .expect("fault handoff waited for the active recovery round to clear");
+
+        assert!(handed_off);
+        assert!(controller
+            .read_fault_reports()
+            .await
+            .into_iter()
+            .any(|(node, sequence)| node == node_id && sequence > 0));
+        assert!(matches!(
+            controller.observe_recover().await,
+            Some((RecoverPhase::Prepare, 42))
+        ));
     }
 }
 
