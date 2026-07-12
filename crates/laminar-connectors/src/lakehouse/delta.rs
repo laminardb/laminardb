@@ -44,6 +44,18 @@ use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
 use crate::connector::DeliveryGuarantee;
 
+#[cfg(feature = "delta-lake")]
+async fn await_delta_write<T, F>(write_timeout: Duration, write: F) -> Result<T, ConnectorError>
+where
+    F: std::future::Future<Output = Result<T, ConnectorError>>,
+{
+    tokio::time::timeout(write_timeout, write)
+        .await
+        .map_err(|_| {
+            ConnectorError::WriteError(format!("Delta write timed out after {write_timeout:?}"))
+        })?
+}
+
 /// Counts `(upserts, deletes)` in a collapsed changelog batch's `_op` column.
 /// A row is a delete iff `_op == "D"`; everything else (including a missing or
 /// null op) counts as an upsert. Used only for collapse observability.
@@ -146,6 +158,10 @@ pub struct DeltaLakeSink {
     /// allocator churn under steady-state upsert load.
     #[cfg(feature = "delta-lake")]
     merge_session: Option<datafusion::prelude::SessionContext>,
+    /// Test hook that makes coordinated descriptor preparation remain pending.
+    /// This is compiled out of production builds.
+    #[cfg(all(test, feature = "delta-lake"))]
+    stall_descriptor_write: bool,
 }
 
 impl DeltaLakeSink {
@@ -184,6 +200,8 @@ impl DeltaLakeSink {
             cached_writer_properties: None,
             #[cfg(feature = "delta-lake")]
             merge_session: None,
+            #[cfg(all(test, feature = "delta-lake"))]
+            stall_descriptor_write: false,
         }
     }
 
@@ -595,6 +613,11 @@ impl DeltaLakeSink {
     async fn write_staged_to_descriptor(&self) -> Result<Vec<u8>, ConnectorError> {
         use deltalake::writer::{DeltaWriter, RecordBatchWriter};
 
+        #[cfg(test)]
+        if self.stall_descriptor_write {
+            std::future::pending::<()>().await;
+        }
+
         let table = self
             .table
             .as_ref()
@@ -703,18 +726,10 @@ impl DeltaLakeSink {
             // Azure LB drops idle connections after ~4 min; without this,
             // a dead connection blocks the sink task forever.
             let write_timeout = self.config.write_timeout;
+            // The table handle is consumed by attempt_delta_write; after either a timeout or
+            // write error the retry loop reopens it through reopen_table().
             let write_result =
-                tokio::time::timeout(write_timeout, self.attempt_delta_write(table)).await;
-
-            // Convert timeout to a write error. The table handle was consumed
-            // by attempt_delta_write; the retry loop will reopen via reopen_table().
-            let write_result = match write_result {
-                Ok(inner) => inner,
-                Err(_elapsed) => Err(ConnectorError::WriteError(format!(
-                    "Delta write timed out after {}s",
-                    write_timeout.as_secs()
-                ))),
-            };
+                await_delta_write(write_timeout, self.attempt_delta_write(table)).await;
 
             match write_result {
                 Ok(table) => {
@@ -1329,14 +1344,8 @@ impl SinkConnector for DeltaLakeSink {
             // Same timeout the commit path uses: a stale object-store connection
             // must not hang the sink task forever (Azure LB drops idle conns).
             let write_timeout = self.config.write_timeout;
-            let descriptor = tokio::time::timeout(write_timeout, self.write_staged_to_descriptor())
-                .await
-                .map_err(|_| {
-                    ConnectorError::WriteError(format!(
-                        "Delta write timed out after {}s",
-                        write_timeout.as_secs()
-                    ))
-                })??;
+            let descriptor =
+                await_delta_write(write_timeout, self.write_staged_to_descriptor()).await?;
             self.staged_batches.clear();
             self.staged_rows = 0;
             self.staged_bytes = 0;

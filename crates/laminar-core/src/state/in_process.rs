@@ -25,8 +25,6 @@ pub struct InProcessBackend {
     partials: RwLock<FxHashMap<(CheckpointAttempt, u32), StoredPartial>>,
     /// `attempt -> key -> descriptor`, mirroring the durable attempt namespace.
     descriptors: RwLock<FxHashMap<CheckpointAttempt, FxHashMap<String, Bytes>>>,
-    /// `attempt -> node_key -> source offsets`.
-    source_offsets: RwLock<FxHashMap<CheckpointAttempt, FxHashMap<String, Bytes>>>,
     /// Exact attempts sealed by [`StateBackend::seal_checkpoint`].
     sealed: RwLock<BTreeMap<CheckpointAttempt, CheckpointSeal>>,
     execution_id: uuid::Uuid,
@@ -40,7 +38,6 @@ impl InProcessBackend {
         Self {
             partials: RwLock::new(FxHashMap::default()),
             descriptors: RwLock::new(FxHashMap::default()),
-            source_offsets: RwLock::new(FxHashMap::default()),
             sealed: RwLock::new(BTreeMap::new()),
             execution_id: uuid::Uuid::new_v4(),
             vnode_capacity,
@@ -170,49 +167,6 @@ impl StateBackend for InProcessBackend {
         Ok(descriptors)
     }
 
-    async fn write_source_offsets(
-        &self,
-        attempt: CheckpointAttempt,
-        node_key: &str,
-        _assignment_version: u64,
-        bytes: Bytes,
-    ) -> Result<(), StateBackendError> {
-        let mut source_offsets = self.source_offsets.write();
-        let attempt_offsets = source_offsets.entry(attempt).or_default();
-        match attempt_offsets.get(node_key) {
-            Some(existing) if existing == &bytes => Ok(()),
-            Some(_) => Err(StateBackendError::Conflict {
-                resource: format!(
-                    "state-v2/epoch={}/checkpoint={}/srcoff/{node_key}",
-                    attempt.epoch, attempt.checkpoint_id
-                ),
-                message: "source offsets already exist with different bytes".into(),
-            }),
-            None => {
-                attempt_offsets.insert(node_key.to_string(), bytes);
-                Ok(())
-            }
-        }
-    }
-
-    async fn read_source_offsets(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<Bytes>, StateBackendError> {
-        let mut offsets: Vec<_> = self
-            .source_offsets
-            .read()
-            .get(&attempt)
-            .map(|m| {
-                m.iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        offsets.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        Ok(offsets.into_iter().map(|(_, value)| value).collect())
-    }
-
     async fn seal_checkpoint(
         &self,
         attempt: CheckpointAttempt,
@@ -317,9 +271,6 @@ impl StateBackend for InProcessBackend {
         self.descriptors
             .write()
             .retain(|attempt, _| attempt.epoch >= before);
-        self.source_offsets
-            .write()
-            .retain(|attempt, _| attempt.epoch >= before);
         self.sealed
             .write()
             .retain(|attempt, _| attempt.epoch >= before);
@@ -331,9 +282,6 @@ impl StateBackend for InProcessBackend {
             .write()
             .retain(|&(attempt, _), _| attempt.epoch <= after);
         self.descriptors
-            .write()
-            .retain(|attempt, _| attempt.epoch <= after);
-        self.source_offsets
             .write()
             .retain(|attempt, _| attempt.epoch <= after);
         self.sealed
@@ -398,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn descriptors_and_source_offsets_are_immutable_per_attempt() {
+    async fn descriptors_are_immutable_per_attempt() {
         let b = InProcessBackend::new(2);
         let checkpoint = attempt(2);
         b.write_commit_descriptor(checkpoint, "sink", 0, Bytes::from_static(b"d"))
@@ -409,15 +357,6 @@ mod tests {
             .unwrap();
         assert!(matches!(
             b.write_commit_descriptor(checkpoint, "sink", 0, Bytes::from_static(b"other"))
-                .await,
-            Err(StateBackendError::Conflict { .. })
-        ));
-
-        b.write_source_offsets(checkpoint, "node", 0, Bytes::from_static(b"o"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            b.write_source_offsets(checkpoint, "node", 0, Bytes::from_static(b"other"))
                 .await,
             Err(StateBackendError::Conflict { .. })
         ));

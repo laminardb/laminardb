@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cluster")]
+use futures::{StreamExt, TryStreamExt};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::CoordinatedCommitNamespace;
 use laminar_core::state::{CheckpointAttempt, StateBackend};
@@ -112,9 +114,22 @@ const COORDINATED_COMMITTER_POLL: Duration = Duration::from_secs(1);
 #[cfg(feature = "cluster")]
 const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
 
+/// A follower's relationship to the durable decision for one exact attempt.
+///
+/// `Excluded` is a terminal decision for the local participant: the cluster committed the cut,
+/// but this participant was not part of it and must discard any late prepared state.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowerDecisionMatch {
+    Pending,
+    Included,
+    Excluded,
+}
+
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
-    /// Number of completed checkpoints retained on disk/in object store.
+    /// Number of predecessor checkpoints retained alongside the current recovery cut.
+    /// Predecessors keep reference/delta partial chains resolvable.
     pub max_retained: usize,
     /// Hard end-to-end deadline for one durable checkpoint attempt. Phase-specific connector
     /// and storage limits are clamped by this single semantic deadline.
@@ -122,12 +137,8 @@ pub struct CheckpointConfig {
     /// Internal recovery/rollback budget. This is deliberately not an end-user checkpoint
     /// tuning dimension: cleanup happens only after the attempt deadline or another failure.
     pub(crate) cleanup_timeout: Duration,
-    /// Quorum wait timeout for checkpoint coordination.
-    pub quorum_timeout: Duration,
-    /// Max wait for every vnode's partial to land before the epoch is declared restorable.
-    ///
-    /// The gate polls (followers upload asynchronously after the capture ack); expiry aborts.
-    pub restorable_gate_timeout: Duration,
+    /// Private cluster-control health limit; the absolute checkpoint deadline remains authoritative.
+    pub(crate) quorum_timeout: Duration,
     /// Max pipelined epochs between `Aligned` and restorable. Exactly-once pipelines cap at 1.
     pub max_in_flight_epochs: u64,
     /// Cap on in-flight captured-state bytes. At the cap, barrier admission pauses.
@@ -144,8 +155,6 @@ impl Default for CheckpointConfig {
             checkpoint_timeout: Duration::from_secs(120),
             cleanup_timeout: Duration::from_secs(30),
             quorum_timeout: Duration::from_secs(3),
-            // Last-resort bound: fail-fasts catch dead participants in seconds.
-            restorable_gate_timeout: Duration::from_secs(10),
             max_in_flight_epochs: 4,
             max_staged_bytes: 512 * 1024 * 1024,
             max_uncommitted_epochs: 16,
@@ -365,6 +374,42 @@ pub(crate) enum QuorumStage {
         /// Followers that acked the capture quorum.
         participants: Vec<QuorumPeer>,
     },
+}
+
+#[cfg(feature = "cluster")]
+const PARTICIPANT_READY_VERSION: u16 = 1;
+#[cfg(feature = "cluster")]
+pub(crate) const PARTICIPANT_READY_PREFIX: &str = "participant-ready/v1/participant=";
+#[cfg(feature = "cluster")]
+const PARTICIPANT_READY_READ_CONCURRENCY: usize = 8;
+
+/// Durable proof that one capture participant completed its entire local prepare.
+///
+/// The marker is written after the manifest, source offsets, sink descriptors, and vnode
+/// partials. The leader requires every capture participant's key in the immutable state seal
+/// before recording the global decision.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ParticipantReady {
+    version: u16,
+    attempt: CheckpointAttempt,
+    participant_id: u64,
+    assignment_version: u64,
+    deployment_id: String,
+    pipeline_identity: PipelineIdentity,
+    owned_vnodes: Vec<u32>,
+    source_offsets: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn participant_ready_key(participant_id: u64) -> String {
+    format!("{PARTICIPANT_READY_PREFIX}{participant_id}")
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn participant_from_ready_key(key: &str) -> Option<u64> {
+    let participant_id = key.strip_prefix(PARTICIPANT_READY_PREFIX)?.parse().ok()?;
+    (participant_ready_key(participant_id) == key).then_some(participant_id)
 }
 
 /// Leadership observation captured for one cluster checkpoint attempt.
@@ -650,6 +695,11 @@ pub struct CheckpointCoordinator {
     // coordinator drop, so remote GC can neither enter source-ack latency nor detach.
     retention_requests: tokio::sync::watch::Sender<Option<RetentionRequest>>,
     retention_requested_horizon: u64,
+    // Followers prune only their participant-local manifest namespace. Keep that horizon
+    // independent from shared state/decision GC: after a role change, a follower-local horizon
+    // must never let a newly promoted leader advance shared retention past its commit floor.
+    #[cfg(feature = "cluster")]
+    local_manifest_retention_requested_horizon: u64,
     maintenance_tasks: tokio::task::JoinSet<()>,
     // Invalidated on `register_sink`; rebuilt on the next checkpoint.
     cached_sorted_sink_names: Option<Vec<String>>,
@@ -770,6 +820,8 @@ impl CheckpointCoordinator {
             cluster_controller: None,
             retention_requests,
             retention_requested_horizon: 0,
+            #[cfg(feature = "cluster")]
+            local_manifest_retention_requested_horizon: 0,
             maintenance_tasks,
             cached_sorted_sink_names: None,
         })
@@ -800,6 +852,37 @@ impl CheckpointCoordinator {
             warn!(
                 epoch,
                 horizon = self.retention_requested_horizon,
+                "[LDB-6026] checkpoint retention worker is unavailable"
+            );
+        }
+    }
+
+    /// Schedule participant-local manifest retention without advancing the shared GC horizon.
+    ///
+    /// A coordinator can be promoted after serving as a follower. Reusing
+    /// `retention_requested_horizon` here would allow the old follower horizon to overtake a
+    /// lagging coordinated-sink commit floor when that coordinator later becomes leader.
+    #[cfg(feature = "cluster")]
+    fn schedule_local_manifest_retention_prune(&mut self, horizon: u64, epoch: u64) {
+        while let Some(result) = self.maintenance_tasks.try_join_next() {
+            match result {
+                Ok(()) => warn!("checkpoint retention worker stopped unexpectedly"),
+                Err(error) => warn!(%error, "checkpoint retention worker terminated unexpectedly"),
+            }
+        }
+
+        self.local_manifest_retention_requested_horizon =
+            self.local_manifest_retention_requested_horizon.max(horizon);
+        let request = RetentionRequest {
+            horizon: self.local_manifest_retention_requested_horizon,
+            trigger_epoch: epoch,
+            state_backend: None,
+            decision_store: None,
+        };
+        if self.retention_requests.send(Some(request)).is_err() {
+            warn!(
+                epoch,
+                horizon = self.local_manifest_retention_requested_horizon,
                 "[LDB-6026] checkpoint retention worker is unavailable"
             );
         }
@@ -1279,51 +1362,94 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Persist this node's source offsets for `attempt`, keyed per node and source instance, so a node that acquires a
-    /// partition on a later rotation resumes from the committed cut (see
-    /// [`acquired_source_handoff`](Self::acquired_source_handoff)) rather than
-    /// `auto.offset.reset`.
-    /// Written pre-seal; a write error fails the epoch. No-op without a cluster assignment or backend.
-    async fn persist_source_offset_handoff(
+    /// Persist this participant's final prepare attestation.
+    ///
+    /// The payload also carries the exact source-offset handoff. Requiring its key in `_SEAL`
+    /// proves both manifest completion and a complete participant offset inventory, including
+    /// participants with zero vnodes or empty offsets.
+    #[cfg(feature = "cluster")]
+    async fn persist_participant_ready_until(
         &self,
         attempt: CheckpointAttempt,
-        source_offsets: &HashMap<String, ConnectorCheckpoint>,
+        manifest: &CheckpointManifest,
+        deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        let backend = self.state_backend.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] cluster checkpoint requires a state backend for participant \
+                 readiness attestation"
+                    .into(),
+            )
+        })?;
         if self.assignment_version == 0 {
-            return Ok(());
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] cluster participant readiness requires a non-zero assignment version"
+                    .into(),
+            ));
         }
-        let Some(ref backend) = self.state_backend else {
-            return Ok(());
-        };
-        let by_source: HashMap<String, HashMap<String, String>> = source_offsets
+        let mut owned_vnodes = self.vnode_set.clone();
+        owned_vnodes.sort_unstable();
+        owned_vnodes.dedup();
+        let source_offsets = manifest
+            .source_offsets
             .iter()
-            .filter(|(_, cp)| !cp.offsets.is_empty())
-            .map(|(source, cp)| (source.clone(), cp.offsets.clone()))
+            .map(|(source, checkpoint)| {
+                (
+                    source.clone(),
+                    checkpoint
+                        .offsets
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            })
             .collect();
-        if by_source.is_empty() {
-            return Ok(());
+        let ready = ParticipantReady {
+            version: PARTICIPANT_READY_VERSION,
+            attempt,
+            participant_id: self.self_node_id(),
+            assignment_version: self.assignment_version,
+            deployment_id: manifest.deployment_id.clone(),
+            pipeline_identity: manifest.pipeline_identity.clone(),
+            owned_vnodes,
+            source_offsets,
+        };
+        if ready.participant_id != manifest.participant_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] participant readiness writer {} does not match manifest participant {}",
+                ready.participant_id, manifest.participant_id
+            )));
         }
-        let bytes = serde_json::to_vec(&by_source)
-            .map_err(|e| DbError::Checkpoint(format!("source-offset handoff encode: {e}")))?;
-        let node_key = format!("node-{}", self.self_node_id());
-        let timeout = self.config.checkpoint_timeout;
-        tokio::time::timeout(
-            timeout,
-            backend.write_source_offsets(attempt, &node_key, self.assignment_version, bytes.into()),
+        let bytes = serde_json::to_vec(&ready)
+            .map(bytes::Bytes::from)
+            .map_err(|error| {
+                DbError::Checkpoint(format!("participant readiness encode: {error}"))
+            })?;
+        tokio::time::timeout_at(
+            deadline,
+            backend.write_commit_descriptor(
+                attempt,
+                &participant_ready_key(ready.participant_id),
+                self.assignment_version,
+                bytes,
+            ),
         )
         .await
         .map_err(|_| {
             DbError::Checkpoint(format!(
-                "source-offset handoff write timed out after {timeout:?}"
+                "[LDB-6046] participant readiness write for epoch {} checkpoint {} exceeded the \
+                 checkpoint deadline",
+                attempt.epoch, attempt.checkpoint_id
             ))
         })?
-        .map_err(|e| DbError::Checkpoint(format!("source-offset handoff write: {e}")))?;
-        Ok(())
+        .map_err(|error| {
+            DbError::Checkpoint(format!("participant readiness write failed: {error}"))
+        })
     }
 
     /// The source-instance-namespaced offset map for the latest sealed checkpoint, unioned from
-    /// every node's blob
-    /// (opaque connector key/values). An acquiring source resumes its newly-owned partitions from
+    /// every participant's readiness attestation (opaque connector key/values). An acquiring
+    /// source resumes its newly-owned partitions from
     /// the previous owner's sealed position. Empty backend / no sealed attempt yields an empty map;
     /// a read FAILURE is propagated so the caller defers the rotation rather than re-emitting.
     ///
@@ -1339,6 +1465,9 @@ impl CheckpointCoordinator {
         &self,
     ) -> Result<Option<(CheckpointAttempt, HashMap<String, HashMap<String, String>>)>, DbError>
     {
+        if self.cluster_controller.is_none() {
+            return Ok(None);
+        }
         let Some(ref backend) = self.state_backend else {
             return Ok(None);
         };
@@ -1364,34 +1493,118 @@ impl CheckpointCoordinator {
         Ok(Some((attempt, offsets)))
     }
 
-    /// Every node's sealed source-offset handoff blobs at `epoch`, unioned. Recovery passes the
-    /// epoch it restored to (not the latest), so a re-acquired partition can't skip past it.
+    #[cfg(feature = "cluster")]
+    async fn read_participant_ready(
+        backend: &dyn StateBackend,
+        attempt: CheckpointAttempt,
+        key: &str,
+    ) -> Result<ParticipantReady, DbError> {
+        let bytes = backend
+            .read_commit_descriptor(attempt, key)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "participant readiness read failed for '{key}': {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] sealed participant readiness marker '{key}' is missing"
+                ))
+            })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6041] participant readiness marker '{key}' is corrupt: {error}"
+            ))
+        })
+    }
+
+    /// Every sealed participant's exact source-offset handoff, unioned from readiness markers.
+    /// Recovery passes the attempt it restored (not latest), so an acquired partition cannot skip
+    /// past its state cut.
     #[cfg(feature = "cluster")]
     pub(crate) async fn source_offsets_at(
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<HashMap<String, HashMap<String, String>>, DbError> {
-        let mut merged = HashMap::new();
-        let Some(ref backend) = self.state_backend else {
-            return Ok(merged);
-        };
-        let blobs = backend.read_source_offsets(attempt).await.map_err(|e| {
-            DbError::Checkpoint(format!(
-                "source-offset handoff: read_source_offsets failed: {e}"
-            ))
+        // `cluster` is a compile-time capability, not the active runtime mode. Embedded and
+        // standalone runtimes compiled with that feature recover directly from their local
+        // manifest and intentionally have no participant-readiness inventory.
+        if self.cluster_controller.is_none() {
+            return Ok(HashMap::new());
+        }
+        let backend = self.state_backend.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] source-offset recovery requires the sealed cluster state backend"
+                    .into(),
+            )
         })?;
-        for blob in blobs {
-            // Skipping a blob would drop a whole node's partitions from the union, and the
-            // acquiring source would silently fall back to `auto.offset.reset`. Both callers
-            // fail closed on an error (the rotation defers; recovery aborts), so propagate.
-            let m: HashMap<String, HashMap<String, String>> =
-                serde_json::from_slice(&blob).map_err(|e| {
+        let inventory = backend
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!("checkpoint seal inventory read failed: {error}"))
+            })?
+            .ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "[LDB-6033] source-offset handoff: undecodable blob at epoch {} checkpoint {}: {e}",
-                    attempt.epoch, attempt.checkpoint_id
+                    "[LDB-6041] checkpoint {} epoch {} has no exact state seal",
+                    attempt.checkpoint_id, attempt.epoch
                 ))
             })?;
-            for (source, offsets) in m {
+        let ready_keys: Vec<String> = inventory
+            .required_descriptors
+            .iter()
+            .filter(|key| participant_from_ready_key(key).is_some())
+            .cloned()
+            .collect();
+        if ready_keys.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] checkpoint {} epoch {} seal has no participant readiness inventory",
+                attempt.checkpoint_id, attempt.epoch
+            )));
+        }
+
+        let expected_deployment = self.expected_deployment_id()?;
+        let expected_identity = self.expected_pipeline_identity();
+        let readiness = futures::stream::iter(ready_keys.into_iter().map(|key| async move {
+            let key_participant = participant_from_ready_key(&key).ok_or_else(|| {
+                DbError::Checkpoint(format!("invalid participant readiness key '{key}'"))
+            })?;
+            let ready = Self::read_participant_ready(backend.as_ref(), attempt, &key).await?;
+            Ok::<_, DbError>((key, key_participant, ready))
+        }))
+        .buffer_unordered(PARTICIPANT_READY_READ_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        let mut participants = std::collections::BTreeSet::new();
+        let mut owned_vnodes = std::collections::BTreeSet::new();
+        let mut merged = HashMap::new();
+        for (key, key_participant, ready) in readiness {
+            let mut canonical_vnodes = ready.owned_vnodes.clone();
+            canonical_vnodes.sort_unstable();
+            canonical_vnodes.dedup();
+            if ready.version != PARTICIPANT_READY_VERSION
+                || ready.attempt != attempt
+                || ready.participant_id != key_participant
+                || ready.assignment_version != inventory.assignment_version
+                || ready.deployment_id != expected_deployment
+                || ready.pipeline_identity != expected_identity
+                || canonical_vnodes != ready.owned_vnodes
+                || !participants.insert(ready.participant_id)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] participant readiness marker '{key}' does not match its sealed cut"
+                )));
+            }
+            for vnode in ready.owned_vnodes {
+                if !owned_vnodes.insert(vnode) {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6041] vnode {vnode} is claimed by multiple checkpoint participants"
+                    )));
+                }
+            }
+            for (source, offsets) in ready.source_offsets {
                 let target = merged.entry(source).or_insert_with(HashMap::new);
                 for (key, value) in offsets {
                     if let Some(existing) = target.insert(key.clone(), value.clone()) {
@@ -1404,6 +1617,13 @@ impl CheckpointCoordinator {
                     }
                 }
             }
+        }
+        let sealed_vnodes: std::collections::BTreeSet<u32> =
+            inventory.required_vnodes.iter().copied().collect();
+        if owned_vnodes != sealed_vnodes {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] participant readiness vnode inventory {owned_vnodes:?} does not match seal {sealed_vnodes:?}"
+            )));
         }
         Ok(merged)
     }
@@ -1679,6 +1899,15 @@ impl CheckpointCoordinator {
         0
     }
 
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
+    fn active_decision_scope(&self) -> laminar_core::checkpoint_decision::CommitDecisionScope {
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            return laminar_core::checkpoint_decision::CommitDecisionScope::Cluster;
+        }
+        laminar_core::checkpoint_decision::CommitDecisionScope::Local
+    }
+
     fn coordinated_namespaces(&self) -> Result<Vec<CoordinatedCommitNamespace>, DbError> {
         let identity = self.expected_pipeline_identity();
         let deployment_id = self.expected_deployment_id()?;
@@ -1699,19 +1928,14 @@ impl CheckpointCoordinator {
         Ok(namespaces)
     }
 
-    /// Every quorum participant must persist one marker for every coordinated
-    /// sink, including an empty marker. The exact key set is bound into `_SEAL`.
+    /// Every quorum participant must persist one marker for every coordinated sink, including
+    /// an empty marker, plus one final readiness attestation in cluster mode. The exact key set
+    /// is bound into `_SEAL`.
     fn required_descriptor_keys(
         &self,
         participants: &[QuorumPeer],
     ) -> Result<Vec<String>, DbError> {
-        let mut participant_ids = vec![self.self_node_id()];
-        #[cfg(feature = "cluster")]
-        participant_ids.extend(participants.iter().map(|participant| participant.0));
-        #[cfg(not(feature = "cluster"))]
-        participant_ids.extend(participants.iter().copied());
-        participant_ids.sort_unstable();
-        participant_ids.dedup();
+        let participant_ids = self.checkpoint_participant_ids(participants);
 
         let namespaces = self.coordinated_namespaces()?;
         let mut keys = Vec::with_capacity(namespaces.len() * participant_ids.len());
@@ -1723,8 +1947,23 @@ impl CheckpointCoordinator {
                 ));
             }
         }
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            keys.extend(participant_ids.iter().copied().map(participant_ready_key));
+        }
         keys.sort_unstable();
         Ok(keys)
+    }
+
+    fn checkpoint_participant_ids(&self, participants: &[QuorumPeer]) -> Vec<u64> {
+        let mut participant_ids = vec![self.self_node_id()];
+        #[cfg(feature = "cluster")]
+        participant_ids.extend(participants.iter().map(|participant| participant.0));
+        #[cfg(not(feature = "cluster"))]
+        participant_ids.extend(participants.iter().copied());
+        participant_ids.sort_unstable();
+        participant_ids.dedup();
+        participant_ids
     }
 
     /// Persist this participant's prepared marker for every coordinated sink.
@@ -2072,6 +2311,7 @@ impl CheckpointCoordinator {
         &self,
         attempt: CheckpointAttempt,
         participants: &[QuorumPeer],
+        deadline: tokio::time::Instant,
     ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
 
@@ -2092,7 +2332,6 @@ impl CheckpointCoordinator {
             return Ok(());
         }
 
-        let deadline = Instant::now() + self.config.restorable_gate_timeout;
         let mut interval = initial_poll;
         let mut last_state = String::from("not all vnodes persisted");
         loop {
@@ -2103,11 +2342,11 @@ impl CheckpointCoordinator {
                     attempt.epoch, self.rotation_epoch_floor
                 ));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(format!(
-                    "state durability gate timed out after {:?}: {last_state}",
-                    self.config.restorable_gate_timeout
+                    "state durability gate exhausted the end-to-end checkpoint deadline: \
+                     {last_state}"
                 ));
             }
             let seal_result = tokio::time::timeout(
@@ -2122,12 +2361,23 @@ impl CheckpointCoordinator {
             .await;
             match seal_result {
                 Err(_) => {
-                    return Err(format!(
-                        "state durability gate timed out after {:?} while sealing exact attempt",
-                        self.config.restorable_gate_timeout
-                    ));
+                    return Err(
+                        "state durability gate exhausted the end-to-end checkpoint deadline while sealing exact attempt"
+                            .into(),
+                    );
                 }
-                Ok(Ok(true)) => return Ok(()),
+                Ok(Ok(true)) => {
+                    #[cfg(feature = "cluster")]
+                    if self.cluster_controller.is_some() {
+                        // The object-store seal proves the required marker keys exist. Decode the
+                        // payloads before publishing a decision so corrupt or cross-attempt
+                        // attestations fail closed instead of becoming the recovery frontier.
+                        self.source_offsets_at(attempt)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    return Ok(());
+                }
                 Ok(Ok(false)) => {}
                 Ok(Err(e @ StateBackendError::Conflict { .. })) => {
                     return Err(format!("state durability gate: {e}"));
@@ -2158,10 +2408,10 @@ impl CheckpointCoordinator {
             }
             #[cfg(not(feature = "cluster"))]
             let _ = participants;
-            if Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "state durability gate timed out after {:?}: {last_state}",
-                    self.config.restorable_gate_timeout
+                    "state durability gate exhausted the end-to-end checkpoint deadline: \
+                     {last_state}"
                 ));
             }
             tokio::time::sleep(interval).await;
@@ -2310,6 +2560,55 @@ impl CheckpointCoordinator {
             })
     }
 
+    async fn prepared_decision_status(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<(bool, bool), DbError> {
+        let decision_store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] prepared-checkpoint reconciliation requires the durable decision store"
+                    .into(),
+            )
+        })?;
+        let decision = tokio::time::timeout(
+            self.config.checkpoint_timeout,
+            decision_store.decision(epoch),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "[LDB-6040] decision read for prepared epoch {epoch} timed out after {:?}",
+                self.config.checkpoint_timeout
+            ))
+        })?
+        .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
+
+        match decision {
+            Some(decision) if decision.checkpoint_id == checkpoint_id => {
+                #[cfg(feature = "cluster")]
+                if let Some(controller) = self.cluster_controller.as_ref() {
+                    let local = matches!(
+                        Self::match_follower_decision(
+                            Some(&decision),
+                            controller.instance_id().0,
+                            epoch,
+                            checkpoint_id,
+                        )?,
+                        FollowerDecisionMatch::Included
+                    );
+                    return Ok((true, local));
+                }
+                Ok((true, true))
+            }
+            Some(decision) => Err(DbError::Checkpoint(format!(
+                "[LDB-6041] epoch {epoch} decision binds checkpoint {}, but highest prepared checkpoint is {checkpoint_id}",
+                decision.checkpoint_id
+            ))),
+            None => Ok((false, false)),
+        }
+    }
+
     /// Reconcile the highest prepared manifest on startup.
     ///
     /// The exact decision is the sole commit authority. External sink publication is re-driven
@@ -2339,35 +2638,8 @@ impl CheckpointCoordinator {
         let epoch = last.epoch;
         let checkpoint_id = last.checkpoint_id;
 
-        let decision_store = self.decision_store.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(
-                "[LDB-6050] prepared-checkpoint reconciliation requires the durable decision store"
-                    .into(),
-            )
-        })?;
-        let decision = tokio::time::timeout(
-            self.config.checkpoint_timeout,
-            decision_store.decision(epoch),
-        )
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint(format!(
-                "[LDB-6040] decision read for prepared epoch {epoch} timed out after {:?}",
-                self.config.checkpoint_timeout
-            ))
-        })?
-        .map_err(|e| DbError::Checkpoint(format!("[LDB-6040] {e}")))?;
-        let committed = match decision {
-            Some(decision) if decision.checkpoint_id == checkpoint_id => true,
-            Some(decision) => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6041] epoch {epoch} decision binds checkpoint {}, \
-                     but highest prepared checkpoint is {checkpoint_id}",
-                    decision.checkpoint_id
-                )));
-            }
-            None => false,
-        };
+        let (globally_committed, locally_committed) =
+            self.prepared_decision_status(epoch, checkpoint_id).await?;
 
         #[cfg(feature = "cluster")]
         let is_leader = self
@@ -2375,39 +2647,40 @@ impl CheckpointCoordinator {
             .as_ref()
             .is_some_and(|cc| cc.is_leader());
 
-        if committed {
+        if locally_committed {
             info!(
                 epoch,
                 checkpoint_id, "finalizing exactly decided prepared checkpoint"
             );
             self.finalize_manifest(checkpoint_id).await?;
-            #[cfg(feature = "cluster")]
-            if is_leader {
-                self.announce_if_leader(
-                    epoch,
-                    checkpoint_id,
-                    laminar_core::cluster::control::Phase::Commit,
-                    None,
-                )
-                .await;
-            }
         } else {
-            warn!(
-                epoch,
-                checkpoint_id,
-                "[LDB-6035] prepared epoch has no exact decision — force-rolling back"
-            );
-            self.rollback_sinks(epoch).await?;
-            #[cfg(feature = "cluster")]
-            if is_leader {
-                self.announce_if_leader(
+            if globally_committed {
+                warn!(
                     epoch,
                     checkpoint_id,
-                    laminar_core::cluster::control::Phase::Abort,
-                    None,
-                )
-                .await;
+                    participant_id = self.store.participant_id(),
+                    "[LDB-6035] prepared participant is excluded from the exact decision — \
+                     force-rolling back local state"
+                );
+            } else {
+                warn!(
+                    epoch,
+                    checkpoint_id,
+                    "[LDB-6035] prepared epoch has no exact decision — force-rolling back"
+                );
             }
+            self.rollback_sinks(epoch).await?;
+        }
+
+        #[cfg(feature = "cluster")]
+        if is_leader {
+            let phase = if globally_committed {
+                laminar_core::cluster::control::Phase::Commit
+            } else {
+                laminar_core::cluster::control::Phase::Abort
+            };
+            self.announce_if_leader(epoch, checkpoint_id, phase, None)
+                .await;
         }
 
         Ok(())
@@ -2792,7 +3065,7 @@ impl CheckpointCoordinator {
     /// leader's commit/abort. Returns `Ok(true)` = committed, `Ok(false)` = aborted.
     ///
     /// The ack means "aligned + captured"; the leader verifies prepare completion through
-    /// the restorable gate (partials written last imply the full prepare finished).
+    /// the restorable gate (the final readiness attestation proves the full prepare finished).
     ///
     /// # Errors
     /// Propagates sink pre-commit, manifest save, or marker-write failures.
@@ -2919,9 +3192,10 @@ impl CheckpointCoordinator {
 
     /// Follower stage 2: wait for the leader's decision without holding the coordinator mutex.
     ///
-    /// The durable marker is authoritative for commit. An explicit Abort is authoritative only
-    /// while no marker exists. Timeouts and marker-read failures leave the participant in-doubt
-    /// and return an error; a prepared participant must never unilaterally roll back.
+    /// The durable decision is authoritative per participant: an included participant commits,
+    /// while an excluded participant rolls back its late prepare. An explicit Abort is
+    /// authoritative only while no decision exists. Timeouts and read failures leave the
+    /// participant in-doubt and return an error; a prepared participant never guesses.
     ///
     /// # Errors
     /// Returns an error when the decision store is unavailable, contains a conflicting decision,
@@ -2935,6 +3209,7 @@ impl CheckpointCoordinator {
         decision_timeout: Duration,
     ) -> Result<bool, DbError> {
         let deadline = Instant::now() + decision_timeout;
+        let participant_id = cc.instance_id().0;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -2944,10 +3219,18 @@ impl CheckpointCoordinator {
             // The durable marker is the commit authority, so poll it independently of the
             // best-effort control announcement. This also covers a leader that recorded the
             // decision and crashed before publishing Commit.
-            if Self::has_matching_follower_decision(decision_store, epoch, checkpoint_id, deadline)
-                .await?
+            match Self::has_matching_follower_decision(
+                decision_store,
+                participant_id,
+                epoch,
+                checkpoint_id,
+                deadline,
+            )
+            .await?
             {
-                return Ok(true);
+                FollowerDecisionMatch::Included => return Ok(true),
+                FollowerDecisionMatch::Excluded => return Ok(false),
+                FollowerDecisionMatch::Pending => {}
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2972,6 +3255,7 @@ impl CheckpointCoordinator {
             if let Some(committed) = Self::resolve_follower_announcement(
                 &announcement,
                 decision_store,
+                participant_id,
                 epoch,
                 checkpoint_id,
                 deadline,
@@ -3028,6 +3312,7 @@ impl CheckpointCoordinator {
     async fn resolve_follower_announcement(
         announcement: &laminar_core::cluster::control::BarrierAnnouncement,
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        participant_id: u64,
         epoch: u64,
         checkpoint_id: u64,
         deadline: Instant,
@@ -3035,38 +3320,73 @@ impl CheckpointCoordinator {
         use laminar_core::cluster::control::Phase;
 
         if announcement.epoch == epoch && announcement.phase == Phase::Commit {
-            if Self::has_matching_follower_decision(decision_store, epoch, checkpoint_id, deadline)
-                .await?
+            return match Self::has_matching_follower_decision(
+                decision_store,
+                participant_id,
+                epoch,
+                checkpoint_id,
+                deadline,
+            )
+            .await?
             {
-                return Ok(Some(true));
-            }
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6045] Commit announcement for epoch {epoch}, checkpoint \
-                 {checkpoint_id} has no matching durable decision"
-            )));
+                FollowerDecisionMatch::Included => Ok(Some(true)),
+                FollowerDecisionMatch::Excluded => Ok(Some(false)),
+                FollowerDecisionMatch::Pending => Err(DbError::Checkpoint(format!(
+                    "[LDB-6045] Commit announcement for epoch {epoch}, checkpoint \
+                     {checkpoint_id} has no matching durable decision"
+                ))),
+            };
         }
         if announcement.epoch == epoch && announcement.phase == Phase::Abort {
-            if Self::has_matching_follower_decision(decision_store, epoch, checkpoint_id, deadline)
-                .await?
+            return match Self::has_matching_follower_decision(
+                decision_store,
+                participant_id,
+                epoch,
+                checkpoint_id,
+                deadline,
+            )
+            .await?
             {
-                warn!(
+                FollowerDecisionMatch::Included => {
+                    warn!(
+                        epoch,
+                        checkpoint_id,
+                        "Abort announcement conflicts with durable commit — commit wins",
+                    );
+                    Ok(Some(true))
+                }
+                FollowerDecisionMatch::Excluded | FollowerDecisionMatch::Pending => Ok(Some(false)),
+            };
+        }
+        match Self::has_matching_follower_decision(
+            decision_store,
+            participant_id,
+            epoch,
+            checkpoint_id,
+            deadline,
+        )
+        .await?
+        {
+            FollowerDecisionMatch::Included => {
+                info!(
                     epoch,
-                    checkpoint_id, "Abort announcement conflicts with durable commit — commit wins",
+                    checkpoint_id,
+                    observed_epoch = announcement.epoch,
+                    "newer epoch observed with commit marker present — committing",
                 );
                 return Ok(Some(true));
             }
-            return Ok(Some(false));
-        }
-        if Self::has_matching_follower_decision(decision_store, epoch, checkpoint_id, deadline)
-            .await?
-        {
-            info!(
-                epoch,
-                checkpoint_id,
-                observed_epoch = announcement.epoch,
-                "newer epoch observed with commit marker present — committing",
-            );
-            return Ok(Some(true));
+            FollowerDecisionMatch::Excluded => {
+                info!(
+                    epoch,
+                    checkpoint_id,
+                    participant_id,
+                    observed_epoch = announcement.epoch,
+                    "newer epoch observed after participant exclusion — rolling back local prepare",
+                );
+                return Ok(Some(false));
+            }
+            FollowerDecisionMatch::Pending => {}
         }
         // A pipelined newer Prepare is not an abort decision for this epoch. Pace the durable
         // re-check so a cached gossip announcement cannot busy-spin.
@@ -3080,10 +3400,11 @@ impl CheckpointCoordinator {
     #[cfg(feature = "cluster")]
     async fn has_matching_follower_decision(
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        participant_id: u64,
         epoch: u64,
         checkpoint_id: u64,
         deadline: Instant,
-    ) -> Result<bool, DbError> {
+    ) -> Result<FollowerDecisionMatch, DbError> {
         let store = decision_store.ok_or_else(|| {
             DbError::Checkpoint("[LDB-6045] cluster follower has no durable decision store".into())
         })?;
@@ -3107,14 +3428,36 @@ impl CheckpointCoordinator {
                     "[LDB-6045] failed to read durable decision for epoch {epoch}: {e}"
                 ))
             })?;
-        match decision {
-            None => Ok(false),
-            Some(decision) if decision.checkpoint_id == checkpoint_id => Ok(true),
-            Some(decision) => Err(DbError::Checkpoint(format!(
+        Self::match_follower_decision(decision.as_ref(), participant_id, epoch, checkpoint_id)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn match_follower_decision(
+        decision: Option<&laminar_core::checkpoint_decision::CommitDecision>,
+        participant_id: u64,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<FollowerDecisionMatch, DbError> {
+        let Some(decision) = decision else {
+            return Ok(FollowerDecisionMatch::Pending);
+        };
+        if decision.checkpoint_id != checkpoint_id {
+            return Err(DbError::Checkpoint(format!(
                 "[LDB-6045] epoch {epoch} is durably bound to checkpoint {}, not participant \
                  checkpoint {checkpoint_id}",
                 decision.checkpoint_id
-            ))),
+            )));
+        }
+        if decision.scope != laminar_core::checkpoint_decision::CommitDecisionScope::Cluster {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6045] cluster participant {participant_id} observed a local-scope durable \
+                 decision for epoch {epoch}, checkpoint {checkpoint_id}"
+            )));
+        }
+        if decision.participants.binary_search(&participant_id).is_ok() {
+            Ok(FollowerDecisionMatch::Included)
+        } else {
+            Ok(FollowerDecisionMatch::Excluded)
         }
     }
 
@@ -3138,6 +3481,12 @@ impl CheckpointCoordinator {
             self.checkpoints_completed += 1;
             self.allocator.advance_epoch_to(epoch.saturating_add(1));
             self.phase = CheckpointPhase::Idle;
+            // The shared backend and decision namespace are leader-owned, but each follower owns
+            // a participant-specific manifest namespace and must bound that local inventory too.
+            let horizon = epoch.saturating_sub(self.config.max_retained as u64);
+            if horizon > 0 {
+                self.schedule_local_manifest_retention_prune(horizon, epoch);
+            }
             true
         } else {
             self.rollback_sinks(epoch).await.ok();
@@ -3209,25 +3558,28 @@ impl CheckpointCoordinator {
         let state_data =
             Self::pack_operator_states(&mut manifest, &operator_states, STATE_INLINE_THRESHOLD);
 
-        if let Err(e) = self
-            .persist_source_offset_handoff(
+        self.phase = CheckpointPhase::Persisting;
+        let manifest = match self.save_manifest(Arc::new(manifest), state_data).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.pending_vnode_states.clear();
+                return Err(error);
+            }
+        };
+        if let Err(e) = self.write_vnode_partials(epoch, checkpoint_id).await {
+            self.pending_vnode_states.clear();
+            return Err(e);
+        }
+        if let Err(error) = self
+            .persist_participant_ready_until(
                 CheckpointAttempt::new(epoch, checkpoint_id),
-                &manifest.source_offsets,
+                &manifest,
+                deadline,
             )
             .await
         {
             self.pending_vnode_states.clear();
-            return Err(e);
-        }
-
-        self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(Arc::new(manifest), state_data).await {
-            self.pending_vnode_states.clear();
-            return Err(e);
-        }
-        if let Err(e) = self.write_vnode_partials(epoch, checkpoint_id).await {
-            self.pending_vnode_states.clear();
-            return Err(e);
+            return Err(error);
         }
         self.pending_vnode_states.clear();
         Ok(())
@@ -3396,7 +3748,7 @@ impl CheckpointCoordinator {
         }
 
         self.phase = CheckpointPhase::Persisting;
-        let manifest = match self.save_manifest(Arc::new(manifest), state_data).await {
+        let persisted_manifest = match self.save_manifest(Arc::new(manifest), state_data).await {
             Ok(persisted) => Arc::new(persisted),
             Err(e) => {
                 error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
@@ -3423,23 +3775,29 @@ impl CheckpointCoordinator {
                 .await);
         }
 
-        if let Err(e) = self
-            .persist_source_offset_handoff(
-                CheckpointAttempt::new(epoch, checkpoint_id),
-                &manifest.source_offsets,
-            )
-            .await
-        {
-            error!(checkpoint_id, epoch, error = %e, "source-offset handoff write failed");
-            return Ok(self
-                .fail_epoch(
-                    checkpoint_id,
-                    epoch,
-                    start,
-                    format!("source-offset handoff write failed: {e}"),
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            if let Err(e) = self
+                .persist_participant_ready_until(
+                    CheckpointAttempt::new(epoch, checkpoint_id),
+                    &persisted_manifest,
+                    attempt_deadline,
                 )
-                .await);
+                .await
+            {
+                error!(checkpoint_id, epoch, error = %e, "participant readiness write failed");
+                return Ok(self
+                    .fail_epoch(
+                        checkpoint_id,
+                        epoch,
+                        start,
+                        format!("participant readiness write failed: {e}"),
+                    )
+                    .await);
+            }
         }
+        #[cfg(not(feature = "cluster"))]
+        drop(persisted_manifest);
 
         // Level 2 ("restorable"): all vnodes persisted before sinks commit.
         // Polls because followers upload asynchronously after their capture ack.
@@ -3450,6 +3808,7 @@ impl CheckpointCoordinator {
             .await_restorable_gate(
                 CheckpointAttempt::new(epoch, checkpoint_id),
                 &quorum_participants,
+                attempt_deadline,
             )
             .await;
         if let Some(ref m) = self.prom {
@@ -3492,7 +3851,24 @@ impl CheckpointCoordinator {
             // Set this before issuing I/O. A timeout/error cannot prove the create was absent.
             self.decision_write_started = true;
             let timeout = self.config.checkpoint_timeout;
-            match tokio::time::timeout(timeout, ds.record_committed(epoch, checkpoint_id)).await {
+            #[cfg(feature = "cluster")]
+            let decision_participants = self.checkpoint_participant_ids(&quorum_participants);
+            let decision_write = async {
+                #[cfg(feature = "cluster")]
+                if self.cluster_controller.is_some() {
+                    return ds
+                        .record_committed_for_participants(
+                            epoch,
+                            checkpoint_id,
+                            &decision_participants,
+                            self.self_node_id(),
+                            self.assignment_version,
+                        )
+                        .await;
+                }
+                ds.record_committed(epoch, checkpoint_id).await
+            };
+            match tokio::time::timeout(timeout, decision_write).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     error!(checkpoint_id, epoch, %error, "[LDB-6038] commit decision write failed ambiguously");
@@ -3588,7 +3964,7 @@ impl CheckpointCoordinator {
                 );
             }
             // Pin at the decided cut: a coordinated rewind targets the highest commit
-            // marker and must find that epoch's partials and offset blobs intact even
+            // marker and must find that epoch's partials and readiness descriptors intact even
             // when sink commits stall behind the retention window.
             if self.decision_store.is_some() {
                 horizon = horizon.min(self.highest_decided);
@@ -3692,6 +4068,95 @@ impl CheckpointCoordinator {
     ///
     /// # Errors
     /// Returns `DbError::Checkpoint` if the store read fails.
+    #[cfg(feature = "cluster")]
+    fn validate_manifest_source_handoff(
+        manifest: &CheckpointManifest,
+        handoff: &HashMap<String, HashMap<String, String>>,
+    ) -> Result<(), DbError> {
+        for (source, checkpoint) in &manifest.source_offsets {
+            let sealed = handoff.get(source).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] participant manifest source '{source}' is absent from the sealed source handoff"
+                ))
+            })?;
+            for (key, value) in &checkpoint.offsets {
+                if sealed.get(key) != Some(value) {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6041] participant manifest source '{source}' offset '{key}' does not match the sealed source handoff"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn validate_recovered_cluster_cut(
+        &self,
+        recovered: &mut crate::recovery_manager::RecoveredState,
+    ) -> Result<(), DbError> {
+        if self.active_decision_scope()
+            != laminar_core::checkpoint_decision::CommitDecisionScope::Cluster
+        {
+            return Ok(());
+        }
+        let Some(decision) = recovered.decision() else {
+            return Ok(());
+        };
+        if decision.scope != laminar_core::checkpoint_decision::CommitDecisionScope::Cluster {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] cluster recovery observed a {:?} durable decision",
+                decision.scope
+            )));
+        }
+        let backend = self.state_backend.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] cluster decision recovery requires the sealed state backend".into(),
+            )
+        })?;
+        let attempt = CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
+        let inventory = backend
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!("checkpoint seal inventory read failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] decided epoch {} checkpoint {} has no exact state seal",
+                    decision.epoch, decision.checkpoint_id
+                ))
+            })?;
+        if inventory.assignment_version != decision.assignment_version {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] decided epoch {} checkpoint {} assignment version {} does not match \
+                 sealed version {}",
+                decision.epoch,
+                decision.checkpoint_id,
+                decision.assignment_version,
+                inventory.assignment_version
+            )));
+        }
+        let sealed_participants: std::collections::BTreeSet<u64> = inventory
+            .required_descriptors
+            .iter()
+            .filter_map(|key| participant_from_ready_key(key))
+            .collect();
+        let decided_participants: std::collections::BTreeSet<u64> =
+            decision.participants.iter().copied().collect();
+        if sealed_participants != decided_participants {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] decided participants {decided_participants:?} do not match sealed readiness participants {sealed_participants:?}"
+            )));
+        }
+        // Decode and validate every readiness payload even for pipelines without replayable
+        // sources; the marker is also the manifest-completion attestation.
+        let handoff = self.source_offsets_at(attempt).await?;
+        Self::validate_manifest_source_handoff(&recovered.manifest, &handoff)?;
+        recovered.set_cluster_source_handoff(handoff);
+        Ok(())
+    }
+
     pub async fn recover(
         &mut self,
     ) -> Result<Option<crate::recovery_manager::RecoveredState>, DbError> {
@@ -3701,10 +4166,13 @@ impl CheckpointCoordinator {
         let deployment_id = self.expected_deployment_id()?;
         let mgr = RecoveryManager::new(&*self.store)
             .with_pipeline_identity(&identity)
-            .with_deployment_id(deployment_id);
-        let result = mgr.recover(self.decision_store.as_deref()).await?;
+            .with_deployment_id(deployment_id)
+            .with_decision_scope(self.active_decision_scope());
+        let mut result = mgr.recover(self.decision_store.as_deref()).await?;
 
-        if let Some(ref recovered) = result {
+        if let Some(ref mut recovered) = result {
+            #[cfg(feature = "cluster")]
+            self.validate_recovered_cluster_cut(recovered).await?;
             self.allocator.advance_epoch_to(recovered.epoch() + 1);
             info!(
                 epoch = self.allocator.peek_epoch(),
@@ -3729,12 +4197,15 @@ impl CheckpointCoordinator {
         let deployment_id = self.expected_deployment_id()?;
         let mgr = RecoveryManager::new(&*self.store)
             .with_pipeline_identity(&identity)
-            .with_deployment_id(deployment_id);
-        let result = mgr
+            .with_deployment_id(deployment_id)
+            .with_decision_scope(self.active_decision_scope());
+        let mut result = mgr
             .recover_to_epoch(target_epoch, self.decision_store.as_deref())
             .await?;
 
-        if let Some(ref recovered) = result {
+        if let Some(ref mut recovered) = result {
+            #[cfg(feature = "cluster")]
+            self.validate_recovered_cluster_cut(recovered).await?;
             self.allocator.advance_epoch_to(recovered.epoch() + 1);
             info!(
                 epoch = self.allocator.peek_epoch(),

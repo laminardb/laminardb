@@ -1034,34 +1034,36 @@ async fn coordinated_open_caches_configured_writer_properties() {
     sink.close().await.unwrap();
 }
 
-/// Finding C: the coordinated staging write is wrapped in the same write
-/// timeout the commit path uses, so a wedged object store can't hang the sink
-/// task forever. A near-zero timeout forces the wrapper to fire.
+/// Coordinated preparation times out without discarding the staged checkpoint cut.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn coordinated_pre_commit_honors_write_timeout() {
-    let dir = tempfile::tempdir().unwrap();
-    let table_dir = dir.path().join("coord_timeout");
-    std::fs::create_dir_all(&table_dir).unwrap();
-    let path = table_dir.to_string_lossy().to_string();
+async fn coordinated_pre_commit_timeout_preserves_staged_data_until_rollback() {
+    let mut config = coordinated_config("unused-by-stalled-test");
+    config.write_timeout = Duration::from_millis(10);
 
-    let mut cfg = coordinated_config(&path);
-    cfg.write_timeout = Duration::from_nanos(1);
-
-    let mut sink = DeltaLakeSink::with_schema(cfg, test_schema());
-    sink.open(&ConnectorConfig::new("delta-lake"))
-        .await
-        .unwrap();
-
-    sink.begin_epoch(1).await.unwrap();
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    sink.state = ConnectorState::Running;
+    sink.stall_descriptor_write = true;
+    sink.begin_epoch(7).await.unwrap();
     sink.write_batch(&test_batch(3)).await.unwrap();
-    let err = sink
-        .pre_commit(1)
+
+    let error = sink
+        .pre_commit(7)
         .await
-        .expect_err("a 1ns write timeout must trip the wrapper");
+        .expect_err("the injected stalled descriptor write must time out");
     assert!(
-        err.to_string().contains("timed out"),
-        "expected a timeout error, got: {err}"
+        error.to_string().contains("timed out"),
+        "expected a timeout error, got: {error}"
     );
-    sink.close().await.unwrap();
+
+    assert_eq!(sink.buffered_rows, 0, "pre_commit must stage the buffer");
+    assert!(sink.buffer.is_empty());
+    assert_eq!(sink.staged_rows, 3, "timeout must preserve staged rows");
+    assert_eq!(sink.staged_batches.len(), 1);
+    assert!(sink.staged_bytes > 0);
+
+    sink.rollback_epoch(7).await.unwrap();
+    assert_eq!(sink.staged_rows, 0);
+    assert_eq!(sink.staged_bytes, 0);
+    assert!(sink.staged_batches.is_empty());
 }

@@ -619,8 +619,9 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// A source's recovery offsets: manifest offsets plus partitions the per-node-incomplete
-    /// manifest lacked, filled from the handoff union scoped to this source's topics.
+    /// A source's recovery offsets from the manifest and its decision-bound sealed cluster
+    /// handoff. Explicit empty checkpoints remain present so pre-first-record sources resume
+    /// from their connector-defined initial position rather than appearing uncheckpointed.
     #[cfg(feature = "cluster")]
     fn recovery_source_checkpoint(
         source: &str,
@@ -629,6 +630,7 @@ impl LaminarDB {
         _epoch: u64,
     ) -> Option<laminar_connectors::checkpoint::SourceCheckpoint> {
         use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
+        let participated = manifest_cp.is_some() || handoff.contains_key(source);
         let mut cp = manifest_cp
             .cloned()
             .unwrap_or_else(|| ConnectorCheckpoint::with_offsets(HashMap::new()));
@@ -647,7 +649,7 @@ impl LaminarDB {
             );
             cp.offsets.extend(fill);
         }
-        if cp.offsets.is_empty() {
+        if cp.offsets.is_empty() && !participated {
             return None;
         }
         Some(crate::checkpoint_coordinator::connector_to_source_checkpoint(&cp))
@@ -1990,23 +1992,16 @@ impl LaminarDB {
                                 }
                             }
                         }
-                        // The manifest is per-node incomplete (first-writer-wins), so a partition
-                        // re-acquired from a killed peer is absent; the handoff union at the
-                        // recovered epoch fills it. A read failure fails recovery closed.
+                        // Each manifest is participant-scoped, so the validated seal-bound union
+                        // fills partitions captured by other participants.
                         let recovered_attempt = laminar_core::state::CheckpointAttempt::new(
                             recovered.manifest.epoch,
                             recovered.manifest.checkpoint_id,
                         );
                         #[cfg(feature = "cluster")]
-                        let handoff =
-                            coord
-                                .source_offsets_at(recovered_attempt)
-                                .await
-                                .map_err(|e| {
-                                    DbError::Checkpoint(format!(
-                                    "[LDB-6033] recovery source-offset handoff read failed: {e}"
-                                ))
-                                })?;
+                        let empty_handoff = HashMap::new();
+                        #[cfg(feature = "cluster")]
+                        let handoff = recovered.cluster_source_handoff().unwrap_or(&empty_handoff);
                         for src in &mut sources {
                             if !src.contract.supports_replay() {
                                 continue;
@@ -2016,7 +2011,7 @@ impl LaminarDB {
                             let restored = Self::recovery_source_checkpoint(
                                 &src.name,
                                 manifest_cp,
-                                &handoff,
+                                handoff,
                                 recovered.epoch(),
                             );
                             #[cfg(not(feature = "cluster"))]
@@ -3107,6 +3102,8 @@ impl LaminarDB {
 
 #[cfg(test)]
 mod connector_admission_tests {
+    #[cfg(feature = "cluster")]
+    use super::LaminarDB;
     use super::{
         admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
         open_prepared_sinks, PreparedSink, RuntimeMode, SinkAdmissionContext, EXACT_SINK_PROTOCOL,
@@ -3122,9 +3119,22 @@ mod connector_admission_tests {
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::state::StateBackendDurability;
+    #[cfg(feature = "cluster")]
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_recovery_preserves_an_explicit_empty_source_checkpoint() {
+        let handoff = HashMap::from([("kafka".to_owned(), HashMap::new())]);
+        let restored = LaminarDB::recovery_source_checkpoint("kafka", None, &handoff, 7)
+            .expect("sealed source participation must survive before the first record");
+        assert!(restored.offsets().is_empty());
+
+        assert!(LaminarDB::recovery_source_checkpoint("missing", None, &handoff, 7).is_none());
+    }
 
     #[test]
     fn source_contract_admission_matrix_is_fail_closed() {

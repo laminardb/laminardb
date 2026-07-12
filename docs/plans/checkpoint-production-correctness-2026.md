@@ -1,8 +1,9 @@
 # Checkpoint Production Correctness — 2026 Order
 
-**Status:** corrective fault cycle active on `feat/checkpoint-correctness-2026`; embedded hard-kill
-proof passed and the cluster restore defect exposed by the first matrix is fixed locally; the full
-matrix rerun remains.
+**Status:** corrective fault cycle active on `feat/checkpoint-correctness-2026`; embedded and
+coordinated leader/follower hard-kill proofs passed. The rotating three-node run exposed an
+excluded-participant recovery gap, and its participant-bound corrective cycle is under validation;
+the full matrix rerun remains.
 **Decision date:** 2026-07-12
 
 This plan supersedes the older implementation order that treated connector phase-2 commits and
@@ -17,6 +18,10 @@ separation of fast alignment from durable completion described in the current
 and [Flink sink contract](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/sinks/).
 The latency design also incorporates recent work on decoupling the pipeline pause from remote
 checkpoint persistence ([arXiv:2403.13629](https://arxiv.org/abs/2403.13629)).
+The release gates treat guarantees as empirical contracts, following the 2025 PVLDB work on
+end-to-end processing-guarantee validation under injected process and network faults
+([PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf)); a clean unit-test model is not a
+substitute for recovery-output validation.
 
 ## Required implementation order
 
@@ -28,23 +33,29 @@ checkpoint persistence ([arXiv:2403.13629](https://arxiv.org/abs/2403.13629)).
    retried under the same identity.
 3. **Aligned capture.** One streaming coordinator admits barriers, fences prior sink writes,
    aligns source/shuffle input, and captures source offsets with operator state.
-4. **Immutable prepare.** Persist the Prepared manifest, source handoff, vnode partials, and every
-   coordinated sink participant marker under the exact attempt. Writer generation and payload
-   digests make stale or conflicting partials unsealable.
-5. **Restorable seal.** Publish one canonical seal only after the complete vnode/descriptor
-   inventory validates. Presence without exact provenance is not sufficient.
-6. **Durable decision.** Record the exact decision after the seal. Starting this write is the
+4. **Immutable participant prepare.** Each capture participant persists its Prepared manifest,
+   source handoff, vnode partials, coordinated-sink marker, and one final readiness attestation
+   under the exact attempt. The readiness key is required even for a zero-vnode/idle participant.
+   Writer generation and payload digests make stale or conflicting artifacts unsealable.
+5. **Restorable seal.** Publish one canonical seal only after the complete vnode, descriptor, and
+   participant-readiness inventory decodes and validates against one assignment generation.
+   Presence without exact provenance or participant completeness is not sufficient.
+6. **Durable decision.** Record the exact decision after the seal, binding the canonical
+   participant set, assignment generation, and manifest owner. Starting this write is the
    irrevocable boundary: timeout or transport failure is ambiguous and must never trigger live
-   rollback.
+   rollback. A participant absent from the decision must roll back its late prepare.
 7. **Completion and source acknowledgement.** Finalize the manifest and deliver the exact
    completion. Sources acknowledge only that validated attempt. A successor-epoch failure is a
    continuation fault, not a retroactive failure of the committed cut.
 8. **External publication.** A designated committer consumes decided sealed inventories in order,
    validates the exact predecessor cursor, and commits Delta/Iceberg outside pipeline-stall
    latency. It re-reads external cursors on every pass and fails closed on rollback or overlap.
-9. **Recovery.** Select the highest exact durable decision, require its bound manifest/seal and
-   deployment identity, finalize a matching Prepared manifest, and re-drive external publication.
-   An undecided Prepared attempt is force-rolled back.
+9. **Recovery.** Select the highest exact durable decision, require its bound manifest, seal,
+   participant set, assignment generation, and deployment identity, finalize a matching Prepared
+   manifest, and re-drive external publication. An undecided or excluded Prepared attempt is
+   force-rolled back. Until a canonical cluster recovery capsule exists, a replacement participant
+   may borrow only a metadata-only peer manifest; participant-local operators, tables, or
+   watermarks fail closed rather than being guessed from a donor.
 10. **Retention and shutdown.** Retention is one coalescing maintenance owner pinned by the
     external-commit floor and newest decision. Shutdown first settles/cancels durable tails, then
     tears down sources/sinks and finally releases deployment/control-plane ownership.
@@ -108,18 +119,27 @@ checkpoint-bounded visibility and transaction-timeout constraints.
 
 Implement the remaining work in this order:
 
-1. **Make the existing matrix truthful and useful.** Replace the free-form server mode string with
+1. **Build the canonical cluster recovery capsule.** This is the first remaining availability
+   blocker because cluster at-least-once already admits stateful pipelines, while a replacement
+   participant cannot safely reconstruct participant-local operator, table, or watermark state.
+   Seal a decision-bound global recovery image, not an arbitrary participant's local manifest.
+   It must bind the assignment, every participant readiness digest, source-offset union,
+   cluster-min watermark, operator/table-state roots, and any materialized-view metadata needed
+   after ownership changes. Keep the current metadata-only peer bootstrap as a narrow
+   optimization; reject non-portable donor state until this capsule is implemented and
+   fault-tested.
+2. **Make the existing matrix truthful and useful.** Replace the free-form server mode string with
    the actual protocol boundary (`Local` or `Cluster`); embedded and standalone hosting are both
    local. Install a single-owner vnode registry for a local Kafka source before connector start,
    then prove initial start, restart, and partition discovery under exact checkpoints. Give
    Iceberg a real direct-append at-least-once path (or separately certify that running its stronger
    coordinated protocol under an at-least-once label is safe) so the default configuration is
    usable.
-2. **Certify source transaction cuts.** Add a deadline-bounded async barrier-prepare hook for
+3. **Certify source transaction cuts.** Add a deadline-bounded async barrier-prepare hook for
    commit-coupled CDC. PostgreSQL CDC must either drain through the current database transaction
    before emitting its barrier or persist the transaction identifier, event ordinal, and in-flight
    payload. Merely removing its admission rejection can replay a partially emitted transaction.
-3. **Add recoverable Kafka sink committables, local first.** Stage encoded record segments durably
+4. **Add recoverable Kafka sink committables, local first.** Stage encoded record segments durably
    before the seal and keep participant descriptors small and checksummed. After the exact engine
    decision, a designated committer opens a fresh Kafka transaction, publishes the staged records
    plus a namespaced exact cursor marker atomically, and resolves ambiguous commits by reading that
@@ -127,12 +147,12 @@ Implement the remaining work in this order:
    sink, and participant; do not add a public writer-ID dimension. Reject a non-transactional DLQ
    under exactly-once and validate transaction timeout against checkpoint plus recovery bounds.
    Preserve the current direct producer path for low-latency at-least-once operation.
-4. **Build a linearizable cluster decision authority.** Complete AD-0 from
+5. **Build a linearizable cluster decision authority.** Complete AD-0 from
    `cluster-production-readiness.md`: use the authoritative Postgres control store to insert the
    seal-bound decision in a transaction conditioned on the current owner and fencing term. The
    existing `strategy = "raft"`/`raft_port` settings are not a Raft implementation and cannot
    justify removing `LDB-0013`.
-5. **Fence and certify every external committer.** External cursors must carry the exact
+6. **Fence and certify every external committer.** External cursors must carry the exact
    predecessor, deployment namespace, and decision fence. Run stale-leader, network-partition,
    rebalance, process-death-before/after-decision, ambiguous Kafka commit, mixed-sink, and
    transaction-timeout matrices before admitting cluster exactly-once.

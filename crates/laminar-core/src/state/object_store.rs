@@ -180,13 +180,6 @@ impl ObjectStoreBackend {
         OsPath::from(format!("{}commit/{key}", Self::attempt_prefix(attempt)))
     }
 
-    fn source_offsets_path(attempt: CheckpointAttempt, node_key: &str) -> OsPath {
-        OsPath::from(format!(
-            "{}srcoff/{node_key}",
-            Self::attempt_prefix(attempt)
-        ))
-    }
-
     /// Parse an attempt from `state-v2/epoch=N/checkpoint=M/...`.
     fn attempt_from_path(loc: &str) -> Option<CheckpointAttempt> {
         let mut parts = loc.split('/');
@@ -441,45 +434,6 @@ impl StateBackend for ObjectStoreBackend {
         Ok(out)
     }
 
-    async fn write_source_offsets(
-        &self,
-        attempt: CheckpointAttempt,
-        node_key: &str,
-        assignment_version: u64,
-        bytes: Bytes,
-    ) -> Result<(), StateBackendError> {
-        self.check_assignment_version(assignment_version)?;
-        self.put_immutable(&Self::source_offsets_path(attempt, node_key), bytes)
-            .await
-    }
-
-    async fn read_source_offsets(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<Bytes>, StateBackendError> {
-        use tokio_stream::StreamExt;
-
-        let prefix = OsPath::from(format!("{}srcoff/", Self::attempt_prefix(attempt)));
-        let mut entries = self.store.list(Some(&prefix));
-        let mut out = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let loc = entry
-                .map_err(|e| StateBackendError::Io(e.to_string()))?
-                .location;
-            let bytes = self
-                .store
-                .get(&loc)
-                .await
-                .map_err(|e| StateBackendError::Io(e.to_string()))?
-                .bytes()
-                .await
-                .map_err(|e| StateBackendError::Io(e.to_string()))?;
-            out.push((loc.to_string(), bytes));
-        }
-        out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        Ok(out.into_iter().map(|(_, bytes)| bytes).collect())
-    }
-
     async fn seal_checkpoint(
         &self,
         attempt: CheckpointAttempt,
@@ -648,9 +602,13 @@ impl StateBackend for ObjectStoreBackend {
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
         let path = Self::seal_path(attempt);
-        match self.store.head(&path).await {
-            Ok(_) => {
-                let seal = self.read_seal(&path).await?;
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|error| StateBackendError::Io(error.to_string()))?;
+                let seal = Self::decode_seal(&bytes)?;
                 if seal.attempt != attempt {
                     return Err(StateBackendError::Conflict {
                         resource: path.to_string(),
@@ -848,7 +806,11 @@ impl ObjectStoreBackend {
             .bytes()
             .await
             .map_err(|e| StateBackendError::Io(e.to_string()))?;
-        let seal: CheckpointSeal = serde_json::from_slice(&bytes).map_err(|e| {
+        Self::decode_seal(&bytes)
+    }
+
+    fn decode_seal(bytes: &[u8]) -> Result<CheckpointSeal, StateBackendError> {
+        let seal: CheckpointSeal = serde_json::from_slice(bytes).map_err(|e| {
             StateBackendError::Serialization(format!("invalid checkpoint seal: {e}"))
         })?;
         if seal.version != CHECKPOINT_SEAL_VERSION {
@@ -991,47 +953,6 @@ mod tests {
             backend.read_partial(new, 0).await.unwrap().unwrap(),
             Bytes::from_static(b"new")
         );
-    }
-
-    #[tokio::test]
-    async fn source_offsets_union_and_prune() {
-        let dir = tempdir().unwrap();
-        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
-
-        backend
-            .write_source_offsets(
-                attempt(7),
-                "node-1",
-                0,
-                Bytes::from_static(b"{\"events:0\":\"100\"}"),
-            )
-            .await
-            .unwrap();
-        backend
-            .write_source_offsets(
-                attempt(7),
-                "node-2",
-                0,
-                Bytes::from_static(b"{\"events:1\":\"200\"}"),
-            )
-            .await
-            .unwrap();
-
-        let blobs = backend.read_source_offsets(attempt(7)).await.unwrap();
-        assert_eq!(blobs.len(), 2);
-        assert!(backend
-            .read_source_offsets(attempt(8))
-            .await
-            .unwrap()
-            .is_empty());
-
-        // Lives under `epoch=7/srcoff/`, so the epoch-prefix prune reclaims it.
-        backend.prune_before(8).await.unwrap();
-        assert!(backend
-            .read_source_offsets(attempt(7))
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test]
@@ -1446,10 +1367,6 @@ mod tests {
                 .write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"x"))
                 .await
                 .unwrap();
-            backend
-                .write_source_offsets(attempt(epoch), "node-0", 0, Bytes::from_static(b"{}"))
-                .await
-                .unwrap();
             assert!(backend
                 .seal_checkpoint(attempt(epoch), 0, &[0], &[])
                 .await
@@ -1468,14 +1385,6 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some());
-            assert_eq!(
-                backend
-                    .read_source_offsets(attempt(epoch))
-                    .await
-                    .unwrap()
-                    .len(),
-                1
-            );
         }
         for epoch in 4..=5u64 {
             assert!(backend
@@ -1483,11 +1392,6 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
-            assert!(backend
-                .read_source_offsets(attempt(epoch))
-                .await
-                .unwrap()
-                .is_empty());
         }
         // The seal must rewind too — it feeds the adopt path's offset cut and the
         // reused epoch numbers must not find a foreign `_SEAL` marker.

@@ -581,7 +581,8 @@ pub struct CheckpointSection {
     /// One end-to-end checkpoint-attempt deadline.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
-    /// Number of recent checkpoints to retain before pruning.
+    /// Number of predecessor checkpoints retained alongside the current recovery cut.
+    /// Predecessors keep reference/delta chains resolvable.
     #[serde(default = "default_max_retained")]
     pub max_retained: usize,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).

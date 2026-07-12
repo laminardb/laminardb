@@ -55,18 +55,31 @@ async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
     make_coordinator_with_decision_store(dir).await.0
 }
 
-/// Coordinator whose restorable gate gives up quickly — for tests
-/// that exercise a gate *miss* (the default 30s poll would stall
-/// the suite).
-async fn make_coordinator_with_fast_gate(dir: &std::path::Path) -> CheckpointCoordinator {
-    let store = Box::new(FileSystemCheckpointStore::new(dir));
-    let config = CheckpointConfig {
-        restorable_gate_timeout: Duration::from_millis(250),
-        ..CheckpointConfig::default()
-    };
-    let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+#[cfg(feature = "cluster")]
+async fn make_cluster_coordinator(
+    dir: &std::path::Path,
+    participant_id: u64,
+) -> CheckpointCoordinator {
+    let store = Box::new(FileSystemCheckpointStore::new(dir).with_participant_id(participant_id));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
     bind_in_memory_decision_store(&mut coord).await;
+    coord.set_assignment_version(1);
+    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
     coord
+}
+
+#[cfg(feature = "cluster")]
+fn attach_solo_cluster_controller(coord: &mut CheckpointCoordinator, participant_id: u64) {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use tokio::sync::watch;
+
+    let self_id = NodeId(participant_id);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+    let (_tx, rx) = watch::channel(Vec::new());
+    coord.set_cluster_controller(Arc::new(ClusterController::new(self_id, kv, None, rx)));
 }
 
 #[tokio::test]
@@ -570,15 +583,19 @@ async fn reconcile_announces_commit_when_marker_present() {
 
     let ckpt_dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()));
+    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()).with_participant_id(1));
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
     let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     let mut orphan = CheckpointManifest::new(42, 7);
     orphan.deployment_id.clone_from(&deployment_id);
+    orphan.participant_id = 1;
     store.save_with_state(&orphan, None).await.unwrap();
-    decision_store.record_committed(7, 42).await.unwrap();
+    decision_store
+        .record_committed_for_participants(7, 42, &[1], 1, 1)
+        .await
+        .unwrap();
 
     let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
@@ -590,7 +607,9 @@ async fn reconcile_announces_commit_when_marker_present() {
     let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
     let mut coord = coord;
     coord.set_cluster_controller(controller);
-    coord.set_decision_store(decision_store).unwrap();
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
 
     coord.reconcile_prepared_on_init().await.unwrap();
 
@@ -616,13 +635,14 @@ async fn reconcile_announces_abort_when_marker_missing() {
 
     let ckpt_dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()));
+    let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()).with_participant_id(1));
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
     let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     let mut orphan = CheckpointManifest::new(11, 3);
     orphan.deployment_id.clone_from(&deployment_id);
+    orphan.participant_id = 1;
     store.save_with_state(&orphan, None).await.unwrap();
 
     let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
@@ -635,7 +655,9 @@ async fn reconcile_announces_abort_when_marker_missing() {
     let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
     let mut coord = coord;
     coord.set_cluster_controller(controller);
-    coord.set_decision_store(decision_store).unwrap();
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
 
     coord.reconcile_prepared_on_init().await.unwrap();
 
@@ -643,6 +665,62 @@ async fn reconcile_announces_abort_when_marker_missing() {
     let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
     assert_eq!(ann.phase, Phase::Abort);
     assert_eq!(ann.epoch, 3);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn reconcile_rolls_back_participant_excluded_from_exact_decision() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+    use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
+    use tokio::sync::watch;
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let store =
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(7));
+    let decision_store = in_memory_decision_store();
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let mut late_prepare = CheckpointManifest::new(91, 9);
+    late_prepare.deployment_id.clone_from(&deployment_id);
+    late_prepare.participant_id = 7;
+    store.save_with_state(&late_prepare, None).await.unwrap();
+    decision_store
+        .record_committed_for_participants(9, 91, &[1, 2], 1, 3)
+        .await
+        .unwrap();
+
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    coordinator
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coordinator.bind_deployment_id(deployment_id).unwrap();
+
+    let self_id = NodeId(7);
+    let leader = NodeInfo {
+        id: NodeId(1),
+        name: "leader".into(),
+        rpc_address: String::new(),
+        raft_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    };
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(vec![leader]);
+    coordinator.set_cluster_controller(Arc::new(ClusterController::new(
+        self_id, kv, None, members_rx,
+    )));
+
+    coordinator.reconcile_prepared_on_init().await.unwrap();
+
+    let stored = coordinator.store().load_by_id(91).await.unwrap().unwrap();
+    assert_eq!(
+        stored.durable_phase,
+        DurableCheckpointPhase::Prepared,
+        "an excluded late participant must not publish its local prepare"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -658,7 +736,11 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     const VNODE_COUNT: u16 = 64;
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_vnode_count(VNODE_COUNT));
+    let store = Box::new(
+        FileSystemCheckpointStore::new(dir.path())
+            .with_vnode_count(VNODE_COUNT)
+            .with_participant_id(7),
+    );
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
@@ -668,7 +750,14 @@ async fn follower_checkpoint_commits_on_leader_commit() {
         .set_decision_store(Arc::clone(&decision_store))
         .unwrap();
     coord.bind_deployment_id(deployment_id).unwrap();
-    decision_store.record_committed(1, 1).await.unwrap();
+    decision_store
+        .record_committed_for_participants(1, 1, &[7], 7, 1)
+        .await
+        .unwrap();
+    coord.set_assignment_version(1);
+    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(
+        u32::from(VNODE_COUNT),
+    )));
 
     let leader_id = NodeId(1);
     let follower_id = NodeId(7);
@@ -741,6 +830,53 @@ async fn follower_checkpoint_commits_on_leader_commit() {
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc() {
+    const PARTICIPANT_ID: u64 = 7;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
+    for epoch in 1..=4 {
+        let mut manifest = CheckpointManifest::new(epoch, epoch);
+        manifest.participant_id = PARTICIPANT_ID;
+        writer.save(&manifest).await.unwrap();
+    }
+
+    let config = CheckpointConfig {
+        max_retained: 1,
+        ..CheckpointConfig::default()
+    };
+    let store =
+        Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID));
+    let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+
+    assert!(coord.follower_finish(4, 4, true).await.unwrap());
+    assert_eq!(
+        coord.retention_requested_horizon, 0,
+        "local follower retention must not advance the shared state/decision GC horizon"
+    );
+    assert_eq!(coord.local_manifest_retention_requested_horizon, 3);
+
+    let reader = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
+    let ids = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ids = reader.list_ids().await.unwrap();
+            if ids == vec![3, 4] {
+                break ids;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("local manifest retention worker did not prune in time");
+    assert_eq!(ids, vec![3, 4]);
+    assert_eq!(
+        reader.load_latest().await.unwrap().unwrap().checkpoint_id,
+        4
+    );
+}
+
+#[cfg(feature = "cluster")]
 fn follower_decision_controller() -> (
     Arc<laminar_core::cluster::control::ClusterController>,
     Arc<laminar_core::cluster::control::InMemoryKv>,
@@ -792,7 +928,10 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
     let writer = Arc::clone(&decision_store);
     let record = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        writer.record_committed(12, 34).await.unwrap();
+        writer
+            .record_committed_for_participants(12, 34, &[7], 7, 1)
+            .await
+            .unwrap();
     });
     let committed = CheckpointCoordinator::await_follower_decision(
         &controller,
@@ -818,7 +957,10 @@ async fn exact_decision_wins_over_abort_announcement() {
 
     let (controller, kv, leader_id) = follower_decision_controller();
     let decision_store = in_memory_decision_store();
-    decision_store.record_committed(21, 55).await.unwrap();
+    decision_store
+        .record_committed_for_participants(21, 55, &[7], 7, 1)
+        .await
+        .unwrap();
     let abort = serde_json::to_string(&BarrierAnnouncement {
         epoch: 21,
         checkpoint_id: 55,
@@ -844,6 +986,54 @@ async fn exact_decision_wins_over_abort_announcement() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn follower_rolls_back_when_exact_decision_excludes_it() {
+    let (controller, _kv, _leader_id) = follower_decision_controller();
+    let decision_store = in_memory_decision_store();
+    decision_store
+        .record_committed_for_participants(22, 56, &[1, 2], 1, 4)
+        .await
+        .unwrap();
+
+    let committed = CheckpointCoordinator::await_follower_decision(
+        &controller,
+        Some(decision_store.as_ref()),
+        22,
+        56,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !committed,
+        "a late follower absent from the durable participant set must roll back"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_decision_membership_preserves_participant_zero() {
+    let decision_store = in_memory_decision_store();
+    decision_store
+        .record_committed_for_participants(23, 57, &[0, 4], 4, 5)
+        .await
+        .unwrap();
+
+    let status = CheckpointCoordinator::has_matching_follower_decision(
+        Some(decision_store.as_ref()),
+        0,
+        23,
+        57,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, FollowerDecisionMatch::Included);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn follower_checkpoint_rolls_back_on_leader_abort() {
     use laminar_core::cluster::control::{
         BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
@@ -852,7 +1042,7 @@ async fn follower_checkpoint_rolls_back_on_leader_abort() {
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_cluster_coordinator(dir.path(), 9).await;
 
     let leader_id = NodeId(1);
     let follower_id = NodeId(9);
@@ -1037,7 +1227,8 @@ async fn leader_loss_after_durable_decision_never_finalizes_or_reports_success()
     use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
 
     let checkpoint_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()));
+    let store =
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
@@ -1055,6 +1246,8 @@ async fn leader_loss_after_durable_decision_never_finalizes_or_reports_success()
     }));
     controller.set_leader_lease_watch(lease_rx);
     coord.set_cluster_controller(controller);
+    coord.set_assignment_version(1);
+    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
 
     let backing: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
@@ -1125,7 +1318,7 @@ async fn leader_announces_aligned_between_prepare_and_commit() {
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
 
     let self_id = NodeId(1);
     let announcements = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1238,16 +1431,21 @@ async fn leader_publishes_cluster_min_watermark_to_controller() {
 
     let dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(1));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
 
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+    let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     coord
-        .set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)))
+        .set_decision_store(Arc::clone(&decision_store))
         .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
+    coord.set_assignment_version(1);
+    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
 
     let self_id = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(self_id));
@@ -1303,16 +1501,21 @@ async fn leader_announces_prepare_and_commit_on_solo_cluster() {
 
     let dir = tempfile::tempdir().unwrap();
     let decision_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(1));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
 
     let decision_os: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+    let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     coord
-        .set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)))
+        .set_decision_store(Arc::clone(&decision_store))
         .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
+    coord.set_assignment_version(1);
+    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
 
     let self_id = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(self_id));
@@ -1334,6 +1537,14 @@ async fn leader_announces_prepare_and_commit_on_solo_cluster() {
         serde_json::from_str(&raw).unwrap();
     assert_eq!(ann.phase, Phase::Commit);
     assert_eq!(ann.epoch, result.epoch);
+    let decision = decision_store
+        .decision(result.epoch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.participants, [1]);
+    assert_eq!(decision.manifest_participant_id, 1);
+    assert_eq!(decision.assignment_version, 1);
 }
 
 #[tokio::test]
@@ -1344,30 +1555,35 @@ async fn gate_checks_full_registry_not_just_owned() {
     // gate must fail even though the leader wrote its own.
     use laminar_core::state::InProcessBackend;
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator_with_fast_gate(dir.path()).await;
+    let mut coord = make_coordinator(dir.path()).await;
     let backend = Arc::new(InProcessBackend::new(4));
     coord.set_state_backend(backend.clone());
     coord.set_vnode_set(vec![0, 1]); // leader's owned subset
     coord.set_gate_vnode_set(vec![0, 1, 2, 3]); // full cluster registry
+    let attempt = CheckpointAttempt::new(1, 1);
+    for vnode in [0, 1] {
+        backend
+            .write_partial(attempt, vnode, 0, bytes::Bytes::from_static(b"leader"))
+            .await
+            .unwrap();
+    }
 
-    let result = coord
-        .checkpoint(CheckpointRequest::default())
+    let err = coord
+        .await_restorable_gate(
+            attempt,
+            &[],
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        )
         .await
-        .unwrap();
-    assert!(
-        !result.success,
-        "gate must fail when follower markers are missing",
-    );
-    let err = result.error.expect("failure produces an error message");
+        .expect_err("gate must fail when follower markers are missing");
     assert!(
         err.contains("not all vnodes persisted"),
         "expected full-registry gate miss, got: {err}",
     );
 }
 
-/// B1: each node persists its source offsets every checkpoint; once the epoch
-/// seals, a node acquiring a partition reads the union of every node's blob and
-/// recovers the committed offset instead of falling back to `auto.offset.reset`.
+/// Each participant's final readiness marker carries its exact source offsets. Once the attempt
+/// seals, a node acquiring a partition reads the sealed union and resumes from the committed cut.
 #[cfg(feature = "cluster")]
 #[tokio::test]
 #[allow(clippy::disallowed_types)]
@@ -1378,7 +1594,9 @@ async fn source_offset_handoff_round_trip() {
     let mut coord = make_coordinator(dir.path()).await;
     let backend = Arc::new(InProcessBackend::new(4));
     coord.set_state_backend(backend.clone());
-    coord.set_assignment_version(1); // >0 so the handoff actually writes
+    coord.set_assignment_version(1);
+    coord.set_vnode_set(vec![0, 1, 2, 3]);
+    attach_solo_cluster_controller(&mut coord, 0);
 
     let mut source_offsets = HashMap::new();
     source_offsets.insert(
@@ -1389,8 +1607,17 @@ async fn source_offset_handoff_round_trip() {
         )])),
     );
     let attempt = CheckpointAttempt::new(5, 5);
+    let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
+    manifest.participant_id = 0;
+    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+    manifest.pipeline_identity = coord.expected_pipeline_identity();
+    manifest.source_offsets = source_offsets;
     coord
-        .persist_source_offset_handoff(attempt, &source_offsets)
+        .persist_participant_ready_until(
+            attempt,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .await
         .unwrap();
 
@@ -1402,7 +1629,7 @@ async fn source_offset_handoff_round_trip() {
             .unwrap();
     }
     assert!(backend
-        .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[])
+        .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[participant_ready_key(0)],)
         .await
         .unwrap());
 
@@ -1431,6 +1658,8 @@ async fn source_offsets_at_reads_the_requested_epoch() {
     let backend = Arc::new(InProcessBackend::new(4));
     coord.set_state_backend(backend.clone());
     coord.set_assignment_version(1);
+    coord.set_vnode_set(vec![0, 1, 2, 3]);
+    attach_solo_cluster_controller(&mut coord, 0);
 
     let handoff = |off: &str| {
         HashMap::from([(
@@ -1443,14 +1672,21 @@ async fn source_offsets_at_reads_the_requested_epoch() {
     };
     let attempt5 = CheckpointAttempt::new(5, 5);
     let attempt8 = CheckpointAttempt::new(8, 8);
-    coord
-        .persist_source_offset_handoff(attempt5, &handoff("100"))
-        .await
-        .unwrap();
-    coord
-        .persist_source_offset_handoff(attempt8, &handoff("200"))
-        .await
-        .unwrap();
+    for (attempt, offsets) in [(attempt5, handoff("100")), (attempt8, handoff("200"))] {
+        let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
+        manifest.participant_id = 0;
+        manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+        manifest.pipeline_identity = coord.expected_pipeline_identity();
+        manifest.source_offsets = offsets;
+        coord
+            .persist_participant_ready_until(
+                attempt,
+                &manifest,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+    }
     for attempt in [attempt5, attempt8] {
         for v in 0u32..4 {
             backend
@@ -1459,7 +1695,7 @@ async fn source_offsets_at_reads_the_requested_epoch() {
                 .unwrap();
         }
         assert!(backend
-            .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[])
+            .seal_checkpoint(attempt, 1, &[0, 1, 2, 3], &[participant_ready_key(0)],)
             .await
             .unwrap());
     }
@@ -1485,6 +1721,245 @@ async fn source_offsets_at_reads_the_requested_epoch() {
         at8.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"200".to_string())
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn seal_requires_readiness_from_zero_vnode_participants() {
+    use bytes::Bytes;
+    use laminar_core::state::{InProcessBackend, StateBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(1));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(9);
+    coord.set_vnode_set(Vec::new());
+    attach_solo_cluster_controller(&mut coord, 0);
+    let attempt = CheckpointAttempt::new(5, 7);
+    let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
+    manifest.participant_id = 0;
+    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+    manifest.pipeline_identity = coord.expected_pipeline_identity();
+    manifest
+        .source_offsets
+        .insert("kafka".into(), ConnectorCheckpoint::new());
+    coord
+        .persist_participant_ready_until(
+            attempt,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    let required = [participant_ready_key(0), participant_ready_key(1)];
+    assert!(
+        !backend
+            .seal_checkpoint(attempt, 9, &[], &required)
+            .await
+            .unwrap(),
+        "a zero-vnode participant still owes a final prepare attestation"
+    );
+
+    let peer_ready = ParticipantReady {
+        version: PARTICIPANT_READY_VERSION,
+        attempt,
+        participant_id: 1,
+        assignment_version: 9,
+        deployment_id: manifest.deployment_id.clone(),
+        pipeline_identity: manifest.pipeline_identity.clone(),
+        owned_vnodes: Vec::new(),
+        source_offsets: std::collections::BTreeMap::new(),
+    };
+    backend
+        .write_commit_descriptor(
+            attempt,
+            &participant_ready_key(1),
+            9,
+            Bytes::from(serde_json::to_vec(&peer_ready).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(attempt, 9, &[], &required)
+        .await
+        .unwrap());
+    let handoff = coord.source_offsets_at(attempt).await.unwrap();
+    assert_eq!(handoff.get("kafka"), Some(&HashMap::new()));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn readiness_rejects_overlapping_vnode_ownership() {
+    use bytes::Bytes;
+    use laminar_core::state::{InProcessBackend, StateBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(1));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(9);
+    coord.set_vnode_set(vec![0]);
+    attach_solo_cluster_controller(&mut coord, 0);
+    let attempt = CheckpointAttempt::new(5, 8);
+    let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
+    manifest.participant_id = 0;
+    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+    manifest.pipeline_identity = coord.expected_pipeline_identity();
+    coord
+        .persist_participant_ready_until(
+            attempt,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let peer_ready = ParticipantReady {
+        version: PARTICIPANT_READY_VERSION,
+        attempt,
+        participant_id: 1,
+        assignment_version: 9,
+        deployment_id: manifest.deployment_id,
+        pipeline_identity: manifest.pipeline_identity,
+        owned_vnodes: vec![0],
+        source_offsets: std::collections::BTreeMap::new(),
+    };
+    backend
+        .write_commit_descriptor(
+            attempt,
+            &participant_ready_key(1),
+            9,
+            Bytes::from(serde_json::to_vec(&peer_ready).unwrap()),
+        )
+        .await
+        .unwrap();
+    backend
+        .write_partial(attempt, 0, 9, Bytes::from_static(b"state"))
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(
+            attempt,
+            9,
+            &[0],
+            &[participant_ready_key(0), participant_ready_key(1)],
+        )
+        .await
+        .unwrap());
+
+    let error = coord
+        .source_offsets_at(attempt)
+        .await
+        .expect_err("one vnode cannot belong to two checkpoint participants");
+    assert!(error.to_string().contains("vnode 0 is claimed by multiple"));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn readiness_encoding_is_canonical_for_idempotent_reconstruction() {
+    use bytes::Bytes;
+    use laminar_core::state::{InProcessBackend, StateBackend};
+
+    let backend = InProcessBackend::new(1);
+    let attempt = CheckpointAttempt::new(9, 11);
+    let ready = |offsets: [(&str, &str); 2]| ParticipantReady {
+        version: PARTICIPANT_READY_VERSION,
+        attempt,
+        participant_id: 3,
+        assignment_version: 4,
+        deployment_id: "deployment".into(),
+        pipeline_identity: PipelineIdentity::empty(),
+        owned_vnodes: Vec::new(),
+        source_offsets: std::collections::BTreeMap::from([(
+            "kafka".into(),
+            offsets
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+        )]),
+    };
+    let first = serde_json::to_vec(&ready([("events:1", "20"), ("events:0", "10")])).unwrap();
+    let second = serde_json::to_vec(&ready([("events:0", "10"), ("events:1", "20")])).unwrap();
+    assert_eq!(first, second);
+    let key = participant_ready_key(3);
+    backend
+        .write_commit_descriptor(attempt, &key, 4, Bytes::from(first))
+        .await
+        .unwrap();
+    backend
+        .write_commit_descriptor(attempt, &key, 4, Bytes::from(second))
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn recovered_manifest_offsets_must_match_sealed_handoff() {
+    let mut manifest = CheckpointManifest::new(7, 6);
+    manifest.source_offsets.insert(
+        "kafka".into(),
+        ConnectorCheckpoint::with_offsets(HashMap::from([("events:0".into(), "100".into())])),
+    );
+    let matching = HashMap::from([(
+        "kafka".into(),
+        HashMap::from([("events:0".into(), "100".into())]),
+    )]);
+    CheckpointCoordinator::validate_manifest_source_handoff(&manifest, &matching).unwrap();
+
+    let divergent = HashMap::from([(
+        "kafka".into(),
+        HashMap::from([("events:0".into(), "101".into())]),
+    )]);
+    let error = CheckpointCoordinator::validate_manifest_source_handoff(&manifest, &divergent)
+        .expect_err("manifest offsets cannot override the sealed handoff");
+    assert!(error.to_string().contains("does not match the sealed"));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn recovery_rejects_decision_with_a_different_sealed_assignment() {
+    use laminar_core::state::{InProcessBackend, StateBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut coord, decisions) = make_coordinator_with_decision_store(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(1));
+    coord.set_state_backend(backend.clone());
+    coord.set_assignment_version(2);
+    coord.set_vnode_set(Vec::new());
+    attach_solo_cluster_controller(&mut coord, 0);
+    let attempt = CheckpointAttempt::new(6, 7);
+    let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
+    manifest.participant_id = 0;
+    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
+    manifest.pipeline_identity = coord.expected_pipeline_identity();
+    coord.store.save(&manifest).await.unwrap();
+    coord
+        .persist_participant_ready_until(
+            attempt,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(attempt, 2, &[], &[participant_ready_key(0)])
+        .await
+        .unwrap());
+    decisions
+        .record_committed_for_participants(attempt.epoch, attempt.checkpoint_id, &[0], 0, 1)
+        .await
+        .unwrap();
+
+    let error = coord
+        .recover()
+        .await
+        .expect_err("decision and state seal must fence the same assignment");
+    assert!(
+        error.to_string().contains("assignment version 1"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("sealed version 2"), "{error}");
 }
 
 /// Followers ack at capture and upload partials
@@ -1524,7 +1999,11 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
 
     let start = std::time::Instant::now();
     coord
-        .await_restorable_gate(attempt, &[])
+        .await_restorable_gate(
+            attempt,
+            &[],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .await
         .expect("gate must seal once the late partials land");
     assert!(
@@ -2146,7 +2625,10 @@ async fn recovery_never_walks_epoch_back_onto_aborted_attempt() {
         .await
         .unwrap();
     decision_store.record_committed(3, 3).await.unwrap();
-    coord.set_decision_store(decision_store).unwrap();
+    coord
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
     assert_eq!(coord.epoch(), 6, "seeds from the highest loadable manifest");
 
     let recovered = coord.recover().await.unwrap().expect("recovers");

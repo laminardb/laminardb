@@ -8,13 +8,16 @@ use futures::{StreamExt, TryStreamExt};
 use laminar_connectors::connector::{
     CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use laminar_core::checkpoint_decision::{CommitDecision, CommitDecisionScope};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use laminar_core::state::{CheckpointAttempt, StateBackend};
+use laminar_core::state::{CheckpointAttempt, CheckpointSealInventory, StateBackend};
 use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
 
+#[cfg(feature = "cluster")]
+use crate::checkpoint_coordinator::{participant_from_ready_key, PARTICIPANT_READY_PREFIX};
 use crate::error::DbError;
 use crate::sink_task::SinkTaskHandle;
 
@@ -26,7 +29,19 @@ const MAX_PREPARED_HEADER_BYTES: usize = 64 * 1024;
 const MAX_COMMIT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_COMMIT_BATCH_ENTRIES: usize = 4_096;
 const MAX_DESCRIPTOR_READ_CONCURRENCY: usize = 4;
+const MAX_SEAL_READ_CONCURRENCY: usize = 8;
 const PREPARED_MARKER_MAGIC: &[u8; 8] = b"LDBCM2\0\0";
+
+struct CommitInventory {
+    attempts: Vec<CheckpointAttempt>,
+    bindings: CommitBindings,
+    observed_cursors: FxHashMap<String, u64>,
+}
+
+struct CommitBindings {
+    decisions: FxHashMap<CheckpointAttempt, CommitDecision>,
+    seals: FxHashMap<CheckpointAttempt, CheckpointSealInventory>,
+}
 
 /// Immutable runtime-owned header around a connector's opaque committable. The payload follows
 /// as raw bytes; serializing it as a JSON integer array would amplify a valid marker into
@@ -218,6 +233,7 @@ pub(crate) struct CoordinatedCommitter {
     max_uncommitted_epochs: u64,
     metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     decision_store: Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
+    decision_scope: CommitDecisionScope,
     storage_timeout: std::time::Duration,
     #[cfg(feature = "cluster")]
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -245,6 +261,7 @@ impl CoordinatedCommitter {
             max_uncommitted_epochs: u64::MAX,
             metrics: None,
             decision_store: None,
+            decision_scope: CommitDecisionScope::Local,
             storage_timeout: std::time::Duration::from_secs(120),
             #[cfg(feature = "cluster")]
             controller: None,
@@ -325,7 +342,18 @@ impl CoordinatedCommitter {
         mut self,
         controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     ) -> Self {
+        self.decision_scope = if controller.is_some() {
+            CommitDecisionScope::Cluster
+        } else {
+            CommitDecisionScope::Local
+        };
         self.controller = controller;
+        self
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    fn with_decision_scope(mut self, scope: CommitDecisionScope) -> Self {
+        self.decision_scope = scope;
         self
     }
 
@@ -343,13 +371,18 @@ impl CoordinatedCommitter {
             return Ok(());
         }
 
-        let (all_decided, observed_cursors) = match self.load_commit_inventory().await {
+        let inventory = match self.load_commit_inventory().await {
             Ok(inventory) => inventory,
             Err(error) => {
                 self.mark_lag_unknown();
                 return Err(error);
             }
         };
+        let CommitInventory {
+            attempts: all_decided,
+            bindings,
+            observed_cursors,
+        } = inventory;
         self.committed_through = observed_cursors;
         self.seeded = true;
         let high_epoch = all_decided.last().map(|attempt| attempt.epoch);
@@ -366,7 +399,7 @@ impl CoordinatedCommitter {
                 continue;
             };
             match self
-                .commit_sealed(handle, name, cursor, &sealed, target)
+                .commit_sealed(handle, name, cursor, &sealed, target, &bindings)
                 .await
             {
                 Ok(()) => {
@@ -413,9 +446,7 @@ impl CoordinatedCommitter {
         first_err.map_or(Ok(()), Err)
     }
 
-    async fn load_commit_inventory(
-        &self,
-    ) -> Result<(Vec<CheckpointAttempt>, FxHashMap<String, u64>), DbError> {
+    async fn load_commit_inventory(&self) -> Result<CommitInventory, DbError> {
         let decision_store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
                 "committer: coordinated commit requires a checkpoint decision store".into(),
@@ -427,21 +458,81 @@ impl CoordinatedCommitter {
                 decision_store.committed_decisions(),
             )
             .await?;
+        for decision in &decisions {
+            if decision.deployment_id != self.deployment_id {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: checkpoint {} decision deployment '{}' does not match committer deployment '{}'",
+                    decision.checkpoint_id, decision.deployment_id, self.deployment_id
+                )));
+            }
+            if decision.scope != self.decision_scope {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: checkpoint {} decision scope {:?} does not match active runtime scope {:?}",
+                    decision.checkpoint_id, decision.scope, self.decision_scope
+                )));
+            }
+        }
         let all_decided: Vec<CheckpointAttempt> = decisions
             .iter()
             .map(|decision| CheckpointAttempt::new(decision.epoch, decision.checkpoint_id))
             .collect();
+        let mut decision_bindings = FxHashMap::default();
+        for decision in decisions {
+            let attempt = CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
+            if decision_bindings.insert(attempt, decision).is_some() {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: duplicate durable decision for epoch {} checkpoint {}",
+                    attempt.epoch, attempt.checkpoint_id
+                )));
+            }
+        }
         let observed_cursors = self.read_external_cursors().await?;
-        let sealed: FxHashSet<CheckpointAttempt> = self
-            .storage_io(
-                "list sealed checkpoints",
-                self.backend.sealed_checkpoints(0),
-            )
-            .await?
-            .into_iter()
+        let min_observed = self
+            .sinks
+            .iter()
+            .map(|(name, _)| observed_cursors.get(name).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let pending_attempts: Vec<_> = all_decided
+            .iter()
+            .copied()
+            .filter(|attempt| attempt.checkpoint_id > min_observed)
             .collect();
-        self.validate_commit_continuity(&all_decided, &observed_cursors, &sealed)?;
-        Ok((all_decided, observed_cursors))
+        let seal_reads =
+            futures::stream::iter(pending_attempts.into_iter().map(|attempt| async move {
+                let inventory = self
+                    .storage_io(
+                        &format!(
+                            "read seal inventory for checkpoint {}",
+                            attempt.checkpoint_id
+                        ),
+                        self.backend.checkpoint_seal_inventory(attempt),
+                    )
+                    .await?;
+                Ok::<_, DbError>((attempt, inventory))
+            }))
+            .buffer_unordered(MAX_SEAL_READ_CONCURRENCY);
+        tokio::pin!(seal_reads);
+        let mut seals = FxHashMap::default();
+        while let Some((attempt, inventory)) = seal_reads.try_next().await? {
+            if let Some(inventory) = inventory {
+                if seals.insert(attempt, inventory).is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "committer: duplicate seal inventory for checkpoint {}",
+                        attempt.checkpoint_id
+                    )));
+                }
+            }
+        }
+        self.validate_commit_continuity(&all_decided, &observed_cursors, &seals)?;
+        Ok(CommitInventory {
+            attempts: all_decided,
+            bindings: CommitBindings {
+                decisions: decision_bindings,
+                seals,
+            },
+            observed_cursors,
+        })
     }
 
     /// Re-read every external cursor on every pass. Besides recovering an ambiguous prior commit,
@@ -480,7 +571,7 @@ impl CoordinatedCommitter {
         &self,
         all_decided: &[CheckpointAttempt],
         observed_cursors: &FxHashMap<String, u64>,
-        sealed: &FxHashSet<CheckpointAttempt>,
+        seals: &FxHashMap<CheckpointAttempt, CheckpointSealInventory>,
     ) -> Result<(), DbError> {
         let min_observed = self
             .sinks
@@ -494,7 +585,7 @@ impl CoordinatedCommitter {
             .iter()
             .filter(|attempt| attempt.checkpoint_id > min_observed)
         {
-            if !sealed.contains(attempt) {
+            if !seals.contains_key(attempt) {
                 return Err(DbError::Checkpoint(format!(
                     "committer: durable decision for epoch {} checkpoint {} has no exact state \
                      seal; external publication cannot skip the missing cut",
@@ -511,7 +602,7 @@ impl CoordinatedCommitter {
                 // seal. If it is the GC anchor, zero proves catalog rollback.
                 all_decided
                     .first()
-                    .is_none_or(|attempt| sealed.contains(attempt))
+                    .is_none_or(|attempt| seals.contains_key(attempt))
             } else {
                 all_decided
                     .binary_search_by_key(cursor, |attempt| attempt.checkpoint_id)
@@ -545,6 +636,7 @@ impl CoordinatedCommitter {
         predecessor: u64,
         sealed: &[CheckpointAttempt],
         target: CheckpointAttempt,
+        bindings: &CommitBindings,
     ) -> Result<(), DbError> {
         if sealed.last().copied() != Some(target) {
             return Err(DbError::Checkpoint(
@@ -563,8 +655,20 @@ impl CoordinatedCommitter {
         let mut batch_target = None;
         let mut batch_predecessor = predecessor;
         for &attempt in sealed {
+            let decision = bindings.decisions.get(&attempt).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "committer: checkpoint {} has no durable decision binding",
+                    attempt.checkpoint_id
+                ))
+            })?;
+            let inventory = bindings.seals.get(&attempt).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "committer: checkpoint {} has no cached exact seal inventory",
+                    attempt.checkpoint_id
+                ))
+            })?;
             let (mut attempt_entries, attempt_descriptor_bytes) = self
-                .load_attempt_entries(name, &namespace, &prefix, attempt)
+                .load_attempt_entries(name, &namespace, &prefix, attempt, decision, inventory)
                 .await?;
 
             let combined_bytes = batch_descriptor_bytes
@@ -621,33 +725,80 @@ impl CoordinatedCommitter {
         .await
     }
 
-    async fn load_attempt_entries(
+    fn validate_attempt_inventory(
         &self,
         name: &str,
-        namespace: &CoordinatedCommitNamespace,
         prefix: &str,
         attempt: CheckpointAttempt,
-    ) -> Result<(Vec<CoordinatedCommitPayload>, usize), DbError> {
-        let inventory = self
-            .storage_io(
-                &format!(
-                    "read seal inventory for checkpoint {}",
-                    attempt.checkpoint_id
-                ),
-                self.backend.checkpoint_seal_inventory(attempt),
-            )
-            .await?
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "committer: checkpoint {} was listed sealed but its seal disappeared",
-                    attempt.checkpoint_id
-                ))
-            })?;
+        decision: &CommitDecision,
+        inventory: &CheckpointSealInventory,
+    ) -> Result<Vec<String>, DbError> {
         if inventory.attempt != attempt {
             return Err(DbError::Checkpoint(format!(
                 "committer: seal inventory identity mismatch for checkpoint {}",
                 attempt.checkpoint_id
             )));
+        }
+        if decision.epoch != attempt.epoch || decision.checkpoint_id != attempt.checkpoint_id {
+            return Err(DbError::Checkpoint(format!(
+                "committer: decision identity mismatch for checkpoint {}",
+                attempt.checkpoint_id
+            )));
+        }
+        if decision.deployment_id != self.deployment_id {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} decision deployment '{}' does not match committer deployment '{}'",
+                attempt.checkpoint_id, decision.deployment_id, self.deployment_id
+            )));
+        }
+        if decision.scope != self.decision_scope {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} decision scope {:?} does not match active runtime scope {:?}",
+                attempt.checkpoint_id, decision.scope, self.decision_scope
+            )));
+        }
+        match decision.scope {
+            CommitDecisionScope::Local if inventory.assignment_version != 0 => {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: local checkpoint {} has non-local sealed assignment {}",
+                    attempt.checkpoint_id, inventory.assignment_version
+                )));
+            }
+            CommitDecisionScope::Cluster
+                if inventory.assignment_version != decision.assignment_version =>
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: checkpoint {} decision assignment {} does not match sealed assignment {}",
+                    attempt.checkpoint_id,
+                    decision.assignment_version,
+                    inventory.assignment_version
+                )));
+            }
+            _ => {}
+        }
+        #[cfg(feature = "cluster")]
+        if decision.scope == CommitDecisionScope::Cluster {
+            let mut readiness_participants = Vec::new();
+            for key in inventory
+                .required_descriptors
+                .iter()
+                .filter(|key| key.starts_with(PARTICIPANT_READY_PREFIX))
+            {
+                let participant_id = participant_from_ready_key(key).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "committer: checkpoint {} has non-canonical participant readiness key '{key}'",
+                        attempt.checkpoint_id
+                    ))
+                })?;
+                readiness_participants.push(participant_id);
+            }
+            readiness_participants.sort_unstable();
+            if readiness_participants != decision.participants {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: checkpoint {} readiness participants {readiness_participants:?} do not match decision participants {:?}",
+                    attempt.checkpoint_id, decision.participants
+                )));
+            }
         }
         let required: Vec<String> = inventory
             .required_descriptors
@@ -669,6 +820,20 @@ impl CoordinatedCommitter {
                 required.len()
             )));
         }
+        Ok(required)
+    }
+
+    async fn load_attempt_entries(
+        &self,
+        name: &str,
+        namespace: &CoordinatedCommitNamespace,
+        prefix: &str,
+        attempt: CheckpointAttempt,
+        decision: &CommitDecision,
+        inventory: &CheckpointSealInventory,
+    ) -> Result<(Vec<CoordinatedCommitPayload>, usize), DbError> {
+        let required =
+            self.validate_attempt_inventory(name, prefix, attempt, decision, inventory)?;
 
         let descriptors = futures::stream::iter(required.into_iter().map(|key| async move {
             let bytes = self
@@ -703,6 +868,15 @@ impl CoordinatedCommitter {
                 )));
             }
             entries.push(decode_prepared_marker(&key, &bytes, attempt, namespace)?);
+        }
+        entries.sort_unstable_by_key(|entry| entry.participant_id);
+        let actual_participants: Vec<u64> =
+            entries.iter().map(|entry| entry.participant_id).collect();
+        if actual_participants != decision.participants {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} sink '{name}' participants {actual_participants:?} do not match decision participants {:?}",
+                attempt.checkpoint_id, decision.participants
+            )));
         }
         Ok((entries, descriptor_bytes))
     }
@@ -748,9 +922,11 @@ mod tests {
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::state::{InProcessBackend, StateBackend};
-    use object_store::memory::InMemory;
+    use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt, PutPayload};
     use parking_lot::Mutex;
 
+    #[cfg(feature = "cluster")]
+    use crate::checkpoint_coordinator::participant_ready_key;
     use crate::sink_task::{SinkTaskConfig, SinkTaskHandle, DEFAULT_CHANNEL_CAPACITY};
 
     type Recorded = Arc<Mutex<Vec<CoordinatedCommitBatch>>>;
@@ -860,6 +1036,40 @@ mod tests {
         attempt: CheckpointAttempt,
         markers: &[(u64, Option<&[u8]>)],
     ) {
+        seal_with_assignment(backend, attempt, markers, 0).await;
+    }
+
+    async fn seal_with_assignment(
+        backend: &InProcessBackend,
+        attempt: CheckpointAttempt,
+        markers: &[(u64, Option<&[u8]>)],
+        assignment_version: u64,
+    ) {
+        let readiness_participants: Vec<u64> = if assignment_version == 0 {
+            Vec::new()
+        } else {
+            markers
+                .iter()
+                .map(|(participant, _)| *participant)
+                .collect()
+        };
+        seal_with_readiness(
+            backend,
+            attempt,
+            markers,
+            &readiness_participants,
+            assignment_version,
+        )
+        .await;
+    }
+
+    async fn seal_with_readiness(
+        backend: &InProcessBackend,
+        attempt: CheckpointAttempt,
+        markers: &[(u64, Option<&[u8]>)],
+        readiness_participants: &[u64],
+        assignment_version: u64,
+    ) {
         let namespace = namespace();
         let mut keys = Vec::new();
         for &(participant_id, payload) in markers {
@@ -867,39 +1077,67 @@ mod tests {
             let marker =
                 encode_prepared_marker(&namespace, attempt, participant_id, payload).unwrap();
             backend
-                .write_commit_descriptor(attempt, &key, 0, Bytes::from(marker))
+                .write_commit_descriptor(attempt, &key, assignment_version, Bytes::from(marker))
                 .await
                 .unwrap();
             keys.push(key);
         }
+        #[cfg(feature = "cluster")]
+        for &participant_id in readiness_participants {
+            let ready_key = participant_ready_key(participant_id);
+            backend
+                .write_commit_descriptor(
+                    attempt,
+                    &ready_key,
+                    assignment_version,
+                    Bytes::from_static(b"ready"),
+                )
+                .await
+                .unwrap();
+            keys.push(ready_key);
+        }
+        #[cfg(not(feature = "cluster"))]
+        let _ = readiness_participants;
         keys.sort_unstable();
         assert!(backend
-            .seal_checkpoint(attempt, 0, &[], &keys)
+            .seal_checkpoint(attempt, assignment_version, &[], &keys)
             .await
             .unwrap());
     }
 
-    fn decisions() -> Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore> {
-        Arc::new(
-            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
-                InMemory::new(),
-            )),
-        )
+    async fn decisions() -> Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let identity = format!(r#"{{"version":1,"id":"{}"}}"#, deployment_id());
+        store
+            .put(
+                &object_store::path::Path::from("checkpoint-deployment/identity.json"),
+                PutPayload::from_bytes(Bytes::from(identity)),
+            )
+            .await
+            .unwrap();
+        Arc::new(laminar_core::checkpoint_decision::CheckpointDecisionStore::new(store))
     }
 
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn batches_sealed_epochs_into_one_commit() {
         let backend = Arc::new(InProcessBackend::new(2));
         let first = CheckpointAttempt::new(1, 11);
         let second = CheckpointAttempt::new(2, 22);
-        seal(&backend, first, &[(7, Some(b"e1")), (9, None)]).await;
-        seal(&backend, second, &[(7, Some(b"e2")), (9, None)]).await;
+        seal_with_assignment(&backend, first, &[(7, Some(b"e1")), (9, None)], 3).await;
+        seal_with_assignment(&backend, second, &[(7, Some(b"e2")), (9, None)], 3).await;
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        let decisions = decisions();
-        decisions.record_committed(1, 11).await.unwrap();
-        decisions.record_committed(2, 22).await.unwrap();
+        let decisions = decisions().await;
+        decisions
+            .record_committed_for_participants(1, 11, &[7, 9], 7, 3)
+            .await
+            .unwrap();
+        decisions
+            .record_committed_for_participants(2, 22, &[7, 9], 7, 3)
+            .await
+            .unwrap();
         let floor = Arc::new(AtomicU64::new(0));
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
@@ -908,6 +1146,7 @@ mod tests {
             deployment_id(),
             Arc::clone(&floor),
         )
+        .with_decision_scope(CommitDecisionScope::Cluster)
         .with_decision_store(Some(decisions));
 
         committer.commit_ready().await.unwrap();
@@ -957,7 +1196,7 @@ mod tests {
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        let decisions = decisions();
+        let decisions = decisions().await;
         decisions.record_committed(1, 11).await.unwrap();
         decisions.record_committed(3, 31).await.unwrap();
         let mut committer = CoordinatedCommitter::new(
@@ -996,7 +1235,7 @@ mod tests {
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        let decisions = decisions();
+        let decisions = decisions().await;
         decisions.record_committed(1, 11).await.unwrap();
         decisions.record_committed(2, 22).await.unwrap();
 
@@ -1047,7 +1286,7 @@ mod tests {
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        let decisions = decisions();
+        let decisions = decisions().await;
         decisions.record_committed(4, 44).await.unwrap();
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
@@ -1064,11 +1303,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_decision_rejects_a_cluster_assignment_seal() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let attempt = CheckpointAttempt::new(4, 45);
+        seal_with_readiness(&backend, attempt, &[(0, Some(b"payload"))], &[], 4).await;
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink(Arc::clone(&recorded));
+        let decisions = decisions().await;
+        decisions.record_committed(4, 45).await.unwrap();
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            identity(),
+            deployment_id(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_decision_store(Some(decisions));
+
+        let error = committer.commit_ready().await.unwrap_err();
+        assert!(error.to_string().contains("non-local sealed assignment 4"));
+        assert!(recorded.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn caught_up_history_still_rejects_a_different_deployment() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle =
+            spawn_recording_sink_with_cursor(Arc::clone(&recorded), Arc::new(AtomicU64::new(44)));
+        let decisions = decisions().await;
+        decisions.record_committed(4, 44).await.unwrap();
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            identity(),
+            "018f0000-0000-7000-8000-000000000099".into(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_decision_store(Some(decisions));
+
+        let error = committer.commit_ready().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match committer deployment"));
+        assert!(recorded.lock().is_empty());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn caught_up_history_still_rejects_a_different_runtime_scope() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle =
+            spawn_recording_sink_with_cursor(Arc::clone(&recorded), Arc::new(AtomicU64::new(44)));
+        let decisions = decisions().await;
+        decisions.record_committed(4, 44).await.unwrap();
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            identity(),
+            deployment_id(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_decision_scope(CommitDecisionScope::Cluster)
+        .with_decision_store(Some(decisions));
+
+        let error = committer.commit_ready().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match active runtime scope"));
+        assert!(recorded.lock().is_empty());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn external_commit_rejects_participants_outside_the_decision() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let attempt = CheckpointAttempt::new(5, 55);
+        seal_with_readiness(&backend, attempt, &[(7, Some(b"payload"))], &[7, 9], 4).await;
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink(Arc::clone(&recorded));
+        let decisions = decisions().await;
+        decisions
+            .record_committed_for_participants(5, 55, &[7, 9], 7, 4)
+            .await
+            .unwrap();
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            identity(),
+            deployment_id(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_decision_scope(CommitDecisionScope::Cluster)
+        .with_decision_store(Some(decisions));
+
+        let error = committer.commit_ready().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("do not match decision participants"));
+        assert!(recorded.lock().is_empty());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn external_commit_rejects_readiness_outside_the_decision() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let attempt = CheckpointAttempt::new(5, 56);
+        seal_with_readiness(
+            &backend,
+            attempt,
+            &[(7, Some(b"payload")), (9, None)],
+            &[7],
+            4,
+        )
+        .await;
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink(Arc::clone(&recorded));
+        let decisions = decisions().await;
+        decisions
+            .record_committed_for_participants(5, 56, &[7, 9], 7, 4)
+            .await
+            .unwrap();
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            identity(),
+            deployment_id(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_decision_scope(CommitDecisionScope::Cluster)
+        .with_decision_store(Some(decisions));
+
+        let error = committer.commit_ready().await.unwrap_err();
+        assert!(error.to_string().contains("readiness participants [7]"));
+        assert!(recorded.lock().is_empty());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn external_commit_rejects_a_different_decision_assignment() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let attempt = CheckpointAttempt::new(6, 66);
+        seal_with_assignment(&backend, attempt, &[(7, Some(b"payload"))], 4).await;
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink(Arc::clone(&recorded));
+        let decisions = decisions().await;
+        decisions
+            .record_committed_for_participants(6, 66, &[7], 7, 5)
+            .await
+            .unwrap();
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![("ice".into(), handle)],
+            identity(),
+            deployment_id(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_decision_scope(CommitDecisionScope::Cluster)
+        .with_decision_store(Some(decisions));
+
+        let error = committer.commit_ready().await.unwrap_err();
+        assert!(error.to_string().contains("decision assignment 5"));
+        assert!(error.to_string().contains("sealed assignment 4"));
+        assert!(recorded.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn durable_decision_without_exact_seal_fails_closed() {
         let backend = Arc::new(InProcessBackend::new(1));
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        let decisions = decisions();
+        let decisions = decisions().await;
         decisions.record_committed(4, 44).await.unwrap();
         let lag = Arc::new(AtomicU64::new(7));
         let lag_known = Arc::new(AtomicBool::new(true));
@@ -1101,7 +1507,7 @@ mod tests {
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let cursor = Arc::new(AtomicU64::new(0));
         let handle = spawn_recording_sink_with_cursor(Arc::clone(&recorded), Arc::clone(&cursor));
-        let decisions = decisions();
+        let decisions = decisions().await;
         decisions.record_committed(1, 11).await.unwrap();
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,

@@ -44,21 +44,110 @@ pub enum DecisionError {
     Conflict(String),
 }
 
+/// Runtime scope of a durable checkpoint decision.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitDecisionScope {
+    /// Embedded or standalone recovery domain.
+    Local,
+    /// Multi-participant cluster recovery domain.
+    Cluster,
+}
+
 /// Durable commit decision bound to one concrete checkpoint attempt.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CommitDecision {
     /// Decision payload format.
     pub version: u32,
+    /// Recovery domain that created the decision.
+    pub scope: CommitDecisionScope,
     /// Committed epoch.
     pub epoch: u64,
     /// Exact checkpoint attempt selected for that epoch.
     pub checkpoint_id: u64,
     /// Durable deployment incarnation that owns this decision.
     pub deployment_id: String,
+    /// Canonical (sorted, duplicate-free) checkpoint participant IDs.
+    ///
+    /// A participant absent from this set was not required to persist a local manifest for this
+    /// cut. Recovery uses that distinction to avoid treating an intentionally shed node as
+    /// participant-local storage loss.
+    pub participants: Vec<u64>,
+    /// Participant whose prepared manifest is the canonical manifest for this decision.
+    pub manifest_participant_id: u64,
+    /// Vnode-assignment generation captured by the checkpoint durability gate.
+    ///
+    /// Local runtimes use generation `0`; cluster decisions require a non-zero generation.
+    pub assignment_version: u64,
 }
 
-// v2 adds the required deployment incarnation that fences checkpoint-store resets.
-const COMMIT_DECISION_VERSION: u32 = 2;
+// v3 binds the manifest owner and exact assignment participant set to the durable decision.
+const COMMIT_DECISION_VERSION: u32 = 3;
+
+impl CommitDecision {
+    fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
+        if self.version != COMMIT_DECISION_VERSION {
+            return Err(DecisionError::Conflict(format!(
+                "decision for epoch {path_epoch} has unsupported version {}; expected \
+                 {COMMIT_DECISION_VERSION}",
+                self.version
+            )));
+        }
+        if self.epoch == 0 || self.epoch != path_epoch {
+            return Err(DecisionError::Conflict(format!(
+                "decision path epoch {path_epoch} does not match non-zero payload epoch {}",
+                self.epoch
+            )));
+        }
+        if self.checkpoint_id == 0 {
+            return Err(DecisionError::Conflict(format!(
+                "decision for epoch {path_epoch} has checkpoint ID 0"
+            )));
+        }
+        if self.participants.is_empty() {
+            return Err(DecisionError::Conflict(format!(
+                "decision for epoch {path_epoch} has no participants"
+            )));
+        }
+        if self.participants.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(DecisionError::Conflict(format!(
+                "decision for epoch {path_epoch} participants are not canonical"
+            )));
+        }
+        if self
+            .participants
+            .binary_search(&self.manifest_participant_id)
+            .is_err()
+        {
+            return Err(DecisionError::Conflict(format!(
+                "decision for epoch {path_epoch} manifest participant {} is absent from \
+                 participants {:?}",
+                self.manifest_participant_id, self.participants
+            )));
+        }
+
+        match self.scope {
+            CommitDecisionScope::Local
+                if self.participants != [0]
+                    || self.manifest_participant_id != 0
+                    || self.assignment_version != 0 =>
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "local decision for epoch {path_epoch} must use participant 0 and assignment \
+                     version 0"
+                )));
+            }
+            CommitDecisionScope::Cluster if self.assignment_version == 0 => {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster decision for epoch {path_epoch} requires a non-zero assignment \
+                     version"
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 /// Durable allocator state for globally unique checkpoint IDs.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -328,13 +417,63 @@ impl CheckpointDecisionStore {
         epoch: u64,
         checkpoint_id: u64,
     ) -> Result<bool, DecisionError> {
-        let deployment_id = self.load_or_create_deployment_id().await?;
-        let decision = CommitDecision {
-            version: COMMIT_DECISION_VERSION,
+        self.record_committed_scoped(epoch, checkpoint_id, CommitDecisionScope::Local, &[0], 0, 0)
+            .await
+    }
+
+    /// CAS-create the commit marker for a participant-complete cluster checkpoint.
+    ///
+    /// `participants` is treated as a set and canonicalized before persistence, so retries from
+    /// independent coordinators produce byte-equivalent metadata regardless of discovery order.
+    /// The canonical manifest participant must belong to that set. Cluster decisions require a
+    /// non-zero assignment version; local callers should use [`Self::record_committed`].
+    ///
+    /// # Errors
+    /// Object-store I/O or invalid/conflicting decision metadata.
+    pub async fn record_committed_for_participants(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+        participants: &[u64],
+        manifest_participant_id: u64,
+        assignment_version: u64,
+    ) -> Result<bool, DecisionError> {
+        self.record_committed_scoped(
             epoch,
             checkpoint_id,
-            deployment_id,
+            CommitDecisionScope::Cluster,
+            participants,
+            manifest_participant_id,
+            assignment_version,
+        )
+        .await
+    }
+
+    async fn record_committed_scoped(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+        scope: CommitDecisionScope,
+        participants: &[u64],
+        manifest_participant_id: u64,
+        assignment_version: u64,
+    ) -> Result<bool, DecisionError> {
+        let mut participants = participants.to_vec();
+        participants.sort_unstable();
+        participants.dedup();
+        let mut decision = CommitDecision {
+            version: COMMIT_DECISION_VERSION,
+            scope,
+            epoch,
+            checkpoint_id,
+            deployment_id: String::new(),
+            participants,
+            manifest_participant_id,
+            assignment_version,
         };
+        // Validate caller-controlled metadata before creating the durable deployment identity.
+        decision.validate_shape(epoch)?;
+        decision.deployment_id = self.load_or_create_deployment_id().await?;
         let payload =
             serde_json::to_vec(&decision).map_err(|e| DecisionError::Conflict(e.to_string()))?;
         let opts = PutOptions {
@@ -361,8 +500,15 @@ impl CheckpointDecisionStore {
                     Ok(false)
                 } else {
                     Err(DecisionError::Conflict(format!(
-                        "epoch {epoch} already binds checkpoint {}, cannot bind {checkpoint_id}",
-                        existing.checkpoint_id
+                        "epoch {epoch} already binds checkpoint {} with participants {:?}, \
+                         manifest participant {}, and assignment version {}; cannot bind \
+                         checkpoint {checkpoint_id} with participants {:?}, manifest participant \
+                         {manifest_participant_id}, and assignment version {assignment_version}",
+                        existing.checkpoint_id,
+                        existing.participants,
+                        existing.manifest_participant_id,
+                        existing.assignment_version,
+                        decision.participants,
                     )))
                 }
             }
@@ -386,11 +532,7 @@ impl CheckpointDecisionStore {
             .map_err(|e| DecisionError::Io(e.to_string()))?;
         let decision: CommitDecision = serde_json::from_slice(&bytes)
             .map_err(|e| DecisionError::Conflict(format!("epoch {epoch}: {e}")))?;
-        if decision.version != COMMIT_DECISION_VERSION || decision.epoch != epoch {
-            return Err(DecisionError::Conflict(format!(
-                "invalid decision payload for epoch {epoch}: {decision:?}"
-            )));
-        }
+        decision.validate_shape(epoch)?;
         let expected_deployment = self.load_or_create_deployment_id().await?;
         if decision.deployment_id != expected_deployment {
             return Err(DecisionError::Conflict(format!(
@@ -453,6 +595,15 @@ impl CheckpointDecisionStore {
             decisions.push(decision);
         }
         decisions.sort_unstable_by_key(|decision| decision.checkpoint_id);
+        if let Some(pair) = decisions
+            .windows(2)
+            .find(|pair| pair[0].checkpoint_id == pair[1].checkpoint_id)
+        {
+            return Err(DecisionError::Conflict(format!(
+                "globally unique checkpoint ID {} is bound to both epoch {} and epoch {}",
+                pair[0].checkpoint_id, pair[0].epoch, pair[1].epoch
+            )));
+        }
         Ok(decisions)
     }
 
@@ -545,7 +696,137 @@ mod tests {
         let s = store_in(dir.path());
         assert!(s.record_committed(5, 50).await.unwrap());
         assert!(s.is_committed(5).await.unwrap());
-        assert_eq!(s.decision(5).await.unwrap().unwrap().checkpoint_id, 50);
+        let decision = s.decision(5).await.unwrap().unwrap();
+        assert_eq!(decision.checkpoint_id, 50);
+        assert_eq!(decision.scope, CommitDecisionScope::Local);
+        assert_eq!(decision.participants, [0]);
+        assert_eq!(decision.manifest_participant_id, 0);
+        assert_eq!(decision.assignment_version, 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_decision_canonicalizes_and_round_trips_participants() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+
+        assert!(s
+            .record_committed_for_participants(5, 50, &[9, 3, 9, 5], 5, 42)
+            .await
+            .unwrap());
+        let decision = s.decision(5).await.unwrap().unwrap();
+
+        assert_eq!(decision.version, COMMIT_DECISION_VERSION);
+        assert_eq!(decision.scope, CommitDecisionScope::Cluster);
+        assert_eq!(decision.participants, [3, 5, 9]);
+        assert_eq!(decision.manifest_participant_id, 5);
+        assert_eq!(decision.assignment_version, 42);
+    }
+
+    #[tokio::test]
+    async fn cluster_decision_rejects_invalid_participant_metadata() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+
+        for (participants, manifest_participant, assignment_version) in [
+            (Vec::new(), 3, 1),
+            (vec![3, 5], 7, 1),
+            (vec![3, 5], 3, 0),
+            (vec![0, 3], 3, 0),
+        ] {
+            assert!(matches!(
+                s.record_committed_for_participants(
+                    5,
+                    50,
+                    &participants,
+                    manifest_participant,
+                    assignment_version
+                )
+                .await,
+                Err(DecisionError::Conflict(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn durable_decision_shape_requires_canonical_participants() {
+        let base = CommitDecision {
+            version: COMMIT_DECISION_VERSION,
+            scope: CommitDecisionScope::Cluster,
+            epoch: 5,
+            checkpoint_id: 50,
+            deployment_id: uuid::Uuid::now_v7().to_string(),
+            participants: vec![3, 5],
+            manifest_participant_id: 3,
+            assignment_version: 7,
+        };
+        assert!(base.validate_shape(5).is_ok());
+
+        for participants in [vec![5, 3], vec![3, 3], Vec::new()] {
+            let malformed = CommitDecision {
+                participants,
+                ..base.clone()
+            };
+            assert!(matches!(
+                malformed.validate_shape(5),
+                Err(DecisionError::Conflict(_))
+            ));
+        }
+
+        for malformed in [
+            CommitDecision {
+                version: COMMIT_DECISION_VERSION - 1,
+                ..base.clone()
+            },
+            CommitDecision {
+                epoch: 0,
+                ..base.clone()
+            },
+            CommitDecision {
+                checkpoint_id: 0,
+                ..base.clone()
+            },
+            CommitDecision {
+                manifest_participant_id: 7,
+                ..base.clone()
+            },
+            CommitDecision {
+                assignment_version: 0,
+                ..base.clone()
+            },
+        ] {
+            assert!(matches!(
+                malformed.validate_shape(5),
+                Err(DecisionError::Conflict(_))
+            ));
+        }
+
+        let malformed_local = CommitDecision {
+            scope: CommitDecisionScope::Local,
+            participants: vec![0, 3],
+            manifest_participant_id: 0,
+            assignment_version: 0,
+            ..base
+        };
+        assert!(matches!(
+            malformed_local.validate_shape(5),
+            Err(DecisionError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_decision_accepts_zero_as_a_real_node_id() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        store
+            .record_committed_for_participants(5, 50, &[2, 0, 1], 0, 7)
+            .await
+            .unwrap();
+        let decision = store.decision(5).await.unwrap().unwrap();
+
+        assert_eq!(decision.participants, [0, 1, 2]);
+        assert_eq!(decision.manifest_participant_id, 0);
+        assert_eq!(decision.assignment_version, 7);
     }
 
     #[tokio::test]
@@ -612,6 +893,39 @@ mod tests {
         s.record_committed(9, 90).await.unwrap();
         assert!(matches!(
             s.record_committed(9, 91).await,
+            Err(DecisionError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_checkpoint_id_across_epochs_is_rejected_from_inventory() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        store.record_committed(8, 90).await.unwrap();
+        store.record_committed(9, 90).await.unwrap();
+
+        let error = store.committed_decisions().await.unwrap_err();
+        assert!(error.to_string().contains("checkpoint ID 90"));
+        assert!(error.to_string().contains("epoch 8"));
+        assert!(error.to_string().contains("epoch 9"));
+    }
+
+    #[tokio::test]
+    async fn conflicting_cluster_metadata_for_epoch_is_rejected() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+        s.record_committed_for_participants(9, 90, &[3, 5], 3, 12)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.record_committed_for_participants(9, 90, &[3, 5], 5, 12)
+                .await,
+            Err(DecisionError::Conflict(_))
+        ));
+        assert!(matches!(
+            s.record_committed_for_participants(9, 90, &[3, 5], 3, 13)
+                .await,
             Err(DecisionError::Conflict(_))
         ));
     }

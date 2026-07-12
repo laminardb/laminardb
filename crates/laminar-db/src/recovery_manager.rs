@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use laminar_core::checkpoint_decision::{CommitDecision, CommitDecisionScope};
 use laminar_core::state::{CheckpointAttempt, StateBackend};
 use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, DurableCheckpointPhase, PipelineIdentity,
@@ -20,6 +21,9 @@ use crate::error::DbError;
 pub struct RecoveredState {
     /// Manifest that was restored from.
     pub manifest: CheckpointManifest,
+    decision: Option<CommitDecision>,
+    #[cfg(feature = "cluster")]
+    cluster_source_handoff: Option<HashMap<String, HashMap<String, String>>>,
 }
 
 impl RecoveredState {
@@ -27,6 +31,26 @@ impl RecoveredState {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.manifest.epoch
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn decision(&self) -> Option<&CommitDecision> {
+        self.decision.as_ref()
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_cluster_source_handoff(
+        &mut self,
+        handoff: HashMap<String, HashMap<String, String>>,
+    ) {
+        self.cluster_source_handoff = Some(handoff);
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cluster_source_handoff(
+        &self,
+    ) -> Option<&HashMap<String, HashMap<String, String>>> {
+        self.cluster_source_handoff.as_ref()
     }
 }
 
@@ -291,6 +315,7 @@ pub struct RecoveryManager<'a> {
     store: &'a dyn CheckpointStore,
     expected_pipeline_identity: PipelineIdentity,
     expected_deployment_id: String,
+    expected_decision_scope: CommitDecisionScope,
 }
 
 impl<'a> RecoveryManager<'a> {
@@ -301,6 +326,7 @@ impl<'a> RecoveryManager<'a> {
             store,
             expected_pipeline_identity: PipelineIdentity::empty(),
             expected_deployment_id: String::new(),
+            expected_decision_scope: CommitDecisionScope::Local,
         }
     }
 
@@ -318,6 +344,113 @@ impl<'a> RecoveryManager<'a> {
         self
     }
 
+    /// Require durable decisions to belong to the active local or cluster recovery domain.
+    #[must_use]
+    pub(crate) fn with_decision_scope(mut self, scope: CommitDecisionScope) -> Self {
+        self.expected_decision_scope = scope;
+        self
+    }
+
+    fn ensure_peer_manifest_portable(manifest: &CheckpointManifest) -> Result<(), DbError> {
+        let mut participant_local = Vec::new();
+        if !manifest.operator_states.is_empty() || manifest.state_checksum.is_some() {
+            participant_local.push("operator/materialized-view state");
+        }
+        if !manifest.table_offsets.is_empty() || manifest.table_store_checkpoint_path.is_some() {
+            participant_local.push("reference-table state");
+        }
+        if manifest.watermark.is_some() || !manifest.source_watermarks.is_empty() {
+            participant_local.push("local watermark state");
+        }
+        if participant_local.is_empty() {
+            return Ok(());
+        }
+        Err(DbError::Checkpoint(format!(
+            "[LDB-6041] checkpoint {} participant {} contains non-portable {}; a shed node \
+             cannot bootstrap from another participant until that state is persisted in a \
+             canonical cluster recovery capsule",
+            manifest.checkpoint_id,
+            manifest.participant_id,
+            participant_local.join(", ")
+        )))
+    }
+
+    async fn restore_decided(
+        &self,
+        decision: &laminar_core::checkpoint_decision::CommitDecision,
+        decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    ) -> Result<Option<RecoveredState>, DbError> {
+        if decision.scope != self.expected_decision_scope {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] durable decision scope {:?} does not match active runtime scope {:?}",
+                decision.scope, self.expected_decision_scope
+            )));
+        }
+        let local_participant = self.store.participant_id();
+        if decision.scope == CommitDecisionScope::Local && local_participant != 0 {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] local decision recovery requires participant 0, but the checkpoint store is participant {local_participant}"
+            )));
+        }
+        let storage_participant = if decision
+            .participants
+            .binary_search(&local_participant)
+            .is_ok()
+        {
+            // An included participant must have persisted its own exact manifest. Missing or
+            // corrupt local inventory is storage loss and remains fatal.
+            local_participant
+        } else {
+            // A shed/new participant legitimately has no local manifest for this cut. The
+            // decision binds the canonical peer namespace; shared vnode chains and source-offset
+            // handoff remain authoritative for ownership-specific state.
+            info!(
+                local_participant,
+                manifest_participant = decision.manifest_participant_id,
+                epoch = decision.epoch,
+                checkpoint_id = decision.checkpoint_id,
+                assignment_version = decision.assignment_version,
+                "cluster recovery: local participant absent from cut; using canonical peer manifest"
+            );
+            decision.manifest_participant_id
+        };
+
+        let manifest = self
+            .store
+            .load_manifest_for_participant(storage_participant, decision.checkpoint_id)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] decided epoch {} checkpoint {} participant {} manifest is unreadable: {error}",
+                    decision.epoch, decision.checkpoint_id, storage_participant
+                ))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] decided checkpoint {} is absent from participant \
+                     {storage_participant} recovery inventory",
+                    decision.checkpoint_id
+                ))
+            })?;
+        if manifest.epoch != decision.epoch || manifest.checkpoint_id != decision.checkpoint_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] decision epoch {} checkpoint {} does not match participant \
+                 {storage_participant} manifest epoch {} checkpoint {}",
+                decision.epoch, decision.checkpoint_id, manifest.epoch, manifest.checkpoint_id
+            )));
+        }
+        if storage_participant != local_participant {
+            Self::ensure_peer_manifest_portable(&manifest)?;
+        }
+        self.try_restore(
+            decision.checkpoint_id,
+            manifest,
+            Some(decision_store),
+            storage_participant,
+        )
+        .await
+    }
+
     /// Recover from the latest committed, structurally valid checkpoint.
     ///
     /// Returns `Ok(None)` only when the checkpoint store is empty.
@@ -329,35 +462,31 @@ impl<'a> RecoveryManager<'a> {
         &self,
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> Result<Option<RecoveredState>, DbError> {
-        let mut checkpoint_ids = self.store.list_ids().await.map_err(DbError::from)?;
         // A durable decision is the irrevocable recovery frontier. Once it exists, restoring any
         // older manifest can replay output already visible in an exact external sink. Resolve the
-        // highest decision first and require its exact manifest; corruption or partial storage
-        // loss is fatal rather than a reason to rewind.
+        // highest decision first and require an exact participant-bound manifest. Corruption or
+        // storage loss for an included participant is fatal rather than a reason to rewind.
         if let Some(ds) = decision_store {
             if let Some(decision) = ds
                 .highest_committed()
                 .await
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?
             {
-                if !checkpoint_ids.contains(&decision.checkpoint_id) {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6041] highest commit decision is epoch {} checkpoint {}, but that \
-                         exact checkpoint is absent from inventory",
-                        decision.epoch, decision.checkpoint_id
-                    )));
-                }
-                return self
-                    .restore_first(&[decision.checkpoint_id], Some(ds))
-                    .await;
+                return self.restore_decided(&decision, ds).await;
             }
         }
+        let mut checkpoint_ids = self.store.list_ids().await.map_err(DbError::from)?;
         if checkpoint_ids.is_empty() {
             info!("checkpoint store is empty, starting fresh");
             return Ok(None);
         }
         checkpoint_ids.reverse();
-        self.restore_first(&checkpoint_ids, decision_store).await
+        self.restore_first_for_participant(
+            &checkpoint_ids,
+            decision_store,
+            self.store.participant_id(),
+        )
+        .await
     }
 
     /// Recover from the newest viable checkpoint with `epoch <= target_epoch` — the
@@ -370,6 +499,20 @@ impl<'a> RecoveryManager<'a> {
         target_epoch: u64,
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) -> Result<Option<RecoveredState>, DbError> {
+        if let Some(ds) = decision_store {
+            let decision = ds
+                .decision(target_epoch)
+                .await
+                .map_err(|e| DbError::Checkpoint(e.to_string()))?;
+            return match decision {
+                Some(decision) => self.restore_decided(&decision, ds).await,
+                None if target_epoch == 0 => Ok(None),
+                None => Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] recovery target epoch {target_epoch} has no commit decision"
+                ))),
+            };
+        }
+
         let checkpoint_ids = self.store.list_ids().await.map_err(DbError::from)?;
         if checkpoint_ids.is_empty() {
             return if target_epoch == 0 {
@@ -378,22 +521,6 @@ impl<'a> RecoveryManager<'a> {
                 Err(DbError::Checkpoint(format!(
                     "[LDB-6041] recovery target epoch {target_epoch} has no checkpoint history"
                 )))
-            };
-        }
-        if let Some(ds) = decision_store {
-            let decision = ds
-                .decision(target_epoch)
-                .await
-                .map_err(|e| DbError::Checkpoint(e.to_string()))?;
-            return match decision {
-                Some(decision) => {
-                    self.restore_first(&[decision.checkpoint_id], decision_store)
-                        .await
-                }
-                None if target_epoch == 0 => Ok(None),
-                None => Err(DbError::Checkpoint(format!(
-                    "[LDB-6041] recovery target epoch {target_epoch} has no commit decision"
-                ))),
             };
         }
 
@@ -436,7 +563,12 @@ impl<'a> RecoveryManager<'a> {
             };
         }
         let candidate_ids: Vec<u64> = checkpoints.iter().map(|&(id, _)| id).collect();
-        self.restore_first(&candidate_ids, decision_store).await
+        self.restore_first_for_participant(
+            &candidate_ids,
+            decision_store,
+            self.store.participant_id(),
+        )
+        .await
     }
 
     /// Resolve external operator states from the sidecar file into inline entries.
@@ -526,7 +658,12 @@ impl<'a> RecoveryManager<'a> {
             epoch = manifest.epoch,
             "recovering from checkpoint"
         );
-        Ok(RecoveredState { manifest })
+        Ok(RecoveredState {
+            manifest,
+            decision: None,
+            #[cfg(feature = "cluster")]
+            cluster_source_handoff: None,
+        })
     }
 
     /// Returns `true` if the checkpoint fails integrity validation.
@@ -537,6 +674,7 @@ impl<'a> RecoveryManager<'a> {
         &self,
         storage_id: u64,
         manifest: &CheckpointManifest,
+        storage_participant: u64,
     ) -> Result<bool, DbError> {
         if manifest.checkpoint_id != storage_id {
             error!(
@@ -554,6 +692,11 @@ impl<'a> RecoveryManager<'a> {
                 "[LDB-6010] checkpoint manifest is incompatible"
             );
             return Ok(true);
+        }
+        if storage_participant != self.store.participant_id() {
+            // Peer bootstrap admits metadata-only manifests, so manifest validation above is the
+            // complete integrity check; participant-local sidecars are deliberately unsupported.
+            return Ok(false);
         }
         match self.store.validate_checkpoint(storage_id).await {
             Ok(ValidationResult {
@@ -573,6 +716,53 @@ impl<'a> RecoveryManager<'a> {
         }
     }
 
+    fn validate_decision_manifest_binding(
+        &self,
+        decision: &CommitDecision,
+        storage_id: u64,
+        manifest: &CheckpointManifest,
+        storage_participant: u64,
+    ) -> Result<(), DbError> {
+        if decision.scope != self.expected_decision_scope {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] durable decision scope {:?} does not match active runtime scope {:?}",
+                decision.scope, self.expected_decision_scope
+            )));
+        }
+        if decision.checkpoint_id != storage_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] epoch {} commits checkpoint {}, but storage candidate is {storage_id}",
+                manifest.epoch, decision.checkpoint_id
+            )));
+        }
+        if decision.deployment_id != manifest.deployment_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] epoch {} checkpoint {storage_id} decision deployment '{}' does not match manifest deployment '{}'",
+                manifest.epoch, decision.deployment_id, manifest.deployment_id
+            )));
+        }
+        if decision
+            .participants
+            .binary_search(&storage_participant)
+            .is_err()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] epoch {} checkpoint {storage_id} storage participant {storage_participant} is absent from decision participants {:?}",
+                manifest.epoch, decision.participants
+            )));
+        }
+        let local_participant = self.store.participant_id();
+        if storage_participant != local_participant
+            && storage_participant != decision.manifest_participant_id
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] epoch {} checkpoint {storage_id} attempted peer manifest participant {storage_participant}, but the decision binds participant {}",
+                manifest.epoch, decision.manifest_participant_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Restore from `manifest` if it is viable; `None` means an older checkpoint may be tried
     /// because this candidate is deterministically corrupt or has no durable commit decision.
     async fn try_restore(
@@ -580,8 +770,16 @@ impl<'a> RecoveryManager<'a> {
         storage_id: u64,
         manifest: CheckpointManifest,
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        storage_participant: u64,
     ) -> Result<Option<RecoveredState>, DbError> {
         let (checkpoint_id, epoch) = (manifest.checkpoint_id, manifest.epoch);
+        if manifest.participant_id != storage_participant {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] checkpoint {storage_id} manifest participant {} does not match \
+                 storage participant {storage_participant}",
+                manifest.participant_id
+            )));
+        }
         if manifest.pipeline_identity != self.expected_pipeline_identity {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6043] checkpoint {storage_id} pipeline identity {} does not match runtime \
@@ -604,19 +802,12 @@ impl<'a> RecoveryManager<'a> {
             None => None,
         };
         if let Some(ref decision) = decision {
-            if decision.checkpoint_id != storage_id {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6041] epoch {epoch} commits checkpoint {}, but storage candidate is {storage_id}",
-                    decision.checkpoint_id
-                )));
-            }
-            if decision.deployment_id != manifest.deployment_id {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6041] epoch {epoch} checkpoint {storage_id} decision deployment '{}' \
-                     does not match manifest deployment '{}'",
-                    decision.deployment_id, manifest.deployment_id
-                )));
-            }
+            self.validate_decision_manifest_binding(
+                decision,
+                storage_id,
+                &manifest,
+                storage_participant,
+            )?;
         }
 
         // Prepared inventory is never a recovery cut on its own. When an exact decision store is
@@ -636,7 +827,10 @@ impl<'a> RecoveryManager<'a> {
             return Ok(None);
         }
 
-        if self.is_checkpoint_corrupt(storage_id, &manifest).await? {
+        if self
+            .is_checkpoint_corrupt(storage_id, &manifest, storage_participant)
+            .await?
+        {
             warn!(
                 checkpoint_id,
                 epoch, "[LDB-6010] checkpoint corrupt, trying older"
@@ -649,27 +843,37 @@ impl<'a> RecoveryManager<'a> {
             return Ok(None);
         }
         let mut state = self.restore_from(manifest).await?;
+        state.decision = decision.clone();
         if state.manifest.durable_phase == DurableCheckpointPhase::Prepared {
-            self.store
-                .finalize(storage_id)
-                .await
-                .map_err(DbError::from)?;
+            if storage_participant == self.store.participant_id() {
+                self.store
+                    .finalize(storage_id)
+                    .await
+                    .map_err(DbError::from)?;
+            }
+            // The exact decision is authoritative. A peer bootstrap does not rewrite another
+            // participant's pointer, but the recovered in-memory cut is effectively finalized.
             state.manifest.durable_phase = DurableCheckpointPhase::Finalized;
         }
         Ok(Some(state))
     }
 
     /// Restore from the first viable checkpoint ID in try order.
-    async fn restore_first(
+    async fn restore_first_for_participant(
         &self,
         candidates: &[u64],
         decision_store: Option<&laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+        storage_participant: u64,
     ) -> Result<Option<RecoveredState>, DbError> {
         for &checkpoint_id in candidates {
-            match self.store.load_by_id(checkpoint_id).await {
+            match self
+                .store
+                .load_manifest_for_participant(storage_participant, checkpoint_id)
+                .await
+            {
                 Ok(Some(manifest)) => {
                     if let Some(state) = self
-                        .try_restore(checkpoint_id, manifest, decision_store)
+                        .try_restore(checkpoint_id, manifest, decision_store, storage_participant)
                         .await?
                     {
                         return Ok(Some(state));
@@ -677,7 +881,8 @@ impl<'a> RecoveryManager<'a> {
                 }
                 Ok(None) => {
                     return Err(DbError::Checkpoint(format!(
-                        "[LDB-6041] checkpoint {checkpoint_id} disappeared during recovery"
+                        "[LDB-6041] checkpoint {checkpoint_id} is absent from participant \
+                         {storage_participant} recovery inventory"
                     )));
                 }
                 Err(CheckpointStoreError::Serde(e)) => {
@@ -701,7 +906,9 @@ impl<'a> RecoveryManager<'a> {
 mod tests {
     use super::*;
     use laminar_core::storage::checkpoint_manifest::OperatorCheckpoint;
-    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
+    use laminar_core::storage::checkpoint_store::{
+        FileSystemCheckpointStore, ObjectStoreCheckpointStore,
+    };
 
     fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
         FileSystemCheckpointStore::new(dir)
@@ -894,7 +1101,12 @@ mod tests {
             .recover(Some(&decisions))
             .await
             .expect_err("a decided checkpoint cannot rewind to checkpoint 1");
-        assert!(error.to_string().contains("checkpoint ids: [2]"), "{error}");
+        assert!(
+            error.to_string().contains(
+                "[LDB-6041] decided epoch 20 checkpoint 2 participant 0 manifest is unreadable"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1152,6 +1364,189 @@ mod tests {
         assert!(error.to_string().contains("[LDB-6043]"));
         let persisted = store.load_by_id(1).await.unwrap().unwrap();
         assert_eq!(persisted.durable_phase, DurableCheckpointPhase::Prepared);
+    }
+
+    #[tokio::test]
+    async fn decision_scope_mismatch_does_not_finalize_prepared_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        let prepared = CheckpointManifest::new(1, 7);
+        store.save(&prepared).await.unwrap();
+
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+        decisions.record_committed(7, 1).await.unwrap();
+
+        let error = RecoveryManager::new(&store)
+            .with_decision_scope(CommitDecisionScope::Cluster)
+            .recover(Some(&decisions))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("decision scope Local"));
+        let persisted = store.load_by_id(1).await.unwrap().unwrap();
+        assert_eq!(persisted.durable_phase, DurableCheckpointPhase::Prepared);
+    }
+
+    #[tokio::test]
+    async fn local_recovery_rejects_cluster_decision_before_manifest_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+        decisions
+            .record_committed_for_participants(7, 1, &[0], 0, 4)
+            .await
+            .unwrap();
+
+        let error = RecoveryManager::new(&store)
+            .recover(Some(&decisions))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("decision scope Cluster"));
+        assert!(error.to_string().contains("active runtime scope Local"));
+    }
+
+    #[tokio::test]
+    async fn excluded_participant_recovers_exact_portable_peer_manifest() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let donor =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let local =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
+                .with_participant_id(2);
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::clone(&backing),
+        );
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+
+        let mut manifest = CheckpointManifest::new(7, 6);
+        manifest.participant_id = 1;
+        manifest.deployment_id.clone_from(&deployment_id);
+        donor.save(&manifest).await.unwrap();
+        decisions
+            .record_committed_for_participants(6, 7, &[3, 1], 1, 4)
+            .await
+            .unwrap();
+
+        let manager = RecoveryManager::new(&local)
+            .with_deployment_id(&deployment_id)
+            .with_decision_scope(CommitDecisionScope::Cluster);
+        let recovered = manager
+            .recover_to_epoch(6, Some(&decisions))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered.manifest.participant_id, 1);
+        assert_eq!(
+            donor.load_by_id(7).await.unwrap().unwrap().durable_phase,
+            DurableCheckpointPhase::Prepared,
+            "peer bootstrap must not rewrite another participant's recovery pointer"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_participant_rejects_peer_local_state() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let donor =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/0/".into())
+                .with_participant_id(0);
+        let local =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
+                .with_participant_id(2);
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::clone(&backing),
+        );
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+        let mut manifest = CheckpointManifest::new(7, 6);
+        manifest.participant_id = 0;
+        manifest.deployment_id.clone_from(&deployment_id);
+        manifest.source_watermarks.insert("events".into(), 42_000);
+        donor.save(&manifest).await.unwrap();
+        decisions
+            .record_committed_for_participants(6, 7, &[0, 1], 0, 4)
+            .await
+            .unwrap();
+
+        let error = RecoveryManager::new(&local)
+            .with_deployment_id(&deployment_id)
+            .with_decision_scope(CommitDecisionScope::Cluster)
+            .recover(Some(&decisions))
+            .await
+            .expect_err("a donor-local watermark must not seed another participant");
+
+        assert!(
+            error.to_string().contains("local watermark state"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decided_peer_manifest_must_match_the_exact_epoch() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let donor =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let local =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
+                .with_participant_id(2);
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+            std::sync::Arc::clone(&backing),
+        );
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+        let mut wrong_epoch = CheckpointManifest::new(7, 5);
+        wrong_epoch.participant_id = 1;
+        wrong_epoch.deployment_id.clone_from(&deployment_id);
+        donor.save(&wrong_epoch).await.unwrap();
+        decisions
+            .record_committed_for_participants(6, 7, &[1, 3], 1, 4)
+            .await
+            .unwrap();
+
+        let error = RecoveryManager::new(&local)
+            .with_deployment_id(&deployment_id)
+            .with_decision_scope(CommitDecisionScope::Cluster)
+            .recover_to_epoch(6, Some(&decisions))
+            .await
+            .expect_err("decision and donor manifest must identify one exact attempt");
+
+        assert!(
+            error.to_string().contains("decision epoch 6 checkpoint 7"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn included_participant_with_missing_exact_manifest_fails_closed() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let local =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
+                .with_participant_id(2);
+        let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(backing);
+        decisions
+            .record_committed_for_participants(6, 7, &[1, 2], 1, 4)
+            .await
+            .unwrap();
+
+        let error = RecoveryManager::new(&local)
+            .with_decision_scope(CommitDecisionScope::Cluster)
+            .recover(Some(&decisions))
+            .await
+            .expect_err("an included participant cannot borrow a peer manifest");
+
+        assert!(
+            error
+                .to_string()
+                .contains("absent from participant 2 recovery inventory"),
+            "{error}"
+        );
     }
 }
 

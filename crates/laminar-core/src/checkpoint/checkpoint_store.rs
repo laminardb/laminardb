@@ -298,6 +298,25 @@ pub trait CheckpointStore: Send + Sync {
     async fn load_by_id(&self, id: u64)
         -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
+    /// Load an exact checkpoint from a participant namespace.
+    ///
+    /// Cluster recovery uses this only when the durable decision proves that the local
+    /// participant was not part of the committed cut. Implementations that do not expose a
+    /// shared participant namespace reject non-local reads.
+    async fn load_manifest_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+        if participant_id != self.participant_id() {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint store participant {} cannot read participant {participant_id}",
+                self.participant_id()
+            )));
+        }
+        self.load_by_id(id).await
+    }
+
     /// Lists all available checkpoints as `(id, epoch)` pairs, sorted
     /// ascending by ID. May read every manifest; callers that only
     /// need IDs should use [`Self::list_ids`].
@@ -1089,6 +1108,31 @@ impl ObjectStoreCheckpointStore {
         object_store::path::Path::from(format!("{}checkpoints/state-{id:06}.bin", self.prefix))
     }
 
+    fn prefix_for_participant(&self, participant_id: u64) -> Result<String, CheckpointStoreError> {
+        if participant_id == self.participant_id {
+            return Ok(self.prefix.clone());
+        }
+        let expected = format!("nodes/{}/", self.participant_id);
+        if self.prefix != expected {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint prefix '{}' is not the shared {expected} namespace",
+                self.prefix
+            )));
+        }
+        Ok(format!("nodes/{participant_id}/"))
+    }
+
+    fn manifest_path_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<object_store::path::Path, CheckpointStoreError> {
+        let prefix = self.prefix_for_participant(participant_id)?;
+        Ok(object_store::path::Path::from(format!(
+            "{prefix}manifests/manifest-{id:06}.json"
+        )))
+    }
+
     /// Read the recovery pointer without loading its manifest. Retention must
     /// preserve this exact ID even if newer prepared attempts sort after it.
     async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
@@ -1101,12 +1145,60 @@ impl ObjectStoreCheckpointStore {
 
     // ── Helpers ──
 
-    /// Put a payload with bounded retry + jittered backoff for idempotent
-    /// writes (sidecar state, pointer update). Retries on
+    /// Create an immutable object with bounded retry and report whether this call created it.
+    ///
+    /// An ambiguous transient failure is retried with the same conditional create. If the first
+    /// request actually succeeded, the retry returns `AlreadyExists`; callers then compare the
+    /// durable bytes with their intended content before treating the operation as idempotent.
+    async fn create_with_retry(
+        &self,
+        path: &object_store::path::Path,
+        payload: PutPayload,
+    ) -> Result<bool, CheckpointStoreError> {
+        const BACKOFFS_MS: &[u64] = &[100, 500, 2000];
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let mut attempt = 0usize;
+        loop {
+            match self
+                .store
+                .put_opts(path, payload.clone(), options.clone())
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(object_store::Error::AlreadyExists { .. }) => return Ok(false),
+                Err(object_store::Error::Generic { .. }) if attempt < BACKOFFS_MS.len() => {
+                    use rand::RngExt;
+                    let base_ms = BACKOFFS_MS[attempt];
+                    let jitter_ms = rand::rng().random_range(0..=base_ms / 2);
+                    let delay = std::time::Duration::from_millis(base_ms + jitter_ms);
+                    tracing::warn!(
+                        path = %path,
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis(),
+                        "transient immutable create error, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(object_store::Error::NotImplemented { .. }) => {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "object store does not support conditional create required for immutable checkpoint object '{path}'"
+                    )));
+                }
+                Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+            }
+        }
+    }
+
+    /// Put a payload with bounded retry + jittered backoff for replaceable
+    /// writes (latest-pointer updates). Retries on
     /// `object_store::Error::Generic` — which covers most transient
     /// 5xx / connection failures across backends — and bubbles every
-    /// other error immediately. Non-idempotent writes (conditional
-    /// creates on the manifest path) MUST NOT use this helper.
+    /// other error immediately. Immutable checkpoint objects use
+    /// [`Self::create_with_retry`] instead.
     ///
     /// `payload` is consumed on the happy path and cloned on retry.
     /// `PutPayload::clone` is cheap (Arc-bump on each underlying
@@ -1128,7 +1220,10 @@ impl ObjectStoreCheckpointStore {
             match result {
                 Ok(_) => return Ok(()),
                 Err(object_store::Error::Generic { .. }) if attempt < BACKOFFS_MS.len() => {
-                    let delay = std::time::Duration::from_millis(BACKOFFS_MS[attempt]);
+                    use rand::RngExt;
+                    let base_ms = BACKOFFS_MS[attempt];
+                    let jitter_ms = rand::rng().random_range(0..=base_ms / 2);
+                    let delay = std::time::Duration::from_millis(base_ms + jitter_ms);
                     tracing::warn!(
                         path = %path,
                         attempt = attempt + 1,
@@ -1214,38 +1309,24 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let json_bytes = bytes::Bytes::from(json);
 
         // Conditional PUT — prevents duplicate manifest writes (split-brain safety).
-        let create_opts = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        let result = self
-            .store
-            .put_opts(
-                &path,
-                PutPayload::from_bytes(json_bytes.clone()),
-                create_opts,
-            )
-            .await;
-
-        match result {
-            Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                tracing::warn!(
-                    checkpoint_id = manifest.checkpoint_id,
-                    "[LDB-6010] Manifest already exists — skipping write"
-                );
+        if !self
+            .create_with_retry(&path, PutPayload::from_bytes(json_bytes))
+            .await?
+        {
+            let existing = self.get_bytes(&path).await?.ok_or_else(|| {
+                CheckpointStoreError::Invalid(format!(
+                    "checkpoint {} manifest create reported AlreadyExists but the object is missing",
+                    manifest.checkpoint_id
+                ))
+            })?;
+            let existing: CheckpointManifest = serde_json::from_slice(&existing)?;
+            self.ensure_manifest_participant(&existing)?;
+            if existing != *manifest {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint {} manifest already exists with different immutable content",
+                    manifest.checkpoint_id
+                )));
             }
-            Err(object_store::Error::NotImplemented { .. }) => {
-                // Backend doesn't support conditional PUT — fall back to overwrite.
-                self.store
-                    .put_opts(
-                        &path,
-                        PutPayload::from_bytes(json_bytes),
-                        PutOptions::default(),
-                    )
-                    .await?;
-            }
-            Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
         }
 
         // A prepared manifest is deliberately invisible to the normal latest
@@ -1363,6 +1444,25 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         self.load_manifest_at(&self.manifest_path(id)).await
     }
 
+    async fn load_manifest_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+        let path = self.manifest_path_for_participant(participant_id, id)?;
+        let Some(data) = self.get_bytes(&path).await? else {
+            return Ok(None);
+        };
+        let manifest: CheckpointManifest = serde_json::from_slice(&data)?;
+        if manifest.participant_id != participant_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "manifest participant {} does not match storage participant {participant_id}",
+                manifest.participant_id
+            )));
+        }
+        Ok(Some(manifest))
+    }
+
     async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
         self.list_checkpoint_ids().await
     }
@@ -1431,9 +1531,24 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         // contiguous buffer. Each Arc bump is ~nothing; the underlying
         // bytes reach the object-store client untouched.
         let payload: PutPayload = chunks.iter().cloned().collect();
-        // Sidecar writes are idempotent — retry transients.
-        self.put_with_retry(&path, payload, &PutOptions::default())
-            .await
+        if self.create_with_retry(&path, payload).await? {
+            Ok(())
+        } else {
+            let existing = self.get_bytes(&path).await?.ok_or_else(|| {
+                CheckpointStoreError::Invalid(format!(
+                    "checkpoint {id} state create reported AlreadyExists but the object is missing"
+                ))
+            })?;
+            let expected = sha256_hex_chunks(chunks);
+            let actual = sha256_hex(&existing);
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint {id} state already exists with different immutable content"
+                )))
+            }
+        }
     }
 
     async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
@@ -1805,6 +1920,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_manifest_is_immutable_and_idempotent() {
+        let store = make_obj_store();
+        let manifest = make_manifest(7, 5);
+
+        store.save(&manifest).await.unwrap();
+        store.save(&manifest).await.unwrap();
+
+        let mut conflicting = manifest.clone();
+        conflicting.epoch = 6;
+        let error = store
+            .save(&conflicting)
+            .await
+            .expect_err("one checkpoint ID cannot name two manifests");
+        assert!(error.to_string().contains("different immutable content"));
+        assert_eq!(store.load_by_id(7).await.unwrap().unwrap(), manifest);
+    }
+
+    #[tokio::test]
     async fn test_obj_list() {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
@@ -1863,6 +1996,25 @@ mod tests {
 
         let loaded = store.load_state_data(1).await.unwrap().unwrap();
         assert_eq!(loaded, data);
+    }
+
+    #[tokio::test]
+    async fn object_store_state_sidecar_is_immutable_and_idempotent() {
+        let store = make_obj_store();
+        let original = [bytes::Bytes::from_static(b"state-blob")];
+
+        store.save_state_data(1, &original).await.unwrap();
+        store.save_state_data(1, &original).await.unwrap();
+
+        let error = store
+            .save_state_data(1, &[bytes::Bytes::from_static(b"different")])
+            .await
+            .expect_err("one checkpoint ID cannot overwrite its state sidecar");
+        assert!(error.to_string().contains("different immutable content"));
+        assert_eq!(
+            store.load_state_data(1).await.unwrap().unwrap(),
+            b"state-blob"
+        );
     }
 
     #[tokio::test]

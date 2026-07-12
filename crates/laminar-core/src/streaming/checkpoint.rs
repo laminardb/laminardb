@@ -11,7 +11,8 @@ pub struct StreamCheckpointConfig {
     /// Directory for persisting checkpoints. `None` uses the database storage directory, then
     /// falls back to `./data`; it never silently selects volatile checkpoint storage.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Maximum number of retained checkpoints. `None` = default (3).
+    /// Number of predecessor checkpoints retained alongside the current recovery cut.
+    /// `None` = default (3); predecessors keep reference/delta chains resolvable.
     pub max_retained: Option<usize>,
     /// Max epochs admitted between capture and restorable. `None` = default (4).
     /// Exactly-once pipelines are capped at 1 regardless.

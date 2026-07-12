@@ -111,6 +111,8 @@ pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
 pub struct CheckpointSealInventory {
     /// Exact attempt named by the seal.
     pub attempt: CheckpointAttempt,
+    /// Vnode-assignment generation fenced by the seal.
+    pub assignment_version: u64,
     /// Sorted, duplicate-free vnode partials required by the seal.
     pub required_vnodes: Vec<u32>,
     /// Per-vnode writer, assignment-generation, length, and digest attestations.
@@ -170,6 +172,7 @@ impl CheckpointSeal {
     pub(crate) fn inventory(&self) -> CheckpointSealInventory {
         CheckpointSealInventory {
             attempt: self.attempt,
+            assignment_version: self.assignment_version,
             required_vnodes: self.required_vnodes.clone(),
             sealed_partials: self.sealed_partials.clone(),
             required_descriptors: self.required_descriptors.clone(),
@@ -400,39 +403,11 @@ pub trait StateBackend: Send + Sync + 'static {
         attempt: CheckpointAttempt,
     ) -> Result<Vec<(String, Bytes)>, StateBackendError>;
 
-    /// Persist this node's source-checkpoint offsets for `attempt` (opaque
-    /// connector key/value bytes), keyed by a per-node `node_key` so writers
-    /// don't collide. A node acquiring a partition on a later rotation unions
-    /// every node's blob (see [`read_source_offsets`](Self::read_source_offsets))
-    /// to resume from the committed cut instead of `auto.offset.reset`. Same
-    /// fence as `write_partial`. Default no-op: handoff degrades to the source's
-    /// configured startup offset.
-    async fn write_source_offsets(
-        &self,
-        attempt: CheckpointAttempt,
-        node_key: &str,
-        assignment_version: u64,
-        bytes: Bytes,
-    ) -> Result<(), StateBackendError> {
-        let _ = (attempt, node_key, assignment_version, bytes);
-        Ok(())
-    }
-
-    /// Every node's source-offset blob for `attempt` (see
-    /// [`write_source_offsets`](Self::write_source_offsets)). The caller unions
-    /// them into the global offset map. Default empty.
-    async fn read_source_offsets(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<Vec<Bytes>, StateBackendError> {
-        let _ = attempt;
-        Ok(Vec::new())
-    }
-
     /// Durability barrier: true once every `vnode` partial and every
     /// `required_descriptors` key for `attempt` is persisted, sealing that exact attempt.
-    /// Sinks do not commit until it returns `Ok(true)`. `required_descriptors`
-    /// is empty unless coordinated-commit sinks are present.
+    /// Sinks do not commit until it returns `Ok(true)`. In cluster mode,
+    /// `required_descriptors` also binds every participant's final readiness attestation,
+    /// including participants with no vnodes or coordinated sinks.
     async fn seal_checkpoint(
         &self,
         attempt: CheckpointAttempt,
@@ -467,7 +442,7 @@ pub trait StateBackend: Send + Sync + 'static {
     /// implement `Ok(())` explicitly so the choice is visible.
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
 
-    /// Delete every artifact (partials, seals, descriptors, source-offset blobs) whose epoch
+    /// Delete every artifact (partials, seals, and commit/readiness descriptors) whose epoch
     /// is strictly greater than `after`. A coordinated rewind to epoch `after` calls this
     /// while the cluster is stopped. Exact attempt namespaces prevent overwrite collisions,
     /// while truncation removes abandoned seals so `latest_sealed_checkpoint` reflects the
