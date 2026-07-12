@@ -308,7 +308,7 @@ fn test_path_to_url_local() {
     let path = temp_dir.path().to_str().unwrap();
 
     let url = path_to_url(path).unwrap();
-    assert!(url.scheme() == "file");
+    assert_eq!(url.scheme(), "file");
 }
 
 #[test]

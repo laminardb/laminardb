@@ -39,6 +39,21 @@ impl VnodePartial {
     /// Deserialize a `partial.bin` blob; returns `Err` for legacy markers so callers can skip them.
     #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
+
+        if bytes.as_ptr().align_offset(ARCHIVE_ALIGNMENT) == 0 {
+            return Self::decode_aligned(bytes);
+        }
+
+        // `Bytes` and arbitrary byte slices do not promise the alignment required by rkyv's
+        // archived format. This is normally handled once by ObjectStoreBackend, but keeping the
+        // decoder total over arbitrary slices also covers custom and in-process backends.
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(bytes);
+        Self::decode_aligned(&aligned)
+    }
+
+    fn decode_aligned(bytes: &[u8]) -> Result<Self, DbError> {
         rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
             .map_err(|e| DbError::Checkpoint(format!("vnode partial deserialization: {e}")))
     }
@@ -98,5 +113,36 @@ mod tests {
         // The old payload was the literal string `ckpt:{id}`.
         let err = VnodePartial::decode(b"ckpt:123");
         assert!(err.is_err(), "legacy marker must fail to decode, not panic");
+    }
+
+    #[test]
+    fn decodes_unaligned_transport_buffer() {
+        let partial = VnodePartial {
+            operators: vec![("agg".to_string(), vec![1, 2, 3])],
+            base: None,
+            deltas: Vec::new(),
+        };
+        let encoded = partial.encode().unwrap();
+        let required_alignment = std::mem::align_of::<<VnodePartial as rkyv::Archive>::Archived>();
+        assert!(required_alignment > 1);
+
+        // Object-store clients may return a `Bytes` view into a larger network buffer. Recreate
+        // that shape with an offset which makes the archive root unaligned.
+        let mut transport = vec![0_u8; encoded.len() + required_alignment];
+        let root_position =
+            rkyv::api::root_position::<<VnodePartial as rkyv::Archive>::Archived>(encoded.len());
+        let offset = (0..required_alignment)
+            .find(|offset| {
+                !(transport.as_ptr() as usize + offset + root_position)
+                    .is_multiple_of(required_alignment)
+            })
+            .expect("an unaligned offset exists");
+        transport[offset..offset + encoded.len()].copy_from_slice(&encoded);
+        let unaligned = &transport[offset..offset + encoded.len()];
+        assert!(!(unaligned.as_ptr() as usize + root_position).is_multiple_of(required_alignment));
+
+        let restored = VnodePartial::decode(unaligned).unwrap();
+        assert_eq!(restored.operators[0].0, "agg");
+        assert_eq!(restored.operators[0].1, vec![1, 2, 3]);
     }
 }

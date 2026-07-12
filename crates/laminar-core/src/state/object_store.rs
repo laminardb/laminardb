@@ -292,6 +292,8 @@ impl ObjectStoreBackend {
         expected_attempt: CheckpointAttempt,
         expected_vnode: u32,
     ) -> Result<Bytes, StateBackendError> {
+        const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
+
         let metadata = Self::parse_partial_header(bytes, expected_attempt, expected_vnode)?;
         let payload_len = usize::try_from(metadata.payload_len).map_err(|_| {
             StateBackendError::Serialization("vnode partial payload length overflows usize".into())
@@ -309,7 +311,16 @@ impl ObjectStoreBackend {
                 "vnode partial payload checksum mismatch".into(),
             ));
         }
-        Ok(payload)
+        if payload.is_empty() || payload.as_ptr().align_offset(ARCHIVE_ALIGNMENT) == 0 {
+            return Ok(payload);
+        }
+
+        // Object-store clients may expose a view into an arbitrarily aligned network buffer.
+        // Normalize it once here so recovery-chain consumers can validate and decode the rkyv
+        // payload repeatedly without making a fresh aligned copy on every pass.
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(payload.len());
+        aligned.extend_from_slice(&payload);
+        Ok(Bytes::from_owner(aligned))
     }
 
     async fn read_partial_attestation(
@@ -906,6 +917,33 @@ mod tests {
         assert_eq!(&got[..], b"hello");
     }
 
+    #[test]
+    fn decode_partial_realigns_an_unaligned_transport_buffer() {
+        const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
+
+        let backend =
+            ObjectStoreBackend::new(Arc::new(object_store::memory::InMemory::new()), "node-0", 4);
+        let checkpoint = attempt(1);
+        let payload = Bytes::from_static(b"archived vnode state");
+        let encoded = backend.encode_partial(checkpoint, 0, 0, &payload);
+
+        let mut transport = bytes::BytesMut::zeroed(encoded.len() + ARCHIVE_ALIGNMENT);
+        let offset = (0..ARCHIVE_ALIGNMENT)
+            .find(|offset| {
+                !(transport.as_ptr() as usize + offset + VNODE_PARTIAL_HEADER_LEN)
+                    .is_multiple_of(ARCHIVE_ALIGNMENT)
+            })
+            .expect("an unaligned offset exists");
+        transport[offset..offset + encoded.len()].copy_from_slice(&encoded);
+        let transport = transport.freeze().slice(offset..offset + encoded.len());
+        assert!(!(transport[VNODE_PARTIAL_HEADER_LEN..].as_ptr() as usize)
+            .is_multiple_of(ARCHIVE_ALIGNMENT));
+
+        let decoded = ObjectStoreBackend::decode_partial(&transport, checkpoint, 0).unwrap();
+        assert_eq!(decoded, payload);
+        assert!((decoded.as_ptr() as usize).is_multiple_of(ARCHIVE_ALIGNMENT));
+    }
+
     #[tokio::test]
     async fn immutable_artifact_accepts_identical_retry_and_rejects_conflict() {
         let dir = tempdir().unwrap();
@@ -965,7 +1003,7 @@ mod tests {
                 attempt(7),
                 "node-1",
                 0,
-                Bytes::from_static(b"{\"events-0\":\"100\"}"),
+                Bytes::from_static(b"{\"events:0\":\"100\"}"),
             )
             .await
             .unwrap();
@@ -974,7 +1012,7 @@ mod tests {
                 attempt(7),
                 "node-2",
                 0,
-                Bytes::from_static(b"{\"events-1\":\"200\"}"),
+                Bytes::from_static(b"{\"events:1\":\"200\"}"),
             )
             .await
             .unwrap();
