@@ -376,6 +376,14 @@ closed with `[LDB-0014]` until their lease term can fence decisions and sink
 commits. Incompatible connectors fail before external I/O; there is no
 per-connector delivery override or public writer ID.
 
+The currently reachable certified external matrix is narrower: local file or
+generator input to append-mode Delta Lake or Iceberg. Kafka is replayable in
+principle, but its source requires engine-owned vnode assignment that is not yet
+wired in local mode; its sink is durable at-least-once and has no recoverable
+checkpoint committable. Kafka transactions must not be advertised as exact
+until a crash after the engine decision can be recovered and committed from
+durable staged output.
+
 ## Cluster Architecture (Distributed Mode)
 
 With the `cluster` feature enabled, multi-node operation provides:

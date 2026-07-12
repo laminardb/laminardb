@@ -2122,7 +2122,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Embedded/single-node only, node-durable state, a local checkpoint directory protected by an exclusive OS deployment lock, a certified <code>Replayable</code> source cut (for example Kafka with runtime vnode assignment), and a coordinated sink. Shared-object-store local exact deployments fail with <code>[LDB-0014]</code> until a term-fenced lease exists. Commit-coupled CDC sources are currently at-least-once only. Current external exact sinks: append-mode Delta Lake and Apache Iceberg.</td>
+            <td>Embedded/single-node only, node-durable state, a local checkpoint directory protected by an exclusive OS deployment lock, a certified <code>Replayable</code> source cut, and a coordinated sink. The currently reachable external matrix is local file/generator input to append-mode Delta Lake or Apache Iceberg. Local Kafka source ownership and recoverable Kafka sink transactions are not yet certified. Shared-object-store local exact deployments fail with <code>[LDB-0014]</code> until a term-fenced lease exists. Commit-coupled CDC sources are currently at-least-once only.</td>
           </tr>
         </tbody>
       </table>

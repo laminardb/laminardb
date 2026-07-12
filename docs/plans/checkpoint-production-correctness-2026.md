@@ -1,8 +1,9 @@
 # Checkpoint Production Correctness — 2026 Order
 
-**Status:** code-complete for currently admitted runtime modes on
-`feat/checkpoint-correctness-2026`; fault-injection and soak execution remain
-**Decision date:** 2026-07-11
+**Status:** corrective fault cycle active on `feat/checkpoint-correctness-2026`; embedded hard-kill
+proof passed and the cluster restore defect exposed by the first matrix is fixed locally; the full
+matrix rerun remains.
+**Decision date:** 2026-07-12
 
 This plan supersedes the older implementation order that treated connector phase-2 commits and
 per-sink status fields as the checkpoint commit point. LaminarDB now follows a decision-led
@@ -78,6 +79,69 @@ dimensions, or belong outside checkpoint configuration.
 The rejection is intentional correctness, not a missing fallback: a renewable leader lease alone
 cannot prevent an expired leader from completing a separate object-store or catalog transaction.
 
+## Effective exactly-once scope and next order
+
+The contract audit on 2026-07-12 found a narrower reachable matrix than the runtime table alone
+suggests:
+
+- local Kafka sources reject exactly-once because engine-owned vnode assignment is currently
+  installed only when a cluster controller exists, while cluster exactly-once is rejected;
+- the Kafka sink is intentionally `DurableAtLeastOnce`: idempotent production and `acks=all` do
+  not make its output transaction recoverable from an exact LaminarDB decision;
+- commit-coupled CDC sources cannot yet align a checkpoint at an external transaction boundary;
+- only coordinated append-mode Delta Lake and Iceberg are checkpoint-committable sinks; and
+- Iceberg has no direct at-least-once flush path, so it is also unreachable under the default
+  at-least-once setting.
+
+Consequently, the currently certified external exactly-once matrix is local file/generator input
+to append-mode Delta Lake or Iceberg. Documentation must not advertise Kafka as a certified local
+exact source until its single-owner assignment is wired and fault-tested.
+
+Do not restore the former inline Kafka transaction path. A process can die after the engine's
+durable decision but before `commit_transaction`; a new librdkafka producer fences and completes
+the old session, but LaminarDB has no durable committable from which to reproduce output that was
+aborted before publication. Kafka's transaction protocol requires stable transactional IDs and
+atomic commit markers ([KIP-98](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging)); moving partition ownership also
+requires group-generation fencing ([KIP-447](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/103093950/KIP-447%2BProducer%2Bscalability%2Bfor%2Bexactly%2Bonce%2Bsemantics)). Flink likewise makes
+Kafka transactions checkpoint-owned, requires a stable transactional-ID prefix, and documents
+checkpoint-bounded visibility and transaction-timeout constraints.
+
+Implement the remaining work in this order:
+
+1. **Make the existing matrix truthful and useful.** Replace the free-form server mode string with
+   the actual protocol boundary (`Local` or `Cluster`); embedded and standalone hosting are both
+   local. Install a single-owner vnode registry for a local Kafka source before connector start,
+   then prove initial start, restart, and partition discovery under exact checkpoints. Give
+   Iceberg a real direct-append at-least-once path (or separately certify that running its stronger
+   coordinated protocol under an at-least-once label is safe) so the default configuration is
+   usable.
+2. **Certify source transaction cuts.** Add a deadline-bounded async barrier-prepare hook for
+   commit-coupled CDC. PostgreSQL CDC must either drain through the current database transaction
+   before emitting its barrier or persist the transaction identifier, event ordinal, and in-flight
+   payload. Merely removing its admission rejection can replay a partially emitted transaction.
+3. **Add recoverable Kafka sink committables, local first.** Stage encoded record segments durably
+   before the seal and keep participant descriptors small and checksummed. After the exact engine
+   decision, a designated committer opens a fresh Kafka transaction, publishes the staged records
+   plus a namespaced exact cursor marker atomically, and resolves ambiguous commits by reading that
+   cursor with `read_committed`. Derive the transactional ID from pipeline identity, deployment,
+   sink, and participant; do not add a public writer-ID dimension. Reject a non-transactional DLQ
+   under exactly-once and validate transaction timeout against checkpoint plus recovery bounds.
+   Preserve the current direct producer path for low-latency at-least-once operation.
+4. **Build a linearizable cluster decision authority.** Complete AD-0 from
+   `cluster-production-readiness.md`: use the authoritative Postgres control store to insert the
+   seal-bound decision in a transaction conditioned on the current owner and fencing term. The
+   existing `strategy = "raft"`/`raft_port` settings are not a Raft implementation and cannot
+   justify removing `LDB-0013`.
+5. **Fence and certify every external committer.** External cursors must carry the exact
+   predecessor, deployment namespace, and decision fence. Run stale-leader, network-partition,
+   rebalance, process-death-before/after-decision, ambiguous Kafka commit, mixed-sink, and
+   transaction-timeout matrices before admitting cluster exactly-once.
+
+Keep consistency, topology, and input mode as derived connector contract dimensions rather than
+user options. The public delivery setting remains the requested end-to-end minimum; diagnostics
+and status APIs should also expose the effective source/state/sink guarantee so a narrower matrix
+cannot be mistaken for broad exactly-once support.
+
 ## Exit gates
 
 - All-target compilation for core, connectors, DB (local and `cluster`), and server.
@@ -92,9 +156,12 @@ cannot prevent an expired leader from completing a separate object-store or cata
 Code gates completed on 2026-07-11: strict all-target Clippy passes for core/connectors, DB in
 local and cluster feature builds, and server; connectors also pass with no default features;
 workspace rustfmt and `git diff --check` pass. Test targets compile through those all-target gates.
-Runtime test execution remains outstanding in this Windows environment because linking the test
-binaries exhausts the configured paging file; run the fault-injection and soak matrix on the Linux
-production CI runners before release.
+The first Linux fault matrix (`29169226798`) completed four embedded kill-9 rounds with aggregate
+state continuity, 908 demotions, and 31,025 cold-state fetches. Its cluster legs exposed an
+unaligned rkyv vnode payload returned from object storage after the first fault; object-store reads
+now normalize that buffer once and the decoder also protects custom backends. The deliberately
+misaligned regressions pass locally; the production matrix must pass on the corrective commit
+before release.
 
 Remaining deliberate gap: cluster exactly once requires a term-fenced decision/external-commit
 protocol. Until that exists, admitting it would be less correct than failing configuration.
