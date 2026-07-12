@@ -432,7 +432,6 @@ fn write_config(
     let mut toml = format!(
         r#"
 node_id = "n{id}"
-storage_dir = "{data}"
 
 [server]
 mode = "cluster"
@@ -482,7 +481,6 @@ nullable = false
 name = "soak_stream"
 sql = "SELECT seq FROM kin"
 "#,
-        data = data_dir.display().to_string().replace('\\', "/"),
         seeds = seeds.join(", "),
         url = checkpoint_url,
     );
