@@ -2246,7 +2246,7 @@ mod tests {
         request_config.set("laminar.source.name", "replacement-source");
 
         let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
-            "replacement-topic-0".to_string(),
+            "replacement-topic:0".to_string(),
             "42".to_string(),
         )]));
         let error = source
@@ -2284,7 +2284,7 @@ mod tests {
     #[test]
     fn acquired_resume_prefers_handoff_over_local() {
         let map = |off: &str| {
-            std::collections::HashMap::from([("events-0".to_string(), off.to_string())])
+            std::collections::HashMap::from([("events:0".to_string(), off.to_string())])
         };
         let handoff = OffsetTracker::try_from_offset_map(&map("100")).unwrap();
         let local = OffsetTracker::try_from_offset_map(&map("250")).unwrap();
@@ -2328,8 +2328,8 @@ mod tests {
         }
 
         let cp = source.checkpoint();
-        assert_eq!(cp.get_offset("events-0"), Some("100"));
-        assert_eq!(cp.get_offset("events-1"), Some("200"));
+        assert_eq!(cp.get_offset("events:0"), Some("100"));
+        assert_eq!(cp.get_offset("events:1"), Some("200"));
     }
 
     #[test]
@@ -2356,10 +2356,10 @@ mod tests {
         // rebalance_state is empty (no callbacks under manual assign): the old
         // code returned an empty checkpoint here.
         let cp = source.checkpoint();
-        assert_eq!(cp.get_offset("events-0"), Some("100")); // vnode 0 → node0
-        assert_eq!(cp.get_offset("events-1"), None); // vnode 1 → node1
-        assert_eq!(cp.get_offset("events-2"), Some("300")); // vnode 2 → node0
-        assert_eq!(cp.get_offset("events-3"), None); // vnode 3 → node1
+        assert_eq!(cp.get_offset("events:0"), Some("100")); // vnode 0 → node0
+        assert_eq!(cp.get_offset("events:1"), None); // vnode 1 → node1
+        assert_eq!(cp.get_offset("events:2"), Some("300")); // vnode 2 → node0
+        assert_eq!(cp.get_offset("events:3"), None); // vnode 3 → node1
     }
 
     #[test]
@@ -2428,13 +2428,14 @@ mod tests {
     fn resume_checkpoint_decode_is_strict() {
         for (key, value) in [
             ("missing_separator", "1"),
-            ("-0", "1"),
-            ("events-x", "1"),
-            ("events--1", "1"),
-            ("events-00", "1"),
-            ("events-0", "not-an-offset"),
-            ("events-0", "-1"),
-            ("events-0", "9223372036854775807"),
+            (":0", "1"),
+            ("events:x", "1"),
+            ("events:-1", "1"),
+            ("events:00", "1"),
+            ("events:0", "not-an-offset"),
+            ("events:0", "-1"),
+            ("events:0", "9223372036854775807"),
+            ("invalid:topic:0", "1"),
         ] {
             let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
                 key.to_string(),
@@ -2536,9 +2537,9 @@ mod tests {
         }
 
         let cp = source.checkpoint();
-        assert_eq!(cp.get_offset("events-0"), Some("100"));
-        assert_eq!(cp.get_offset("events-1"), None); // revoked — filtered out
-        assert_eq!(cp.get_offset("events-2"), Some("300"));
+        assert_eq!(cp.get_offset("events:0"), Some("100"));
+        assert_eq!(cp.get_offset("events:1"), None); // revoked — filtered out
+        assert_eq!(cp.get_offset("events:2"), Some("300"));
     }
 
     #[test]
@@ -2874,8 +2875,8 @@ mod tests {
     #[test]
     fn test_checkpoint_to_tpl_uses_next_offset() {
         let mut offsets = std::collections::HashMap::new();
-        offsets.insert("events-0".to_string(), "100".to_string());
-        offsets.insert("events-1".to_string(), "200".to_string());
+        offsets.insert("events:0".to_string(), "100".to_string());
+        offsets.insert("events:1".to_string(), "200".to_string());
         let cp = SourceCheckpoint::with_offsets(offsets);
         let tpl = OffsetTracker::try_from_checkpoint(&cp)
             .unwrap()
@@ -2903,7 +2904,7 @@ mod tests {
 
     fn durable_kafka_checkpoint() -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
-        checkpoint.set_offset("events-0", "100");
+        checkpoint.set_offset("events:0", "100");
         checkpoint
     }
 

@@ -125,11 +125,11 @@ fn test_checkpoint_phase_display() {
 #[test]
 fn test_source_to_connector_checkpoint() {
     let mut cp = SourceCheckpoint::new();
-    cp.set_offset("partition-0", "1234");
+    cp.set_offset("events:0", "1234");
     cp.set_metadata("topic", "events");
 
     let cc = source_to_connector_checkpoint(&cp);
-    assert_eq!(cc.offsets.get("partition-0"), Some(&"1234".into()));
+    assert_eq!(cc.offsets.get("events:0"), Some(&"1234".into()));
     assert_eq!(cc.metadata.get("topic"), Some(&"events".into()));
 }
 
@@ -1384,7 +1384,7 @@ async fn source_offset_handoff_round_trip() {
     source_offsets.insert(
         "kafka".to_string(),
         ConnectorCheckpoint::with_offsets(HashMap::from([(
-            "events-0".to_string(),
+            "events:0".to_string(),
             "100".to_string(),
         )])),
     );
@@ -1406,7 +1406,7 @@ async fn source_offset_handoff_round_trip() {
         .await
         .unwrap());
 
-    // A node acquiring events-0 on rotation recovers the committed offset.
+    // A node acquiring events partition 0 on rotation recovers the committed offset.
     let (acquired_attempt, acquired) = coord
         .acquired_source_handoff()
         .await
@@ -1414,7 +1414,7 @@ async fn source_offset_handoff_round_trip() {
         .expect("sealed handoff");
     assert_eq!(acquired_attempt, attempt);
     assert_eq!(
-        acquired.get("kafka").and_then(|m| m.get("events-0")),
+        acquired.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"100".to_string())
     );
 }
@@ -1436,7 +1436,7 @@ async fn source_offsets_at_reads_the_requested_epoch() {
         HashMap::from([(
             "kafka".to_string(),
             ConnectorCheckpoint::with_offsets(HashMap::from([(
-                "events-0".to_string(),
+                "events:0".to_string(),
                 off.to_string(),
             )])),
         )])
@@ -1472,17 +1472,17 @@ async fn source_offsets_at_reads_the_requested_epoch() {
         .expect("latest sealed handoff");
     assert_eq!(latest_attempt, attempt8);
     assert_eq!(
-        latest.get("kafka").and_then(|m| m.get("events-0")),
+        latest.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"200".to_string())
     );
     let at5 = coord.source_offsets_at(attempt5).await.unwrap();
     assert_eq!(
-        at5.get("kafka").and_then(|m| m.get("events-0")),
+        at5.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"100".to_string())
     );
     let at8 = coord.source_offsets_at(attempt8).await.unwrap();
     assert_eq!(
-        at8.get("kafka").and_then(|m| m.get("events-0")),
+        at8.get("kafka").and_then(|m| m.get("events:0")),
         Some(&"200".to_string())
     );
 }

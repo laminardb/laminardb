@@ -78,7 +78,7 @@ async fn produce(brokers: &str, topic: &str, start: i64, count: i64) {
 fn part_offset(source: &KafkaSource, topic: &str, partition: i32) -> i64 {
     source
         .checkpoint()
-        .get_offset(&format!("{topic}-{partition}"))
+        .get_offset(&format!("{topic}:{partition}"))
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(-1)
 }

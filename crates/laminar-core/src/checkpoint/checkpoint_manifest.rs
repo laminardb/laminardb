@@ -299,7 +299,7 @@ impl CheckpointManifest {
 /// Connector-agnostic offset container.
 ///
 /// Uses string key-value pairs to support all connector types:
-/// - **Kafka**: `{"partition-0": "1234", "partition-1": "5678"}`
+/// - **Kafka**: `{"events:0": "1234", "events:1": "5678"}`
 /// - **`PostgreSQL` CDC**: `{"lsn": "0/1234ABCD"}`
 /// - **`MySQL` CDC**: `{"gtid_set": "uuid:1-5", "binlog_file": "mysql-bin.000003"}`
 /// - **Delta Lake**: `{"version": "42"}`
@@ -493,8 +493,8 @@ mod tests {
         m.source_offsets.insert(
             "kafka-src".into(),
             ConnectorCheckpoint::with_offsets(HashMap::from([
-                ("partition-0".into(), "1234".into()),
-                ("partition-1".into(), "5678".into()),
+                ("events:0".into(), "1234".into()),
+                ("events:1".into(), "5678".into()),
             ])),
         );
         m.watermark = Some(999_000);
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(restored.epoch, 10);
         assert_eq!(restored.watermark, Some(999_000));
         let src = restored.source_offsets.get("kafka-src").unwrap();
-        assert_eq!(src.offsets.get("partition-0"), Some(&"1234".into()));
+        assert_eq!(src.offsets.get("events:0"), Some(&"1234".into()));
 
         let op = restored.operator_states.get("window-agg").unwrap();
         assert_eq!(op.decode_inline().unwrap(), b"hello");

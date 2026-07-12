@@ -41,9 +41,9 @@ fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> Chec
         m.source_offsets.insert(
             name.clone(),
             ConnectorCheckpoint::with_offsets(HashMap::from([
-                ("partition-0".into(), format!("{}", 1000 * id)),
-                ("partition-1".into(), format!("{}", 2000 * id)),
-                ("partition-2".into(), format!("{}", 3000 * id)),
+                ("events:0".into(), format!("{}", 1000 * id)),
+                ("events:1".into(), format!("{}", 2000 * id)),
+                ("events:2".into(), format!("{}", 3000 * id)),
             ])),
         );
         m.source_watermarks.insert(name, 500_000 + i as i64);

@@ -93,7 +93,10 @@ impl OffsetTracker {
 
     /// Converts tracked offsets to a [`SourceCheckpoint`].
     ///
-    /// Key format: `"{topic}-{partition}"`, value: offset as string.
+    /// Key format: `"{topic}:{partition}"`, value: offset as string.
+    ///
+    /// `:` is not valid in a Kafka topic name, so the encoding remains
+    /// unambiguous for valid topics containing or ending in `-`.
     #[must_use]
     pub fn to_checkpoint(&self) -> SourceCheckpoint {
         let offsets: HashMap<String, String> = self
@@ -101,7 +104,7 @@ impl OffsetTracker {
             .iter()
             .flat_map(|(topic, partitions)| {
                 partitions.iter().map(move |(partition, offset)| {
-                    (format!("{topic}-{partition}"), offset.to_string())
+                    (format!("{topic}:{partition}"), offset.to_string())
                 })
             })
             .collect();
@@ -131,9 +134,10 @@ impl OffsetTracker {
         Self::try_from_offset_map(cp.offsets())
     }
 
-    /// Strictly builds a tracker from a raw `"{topic}-{partition}" -> offset`
-    /// map. Topic names may contain `-`, so the partition is split off the last
-    /// `-`. Keys and values must use their canonical non-negative decimal form.
+    /// Strictly builds a tracker from a raw `"{topic}:{partition}" -> offset`
+    /// map. Kafka topic names cannot contain `:`, so the partition delimiter is
+    /// unambiguous even when a topic contains or ends in `-`. Keys and values
+    /// must use their canonical non-negative decimal form.
     ///
     /// # Errors
     ///
@@ -142,14 +146,19 @@ impl OffsetTracker {
     pub fn try_from_offset_map(offsets: &HashMap<String, String>) -> Result<Self, ConnectorError> {
         let mut tracker = Self::new();
         for (key, value) in offsets {
-            let (topic, partition_text) = key.rsplit_once('-').ok_or_else(|| {
+            let (topic, partition_text) = key.rsplit_once(':').ok_or_else(|| {
                 ConnectorError::ConfigurationError(format!(
-                    "invalid Kafka offset key '{key}': expected '<topic>-<partition>'"
+                    "invalid Kafka offset key '{key}': expected '<topic>:<partition>'"
                 ))
             })?;
             if topic.is_empty() {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "invalid Kafka offset key '{key}': topic is empty"
+                )));
+            }
+            if topic.contains(':') {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid Kafka offset key '{key}': topic contains the ':' delimiter"
                 )));
             }
 
@@ -252,7 +261,7 @@ impl OffsetTracker {
             .flat_map(|(topic, partitions)| {
                 partitions.iter().filter_map(move |(partition, offset)| {
                     if assigned.contains(&(topic.to_string(), *partition)) {
-                        Some((format!("{topic}-{partition}"), offset.to_string()))
+                        Some((format!("{topic}:{partition}"), offset.to_string()))
                     } else {
                         None
                     }
@@ -363,28 +372,43 @@ mod tests {
     }
 
     #[test]
-    fn from_offset_map_splits_partition_off_last_dash() {
-        // Topic names may contain '-': only the final segment is the partition.
+    fn from_offset_map_supports_hyphenated_topics() {
         let map = HashMap::from([
-            ("events-5".to_string(), "100".to_string()),
-            ("my-topic-2".to_string(), "7".to_string()),
+            ("events:5".to_string(), "100".to_string()),
+            ("my-topic:2".to_string(), "7".to_string()),
+            ("trailing-hyphen-:3".to_string(), "9".to_string()),
         ]);
         let tracker = OffsetTracker::try_from_offset_map(&map).unwrap();
         assert_eq!(tracker.get("events", 5), Some(100));
         assert_eq!(tracker.get("my-topic", 2), Some(7));
-        assert_eq!(tracker.partition_count(), 2);
+        assert_eq!(tracker.get("trailing-hyphen-", 3), Some(9));
+        assert_eq!(tracker.partition_count(), 3);
+    }
+
+    #[test]
+    fn checkpoint_roundtrips_topic_ending_in_hyphen() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("trailing-hyphen-", 3, 9);
+
+        let checkpoint = tracker.to_checkpoint();
+        assert_eq!(checkpoint.get_offset("trailing-hyphen-:3"), Some("9"));
+
+        let restored = OffsetTracker::try_from_checkpoint(&checkpoint).unwrap();
+        assert_eq!(restored.get("trailing-hyphen-", 3), Some(9));
     }
 
     #[test]
     fn try_from_offset_map_rejects_malformed_entries() {
         for (key, value) in [
-            ("bad-partition-x", "10"),
-            ("nodashseparator", "10"),
-            ("offset-0", "notanumber"),
-            ("negative-partition--1", "10"),
-            ("negative-offset-0", "-1"),
-            ("noncanonical-partition-00", "10"),
-            ("noncanonical-offset-0", "010"),
+            ("bad-partition:x", "10"),
+            ("noseparator", "10"),
+            ("events-0", "10"),
+            ("offset:0", "notanumber"),
+            ("negative-partition:-1", "10"),
+            ("negative-offset:0", "-1"),
+            ("noncanonical-partition:00", "10"),
+            ("noncanonical-offset:0", "010"),
+            ("invalid:topic:0", "10"),
         ] {
             let map = HashMap::from([(key.to_string(), value.to_string())]);
             assert!(
@@ -466,7 +490,7 @@ mod tests {
         let mut assigned = HashSet::new();
         assigned.insert(("events".to_string(), 0));
         assigned.insert(("events".to_string(), 2));
-        // orders-0 and events-1 are NOT assigned (revoked)
+        // orders partition 0 and events partition 1 are NOT assigned (revoked)
 
         tracker.retain_assigned(&assigned);
 
@@ -500,9 +524,9 @@ mod tests {
 
         let cp = tracker.to_checkpoint_filtered(&assigned);
 
-        assert_eq!(cp.get_offset("events-0"), Some("100"));
-        assert_eq!(cp.get_offset("events-1"), None); // filtered out
-        assert_eq!(cp.get_offset("orders-0"), Some("50"));
+        assert_eq!(cp.get_offset("events:0"), Some("100"));
+        assert_eq!(cp.get_offset("events:1"), None); // filtered out
+        assert_eq!(cp.get_offset("orders:0"), Some("50"));
     }
 
     #[test]

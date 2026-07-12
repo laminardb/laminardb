@@ -139,7 +139,7 @@ impl fmt::Debug for PersistentOffset {
 ///
 /// Captures the connector's position using string key-value pairs.
 /// This is flexible enough to represent:
-/// - Kafka: `{"partition-0": "1234", "partition-1": "5678"}`
+/// - Kafka: `{"events:0": "1234", "events:1": "5678"}`
 /// - `PostgreSQL` CDC: `{"lsn": "0/1234ABCD"}`
 /// - File: `{"manifest": "[...]", "file_progress": "..."}`
 ///
@@ -331,12 +331,12 @@ mod tests {
     #[test]
     fn test_source_checkpoint_basic() {
         let mut cp = SourceCheckpoint::new();
-        cp.set_offset("partition-0", "1234");
-        cp.set_offset("partition-1", "5678");
+        cp.set_offset("events:0", "1234");
+        cp.set_offset("events:1", "5678");
 
-        assert_eq!(cp.get_offset("partition-0"), Some("1234"));
-        assert_eq!(cp.get_offset("partition-1"), Some("5678"));
-        assert_eq!(cp.get_offset("partition-2"), None);
+        assert_eq!(cp.get_offset("events:0"), Some("1234"));
+        assert_eq!(cp.get_offset("events:1"), Some("5678"));
+        assert_eq!(cp.get_offset("events:2"), None);
         assert!(!cp.is_empty());
     }
 

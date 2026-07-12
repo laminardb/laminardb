@@ -1656,8 +1656,8 @@ mod tests {
         m.source_offsets.insert(
             "kafka-src".into(),
             ConnectorCheckpoint::with_offsets(HashMap::from([
-                ("0".into(), "1000".into()),
-                ("1".into(), "2000".into()),
+                ("events:0".into(), "1000".into()),
+                ("events:1".into(), "2000".into()),
             ])),
         );
         m.table_offsets.insert(
@@ -1676,7 +1676,7 @@ mod tests {
         assert_eq!(loaded.watermark, Some(999_000));
 
         let src = loaded.source_offsets.get("kafka-src").unwrap();
-        assert_eq!(src.offsets.get("0"), Some(&"1000".into()));
+        assert_eq!(src.offsets.get("events:0"), Some(&"1000".into()));
 
         let tbl = loaded.table_offsets.get("instruments").unwrap();
         assert_eq!(tbl.offsets.get("lsn"), Some(&"0/AB".into()));

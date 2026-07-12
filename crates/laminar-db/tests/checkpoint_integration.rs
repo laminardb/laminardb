@@ -918,8 +918,8 @@ mod recovery {
             "kafka-trades".into(),
             ConnectorCheckpoint {
                 offsets: HashMap::from([
-                    ("partition-0".into(), "1234".into()),
-                    ("partition-1".into(), "5678".into()),
+                    ("trades:0".into(), "1234".into()),
+                    ("trades:1".into(), "5678".into()),
                 ]),
                 metadata: HashMap::from([("topic".into(), "trades".into())]),
             },
@@ -936,8 +936,8 @@ mod recovery {
         let manifest = store.load_latest().await.unwrap().unwrap();
 
         let kafka = manifest.source_offsets.get("kafka-trades").unwrap();
-        assert_eq!(kafka.offsets.get("partition-0"), Some(&"1234".into()));
-        assert_eq!(kafka.offsets.get("partition-1"), Some(&"5678".into()));
+        assert_eq!(kafka.offsets.get("trades:0"), Some(&"1234".into()));
+        assert_eq!(kafka.offsets.get("trades:1"), Some(&"5678".into()));
         assert_eq!(kafka.metadata.get("topic"), Some(&"trades".into()));
 
         let pg = manifest.source_offsets.get("pg-orders").unwrap();

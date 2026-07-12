@@ -607,12 +607,12 @@ mod tests {
         let mut offsets = ResumeOffsets::new();
         offsets.insert(
             "orders".into(),
-            SourceResumeOffsets::from([("orders-0".into(), "41".into())]),
+            SourceResumeOffsets::from([("orders:0".into(), "41".into())]),
         );
         r.stage_resume_offsets(offsets);
         assert_eq!(
             r.resume_offsets_for("orders")
-                .get("orders-0")
+                .get("orders:0")
                 .map(String::as_str),
             Some("41")
         );
