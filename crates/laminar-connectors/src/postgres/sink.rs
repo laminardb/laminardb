@@ -71,8 +71,8 @@ fn build_pool(config: &PostgresSinkConfig) -> Result<Pool, ConnectorError> {
     pool_config.options = Some(config.statement_timeout_startup_option());
     pool_config.connect_timeout = Some(config.connect_timeout);
     pool_config.ssl_mode = Some(match config.ssl_mode {
-        crate::connector::PostgresSslMode::Disable => deadpool_postgres::SslMode::Disable,
-        crate::connector::PostgresSslMode::VerifyFull => deadpool_postgres::SslMode::Require,
+        crate::postgres::SslMode::Disable => deadpool_postgres::SslMode::Disable,
+        crate::postgres::SslMode::VerifyFull => deadpool_postgres::SslMode::Require,
     });
     let mut deadpool_config = deadpool_postgres::PoolConfig::new(SINK_POOL_SIZE);
     deadpool_config.timeouts.wait = Some(config.connect_timeout);
@@ -81,14 +81,13 @@ fn build_pool(config: &PostgresSinkConfig) -> Result<Pool, ConnectorError> {
 
     let runtime = Some(deadpool_postgres::Runtime::Tokio1);
     match config.ssl_mode {
-        crate::connector::PostgresSslMode::Disable => pool_config
+        crate::postgres::SslMode::Disable => pool_config
             .create_pool(runtime, tokio_postgres::NoTls)
             .map_err(|error| {
                 ConnectorError::ConnectionFailed(format!("pool creation failed: {error}"))
             }),
-        crate::connector::PostgresSslMode::VerifyFull => {
-            let tls =
-                crate::postgres_tls::make_rustls_connector(config.ssl_ca_cert_path.as_deref())?;
+        crate::postgres::SslMode::VerifyFull => {
+            let tls = crate::postgres::make_rustls_connector(config.ssl_ca_cert_path.as_deref())?;
             pool_config.create_pool(runtime, tls).map_err(|error| {
                 ConnectorError::ConnectionFailed(format!("TLS pool creation failed: {error}"))
             })

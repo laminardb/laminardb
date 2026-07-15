@@ -2157,7 +2157,7 @@ mod tests {
 
     fn default_source() -> PostgresCdcSource {
         let mut config = PostgresCdcConfig::default();
-        config.ssl_mode = crate::cdc::postgres::config::SslMode::Disable;
+        config.ssl_mode = crate::postgres::SslMode::Disable;
         PostgresCdcSource::new(config, None)
     }
 
@@ -3350,7 +3350,7 @@ mod tests {
     #[tokio::test]
     async fn empty_filtered_transaction_advances_only_in_wal_order() {
         let mut config = PostgresCdcConfig::default();
-        config.ssl_mode = crate::cdc::postgres::config::SslMode::Disable;
+        config.ssl_mode = crate::postgres::SslMode::Disable;
         config.table_exclude = vec!["public.users".to_string()];
         let mut src = PostgresCdcSource::new(config, None);
         src.state = ConnectorState::Running;

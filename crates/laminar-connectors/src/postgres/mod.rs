@@ -1,21 +1,37 @@
-//! `PostgreSQL` sink connector.
+//! PostgreSQL connector-specific configuration and implementations.
 
+#[cfg(feature = "postgres-sink")]
 pub mod sink;
+#[cfg(feature = "postgres-sink")]
 pub mod sink_config;
+#[cfg(feature = "postgres-sink")]
 pub mod sink_metrics;
+mod tls;
+#[cfg(feature = "postgres-sink")]
 pub mod types;
 
-// Re-export primary types at module level.
+pub(crate) use tls::make_rustls_connector;
+/// PostgreSQL connection security policy.
+pub use tls::SslMode;
+
+// Re-export primary sink types at module level.
+#[cfg(feature = "postgres-sink")]
 pub use sink::PostgresSink;
-pub use sink_config::{PostgresSinkConfig, SslMode, WriteMode};
+#[cfg(feature = "postgres-sink")]
+pub use sink_config::{PostgresSinkConfig, WriteMode};
+#[cfg(feature = "postgres-sink")]
 pub use sink_metrics::PostgresSinkMetrics;
 
+#[cfg(feature = "postgres-sink")]
 use std::sync::Arc;
 
+#[cfg(feature = "postgres-sink")]
 use crate::config::{ConfigKeySpec, ConnectorInfo};
+#[cfg(feature = "postgres-sink")]
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `PostgreSQL` sink connector with the given registry.
+#[cfg(feature = "postgres-sink")]
 pub fn register_postgres_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -39,6 +55,7 @@ pub fn register_postgres_sink(
     )
 }
 
+#[cfg(feature = "postgres-sink")]
 fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         ConfigKeySpec::required("hostname", "PostgreSQL server hostname"),
@@ -84,7 +101,7 @@ fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
     ]
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres-sink"))]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};

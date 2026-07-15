@@ -11,7 +11,8 @@ pub mod source;
 pub mod types;
 
 // Re-export primary types at module level.
-pub use config::{PostgresCdcConfig, SslMode};
+pub use crate::postgres::SslMode;
+pub use config::PostgresCdcConfig;
 pub use lsn::Lsn;
 pub use source::PostgresCdcSource;
 

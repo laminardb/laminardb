@@ -243,40 +243,6 @@ impl SinkContract {
     }
 }
 
-/// Connection security for `PostgreSQL` connectors.
-///
-/// Production connections either verify both the certificate chain and server
-/// hostname, or explicitly opt into plaintext for trusted test networks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PostgresSslMode {
-    /// Disable TLS explicitly.
-    Disable,
-    /// Require TLS with certificate-chain and hostname verification.
-    #[default]
-    VerifyFull,
-}
-
-impl std::fmt::Display for PostgresSslMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Disable => write!(f, "disable"),
-            Self::VerifyFull => write!(f, "verify-full"),
-        }
-    }
-}
-
-impl FromStr for PostgresSslMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "disable" => Ok(Self::Disable),
-            "verify-full" => Ok(Self::VerifyFull),
-            other => Err(format!("unknown SSL mode: '{other}'")),
-        }
-    }
-}
-
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
 pub struct SourceBatch {

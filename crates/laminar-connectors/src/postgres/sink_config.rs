@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
+use crate::postgres::SslMode;
 
 const MAX_POSTGRES_IDENTIFIER_BYTES: usize = 63;
 const MAX_POSTGRES_STATEMENT_TIMEOUT_MS: u128 = 2_147_483_647;
@@ -366,8 +367,6 @@ str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
     Upsert => "upsert", "insert"
 );
 
-pub use crate::connector::PostgresSslMode as SslMode;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,31 +546,6 @@ mod tests {
     fn test_write_mode_display() {
         assert_eq!(WriteMode::Append.to_string(), "append");
         assert_eq!(WriteMode::Upsert.to_string(), "upsert");
-    }
-
-    #[test]
-    fn test_ssl_mode_parse() {
-        assert_eq!("disable".parse::<SslMode>().unwrap(), SslMode::Disable);
-        assert_eq!(
-            "verify-full".parse::<SslMode>().unwrap(),
-            SslMode::VerifyFull
-        );
-        for rejected in [
-            "off",
-            "prefer",
-            "require",
-            "verify-ca",
-            "verify_full",
-            "verifyfull",
-        ] {
-            assert!(rejected.parse::<SslMode>().is_err(), "{rejected}");
-        }
-    }
-
-    #[test]
-    fn test_ssl_mode_display() {
-        assert_eq!(SslMode::Disable.to_string(), "disable");
-        assert_eq!(SslMode::VerifyFull.to_string(), "verify-full");
     }
 
     #[test]

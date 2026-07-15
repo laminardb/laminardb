@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
+use crate::postgres::SslMode;
 
 const REMOVED_CONFIG_KEYS: &[&str] = &[
     "backpressure.high.watermark",
@@ -363,8 +364,6 @@ fn normalize_table_list(tables: &mut Vec<String>) {
     tables.dedup();
 }
 
-pub use crate::connector::PostgresSslMode as SslMode;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,31 +555,6 @@ mod tests {
             let error = PostgresCdcConfig::from_config(&config).unwrap_err();
             assert!(error.to_string().contains(key));
         }
-    }
-
-    #[test]
-    fn test_ssl_mode_fromstr() {
-        assert_eq!("disable".parse::<SslMode>().unwrap(), SslMode::Disable);
-        assert_eq!(
-            "verify-full".parse::<SslMode>().unwrap(),
-            SslMode::VerifyFull
-        );
-        for rejected in [
-            "off",
-            "prefer",
-            "require",
-            "verify-ca",
-            "verify_full",
-            "verifyfull",
-        ] {
-            assert!(rejected.parse::<SslMode>().is_err(), "{rejected}");
-        }
-    }
-
-    #[test]
-    fn test_ssl_mode_display() {
-        assert_eq!(SslMode::Disable.to_string(), "disable");
-        assert_eq!(SslMode::VerifyFull.to_string(), "verify-full");
     }
 
     #[test]

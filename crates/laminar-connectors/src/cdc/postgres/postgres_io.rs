@@ -102,7 +102,7 @@ impl Drop for ControlConnection {
 pub(super) async fn connect(
     config: &super::config::PostgresCdcConfig,
 ) -> Result<ControlConnection, ConnectorError> {
-    use super::config::SslMode;
+    use crate::postgres::SslMode;
 
     let pg_config = config.control_connection_config()?;
     match config.ssl_mode {
@@ -129,8 +129,7 @@ pub(super) async fn connect(
             })
         }
         SslMode::VerifyFull => {
-            let tls =
-                crate::postgres_tls::make_rustls_connector(config.ssl_ca_cert_path.as_deref())?;
+            let tls = crate::postgres::make_rustls_connector(config.ssl_ca_cert_path.as_deref())?;
             let (client, connection) =
                 tokio::time::timeout(CONNECT_TIMEOUT, pg_config.connect(tls))
                     .await
@@ -420,8 +419,8 @@ pub(super) fn build_replication_config(
         password: config.password.clone().unwrap_or_default(),
         database: config.database.clone(),
         tls: match config.ssl_mode {
-            super::config::SslMode::Disable => pgwire_replication::TlsConfig::disabled(),
-            super::config::SslMode::VerifyFull => {
+            crate::postgres::SslMode::Disable => pgwire_replication::TlsConfig::disabled(),
+            crate::postgres::SslMode::VerifyFull => {
                 pgwire_replication::TlsConfig::verify_full(config.ssl_ca_cert_path.clone())
             }
         },
@@ -446,7 +445,7 @@ mod tests {
         build_replication_config, source_config_digest, validate_replication_slot,
         validate_server_version_num,
     };
-    use crate::cdc::postgres::config::{PostgresCdcConfig, SslMode};
+    use crate::cdc::postgres::{PostgresCdcConfig, SslMode};
 
     #[test]
     fn replication_config_disables_tls() {

@@ -246,16 +246,14 @@ impl PostgresReferenceTableSource {
                 "postgres reference ssl.ca.cert.path must not be empty".into(),
             ));
         }
-        if ssl_mode == crate::connector::PostgresSslMode::Disable && ca_path.is_some() {
+        if ssl_mode == crate::postgres::SslMode::Disable && ca_path.is_some() {
             return Err(ConnectorError::ConfigurationError(
                 "ssl.ca.cert.path requires ssl.mode=verify-full".into(),
             ));
         }
         config.ssl_mode(match ssl_mode {
-            crate::connector::PostgresSslMode::Disable => tokio_postgres::config::SslMode::Disable,
-            crate::connector::PostgresSslMode::VerifyFull => {
-                tokio_postgres::config::SslMode::Require
-            }
+            crate::postgres::SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+            crate::postgres::SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
         });
         config.connect_timeout(CONNECT_TIMEOUT);
         Ok(config)
@@ -319,7 +317,7 @@ impl PostgresReferenceTableSource {
         ))
     }
 
-    fn ssl_mode(&self) -> Result<crate::connector::PostgresSslMode, ConnectorError> {
+    fn ssl_mode(&self) -> Result<crate::postgres::SslMode, ConnectorError> {
         self.config
             .get("ssl.mode")
             .map(str::parse)
@@ -341,7 +339,7 @@ impl PostgresReferenceTableSource {
             .get("ssl.ca.cert.path")
             .map(std::path::Path::new);
         let session = match ssl_mode {
-            crate::connector::PostgresSslMode::Disable => {
+            crate::postgres::SslMode::Disable => {
                 await_reference_driver("connect", async move {
                     let (client, connection) = tokio::time::timeout(
                         CONNECT_TIMEOUT,
@@ -361,8 +359,8 @@ impl PostgresReferenceTableSource {
                 })
                 .await?
             }
-            crate::connector::PostgresSslMode::VerifyFull => {
-                let tls = crate::postgres_tls::make_rustls_connector(ca_path)?;
+            crate::postgres::SslMode::VerifyFull => {
+                let tls = crate::postgres::make_rustls_connector(ca_path)?;
                 await_reference_driver("TLS connect", async move {
                     let (client, connection) =
                         tokio::time::timeout(CONNECT_TIMEOUT, pg_config.connect(tls))
@@ -759,7 +757,7 @@ mod tests {
             PostgresReferenceTableSource::new(ConnectorConfig::new("postgres"), declared_schema());
         assert_eq!(
             source.ssl_mode().unwrap(),
-            crate::connector::PostgresSslMode::VerifyFull
+            crate::postgres::SslMode::VerifyFull
         );
         assert_eq!(
             source.postgres_config().unwrap().get_ssl_mode(),
@@ -782,7 +780,7 @@ mod tests {
         let source = PostgresReferenceTableSource::new(config, declared_schema());
         assert_eq!(
             source.ssl_mode().unwrap(),
-            crate::connector::PostgresSslMode::Disable
+            crate::postgres::SslMode::Disable
         );
         assert_eq!(
             source.postgres_config().unwrap().get_ssl_mode(),

@@ -687,31 +687,29 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
     cfg.ssl_mode = Some(driver_ssl_mode(ssl_mode));
 
     match ssl_mode {
-        crate::connector::PostgresSslMode::VerifyFull => {
+        crate::postgres::SslMode::VerifyFull => {
             let connector = build_rustls_connector(props)?;
             cfg.create_pool(runtime, connector)
                 .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
         }
-        crate::connector::PostgresSslMode::Disable => cfg
+        crate::postgres::SslMode::Disable => cfg
             .create_pool(runtime, tokio_postgres::NoTls)
             .map_err(|e| LookupError::Connection(format!("create pool: {e}"))),
     }
 }
 
 #[cfg(feature = "postgres-cdc")]
-fn driver_ssl_mode(mode: crate::connector::PostgresSslMode) -> deadpool_postgres::SslMode {
+fn driver_ssl_mode(mode: crate::postgres::SslMode) -> deadpool_postgres::SslMode {
     match mode {
-        crate::connector::PostgresSslMode::Disable => deadpool_postgres::SslMode::Disable,
-        crate::connector::PostgresSslMode::VerifyFull => deadpool_postgres::SslMode::Require,
+        crate::postgres::SslMode::Disable => deadpool_postgres::SslMode::Disable,
+        crate::postgres::SslMode::VerifyFull => deadpool_postgres::SslMode::Require,
     }
 }
 
 /// Whether the configuration requests verified TLS. It is secure by default;
 /// plaintext requires an explicit opt-out.
 #[cfg(feature = "postgres-cdc")]
-fn ssl_mode(
-    props: &HashMap<String, String>,
-) -> Result<crate::connector::PostgresSslMode, LookupError> {
+fn ssl_mode(props: &HashMap<String, String>) -> Result<crate::postgres::SslMode, LookupError> {
     if props.contains_key("sslmode") {
         return Err(LookupError::Connection(
             "postgres lookup uses ssl.mode (disable or verify-full), not sslmode".into(),
@@ -725,23 +723,20 @@ fn ssl_mode(
             "postgres lookup ssl.ca.cert.path must not be empty".into(),
         ));
     }
-    let Some(mode) = props.get("ssl.mode") else {
-        return Ok(crate::connector::PostgresSslMode::VerifyFull);
+    let mode = match props.get("ssl.mode") {
+        Some(value) => value.parse::<crate::postgres::SslMode>().map_err(|_| {
+            LookupError::Connection(format!(
+                "unsupported ssl.mode '{value}' (use disable or verify-full)"
+            ))
+        })?,
+        None => crate::postgres::SslMode::default(),
     };
-    match mode.to_ascii_lowercase().as_str() {
-        "disable" => {
-            if props.contains_key("ssl.ca.cert.path") {
-                return Err(LookupError::Connection(
-                    "postgres lookup ssl.ca.cert.path requires ssl.mode=verify-full".into(),
-                ));
-            }
-            Ok(crate::connector::PostgresSslMode::Disable)
-        }
-        "verify-full" => Ok(crate::connector::PostgresSslMode::VerifyFull),
-        other => Err(LookupError::Connection(format!(
-            "unsupported ssl.mode '{other}' (use disable or verify-full)"
-        ))),
+    if mode == crate::postgres::SslMode::Disable && props.contains_key("ssl.ca.cert.path") {
+        return Err(LookupError::Connection(
+            "postgres lookup ssl.ca.cert.path requires ssl.mode=verify-full".into(),
+        ));
     }
+    Ok(mode)
 }
 
 /// Build a server-auth rustls TLS connector. Roots come from `ssl.ca.cert.path`
@@ -752,7 +747,7 @@ fn build_rustls_connector(
     props: &HashMap<String, String>,
 ) -> Result<tokio_postgres_rustls::MakeRustlsConnect, LookupError> {
     let ca_path = props.get("ssl.ca.cert.path").map(std::path::Path::new);
-    crate::postgres_tls::make_rustls_connector(ca_path)
+    crate::postgres::make_rustls_connector(ca_path)
         .map_err(|error| LookupError::Connection(error.to_string()))
 }
 
@@ -1008,22 +1003,22 @@ mod tests {
     fn tls_mode_parsing() {
         assert_eq!(
             ssl_mode(&HashMap::new()).unwrap(),
-            crate::connector::PostgresSslMode::VerifyFull
+            crate::postgres::SslMode::VerifyFull
         );
         assert_eq!(
             ssl_mode(&props(&[("ssl.mode", "disable")])).unwrap(),
-            crate::connector::PostgresSslMode::Disable
+            crate::postgres::SslMode::Disable
         );
         assert_eq!(
             ssl_mode(&props(&[("ssl.mode", "verify-full")])).unwrap(),
-            crate::connector::PostgresSslMode::VerifyFull
+            crate::postgres::SslMode::VerifyFull
         );
         assert_eq!(
-            driver_ssl_mode(crate::connector::PostgresSslMode::VerifyFull),
+            driver_ssl_mode(crate::postgres::SslMode::VerifyFull),
             deadpool_postgres::SslMode::Require
         );
         assert_eq!(
-            driver_ssl_mode(crate::connector::PostgresSslMode::Disable),
+            driver_ssl_mode(crate::postgres::SslMode::Disable),
             deadpool_postgres::SslMode::Disable
         );
         for rejected in ["prefer", "require", "verify-ca", "bogus"] {
