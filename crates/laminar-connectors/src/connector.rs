@@ -557,14 +557,6 @@ pub trait SourceConnector: Send {
     /// polling and barriers are fenced.
     fn drive_control_plane(&mut self) {}
 
-    /// Whether this concrete source instance has engine vnode ownership installed.
-    ///
-    /// The runtime uses this internal seam to allocate drain controls only for clustered,
-    /// partitioned instances. Embedded and single-node sources retain the allocation-free path.
-    fn vnode_drain_enabled(&self) -> bool {
-        false
-    }
-
     /// Start an exact partition drain without waiting for the reader FIFO to empty.
     ///
     /// Implementations return [`SourceDrainStart::Pending`] and later expose the cut through

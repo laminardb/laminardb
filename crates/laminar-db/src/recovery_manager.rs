@@ -798,6 +798,10 @@ impl<'a> RecoveryManager<'a> {
                         ConnectorCheckpoint {
                             offsets: offsets.clone().into_iter().collect(),
                             metadata: metadata.clone().into_iter().collect(),
+                            source_assignment_version: capsule
+                                .source_assignment_versions
+                                .get(source)
+                                .copied(),
                         },
                     )
                 })
@@ -1847,6 +1851,15 @@ mod tests {
                 )
             })
             .collect();
+        let source_assignment_versions = manifest
+            .source_offsets
+            .iter()
+            .filter_map(|(source, checkpoint)| {
+                checkpoint
+                    .source_assignment_version
+                    .map(|version| (source.clone(), version))
+            })
+            .collect();
         let source_watermarks = manifest
             .source_watermarks
             .iter()
@@ -1875,6 +1888,7 @@ mod tests {
             participants,
             source_offsets,
             source_metadata,
+            source_assignment_versions,
             source_watermarks,
             cluster_watermark: manifest.watermark.map_or(
                 laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
@@ -1941,6 +1955,15 @@ mod tests {
                 )
             })
             .collect();
+        let source_assignment_versions = source_manifest
+            .source_offsets
+            .iter()
+            .filter_map(|(source, checkpoint)| {
+                checkpoint
+                    .source_assignment_version
+                    .map(|version| (source.clone(), version))
+            })
+            .collect();
         let source_watermarks = source_manifest
             .source_watermarks
             .iter()
@@ -1957,6 +1980,7 @@ mod tests {
             participants,
             source_offsets,
             source_metadata,
+            source_assignment_versions,
             source_watermarks,
             cluster_watermark: source_manifest.watermark.map_or(
                 laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
@@ -3030,6 +3054,7 @@ mod tests {
             ConnectorCheckpoint {
                 offsets: HashMap::from([("partition:0".into(), "41".into())]),
                 metadata: HashMap::from([("topic".into(), "events".into())]),
+                source_assignment_version: std::num::NonZeroU64::new(4),
             },
         );
         manifest.source_names.push("events".into());

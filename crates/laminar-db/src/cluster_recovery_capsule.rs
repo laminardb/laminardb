@@ -16,8 +16,8 @@ use laminar_core::storage::checkpoint_manifest::{
 
 use crate::error::DbError;
 
-pub(crate) const PARTICIPANT_READY_VERSION: u16 = 4;
-pub(crate) const PARTICIPANT_READY_PREFIX: &str = "participant-ready/v4/participant=";
+pub(crate) const PARTICIPANT_READY_VERSION: u16 = 5;
+pub(crate) const PARTICIPANT_READY_PREFIX: &str = "participant-ready/v5/participant=";
 pub(crate) const MAX_PARTICIPANT_READY_AGGREGATE_BYTES: u64 = MAX_RECOVERY_CAPSULE_BYTES as u64;
 pub(crate) const MAX_PARTICIPANT_READY_READ_CONCURRENCY: usize = 8;
 // `buffer_unordered` may retain every in-flight body until the aggregate loop is polled.
@@ -60,6 +60,7 @@ pub(crate) struct ParticipantReady {
     pub(crate) owned_vnodes: Vec<u32>,
     pub(crate) source_offsets: BTreeMap<String, BTreeMap<String, String>>,
     pub(crate) source_metadata: BTreeMap<String, BTreeMap<String, String>>,
+    pub(crate) source_assignment_versions: BTreeMap<String, std::num::NonZeroU64>,
     pub(crate) source_watermarks: BTreeMap<String, i64>,
     pub(crate) local_watermark: CheckpointWatermark,
     pub(crate) manifest_sha256: String,
@@ -147,6 +148,28 @@ fn merge_source_map(
     Ok(())
 }
 
+fn merge_source_assignment_versions(
+    target: &mut BTreeMap<String, std::num::NonZeroU64>,
+    incoming: BTreeMap<String, std::num::NonZeroU64>,
+    attempt: CheckpointAttempt,
+) -> Result<(), DbError> {
+    for (source, version) in incoming {
+        match target.get(&source) {
+            None => {
+                target.insert(source, version);
+            }
+            Some(existing) if *existing == version => {}
+            Some(existing) => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] participants disagree on source '{source}' assignment version at checkpoint {} epoch {}: {existing} vs {version}",
+                    attempt.checkpoint_id, attempt.epoch
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Assemble one compact global image from the readiness records admitted by an exact seal.
 pub(crate) fn assemble_capsule(
     inventory: &CheckpointSealInventory,
@@ -211,6 +234,8 @@ pub(crate) fn assemble_capsule(
     let mut observed_owners = BTreeMap::new();
     let mut source_offsets = BTreeMap::new();
     let mut source_metadata = BTreeMap::new();
+    let mut source_assignment_versions = BTreeMap::new();
+    let mut source_assignment_presence = BTreeMap::<String, bool>::new();
     let mut source_watermarks = BTreeMap::<String, i64>::new();
     let mut participant_watermark = None;
     let mut participants = Vec::with_capacity(readiness.len());
@@ -239,6 +264,14 @@ pub(crate) fn assemble_capsule(
             || ready.pipeline_identity != *expected_identity
             || canonical_vnodes != ready.owned_vnodes
             || ready.source_offsets.keys().ne(ready.source_metadata.keys())
+            || ready
+                .source_assignment_versions
+                .keys()
+                .any(|source| !ready.source_offsets.contains_key(source))
+            || ready
+                .source_assignment_versions
+                .values()
+                .any(|version| version.get() != fence.assignment_version)
             || !observed_participants.insert(ready.participant_id)
         {
             return Err(DbError::Checkpoint(format!(
@@ -255,6 +288,21 @@ pub(crate) fn assemble_capsule(
                 "[LDB-6041] participant {} readiness contains a reserved or invalid watermark",
                 ready.participant_id
             )));
+        }
+        for source in ready.source_offsets.keys() {
+            let assignment_bound = ready.source_assignment_versions.contains_key(source);
+            match source_assignment_presence.get(source) {
+                None => {
+                    source_assignment_presence.insert(source.clone(), assignment_bound);
+                }
+                Some(expected) if *expected == assignment_bound => {}
+                Some(_) => {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6041] participants disagree on whether source '{source}' is assignment-bound at checkpoint {} epoch {}",
+                        attempt.checkpoint_id, attempt.epoch
+                    )));
+                }
+            }
         }
         for vnode in ready.owned_vnodes {
             if vnode >= fence.vnode_count {
@@ -280,6 +328,11 @@ pub(crate) fn assemble_capsule(
             &mut source_metadata,
             ready.source_metadata,
             "handoff metadata",
+            attempt,
+        )?;
+        merge_source_assignment_versions(
+            &mut source_assignment_versions,
+            ready.source_assignment_versions,
             attempt,
         )?;
         for (source, watermark) in ready.source_watermarks {
@@ -388,6 +441,7 @@ pub(crate) fn assemble_capsule(
         participants,
         source_offsets,
         source_metadata,
+        source_assignment_versions,
         source_watermarks,
         cluster_watermark,
         recovery_watermark_frontier,
@@ -443,6 +497,33 @@ mod tests {
         assert_eq!(retained, MAX_PARTICIPANT_READY_AGGREGATE_BYTES);
     }
 
+    #[test]
+    fn source_assignment_versions_merge_only_one_generation() {
+        let attempt = CheckpointAttempt::new(3, 4);
+        let mut merged = BTreeMap::new();
+        let version = std::num::NonZeroU64::new(7).unwrap();
+        merge_source_assignment_versions(
+            &mut merged,
+            BTreeMap::from([("events".into(), version)]),
+            attempt,
+        )
+        .unwrap();
+        merge_source_assignment_versions(
+            &mut merged,
+            BTreeMap::from([("events".into(), version)]),
+            attempt,
+        )
+        .unwrap();
+
+        let error = merge_source_assignment_versions(
+            &mut merged,
+            BTreeMap::from([("events".into(), std::num::NonZeroU64::new(8).unwrap())]),
+            attempt,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("7 vs 8"), "{error}");
+    }
+
     fn fence() -> CheckpointAssignmentFence {
         CheckpointAssignmentFence::from_owner_map(
             7,
@@ -477,6 +558,7 @@ mod tests {
             owned_vnodes,
             source_offsets: BTreeMap::new(),
             source_metadata: BTreeMap::new(),
+            source_assignment_versions: BTreeMap::new(),
             source_watermarks: BTreeMap::new(),
             local_watermark: CheckpointWatermark::Uninitialized,
             manifest_sha256: format!("{participant_id:064x}"),
@@ -495,18 +577,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn assembly_rejects_forged_vnode_owner() {
+    async fn sealed_inventory(
+        attempt: CheckpointAttempt,
+        fence: &CheckpointAssignmentFence,
+        vnode_writers: [(u32, u64); 2],
+    ) -> CheckpointSealInventory {
         let backend = InProcessBackend::new(2);
-        let attempt = CheckpointAttempt::new(3, 30);
-        let fence = fence();
-        // Node 2 forges vnode 0 even though the certified owner map assigns it to node 1.
-        for (vnode, writer) in [(0, 2), (1, 2)] {
+        for (vnode, writer) in vnode_writers {
             backend
                 .write_certified_partial(
                     attempt,
                     vnode,
-                    &fence,
+                    fence,
                     writer,
                     Bytes::from_static(b"state"),
                 )
@@ -514,13 +596,13 @@ mod tests {
                 .unwrap();
         }
         let keys = [participant_ready_key(1), participant_ready_key(2)];
-        let proof = leader_proof(&fence);
+        let proof = leader_proof(fence);
         for (participant_id, key) in [1, 2].into_iter().zip(&keys) {
             backend
                 .write_certified_commit_descriptor(
                     attempt,
                     key,
-                    &fence,
+                    fence,
                     participant_id,
                     &proof,
                     Bytes::from_static(b"ready"),
@@ -529,14 +611,78 @@ mod tests {
                 .unwrap();
         }
         assert!(backend
-            .seal_checkpoint(attempt, Some(&fence), &[0, 1], &keys)
+            .seal_checkpoint(attempt, Some(fence), &[0, 1], &keys)
             .await
             .unwrap());
-        let inventory = backend
+        backend
             .checkpoint_seal_inventory(attempt)
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn assembly_rejects_mixed_source_assignment_presence() {
+        let attempt = CheckpointAttempt::new(3, 30);
+        let fence = fence();
+        let inventory = sealed_inventory(attempt, &fence, [(0, 1), (1, 2)]).await;
+        let version = std::num::NonZeroU64::new(fence.assignment_version).unwrap();
+
+        for stamped_participant in [1, 2] {
+            let readiness = [1_u64, 2]
+                .into_iter()
+                .map(|participant_id| {
+                    let mut ready = ready(
+                        attempt,
+                        &fence,
+                        participant_id,
+                        vec![u32::try_from(participant_id - 1).unwrap()],
+                    );
+                    ready.source_offsets.insert(
+                        "events".into(),
+                        BTreeMap::from([(
+                            format!("partition:{}", participant_id - 1),
+                            "41".into(),
+                        )]),
+                    );
+                    ready.source_metadata.insert(
+                        "events".into(),
+                        BTreeMap::from([("connector".into(), "partitioned".into())]),
+                    );
+                    if participant_id == stamped_participant {
+                        ready
+                            .source_assignment_versions
+                            .insert("events".into(), version);
+                    }
+                    (participant_ready_key(participant_id), ready)
+                })
+                .collect();
+
+            let error = assemble_capsule(
+                &inventory,
+                readiness,
+                "deployment",
+                &PipelineIdentity::empty(),
+                CheckpointWatermark::Uninitialized,
+                None,
+            )
+            .expect_err("one participant cannot lend its assignment binding to another");
+            assert!(
+                error.to_string().contains(
+                    "participants disagree on whether source 'events' is assignment-bound"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assembly_rejects_forged_vnode_owner() {
+        let attempt = CheckpointAttempt::new(3, 30);
+        let fence = fence();
+        // Node 2 forges vnode 0 even though the certified owner map assigns it to node 1.
+        let inventory = sealed_inventory(attempt, &fence, [(0, 2), (1, 2)]).await;
+        let keys = [participant_ready_key(1), participant_ready_key(2)];
         let readiness = vec![
             (keys[0].clone(), ready(attempt, &fence, 1, vec![0])),
             (keys[1].clone(), ready(attempt, &fence, 2, vec![1])),

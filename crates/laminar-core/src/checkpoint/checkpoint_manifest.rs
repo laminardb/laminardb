@@ -17,9 +17,8 @@ pub const DEFAULT_VNODE_COUNT: u16 = 256;
 
 /// Current checkpoint manifest format. Older manifests are rejected rather
 /// than guessed at recovery time.
-/// Version 3 removes the obsolete inline sink-commit ledger; the exact durable
-/// checkpoint decision is the sole exactly-once commit authority.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 4;
+/// Version 5 adds a typed, provider-neutral source-assignment cut.
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 5;
 
 /// Canonical pipeline-identity payload version.
 pub const PIPELINE_IDENTITY_VERSION: u16 = 2;
@@ -312,6 +311,11 @@ pub struct ConnectorCheckpoint {
     pub offsets: HashMap<String, String>,
     /// Optional metadata (connector type, topic name, etc.).
     pub metadata: HashMap<String, String>,
+    /// Provider-neutral source-assignment version that owns this offset cut.
+    ///
+    /// `None` is valid for sources that do not participate in partition assignment. Cluster
+    /// recovery validates populated versions against the checkpoint assignment fence.
+    pub source_assignment_version: Option<std::num::NonZeroU64>,
 }
 
 impl ConnectorCheckpoint {
@@ -327,6 +331,7 @@ impl ConnectorCheckpoint {
         Self {
             offsets,
             metadata: HashMap::new(),
+            source_assignment_version: None,
         }
     }
 }
@@ -489,13 +494,13 @@ mod tests {
     #[test]
     fn test_manifest_json_round_trip() {
         let mut m = CheckpointManifest::new(42, 10);
-        m.source_offsets.insert(
-            "kafka-src".into(),
-            ConnectorCheckpoint::with_offsets(HashMap::from([
-                ("events:0".into(), "1234".into()),
-                ("events:1".into(), "5678".into()),
-            ])),
-        );
+        let mut source_checkpoint = ConnectorCheckpoint::with_offsets(HashMap::from([
+            ("events:0".into(), "1234".into()),
+            ("events:1".into(), "5678".into()),
+        ]));
+        source_checkpoint.source_assignment_version = std::num::NonZeroU64::new(12);
+        m.source_offsets
+            .insert("kafka-src".into(), source_checkpoint);
         m.watermark = Some(999_000);
         m.operator_states
             .insert("window-agg".into(), OperatorCheckpoint::inline(b"hello"));
@@ -508,6 +513,7 @@ mod tests {
         assert_eq!(restored.watermark, Some(999_000));
         let src = restored.source_offsets.get("kafka-src").unwrap();
         assert_eq!(src.offsets.get("events:0"), Some(&"1234".into()));
+        assert_eq!(src.source_assignment_version, std::num::NonZeroU64::new(12));
 
         let op = restored.operator_states.get("window-agg").unwrap();
         assert_eq!(op.decode_inline().unwrap(), b"hello");
@@ -520,10 +526,11 @@ mod tests {
         let restored: CheckpointManifest =
             serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
         let errors = restored.validate(DEFAULT_VNODE_COUNT);
+        let previous = CHECKPOINT_MANIFEST_VERSION - 1;
         assert!(
-            errors
-                .iter()
-                .any(|error| error.message.contains("unsupported manifest version 3")),
+            errors.iter().any(|error| error
+                .message
+                .contains(&format!("unsupported manifest version {previous}"))),
             "{errors:?}"
         );
     }
@@ -533,6 +540,7 @@ mod tests {
         let cp = ConnectorCheckpoint::new();
         assert!(cp.offsets.is_empty());
         assert!(cp.metadata.is_empty());
+        assert_eq!(cp.source_assignment_version, None);
     }
 
     #[test]
@@ -540,6 +548,7 @@ mod tests {
         let offsets = HashMap::from([("lsn".into(), "0/ABCD".into())]);
         let cp = ConnectorCheckpoint::with_offsets(offsets);
         assert_eq!(cp.offsets.get("lsn"), Some(&"0/ABCD".into()));
+        assert_eq!(cp.source_assignment_version, None);
     }
 
     #[test]

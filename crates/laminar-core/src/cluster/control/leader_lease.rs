@@ -2962,6 +2962,7 @@ mod tests {
             }],
             source_offsets: std::collections::BTreeMap::new(),
             source_metadata: std::collections::BTreeMap::new(),
+            source_assignment_versions: std::collections::BTreeMap::new(),
             source_watermarks: std::collections::BTreeMap::new(),
             cluster_watermark: crate::checkpoint::CheckpointWatermark::Uninitialized,
             recovery_watermark_frontier: None,

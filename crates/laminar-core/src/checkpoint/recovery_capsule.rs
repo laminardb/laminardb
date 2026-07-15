@@ -2,7 +2,7 @@
 
 #![allow(clippy::disallowed_types)] // Durable JSON uses ordered maps by contract.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU64};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ use crate::checkpoint::{
 use crate::state::CheckpointAttempt;
 
 /// Current canonical cluster recovery-capsule format.
-pub const CLUSTER_RECOVERY_CAPSULE_VERSION: u32 = 4;
+pub const CLUSTER_RECOVERY_CAPSULE_VERSION: u32 = 5;
 
 /// One participant's event-time position at a checkpoint cut.
 ///
@@ -79,7 +79,7 @@ pub struct SourceHandoffState {
 }
 
 impl SourceHandoffState {
-    /// Complete connector-defined offsets and metadata for this source.
+    /// Complete connector-defined offsets and metadata plus its provider-neutral assignment cut.
     #[must_use]
     pub const fn checkpoint(&self) -> &ConnectorCheckpoint {
         &self.checkpoint
@@ -247,6 +247,11 @@ pub struct ClusterRecoveryCapsule {
     pub source_offsets: BTreeMap<String, BTreeMap<String, String>>,
     /// Complete per-source connector metadata in canonical map order.
     pub source_metadata: BTreeMap<String, BTreeMap<String, String>>,
+    /// Assignment version captured by each partitioned source, in canonical source-name order.
+    ///
+    /// The map may be sparse because runtime topology determines which sources require an
+    /// assignment cut. Every populated version must match `assignment_fence`.
+    pub source_assignment_versions: BTreeMap<String, NonZeroU64>,
     /// Per-source event-time watermarks in canonical map order.
     pub source_watermarks: BTreeMap<String, i64>,
     /// Cluster-wide event-time state at this exact cut.
@@ -330,6 +335,20 @@ impl ClusterRecoveryCapsule {
             );
         }
         validate_source_maps(&self.source_offsets, &self.source_metadata)?;
+        for (source, assignment_version) in &self.source_assignment_versions {
+            validate_name("source assignment version", source)?;
+            if !self.source_offsets.contains_key(source) {
+                return Err(format!(
+                    "recovery capsule source assignment version names unknown source '{source}'"
+                ));
+            }
+            if assignment_version.get() != self.assignment_fence.assignment_version {
+                return Err(format!(
+                    "recovery capsule source assignment version for '{source}' is {}; expected {}",
+                    assignment_version, self.assignment_fence.assignment_version
+                ));
+            }
+        }
         for (source, watermark) in &self.source_watermarks {
             validate_name("source watermark", source)?;
             if !self.source_offsets.contains_key(source) {
@@ -426,6 +445,10 @@ impl TryFrom<&ClusterRecoveryCapsule> for CommittedSourceHandoff {
                             .iter()
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect(),
+                        source_assignment_version: capsule
+                            .source_assignment_versions
+                            .get(source)
+                            .copied(),
                     },
                     watermark_ms: capsule.source_watermarks.get(source).copied(),
                 },
@@ -607,6 +630,10 @@ mod tests {
                 "events".into(),
                 BTreeMap::from([("topic".into(), "events".into())]),
             )]),
+            source_assignment_versions: BTreeMap::from([(
+                "events".into(),
+                NonZeroU64::new(7).unwrap(),
+            )]),
             source_watermarks: BTreeMap::from([("events".into(), 1_000)]),
             cluster_watermark: CheckpointWatermark::Active(900),
             recovery_watermark_frontier: Some(900),
@@ -640,11 +667,11 @@ mod tests {
         valid.validate().unwrap();
 
         let mut previous_version = valid.clone();
-        previous_version.version = 3;
+        previous_version.version = 4;
         assert!(previous_version
             .validate()
             .unwrap_err()
-            .contains("unsupported recovery capsule version 3"));
+            .contains("unsupported recovery capsule version 4"));
 
         let mut reordered = valid.clone();
         reordered.participants.reverse();
@@ -669,6 +696,7 @@ mod tests {
         assert_eq!(json["cluster_watermark"]["state"], "active");
         assert_eq!(json["cluster_watermark"]["watermark_ms"], 900);
         assert_eq!(json["recovery_watermark_frontier"], 900);
+        assert_eq!(json["source_assignment_versions"]["events"], 7);
         assert_eq!(reference.len, u64::try_from(encoded.len()).unwrap());
         assert_eq!(reference.sha256, sha256_hex(&encoded));
         reference.validate().unwrap();
@@ -706,8 +734,47 @@ mod tests {
                 .map(String::as_str),
             Some("events")
         );
+        assert_eq!(
+            events.checkpoint().source_assignment_version,
+            NonZeroU64::new(7)
+        );
         assert_eq!(events.watermark(), Some(1_000));
         assert!(handoff.source("missing").is_none());
+    }
+
+    #[test]
+    fn source_assignment_versions_are_sparse_and_fenced() {
+        let mut sparse = capsule();
+        sparse.source_assignment_versions.clear();
+        sparse.validate().unwrap();
+        let sparse_handoff = CommittedSourceHandoff::try_from(&sparse).unwrap();
+        assert_eq!(
+            sparse_handoff
+                .source("events")
+                .unwrap()
+                .checkpoint()
+                .source_assignment_version,
+            None
+        );
+
+        let mut unknown = capsule();
+        unknown.source_assignment_versions.insert(
+            "missing".into(),
+            NonZeroU64::new(unknown.assignment_fence.assignment_version).unwrap(),
+        );
+        assert!(unknown
+            .validate()
+            .unwrap_err()
+            .contains("unknown source 'missing'"));
+
+        let mut mismatched = capsule();
+        mismatched
+            .source_assignment_versions
+            .insert("events".into(), NonZeroU64::new(8).unwrap());
+        assert!(mismatched
+            .validate()
+            .unwrap_err()
+            .contains("for 'events' is 8; expected 7"));
     }
 
     #[test]

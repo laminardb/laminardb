@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 enum OffsetTree {
@@ -159,6 +160,9 @@ pub struct SourceCheckpoint {
 
     /// Optional metadata for the checkpoint.
     metadata: HashMap<String, String>,
+
+    /// Provider-neutral assignment version that owns this source cut.
+    assignment_version: Option<NonZeroU64>,
 }
 
 impl Clone for SourceCheckpoint {
@@ -168,6 +172,7 @@ impl Clone for SourceCheckpoint {
             persistent_offsets: self.persistent_offsets.clone(),
             materialized_offsets: Arc::clone(&self.materialized_offsets),
             metadata: self.metadata.clone(),
+            assignment_version: self.assignment_version,
         }
     }
 }
@@ -179,6 +184,7 @@ impl Default for SourceCheckpoint {
             persistent_offsets: HashMap::new(),
             materialized_offsets: Arc::new(OnceLock::new()),
             metadata: HashMap::new(),
+            assignment_version: None,
         }
     }
 }
@@ -192,13 +198,16 @@ impl fmt::Debug for SourceCheckpoint {
                 &self.persistent_offsets.keys().collect::<Vec<_>>(),
             )
             .field("metadata", &self.metadata)
+            .field("assignment_version", &self.assignment_version)
             .finish_non_exhaustive()
     }
 }
 
 impl PartialEq for SourceCheckpoint {
     fn eq(&self, other: &Self) -> bool {
-        self.offsets() == other.offsets() && self.metadata == other.metadata
+        self.offsets() == other.offsets()
+            && self.metadata == other.metadata
+            && self.assignment_version == other.assignment_version
     }
 }
 
@@ -219,6 +228,7 @@ impl SourceCheckpoint {
             persistent_offsets: HashMap::new(),
             materialized_offsets: Arc::new(OnceLock::new()),
             metadata: HashMap::new(),
+            assignment_version: None,
         }
     }
 
@@ -308,6 +318,17 @@ impl SourceCheckpoint {
         &self.metadata
     }
 
+    /// Binds this source cut to the exact partition-assignment publication that owns it.
+    pub fn bind_assignment_version(&mut self, assignment_version: NonZeroU64) {
+        self.assignment_version = Some(assignment_version);
+    }
+
+    /// Returns the partition-assignment publication that owns this source cut.
+    #[must_use]
+    pub const fn assignment_version(&self) -> Option<NonZeroU64> {
+        self.assignment_version
+    }
+
     /// Returns `true` if the checkpoint has no offsets.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -357,6 +378,22 @@ mod tests {
 
         assert_eq!(cp.get_metadata("connector"), Some("kafka"));
         assert_eq!(cp.get_metadata("topic"), Some("events"));
+    }
+
+    #[test]
+    fn source_checkpoint_assignment_version_is_typed_and_part_of_identity() {
+        let mut checkpoint = SourceCheckpoint::new();
+        assert_eq!(checkpoint.assignment_version(), None);
+
+        let version = NonZeroU64::new(7).unwrap();
+        checkpoint.bind_assignment_version(version);
+        assert_eq!(checkpoint.assignment_version(), Some(version));
+        assert_eq!(checkpoint.clone(), checkpoint);
+        assert!(format!("{checkpoint:?}").contains("assignment_version: Some(7)"));
+
+        let unbound = SourceCheckpoint::new();
+        assert_ne!(checkpoint, unbound);
+        assert_eq!(SourceCheckpoint::default().assignment_version(), None);
     }
 
     #[test]

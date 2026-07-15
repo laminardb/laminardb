@@ -283,6 +283,10 @@ pub struct SourceRegistration {
     pub config: ConnectorConfig,
     /// Durability and placement semantics resolved from the connector configuration.
     pub contract: SourceContract,
+    /// The runtime installed cluster vnode ownership for this source instance.
+    ///
+    /// This is an engine-owned admission fact, not a connector capability switch.
+    pub assignment_scoped: bool,
     /// Exact position to install atomically when the source starts.
     pub position: SourcePosition,
 }

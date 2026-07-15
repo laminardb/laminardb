@@ -205,7 +205,14 @@ fn admit_source_contract(
     if runtime == RuntimeMode::Cluster {
         match contract.topology {
             SourceTopology::Splittable => {}
-            SourceTopology::NodeLocalIngress if delivery == DeliveryGuarantee::BestEffort => {}
+            SourceTopology::NodeLocalIngress
+                if delivery == DeliveryGuarantee::BestEffort
+                    && contract.consistency == SourceConsistency::Ephemeral => {}
+            SourceTopology::NodeLocalIngress if delivery == DeliveryGuarantee::BestEffort => {
+                return Err(
+                    "cluster node-local ingress must be ephemeral because node-local recovery cursors cannot form one global replay cut",
+                );
+            }
             SourceTopology::NodeLocalIngress => {
                 return Err(
                     "cluster node-local ingress is supported only with best-effort delivery",
@@ -220,6 +227,32 @@ fn admit_source_contract(
     }
 
     Ok(())
+}
+
+fn validate_source_recovery_assignment(
+    source: &str,
+    assignment_scoped: bool,
+    checkpoint: Option<&laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint>,
+    expected_assignment: Option<std::num::NonZeroU64>,
+) -> Result<(), DbError> {
+    let captured = checkpoint.and_then(|checkpoint| checkpoint.source_assignment_version);
+    match (assignment_scoped, expected_assignment, captured) {
+        (true, None, _) => Err(DbError::Checkpoint(format!(
+            "[LDB-6055] cluster-assigned source '{source}' recovery has no authoritative assignment fence"
+        ))),
+        (true, Some(_), None) => Err(DbError::Checkpoint(format!(
+            "[LDB-6055] cluster-assigned source '{source}' recovery checkpoint is missing its assignment version"
+        ))),
+        (true, Some(expected), Some(captured)) if captured != expected => {
+            Err(DbError::Checkpoint(format!(
+                "[LDB-6055] source '{source}' recovery checkpoint captured assignment version {captured}, committed fence is {expected}"
+            )))
+        }
+        (false, _, Some(captured)) => Err(DbError::Checkpoint(format!(
+            "[LDB-6055] non-assigned source '{source}' recovery checkpoint unexpectedly carries assignment version {captured}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Validate sink durability, placement, and changelog semantics before I/O.
@@ -2383,10 +2416,11 @@ impl LaminarDB {
                     self.config.delivery_guarantee
                 ))
             })?;
+            let assignment_scoped = cfg!(feature = "cluster")
+                && runtime_mode == RuntimeMode::Cluster
+                && contract.topology == SourceTopology::Splittable;
             #[cfg(feature = "cluster")]
-            if runtime_mode == RuntimeMode::Cluster
-                && contract.topology == SourceTopology::Splittable
-            {
+            if assignment_scoped {
                 let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
                     DbError::Config(format!("cluster source '{name}' has no vnode registry"))
                 })?;
@@ -2423,6 +2457,7 @@ impl LaminarDB {
                 connector: source,
                 config,
                 contract,
+                assignment_scoped,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             });
         }
@@ -2462,6 +2497,7 @@ impl LaminarDB {
                     connector: Box::new(connector),
                     config,
                     contract,
+                    assignment_scoped: false,
                     position: laminar_connectors::connector::SourcePosition::Initial,
                 });
             }
@@ -2500,6 +2536,7 @@ impl LaminarDB {
                     connector: Box::new(connector),
                     config,
                     contract,
+                    assignment_scoped: false,
                     position: laminar_connectors::connector::SourcePosition::Initial,
                 });
             }
@@ -2676,6 +2713,12 @@ impl LaminarDB {
         let (coordinated_committer, committer_poll, committer_notify) = {
             let mut guard = self.coordinator.lock().await;
             if let Some(coord) = guard.as_mut() {
+                coord.set_assignment_scoped_sources(
+                    sources
+                        .iter()
+                        .filter(|source| source.assignment_scoped)
+                        .map(|source| source.name.clone()),
+                );
                 for (name, handle, _, _, _) in &sinks {
                     coord.register_sink(name.clone(), handle.clone());
                 }
@@ -2761,6 +2804,39 @@ impl LaminarDB {
                 }
                 match recovery {
                     Ok(Some(recovered)) => {
+                        #[cfg(feature = "cluster")]
+                        let recovered_assignment = if runtime_mode == RuntimeMode::Cluster {
+                            let capsule = recovered.cluster_capsule().ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "[LDB-6041] cluster recovery selected checkpoint {} without its recovery capsule",
+                                    recovered.manifest.checkpoint_id
+                                ))
+                            })?;
+                            Some(
+                                std::num::NonZeroU64::new(
+                                    capsule.assignment_fence.assignment_version,
+                                )
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(
+                                        "[LDB-6055] recovered cluster assignment fence is zero"
+                                            .into(),
+                                    )
+                                })?,
+                            )
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "cluster"))]
+                        let recovered_assignment = None;
+                        for source in &sources {
+                            validate_source_recovery_assignment(
+                                &source.name,
+                                source.assignment_scoped,
+                                recovered.manifest.source_offsets.get(&source.name),
+                                recovered_assignment,
+                            )?;
+                        }
+
                         source_watermark_recovery_selected = true;
                         recovered_watermark_frontier = recovered.manifest.watermark;
                         #[cfg(feature = "cluster")]
@@ -4045,7 +4121,8 @@ mod connector_admission_tests {
     use super::LaminarDB;
     use super::{
         admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
-        open_prepared_sinks, PreparedSink, RuntimeMode, SinkAdmissionContext, EXACT_SINK_PROTOCOL,
+        open_prepared_sinks, validate_source_recovery_assignment, PreparedSink, RuntimeMode,
+        SinkAdmissionContext, EXACT_SINK_PROTOCOL,
     };
     use crate::db::DbState;
     use crate::pipeline::PipelineConfig;
@@ -4060,6 +4137,7 @@ mod connector_admission_tests {
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::state::StateBackendDurability;
+    use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4074,6 +4152,42 @@ mod connector_admission_tests {
         assert_eq!(cluster_delta_chain_bound(4), Some(3));
         assert_eq!(cluster_delta_chain_bound(5), Some(4));
         assert_eq!(cluster_delta_chain_bound(usize::MAX), Some(4));
+    }
+
+    #[test]
+    fn recovered_source_assignment_scope_fails_closed() {
+        let expected = std::num::NonZeroU64::new(7).unwrap();
+        let mut checkpoint = ConnectorCheckpoint::new();
+
+        let error =
+            validate_source_recovery_assignment("events", true, Some(&checkpoint), Some(expected))
+                .unwrap_err();
+        assert!(error.to_string().contains("missing its assignment version"));
+
+        checkpoint.source_assignment_version = std::num::NonZeroU64::new(6);
+        let error =
+            validate_source_recovery_assignment("events", true, Some(&checkpoint), Some(expected))
+                .unwrap_err();
+        assert!(error.to_string().contains("committed fence is 7"));
+
+        checkpoint.source_assignment_version = Some(expected);
+        validate_source_recovery_assignment("events", true, Some(&checkpoint), Some(expected))
+            .unwrap();
+
+        let error = validate_source_recovery_assignment("events", true, Some(&checkpoint), None)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no authoritative assignment fence"));
+
+        let error = validate_source_recovery_assignment("local", false, Some(&checkpoint), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("non-assigned source 'local'"));
+
+        checkpoint.source_assignment_version = None;
+        validate_source_recovery_assignment("local", false, Some(&checkpoint), None).unwrap();
+        validate_source_recovery_assignment("local", false, Some(&checkpoint), Some(expected))
+            .unwrap();
     }
 
     #[test]
@@ -4310,7 +4424,8 @@ mod connector_admission_tests {
                                     && (runtime != RuntimeMode::Cluster
                                         || topology == SourceTopology::Splittable
                                         || (topology == SourceTopology::NodeLocalIngress
-                                            && delivery == DeliveryGuarantee::BestEffort));
+                                            && delivery == DeliveryGuarantee::BestEffort
+                                            && consistency == SourceConsistency::Ephemeral));
 
                                 assert_eq!(
                                     admit_source_contract(
@@ -4345,6 +4460,22 @@ mod connector_admission_tests {
         )
         .unwrap_err();
         assert!(error.contains("fenced singleton placement"));
+    }
+
+    #[test]
+    fn cluster_node_local_replay_cursor_is_rejected() {
+        let contract = SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::NodeLocalIngress,
+        );
+        let error = admit_source_contract(
+            contract,
+            DeliveryGuarantee::BestEffort,
+            true,
+            RuntimeMode::Cluster,
+        )
+        .unwrap_err();
+        assert!(error.contains("must be ephemeral"), "{error}");
     }
 
     #[test]

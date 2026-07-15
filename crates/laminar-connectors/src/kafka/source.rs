@@ -11,6 +11,7 @@ use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -127,7 +128,6 @@ struct KafkaSourceDrain {
 
 const KAFKA_BACKGROUND_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 const KAFKA_PARTITION_INVENTORY_METADATA: &str = "kafka.partition.inventory.v1";
-const KAFKA_ASSIGNMENT_VERSION_METADATA: &str = "kafka.assignment.version.v1";
 const KAFKA_POSITION_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const KAFKA_POSITION_LOOKUP_CONCURRENCY: usize = 32;
 
@@ -413,28 +413,20 @@ fn decode_committed_kafka_handoff(
         ))
     })?;
     let checkpoint = source_state.checkpoint();
-    let assignment_text = checkpoint
-        .metadata
-        .get(KAFKA_ASSIGNMENT_VERSION_METADATA)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "Kafka source '{source}' handoff is missing assignment version metadata"
-            ))
-        })?;
-    let assignment_version = assignment_text.parse::<u64>().map_err(|_| {
+    let assignment_version = checkpoint.source_assignment_version.ok_or_else(|| {
         ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff has invalid assignment version '{assignment_text}'"
+            "Kafka source '{source}' handoff is missing its source assignment version"
         ))
     })?;
-    if assignment_version == 0 || assignment_version.to_string() != *assignment_text {
+    let checkpoint_assignment_version = NonZeroU64::new(handoff.checkpoint_assignment_version())
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "Kafka source '{source}' handoff has a zero checkpoint assignment version"
+            ))
+        })?;
+    if assignment_version != checkpoint_assignment_version {
         return Err(ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff assignment version must be a canonical positive integer"
-        )));
-    }
-    if assignment_version != handoff.checkpoint_assignment_version() {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff assignment version {assignment_version} does not match checkpoint fence {}",
-            handoff.checkpoint_assignment_version()
+            "Kafka source '{source}' handoff assignment version {assignment_version} does not match checkpoint fence {checkpoint_assignment_version}",
         )));
     }
 
@@ -1904,10 +1896,12 @@ impl KafkaSource {
         let mut checkpoint = self.offsets.to_checkpoint_filtered(&offset_owned);
         attach_partition_baselines(&mut checkpoint, &self.manual_partition_baselines, &owned);
         attach_rotation_baselines(&mut checkpoint, &rotation.baselines, &owned);
-        checkpoint.set_metadata(
-            KAFKA_ASSIGNMENT_VERSION_METADATA,
-            published.version().to_string(),
-        );
+        let assignment_version =
+            NonZeroU64::new(published.version()).ok_or_else(|| ConnectorError::InvalidState {
+                expected: "a positive vnode assignment version".into(),
+                actual: published.version().to_string(),
+            })?;
+        checkpoint.bind_assignment_version(assignment_version);
         Ok(checkpoint)
     }
 
@@ -2645,10 +2639,6 @@ impl SourceConnector for KafkaSource {
         self.source_name = Arc::from(source_identity);
         self.vnode_assignment = Some((registry, self_id));
         Ok(())
-    }
-
-    fn vnode_drain_enabled(&self) -> bool {
-        self.vnode_assignment.is_some()
     }
 
     fn begin_drain(
@@ -4201,13 +4191,21 @@ mod tests {
     fn committed_kafka_handoff(
         source_name: &str,
         checkpoint_assignment_version: u64,
-        metadata: BTreeMap<String, String>,
-    ) -> CommittedSourceHandoff {
+        source_assignment_version: Option<NonZeroU64>,
+        connector: Option<&str>,
+    ) -> Result<CommittedSourceHandoff, String> {
         let participant = CheckpointParticipant {
             node_id: 1,
             boot_incarnation: uuid::Uuid::from_u128(1),
         };
         let digest = |byte: u8| format!("{byte:02x}").repeat(32);
+        let source_assignment_versions = source_assignment_version
+            .map_or_else(BTreeMap::new, |version| {
+                BTreeMap::from([(source_name.to_string(), version)])
+            });
+        let metadata = connector.map_or_else(BTreeMap::new, |connector| {
+            BTreeMap::from([("connector".into(), connector.into())])
+        });
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
             attempt: CheckpointAttempt::new(3, 9),
@@ -4237,22 +4235,13 @@ mod tests {
                 ]),
             )]),
             source_metadata: BTreeMap::from([(source_name.to_string(), metadata)]),
+            source_assignment_versions,
             source_watermarks: BTreeMap::from([(source_name.to_string(), 1_000)]),
             cluster_watermark: CheckpointWatermark::Active(900),
             recovery_watermark_frontier: Some(900),
             portable_state_sha256: digest(5),
         };
-        CommittedSourceHandoff::try_from(&capsule).unwrap()
-    }
-
-    fn kafka_handoff_metadata(assignment_version: &str) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("connector".into(), "kafka".into()),
-            (
-                KAFKA_ASSIGNMENT_VERSION_METADATA.into(),
-                assignment_version.into(),
-            ),
-        ])
+        CommittedSourceHandoff::try_from(&capsule)
     }
 
     fn drain_request(vnodes: &[u32]) -> SourceDrainRequest {
@@ -4375,7 +4364,8 @@ mod tests {
 
     #[test]
     fn committed_handoff_preserves_kafka_identity_assignment_and_baseline() {
-        let handoff = committed_kafka_handoff("orders", 7, kafka_handoff_metadata("7"));
+        let handoff =
+            committed_kafka_handoff("orders", 7, NonZeroU64::new(7), Some("kafka")).unwrap();
         let (offsets, baselines) = decode_committed_kafka_handoff(&handoff, "orders").unwrap();
 
         assert_eq!(offsets.get("events", 0), Some(41));
@@ -4385,20 +4375,20 @@ mod tests {
     }
 
     #[test]
-    fn committed_kafka_handoff_rejects_unbound_metadata() {
-        for metadata in [
-            BTreeMap::from([(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "7".into())]),
-            BTreeMap::from([
-                ("connector".into(), "postgres-cdc".into()),
-                (KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "7".into()),
-            ]),
-            BTreeMap::from([("connector".into(), "kafka".into())]),
-            kafka_handoff_metadata("07"),
-            kafka_handoff_metadata("8"),
-        ] {
-            let handoff = committed_kafka_handoff("orders", 7, metadata);
+    fn committed_kafka_handoff_rejects_missing_or_mismatched_binding() {
+        for (source_assignment_version, connector) in
+            [(None, Some("kafka")), (NonZeroU64::new(7), None)]
+        {
+            let handoff =
+                committed_kafka_handoff("orders", 7, source_assignment_version, connector).unwrap();
             assert!(decode_committed_kafka_handoff(&handoff, "orders").is_err());
         }
+
+        let wrong_connector =
+            committed_kafka_handoff("orders", 7, NonZeroU64::new(7), Some("postgres-cdc")).unwrap();
+        assert!(decode_committed_kafka_handoff(&wrong_connector, "orders").is_err());
+
+        assert!(committed_kafka_handoff("orders", 7, NonZeroU64::new(8), Some("kafka")).is_err());
     }
 
     #[test]
@@ -5174,11 +5164,9 @@ mod tests {
         assert!(source.checkpoint_ready().unwrap());
         assert!(source.try_checkpoint().unwrap().is_some());
 
-        let handoff = Arc::new(committed_kafka_handoff(
-            "events-source",
-            1,
-            kafka_handoff_metadata("1"),
-        ));
+        let handoff = Arc::new(
+            committed_kafka_handoff("events-source", 1, NonZeroU64::new(1), Some("kafka")).unwrap(),
+        );
         registry.set_assignment_and_version_with_source_handoff(registry.snapshot(), 2, handoff);
 
         assert!(
@@ -5200,10 +5188,7 @@ mod tests {
                 baselines: KafkaRotationBaselines::new(),
             });
         let checkpoint = source.try_checkpoint().unwrap().unwrap();
-        assert_eq!(
-            checkpoint.get_metadata(KAFKA_ASSIGNMENT_VERSION_METADATA),
-            Some("2")
-        );
+        assert_eq!(checkpoint.assignment_version(), NonZeroU64::new(2));
     }
 
     #[test]

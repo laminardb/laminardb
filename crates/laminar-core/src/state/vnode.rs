@@ -936,11 +936,19 @@ mod tests {
     ) -> Arc<CommittedSourceHandoff> {
         let mut source_offsets = BTreeMap::new();
         let mut source_metadata = BTreeMap::new();
+        let mut source_assignment_versions = BTreeMap::new();
         let mut source_watermarks = BTreeMap::new();
         if let Some((source, checkpoint, watermark)) = source {
-            let ConnectorCheckpoint { offsets, metadata } = checkpoint;
+            let ConnectorCheckpoint {
+                offsets,
+                metadata,
+                source_assignment_version,
+            } = checkpoint;
             source_offsets.insert(source.to_string(), offsets.into_iter().collect());
             source_metadata.insert(source.to_string(), metadata.into_iter().collect());
+            if let Some(assignment_version) = source_assignment_version {
+                source_assignment_versions.insert(source.to_string(), assignment_version);
+            }
             if let Some(watermark) = watermark {
                 source_watermarks.insert(source.to_string(), watermark);
             }
@@ -973,6 +981,7 @@ mod tests {
             }],
             source_offsets,
             source_metadata,
+            source_assignment_versions,
             source_watermarks,
             cluster_watermark,
             recovery_watermark_frontier: cluster_watermark.active_value(),
@@ -1039,6 +1048,7 @@ mod tests {
         let orders = ConnectorCheckpoint {
             offsets: [("orders:0".into(), "41".into())].into_iter().collect(),
             metadata: [("topic".into(), "orders".into())].into_iter().collect(),
+            source_assignment_version: std::num::NonZeroU64::new(17),
         };
         let version_one_handoff = committed_handoff(
             Some(("orders", orders, Some(700))),
@@ -1071,6 +1081,14 @@ mod tests {
                 .get("topic")
                 .map(String::as_str),
             Some("orders")
+        );
+        assert_eq!(
+            version_one
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .source_assignment_version,
+            std::num::NonZeroU64::new(17)
         );
         assert_eq!(
             version_one.source_handoff("orders").unwrap().watermark(),

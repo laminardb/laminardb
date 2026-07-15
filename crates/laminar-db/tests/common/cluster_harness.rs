@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
 use laminar_connectors::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology,
+    ConnectorDrainCut, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
+    SourceDrainRequest, SourceDrainStart, SourceStart, SourceTopology,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
@@ -39,7 +40,10 @@ const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
 pub const TEST_SOURCE_DDL: &str =
     "CREATE SOURCE src (key BIGINT, value BIGINT) WITH ('connector' = 'cluster-harness-idle')";
 
-struct IdleClusterHarnessSource;
+#[derive(Default)]
+struct IdleClusterHarnessSource {
+    vnode_registry: Option<Arc<VnodeRegistry>>,
+}
 
 #[async_trait]
 impl SourceConnector for IdleClusterHarnessSource {
@@ -62,7 +66,15 @@ impl SourceConnector for IdleClusterHarnessSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        SourceCheckpoint::new()
+        let mut checkpoint = SourceCheckpoint::new();
+        if let Some(version) = self
+            .vnode_registry
+            .as_ref()
+            .and_then(|registry| std::num::NonZeroU64::new(registry.assignment_version()))
+        {
+            checkpoint.bind_assignment_version(version);
+        }
+        checkpoint
     }
 
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
@@ -70,6 +82,23 @@ impl SourceConnector for IdleClusterHarnessSource {
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
         ))
+    }
+
+    fn set_vnode_assignment(
+        &mut self,
+        _source_identity: &str,
+        registry: Arc<VnodeRegistry>,
+        _self_id: NodeId,
+    ) -> Result<(), ConnectorError> {
+        self.vnode_registry = Some(registry);
+        Ok(())
+    }
+
+    fn begin_drain(
+        &mut self,
+        _request: &SourceDrainRequest,
+    ) -> Result<SourceDrainStart, ConnectorError> {
+        Ok(SourceDrainStart::Ready(ConnectorDrainCut::empty()))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -391,7 +420,7 @@ impl ClusterEngineHarness {
                             is_sink: false,
                             config_keys: vec![],
                         },
-                        Arc::new(|_| Box::new(IdleClusterHarnessSource)),
+                        Arc::new(|_| Box::new(IdleClusterHarnessSource::default())),
                     )
                 })
                 // Mirror production: DataFusion partitions track vnode count.
@@ -426,6 +455,9 @@ impl ClusterEngineHarness {
     pub async fn start_all(&mut self) {
         for node in &self.nodes {
             node.db.fence_cluster_startup();
+            node.db
+                .enable_coordinated_recovery()
+                .expect("enable cluster recovery monitor");
         }
         for node in &self.nodes {
             node.db.start().await.expect("db.start()");
@@ -520,19 +552,39 @@ impl ClusterEngineHarness {
         }
 
         let authority_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut intake_open = true;
         for node in &self.nodes {
-            assert!(
-                node.db
-                    .finish_cluster_startup(authority_deadline)
-                    .await
-                    .expect("fresh cluster startup authority activation"),
-                "fresh cluster startup remained fenced on node {}",
-                node.instance_id.0,
-            );
+            intake_open &= node
+                .db
+                .finish_cluster_startup(authority_deadline)
+                .await
+                .expect("cluster startup authority activation");
+        }
+        if !intake_open {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if self
+                        .nodes
+                        .iter()
+                        .zip(&self.cluster.nodes)
+                        .all(|(runtime, cluster_node)| {
+                            !runtime.db.cluster_intake_fenced()
+                                && !cluster_node.controller.is_recovering()
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("coordinated startup recovery must release every node");
+        }
+        for node in &self.nodes {
             assert!(
                 !node.db.cluster_intake_fenced(),
                 "source intake remained fenced on node {}",
-                node.instance_id.0,
+                node.instance_id.0
             );
         }
     }

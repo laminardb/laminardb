@@ -3,7 +3,7 @@
 //! Checkpoint manifest is the source of truth for source offsets; broker commits are advisory.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,6 @@ pub(crate) use crate::cluster_recovery_capsule::{
 };
 use crate::error::DbError;
 
-const KAFKA_ASSIGNMENT_VERSION_METADATA: &str = "kafka.assignment.version.v1";
 const MAX_SINK_PHASE_ONE_CONCURRENCY: usize = 8;
 const MAX_VNODE_PARTIAL_WRITE_CONCURRENCY: usize = 32;
 
@@ -1185,6 +1184,9 @@ pub struct CheckpointCoordinator {
     state_backend: Option<Arc<dyn StateBackend>>,
     // Stamped into every `write_partial` for the split-brain fence; zero = fence disabled.
     assignment_version: u64,
+    // Sources for which the runtime successfully installed cluster vnode ownership. Their
+    // connector cursor must be captured under the same assignment as operator and shuffle state.
+    assignment_scoped_sources: HashSet<String>,
     // Exact admission certificate for the attempt currently owning this serialized coordinator.
     // Terminal announcements retain it even when membership changes during failure cleanup.
     active_assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
@@ -1378,6 +1380,7 @@ impl CheckpointCoordinator {
             total_bytes_written: 0,
             state_backend: None,
             assignment_version: 0,
+            assignment_scoped_sources: HashSet::new(),
             active_assignment_fence: None,
             active_leader_proof: None,
             decision_store: None,
@@ -1891,6 +1894,13 @@ impl CheckpointCoordinator {
         self.assignment_version = version;
     }
 
+    pub(crate) fn set_assignment_scoped_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = String>,
+    ) {
+        self.assignment_scoped_sources = sources.into_iter().collect();
+    }
+
     /// Set the explicit local event-time state included in the checkpoint cut.
     pub fn set_local_watermark(&mut self, watermark: CheckpointWatermark) {
         self.local_watermark = watermark;
@@ -2136,6 +2146,15 @@ impl CheckpointCoordinator {
                 )
             })
             .collect();
+        let source_assignment_versions = manifest
+            .source_offsets
+            .iter()
+            .filter_map(|(source, checkpoint)| {
+                checkpoint
+                    .source_assignment_version
+                    .map(|version| (source.clone(), version))
+            })
+            .collect();
         let source_watermarks = manifest
             .source_watermarks
             .iter()
@@ -2152,6 +2171,7 @@ impl CheckpointCoordinator {
             owned_vnodes,
             source_offsets,
             source_metadata,
+            source_assignment_versions,
             source_watermarks,
             local_watermark: self.local_watermark,
             manifest_sha256,
@@ -2795,34 +2815,62 @@ impl CheckpointCoordinator {
 
     fn validate_source_assignment_cuts(&self, request: &CheckpointRequest) -> Result<(), DbError> {
         if self.assignment_version == 0 {
+            if !self.assignment_scoped_sources.is_empty() {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6055] assignment-scoped sources are configured without an authoritative assignment version"
+                        .into(),
+                ));
+            }
+            if let Some((source, version)) =
+                request
+                    .source_offset_overrides
+                    .iter()
+                    .find_map(|(source, checkpoint)| {
+                        checkpoint
+                            .source_assignment_version
+                            .map(|version| (source, version))
+                    })
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6055] local source '{source}' checkpoint unexpectedly carries cluster assignment version {version}"
+                )));
+            }
             return Ok(());
         }
         let required_assignment = request
             .assignment_fence
             .as_ref()
             .map_or(self.assignment_version, |fence| fence.assignment_version);
-        for (source, checkpoint) in &request.source_offset_overrides {
-            if checkpoint.metadata.get("connector").map(String::as_str) != Some("kafka") {
-                continue;
-            }
-            let encoded = checkpoint
-                .metadata
-                .get(KAFKA_ASSIGNMENT_VERSION_METADATA)
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6055] Kafka source '{source}' checkpoint is missing its assignment-version fence"
-                    ))
-                })?;
-            let captured = encoded.parse::<u64>().map_err(|_| {
+        for source in &self.assignment_scoped_sources {
+            let checkpoint = request.source_offset_overrides.get(source).ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "[LDB-6055] Kafka source '{source}' has invalid assignment-version fence '{encoded}'"
+                    "[LDB-6055] cluster-assigned source '{source}' has no checkpoint at the admitted cut"
                 ))
             })?;
-            if captured.to_string() != *encoded || captured != required_assignment {
+            let captured = checkpoint.source_assignment_version.ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6055] cluster-assigned source '{source}' checkpoint is missing its assignment version"
+                ))
+            })?;
+            if captured.get() != required_assignment {
                 return Err(DbError::Checkpoint(format!(
-                    "[LDB-6055] Kafka source '{source}' captured assignment version {encoded}, coordinator requires {required_assignment}"
+                    "[LDB-6055] source '{source}' captured assignment version {captured}, coordinator requires {required_assignment}"
                 )));
             }
+        }
+        if let Some((source, version)) = request
+            .source_offset_overrides
+            .iter()
+            .filter(|(source, _)| !self.assignment_scoped_sources.contains(*source))
+            .find_map(|(source, checkpoint)| {
+                checkpoint
+                    .source_assignment_version
+                    .map(|version| (source, version))
+            })
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6055] non-assigned source '{source}' checkpoint unexpectedly carries assignment version {version}"
+            )));
         }
         Ok(())
     }
@@ -6365,6 +6413,7 @@ pub(crate) fn source_to_connector_checkpoint(cp: &SourceCheckpoint) -> Connector
     ConnectorCheckpoint {
         offsets: cp.durable_offsets(),
         metadata: cp.metadata().clone(),
+        source_assignment_version: cp.assignment_version(),
     }
 }
 
@@ -6374,6 +6423,9 @@ pub(crate) fn connector_to_source_checkpoint(cp: &ConnectorCheckpoint) -> Source
     let mut source_cp = SourceCheckpoint::with_offsets(cp.offsets.clone());
     for (k, v) in &cp.metadata {
         source_cp.set_metadata(k.clone(), v.clone());
+    }
+    if let Some(version) = cp.source_assignment_version {
+        source_cp.bind_assignment_version(version);
     }
     source_cp
 }

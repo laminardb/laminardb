@@ -23,7 +23,6 @@ use laminar_connectors::connector::{
     ConnectorDrainCut, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution,
     SourceDrainStart,
 };
-#[cfg(any(test, feature = "cluster"))]
 use laminar_connectors::error::ConnectorError;
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::{
@@ -724,6 +723,25 @@ fn warn_external_commit_cap_throttled(known: bool, pending: u64, cap: u64) {
     }
 }
 
+fn try_source_checkpoint(
+    connector: &dyn SourceConnector,
+    assignment_scoped: bool,
+) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+    let checkpoint = connector.try_checkpoint()?;
+    let Some(captured) = checkpoint.as_ref() else {
+        return Ok(None);
+    };
+    match (assignment_scoped, captured.assignment_version()) {
+        (true, None) => Err(ConnectorError::Internal(
+            "cluster-assigned source checkpoint is missing its assignment version".into(),
+        )),
+        (false, Some(version)) => Err(ConnectorError::Internal(format!(
+            "local source checkpoint unexpectedly carries cluster assignment version {version}"
+        ))),
+        _ => Ok(checkpoint),
+    }
+}
+
 /// Apply the newest durable commit notification while no source poll borrows
 /// the connector. Non-best-effort pipelines fault if upstream acknowledgement
 /// fails because silently continuing can exhaust broker retention/headroom.
@@ -1360,11 +1378,12 @@ impl StreamingCoordinator {
             let delivery_guarantee = config.delivery_guarantee;
             let src_name = src.name.clone();
             let recovery_cursor = src.contract.supports_replay();
+            let assignment_scoped = src.assignment_scoped;
             let cancellation_policy = src.connector.cancellation_policy();
             let mut connector = src.connector;
 
             #[cfg(feature = "cluster")]
-            let drain_control = if connector.vnode_drain_enabled() {
+            let drain_control = if assignment_scoped {
                 let (command_tx, _) =
                     tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
                 let (status_tx, _) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
@@ -1547,7 +1566,7 @@ impl StreamingCoordinator {
                     // retry its cursor once reconciliation completes; faulting or dropping here
                     // would turn a normal rotation into either downtime or data loss.
                     if let Some(batch) = pending_batch.take() {
-                        match connector.try_checkpoint() {
+                        match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
                             Ok(Some(checkpoint)) => {
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
@@ -1602,7 +1621,7 @@ impl StreamingCoordinator {
                     // it or polling another batch across the cut.
                     if !drain_flushing {
                         if let Some(barrier) = pending_barrier.take() {
-                            match connector.try_checkpoint() {
+                            match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
                                         source_idx: idx,
@@ -1668,7 +1687,7 @@ impl StreamingCoordinator {
                         if let Some(barrier) =
                             pending_barrier.take().or_else(|| barrier_handle.poll())
                         {
-                            match connector.try_checkpoint() {
+                            match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
                                         source_idx: idx,
@@ -1751,7 +1770,10 @@ impl StreamingCoordinator {
 
                     match poll_result {
                         Ok(Some(batch)) => {
-                            let checkpoint = match connector.try_checkpoint() {
+                            let checkpoint = match try_source_checkpoint(
+                                connector.as_ref(),
+                                assignment_scoped,
+                            ) {
                                 Ok(Some(checkpoint)) => checkpoint,
                                 Ok(None) => {
                                     pending_batch = Some(batch);
@@ -1858,7 +1880,7 @@ impl StreamingCoordinator {
                         if let Some(barrier) =
                             pending_barrier.take().or_else(|| barrier_handle.poll())
                         {
-                            match connector.try_checkpoint() {
+                            match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
                                         source_idx: idx,
@@ -1901,7 +1923,9 @@ impl StreamingCoordinator {
                 // always-ready poll (timeout() polls the future first). Unflushed rows resume
                 // from the committed offset.
                 if let Some(batch) = pending_batch.take() {
-                    if let Ok(Some(checkpoint)) = connector.try_checkpoint() {
+                    if let Ok(Some(checkpoint)) =
+                        try_source_checkpoint(connector.as_ref(), assignment_scoped)
+                    {
                         let _ = task_tx.try_send(SourceMsg::Batch {
                             source_idx: idx,
                             batch: batch.records,
@@ -1928,7 +1952,9 @@ impl StreamingCoordinator {
                     };
                     match poll_result {
                         Some(Ok(Some(batch))) => {
-                            let Ok(Some(checkpoint)) = connector.try_checkpoint() else {
+                            let Ok(Some(checkpoint)) =
+                                try_source_checkpoint(connector.as_ref(), assignment_scoped)
+                            else {
                                 break;
                             };
                             let msg = SourceMsg::Batch {
@@ -5581,6 +5607,7 @@ mod tests {
     struct BarrierRetrySourceState {
         allow_capture: AtomicBool,
         emit_batch: AtomicBool,
+        assignment_version: AtomicU64,
         capture_attempts: AtomicU64,
         successful_captures: AtomicU64,
         polls: AtomicU64,
@@ -5888,7 +5915,13 @@ mod tests {
             self.state
                 .successful_captures
                 .fetch_add(1, Ordering::SeqCst);
-            Ok(Some(SourceCheckpoint::new()))
+            let mut checkpoint = SourceCheckpoint::new();
+            if let Some(version) =
+                std::num::NonZeroU64::new(self.state.assignment_version.load(Ordering::Acquire))
+            {
+                checkpoint.bind_assignment_version(version);
+            }
+            Ok(Some(checkpoint))
         }
 
         async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -6110,6 +6143,7 @@ mod tests {
                     "generator",
                 ))
                 .expect("static generator contract"),
+            assignment_scoped: false,
             position: SourcePosition::Initial,
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
@@ -6202,6 +6236,7 @@ mod tests {
                 laminar_connectors::connector::SourceConsistency::Replayable,
                 laminar_connectors::connector::SourceTopology::Singleton,
             ),
+            assignment_scoped: false,
             position,
         }
     }
@@ -6327,6 +6362,7 @@ mod tests {
                 laminar_connectors::connector::SourceConsistency::Replayable,
                 laminar_connectors::connector::SourceTopology::Singleton,
             ),
+            assignment_scoped: false,
             position: SourcePosition::Initial,
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
@@ -6380,6 +6416,33 @@ mod tests {
         assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
     }
 
+    #[test]
+    fn source_checkpoint_scope_is_validated_before_publication() {
+        let state = Arc::new(BarrierRetrySourceState::default());
+        state.allow_capture.store(true, Ordering::Release);
+        let source = BarrierRetrySource {
+            state: Arc::clone(&state),
+        };
+
+        assert!(try_source_checkpoint(&source, false).unwrap().is_some());
+        let error = try_source_checkpoint(&source, true).unwrap_err();
+        assert!(error.to_string().contains("missing its assignment version"));
+
+        state.assignment_version.store(7, Ordering::Release);
+        assert_eq!(
+            try_source_checkpoint(&source, true)
+                .unwrap()
+                .unwrap()
+                .assignment_version()
+                .map(|version| version.get()),
+            Some(7)
+        );
+        let error = try_source_checkpoint(&source, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unexpectedly carries cluster assignment version 7"));
+    }
+
     #[tokio::test]
     async fn emitted_barrier_holds_polling_until_an_applicable_release() {
         let state = Arc::new(BarrierHoldProbeState::default());
@@ -6393,6 +6456,7 @@ mod tests {
                 laminar_connectors::connector::SourceConsistency::Replayable,
                 laminar_connectors::connector::SourceTopology::Singleton,
             ),
+            assignment_scoped: false,
             position: SourcePosition::Initial,
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
@@ -6482,6 +6546,7 @@ mod tests {
                 laminar_connectors::connector::SourceConsistency::Replayable,
                 laminar_connectors::connector::SourceTopology::Singleton,
             ),
+            assignment_scoped: false,
             position: SourcePosition::Initial,
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
@@ -6914,6 +6979,7 @@ mod tests {
                 laminar_connectors::connector::SourceConsistency::Replayable,
                 laminar_connectors::connector::SourceTopology::Singleton,
             ),
+            assignment_scoped: false,
             position: SourcePosition::Initial,
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
@@ -7489,6 +7555,7 @@ mod tests {
                 laminar_connectors::connector::SourceConsistency::Replayable,
                 laminar_connectors::connector::SourceTopology::Singleton,
             ),
+            assignment_scoped: false,
             position: SourcePosition::Initial,
         };
         let peer = startup_source(

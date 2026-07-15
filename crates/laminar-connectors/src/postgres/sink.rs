@@ -1390,6 +1390,14 @@ mod tests {
         ]))
     }
 
+    fn composite_key_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+        ]))
+    }
+
     fn test_config() -> PostgresSinkConfig {
         PostgresSinkConfig::new("localhost", "mydb", "events")
     }
@@ -1632,7 +1640,7 @@ mod tests {
 
     #[test]
     fn test_build_upsert_sql_composite_key() {
-        let schema = test_schema();
+        let schema = composite_key_schema();
         let mut config = upsert_config();
         config.primary_key_columns = vec!["id".to_string(), "name".to_string()];
         let sql = PostgresSink::build_upsert_sql(&schema, &config).unwrap();
@@ -1668,7 +1676,7 @@ mod tests {
 
     #[test]
     fn test_build_delete_sql_composite_key() {
-        let schema = test_schema();
+        let schema = composite_key_schema();
         let mut config = upsert_config();
         config.primary_key_columns = vec!["id".to_string(), "name".to_string()];
         let sql = PostgresSink::build_delete_sql(&schema, &config).unwrap();

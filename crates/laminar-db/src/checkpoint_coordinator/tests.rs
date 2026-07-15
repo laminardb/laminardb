@@ -643,28 +643,27 @@ async fn coordinator_construction_rejects_exhausted_manifest_epoch() {
 }
 
 #[tokio::test]
-async fn kafka_source_cut_must_match_coordinator_assignment_version() {
+async fn assigned_source_cut_must_match_coordinator_assignment_version() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_coordinator(dir.path()).await;
     coord.set_assignment_version(9);
+    coord.set_assignment_scoped_sources(["events".to_string()]);
 
-    let mut kafka = ConnectorCheckpoint::new();
-    kafka.metadata.insert("connector".into(), "kafka".into());
+    let checkpoint = ConnectorCheckpoint::new();
     let mut request = CheckpointRequest {
-        source_offset_overrides: HashMap::from([("events".to_string(), kafka)]),
+        source_offset_overrides: HashMap::from([("events".to_string(), checkpoint)]),
         ..CheckpointRequest::default()
     };
     let error = coord
         .validate_source_assignment_cuts(&request)
-        .expect_err("an unstamped cluster Kafka cut must fail closed");
-    assert!(error.to_string().contains("missing its assignment-version"));
+        .expect_err("an unstamped cluster source cut must fail closed");
+    assert!(error.to_string().contains("missing its assignment version"));
 
     request
         .source_offset_overrides
         .get_mut("events")
         .unwrap()
-        .metadata
-        .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "8".into());
+        .source_assignment_version = std::num::NonZeroU64::new(8);
     let error = coord
         .validate_source_assignment_cuts(&request)
         .expect_err("a stale assignment cut must fail closed");
@@ -674,16 +673,54 @@ async fn kafka_source_cut_must_match_coordinator_assignment_version() {
         .source_offset_overrides
         .get_mut("events")
         .unwrap()
-        .metadata
-        .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "9".into());
+        .source_assignment_version = std::num::NonZeroU64::new(9);
     coord
         .validate_source_assignment_cuts(&request)
         .expect("matching source and coordinator fences are admissible");
 }
 
+#[tokio::test]
+async fn source_assignment_scope_rejects_missing_and_unexpected_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let mut stamped = ConnectorCheckpoint::new();
+    stamped.source_assignment_version = std::num::NonZeroU64::new(9);
+    let mut request = CheckpointRequest {
+        source_offset_overrides: HashMap::from([("local".to_string(), stamped.clone())]),
+        ..CheckpointRequest::default()
+    };
+    let error = coord
+        .validate_source_assignment_cuts(&request)
+        .expect_err("local sources must not carry a cluster assignment");
+    assert!(error.to_string().contains("local source 'local'"));
+
+    coord.set_assignment_version(9);
+    coord.set_assignment_scoped_sources(["events".to_string()]);
+    request.source_offset_overrides.clear();
+    let error = coord
+        .validate_source_assignment_cuts(&request)
+        .expect_err("every assigned source must contribute a checkpoint");
+    assert!(error.to_string().contains("has no checkpoint"));
+
+    request.source_offset_overrides.insert(
+        "events".into(),
+        ConnectorCheckpoint {
+            source_assignment_version: std::num::NonZeroU64::new(9),
+            ..ConnectorCheckpoint::default()
+        },
+    );
+    request
+        .source_offset_overrides
+        .insert("local".into(), stamped);
+    let error = coord
+        .validate_source_assignment_cuts(&request)
+        .expect_err("non-assigned sources must remain unstamped");
+    assert!(error.to_string().contains("non-assigned source 'local'"));
+}
+
 #[cfg(feature = "cluster")]
-async fn assert_follower_kafka_cut_rejected_without_readiness(
-    assignment_fence: Option<&str>,
+async fn assert_follower_source_cut_rejected_without_readiness(
+    assignment_version: Option<u64>,
     expected_detail: &str,
 ) {
     const PARTICIPANT_ID: u64 = 7;
@@ -692,6 +729,7 @@ async fn assert_follower_kafka_cut_rejected_without_readiness(
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), PARTICIPANT_ID).await;
     coord.set_assignment_version(ASSIGNMENT_VERSION);
+    coord.set_assignment_scoped_sources(["events".to_string()]);
     let _leader_lease = attach_cluster_controller(&mut coord, PARTICIPANT_ID, &[]).await;
     let leader_proof = coord
         .cluster_controller
@@ -701,15 +739,10 @@ async fn assert_follower_kafka_cut_rejected_without_readiness(
         .unwrap();
     let backend = Arc::clone(coord.state_backend.as_ref().expect("state backend"));
 
-    let mut kafka = ConnectorCheckpoint::new();
-    kafka.metadata.insert("connector".into(), "kafka".into());
-    if let Some(fence) = assignment_fence {
-        kafka
-            .metadata
-            .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), fence.into());
-    }
+    let mut checkpoint = ConnectorCheckpoint::new();
+    checkpoint.source_assignment_version = assignment_version.and_then(std::num::NonZeroU64::new);
     let mut request = certified_cluster_request(&coord);
-    request.source_offset_overrides = HashMap::from([("events".to_string(), kafka)]);
+    request.source_offset_overrides = HashMap::from([("events".to_string(), checkpoint)]);
     let attempt = CheckpointAttempt::new(4, 5);
 
     let error = coord
@@ -721,7 +754,7 @@ async fn assert_follower_kafka_cut_rejected_without_readiness(
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await
-        .expect_err("follower must reject a Kafka cut from another assignment generation");
+        .expect_err("follower must reject a source cut from another assignment generation");
     let message = error.to_string();
     assert!(message.contains("[LDB-6055]"), "{message}");
     assert!(message.contains(expected_detail), "{message}");
@@ -746,19 +779,16 @@ async fn assert_follower_kafka_cut_rejected_without_readiness(
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn follower_prepare_rejects_unstamped_kafka_cut_before_readiness() {
-    assert_follower_kafka_cut_rejected_without_readiness(
-        None,
-        "missing its assignment-version fence",
-    )
-    .await;
+async fn follower_prepare_rejects_unstamped_source_cut_before_readiness() {
+    assert_follower_source_cut_rejected_without_readiness(None, "missing its assignment version")
+        .await;
 }
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn follower_prepare_rejects_stale_kafka_cut_before_readiness() {
-    assert_follower_kafka_cut_rejected_without_readiness(
-        Some("8"),
+async fn follower_prepare_rejects_stale_source_cut_before_readiness() {
+    assert_follower_source_cut_rejected_without_readiness(
+        Some(8),
         "captured assignment version 8, coordinator requires 9",
     )
     .await;
@@ -832,10 +862,15 @@ fn test_source_to_connector_checkpoint() {
     let mut cp = SourceCheckpoint::new();
     cp.set_offset("events:0", "1234");
     cp.set_metadata("topic", "events");
+    cp.bind_assignment_version(std::num::NonZeroU64::new(7).unwrap());
 
     let cc = source_to_connector_checkpoint(&cp);
     assert_eq!(cc.offsets.get("events:0"), Some(&"1234".into()));
     assert_eq!(cc.metadata.get("topic"), Some(&"events".into()));
+    assert_eq!(
+        cc.source_assignment_version.map(|version| version.get()),
+        Some(7)
+    );
 }
 
 #[test]
@@ -858,11 +893,16 @@ fn test_connector_to_source_checkpoint() {
     let cc = ConnectorCheckpoint {
         offsets: HashMap::from([("lsn".into(), "0/ABCD".into())]),
         metadata: HashMap::from([("type".into(), "postgres".into())]),
+        source_assignment_version: std::num::NonZeroU64::new(11),
     };
 
     let cp = connector_to_source_checkpoint(&cc);
     assert_eq!(cp.get_offset("lsn"), Some("0/ABCD"));
     assert_eq!(cp.get_metadata("type"), Some("postgres"));
+    assert_eq!(
+        cp.assignment_version().map(|version| version.get()),
+        Some(11)
+    );
 }
 
 #[tokio::test]
@@ -1692,6 +1732,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
                     .unwrap_or_default(),
                 source_offsets: Default::default(),
                 source_metadata: Default::default(),
+                source_assignment_versions: Default::default(),
                 source_watermarks: Default::default(),
                 local_watermark: CheckpointWatermark::Uninitialized,
                 manifest_sha256: manifest_sha256.clone(),
@@ -1920,6 +1961,7 @@ async fn create_test_recovery_capsule(
         participants,
         source_offsets: Default::default(),
         source_metadata: Default::default(),
+        source_assignment_versions: Default::default(),
         source_watermarks: Default::default(),
         cluster_watermark: CheckpointWatermark::Uninitialized,
         recovery_watermark_frontier: None,
@@ -3165,9 +3207,7 @@ async fn source_offset_handoff_round_trip() {
     kafka_checkpoint
         .metadata
         .insert("connector".into(), "kafka".into());
-    kafka_checkpoint
-        .metadata
-        .insert(KAFKA_ASSIGNMENT_VERSION_METADATA.into(), "1".into());
+    kafka_checkpoint.source_assignment_version = std::num::NonZeroU64::new(1);
     let attempt = CheckpointAttempt::new(5, 5);
     let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     manifest.participant_id = 1;
@@ -3238,6 +3278,13 @@ async fn source_offset_handoff_round_trip() {
             .get("connector")
             .map(String::as_str),
         Some("kafka")
+    );
+    assert_eq!(
+        kafka
+            .checkpoint()
+            .source_assignment_version
+            .map(|version| version.get()),
+        Some(1)
     );
     assert_eq!(kafka.watermark(), Some(1_000));
 }
@@ -3577,6 +3624,7 @@ async fn seal_requires_readiness_from_zero_vnode_participants() {
         owned_vnodes: Vec::new(),
         source_offsets: std::collections::BTreeMap::new(),
         source_metadata: std::collections::BTreeMap::new(),
+        source_assignment_versions: std::collections::BTreeMap::new(),
         source_watermarks: std::collections::BTreeMap::new(),
         local_watermark: CheckpointWatermark::Uninitialized,
         manifest_sha256,
@@ -3678,6 +3726,7 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
         owned_vnodes: vec![0],
         source_offsets: std::collections::BTreeMap::new(),
         source_metadata: std::collections::BTreeMap::new(),
+        source_assignment_versions: std::collections::BTreeMap::new(),
         source_watermarks: std::collections::BTreeMap::new(),
         local_watermark: CheckpointWatermark::Uninitialized,
         manifest_sha256,
@@ -3771,6 +3820,7 @@ async fn readiness_encoding_is_canonical_for_idempotent_reconstruction() {
             "kafka".into(),
             std::collections::BTreeMap::new(),
         )]),
+        source_assignment_versions: std::collections::BTreeMap::new(),
         source_watermarks: std::collections::BTreeMap::new(),
         local_watermark: CheckpointWatermark::Uninitialized,
         manifest_sha256: "11".repeat(32),

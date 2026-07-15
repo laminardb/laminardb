@@ -69,6 +69,20 @@ mod disk_persistence {
         .unwrap();
         source.push_arrow(batch).unwrap();
 
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if db
+                    .stream_metrics("avg_val")
+                    .is_some_and(|metrics| metrics.total_events > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the inserted batch must complete a processing cycle");
+
         // Manual checkpoint — this should persist to disk
         let result = db.checkpoint().await.unwrap();
         assert!(result.success, "checkpoint should succeed");
@@ -285,6 +299,7 @@ mod exactly_once {
                 SourceConsistency::Replayable,
                 SourceTopology::Splittable,
             ),
+            assignment_scoped: false,
             position: laminar_connectors::connector::SourcePosition::Initial,
         }];
         let shutdown = Arc::new(Notify::new());
@@ -343,6 +358,7 @@ mod exactly_once {
                     SourceConsistency::Replayable,
                     SourceTopology::Splittable,
                 ),
+                assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
             SourceRegistration {
@@ -355,6 +371,7 @@ mod exactly_once {
                     SourceConsistency::Replayable,
                     SourceTopology::Splittable,
                 ),
+                assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
         ];
@@ -427,6 +444,7 @@ mod exactly_once {
                     SourceConsistency::Replayable,
                     SourceTopology::Splittable,
                 ),
+                assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
             SourceRegistration {
@@ -437,6 +455,7 @@ mod exactly_once {
                     SourceConsistency::Replayable,
                     SourceTopology::Splittable,
                 ),
+                assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
         ];
@@ -513,6 +532,7 @@ mod exactly_once {
             laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint {
                 offsets: HashMap::from([("records".into(), "500".into())]),
                 metadata: HashMap::new(),
+                source_assignment_version: None,
             },
         );
         source_overrides.insert(
@@ -520,6 +540,7 @@ mod exactly_once {
             laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint {
                 offsets: HashMap::from([("records".into(), "300".into())]),
                 metadata: HashMap::new(),
+                source_assignment_version: None,
             },
         );
 
@@ -588,6 +609,7 @@ mod exactly_once {
                 SourceConsistency::Replayable,
                 SourceTopology::Splittable,
             ),
+            assignment_scoped: false,
             position: laminar_connectors::connector::SourcePosition::Initial,
         }];
 
@@ -645,6 +667,7 @@ mod exactly_once {
                     SourceConsistency::Replayable,
                     SourceTopology::Splittable,
                 ),
+                assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
             SourceRegistration {
@@ -657,6 +680,7 @@ mod exactly_once {
                     SourceConsistency::Replayable,
                     SourceTopology::Splittable,
                 ),
+                assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
         ];
@@ -959,6 +983,7 @@ mod recovery {
                     ("trades:1".into(), "5678".into()),
                 ]),
                 metadata: HashMap::from([("topic".into(), "trades".into())]),
+                source_assignment_version: None,
             },
         );
         manifest.source_offsets.insert(
@@ -966,6 +991,7 @@ mod recovery {
             ConnectorCheckpoint {
                 offsets: HashMap::from([("lsn".into(), "0/ABCDEF".into())]),
                 metadata: HashMap::from([("slot".into(), "laminar_slot".into())]),
+                source_assignment_version: None,
             },
         );
         save_finalized(&store, &manifest).await;
@@ -1114,6 +1140,7 @@ mod recovery {
             ConnectorCheckpoint {
                 offsets: HashMap::from([("lsn".into(), "0/FF00".into())]),
                 metadata: HashMap::new(),
+                source_assignment_version: None,
             },
         );
         save_finalized(&store, &manifest).await;
@@ -1135,6 +1162,7 @@ mod recovery {
             ConnectorCheckpoint {
                 offsets: HashMap::from([("p0".into(), "100".into())]),
                 metadata: HashMap::new(),
+                source_assignment_version: None,
             },
         );
         manifest

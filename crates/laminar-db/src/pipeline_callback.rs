@@ -5202,6 +5202,7 @@ mod tests {
             seal_inventory_sha256: digest(2),
             source_offsets: BTreeMap::from([("orders".into(), BTreeMap::new())]),
             source_metadata: BTreeMap::from([("orders".into(), BTreeMap::new())]),
+            source_assignment_versions: BTreeMap::new(),
             source_watermarks,
             cluster_watermark,
             recovery_watermark_frontier,

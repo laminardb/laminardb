@@ -776,6 +776,46 @@ mod rebalance {
 
         harness.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn source_assignment_cut_survives_cluster_restart() {
+        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
+        harness.start_all().await;
+
+        let first = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("initial cluster checkpoint");
+        assert!(first.success, "initial checkpoint: {:?}", first.error);
+
+        let (shared_dir, checkpoint_dirs) = harness.shutdown_keep_dirs().await;
+        let mut restarted = ClusterEngineHarness::spawn_with_dirs(
+            N_NODES,
+            VNODE_COUNT,
+            shared_dir,
+            checkpoint_dirs,
+        )
+        .await;
+        restarted.start_all().await;
+
+        let second = restarted.nodes[restarted.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after recovery");
+        assert!(second.success, "recovered checkpoint: {:?}", second.error);
+        assert!(second.epoch > first.epoch);
+
+        restarted.shutdown().await;
+    }
 }
 
 mod two_pc {
@@ -902,6 +942,7 @@ mod two_pc {
             participants,
             source_offsets: Default::default(),
             source_metadata: Default::default(),
+            source_assignment_versions: Default::default(),
             source_watermarks: Default::default(),
             cluster_watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             recovery_watermark_frontier: None,
