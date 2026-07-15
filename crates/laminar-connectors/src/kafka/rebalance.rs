@@ -1,7 +1,7 @@
 //! Kafka consumer group rebalance state tracking.
 //!
 //! [`RebalanceState`] tracks which topic-partitions are currently
-//! assigned to this consumer and counts rebalance events.
+//! assigned to this consumer.
 //!
 //! [`LaminarConsumerContext`] is an rdkafka `ConsumerContext` that tracks
 //! assignment changes and broker offset-commit outcomes.
@@ -19,9 +19,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Default)]
 pub struct RebalanceState {
     /// Currently assigned (topic, partition) pairs.
-    assigned: HashSet<(String, i32)>,
-    /// Total number of rebalance events.
-    rebalance_count: u64,
+    assigned: Arc<HashSet<(String, i32)>>,
 }
 
 impl RebalanceState {
@@ -39,18 +37,19 @@ impl RebalanceState {
     /// - Cooperative: `Assign` only contains newly assigned partitions,
     ///   so clearing would lose existing assignments.
     pub fn on_assign(&mut self, partitions: &[(String, i32)]) {
+        let assigned = Arc::make_mut(&mut self.assigned);
         for (topic, partition) in partitions {
-            self.assigned.insert((topic.clone(), *partition));
+            assigned.insert((topic.clone(), *partition));
         }
-        self.rebalance_count += 1;
     }
 
     /// Handles a partition revocation event.
     ///
     /// Removes the specified partitions from the assignment set.
     pub fn on_revoke(&mut self, partitions: &[(String, i32)]) {
+        let assigned = Arc::make_mut(&mut self.assigned);
         for (topic, partition) in partitions {
-            self.assigned.remove(&(topic.clone(), *partition));
+            assigned.remove(&(topic.clone(), *partition));
         }
     }
 
@@ -60,16 +59,10 @@ impl RebalanceState {
         &self.assigned
     }
 
-    /// Returns the total number of rebalance events.
+    /// Immutable assignment snapshot for checkpoint and revoke processing.
     #[must_use]
-    pub fn rebalance_count(&self) -> u64 {
-        self.rebalance_count
-    }
-
-    /// Returns `true` if the given topic-partition is currently assigned.
-    #[must_use]
-    pub fn is_assigned(&self, topic: &str, partition: i32) -> bool {
-        self.assigned.contains(&(topic.to_string(), partition))
+    pub fn assignment_snapshot(&self) -> Arc<HashSet<(String, i32)>> {
+        Arc::clone(&self.assigned)
     }
 }
 
@@ -83,7 +76,6 @@ impl RebalanceState {
 /// Rebalance callbacks run on rdkafka's background thread, so all shared
 /// state uses `Arc` + atomic types for thread safety.
 pub struct LaminarConsumerContext {
-    rebalance_count: AtomicU64,
     /// Shared rebalance state updated on Assign/Revoke events.
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance event counter for source-level metrics.
@@ -118,7 +110,6 @@ impl LaminarConsumerContext {
         commit_failures_counter: IntCounter,
     ) -> Self {
         Self {
-            rebalance_count: AtomicU64::new(0),
             rebalance_state,
             rebalance_metric,
             revoke_generation,
@@ -126,18 +117,6 @@ impl LaminarConsumerContext {
             commits_counter,
             commit_failures_counter,
         }
-    }
-
-    /// Total rebalance events observed.
-    #[must_use]
-    pub fn rebalance_count(&self) -> u64 {
-        self.rebalance_count.load(Ordering::Relaxed)
-    }
-
-    /// Returns the shared revoke generation counter.
-    #[must_use]
-    pub fn revoke_generation(&self) -> &Arc<AtomicU64> {
-        &self.revoke_generation
     }
 
     /// Locks the rebalance state, recovering from poison.
@@ -175,8 +154,6 @@ impl ConsumerContext for LaminarConsumerContext {
                 self.lock_rebalance_state().on_revoke(&partitions);
                 self.revoke_generation
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
-                self.rebalance_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -193,8 +170,6 @@ impl ConsumerContext for LaminarConsumerContext {
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
                 self.lock_rebalance_state().on_assign(&partitions);
-                self.rebalance_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -253,6 +228,12 @@ impl ConsumerContext for LaminarConsumerContext {
 mod tests {
     use super::*;
 
+    fn is_assigned(state: &RebalanceState, topic: &str, partition: i32) -> bool {
+        state
+            .assigned_partitions()
+            .contains(&(topic.to_string(), partition))
+    }
+
     #[test]
     fn test_assign() {
         let mut state = RebalanceState::new();
@@ -263,11 +244,10 @@ mod tests {
         ]);
 
         assert_eq!(state.assigned_partitions().len(), 3);
-        assert!(state.is_assigned("events", 0));
-        assert!(state.is_assigned("events", 1));
-        assert!(state.is_assigned("events", 2));
-        assert!(!state.is_assigned("events", 3));
-        assert_eq!(state.rebalance_count(), 1);
+        assert!(is_assigned(&state, "events", 0));
+        assert!(is_assigned(&state, "events", 1));
+        assert!(is_assigned(&state, "events", 2));
+        assert!(!is_assigned(&state, "events", 3));
     }
 
     #[test]
@@ -277,8 +257,8 @@ mod tests {
         state.on_revoke(&[("events".into(), 1)]);
 
         assert_eq!(state.assigned_partitions().len(), 1);
-        assert!(state.is_assigned("events", 0));
-        assert!(!state.is_assigned("events", 1));
+        assert!(is_assigned(&state, "events", 0));
+        assert!(!is_assigned(&state, "events", 1));
     }
 
     #[test]
@@ -290,9 +270,8 @@ mod tests {
         state.on_assign(&[("events".into(), 2), ("events".into(), 3)]);
 
         assert_eq!(state.assigned_partitions().len(), 2);
-        assert!(!state.is_assigned("events", 0));
-        assert!(state.is_assigned("events", 2));
-        assert_eq!(state.rebalance_count(), 2);
+        assert!(!is_assigned(&state, "events", 0));
+        assert!(is_assigned(&state, "events", 2));
     }
 
     #[test]
@@ -304,39 +283,26 @@ mod tests {
         state.on_assign(&[("events".into(), 2)]);
 
         assert_eq!(state.assigned_partitions().len(), 2);
-        assert!(state.is_assigned("events", 0)); // retained
-        assert!(!state.is_assigned("events", 1)); // revoked
-        assert!(state.is_assigned("events", 2)); // newly assigned
+        assert!(is_assigned(&state, "events", 0)); // retained
+        assert!(!is_assigned(&state, "events", 1)); // revoked
+        assert!(is_assigned(&state, "events", 2)); // newly assigned
+    }
+
+    #[test]
+    fn assignment_snapshot_is_stable_across_rebalance() {
+        let mut state = RebalanceState::new();
+        state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
+        let pinned = state.assignment_snapshot();
+
+        state.on_revoke(&[("events".into(), 0)]);
+        assert!(pinned.contains(&("events".to_string(), 0)));
+        assert!(!is_assigned(&state, "events", 0));
     }
 
     #[test]
     fn test_empty_state() {
         let state = RebalanceState::new();
         assert_eq!(state.assigned_partitions().len(), 0);
-        assert_eq!(state.rebalance_count(), 0);
-        assert!(!state.is_assigned("events", 0));
-    }
-
-    fn make_context() -> LaminarConsumerContext {
-        let state = Arc::new(Mutex::new(RebalanceState::new()));
-        let metric = Arc::new(AtomicU64::new(0));
-        let revoke_gen = Arc::new(AtomicU64::new(0));
-        let assign_gen = Arc::new(AtomicU64::new(0));
-        let commits = IntCounter::new("test_commits", "test").unwrap();
-        let commit_failures = IntCounter::new("test_commit_failures", "test").unwrap();
-        LaminarConsumerContext::new(
-            state,
-            metric,
-            revoke_gen,
-            assign_gen,
-            commits,
-            commit_failures,
-        )
-    }
-
-    #[test]
-    fn test_consumer_context_initial_state() {
-        let ctx = make_context();
-        assert_eq!(ctx.rebalance_count(), 0);
+        assert!(!is_assigned(&state, "events", 0));
     }
 }
