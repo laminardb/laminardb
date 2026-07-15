@@ -59,7 +59,7 @@ pub fn register_postgres_cdc_source(
         pg_info.clone(),
         Arc::new(|config, declared_schema| {
             Ok(Box::new(
-                crate::lookup::postgres_reference::PostgresReferenceTableSource::new(
+                crate::postgres::reference::PostgresReferenceTableSource::new(
                     config.clone(),
                     declared_schema,
                 ),
@@ -112,7 +112,7 @@ impl crate::registry::LookupSourceFactory for PostgresLookupFactory {
         _declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
-        use crate::lookup::postgres_lookup::{PostgresLookupSource, PostgresLookupSourceConfig};
+        use crate::postgres::lookup::{PostgresLookupSource, PostgresLookupSourceConfig};
 
         let pk_columns: Vec<String> = config
             .get("_primary_key_columns")

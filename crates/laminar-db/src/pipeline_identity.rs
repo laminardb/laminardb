@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn adapted_source_uses_semantic_connector_identity() {
         let registry = ConnectorRegistry::new();
-        laminar_connectors::cdc::postgres::register_postgres_cdc_source(&registry).unwrap();
+        laminar_connectors::postgres::register_postgres_cdc_source(&registry).unwrap();
         let mut left = ConnectorConfig::new("postgres-cdc");
         left.set("host", "db-a.internal");
         left.set("database", "orders");

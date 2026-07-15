@@ -1475,7 +1475,7 @@ max_out_of_orderness = "5s"</code></pre>
 
       <!-- POSTGRES CDC -->
       <h3 id="postgres-cdc">PostgreSQL CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/postgres/source.rs" target="_blank" rel="noopener">cdc/postgres/source.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/postgres/cdc/source.rs" target="_blank" rel="noopener">postgres/cdc/source.rs</a></div>
 
       <p><strong>Delivery boundary:</strong> the source resumes from the last fully emitted committed transaction and is admitted for at-least-once processing. It does not create an initial snapshot, so fresh startup is rejected before network I/O. Both the control and replication connections use the same verified TLS policy.</p>
 

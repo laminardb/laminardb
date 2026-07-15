@@ -445,7 +445,7 @@ mod tests {
         build_replication_config, source_config_digest, validate_replication_slot,
         validate_server_version_num,
     };
-    use crate::cdc::postgres::{PostgresCdcConfig, SslMode};
+    use crate::postgres::cdc::{PostgresCdcConfig, SslMode};
 
     #[test]
     fn replication_config_disables_tls() {

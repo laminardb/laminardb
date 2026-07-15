@@ -413,9 +413,9 @@ fn round_to_arrow_alignment(bytes: usize) -> Result<usize, ConnectorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::postgres::schema::RelationInfo;
-    use crate::cdc::postgres::types::PgColumn;
-    use crate::cdc::postgres::types::{INT8_OID, TEXT_OID};
+    use crate::postgres::cdc::schema::RelationInfo;
+    use crate::postgres::cdc::types::PgColumn;
+    use crate::postgres::cdc::types::{INT8_OID, TEXT_OID};
     use bytes::Bytes;
 
     fn sample_relation() -> RelationInfo {

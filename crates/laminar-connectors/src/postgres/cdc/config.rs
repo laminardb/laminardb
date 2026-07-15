@@ -440,7 +440,7 @@ mod tests {
         );
         assert_eq!(
             control.get_connect_timeout().copied(),
-            Some(crate::cdc::postgres::postgres_io::CONNECT_TIMEOUT)
+            Some(crate::postgres::cdc::postgres_io::CONNECT_TIMEOUT)
         );
     }
 

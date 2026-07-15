@@ -2293,7 +2293,7 @@ impl LaminarDB {
         }
         #[cfg(feature = "postgres-cdc")]
         {
-            laminar_connectors::cdc::postgres::register_postgres_cdc_source(registry)?;
+            laminar_connectors::postgres::register_postgres_cdc_source(registry)?;
         }
         #[cfg(feature = "postgres-sink")]
         {

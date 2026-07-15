@@ -257,7 +257,7 @@ pub fn cdc_envelope_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::postgres::types::{INT4_OID, INT8_OID, TEXT_OID};
+    use crate::postgres::cdc::types::{INT4_OID, INT8_OID, TEXT_OID};
 
     fn sample_relation() -> RelationInfo {
         RelationInfo {

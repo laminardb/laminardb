@@ -10,51 +10,31 @@
 //! rejected rather than presented as aliases. v1 limits: single-column key,
 //! server-auth only (no mTLS client certs).
 
-#[cfg(feature = "postgres-cdc")]
 use std::collections::HashMap;
-#[cfg(feature = "postgres-cdc")]
 use std::sync::Arc;
-#[cfg(feature = "postgres-cdc")]
 use std::time::Duration;
 
-#[cfg(feature = "postgres-cdc")]
 use arrow_array::{Array, RecordBatch};
-#[cfg(feature = "postgres-cdc")]
 use arrow_row::SortField;
-#[cfg(feature = "postgres-cdc")]
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-#[cfg(feature = "postgres-cdc")]
 use deadpool_postgres::Pool;
-#[cfg(feature = "postgres-cdc")]
 use tokio_postgres::types::{ToSql, Type};
 
-#[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::predicate::Predicate;
-#[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::source::{
     projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
 };
-#[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::KeyAligner;
 
-#[cfg(feature = "postgres-cdc")]
 use super::await_owned_driver;
 
-#[cfg(feature = "postgres-cdc")]
 const MAX_LOOKUP_KEYS: usize = 4_096;
-#[cfg(feature = "postgres-cdc")]
 const MAX_LOOKUP_KEY_BYTES: usize = 4 * 1024 * 1024;
-#[cfg(feature = "postgres-cdc")]
 const MAX_LOOKUP_RESULT_BYTES: usize = 64 * 1024 * 1024;
-#[cfg(feature = "postgres-cdc")]
 const MAX_POOL_SIZE: usize = 64;
-#[cfg(feature = "postgres-cdc")]
 const POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(feature = "postgres-cdc")]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(feature = "postgres-cdc")]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "postgres-cdc")]
 const UNIQUE_LOOKUP_KEY_QUERY: &str = r#"
 WITH target AS (
     SELECT pg_catalog.to_regclass($1)::oid AS table_oid
@@ -82,7 +62,6 @@ SELECT
 FROM target
 "#;
 
-#[cfg(feature = "postgres-cdc")]
 async fn await_lookup_driver<T>(
     operation: &'static str,
     future: impl std::future::Future<Output = Result<T, LookupError>> + Send + 'static,
@@ -96,7 +75,6 @@ where
     .await
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn validate_unique_lookup_key(
     table: &str,
     key: &str,
@@ -117,7 +95,6 @@ fn validate_unique_lookup_key(
 }
 
 /// Configuration for [`PostgresLookupSource`].
-#[cfg(feature = "postgres-cdc")]
 #[derive(Debug, Clone)]
 pub struct PostgresLookupSourceConfig {
     /// libpq-style connection settings (host/port/database/user/password or a
@@ -132,7 +109,6 @@ pub struct PostgresLookupSourceConfig {
 }
 
 /// `PostgreSQL` lookup source for on-demand/partial cache mode.
-#[cfg(feature = "postgres-cdc")]
 pub struct PostgresLookupSource {
     pool: Pool,
     select_sql: String,
@@ -145,7 +121,6 @@ pub struct PostgresLookupSource {
     aligner: KeyAligner,
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn quote_identifier(name: &str) -> Result<String, LookupError> {
     if name.is_empty() || name.contains('\0') {
         return Err(LookupError::Internal(
@@ -155,7 +130,6 @@ fn quote_identifier(name: &str) -> Result<String, LookupError> {
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn quote_qualified_identifier(name: &str) -> Result<String, LookupError> {
     name.split('.')
         .map(quote_identifier)
@@ -163,7 +137,6 @@ fn quote_qualified_identifier(name: &str) -> Result<String, LookupError> {
         .map(|parts| parts.join("."))
 }
 
-#[cfg(feature = "postgres-cdc")]
 impl PostgresLookupSource {
     /// Opens a pooled connection and derives the table's Arrow schema.
     ///
@@ -341,7 +314,6 @@ impl PostgresLookupSource {
     }
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn validate_lookup_keys(keys: &[&[u8]]) -> Result<(), LookupError> {
     if keys.len() > MAX_LOOKUP_KEYS {
         return Err(LookupError::Query(format!(
@@ -362,7 +334,6 @@ fn validate_lookup_keys(keys: &[&[u8]]) -> Result<(), LookupError> {
     Ok(())
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn enforce_lookup_result_bytes(batch: &RecordBatch) -> Result<(), LookupError> {
     let bytes = batch.columns().iter().try_fold(0_usize, |total, column| {
         total
@@ -377,7 +348,6 @@ fn enforce_lookup_result_bytes(batch: &RecordBatch) -> Result<(), LookupError> {
     Ok(())
 }
 
-#[cfg(feature = "postgres-cdc")]
 impl LookupSource for PostgresLookupSource {
     async fn query(
         &self,
@@ -560,14 +530,12 @@ impl LookupSource for PostgresLookupSource {
     }
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn discard_pool_client(client: deadpool_postgres::Client) {
     drop(deadpool_postgres::Client::take(client));
 }
 
 /// Build a `deadpool` pool from libpq-style properties (individual keys or a
 /// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
-#[cfg(feature = "postgres-cdc")]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
     if pool_size == 0 || pool_size > MAX_POOL_SIZE {
         return Err(LookupError::Connection(format!(
@@ -698,7 +666,6 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
     }
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn driver_ssl_mode(mode: crate::postgres::SslMode) -> deadpool_postgres::SslMode {
     match mode {
         crate::postgres::SslMode::Disable => deadpool_postgres::SslMode::Disable,
@@ -708,7 +675,6 @@ fn driver_ssl_mode(mode: crate::postgres::SslMode) -> deadpool_postgres::SslMode
 
 /// Whether the configuration requests verified TLS. It is secure by default;
 /// plaintext requires an explicit opt-out.
-#[cfg(feature = "postgres-cdc")]
 fn ssl_mode(props: &HashMap<String, String>) -> Result<crate::postgres::SslMode, LookupError> {
     if props.contains_key("sslmode") {
         return Err(LookupError::Connection(
@@ -742,7 +708,6 @@ fn ssl_mode(props: &HashMap<String, String>) -> Result<crate::postgres::SslMode,
 /// Build a server-auth rustls TLS connector. Roots come from `ssl.ca.cert.path`
 /// (CA PEM) if set, otherwise the Mozilla webpki roots; the server certificate
 /// is always verified (no insecure skip-verify).
-#[cfg(feature = "postgres-cdc")]
 fn build_rustls_connector(
     props: &HashMap<String, String>,
 ) -> Result<tokio_postgres_rustls::MakeRustlsConnect, LookupError> {
@@ -753,7 +718,6 @@ fn build_rustls_connector(
 
 /// Convert `tokio_postgres` rows into one Arrow `RecordBatch` via the
 /// pre-derived schema.
-#[cfg(feature = "postgres-cdc")]
 fn rows_to_batch(
     schema: &SchemaRef,
     rows: &[tokio_postgres::Row],
@@ -838,7 +802,6 @@ fn rows_to_batch(
 }
 
 /// Collect a typed nullable column from all rows.
-#[cfg(feature = "postgres-cdc")]
 fn collect_col<'a, T>(
     rows: &'a [tokio_postgres::Row],
     name: &str,
@@ -856,12 +819,10 @@ where
 
 /// Map a `tokio_postgres` type to an Arrow `DataType`. Types without a native
 /// mapping are explicitly projected as PostgreSQL text.
-#[cfg(feature = "postgres-cdc")]
 fn pg_type_to_arrow(pg_type: &Type) -> DataType {
     native_pg_type_to_arrow(pg_type).unwrap_or(DataType::Utf8)
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn native_pg_type_to_arrow(pg_type: &Type) -> Option<DataType> {
     match *pg_type {
         Type::BOOL => Some(DataType::Boolean),
@@ -882,7 +843,6 @@ fn native_pg_type_to_arrow(pg_type: &Type) -> Option<DataType> {
     }
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn supports_any_parameter(pg_type: &Type) -> bool {
     matches!(
         *pg_type,
@@ -899,12 +859,10 @@ fn supports_any_parameter(pg_type: &Type) -> bool {
     )
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn select_expression(column: &tokio_postgres::Column) -> Result<String, LookupError> {
     select_expression_for(column.name(), column.type_())
 }
 
-#[cfg(feature = "postgres-cdc")]
 fn select_expression_for(name: &str, pg_type: &Type) -> Result<String, LookupError> {
     let identifier = quote_identifier(name)?;
     if native_pg_type_to_arrow(pg_type).is_some() {
@@ -914,7 +872,7 @@ fn select_expression_for(name: &str, pg_type: &Type) -> Result<String, LookupErr
     }
 }
 
-#[cfg(all(test, feature = "postgres-cdc"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};

@@ -10,14 +10,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use arrow_array::{Array, StringArray, UInt64Array};
-use laminar_connectors::cdc::postgres::{Lsn, PostgresCdcConfig, PostgresCdcSource};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     DeliveryGuarantee, SourceBatch, SourceConnector, SourcePosition, SourceStart,
 };
-use laminar_connectors::lookup::postgres_lookup::{
-    PostgresLookupSource, PostgresLookupSourceConfig,
+use laminar_connectors::postgres::{
+    Lsn, PostgresCdcConfig, PostgresCdcSource, PostgresLookupSource, PostgresLookupSourceConfig,
 };
 use laminar_core::state::CheckpointAttempt;
 use serde_json::Value;

@@ -7,7 +7,7 @@ use laminar_connectors::registry::ConnectorRegistry;
 #[test]
 fn postgres_cdc_admission_rejects_unexecuted_options_and_reference_use() {
     let registry = ConnectorRegistry::new();
-    laminar_connectors::cdc::postgres::register_postgres_cdc_source(&registry).unwrap();
+    laminar_connectors::postgres::register_postgres_cdc_source(&registry).unwrap();
     let mut config = ConnectorConfig::new("postgres-cdc");
     config.set("host", "localhost");
     config.set("database", "app");

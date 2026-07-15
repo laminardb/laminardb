@@ -2174,7 +2174,7 @@ impl PostgresCdcSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::postgres::types::{INT4_OID, INT8_OID, TEXT_OID};
+    use crate::postgres::cdc::types::{INT4_OID, INT8_OID, TEXT_OID};
     use arrow_array::cast::AsArray;
 
     fn default_source() -> PostgresCdcSource {

@@ -73,9 +73,6 @@ pub mod testing;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
-/// Change Data Capture connectors for databases.
-pub mod cdc;
-
 /// PostgreSQL connector-specific configuration and implementations.
 #[cfg(any(feature = "postgres-cdc", feature = "postgres-sink"))]
 pub mod postgres;

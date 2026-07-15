@@ -1,5 +1,11 @@
 //! PostgreSQL connector-specific configuration and implementations.
 
+#[cfg(feature = "postgres-cdc")]
+pub mod cdc;
+#[cfg(feature = "postgres-cdc")]
+pub mod lookup;
+#[cfg(feature = "postgres-cdc")]
+pub mod reference;
 #[cfg(feature = "postgres-sink")]
 pub mod sink;
 #[cfg(feature = "postgres-sink")]
@@ -14,6 +20,13 @@ pub(crate) use tls::make_rustls_connector;
 /// PostgreSQL connection security policy.
 pub use tls::SslMode;
 
+#[cfg(feature = "postgres-cdc")]
+pub use cdc::{register_postgres_cdc_source, Lsn, PostgresCdcConfig, PostgresCdcSource};
+#[cfg(feature = "postgres-cdc")]
+pub use lookup::{PostgresLookupSource, PostgresLookupSourceConfig};
+#[cfg(feature = "postgres-cdc")]
+pub use reference::PostgresReferenceTableSource;
+
 // Re-export primary sink types at module level.
 #[cfg(feature = "postgres-sink")]
 pub use sink::PostgresSink;
@@ -22,6 +35,8 @@ pub use sink_config::{PostgresSinkConfig, WriteMode};
 #[cfg(feature = "postgres-sink")]
 pub use sink_metrics::PostgresSinkMetrics;
 
+#[cfg(feature = "postgres-cdc")]
+use std::future::Future;
 #[cfg(feature = "postgres-sink")]
 use std::sync::Arc;
 
@@ -29,6 +44,23 @@ use std::sync::Arc;
 use crate::config::{ConfigKeySpec, ConnectorInfo};
 #[cfg(feature = "postgres-sink")]
 use crate::registry::ConnectorRegistry;
+
+/// Poll a driver future from a task whose lifetime is independent of its caller.
+/// Dropping the waiter detaches the task; it does not cancel the driver operation.
+#[cfg(feature = "postgres-cdc")]
+async fn await_owned_driver<T, E>(
+    future: impl Future<Output = Result<T, E>> + Send + 'static,
+    join_error: impl FnOnce(tokio::task::JoinError) -> E + Send + 'static,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    match tokio::spawn(future).await {
+        Ok(result) => result,
+        Err(error) => Err(join_error(error)),
+    }
+}
 
 /// Registers the `PostgreSQL` sink connector with the given registry.
 #[cfg(feature = "postgres-sink")]
@@ -99,6 +131,45 @@ fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
             "false",
         ),
     ]
+}
+
+#[cfg(all(test, feature = "postgres-cdc"))]
+mod driver_tests {
+    use super::await_owned_driver;
+
+    #[tokio::test]
+    async fn owned_driver_outlives_a_cancelled_waiter() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            await_owned_driver(
+                async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    let _ = completed_tx.send(());
+                    Ok::<(), ()>(())
+                },
+                |_| (),
+            )
+            .await
+        });
+
+        started_rx.await.expect("owned task started");
+        waiter.abort();
+        assert!(waiter
+            .await
+            .expect_err("waiter must be cancelled")
+            .is_cancelled());
+        release_tx
+            .send(())
+            .expect("owned task still receives release");
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed_rx)
+            .await
+            .expect("owned task must finish after waiter cancellation")
+            .expect("completion signal");
+    }
 }
 
 #[cfg(all(test, feature = "postgres-sink"))]
