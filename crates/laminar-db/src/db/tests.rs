@@ -3498,36 +3498,13 @@ async fn create_table_rejects_source_only_connector_without_residue() {
 }
 
 #[tokio::test]
-async fn lookup_cdc_aliases_fail_before_registration() {
-    let db = LaminarDB::open().unwrap();
-
-    for (index, connector) in ["postgres-cdc", "postgres_cdc"].into_iter().enumerate() {
-        let name = format!("rejected_lookup_{index}");
-        let error = db
-            .execute(&format!(
-                "CREATE LOOKUP TABLE {name} (id INT NOT NULL, PRIMARY KEY (id)) \
-                 WITH ('connector' = '{connector}')"
-            ))
-            .await
-            .unwrap_err();
-
-        assert!(
-            error.to_string().contains("cannot back a LOOKUP TABLE"),
-            "unexpected rejection for {connector}: {error}"
-        );
-        assert!(!db.table_store.read().has_table(&name));
-        assert!(!db.connector_manager.lock().tables().contains_key(&name));
-        assert!(!db.ctx.table_exist(name.as_str()).unwrap());
-        assert!(db.planner.lock().get_lookup_table(&name).is_none());
-        assert!(db.lookup_registry.get_entry(&name).is_none());
-    }
-}
-
-#[tokio::test]
 async fn lookup_connectors_without_snapshot_factories_leave_no_residue() {
     let db = LaminarDB::open().unwrap();
 
-    for (index, connector) in ["redis", "s3", "s3-parquet"].into_iter().enumerate() {
+    for (index, connector) in ["missing-snapshot", "another-source"]
+        .into_iter()
+        .enumerate()
+    {
         let name = format!("unsupported_lookup_{index}");
         let error = db
             .execute(&format!(
@@ -3549,6 +3526,33 @@ async fn lookup_connectors_without_snapshot_factories_leave_no_residue() {
         assert!(db.planner.lock().get_lookup_table(&name).is_none());
         assert!(db.lookup_registry.get_entry(&name).is_none());
     }
+}
+
+#[tokio::test]
+async fn static_on_demand_lookup_fails_without_residue() {
+    let db = LaminarDB::open().unwrap();
+    let error = db
+        .execute(
+            "CREATE LOOKUP TABLE static_direct (id INT NOT NULL, PRIMARY KEY (id)) \
+             WITH ('connector' = 'static', 'strategy' = 'on-demand')",
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("supports only the replicated"));
+    assert!(!db.table_store.read().has_table("static_direct"));
+    assert!(!db
+        .connector_manager
+        .lock()
+        .tables()
+        .contains_key("static_direct"));
+    assert!(!db.ctx.table_exist("static_direct").unwrap());
+    assert!(db
+        .planner
+        .lock()
+        .get_lookup_table("static_direct")
+        .is_none());
+    assert!(db.lookup_registry.get_entry("static_direct").is_none());
 }
 
 #[cfg(any(not(feature = "postgres-cdc"), not(feature = "delta-lake")))]
@@ -3586,11 +3590,11 @@ async fn feature_disabled_lookup_connectors_leave_no_residue() {
 
 #[cfg(feature = "postgres-cdc")]
 #[tokio::test]
-async fn postgresql_alias_registers_standalone_lookup() {
+async fn postgres_lookup_registration_preserves_canonical_name() {
     let db = LaminarDB::open().unwrap();
     db.execute(
         "CREATE LOOKUP TABLE customers (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
-         WITH ('connector' = 'postgresql', 'connection' = 'host=localhost', \
+         WITH ('connector' = 'postgres', 'connection' = 'host=localhost', \
          'table' = 'customers')",
     )
     .await
@@ -3615,7 +3619,8 @@ async fn postgresql_alias_registers_standalone_lookup() {
             .lock()
             .get_lookup_table("customers")
             .map(|info| info.properties.connector.clone()),
-        Some(laminar_sql::parser::lookup_table::ConnectorType::Postgres)
+        Some(laminar_sql::parser::lookup_table::LookupConnector::External(name))
+            if name == "postgres"
     ));
 
     let error = db
@@ -3644,7 +3649,8 @@ async fn postgresql_alias_registers_standalone_lookup() {
             .lock()
             .get_lookup_table("customers")
             .map(|info| info.properties.connector.clone()),
-        Some(laminar_sql::parser::lookup_table::ConnectorType::Postgres)
+        Some(laminar_sql::parser::lookup_table::LookupConnector::External(name))
+            if name == "postgres"
     ));
 }
 
@@ -3750,18 +3756,22 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
         }
     }
 
-    struct EmptyLookupFactory;
+    struct EmptyLookupFactory {
+        observed_config:
+            Arc<parking_lot::Mutex<Option<laminar_connectors::config::ConnectorConfig>>>,
+    }
 
     #[async_trait::async_trait]
     impl laminar_connectors::registry::LookupSourceFactory for EmptyLookupFactory {
         async fn build(
             &self,
-            _config: laminar_connectors::config::ConnectorConfig,
+            config: laminar_connectors::config::ConnectorConfig,
             declared_schema: Option<arrow_schema::SchemaRef>,
         ) -> Result<
             Arc<dyn laminar_core::lookup::source::LookupSourceDyn>,
             laminar_connectors::error::ConnectorError,
         > {
+            *self.observed_config.lock() = Some(config);
             let schema = declared_schema.ok_or_else(|| {
                 laminar_connectors::error::ConnectorError::ConfigurationError(
                     "declared schema is required".to_string(),
@@ -3771,8 +3781,10 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
         }
     }
 
+    let observed_config = Arc::new(parking_lot::Mutex::new(None));
+    let factory_observed_config = Arc::clone(&observed_config);
     let db = LaminarDB::builder()
-        .register_connector(|registry| {
+        .register_connector(move |registry| {
             registry.register_lookup_source(
                 "mock-direct",
                 laminar_connectors::config::ConnectorInfo {
@@ -3783,16 +3795,45 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
                     is_sink: false,
                     config_keys: vec![],
                 },
-                Arc::new(EmptyLookupFactory),
+                Arc::new(EmptyLookupFactory {
+                    observed_config: factory_observed_config,
+                }),
             )
         })
         .build()
         .await
         .unwrap();
+
+    let mismatch = db
+        .execute(
+            "CREATE LOOKUP TABLE wrong_strategy (id INT NOT NULL, PRIMARY KEY (id)) \
+             WITH ('connector' = 'mock-direct')",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch
+            .to_string()
+            .contains("no registered snapshot-capable table source"),
+        "{mismatch}"
+    );
+    assert!(!db.table_store.read().has_table("wrong_strategy"));
+    assert!(!db
+        .connector_manager
+        .lock()
+        .tables()
+        .contains_key("wrong_strategy"));
+    assert!(db
+        .planner
+        .lock()
+        .get_lookup_table("wrong_strategy")
+        .is_none());
+
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
     db.execute(
         "CREATE LOOKUP TABLE dimensions (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
          WITH ('connector' = 'mock-direct', 'strategy' = 'on-demand', \
+         'connection' = 'endpoint=test', 'provider.fetch.mode' = 'fast', \
          'cache.memory' = '1mb')",
     )
     .await
@@ -3807,8 +3848,27 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
         .tables()
         .get("dimensions")
         .is_some_and(|registration| {
-            registration.on_demand && registration.connector_type.as_deref() == Some("mock-direct")
+            registration.on_demand
+                && registration.connector_type.as_deref() == Some("mock-direct")
+                && registration
+                    .connector_options
+                    .get("connection")
+                    .map(String::as_str)
+                    == Some("endpoint=test")
+                && registration
+                    .connector_options
+                    .get("provider.fetch.mode")
+                    .map(String::as_str)
+                    == Some("fast")
         }));
+    assert!(matches!(
+        db.planner
+            .lock()
+            .get_lookup_table("dimensions")
+            .map(|info| info.properties.connector.clone()),
+        Some(laminar_sql::parser::lookup_table::LookupConnector::External(name))
+            if name == "mock-direct"
+    ));
 
     db.start().await.unwrap();
     let entry = db.lookup_registry.get_entry("dimensions");
@@ -3817,6 +3877,13 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
         Some(laminar_sql::datafusion::RegisteredLookup::Partial(ref state))
             if state.source.is_some()
     ));
+    let observed_config = observed_config.lock();
+    let observed_config = observed_config
+        .as_ref()
+        .expect("lookup factory was invoked");
+    assert_eq!(observed_config.connector_type(), "mock-direct");
+    assert_eq!(observed_config.get("connection"), Some("endpoint=test"));
+    assert_eq!(observed_config.get("provider.fetch.mode"), Some("fast"));
     db.shutdown().await.unwrap();
 }
 

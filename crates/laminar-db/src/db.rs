@@ -2340,7 +2340,7 @@ impl LaminarDB {
         &self,
         info: laminar_sql::planner::LookupTableInfo,
     ) -> Result<ExecuteResult, DbError> {
-        use laminar_sql::parser::lookup_table::ConnectorType;
+        use laminar_sql::parser::lookup_table::LookupConnector;
 
         self.preflight_lookup_connector(&info.properties)?;
         if info.primary_key.len() != 1 {
@@ -2354,7 +2354,7 @@ impl LaminarDB {
             .write()
             .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
 
-        if !matches!(info.properties.connector, ConnectorType::Static) {
+        if matches!(&info.properties.connector, LookupConnector::External(_)) {
             self.register_lookup_connector(&info, &pk);
         }
 
@@ -2407,7 +2407,7 @@ impl LaminarDB {
         &self,
         properties: &laminar_sql::parser::lookup_table::LookupTableProperties,
     ) -> Result<(), DbError> {
-        use laminar_sql::parser::lookup_table::{ConnectorType, LookupStrategy};
+        use laminar_sql::parser::lookup_table::{LookupConnector, LookupStrategy};
 
         if properties.strategy == LookupStrategy::OnDemand
             && self.config.delivery_guarantee
@@ -2419,24 +2419,24 @@ impl LaminarDB {
                     .into(),
             ));
         }
-        if matches!(properties.connector, ConnectorType::Static) {
-            if properties.strategy == LookupStrategy::OnDemand {
-                return Err(DbError::InvalidOperation(
-                    "static LOOKUP TABLE supports only the replicated strategy".into(),
-                ));
+        let connector = match &properties.connector {
+            LookupConnector::Static => {
+                if properties.strategy == LookupStrategy::OnDemand {
+                    return Err(DbError::InvalidOperation(
+                        "static LOOKUP TABLE supports only the replicated strategy".into(),
+                    ));
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-
-        let connector =
-            crate::connector_manager::normalize_connector_type(&properties.connector.to_string());
+            LookupConnector::External(name) => name,
+        };
         let (available, capability) = match properties.strategy {
             LookupStrategy::Replicated => (
-                self.connector_registry.has_table_source(&connector),
+                self.connector_registry.has_table_source(connector),
                 "snapshot-capable table source",
             ),
             LookupStrategy::OnDemand => (
-                self.connector_registry.has_lookup_source(&connector),
+                self.connector_registry.has_lookup_source(connector),
                 "on-demand lookup source",
             ),
         };
@@ -2451,22 +2451,16 @@ impl LaminarDB {
     }
 
     fn register_lookup_connector(&self, info: &laminar_sql::planner::LookupTableInfo, pk: &str) {
-        use laminar_sql::parser::lookup_table::ConnectorType;
+        use laminar_sql::parser::lookup_table::LookupConnector;
 
-        let connector_type_str = match &info.properties.connector {
-            ConnectorType::Postgres => "postgres",
-            ConnectorType::Redis => "redis",
-            ConnectorType::S3Parquet => "s3-parquet",
-            ConnectorType::DeltaLake => "delta-lake",
-            ConnectorType::Custom(s) => s.as_str(),
-            ConnectorType::Static => unreachable!(),
+        let connector_type = match &info.properties.connector {
+            LookupConnector::External(name) => name.clone(),
+            LookupConnector::Static => unreachable!(),
         };
-        let connector_type_str =
-            crate::connector_manager::normalize_connector_type(connector_type_str);
 
         self.table_store
             .write()
-            .set_connector(&info.name, &connector_type_str);
+            .set_connector(&info.name, &connector_type);
 
         // Keys consumed by LookupTableProperties are excluded; "format.*" keys
         // go to format_options with the prefix stripped.
@@ -2508,7 +2502,7 @@ impl LaminarDB {
             .register_table(crate::connector_manager::TableRegistration {
                 name: info.name.clone(),
                 primary_key: pk.to_string(),
-                connector_type: Some(connector_type_str),
+                connector_type: Some(connector_type),
                 connector_options,
                 format: info.raw_options.get("format").cloned(),
                 format_options,

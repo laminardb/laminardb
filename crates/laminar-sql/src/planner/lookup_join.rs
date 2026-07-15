@@ -258,20 +258,6 @@ fn scan_table_name(plan: &LogicalPlan) -> Option<String> {
     scan_table_name_and_alias(plan).map(|(name, _)| name)
 }
 
-/// Display helpers for connector/strategy/pushdown types.
-impl fmt::Display for crate::parser::lookup_table::ConnectorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Postgres => write!(f, "postgres"),
-            Self::Redis => write!(f, "redis"),
-            Self::S3Parquet => write!(f, "s3-parquet"),
-            Self::DeltaLake => write!(f, "delta-lake"),
-            Self::Static => write!(f, "static"),
-            Self::Custom(s) => write!(f, "{s}"),
-        }
-    }
-}
-
 impl fmt::Display for crate::parser::lookup_table::LookupStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -296,7 +282,7 @@ mod tests {
     use super::*;
     use crate::datafusion::create_session_context;
     use crate::parser::lookup_table::{
-        ConnectorType, LookupStrategy, LookupTableProperties, PushdownMode,
+        LookupConnector, LookupStrategy, LookupTableProperties, PushdownMode,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
@@ -316,8 +302,7 @@ mod tests {
             ],
             primary_key: vec!["id".to_string()],
             properties: LookupTableProperties {
-                connector: ConnectorType::Postgres,
-                connection: Some("postgresql://localhost/db".to_string()),
+                connector: LookupConnector::External("catalog-source".into()),
                 strategy: LookupStrategy::Replicated,
                 cache_memory: None,
                 cache_ttl: None,
@@ -435,11 +420,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fmt_display_connector_type() {
-        assert_eq!(ConnectorType::Postgres.to_string(), "postgres");
-        assert_eq!(ConnectorType::Redis.to_string(), "redis");
+    fn test_fmt_display_lookup_connector() {
+        assert_eq!(LookupConnector::Static.to_string(), "static");
         assert_eq!(
-            ConnectorType::Custom("my-conn".into()).to_string(),
+            LookupConnector::External("my-conn".into()).to_string(),
             "my-conn"
         );
     }
