@@ -5,15 +5,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::BinaryBuilder;
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::builder::{BinaryBuilder, LargeBinaryBuilder};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, SchemaRef};
 
 use crate::error::ConnectorError;
 use crate::schema::csv::{CsvDecoder, CsvDecoderConfig};
 use crate::schema::json::decoder::{JsonDecoder, JsonDecoderConfig};
-use crate::schema::traits::FormatDecoder;
-use crate::schema::types::RawRecord;
 
 use super::source_config::MessageFormat;
 
@@ -23,7 +21,7 @@ pub struct MessageParser {
     schema: SchemaRef,
     /// The message format.
     format: MessageFormat,
-    /// Type-aware JSON decoder (set for JSON/JsonLines formats).
+    /// Type-aware JSON decoder (set for JSON format).
     json_decoder: Option<JsonDecoder>,
     /// Type-aware CSV decoder (set for CSV format).
     csv_decoder: Option<CsvDecoder>,
@@ -38,9 +36,7 @@ impl MessageParser {
         decoder_config: JsonDecoderConfig,
     ) -> Self {
         let json_decoder = match &format {
-            MessageFormat::Json | MessageFormat::JsonLines => {
-                Some(JsonDecoder::with_config(schema.clone(), decoder_config))
-            }
+            MessageFormat::Json => Some(JsonDecoder::with_config(schema.clone(), decoder_config)),
             _ => None,
         };
         let csv_decoder = match &format {
@@ -69,10 +65,40 @@ impl MessageParser {
         }
     }
 
-    /// Returns the output schema.
-    #[must_use]
-    pub fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    /// Validates format-specific requirements against the declared schema.
+    ///
+    /// Binary messages map one frame to one row, so the schema must contain
+    /// exactly one `Binary` or `LargeBinary` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::SchemaMismatch` when the schema cannot
+    /// represent the configured message format without coercion.
+    pub fn validate_format_schema(
+        schema: &SchemaRef,
+        format: &MessageFormat,
+    ) -> Result<(), ConnectorError> {
+        if !matches!(format, MessageFormat::Binary) {
+            return Ok(());
+        }
+
+        if schema.fields().len() != 1 {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "WebSocket binary format requires exactly one Binary or LargeBinary field, got {} fields",
+                schema.fields().len()
+            )));
+        }
+
+        let field = schema.field(0);
+        if !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "WebSocket binary field '{}' must be Binary or LargeBinary, got {}",
+                field.name(),
+                field.data_type()
+            )));
+        }
+
+        Ok(())
     }
 
     /// Parses a batch of raw message payloads into a `RecordBatch`.
@@ -80,13 +106,30 @@ impl MessageParser {
     /// # Errors
     ///
     /// Returns `ConnectorError::Serde` if parsing fails.
+    #[cfg(test)]
     pub fn parse_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
+        self.parse_batch_bounded(messages, usize::MAX)
+    }
+
+    /// Parses messages while bounding the number of produced Arrow rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::Serde` if parsing fails or JSON expansion
+    /// exceeds `max_rows`.
+    pub fn parse_batch_bounded(
+        &self,
+        messages: &[&[u8]],
+        max_rows: usize,
+    ) -> Result<RecordBatch, ConnectorError> {
+        Self::validate_format_schema(&self.schema, &self.format)?;
+
         if messages.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
         match &self.format {
-            MessageFormat::Json | MessageFormat::JsonLines => self.parse_json_batch(messages),
+            MessageFormat::Json => self.parse_json_batch(messages, max_rows),
             MessageFormat::Binary => self.parse_binary_batch(messages),
             MessageFormat::Csv { .. } => self.parse_csv_batch(messages),
         }
@@ -96,35 +139,59 @@ impl MessageParser {
     ///
     /// Uses the type-aware [`JsonDecoder`] to coerce JSON values to the
     /// Arrow types declared in the schema.
-    fn parse_json_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
+    fn parse_json_batch(
+        &self,
+        messages: &[&[u8]],
+        max_rows: usize,
+    ) -> Result<RecordBatch, ConnectorError> {
         let decoder = self.json_decoder.as_ref().ok_or_else(|| {
             ConnectorError::Internal("json_decoder not initialized for JSON format".into())
         })?;
-        let records: Vec<RawRecord> = messages
-            .iter()
-            .map(|m| RawRecord::new(m.to_vec()))
-            .collect();
-        decoder.decode_batch(&records).map_err(ConnectorError::from)
+        decoder
+            .decode_slices_bounded(messages, max_rows)
+            .map_err(ConnectorError::from)
     }
 
-    /// Parses binary messages — each message becomes a single row with a
-    /// `LargeBinary` column named "payload".
-    #[allow(clippy::unused_self)]
+    /// Parses binary messages into the single declared binary field.
     fn parse_binary_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
-        let mut builder =
-            BinaryBuilder::with_capacity(messages.len(), messages.iter().map(|m| m.len()).sum());
-        for msg in messages {
-            builder.append_value(msg);
-        }
+        let total_bytes = messages.iter().try_fold(0_usize, |total, message| {
+            total.checked_add(message.len()).ok_or_else(|| {
+                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(
+                    "WebSocket binary batch size overflow".into(),
+                ))
+            })
+        })?;
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "payload",
-            DataType::Binary,
-            false,
-        )]));
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = vec![Arc::new(builder.finish())];
+        let array: ArrayRef = match self.schema.field(0).data_type() {
+            DataType::Binary => {
+                if total_bytes > i32::MAX as usize {
+                    return Err(ConnectorError::Serde(
+                        crate::error::SerdeError::MalformedInput(format!(
+                            "WebSocket binary batch contains {total_bytes} bytes, exceeding the Binary offset limit; declare LargeBinary"
+                        )),
+                    ));
+                }
+                let mut builder = BinaryBuilder::with_capacity(messages.len(), total_bytes);
+                for message in messages {
+                    builder.append_value(message);
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::LargeBinary => {
+                let mut builder = LargeBinaryBuilder::with_capacity(messages.len(), total_bytes);
+                for message in messages {
+                    builder.append_value(message);
+                }
+                Arc::new(builder.finish())
+            }
+            _ => {
+                return Err(ConnectorError::Internal(
+                    "binary schema was not validated before parsing".into(),
+                ));
+            }
+        };
 
-        RecordBatch::try_new(schema, arrays).map_err(|e| {
+        RecordBatch::try_new(self.schema.clone(), vec![array]).map_err(|e| {
             ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
                 "failed to build binary RecordBatch: {e}"
             )))
@@ -138,113 +205,17 @@ impl MessageParser {
         let decoder = self.csv_decoder.as_ref().ok_or_else(|| {
             ConnectorError::Internal("csv_decoder not initialized for CSV format".into())
         })?;
-        let records: Vec<RawRecord> = messages
-            .iter()
-            .map(|m| RawRecord::new(m.to_vec()))
-            .collect();
-        decoder.decode_batch(&records).map_err(ConnectorError::from)
+        decoder
+            .decode_slices(messages)
+            .map_err(ConnectorError::from)
     }
-}
-
-/// Max event time (epoch ms) from a named `Timestamp(_)` column.
-/// `Ok(None)` when every row is null.
-///
-/// # Errors
-///
-/// `SchemaMismatch` if `field` is missing or isn't a `Timestamp(_)`.
-pub fn extract_max_event_time(
-    batch: &RecordBatch,
-    field: &str,
-) -> Result<Option<i64>, ConnectorError> {
-    let col_idx = batch.schema().index_of(field).map_err(|_| {
-        ConnectorError::SchemaMismatch(format!(
-            "event-time column '{field}' not found in batch schema"
-        ))
-    })?;
-    let arr = laminar_core::time::cast_to_millis_array(batch.column(col_idx).as_ref())
-        .map_err(|e| ConnectorError::SchemaMismatch(format!("event-time column '{field}': {e}")))?;
-    Ok((0..arr.len())
-        .filter(|&i| !arr.is_null(i))
-        .map(|i| arr.value(i))
-        .max())
-}
-
-/// Creates a default schema for JSON messages when no explicit schema is provided.
-///
-/// Uses schema inference from the first message. If `json_path` is provided,
-/// navigates into the object before inferring fields.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::Serde` if the sample is not valid UTF-8 or valid JSON,
-/// or if the top-level value is not a JSON object.
-pub fn infer_schema_from_json(sample: &[u8]) -> Result<SchemaRef, ConnectorError> {
-    infer_schema_from_json_with_path(sample, None)
-}
-
-/// Like [`infer_schema_from_json`] but navigates a `json.path` first.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::Serde` if the sample is not valid UTF-8 or valid JSON,
-/// if a path segment is not found, or if the target is not a JSON object.
-pub fn infer_schema_from_json_with_path(
-    sample: &[u8],
-    json_path: Option<&[String]>,
-) -> Result<SchemaRef, ConnectorError> {
-    let text = std::str::from_utf8(sample).map_err(|e| {
-        ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
-            "invalid UTF-8: {e}"
-        )))
-    })?;
-
-    let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| ConnectorError::Serde(crate::error::SerdeError::Json(e.to_string())))?;
-
-    let target = if let Some(path) = json_path {
-        let mut current = &value;
-        for segment in path {
-            current = current.get(segment.as_str()).ok_or_else(|| {
-                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
-                    "json.path segment '{segment}' not found during inference"
-                )))
-            })?;
-        }
-        current
-    } else {
-        &value
-    };
-
-    let obj = target.as_object().ok_or_else(|| {
-        ConnectorError::Serde(crate::error::SerdeError::MalformedInput(
-            "schema inference requires a JSON object".into(),
-        ))
-    })?;
-
-    let fields: Vec<Field> = obj
-        .iter()
-        .map(|(key, val)| {
-            let dt = match val {
-                serde_json::Value::Bool(_) => DataType::Boolean,
-                serde_json::Value::Number(n) => {
-                    if n.is_f64() {
-                        DataType::Float64
-                    } else {
-                        DataType::Int64
-                    }
-                }
-                _ => DataType::Utf8,
-            };
-            Field::new(key, dt, true)
-        })
-        .collect();
-
-    Ok(Arc::new(Schema::new(fields)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Array;
+    use arrow_schema::{Field, Schema};
 
     fn json_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -268,6 +239,26 @@ mod tests {
         let batch = parser.parse_batch(&messages).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn json_explode_cannot_exceed_the_actor_row_budget() {
+        let parser = MessageParser::new(
+            json_schema(),
+            MessageFormat::Json,
+            JsonDecoderConfig {
+                json_explode: Some(vec!["id".into(), "value".into()]),
+                ..JsonDecoderConfig::default()
+            },
+        );
+        let message = br#"[["1","a"],["2","b"],["3","c"]]"#;
+
+        let error = parser
+            .parse_batch_bounded(&[message], 2)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("2-row batch limit"), "{error}");
     }
 
     #[test]
@@ -300,16 +291,91 @@ mod tests {
     #[test]
     fn test_parse_binary_batch() {
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "payload",
+            "frame",
             DataType::Binary,
             false,
         )]));
-        let parser =
-            MessageParser::new(schema, MessageFormat::Binary, JsonDecoderConfig::default());
+        let parser = MessageParser::new(
+            schema.clone(),
+            MessageFormat::Binary,
+            JsonDecoderConfig::default(),
+        );
         let messages: Vec<&[u8]> = vec![b"hello", b"world"];
 
         let batch = parser.parse_batch(&messages).unwrap();
         assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.schema(), schema);
+        let frames = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        assert_eq!(frames.value(0), b"hello");
+        assert_eq!(frames.value(1), b"world");
+    }
+
+    #[test]
+    fn test_parse_large_binary_preserves_declared_schema() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "packet",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let parser = MessageParser::new(
+            schema.clone(),
+            MessageFormat::Binary,
+            JsonDecoderConfig::default(),
+        );
+        let messages: Vec<&[u8]> = vec![b"one", b"two"];
+
+        let batch = parser.parse_batch(&messages).unwrap();
+
+        assert_eq!(batch.schema(), schema);
+        let packets = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(packets.value(0), b"one");
+        assert_eq!(packets.value(1), b"two");
+    }
+
+    #[test]
+    fn test_binary_format_rejects_ambiguous_or_non_binary_schemas() {
+        let schemas = [
+            Arc::new(Schema::empty()),
+            Arc::new(Schema::new(vec![
+                Field::new("first", DataType::Binary, false),
+                Field::new("second", DataType::Binary, false),
+            ])),
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                false,
+            )])),
+        ];
+
+        for schema in schemas {
+            let error =
+                MessageParser::validate_format_schema(&schema, &MessageFormat::Binary).unwrap_err();
+            assert!(matches!(error, ConnectorError::SchemaMismatch(_)));
+        }
+    }
+
+    #[test]
+    fn test_invalid_binary_schema_fails_even_for_empty_input() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let parser =
+            MessageParser::new(schema, MessageFormat::Binary, JsonDecoderConfig::default());
+
+        assert!(matches!(
+            parser.parse_batch(&[]),
+            Err(ConnectorError::SchemaMismatch(_))
+        ));
     }
 
     #[test]
@@ -401,81 +467,5 @@ mod tests {
             .downcast_ref::<arrow_array::Float64Array>()
             .unwrap();
         assert!((prices.value(0) - 187.52).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_infer_schema() {
-        let sample = br#"{"name": "Alice", "age": 30, "active": true, "score": 99.5}"#;
-        let schema = infer_schema_from_json(sample).unwrap();
-
-        assert_eq!(schema.fields().len(), 4);
-        let age_field = schema.field_with_name("age").unwrap();
-        assert_eq!(age_field.data_type(), &DataType::Int64);
-        let active_field = schema.field_with_name("active").unwrap();
-        assert_eq!(active_field.data_type(), &DataType::Boolean);
-        let score_field = schema.field_with_name("score").unwrap();
-        assert_eq!(score_field.data_type(), &DataType::Float64);
-    }
-
-    #[test]
-    fn test_extract_max_event_time_millis() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
-            false,
-        )]));
-        let ts = arrow_array::TimestampMillisecondArray::from(vec![1000, 3000, 2000]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
-
-        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3000));
-    }
-
-    #[test]
-    fn test_extract_max_event_time_nanos_rescaled() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
-            false,
-        )]));
-        let ts = arrow_array::TimestampNanosecondArray::from(vec![
-            1_000_000_000,
-            3_000_000_000,
-            2_000_000_000,
-        ]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
-
-        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3_000));
-    }
-
-    #[test]
-    fn test_extract_max_event_time_missing_column_errors() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ids = arrow_array::Int64Array::from(vec![1, 2, 3]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap();
-
-        assert!(extract_max_event_time(&batch, "ts").is_err());
-    }
-
-    #[test]
-    fn test_extract_max_event_time_non_timestamp_column_errors() {
-        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
-        let ts = arrow_array::Int64Array::from(vec![1, 2, 3]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
-
-        assert!(extract_max_event_time(&batch, "ts").is_err());
-    }
-
-    #[test]
-    fn test_extract_max_event_time_with_nulls() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
-            true,
-        )]));
-        let ts =
-            arrow_array::TimestampMillisecondArray::from(vec![Some(1000), None, Some(3000), None]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
-
-        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3000));
     }
 }

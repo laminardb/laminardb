@@ -1623,20 +1623,20 @@ max_out_of_orderness = "5s"</code></pre>
       <h3 id="websocket-source">WebSocket Source</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/websocket/source.rs" target="_blank" rel="noopener">websocket/source.rs</a></div>
 
-      <p><strong>Note:</strong> WebSocket is non-replayable and therefore requires pipeline-wide <code>best_effort</code>. A failure can lose accepted messages; stronger guarantees fail admission.</p>
+      <p><strong>Note:</strong> WebSocket is non-replayable and therefore requires pipeline-wide <code>best_effort</code>. Reconnects can create gaps or duplicates; stronger guarantees fail admission.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">mode</td><td class="field-default">client</td><td>client (connect out) or server (accept connections)</td></tr>
-          <tr><td class="field-name">url</td><td></td><td>WebSocket URL (client mode, comma-separated for multi)</td></tr>
-          <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, binary, csv</td></tr>
-          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after handshake (client mode)</td></tr>
-          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect (client mode)</td></tr>
+          <tr><td class="field-name">url</td><td><span class="field-required">required</span></td><td>WebSocket URL (comma-separated in failover order)</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, or binary</td></tr>
+          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after each handshake</td></tr>
+          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect</td></tr>
+          <tr><td class="field-name">reconnect.initial.delay.ms</td><td class="field-default">100</td><td>Initial reconnect delay</td></tr>
           <tr><td class="field-name">reconnect.max.delay.ms</td><td class="field-default">30000</td><td>Max backoff delay</td></tr>
-          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Keepalive ping interval</td></tr>
-          <tr><td class="field-name">auth.type</td><td></td><td>bearer, basic, hmac</td></tr>
+          <tr><td class="field-name">reconnect.max.retries</td><td></td><td>Maximum reconnect attempts; empty means unlimited</td></tr>
+          <tr><td class="field-name">on.backpressure</td><td class="field-default">block</td><td>block or drop_newest</td></tr>
+          <tr><td class="field-name">max.message.size</td><td class="field-default">67108864</td><td>Maximum accepted message size in bytes</td></tr>
         </tbody>
       </table>
 
@@ -1650,12 +1650,13 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">mode</td><td class="field-default">server</td><td>server (accept clients) or client (push to remote)</td></tr>
           <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
           <tr><td class="field-name">url</td><td></td><td>Remote URL (client mode)</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, arrow_ipc, binary</td></tr>
           <tr><td class="field-name">max.connections</td><td class="field-default">10000</td><td>Max concurrent clients (server mode)</td></tr>
-          <tr><td class="field-name">slow.client.policy</td><td class="field-default">drop_oldest</td><td>drop_oldest, drop_newest, disconnect</td></tr>
-          <tr><td class="field-name">replay.buffer.size</td><td></td><td>Messages replayed to new clients</td></tr>
+          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Ping interval (server mode)</td></tr>
+          <tr><td class="field-name">ping.timeout.ms</td><td class="field-default">10000</td><td>Pong timeout (server mode)</td></tr>
         </tbody>
       </table>
+
+      <p>Client mode sends one schema-encoded JSON row per text frame. Server-mode clients must first send <code>{"action":"subscribe"}</code>; the server replies with a subscription ID and then emits <code>{"type":"data","data":[...],"sequence":N}</code> text frames. Server fan-out uses a shared 32-frame ring with 256 KiB frames; an oversized row or burst is rejected before publication, and a lagging subscriber is disconnected so sequence gaps remain visible. The built-in server does not terminate TLS or authenticate clients; expose it only on a trusted network or behind an authenticated TLS reverse proxy.</p>
 
       <!-- FILE SOURCE -->
       <h3 id="file-source">File Source (Auto-Loader)</h3>

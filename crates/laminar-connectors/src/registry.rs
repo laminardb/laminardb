@@ -17,10 +17,15 @@ use crate::serde::{self, Format, RecordDeserializer, RecordSerializer};
 
 /// Factory function type for creating source connectors.
 ///
-/// The optional `&prometheus::Registry` allows connectors to register
-/// their metrics on the shared Prometheus registry when one is available.
-pub type SourceFactory =
-    Arc<dyn Fn(Option<&prometheus::Registry>) -> Box<dyn SourceConnector> + Send + Sync>;
+/// The optional shared Prometheus registry allows connectors to register
+/// metrics and retain stable registry identity when one is available.
+/// Construction failures, including metrics registration errors, are returned
+/// to the caller.
+pub type SourceFactory = Arc<
+    dyn Fn(Option<&Arc<prometheus::Registry>>) -> Result<Box<dyn SourceConnector>, ConnectorError>
+        + Send
+        + Sync,
+>;
 
 /// Factory function type for creating sink connectors.
 ///
@@ -28,12 +33,12 @@ pub type SourceFactory =
 /// select a concrete implementation and reject invalid mode-specific options
 /// before `open()` performs external I/O.
 ///
-/// The optional `&prometheus::Registry` allows connectors to register
-/// their metrics on the shared Prometheus registry when one is available.
+/// The optional shared Prometheus registry allows connectors to register
+/// metrics and retain stable registry identity when one is available.
 pub type SinkFactory = Arc<
     dyn Fn(
             &ConnectorConfig,
-            Option<&prometheus::Registry>,
+            Option<&Arc<prometheus::Registry>>,
         ) -> Result<Box<dyn SinkConnector>, ConnectorError>
         + Send
         + Sync,
@@ -284,9 +289,10 @@ impl ConnectorRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`ConnectorError`] from
-    /// [`SourceConnector::discover_schema`] when discovery fails (bad
-    /// config, unreachable network endpoint, timeout, etc.).
+    /// Returns the source factory's construction error or the underlying
+    /// [`ConnectorError`] from [`SourceConnector::discover_schema`] when
+    /// discovery fails (bad config, unreachable network endpoint, timeout,
+    /// etc.).
     pub async fn default_source_schema(
         &self,
         connector_type: &str,
@@ -300,7 +306,7 @@ impl ConnectorRegistry {
             factory.clone()
         };
 
-        let mut instance = factory(None);
+        let mut instance = factory(None)?;
         instance.discover_schema(properties).await?;
         let schema = instance.schema();
         Ok((!schema.fields().is_empty()).then_some(schema))
@@ -316,11 +322,12 @@ impl ConnectorRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` if not registered.
+    /// Returns `ConnectorError::ConfigurationError` if not registered, or the
+    /// source factory's construction error.
     pub fn create_source(
         &self,
         config: &ConnectorConfig,
-        registry: Option<&prometheus::Registry>,
+        registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
         let sources = self.sources.read();
         let (_, factory) = sources.get(config.connector_type()).ok_or_else(|| {
@@ -329,7 +336,7 @@ impl ConnectorRegistry {
                 config.connector_type()
             ))
         })?;
-        Ok(factory(registry))
+        factory(registry)
     }
 
     /// Derive a registered source connector's semantic recovery identity.
@@ -364,7 +371,7 @@ impl ConnectorRegistry {
     pub fn create_sink(
         &self,
         config: &ConnectorConfig,
-        registry: Option<&prometheus::Registry>,
+        registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Box<dyn SinkConnector>, ConnectorError> {
         let sinks = self.sinks.read();
         let (_, factory) = sinks.get(config.connector_type()).ok_or_else(|| {
@@ -602,7 +609,9 @@ mod tests {
             .register_source(
                 "mock",
                 mock_info("mock", true, false),
-                Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(MockSourceConnector::new()))
+                }),
             )
             .unwrap();
 
@@ -629,6 +638,49 @@ mod tests {
         let config = ConnectorConfig::new("mock");
         let connector = registry.create_sink(&config, None);
         assert!(connector.is_ok());
+    }
+
+    #[test]
+    fn factories_receive_shared_registry_identity() {
+        let connectors = ConnectorRegistry::new();
+        let metrics = Arc::new(prometheus::Registry::new());
+
+        let source_metrics = Arc::clone(&metrics);
+        connectors
+            .register_source(
+                "identity-source",
+                mock_info("identity-source", true, false),
+                Arc::new(move |registry: Option<&Arc<prometheus::Registry>>| {
+                    assert!(
+                        registry.is_some_and(|registry| { Arc::ptr_eq(registry, &source_metrics) })
+                    );
+                    Ok(Box::new(MockSourceConnector::new()))
+                }),
+            )
+            .unwrap();
+
+        let sink_metrics = Arc::clone(&metrics);
+        connectors
+            .register_sink(
+                "identity-sink",
+                mock_info("identity-sink", false, true),
+                Arc::new(
+                    move |_config, registry: Option<&Arc<prometheus::Registry>>| {
+                        assert!(
+                            registry.is_some_and(|registry| Arc::ptr_eq(registry, &sink_metrics))
+                        );
+                        Ok(Box::new(MockSinkConnector::new()))
+                    },
+                ),
+            )
+            .unwrap();
+
+        connectors
+            .create_source(&ConnectorConfig::new("identity-source"), Some(&metrics))
+            .expect("source factory must receive the shared registry Arc");
+        connectors
+            .create_sink(&ConnectorConfig::new("identity-sink"), Some(&metrics))
+            .expect("sink factory must receive the shared registry Arc");
     }
 
     struct RejectLookupFactory;
@@ -694,7 +746,9 @@ mod tests {
             .register_source(
                 "kafka",
                 mock_info("kafka", true, false),
-                Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(MockSourceConnector::new()))
+                }),
             )
             .unwrap();
         registry
@@ -721,7 +775,9 @@ mod tests {
             .register_source(
                 "kafka",
                 mock_info("kafka", true, false),
-                Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(MockSourceConnector::new()))
+                }),
             )
             .unwrap();
 
@@ -748,7 +804,9 @@ mod tests {
             .register_source(
                 "mock",
                 mock_info("mock", true, false),
-                Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(MockSourceConnector::new()))
+                }),
             )
             .unwrap();
         let schema = registry
@@ -766,6 +824,43 @@ mod tests {
             .await
             .expect("unknown connector is Ok(None), not Err")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn source_factory_errors_propagate_from_creation_and_discovery() {
+        let registry = ConnectorRegistry::new();
+        registry
+            .register_source(
+                "failing",
+                mock_info("failing", true, false),
+                Arc::new(
+                    |_: Option<&Arc<prometheus::Registry>>| -> Result<
+                        Box<dyn SourceConnector>,
+                        ConnectorError,
+                    > {
+                        Err(ConnectorError::Internal(
+                            "source construction failed".into(),
+                        ))
+                    },
+                ),
+            )
+            .unwrap();
+
+        let config = ConnectorConfig::new("failing");
+        let Err(create_error) = registry.create_source(&config, None) else {
+            panic!("source construction must fail");
+        };
+        assert!(create_error
+            .to_string()
+            .contains("source construction failed"));
+
+        let discovery_error = registry
+            .default_source_schema("failing", &std::collections::HashMap::new())
+            .await
+            .expect_err("schema discovery must propagate source construction failure");
+        assert!(discovery_error
+            .to_string()
+            .contains("source construction failed"));
     }
 
     // ── Table source factory tests ──
@@ -835,13 +930,13 @@ mod tests {
     fn duplicate_registration_is_rejected_in_every_category() {
         let registry = ConnectorRegistry::new();
         let source = || {
-            Arc::new(|_: Option<&prometheus::Registry>| {
-                Box::new(MockSourceConnector::new()) as Box<dyn SourceConnector>
+            Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                Ok(Box::new(MockSourceConnector::new()) as Box<dyn SourceConnector>)
             }) as SourceFactory
         };
         let sink = || {
             Arc::new(
-                |_config: &ConnectorConfig, _registry: Option<&prometheus::Registry>| {
+                |_config: &ConnectorConfig, _registry: Option<&Arc<prometheus::Registry>>| {
                     Ok(Box::new(MockSinkConnector::new()) as Box<dyn SinkConnector>)
                 },
             ) as SinkFactory
@@ -910,8 +1005,8 @@ mod tests {
             registry.register_source(
                 "late-source",
                 mock_info("late-source", true, false),
-                Arc::new(|_: Option<&prometheus::Registry>| {
-                    Box::new(MockSourceConnector::new())
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(MockSourceConnector::new()))
                 })
             ),
             Err(ConnectorError::RegistryFrozen { kind: "source", .. })
@@ -971,8 +1066,8 @@ mod tests {
             ]
         };
         let source = || {
-            Arc::new(|_: Option<&prometheus::Registry>| {
-                Box::new(MockSourceConnector::new()) as Box<dyn SourceConnector>
+            Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                Ok(Box::new(MockSourceConnector::new()) as Box<dyn SourceConnector>)
             }) as SourceFactory
         };
 
@@ -1020,7 +1115,9 @@ mod tests {
             .register_source(
                 "secure",
                 info,
-                Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(MockSourceConnector::new()))
+                }),
             )
             .unwrap();
         registry.freeze();

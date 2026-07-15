@@ -7,6 +7,9 @@
 - Removed the experimental tiered-state feature and configuration. Its demotion path could clear
   vnode dirtiness before a checkpoint was durable, then replace newer live groups with bytes from
   the prior durable checkpoint after an attempt failed. It is not a safe keyed-state foundation.
+- Removed WebSocket source-server, replay, connector-owned checkpoint, and connector-owned
+  event-time options. WebSocket sources are client-only and best-effort; event time is declared
+  with SQL `WATERMARK FOR` and decoded against an explicit timestamp schema.
 
 ## [0.22.0]
 

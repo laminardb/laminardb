@@ -2389,7 +2389,7 @@ impl LaminarDB {
             #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
             let mut source = self
                 .connector_registry
-                .create_source(&config, prom_registry.as_deref())
+                .create_source(&config, prom_registry.as_ref())
                 .map_err(|e| {
                     DbError::Connector(format!(
                         "Cannot create source '{}' (type '{}'): {e}",
@@ -2442,16 +2442,6 @@ impl LaminarDB {
                         ))
                     })?;
             }
-            // WebSocket extraction can synthesize event time from an inbound JSON field. Kafka
-            // uses the SQL `WATERMARK FOR` declaration as its single event-time authority.
-            if let Some(entry) = self.catalog.get_source(name) {
-                if entry.source.event_time_column().is_none() {
-                    if let Some(col) = config.get("event.time.field") {
-                        entry.source.set_event_time_column(col);
-                    }
-                }
-            }
-
             sources.push(SourceRegistration {
                 name: name.clone(),
                 connector: source,
@@ -2602,7 +2592,7 @@ impl LaminarDB {
             }
             let sink = self
                 .connector_registry
-                .create_sink(&config, prom_registry.as_deref())
+                .create_sink(&config, prom_registry.as_ref())
                 .map_err(|e| {
                     DbError::Connector(format!(
                         "Cannot create sink '{}' (type '{}'): {e}",
@@ -3264,8 +3254,7 @@ impl LaminarDB {
             }
         }
 
-        // Fallback watermark path for sources that use the programmatic API
-        // or connector properties instead of `WATERMARK FOR`.
+        // Fallback watermark path for sources configured through the programmatic API.
         for name in self.catalog.list_sources() {
             if watermark_states.contains_key(&name) {
                 continue;
@@ -5961,7 +5950,7 @@ mod cluster_fault_watcher_tests {
                         is_sink: false,
                         config_keys: vec![],
                     },
-                    Arc::new(|_| Box::new(IdleClusterTestSource)),
+                    Arc::new(|_| Ok(Box::new(IdleClusterTestSource))),
                 )?;
                 registry.register_source(
                     "rejecting-splittable-test",
@@ -5973,7 +5962,7 @@ mod cluster_fault_watcher_tests {
                         is_sink: false,
                         config_keys: vec![],
                     },
-                    Arc::new(|_| Box::new(RejectingSplittableSource)),
+                    Arc::new(|_| Ok(Box::new(RejectingSplittableSource))),
                 )
             })
             .build()

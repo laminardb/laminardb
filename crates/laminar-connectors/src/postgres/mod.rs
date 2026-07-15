@@ -79,9 +79,10 @@ pub fn register_postgres_sink(
     registry.register_sink(
         "postgres-sink",
         info,
-        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+        Arc::new(|config, registry: Option<&Arc<prometheus::Registry>>| {
             Ok(Box::new(PostgresSink::from_connector_config(
-                config, registry,
+                config,
+                registry.map(Arc::as_ref),
             )?))
         }),
     )

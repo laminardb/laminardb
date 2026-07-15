@@ -187,7 +187,8 @@ pub async fn run_server(
     ]));
     let engine_metrics = Arc::new(EngineMetrics::new(&registry));
     db.set_engine_metrics(Arc::clone(&engine_metrics));
-    db.set_prometheus_registry(Arc::clone(&registry));
+    db.set_prometheus_registry(Arc::clone(&registry))
+        .map_err(|error| ServerError::Start(error.to_string()))?;
 
     execute_config_ddl(&db, &config, false).await?;
 

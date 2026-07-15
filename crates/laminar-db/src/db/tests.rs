@@ -2114,8 +2114,10 @@ async fn test_builder_register_connector() {
                     is_sink: false,
                     config_keys: vec![],
                 },
-                Arc::new(|_: Option<&prometheus::Registry>| {
-                    Box::new(laminar_connectors::testing::MockSourceConnector::new())
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(
+                        laminar_connectors::testing::MockSourceConnector::new(),
+                    ))
                 }),
             )
         })
@@ -2138,8 +2140,10 @@ async fn test_builder_register_connector() {
             is_sink: false,
             config_keys: vec![],
         },
-        Arc::new(|_: Option<&prometheus::Registry>| {
-            Box::new(laminar_connectors::testing::MockSourceConnector::new())
+        Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(
+                laminar_connectors::testing::MockSourceConnector::new(),
+            ))
         }),
     );
     assert!(matches!(
@@ -2163,8 +2167,10 @@ async fn builder_rejects_custom_replacement_of_builtin_connector() {
                     is_sink: false,
                     config_keys: vec![],
                 },
-                Arc::new(|_: Option<&prometheus::Registry>| {
-                    Box::new(laminar_connectors::testing::MockSourceConnector::new())
+                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(
+                        laminar_connectors::testing::MockSourceConnector::new(),
+                    ))
                 }),
             )
         })
@@ -2338,12 +2344,12 @@ async fn fake_source_db(
                     is_sink: false,
                     config_keys: vec![],
                 },
-                Arc::new(move |_: Option<&prometheus::Registry>| {
-                    Box::new(FakeSource {
+                Arc::new(move |_: Option<&Arc<prometheus::Registry>>| {
+                    Ok(Box::new(FakeSource {
                         schema: Arc::new(ArrowSchema::empty()),
                         on_discover: discovered.clone(),
                         counter: Arc::clone(&counter),
-                    })
+                    }))
                 }),
             )
         })
@@ -2427,12 +2433,12 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
                         config_keys: vec![],
                     },
                     Arc::new(move |_| {
-                        Box::new(GatedSource {
+                        Ok(Box::new(GatedSource {
                             schema: Arc::clone(&schema),
                             entered: Arc::clone(&entered),
                             release: Arc::clone(&release),
                             discovered_once: Arc::clone(&discovered_once),
-                        })
+                        }))
                     }),
                 )
             }
@@ -6712,10 +6718,10 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
                         config_keys: vec![],
                     },
                     Arc::new(move |_| {
-                        Box::new(CapturingSource {
+                        Ok(Box::new(CapturingSource {
                             schema: Arc::clone(&schema),
                             observed: Arc::clone(&observed),
-                        })
+                        }))
                     }),
                 )
             }
@@ -6781,7 +6787,9 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
                         },
                         Arc::new(move |_| {
                             factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Box::new(laminar_connectors::testing::MockSourceConnector::new())
+                            Ok(Box::new(
+                                laminar_connectors::testing::MockSourceConnector::new(),
+                            ))
                         }),
                     )
                 }

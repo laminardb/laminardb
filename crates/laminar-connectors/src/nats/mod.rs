@@ -33,7 +33,12 @@ pub fn register_nats_source(
     registry.register_source(
         "nats",
         info,
-        Arc::new(|reg| Box::new(NatsSource::new(Arc::new(Schema::empty()), reg))),
+        Arc::new(|registry| {
+            Ok(Box::new(NatsSource::new(
+                Arc::new(Schema::empty()),
+                registry.map(Arc::as_ref),
+            )))
+        }),
     )
 }
 
@@ -53,7 +58,10 @@ pub fn register_nats_sink(
         "nats",
         info,
         Arc::new(|_config, registry| {
-            Ok(Box::new(NatsSink::new(Arc::new(Schema::empty()), registry)))
+            Ok(Box::new(NatsSink::new(
+                Arc::new(Schema::empty()),
+                registry.map(Arc::as_ref),
+            )))
         }),
     )
 }

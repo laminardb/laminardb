@@ -418,17 +418,9 @@ fn parse_watermark(
             ))
         })?;
 
-    // Check column is a timestamp or integer type (BIGINT is common for Unix millis)
-    if !matches!(
-        col.data_type,
-        DataType::Timestamp(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Int64
-            | DataType::Int32
-    ) {
+    if !matches!(col.data_type, DataType::Timestamp(_, _)) {
         return Err(ParseError::ValidationError(format!(
-            "watermark column '{}' must be a timestamp or integer type, found {:?}",
+            "watermark column '{}' must be a TIMESTAMP, found {:?}",
             column_name, col.data_type
         )));
     }
@@ -729,7 +721,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("timestamp or integer type"));
+            .contains("must be a TIMESTAMP"));
     }
 
     #[test]
@@ -822,19 +814,16 @@ mod tests {
     }
 
     #[test]
-    fn test_source_watermark_bigint_column() {
-        let def = parse_and_translate(
+    fn test_source_watermark_bigint_column_rejected() {
+        let result = parse_and_translate(
             "CREATE SOURCE events (
                 ts BIGINT,
                 WATERMARK FOR ts
             )",
-        )
-        .unwrap();
+        );
 
-        assert!(def.watermark.is_some());
-        let wm = def.watermark.unwrap();
-        assert_eq!(wm.column, "ts");
-        assert_eq!(wm.max_out_of_orderness, Duration::ZERO);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("must be a TIMESTAMP"), "{error}");
     }
 
     #[test]

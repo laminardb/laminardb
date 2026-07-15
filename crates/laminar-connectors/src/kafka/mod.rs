@@ -62,14 +62,14 @@ pub fn register_kafka_source(
     registry.register_source(
         "kafka",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
             // Empty schema — filled in by discover_schema / open() / SQL DDL columns.
             let empty = Arc::new(arrow_schema::Schema::empty());
-            Box::new(KafkaSource::new(
+            Ok(Box::new(KafkaSource::new(
                 empty,
                 KafkaSourceConfig::default(),
-                registry,
-            ))
+                registry.map(Arc::as_ref),
+            )))
         }),
     )
 }
@@ -90,13 +90,13 @@ pub fn register_kafka_sink(
     registry.register_sink(
         "kafka",
         info,
-        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
+        Arc::new(|_config, registry: Option<&Arc<prometheus::Registry>>| {
             // Empty schema — the sink's schema is bound from the upstream query at build time.
             let empty = Arc::new(arrow_schema::Schema::empty());
             Ok(Box::new(KafkaSink::new(
                 empty,
                 KafkaSinkConfig::default(),
-                registry,
+                registry.map(Arc::as_ref),
             )))
         }),
     )

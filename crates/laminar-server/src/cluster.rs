@@ -1373,7 +1373,8 @@ pub async fn start_cluster(
     ]));
     let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
     db.set_engine_metrics(engine_metrics);
-    db.set_prometheus_registry(Arc::clone(&registry));
+    db.set_prometheus_registry(Arc::clone(&registry))
+        .map_err(|error| ClusterStartupError::EngineConstruction(error.to_string()))?;
 
     // Fenced leader lease. Wiring the watch into the controller makes
     // `is_leader()` lease-aware, so every leader-gated path (checkpoint, 2PC,

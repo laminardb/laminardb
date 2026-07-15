@@ -215,7 +215,9 @@ pub fn register_generator_source(registry: &ConnectorRegistry) -> Result<(), Con
     registry.register_source(
         "generator",
         info,
-        Arc::new(|_registry: Option<&prometheus::Registry>| Box::new(GeneratorSource::default())),
+        Arc::new(|_registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(GeneratorSource::default()))
+        }),
     )
 }
 

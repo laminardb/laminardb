@@ -299,7 +299,7 @@ pub fn register_mock_source(registry: &ConnectorRegistry) -> Result<(), Connecto
             is_sink: false,
             config_keys: vec![],
         },
-        Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
+        Arc::new(|_: Option<&Arc<prometheus::Registry>>| Ok(Box::new(MockSourceConnector::new()))),
     )
 }
 

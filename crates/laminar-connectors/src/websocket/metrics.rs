@@ -1,78 +1,81 @@
 //! `WebSocket` source connector metrics.
 //!
-//! [`WebSocketSourceMetrics`] provides prometheus-backed counters and gauges
+//! [`WebSocketSourceMetrics`] provides Prometheus-backed counters
 //! for tracking WebSocket source statistics.
 
-use prometheus::{IntCounter, IntGauge, Registry};
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
+use prometheus::{IntCounter, Registry};
 
-use crate::prom::reg_or_local;
+use crate::error::ConnectorError;
 
-/// Prometheus-backed counters/gauges for WebSocket source connector statistics.
+/// Prometheus-backed counters for WebSocket source connector statistics.
 #[derive(Debug, Clone)]
 pub struct WebSocketSourceMetrics {
     /// Total messages received from the WebSocket connection.
     pub messages_received: IntCounter,
-    /// Total messages dropped due to backpressure.
-    pub messages_dropped_backpressure: IntCounter,
     /// Total bytes received (raw payload, before parsing).
     pub bytes_received: IntCounter,
     /// Total number of reconnection attempts.
     pub reconnect_count: IntCounter,
     /// Total parse/deserialization errors.
     pub parse_errors: IntCounter,
-    /// Total detected sequence gaps (application-level).
-    pub sequence_gaps: IntCounter,
-    /// Current number of connected clients (for server-mode source).
-    pub connected_clients: IntGauge,
+    /// Total ingress messages dropped by the configured backpressure policy.
+    pub backpressure_drops: IntCounter,
 }
 
 impl WebSocketSourceMetrics {
-    /// Creates a new metrics instance with all counters at zero.
+    /// Creates an unregistered metrics family with all counters at zero.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
-    pub fn new(registry: Option<&Registry>) -> Self {
-        let mut local = None;
-        let reg = reg_or_local(registry, &mut local);
-
+    pub fn local() -> Self {
         Self {
-            messages_received: reg.counter(
-                "ws_source_messages_received_total",
-                "Total WS messages received",
-            ),
-            messages_dropped_backpressure: reg.counter(
-                "ws_source_messages_dropped_backpressure_total",
-                "Total WS messages dropped (backpressure)",
-            ),
-            bytes_received: reg
-                .counter("ws_source_bytes_received_total", "Total WS bytes received"),
-            reconnect_count: reg.counter(
-                "ws_source_reconnect_total",
-                "Total WS reconnection attempts",
-            ),
-            parse_errors: reg.counter(
-                "ws_source_parse_errors_total",
-                "Total WS parse/deserialization errors",
-            ),
-            sequence_gaps: reg.counter(
-                "ws_source_sequence_gaps_total",
-                "Total WS sequence gaps detected",
-            ),
-            connected_clients: reg.gauge(
-                "ws_source_connected_clients",
-                "Current connected WS clients (server mode)",
-            ),
+            messages_received: IntCounter::new(
+                "websocket_source_messages_received_total",
+                "Total WebSocket messages received",
+            )
+            .expect("static WebSocket source metric must be valid"),
+            bytes_received: IntCounter::new(
+                "websocket_source_bytes_received_total",
+                "Total WebSocket bytes received",
+            )
+            .expect("static WebSocket source metric must be valid"),
+            reconnect_count: IntCounter::new(
+                "websocket_source_reconnect_total",
+                "Total WebSocket reconnection attempts",
+            )
+            .expect("static WebSocket source metric must be valid"),
+            parse_errors: IntCounter::new(
+                "websocket_source_parse_errors_total",
+                "Total WebSocket parse and deserialization errors",
+            )
+            .expect("static WebSocket source metric must be valid"),
+            backpressure_drops: IntCounter::new(
+                "websocket_source_backpressure_drops_total",
+                "Total WebSocket messages dropped by ingress backpressure",
+            )
+            .expect("static WebSocket source metric must be valid"),
         }
     }
 
-    /// Records a successfully received message with the given payload size.
-    pub fn record_message(&self, bytes: u64) {
-        self.messages_received.inc();
-        self.bytes_received.inc_by(bytes);
+    /// Creates and registers one source metrics family.
+    pub fn register(registry: &Registry) -> Result<Self, ConnectorError> {
+        let metrics = Self::local();
+        registry
+            .register(Box::new(metrics.clone()))
+            .map_err(|error| {
+                ConnectorError::ConfigurationError(format!(
+                    "failed to register WebSocket source metrics: {error}"
+                ))
+            })?;
+        Ok(metrics)
     }
 
-    /// Records a message dropped due to backpressure.
-    pub fn record_drop(&self) {
-        self.messages_dropped_backpressure.inc();
+    /// Records a successfully received message with the given payload size.
+    pub fn record_message(&self, bytes: usize) {
+        self.messages_received.inc();
+        self.bytes_received
+            .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
     /// Records a reconnection attempt.
@@ -85,21 +88,31 @@ impl WebSocketSourceMetrics {
         self.parse_errors.inc();
     }
 
-    /// Records a detected sequence gap.
-    pub fn record_sequence_gap(&self) {
-        self.sequence_gaps.inc();
-    }
-
-    /// Sets the current number of connected clients (server-mode source).
-    #[allow(clippy::cast_possible_wrap)]
-    pub fn set_connected_clients(&self, n: u64) {
-        self.connected_clients.set(n as i64);
+    /// Records one message intentionally dropped at ingress.
+    pub fn record_backpressure_drop(&self) {
+        self.backpressure_drops.inc();
     }
 }
 
-impl Default for WebSocketSourceMetrics {
-    fn default() -> Self {
-        Self::new(None)
+impl Collector for WebSocketSourceMetrics {
+    fn desc(&self) -> Vec<&Desc> {
+        let mut descriptors = Vec::with_capacity(5);
+        descriptors.extend(self.messages_received.desc());
+        descriptors.extend(self.bytes_received.desc());
+        descriptors.extend(self.reconnect_count.desc());
+        descriptors.extend(self.parse_errors.desc());
+        descriptors.extend(self.backpressure_drops.desc());
+        descriptors
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let mut families = Vec::with_capacity(5);
+        families.extend(self.messages_received.collect());
+        families.extend(self.bytes_received.collect());
+        families.extend(self.reconnect_count.collect());
+        families.extend(self.parse_errors.collect());
+        families.extend(self.backpressure_drops.collect());
+        families
     }
 }
 
@@ -109,15 +122,16 @@ mod tests {
 
     #[test]
     fn test_initial_zeros() {
-        let m = WebSocketSourceMetrics::new(None);
+        let m = WebSocketSourceMetrics::local();
         assert_eq!(m.messages_received.get(), 0);
         assert_eq!(m.bytes_received.get(), 0);
         assert_eq!(m.parse_errors.get(), 0);
+        assert_eq!(m.backpressure_drops.get(), 0);
     }
 
     #[test]
     fn test_record_message() {
-        let m = WebSocketSourceMetrics::new(None);
+        let m = WebSocketSourceMetrics::local();
         m.record_message(1024);
         m.record_message(2048);
 
@@ -126,18 +140,8 @@ mod tests {
     }
 
     #[test]
-    fn test_record_drop() {
-        let m = WebSocketSourceMetrics::new(None);
-        m.record_drop();
-        m.record_drop();
-        m.record_drop();
-
-        assert_eq!(m.messages_dropped_backpressure.get(), 3);
-    }
-
-    #[test]
     fn test_record_reconnect() {
-        let m = WebSocketSourceMetrics::new(None);
+        let m = WebSocketSourceMetrics::local();
         m.record_reconnect();
         m.record_reconnect();
 
@@ -146,54 +150,44 @@ mod tests {
 
     #[test]
     fn test_record_parse_error() {
-        let m = WebSocketSourceMetrics::new(None);
+        let m = WebSocketSourceMetrics::local();
         m.record_parse_error();
 
         assert_eq!(m.parse_errors.get(), 1);
     }
 
     #[test]
-    fn test_record_sequence_gap() {
-        let m = WebSocketSourceMetrics::new(None);
-        m.record_sequence_gap();
-        m.record_sequence_gap();
-
-        assert_eq!(m.sequence_gaps.get(), 2);
-    }
-
-    #[test]
-    fn test_set_connected_clients() {
-        let m = WebSocketSourceMetrics::new(None);
-        m.set_connected_clients(5);
-
-        assert_eq!(m.connected_clients.get(), 5);
-
-        // Verify it overwrites (not accumulates)
-        m.set_connected_clients(3);
-        assert_eq!(m.connected_clients.get(), 3);
-    }
-
-    #[test]
-    fn test_default() {
-        let m = WebSocketSourceMetrics::default();
-        assert_eq!(m.messages_received.get(), 0);
-        assert_eq!(m.bytes_received.get(), 0);
-        assert_eq!(m.parse_errors.get(), 0);
+    fn test_record_backpressure_drop() {
+        let m = WebSocketSourceMetrics::local();
+        m.record_backpressure_drop();
+        assert_eq!(m.backpressure_drops.get(), 1);
     }
 
     #[test]
     fn test_combined_operations() {
-        let m = WebSocketSourceMetrics::new(None);
+        let m = WebSocketSourceMetrics::local();
         m.record_message(100);
         m.record_message(200);
-        m.record_drop();
         m.record_reconnect();
         m.record_parse_error();
-        m.record_sequence_gap();
-        m.set_connected_clients(10);
 
         assert_eq!(m.messages_received.get(), 2);
         assert_eq!(m.bytes_received.get(), 300);
         assert_eq!(m.parse_errors.get(), 1);
+    }
+
+    #[test]
+    fn duplicate_family_registration_fails_visibly() {
+        let registry = Registry::new();
+        WebSocketSourceMetrics::register(&registry).unwrap();
+
+        let error = WebSocketSourceMetrics::register(&registry)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("register WebSocket source metrics"),
+            "{error}"
+        );
     }
 }

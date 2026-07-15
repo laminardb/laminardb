@@ -420,7 +420,7 @@ impl ClusterEngineHarness {
                             is_sink: false,
                             config_keys: vec![],
                         },
-                        Arc::new(|_| Box::new(IdleClusterHarnessSource::default())),
+                        Arc::new(|_| Ok(Box::new(IdleClusterHarnessSource::default()))),
                     )
                 })
                 // Mirror production: DataFusion partitions track vnode count.

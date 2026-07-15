@@ -142,7 +142,7 @@ fn bench_plain_select(c: &mut Criterion) {
                                     is_sink: false,
                                     config_keys: vec![],
                                 },
-                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
                             )
                         })
                         .build()
@@ -202,7 +202,7 @@ fn bench_agg_group_by(c: &mut Criterion) {
                                     is_sink: false,
                                     config_keys: vec![],
                                 },
-                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
                             )
                         })
                         .build()
@@ -261,7 +261,7 @@ fn bench_sort_limit(c: &mut Criterion) {
                                     is_sink: false,
                                     config_keys: vec![],
                                 },
-                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
                             )
                         })
                         .build()
@@ -320,7 +320,7 @@ fn bench_query_chain(c: &mut Criterion) {
                                     is_sink: false,
                                     config_keys: vec![],
                                 },
-                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
                             )
                         })
                         .build()

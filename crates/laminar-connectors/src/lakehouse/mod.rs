@@ -87,10 +87,10 @@ pub fn register_delta_lake_sink(
     registry.register_sink(
         "delta-lake",
         info,
-        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+        Arc::new(|config, registry: Option<&Arc<prometheus::Registry>>| {
             Ok(Box::new(DeltaLakeSink::new(
                 DeltaLakeSinkConfig::from_config(config)?,
-                registry,
+                registry.map(Arc::as_ref),
             )))
         }),
     )
@@ -116,8 +116,11 @@ pub fn register_delta_lake_source(
     registry.register_source(
         "delta-lake",
         info.clone(),
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(DeltaSource::new(DeltaSourceConfig::default(), registry))
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(DeltaSource::new(
+                DeltaSourceConfig::default(),
+                registry.map(Arc::as_ref),
+            )))
         }),
     )?;
 
@@ -214,10 +217,10 @@ pub fn register_iceberg_sink(
     registry.register_sink(
         "iceberg",
         info,
-        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+        Arc::new(|config, registry: Option<&Arc<prometheus::Registry>>| {
             Ok(Box::new(IcebergSink::new(
                 IcebergSinkConfig::from_config(config)?,
-                registry,
+                registry.map(Arc::as_ref),
             )))
         }),
     )
@@ -243,8 +246,8 @@ pub fn register_iceberg_source(
     registry.register_source(
         "iceberg",
         info.clone(),
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(IcebergSource::new(
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(IcebergSource::new(
                 IcebergSourceConfig {
                     catalog: IcebergCatalogConfig {
                         catalog_type: IcebergCatalogType::Rest,
@@ -259,8 +262,8 @@ pub fn register_iceberg_source(
                     snapshot_id: None,
                     select_columns: Vec::new(),
                 },
-                registry,
-            ))
+                registry.map(Arc::as_ref),
+            )))
         }),
     )?;
 

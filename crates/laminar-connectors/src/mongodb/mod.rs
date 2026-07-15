@@ -46,11 +46,11 @@ pub fn register_mongodb_cdc_source(
     registry.register_source(
         "mongodb-cdc",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(MongoDbCdcSource::new(
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(MongoDbCdcSource::new(
                 MongoDbSourceConfig::default(),
-                registry,
-            ))
+                registry.map(Arc::as_ref),
+            )))
         }),
     )?;
 
@@ -130,8 +130,8 @@ pub fn register_mongodb_sink(
     registry.register_sink(
         "mongodb-sink",
         info,
-        Arc::new(|config, registry: Option<&prometheus::Registry>| {
-            MongoDbSink::from_connector_config(config, registry)
+        Arc::new(|config, registry: Option<&Arc<prometheus::Registry>>| {
+            MongoDbSink::from_connector_config(config, registry.map(Arc::as_ref))
                 .map(|sink| Box::new(sink) as Box<dyn crate::connector::SinkConnector>)
         }),
     )

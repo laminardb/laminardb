@@ -1,50 +1,107 @@
-//! WebSocket source/sink connectors. Four modes: source-client (connect
-//! to a WS server), source-server (listen for clients), sink-server (fan
-//! out results to subscribers), sink-client (push to an external server).
+//! WebSocket client source plus client/server sinks.
 //!
-//! WebSocket is non-replayable — source connectors are at-most-once / best-effort;
-//! sinks have a bounded, best-effort replay buffer.
+//! WebSocket is non-replayable. Sources and sinks are best-effort, and failures
+//! can produce gaps or duplicates.
 
-pub mod backpressure;
-pub mod checkpoint;
-pub mod connection;
-pub mod fanout;
-pub mod metrics;
-pub mod parser;
-pub mod protocol;
-pub mod serializer;
-pub mod sink;
-pub mod sink_client;
-pub mod sink_config;
-pub mod sink_metrics;
-pub mod source;
-pub mod source_config;
-pub mod source_server;
+mod backpressure;
+mod connection;
+mod fanout;
+mod metrics;
+mod parser;
+mod protocol;
+mod serializer;
+mod sink;
+mod sink_client;
+mod sink_config;
+mod sink_metrics;
+mod source;
+mod source_config;
 
-pub use backpressure::WsBackpressure;
-pub use checkpoint::WebSocketSourceCheckpoint;
-pub use metrics::WebSocketSourceMetrics;
-pub use protocol::{ClientMessage, ServerMessage};
-pub use sink::WebSocketSinkServer;
-pub use sink_client::WebSocketSinkClient;
-pub use sink_config::{SinkFormat, SinkMode, SlowClientPolicy, WebSocketSinkConfig};
-pub use sink_metrics::WebSocketSinkMetrics;
-pub use source::WebSocketSource;
-pub use source_config::{
-    EventTimeFormat, MessageFormat, ReconnectConfig, SourceMode, WebSocketSourceConfig,
-    WsAuthConfig,
-};
-pub use source_server::WebSocketSourceServer;
+use std::sync::{Arc, OnceLock, Weak};
 
-use std::sync::Arc;
+use metrics::WebSocketSourceMetrics;
+use sink::WebSocketSinkServer;
+use sink_client::WebSocketSinkClient;
+use sink_config::WebSocketSinkConfig;
+use sink_metrics::WebSocketSinkMetrics;
+use source::WebSocketSource;
+use source_config::WebSocketSourceConfig;
 
 use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
+
+struct RegisteredMetricFamily<T> {
+    registry: Weak<prometheus::Registry>,
+    metrics: T,
+}
+
+struct MetricFamilyCache<T> {
+    family: OnceLock<RegisteredMetricFamily<T>>,
+    initialization: parking_lot::Mutex<()>,
+}
+
+impl<T> Default for MetricFamilyCache<T> {
+    fn default() -> Self {
+        Self {
+            family: OnceLock::new(),
+            initialization: parking_lot::Mutex::new(()),
+        }
+    }
+}
+
+impl<T: Clone> MetricFamilyCache<T> {
+    fn get_or_try_init(
+        &self,
+        registry: &Arc<prometheus::Registry>,
+        initialize: impl FnOnce() -> Result<T, crate::error::ConnectorError>,
+    ) -> Result<T, crate::error::ConnectorError> {
+        if let Some(family) = self.family.get() {
+            return family.for_registry(registry);
+        }
+        let _guard = self.initialization.lock();
+        if let Some(family) = self.family.get() {
+            return family.for_registry(registry);
+        }
+        let family = RegisteredMetricFamily {
+            registry: Arc::downgrade(registry),
+            metrics: initialize()?,
+        };
+        self.family
+            .set(family)
+            .unwrap_or_else(|_| unreachable!("metric initialization is serialized"));
+        Ok(self
+            .family
+            .get()
+            .expect("metric family was initialized")
+            .metrics
+            .clone())
+    }
+}
+
+impl<T: Clone> RegisteredMetricFamily<T> {
+    fn for_registry(
+        &self,
+        registry: &Arc<prometheus::Registry>,
+    ) -> Result<T, crate::error::ConnectorError> {
+        if !Weak::ptr_eq(&self.registry, &Arc::downgrade(registry)) {
+            return Err(crate::error::ConnectorError::ConfigurationError(
+                "WebSocket connector registry is already bound to a different Prometheus registry"
+                    .into(),
+            ));
+        }
+        Ok(self.metrics.clone())
+    }
+}
 
 /// Registers the WebSocket source connector with the given registry.
 ///
 /// After registration, the runtime can instantiate `WebSocketSource` by
 /// name when processing `CREATE SOURCE ... WITH (connector = 'websocket')`.
+///
+/// # Errors
+///
+/// Returns an error when the source name is already registered or the
+/// connector registry is frozen.
 pub fn register_websocket_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -57,21 +114,22 @@ pub fn register_websocket_source(
         config_keys: websocket_source_config_keys(),
     };
 
+    let metric_cache = Arc::new(MetricFamilyCache::<WebSocketSourceMetrics>::default());
     registry.register_source(
         "websocket",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            use arrow_schema::{DataType, Field, Schema};
-
-            let default_schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Box::new(WebSocketSource::new(
-                default_schema,
+        Arc::new(move |registry: Option<&Arc<prometheus::Registry>>| {
+            let metrics = if let Some(registry) = registry {
+                metric_cache
+                    .get_or_try_init(registry, || WebSocketSourceMetrics::register(registry))?
+            } else {
+                WebSocketSourceMetrics::local()
+            };
+            Ok(Box::new(WebSocketSource::new(
+                Arc::new(arrow_schema::Schema::empty()),
                 WebSocketSourceConfig::default(),
-                registry,
-            ))
+                metrics,
+            )))
         }),
     )
 }
@@ -80,8 +138,11 @@ pub fn register_websocket_source(
 ///
 /// The sink factory selects server or client mode from the validated config
 /// before either implementation performs network I/O.
-/// If `_arrow_schema` is absent, it uses the legacy nullable `key: Utf8` and
-/// required `value: Utf8` placeholder schema.
+///
+/// # Errors
+///
+/// Returns an error when the sink name is already registered or the connector
+/// registry is frozen.
 pub fn register_websocket_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -94,46 +155,49 @@ pub fn register_websocket_sink(
         config_keys: websocket_sink_config_keys(),
     };
 
+    let metric_cache = Arc::new(MetricFamilyCache::<WebSocketSinkMetrics>::default());
     registry.register_sink(
         "websocket",
         info,
-        Arc::new(|config, registry: Option<&prometheus::Registry>| {
-            use arrow_schema::{DataType, Field, Schema};
-
-            let sink_config = WebSocketSinkConfig::from_config(config)?;
-            // DDL normally injects `_arrow_schema`; programmatic callers may
-            // rely on the documented key/value placeholder.
-            let decoded_schema = config.arrow_schema();
-            if config.get("_arrow_schema").is_some() && decoded_schema.is_none() {
-                return Err(crate::error::ConnectorError::ConfigurationError(
-                    "invalid WebSocket sink _arrow_schema encoding".into(),
-                ));
-            }
-            let schema = decoded_schema.unwrap_or_else(|| {
-                Arc::new(Schema::new(vec![
-                    Field::new("key", DataType::Utf8, true),
-                    Field::new("value", DataType::Utf8, false),
-                ]))
-            });
-            let is_server = matches!(&sink_config.mode, SinkMode::Server { .. });
-            let sink: Box<dyn crate::connector::SinkConnector> = if is_server {
-                Box::new(WebSocketSinkServer::new(schema, sink_config, registry))
-            } else {
-                Box::new(WebSocketSinkClient::new(schema, sink_config, registry))
-            };
-            Ok(sink)
-        }),
+        Arc::new(
+            move |config, registry: Option<&Arc<prometheus::Registry>>| {
+                let sink_config = WebSocketSinkConfig::from_config(config)?;
+                let decoded_schema = config.arrow_schema();
+                if config.get("_arrow_schema").is_some() && decoded_schema.is_none() {
+                    return Err(crate::error::ConnectorError::ConfigurationError(
+                        "invalid WebSocket sink _arrow_schema encoding".into(),
+                    ));
+                }
+                let schema = decoded_schema.ok_or_else(|| {
+                    crate::error::ConnectorError::ConfigurationError(
+                        "WebSocket sink requires a declared Arrow schema".into(),
+                    )
+                })?;
+                let metrics = if let Some(registry) = registry {
+                    metric_cache
+                        .get_or_try_init(registry, || WebSocketSinkMetrics::register(registry))?
+                } else {
+                    WebSocketSinkMetrics::local()
+                };
+                let is_server = matches!(&sink_config, WebSocketSinkConfig::Server { .. });
+                let sink: Box<dyn crate::connector::SinkConnector> = if is_server {
+                    Box::new(WebSocketSinkServer::new(schema, sink_config, metrics))
+                } else {
+                    Box::new(WebSocketSinkClient::new(schema, sink_config, metrics))
+                };
+                Ok(sink)
+            },
+        ),
     )
 }
 
 fn websocket_source_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         ConfigKeySpec::required("url", "WebSocket URL to connect to (ws:// or wss://)"),
-        ConfigKeySpec::optional("mode", "Operating mode (client/server)", "client"),
         ConfigKeySpec::optional("format", "Message format (json/csv/binary)", "json"),
         ConfigKeySpec::optional(
             "subscribe.message",
-            "JSON subscription message to send after handshake",
+            "Text subscription message to send after handshake",
             "",
         ),
         ConfigKeySpec::optional("reconnect.enabled", "Enable automatic reconnection", "true"),
@@ -147,17 +211,14 @@ fn websocket_source_config_keys() -> Vec<ConfigKeySpec> {
             "Maximum reconnect delay in ms",
             "30000",
         ),
-        ConfigKeySpec::optional("ping.interval.ms", "WebSocket ping interval in ms", "30000"),
-        ConfigKeySpec::optional("ping.timeout.ms", "Pong reply timeout in ms", "10000"),
-        ConfigKeySpec::optional("bind.address", "Socket address for server mode", ""),
         ConfigKeySpec::optional(
-            "max.connections",
-            "Max concurrent connections (server mode)",
-            "1024",
+            "reconnect.max.retries",
+            "Maximum reconnect attempts; empty means unlimited",
+            "",
         ),
         ConfigKeySpec::optional(
             "on.backpressure",
-            "Backpressure strategy (block/drop)",
+            "Backpressure strategy (block/drop_newest)",
             "block",
         ),
         ConfigKeySpec::optional(
@@ -165,18 +226,6 @@ fn websocket_source_config_keys() -> Vec<ConfigKeySpec> {
             "Max WebSocket message size in bytes",
             "67108864",
         ),
-        ConfigKeySpec::optional(
-            "event.time.field",
-            "JSON field path for event time extraction",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "event.time.format",
-            "Event time format (epoch_millis/iso8601)",
-            "",
-        ),
-        ConfigKeySpec::optional("auth.type", "Authentication type (bearer/basic/hmac)", ""),
-        ConfigKeySpec::optional("auth.token", "Bearer token for authentication", ""),
     ]
 }
 
@@ -189,56 +238,13 @@ fn websocket_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("mode", "Operating mode (server/client)", "server"),
         ConfigKeySpec::optional(
-            "format",
-            "Serialization format (json/jsonlines/arrow_ipc)",
-            "json",
-        ),
-        ConfigKeySpec::optional(
             "max.connections",
             "Max concurrent client connections",
             "10000",
         ),
-        ConfigKeySpec::optional(
-            "per.client.buffer",
-            "Per-client send buffer in bytes",
-            "262144",
-        ),
-        ConfigKeySpec::optional(
-            "slow.client.policy",
-            "Slow client policy (drop_oldest/disconnect)",
-            "drop_oldest",
-        ),
         ConfigKeySpec::optional("ping.interval.ms", "Ping interval in ms", "30000"),
         ConfigKeySpec::optional("ping.timeout.ms", "Pong timeout in ms", "10000"),
-        ConfigKeySpec::optional(
-            "replay.buffer.size",
-            "Messages to buffer for late joiners",
-            "",
-        ),
-        ConfigKeySpec::optional("path", "URL path filter for server mode", ""),
-        ConfigKeySpec::optional(
-            "slow.client.threshold.pct",
-            "Disconnect threshold percentage for slow server clients",
-            "90",
-        ),
         ConfigKeySpec::optional("url", "WebSocket URL required in client mode", ""),
-        ConfigKeySpec::optional(
-            "buffer.on.disconnect",
-            "Client-mode disconnect buffer size in bytes",
-            "",
-        ),
-        ConfigKeySpec::optional("batch.max.size", "Client-mode maximum batch size", ""),
-        ConfigKeySpec::optional(
-            "batch.interval.ms",
-            "Client-mode batch interval in milliseconds",
-            "",
-        ),
-        ConfigKeySpec::optional("auth.type", "Authentication type (bearer/basic/hmac)", ""),
-        ConfigKeySpec::optional("auth.token", "Bearer token for authentication", ""),
-        ConfigKeySpec::optional("auth.username", "Basic-auth username", ""),
-        ConfigKeySpec::optional("auth.password", "Basic-auth password", ""),
-        ConfigKeySpec::optional("auth.api.key", "HMAC API key", ""),
-        ConfigKeySpec::optional("auth.secret", "HMAC secret", ""),
     ]
 }
 
@@ -246,6 +252,7 @@ fn websocket_sink_config_keys() -> Vec<ConfigKeySpec> {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+    use std::thread;
 
     fn config_with_schema(mode: &str) -> crate::config::ConnectorConfig {
         let mut config = crate::config::ConnectorConfig::new("websocket");
@@ -316,6 +323,11 @@ mod tests {
         invalid_schema.set("bind.address", "127.0.0.1:0");
         invalid_schema.set("_arrow_schema", "not-arrow-ipc");
         assert!(factory_error(&registry, &invalid_schema).contains("_arrow_schema"));
+
+        let mut missing_schema = crate::config::ConnectorConfig::new("websocket");
+        missing_schema.set("mode", "server");
+        missing_schema.set("bind.address", "127.0.0.1:0");
+        assert!(factory_error(&registry, &missing_schema).contains("declared Arrow schema"));
     }
 
     #[test]
@@ -329,5 +341,118 @@ mod tests {
             .find(|key| key.key == "bind.address")
             .unwrap();
         assert!(!bind.required);
+    }
+
+    #[test]
+    fn source_metadata_exposes_only_runtime_options() {
+        let registry = ConnectorRegistry::new();
+        register_websocket_source(&registry).unwrap();
+        let info = registry.source_info("websocket").unwrap();
+        let keys: std::collections::HashSet<&str> = info
+            .config_keys
+            .iter()
+            .map(|key| key.key.as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> = [
+            "url",
+            "format",
+            "subscribe.message",
+            "reconnect.enabled",
+            "reconnect.initial.delay.ms",
+            "reconnect.max.delay.ms",
+            "reconnect.max.retries",
+            "on.backpressure",
+            "max.message.size",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn sink_metadata_exposes_only_runtime_options() {
+        let registry = ConnectorRegistry::new();
+        register_websocket_sink(&registry).unwrap();
+        let info = registry.sink_info("websocket").unwrap();
+        let keys: std::collections::HashSet<&str> = info
+            .config_keys
+            .iter()
+            .map(|key| key.key.as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> = [
+            "bind.address",
+            "mode",
+            "max.connections",
+            "ping.interval.ms",
+            "ping.timeout.ms",
+            "url",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn source_factory_registers_one_shared_metric_family() {
+        let connectors = ConnectorRegistry::new();
+        register_websocket_source(&connectors).unwrap();
+        let metrics = Arc::new(prometheus::Registry::new());
+        let config = crate::config::ConnectorConfig::new("websocket");
+
+        connectors.create_source(&config, Some(&metrics)).unwrap();
+        connectors.create_source(&config, Some(&metrics)).unwrap();
+
+        let families = metrics.gather();
+        assert_eq!(
+            families
+                .iter()
+                .filter(|family| family.name().starts_with("websocket_source_"))
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn metric_family_cache_is_concurrent_and_shared() {
+        let cache = Arc::new(MetricFamilyCache::<WebSocketSourceMetrics>::default());
+        let registry = Arc::new(prometheus::Registry::new());
+        let workers = (0..16)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let registry = Arc::clone(&registry);
+                thread::spawn(move || {
+                    let metrics = cache
+                        .get_or_try_init(&registry, || WebSocketSourceMetrics::register(&registry))
+                        .unwrap();
+                    metrics.record_message(1);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(
+            cache.family.get().unwrap().metrics.messages_received.get(),
+            16
+        );
+    }
+
+    #[test]
+    fn source_factory_rejects_a_different_metrics_registry() {
+        let connectors = ConnectorRegistry::new();
+        register_websocket_source(&connectors).unwrap();
+        let first = Arc::new(prometheus::Registry::new());
+        let second = Arc::new(prometheus::Registry::new());
+        let config = crate::config::ConnectorConfig::new("websocket");
+
+        connectors.create_source(&config, Some(&first)).unwrap();
+        let error = match connectors.create_source(&config, Some(&second)) {
+            Ok(_) => panic!("expected metrics registry mismatch"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("different Prometheus registry"), "{error}");
     }
 }

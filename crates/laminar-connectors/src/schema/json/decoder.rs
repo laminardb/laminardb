@@ -60,8 +60,7 @@ impl TypeMismatchStrategy {
 }
 
 /// Epoch unit for *numeric* JSON timestamps feeding a `Timestamp` column
-/// (strings still go through `timestamp_formats`). Default `Millis`
-/// preserves historical behaviour.
+/// (strings still go through `timestamp_formats`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EpochUnit {
     /// Epoch seconds.
@@ -76,16 +75,14 @@ pub enum EpochUnit {
 }
 
 impl EpochUnit {
-    /// Parse a `json.column.<col>.epoch_unit` value. Accepts the bare
-    /// unit and the `epoch_*` spelling the WebSocket connector's
-    /// `event.time.format` already uses.
+    /// Parse a `json.column.<col>.epoch_unit` value.
     #[must_use]
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
-            "seconds" | "epoch_seconds" => Some(Self::Seconds),
-            "millis" | "epoch_millis" => Some(Self::Millis),
-            "micros" | "epoch_micros" => Some(Self::Micros),
-            "nanos" | "epoch_nanos" => Some(Self::Nanos),
+            "seconds" => Some(Self::Seconds),
+            "millis" => Some(Self::Millis),
+            "micros" => Some(Self::Micros),
+            "nanos" => Some(Self::Nanos),
             _ => None,
         }
     }
@@ -175,52 +172,140 @@ impl JsonDecoderConfig {
     ///
     /// Parses `json.path`, `json.column.*`, `json.explode`,
     /// `schema.enforcement`, and `nested.as.jsonb` properties.
+    /// Epoch-unit options are validated against the frozen output schema.
     /// Called once at Ring 2 (`CREATE SOURCE` time).
-    #[must_use]
-    pub fn from_connector_config(config: &crate::config::ConnectorConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error when an epoch unit is unknown or
+    /// targets a missing or non-timestamp column.
+    pub fn from_connector_config(
+        config: &crate::config::ConnectorConfig,
+        schema: &SchemaRef,
+    ) -> SchemaResult<Self> {
         let mut cfg = Self::default();
 
         if let Some(path) = config.get("json.path") {
-            cfg.json_path = Some(path.split('.').map(ToString::to_string).collect());
+            cfg.json_path = Some(parse_path_option("json.path", path)?);
         }
 
-        let col_props = config.properties_with_prefix("json.column.");
+        let mut col_props: Vec<_> = config
+            .properties_with_prefix("json.column.")
+            .into_iter()
+            .collect();
+        col_props.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         for (col_name, val) in col_props {
             // `json.column.<col>.epoch_unit = '<unit>'` configures numeric
             // timestamp scaling for <col>; everything else is a path.
             // (Column names are SQL identifiers — no dots — so the suffix
             // split is unambiguous against dotted path *values*.)
             if let Some(col) = col_name.strip_suffix(".epoch_unit") {
-                if let Some(unit) = EpochUnit::from_str_opt(&val) {
-                    cfg.numeric_timestamp_units.insert(col.to_string(), unit);
-                } else {
-                    tracing::warn!(
-                        column = col,
-                        value = %val,
-                        "invalid json.column.<col>.epoch_unit (expected \
-                         seconds|millis|micros|nanos); using millis"
-                    );
+                let unit =
+                    EpochUnit::from_str_opt(&val).ok_or_else(|| SchemaError::InvalidConfig {
+                        key: format!("json.column.{col}.epoch_unit"),
+                        message: format!(
+                            "invalid epoch unit '{val}'; expected seconds, millis, micros, or nanos"
+                        ),
+                    })?;
+                let field =
+                    schema
+                        .field_with_name(col)
+                        .map_err(|_| SchemaError::InvalidConfig {
+                            key: format!("json.column.{col}.epoch_unit"),
+                            message: format!("column '{col}' is not present in the source schema"),
+                        })?;
+                if !matches!(field.data_type(), DataType::Timestamp(_, _)) {
+                    return Err(SchemaError::InvalidConfig {
+                        key: format!("json.column.{col}.epoch_unit"),
+                        message: format!(
+                            "column '{col}' must be a Timestamp, found {:?}",
+                            field.data_type()
+                        ),
+                    });
                 }
+                cfg.numeric_timestamp_units.insert(col.to_string(), unit);
                 continue;
             }
-            cfg.json_column_paths
-                .insert(col_name, val.split('.').map(ToString::to_string).collect());
+            schema
+                .field_with_name(&col_name)
+                .map_err(|_| SchemaError::InvalidConfig {
+                    key: format!("json.column.{col_name}"),
+                    message: format!("column '{col_name}' is not present in the source schema"),
+                })?;
+            cfg.json_column_paths.insert(
+                col_name.clone(),
+                parse_path_option(&format!("json.column.{col_name}"), &val)?,
+            );
         }
 
         if let Some(explode) = config.get("json.explode") {
-            cfg.json_explode = Some(explode.split(',').map(|s| s.trim().to_string()).collect());
+            let columns: Vec<String> = explode
+                .split(',')
+                .map(str::trim)
+                .map(ToString::to_string)
+                .collect();
+            if columns.is_empty() || columns.iter().any(String::is_empty) {
+                return Err(SchemaError::InvalidConfig {
+                    key: "json.explode".into(),
+                    message: "expected one or more comma-separated schema columns".into(),
+                });
+            }
+            let mut seen = std::collections::HashSet::with_capacity(columns.len());
+            for column in &columns {
+                if !seen.insert(column) {
+                    return Err(SchemaError::InvalidConfig {
+                        key: "json.explode".into(),
+                        message: format!("column '{column}' is listed more than once"),
+                    });
+                }
+                schema
+                    .field_with_name(column)
+                    .map_err(|_| SchemaError::InvalidConfig {
+                        key: "json.explode".into(),
+                        message: format!("column '{column}' is not present in the source schema"),
+                    })?;
+            }
+            cfg.json_explode = Some(columns);
         }
 
         if let Some(enforcement) = config.get("schema.enforcement") {
-            if let Some(strategy) = TypeMismatchStrategy::from_enforcement_str(enforcement) {
-                cfg.type_mismatch = strategy;
-            }
+            cfg.type_mismatch = TypeMismatchStrategy::from_enforcement_str(enforcement)
+                .ok_or_else(|| SchemaError::InvalidConfig {
+                    key: "schema.enforcement".into(),
+                    message: format!(
+                        "invalid value '{enforcement}'; expected lenient, coerce, or strict"
+                    ),
+                })?;
         }
         if let Some(v) = config.get("nested.as.jsonb") {
-            cfg.nested_as_jsonb = v.eq_ignore_ascii_case("true");
+            cfg.nested_as_jsonb = match v.to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(SchemaError::InvalidConfig {
+                        key: "nested.as.jsonb".into(),
+                        message: format!("invalid boolean '{v}'; expected true or false"),
+                    });
+                }
+            };
         }
-        cfg
+        Ok(cfg)
     }
+}
+
+fn parse_path_option(key: &str, value: &str) -> Result<Vec<String>, SchemaError> {
+    let segments: Vec<String> = value
+        .split('.')
+        .map(str::trim)
+        .map(ToString::to_string)
+        .collect();
+    if segments.is_empty() || segments.iter().any(String::is_empty) {
+        return Err(SchemaError::InvalidConfig {
+            key: key.into(),
+            message: "path must contain non-empty dot-separated segments".into(),
+        });
+    }
+    Ok(segments)
 }
 
 /// Decodes JSON byte payloads into Arrow `RecordBatch`es.
@@ -362,6 +447,21 @@ impl JsonDecoder {
     /// decoded values cannot be assembled into the output schema.
     #[allow(clippy::too_many_lines)]
     pub fn decode_slices(&self, values: &[&[u8]]) -> SchemaResult<RecordBatch> {
+        self.decode_slices_bounded(values, usize::MAX)
+    }
+
+    /// Decode borrowed JSON payloads while rejecting output expansion beyond
+    /// `max_rows` before values are appended to Arrow builders.
+    ///
+    /// # Errors
+    /// Returns `SchemaError::DecodeError` when parsing, coercion, or
+    /// `json.explode` would exceed the row bound.
+    #[allow(clippy::too_many_lines)]
+    pub fn decode_slices_bounded(
+        &self,
+        values: &[&[u8]],
+        max_rows: usize,
+    ) -> SchemaResult<RecordBatch> {
         if values.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
@@ -391,6 +491,7 @@ impl JsonDecoder {
 
         // Reusable populated-tracking buffer — avoids heap alloc per record.
         let mut populated = vec![false; num_fields];
+        let mut output_rows = 0usize;
 
         for &bytes in values {
             let value: serde_json::Value = serde_json::from_slice(bytes)
@@ -412,6 +513,14 @@ impl JsonDecoder {
                 let arr = default_target.as_array().ok_or_else(|| {
                     SchemaError::DecodeError("json.explode target must be an array".into())
                 })?;
+                output_rows = output_rows
+                    .checked_add(arr.len())
+                    .filter(|rows| *rows <= max_rows)
+                    .ok_or_else(|| {
+                        SchemaError::DecodeError(format!(
+                            "JSON output exceeds the {max_rows}-row batch limit"
+                        ))
+                    })?;
                 for element in arr {
                     populated.fill(false);
                     match element {
@@ -469,6 +578,14 @@ impl JsonDecoder {
                 }
             } else {
                 // === NORMAL OBJECT MODE (with per-column path support) ===
+                output_rows = output_rows
+                    .checked_add(1)
+                    .filter(|rows| *rows <= max_rows)
+                    .ok_or_else(|| {
+                        SchemaError::DecodeError(format!(
+                            "JSON output exceeds the {max_rows}-row batch limit"
+                        ))
+                    })?;
                 let default_obj = default_target.as_object().ok_or_else(|| {
                     SchemaError::DecodeError("JSON value must be an object".into())
                 })?;
@@ -1201,19 +1318,24 @@ fn extract_timestamp(
         return checked_epoch_to_unit(n, from, unit);
     }
     if let Some(f) = value.as_f64() {
-        // 2^63 == i64::MAX + 1; exclusive upper bound for a lossless f64->i64.
-        const POW2_63: f64 = 9_223_372_036_854_775_808.0;
-        // `f as i64` saturates (NaN -> 0, +-huge -> i64::MIN/MAX), silently
-        // turning a garbage timestamp into a valid-looking one that poisons
-        // event-time/watermarks. Round to the nearest integer in `from`
-        // units and reject out-of-range/non-finite so the configured
-        // type-mismatch strategy applies, like any other bad value.
-        let rounded = f.round();
-        if !(-POW2_63..POW2_63).contains(&rounded) {
-            return Err(format!("timestamp {f} out of i64 range"));
+        // JSON numbers written with a decimal point or exponent reach this
+        // branch. Never round a fractional epoch: that can move a record
+        // across a watermark boundary. Integral f64 values are accepted only
+        // inside the IEEE-754 exact-integer range so the source text cannot
+        // already have lost integer precision during JSON parsing.
+        const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+        if !f.is_finite() || !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&f) {
+            return Err(format!(
+                "timestamp {f} is not exactly representable as an integer"
+            ));
         }
-        #[allow(clippy::cast_possible_truncation)] // range-checked; already integral
-        let v = rounded as i64;
+        if f.fract() != 0.0 {
+            return Err(format!(
+                "fractional timestamp {f} is not supported; provide an integer in {from:?} units"
+            ));
+        }
+        #[allow(clippy::cast_possible_truncation)] // exact integral f64 in checked range
+        let v = f as i64;
         return checked_epoch_to_unit(v, from, unit);
     }
 
@@ -1241,9 +1363,6 @@ fn extract_timestamp(
 /// `TimeUnit`. Up-scaling (e.g. seconds→nanos) is checked and errors
 /// rather than wrapping on i64 overflow; down-scaling (e.g. nanos→millis)
 /// truncates toward zero, the conventional and expected precision loss.
-///
-/// `from == EpochUnit::Millis` reproduces the historical
-/// `checked_millis_to_unit` behaviour bit-for-bit.
 fn checked_epoch_to_unit(value: i64, from: EpochUnit, to: TimeUnit) -> Result<i64, String> {
     let from_ns = from.nanos_per();
     let to_ns = match to {
@@ -1613,7 +1732,10 @@ mod tests {
         let result = decoder.decode_batch(&records);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("out of i64 range"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not exactly representable"));
     }
 
     #[test]
@@ -1910,10 +2032,8 @@ mod tests {
         );
     }
 
-    /// Records that don't carry the configured json.path are skipped, not
-    /// erroring the batch. Real-world: WebSocket sources receive subscribe
-    /// acks and control frames mixed with data frames; failing the batch
-    /// would poison the source's input buffer.
+    /// Records that don't carry the configured json.path are skipped rather
+    /// than poisoning a batch containing mixed control and data envelopes.
     #[test]
     fn test_json_path_missing_skips_record() {
         let schema = make_schema(vec![("id", DataType::Int64, false)]);
@@ -2145,7 +2265,7 @@ mod tests {
 
     #[test]
     fn test_from_connector_config() {
-        let mut config = crate::config::ConnectorConfig::new("websocket");
+        let mut config = crate::config::ConnectorConfig::new("json");
         config.set("json.path", "data.trade");
         config.set("json.column.stream_name", "stream");
         config.set("json.column.ts", "meta.timestamp");
@@ -2153,7 +2273,13 @@ mod tests {
         config.set("schema.enforcement", "strict");
         config.set("nested.as.jsonb", "true");
 
-        let cfg = JsonDecoderConfig::from_connector_config(&config);
+        let schema = make_schema(vec![
+            ("stream_name", DataType::Utf8, true),
+            ("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            ("price", DataType::Utf8, true),
+            ("qty", DataType::Utf8, true),
+        ]);
+        let cfg = JsonDecoderConfig::from_connector_config(&config, &schema).unwrap();
         assert_eq!(cfg.json_path, Some(vec!["data".into(), "trade".into()]));
         assert_eq!(
             cfg.json_column_paths.get("stream_name"),
@@ -2166,6 +2292,30 @@ mod tests {
         assert_eq!(cfg.json_explode, Some(vec!["price".into(), "qty".into()]));
         assert_eq!(cfg.type_mismatch, TypeMismatchStrategy::Reject);
         assert!(cfg.nested_as_jsonb);
+    }
+
+    #[test]
+    fn connector_config_rejects_invalid_projection_options() {
+        let schema = make_schema(vec![
+            ("id", DataType::Int64, false),
+            ("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]);
+        for (key, value) in [
+            ("json.path", "data..event"),
+            ("json.column.missing", "payload.value"),
+            ("json.column.id", "payload..value"),
+            ("json.explode", "id,missing"),
+            ("json.explode", "id,id"),
+            ("schema.enforcement", "strcit"),
+            ("nested.as.jsonb", "yes"),
+        ] {
+            let mut config = crate::config::ConnectorConfig::new("json");
+            config.set(key, value);
+            let error = JsonDecoderConfig::from_connector_config(&config, &schema)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "{key}={value}: {error}");
+        }
     }
 
     #[test]
@@ -2218,8 +2368,13 @@ mod tests {
             "json.column.evt.epoch_unit".to_string(),
             "micros".to_string(),
         );
-        let cc = ConnectorConfig::with_properties("websocket", props);
-        let cfg = JsonDecoderConfig::from_connector_config(&cc);
+        let cc = ConnectorConfig::with_properties("json", props);
+        let schema = make_schema(vec![(
+            "evt",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]);
+        let cfg = JsonDecoderConfig::from_connector_config(&cc, &schema).unwrap();
         assert_eq!(
             cfg.numeric_timestamp_units.get("evt"),
             Some(&EpochUnit::Micros)
@@ -2227,6 +2382,136 @@ mod tests {
         // The `.epoch_unit` key must NOT become a phantom path column.
         assert!(cfg.json_column_paths.contains_key("evt"));
         assert!(!cfg.json_column_paths.contains_key("evt.epoch_unit"));
+    }
+
+    #[test]
+    fn from_connector_config_rejects_noncanonical_epoch_units() {
+        for value in ["epoch_micros", "minutes"] {
+            let mut config = crate::config::ConnectorConfig::new("source");
+            config.set("json.column.evt.epoch_unit", value);
+            let schema = make_schema(vec![(
+                "evt",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )]);
+            let error = JsonDecoderConfig::from_connector_config(&config, &schema)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("json.column.evt.epoch_unit"), "{error}");
+            assert!(error.contains(value), "{error}");
+        }
+    }
+
+    #[test]
+    fn from_connector_config_rejects_unknown_or_non_timestamp_epoch_columns() {
+        let schema = make_schema(vec![
+            (
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            ("id", DataType::Int64, false),
+        ]);
+
+        for (column, expected) in [
+            ("missing", "not present in the source schema"),
+            ("id", "must be a Timestamp"),
+        ] {
+            let mut config = crate::config::ConnectorConfig::new("source");
+            config.set(format!("json.column.{column}.epoch_unit"), "micros");
+            let error = JsonDecoderConfig::from_connector_config(&config, &schema)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(column), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn integer_epoch_conversion_covers_every_source_and_arrow_unit() {
+        let source_values = [
+            (EpochUnit::Seconds, 2),
+            (EpochUnit::Millis, 2_000),
+            (EpochUnit::Micros, 2_000_000),
+            (EpochUnit::Nanos, 2_000_000_000),
+        ];
+        let target_values = [
+            (TimeUnit::Second, 2),
+            (TimeUnit::Millisecond, 2_000),
+            (TimeUnit::Microsecond, 2_000_000),
+            (TimeUnit::Nanosecond, 2_000_000_000),
+        ];
+
+        for (from, value) in source_values {
+            for (to, expected) in &target_values {
+                assert_eq!(
+                    checked_epoch_to_unit(value, from, to.clone()).unwrap(),
+                    *expected,
+                    "from={from:?}, to={to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integer_epoch_downscale_matches_arrow_for_negative_values() {
+        assert_eq!(
+            checked_epoch_to_unit(-1_500, EpochUnit::Nanos, TimeUnit::Microsecond).unwrap(),
+            -1
+        );
+        assert_eq!(
+            checked_epoch_to_unit(-1_500, EpochUnit::Micros, TimeUnit::Millisecond).unwrap(),
+            -1
+        );
+        assert_eq!(
+            checked_epoch_to_unit(-2, EpochUnit::Seconds, TimeUnit::Nanosecond).unwrap(),
+            -2_000_000_000
+        );
+    }
+
+    #[test]
+    fn integer_epoch_upscale_rejects_positive_and_negative_overflow() {
+        assert!(checked_epoch_to_unit(i64::MAX, EpochUnit::Seconds, TimeUnit::Nanosecond).is_err());
+        assert!(checked_epoch_to_unit(i64::MIN, EpochUnit::Millis, TimeUnit::Microsecond).is_err());
+    }
+
+    #[test]
+    fn fractional_numeric_epoch_is_rejected_instead_of_rounded() {
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]);
+        let decoder = JsonDecoder::new(schema);
+        let error = decoder
+            .decode_batch(&[json_record(r#"{"ts": 1.5}"#)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fractional timestamp"), "{error}");
+    }
+
+    #[test]
+    fn integral_float_epoch_requires_exact_integer_range() {
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]);
+        let decoder = JsonDecoder::new(schema);
+
+        let batch = decoder
+            .decode_batch(&[json_record(r#"{"ts": 1000.0}"#)])
+            .unwrap();
+        let timestamps = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::TimestampMillisecondType>();
+        assert_eq!(timestamps.value(0), 1_000);
+
+        let error = decoder
+            .decode_batch(&[json_record(r#"{"ts": 9.007199254740992e15}"#)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not exactly representable"), "{error}");
     }
 
     #[test]
@@ -2254,7 +2539,7 @@ mod tests {
             .as_primitive::<arrow_array::types::TimestampMillisecondType>();
         assert_eq!(col.value(0), 1_779_019_200_123);
 
-        // Without the override the same number is (legacy) read as millis.
+        // Without an override, numeric epochs use milliseconds.
         let schema2 = make_schema(vec![(
             "ts",
             DataType::Timestamp(TimeUnit::Millisecond, None),

@@ -93,6 +93,9 @@ impl From<SchemaError> for ConnectorError {
     fn from(err: SchemaError) -> Self {
         match err {
             SchemaError::MissingConfig(msg) => ConnectorError::missing_config(msg),
+            SchemaError::InvalidConfig { key, message } => {
+                ConnectorError::ConfigurationError(format!("invalid config key '{key}': {message}"))
+            }
             SchemaError::Incompatible(msg) => ConnectorError::SchemaMismatch(msg),
             SchemaError::DecodeError(msg) => ConnectorError::ReadError(msg),
             other => ConnectorError::Internal(other.to_string()),
@@ -136,6 +139,16 @@ mod tests {
         let se = SchemaError::Incompatible("field type mismatch".into());
         let ce: ConnectorError = se.into();
         assert!(matches!(ce, ConnectorError::SchemaMismatch(_)));
+    }
+
+    #[test]
+    fn invalid_schema_config_remains_a_connector_configuration_error() {
+        let error: ConnectorError = SchemaError::InvalidConfig {
+            key: "json.column.ts.epoch_unit".into(),
+            message: "invalid epoch unit".into(),
+        }
+        .into();
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
     }
 
     #[test]

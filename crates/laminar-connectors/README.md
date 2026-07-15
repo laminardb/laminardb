@@ -13,7 +13,6 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
-| WebSocket Server | `websocket` | tokio-tungstenite listener | Implemented |
 | Delta Lake Source | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
 | Iceberg Source | `iceberg` | REST catalog polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
 | File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
@@ -78,7 +77,7 @@ requirements:
 | `cdc/postgres` | Resume-only PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
 | `mongodb` | Replayable change-stream source and durable at-least-once majority-journaled sink |
 | `otel` | OpenTelemetry OTLP/gRPC receiver for traces, metrics, and logs (tonic server) |
-| `websocket` | WebSocket source/sink (client, server, fan-out, backpressure, reconnect) |
+| `websocket` | WebSocket client source and client/server sinks (fan-out, backpressure, reconnect) |
 | `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog, recovery, compaction, schema evolution) and Apache Iceberg source and sink (REST catalog) |
 | `files` | File source (auto-loader, glob, watch) and sink (rolling, CSV/JSON/Parquet) |
 | `lookup` | Lookup table support: PostgreSQL and Parquet reference tables |

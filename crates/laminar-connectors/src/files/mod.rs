@@ -51,8 +51,10 @@ pub fn register_file_source(
     registry.register_source(
         "files",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(FileSource::with_registry(registry))
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(FileSource::with_registry(
+                registry.map(Arc::as_ref),
+            )))
         }),
     )
 }
@@ -79,8 +81,8 @@ pub fn register_file_sink(
     registry.register_sink(
         "files",
         info,
-        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
-            Ok(Box::new(FileSink::with_registry(registry)))
+        Arc::new(|_config, registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(FileSink::with_registry(registry.map(Arc::as_ref))))
         }),
     )
 }

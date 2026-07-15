@@ -24,8 +24,30 @@ impl LaminarDB {
     /// Called once at startup, after the registry is constructed but before
     /// `start()`. Connectors created after this call will register their
     /// metrics on this registry so they appear in the scrape output.
-    pub fn set_prometheus_registry(&self, registry: Arc<prometheus::Registry>) {
-        *self.prometheus_registry.lock() = Some(registry);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the database leaves `Created` or when a registry
+    /// was already installed.
+    pub fn set_prometheus_registry(
+        &self,
+        registry: Arc<prometheus::Registry>,
+    ) -> Result<(), DbError> {
+        let _startup = self.startup_attempt.lock();
+        let mut slot = self.prometheus_registry.lock();
+        let state = DbState::load(&self.state);
+        if state != DbState::Created {
+            return Err(DbError::InvalidOperation(format!(
+                "Prometheus registry can only be installed while the database is Created, not {state:?}"
+            )));
+        }
+        if slot.is_some() {
+            return Err(DbError::InvalidOperation(
+                "Prometheus registry is already installed".into(),
+            ));
+        }
+        *slot = Some(registry);
+        Ok(())
     }
 
     /// Get the engine metrics if set.
@@ -224,5 +246,58 @@ impl LaminarDB {
             .iter()
             .filter(|(_, _, active)| *active)
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prometheus_registry_is_single_assignment() {
+        let db = LaminarDB::open().unwrap();
+        db.set_prometheus_registry(Arc::new(prometheus::Registry::new()))
+            .unwrap();
+
+        let error = db
+            .set_prometheus_registry(Arc::new(prometheus::Registry::new()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("already installed"), "{error}");
+    }
+
+    #[test]
+    fn prometheus_registry_cannot_change_after_start_begins() {
+        let db = LaminarDB::open().unwrap();
+        DbState::Starting.store(&db.state);
+
+        let error = db
+            .set_prometheus_registry(Arc::new(prometheus::Registry::new()))
+            .unwrap_err()
+            .to_string();
+
+        DbState::Created.store(&db.state);
+        assert!(error.contains("Created"), "{error}");
+    }
+
+    #[test]
+    fn prometheus_registry_install_is_serialized_with_startup_claim() {
+        let db = Arc::new(LaminarDB::open().unwrap());
+        let startup = db.startup_attempt.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let installing = Arc::clone(&db);
+        let install = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            installing.set_prometheus_registry(Arc::new(prometheus::Registry::new()))
+        });
+        started_rx.recv().unwrap();
+        DbState::Starting.store(&db.state);
+        drop(startup);
+
+        let error = install.join().unwrap().unwrap_err().to_string();
+
+        DbState::Created.store(&db.state);
+        assert!(error.contains("Created"), "{error}");
     }
 }

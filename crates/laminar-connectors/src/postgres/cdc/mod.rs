@@ -37,11 +37,11 @@ pub fn register_postgres_cdc_source(
     registry.register_source(
         "postgres-cdc",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(PostgresCdcSource::new(
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(PostgresCdcSource::new(
                 PostgresCdcConfig::default(),
-                registry,
-            ))
+                registry.map(Arc::as_ref),
+            )))
         }),
     )?;
 
