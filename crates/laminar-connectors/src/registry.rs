@@ -1,6 +1,6 @@
 //! Registry of connector factories, keyed by connector type string.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use ::serde::Serialize;
@@ -332,6 +332,24 @@ impl ConnectorRegistry {
         Ok(factory(registry))
     }
 
+    /// Derive a registered source connector's semantic recovery identity.
+    ///
+    /// This constructs an unopened source instance and invokes its pure,
+    /// configuration-only identity hook. `None` requests the runtime's
+    /// conservative sanitized-property fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source type is not registered or the connector
+    /// rejects the supplied semantic configuration.
+    pub fn source_recovery_identity_options(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<BTreeMap<String, String>>, ConnectorError> {
+        self.create_source(config, None)?
+            .recovery_identity_options(config)
+    }
+
     /// Creates a new sink connector instance.
     ///
     /// The connector type is determined by `config.connector_type()`.
@@ -591,6 +609,10 @@ mod tests {
         let config = ConnectorConfig::new("mock");
         let connector = registry.create_source(&config, None);
         assert!(connector.is_ok());
+        assert_eq!(
+            registry.source_recovery_identity_options(&config).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -661,6 +683,7 @@ mod tests {
         let config = ConnectorConfig::new("nonexistent");
 
         assert!(registry.create_source(&config, None).is_err());
+        assert!(registry.source_recovery_identity_options(&config).is_err());
         assert!(registry.create_sink(&config, None).is_err());
     }
 

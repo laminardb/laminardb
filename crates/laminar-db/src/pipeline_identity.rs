@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use arrow_schema::{Field, Schema};
 use laminar_connectors::config::ConnectorConfig;
+use laminar_connectors::registry::ConnectorRegistry;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -124,6 +125,7 @@ impl<'a> PipelineRegistrations<'a> {
 pub(crate) struct PipelineIdentityContext<'a> {
     config: &'a LaminarConfig,
     catalog: &'a SourceCatalog,
+    connector_registry: &'a ConnectorRegistry,
     registrations: PipelineRegistrations<'a>,
     vnode_count: u16,
     clustered: bool,
@@ -134,6 +136,7 @@ impl<'a> PipelineIdentityContext<'a> {
     pub(crate) const fn new(
         config: &'a LaminarConfig,
         catalog: &'a SourceCatalog,
+        connector_registry: &'a ConnectorRegistry,
         registrations: PipelineRegistrations<'a>,
         vnode_count: u16,
         clustered: bool,
@@ -141,6 +144,7 @@ impl<'a> PipelineIdentityContext<'a> {
         Self {
             config,
             catalog,
+            connector_registry,
             registrations,
             vnode_count,
             clustered,
@@ -156,7 +160,11 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
         state_layout: state_layout(context.clustered),
         vnode_count: context.vnode_count,
         delivery_guarantee: context.config.delivery_guarantee.to_string(),
-        sources: canonical_sources(context.catalog, &context.registrations)?,
+        sources: canonical_sources(
+            context.catalog,
+            context.connector_registry,
+            &context.registrations,
+        )?,
         streams: canonical_streams(&context.registrations),
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
@@ -180,12 +188,13 @@ const fn state_layout(clustered: bool) -> &'static str {
 
 fn canonical_sources(
     catalog: &SourceCatalog,
+    connector_registry: &ConnectorRegistry,
     registrations: &PipelineRegistrations<'_>,
 ) -> Result<Vec<CanonicalSource>, DbError> {
     let mut sources = Vec::with_capacity(registrations.sources.len());
     for reg in registrations.sources.values() {
         let (connector_type, options) = if reg.connector_type.is_some() {
-            canonical_source_connector(&build_source_config(reg)?)?
+            canonical_source_connector(&build_source_config(reg)?, connector_registry)?
         } else {
             ("catalog-bridge".into(), BTreeMap::new())
         };
@@ -321,8 +330,10 @@ fn canonical_connector(config: &ConnectorConfig) -> (String, BTreeMap<String, St
 
 fn canonical_source_connector(
     config: &ConnectorConfig,
+    connector_registry: &ConnectorRegistry,
 ) -> Result<(String, BTreeMap<String, String>), DbError> {
-    let options = laminar_connectors::recovery_identity::source_options(config)
+    let options = connector_registry
+        .source_recovery_identity_options(config)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
     Ok(options.map_or_else(
         || canonical_connector(config),
@@ -414,6 +425,8 @@ mod tests {
     #[cfg(feature = "postgres-cdc")]
     #[test]
     fn adapted_source_uses_semantic_connector_identity() {
+        let registry = ConnectorRegistry::new();
+        laminar_connectors::cdc::postgres::register_postgres_cdc_source(&registry).unwrap();
         let mut left = ConnectorConfig::new("postgres-cdc");
         left.set("host", "db-a.internal");
         left.set("database", "orders");
@@ -425,15 +438,15 @@ mod tests {
         moved.set("password", "rotated");
         moved.set("max.buffered.bytes", "134217728");
         assert_eq!(
-            canonical_source_connector(&left).unwrap(),
-            canonical_source_connector(&moved).unwrap()
+            canonical_source_connector(&left, &registry).unwrap(),
+            canonical_source_connector(&moved, &registry).unwrap()
         );
 
         let mut different_publication = left.clone();
         different_publication.set("publication", "other_pub");
         assert_ne!(
-            canonical_source_connector(&left).unwrap(),
-            canonical_source_connector(&different_publication).unwrap()
+            canonical_source_connector(&left, &registry).unwrap(),
+            canonical_source_connector(&different_publication, &registry).unwrap()
         );
     }
 

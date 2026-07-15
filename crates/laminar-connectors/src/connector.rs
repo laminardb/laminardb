@@ -665,6 +665,25 @@ pub trait SourceConnector: Send {
         Ok(SourceContract::default())
     }
 
+    /// Return connector-owned semantic options for durable recovery identity.
+    ///
+    /// The hook must be deterministic, configuration-only, and free of external
+    /// I/O. `Some` replaces the raw property map in the pipeline identity;
+    /// `None` asks the runtime to use its conservative sanitized-property
+    /// fallback. A connector may omit operational endpoints or credentials only
+    /// when its checkpoint independently binds the exact external object.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the semantic identity cannot be
+    /// derived from the supplied source configuration.
+    fn recovery_identity_options(
+        &self,
+        _config: &ConnectorConfig,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Acknowledge that `epoch` has been durably committed.
     ///
     /// Called after the manifest and exact engine commit decision are durable. Coordinated

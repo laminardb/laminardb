@@ -40,9 +40,6 @@ pub mod config;
 /// Secret classification and durable connector-identity sanitization.
 pub mod security;
 
-/// Connector-owned semantic identity for durable source recovery.
-pub mod recovery_identity;
-
 /// Core connector traits (`SourceConnector`, `SinkConnector`).
 pub mod connector;
 pub mod generator;

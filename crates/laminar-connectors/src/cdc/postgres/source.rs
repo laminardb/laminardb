@@ -7,7 +7,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -1455,6 +1455,28 @@ impl PostgresCdcSource {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for PostgresCdcSource {
+    fn recovery_identity_options(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<BTreeMap<String, String>>, ConnectorError> {
+        let mut parsed = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            PostgresCdcConfig::from_config(config)?
+        };
+        parsed.normalize_table_filters();
+        parsed.validate()?;
+
+        Ok(Some(BTreeMap::from([
+            ("database".into(), parsed.database),
+            ("publication".into(), parsed.publication),
+            ("slot.name".into(), parsed.slot_name),
+            ("table.exclude".into(), parsed.table_exclude.join(",")),
+            ("table.include".into(), parsed.table_include.join(",")),
+            ("wire.protocol".into(), "pgoutput-v1".into()),
+        ])))
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         if self.state != ConnectorState::Created {
             return Err(ConnectorError::InvalidState {
@@ -2182,6 +2204,18 @@ mod tests {
         src
     }
 
+    fn recovery_identity_config() -> ConnectorConfig {
+        let mut config = ConnectorConfig::new("postgres-cdc");
+        config.set("host", "db-a.internal");
+        config.set("database", "orders");
+        config.set("username", "replicator");
+        config.set("password", "secret-a");
+        config.set("slot.name", "orders_slot");
+        config.set("publication", "orders_pub");
+        config.set("table.include", "public.z, public.a");
+        config
+    }
+
     // ── Construction ──
 
     #[test]
@@ -2202,6 +2236,54 @@ mod tests {
             .unwrap();
         assert_eq!(contract.consistency, SourceConsistency::CommitCoupled);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
+
+    #[test]
+    fn recovery_identity_ignores_operational_connection_tuning() {
+        let left = recovery_identity_config();
+        let source = PostgresCdcSource::from_config(&left).unwrap();
+        let mut right = recovery_identity_config();
+        right.set("host", "db-b.internal");
+        right.set("port", "6432");
+        right.set("username", "rotated-user");
+        right.set("password", "rotated-secret");
+        right.set("ssl.mode", "disable");
+        right.set("max.buffered.bytes", "134217728");
+
+        let stored = source.recovery_identity_options(&left).unwrap();
+        assert_eq!(
+            stored,
+            source.recovery_identity_options(&right).unwrap(),
+            "connection and memory tuning must not fence durable recovery"
+        );
+        assert_eq!(
+            stored,
+            source
+                .recovery_identity_options(&ConnectorConfig::new("postgres-cdc"))
+                .unwrap(),
+            "an empty runtime config must use the validated provider config"
+        );
+    }
+
+    #[test]
+    fn recovery_identity_normalizes_filters_and_fences_slot_semantics() {
+        let left = recovery_identity_config();
+        let source = PostgresCdcSource::from_config(&left).unwrap();
+        let mut reordered = recovery_identity_config();
+        reordered.set("table.include", "public.a,public.z,public.a");
+        assert_eq!(
+            source.recovery_identity_options(&left).unwrap(),
+            source.recovery_identity_options(&reordered).unwrap(),
+            "equivalent filters must have one canonical identity"
+        );
+
+        let mut different_slot = recovery_identity_config();
+        different_slot.set("slot.name", "other_slot");
+        assert_ne!(
+            source.recovery_identity_options(&left).unwrap(),
+            source.recovery_identity_options(&different_slot).unwrap(),
+            "a different replication history must fence recovery"
+        );
     }
 
     #[test]

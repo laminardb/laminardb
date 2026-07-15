@@ -9,7 +9,7 @@
 //! I/O lives in an owned reader task; cancellation aborts that task so no
 //! connection or cursor outlives its connector.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -855,6 +855,31 @@ fn events_to_record_batch_refs(
 
 #[async_trait]
 impl SourceConnector for MongoDbCdcSource {
+    fn recovery_identity_options(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<BTreeMap<String, String>>, ConnectorError> {
+        let mut parsed = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            MongoDbSourceConfig::from_config(config)?
+        };
+        parsed.normalize_pipeline()?;
+        parsed.validate()?;
+        let pipeline = super::config::canonical_pipeline_json(&parsed.pipeline);
+
+        Ok(Some(BTreeMap::from([
+            ("collection".into(), parsed.collection),
+            ("database".into(), parsed.database),
+            (
+                "full.document.mode".into(),
+                parsed.full_document_mode.to_string(),
+            ),
+            ("pipeline".into(), pipeline),
+            ("wire.protocol".into(), "change-stream-expanded-v1".into()),
+        ])))
+    }
+
     fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
         // poll_batch only drains connector-owned memory. Admission cancellation aborts the
         // candidate reader through its ownership guard.
@@ -2422,6 +2447,14 @@ mod tests {
         config
     }
 
+    fn recovery_identity_config() -> ConnectorConfig {
+        let mut config = ConnectorConfig::new("mongodb-cdc");
+        config.set("connection.uri", "mongodb://db-a.internal:27017");
+        config.set("database", "orders");
+        config.set("collection", "events");
+        config
+    }
+
     fn sample_event(op: OperationType) -> MongoDbChangeEvent {
         MongoDbChangeEvent {
             operation_type: op,
@@ -2473,6 +2506,50 @@ mod tests {
         assert_eq!(
             source.cancellation_policy(),
             ConnectorCancellationPolicy::CancelSafe
+        );
+    }
+
+    #[test]
+    fn recovery_identity_ignores_endpoint_and_memory_tuning() {
+        let left = recovery_identity_config();
+        let source = MongoDbCdcSource::new(MongoDbSourceConfig::from_config(&left).unwrap(), None);
+        let mut right = recovery_identity_config();
+        right.set("connection.uri", "mongodb://db-b.internal:27017");
+        right.set("max.buffered.bytes", "134217728");
+
+        let stored = source.recovery_identity_options(&left).unwrap();
+        assert_eq!(
+            stored,
+            source.recovery_identity_options(&right).unwrap(),
+            "endpoint and memory tuning must not fence durable recovery"
+        );
+        assert_eq!(
+            stored,
+            source
+                .recovery_identity_options(&ConnectorConfig::new("mongodb-cdc"))
+                .unwrap(),
+            "an empty runtime config must use the validated provider config"
+        );
+    }
+
+    #[test]
+    fn recovery_identity_fences_collection_and_delivery_shape() {
+        let left = recovery_identity_config();
+        let source = MongoDbCdcSource::new(MongoDbSourceConfig::from_config(&left).unwrap(), None);
+        let mut collection = recovery_identity_config();
+        collection.set("collection", "other_events");
+        assert_ne!(
+            source.recovery_identity_options(&left).unwrap(),
+            source.recovery_identity_options(&collection).unwrap(),
+            "a different collection must fence recovery"
+        );
+
+        let mut full_document = recovery_identity_config();
+        full_document.set("full.document.mode", "required");
+        assert_ne!(
+            source.recovery_identity_options(&left).unwrap(),
+            source.recovery_identity_options(&full_document).unwrap(),
+            "a different delivery shape must fence recovery"
         );
     }
 

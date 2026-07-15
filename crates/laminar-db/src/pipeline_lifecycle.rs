@@ -1837,6 +1837,7 @@ impl LaminarDB {
             let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
                 &self.config,
                 &self.catalog,
+                &self.connector_registry,
                 identity_registrations,
                 vnode_count,
                 participant.is_some(),
