@@ -95,7 +95,7 @@ data:
     {{- if .properties }}
     [source.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- range .schema }}
@@ -126,7 +126,7 @@ data:
     {{- if .properties }}
     [lookup.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- end }}
@@ -152,7 +152,7 @@ data:
     {{- if .properties }}
     [sink.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- end }}

@@ -3792,7 +3792,7 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
     db.execute(
         "CREATE LOOKUP TABLE dimensions (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
-         WITH ('connector' = 'mock_direct', 'strategy' = 'on-demand', \
+         WITH ('connector' = 'mock-direct', 'strategy' = 'on-demand', \
          'cache.memory' = '1mb')",
     )
     .await

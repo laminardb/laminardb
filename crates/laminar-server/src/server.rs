@@ -448,6 +448,19 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
 // DDL generation
 // ---------------------------------------------------------------------------
 
+fn connector_sql_identifier(connector: &str) -> String {
+    let mut chars = connector.chars();
+    let unquoted = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|character| character.is_ascii_alphanumeric() || character == '_');
+    if unquoted {
+        connector.to_ascii_uppercase()
+    } else {
+        format!("\"{}\"", connector.replace('"', "\"\""))
+    }
+}
+
 pub fn source_to_ddl(source: &SourceConfig) -> String {
     let mut parts = Vec::new();
     parts.push(format!("CREATE SOURCE {}", source.name));
@@ -476,7 +489,7 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
     }
 
     // FROM CONNECTOR (...) clause
-    let connector_keyword = source.connector.replace('-', "_").to_uppercase();
+    let connector_keyword = connector_sql_identifier(&source.connector);
     let mut opts = Vec::new();
     opts.push(format!("format = '{}'", source.format));
     for (key, value) in &source.properties {
@@ -498,7 +511,7 @@ pub fn pipeline_to_ddl(pipeline: &PipelineConfig) -> String {
 }
 
 pub fn sink_to_ddl(sink: &SinkConfig) -> String {
-    let connector_keyword = sink.connector.replace('-', "_").to_uppercase();
+    let connector_keyword = connector_sql_identifier(&sink.connector);
     let opts: Vec<String> = sink
         .properties
         .iter()
@@ -889,10 +902,19 @@ mod tests {
     }
 
     #[test]
+    fn connector_identifiers_preserve_provider_punctuation() {
+        let hyphenated = source_to_ddl(&make_source("events", "postgres-cdc"));
+        assert!(hyphenated.contains("FROM \"postgres-cdc\""));
+
+        let underscored = source_to_ddl(&make_source("events", "vendor_v2"));
+        assert!(underscored.contains("FROM VENDOR_V2"));
+    }
+
+    #[test]
     fn test_source_to_ddl_with_properties() {
         let mut source = make_source("events", "kafka");
         source.properties.insert(
-            "brokers".to_string(),
+            "bootstrap.servers".to_string(),
             toml::Value::String("localhost:9092".to_string()),
         );
         source.properties.insert(
@@ -900,7 +922,7 @@ mod tests {
             toml::Value::String("events".to_string()),
         );
         let ddl = source_to_ddl(&source);
-        assert!(ddl.contains("brokers = 'localhost:9092'"));
+        assert!(ddl.contains("\"bootstrap.servers\" = 'localhost:9092'"));
         assert!(ddl.contains("topic = 'events'"));
     }
 
@@ -925,7 +947,7 @@ mod tests {
             toml::Value::String("output".to_string()),
         );
         props.insert(
-            "brokers".to_string(),
+            "bootstrap.servers".to_string(),
             toml::Value::String("localhost:9092".to_string()),
         );
         let sink = SinkConfig {
@@ -937,7 +959,7 @@ mod tests {
         let ddl = sink_to_ddl(&sink);
         assert!(ddl.starts_with("CREATE SINK output_sink FROM vwap INTO KAFKA"));
         assert!(ddl.contains("topic = 'output'"));
-        assert!(ddl.contains("brokers = 'localhost:9092'"));
+        assert!(ddl.contains("\"bootstrap.servers\" = 'localhost:9092'"));
         // Delivery is injected from the pipeline-wide engine contract at connector build time.
         assert!(!ddl.contains("delivery"));
     }

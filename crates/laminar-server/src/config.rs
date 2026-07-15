@@ -749,7 +749,7 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
-    /// Connector type: "kafka", "postgres_cdc", "mongodb-cdc", "generator".
+    /// Connector type: "kafka", "postgres-cdc", "mongodb-cdc", "generator".
     pub connector: String,
     #[serde(default = "default_format")]
     pub format: String,
@@ -1125,7 +1125,8 @@ name = "trades"
 connector = "kafka"
 format = "json"
 [source.properties]
-brokers = "localhost:9092"
+"bootstrap.servers" = "localhost:9092"
+"group.id" = "laminardb-trades"
 topic = "trades"
 [[source.schema]]
 name = "symbol"
@@ -1147,12 +1148,27 @@ name = "output"
 pipeline = "vwap"
 connector = "kafka"
 [sink.properties]
+"bootstrap.servers" = "localhost:9092"
 topic = "vwap_output"
 "#;
 
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.sources.len(), 1);
         assert_eq!(config.sources[0].name, "trades");
+        assert_eq!(
+            config.sources[0]
+                .properties
+                .get("bootstrap.servers")
+                .and_then(toml::Value::as_str),
+            Some("localhost:9092")
+        );
+        assert_eq!(
+            config.sources[0]
+                .properties
+                .get("group.id")
+                .and_then(toml::Value::as_str),
+            Some("laminardb-trades")
+        );
         assert_eq!(config.sources[0].schema.len(), 2);
         assert!(!config.sources[0].schema[0].nullable);
         assert!(config.sources[0].schema[1].nullable); // default true
@@ -1160,6 +1176,13 @@ topic = "vwap_output"
         assert_eq!(config.pipelines.len(), 1);
         assert_eq!(config.sinks.len(), 1);
         assert_eq!(config.sinks[0].pipeline, "vwap");
+        assert_eq!(
+            config.sinks[0]
+                .properties
+                .get("bootstrap.servers")
+                .and_then(toml::Value::as_str),
+            Some("localhost:9092")
+        );
 
         validate_config(&config).unwrap();
     }

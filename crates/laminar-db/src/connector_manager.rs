@@ -59,18 +59,9 @@ pub(crate) struct TableRegistration {
     pub cache_ttl: Option<std::time::Duration>,
 }
 
-/// Lowercase + replace underscores with hyphens.
+/// Connector identifiers are ASCII case-insensitive; punctuation remains provider-owned.
 pub(crate) fn normalize_connector_type(raw: &str) -> String {
-    raw.to_lowercase().replace('_', "-")
-}
-
-fn normalize_option_key(key: &str) -> String {
-    match key {
-        "brokers" => "bootstrap.servers".to_string(),
-        "group_id" => "group.id".to_string(),
-        "offset_reset" => "auto.offset.reset".to_string(),
-        other => other.to_string(),
-    }
+    raw.to_ascii_lowercase()
 }
 
 /// Build a `ConnectorConfig` from any registration that has connector fields.
@@ -86,7 +77,7 @@ fn build_connector_config(
         .ok_or_else(|| DbError::Connector(format!("{kind} '{name}' has no connector type")))?;
     let mut config = ConnectorConfig::new(normalize_connector_type(ct));
     for (k, v) in connector_options {
-        config.set(normalize_option_key(k), v.clone());
+        config.set(k.clone(), v.clone());
     }
     if let Some(fmt_str) = format {
         let lower = fmt_str.to_lowercase();
@@ -629,6 +620,24 @@ mod tests {
     }
 
     #[test]
+    fn connector_options_are_not_rewritten_by_the_generic_bridge() {
+        let reg = SourceRegistration {
+            name: "custom".to_string(),
+            connector_type: Some("custom".to_string()),
+            connector_options: HashMap::from([
+                ("provider.endpoint".to_string(), "host:1234".to_string()),
+                ("opaque_key".to_string(), "provider-value".to_string()),
+            ]),
+            format: None,
+            format_options: HashMap::new(),
+        };
+
+        let config = build_source_config(&reg).unwrap();
+        assert_eq!(config.get("provider.endpoint"), Some("host:1234"));
+        assert_eq!(config.get("opaque_key"), Some("provider-value"));
+    }
+
+    #[test]
     fn test_build_source_config_missing_type() {
         let reg = SourceRegistration {
             name: "clicks".to_string(),
@@ -811,13 +820,12 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_connector_type_variants() {
-        // All forms of "delta-lake" must resolve to the same canonical name.
+    fn connector_type_normalization_preserves_provider_identifiers() {
         assert_eq!(normalize_connector_type("delta-lake"), "delta-lake");
-        assert_eq!(normalize_connector_type("delta_lake"), "delta-lake");
-        assert_eq!(normalize_connector_type("DELTA_LAKE"), "delta-lake");
+        assert_eq!(normalize_connector_type("delta_lake"), "delta_lake");
+        assert_eq!(normalize_connector_type("DELTA_LAKE"), "delta_lake");
         assert_eq!(normalize_connector_type("DELTA-LAKE"), "delta-lake");
-        assert_eq!(normalize_connector_type("Delta_Lake"), "delta-lake");
+        assert_eq!(normalize_connector_type("Vendor_V2"), "vendor_v2");
     }
 
     #[test]
@@ -831,16 +839,16 @@ mod tests {
     #[test]
     fn test_normalize_connector_type_hyphenated() {
         assert_eq!(normalize_connector_type("postgres-cdc"), "postgres-cdc");
-        assert_eq!(normalize_connector_type("POSTGRES_CDC"), "postgres-cdc");
+        assert_eq!(normalize_connector_type("POSTGRES-CDC"), "postgres-cdc");
         assert_eq!(normalize_connector_type("postgres-sink"), "postgres-sink");
-        assert_eq!(normalize_connector_type("POSTGRES_SINK"), "postgres-sink");
+        assert_eq!(normalize_connector_type("POSTGRES-SINK"), "postgres-sink");
     }
 
     #[test]
-    fn test_build_source_config_normalizes_hyphenated_type() {
+    fn test_build_source_config_normalizes_case_only() {
         let reg = SourceRegistration {
             name: "cdc".to_string(),
-            connector_type: Some("POSTGRES_CDC".to_string()),
+            connector_type: Some("POSTGRES-CDC".to_string()),
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
@@ -850,11 +858,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sink_config_normalizes_hyphenated_type() {
+    fn test_build_sink_config_normalizes_case_only() {
         let reg = SinkRegistration {
             name: "lake".to_string(),
             input: "events".to_string(),
-            connector_type: Some("DELTA_LAKE".to_string()),
+            connector_type: Some("DELTA-LAKE".to_string()),
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),

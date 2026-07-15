@@ -40,10 +40,10 @@ name = "orders"
 connector = "kafka"
 format = "avro"
 [source.properties]
-brokers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "orders"
-group_id = "laminardb-orders"
-schema_registry = "${SCHEMA_REGISTRY_URL}"
+"group.id" = "laminardb-orders"
+"schema.registry.url" = "${SCHEMA_REGISTRY_URL}"
 
 # ── Pipelines ───────────────────────────────────────────────────────────
 
@@ -63,5 +63,5 @@ name = "enriched_orders"
 pipeline = "order_enrichment"
 connector = "kafka"
 [sink.properties]
-brokers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "enriched_orders"

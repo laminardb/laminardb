@@ -56,10 +56,10 @@ SELECT ..., ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY price DESC) FROM tra
 SELECT ..., SUM(vol) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 5 PRECEDING AND CURRENT ROW)
 
 -- Connector DDL
-CREATE SOURCE ... FROM KAFKA (brokers = '...', topic = '...', format = 'json')
-CREATE SOURCE ... FROM POSTGRES_CDC (hostname = '...', database = '...')
-CREATE SINK ... INTO KAFKA (brokers = '...', topic = '...')
-CREATE SINK ... INTO DELTA_LAKE (path = '...')
+CREATE SOURCE ... FROM KAFKA ('bootstrap.servers' = '...', topic = '...', format = 'json')
+CREATE SOURCE ... FROM "postgres-cdc" (host = '...', database = '...')
+CREATE SINK ... INTO KAFKA ('bootstrap.servers' = '...', topic = '...')
+CREATE SINK ... INTO "delta-lake" ('table.path' = '...')
 
 -- Retain a bounded ring of recent epochs so SUBSCRIBE clients can
 -- reconnect without gaps.

@@ -378,14 +378,14 @@ CREATE SOURCE trades (
     symbol VARCHAR, price DOUBLE, volume BIGINT, ts TIMESTAMP,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 ) FROM KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'market-trades',
-    group_id = 'laminar-analytics',
+    'group.id' = 'laminar-analytics',
     format = 'json',
-    offset_reset = 'earliest'
+    'auto.offset.reset' = 'earliest'
 );
 
-CREATE SINK trade_archive INTO DELTA_LAKE (
+CREATE SINK trade_archive INTO "delta-lake" (
     "table.path" = 's3://my-bucket/trade_summary',
     "write.mode" = 'append'
 ) AS SELECT * FROM trade_summary;
