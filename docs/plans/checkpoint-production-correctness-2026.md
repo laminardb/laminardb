@@ -94,17 +94,18 @@ reading that cursor.
 
 Keep public choices to runtime mode, requested delivery, source scope/start policy, connection and
 security data, durable storage location and namespace, checkpoint cadence and end-to-end deadline,
-recovery objective, deterministic sink keys, and hard memory/local-cache budgets. State exposes at
-most one immutable deployment-level `key_groups` expert setting; runtime mode derives the physical
-in-memory, local-disk, cache, and shared-checkpoint policy. Do not expose placement, gossip
-consistency, compaction strategy, or separate backend-specific vnode-capacity matrices.
+recovery objective, deterministic sink keys, and hard memory/local-cache budgets. State exposes one
+optional `state.key_groups` expert setting in cluster mode only. Embedded and single-node runtimes
+resolve to one key group; cluster defaults to 256 and may override it only before the deployment
+namespace is created. Persist the resolved value and reject every later mismatch. Do not expose the
+hash, encoder, seed, source partition count, placement, gossip consistency, compaction strategy, or
+separate backend-specific vnode-capacity matrices.
 
 Consistency, topology, and sink input mode remain typed internal connector contracts because they
 enforce independent admission proofs; they are not user options. Derive writer identity,
 transaction alignment, snapshot concurrency, batching, retry cadence, shuffle behavior, and
 publication ownership. State writer identity is private: local modes use a local audit identity and
 cluster mode derives it from the runtime node.
-Vnode count should be an immutable deployment-level expert setting at most.
 
 Use one absolute checkpoint-attempt deadline, one connector health deadline carried from enqueue
 to acknowledgement, and a private bounded cleanup budget. Stage-specific timeout resets, writer
@@ -117,32 +118,35 @@ checkpoint surface.
    writes, term-fence every durable per-node recovery-control value, preserve the global recovery
    generation across process terms, and fail unknown gossip lifecycle state closed. These are
    recovery-cut prerequisites, not state-engine work.
-2. **Certify the corrective checkpoint core.** Complete compile and deterministic tests for seal
+2. **Freeze the immutable deployment and partition contract.** Replace duplicated state/checkpoint
+   roots with one durable storage URL and deployment namespace. Resolve `state.key_groups` once from
+   runtime mode, persist it, and remove backend-specific vnode capacities and unchecked numeric
+   fallbacks. Version the canonical Arrow-key encoding, ordered key fields, hash, global key group,
+   and source-split mapping as one partitioning ABI. Bind that ABI to catalog/runtime identity,
+   assignments, checkpoints, shuffle handshakes, and recovery before enabling rescale. Pin reviewed
+   golden vectors; an encoder or vector change requires an ABI bump and deliberate state rejection.
+   Local guaranteed delivery must reject temporary or absent storage; cluster must reject node-local
+   storage. Remove dead profile/parallelism/retention choices before certifying deployment artifacts,
+   and never render a guaranteed Helm mode onto `emptyDir`.
+3. **Certify the corrective checkpoint core.** Complete compile and deterministic tests for seal
    provenance and bounds, decision ambiguity, recovery capsules, assignment adoption, retention,
    shutdown tails, and corruption. Run the finite local process-death output oracle and remove dead
    code before another feature cycle.
-3. **Fail closed on mutable capture errors.** Operator and vnode capture can consume dirty sets or
+4. **Fail closed on mutable capture errors.** Operator and vnode capture can consume dirty sets or
    drain accumulators before rebuilding them. Any capture error must fault the pipeline and recover
    from the last committed cut before sources resume. Prove this with an injected drain/rebuild
    failure in local and cluster execution; an in-memory retry is not safe.
-4. **Cancel superseded shuffle scope before rotation.** Bind every blocking connect, send, receive,
+5. **Cancel superseded shuffle scope before rotation.** Bind every blocking connect, send, receive,
    queue, byte permit, and stream slot to the exact assignment/recovery scope. Invalidation,
    suspension, rewind, or replacement must cancel that scope before waiting for the rotation fence.
    Once a newer durable assignment is audited, close old source and shuffle authority before any
    handoff or state read, carry one absolute deadline, and remain fenced on failure.
-5. **Isolate shuffle delivery classes and harden routing.** Give checkpointed data/barriers and
+6. **Isolate shuffle delivery classes and harden routing.** Give checkpointed data/barriers and
    ephemeral subscriptions separate bounded queues, byte reservations, and holdovers under one
    node memory cap and separate connections. Preserve one FIFO domain for checkpointed data plus
    barriers. Make routing
    return errors for invalid owner/vnode inputs, prove row-count conservation, and reject reserved
    protocol field/stage names at DDL admission.
-6. **Make durable configuration fail closed and remove false choices.** Replace the duplicated
-   state/checkpoint roots with one explicit storage URL and deployment namespace, derive physical
-   policy from runtime mode, and persist the immutable key-group count in that namespace. Local
-   guaranteed delivery must reject temporary or absent storage; cluster must reject node-local
-   storage. Remove the dead profile policy, ignored pipeline parallelism, public retention count,
-   and backend matrix before certifying deployment artifacts. Helm must render no guaranteed mode
-   onto `emptyDir`.
 7. **Certify the cluster at-least-once protocol on stateless and explicitly bounded small-state
    graphs.** Test the exact shuffle roster, sequence/high-water loss detection, reconnect, process
    replacement, rebalance, recovery Release, capsule restore, and authority retention under static
@@ -210,11 +214,14 @@ checkpoint surface.
 ## Primary research and implementation references
 
 - Apache Flink 2.3 [fault tolerance](https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/),
+  [parallelism and key groups](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/execution/parallel/),
   [state backends](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/),
   [experimental disaggregated state](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/disaggregated_state/),
   and [network tuning](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/memory/network_mem_tuning/)
 - Apache Spark 4.1.2 [state and shuffle invariants](https://spark.apache.org/docs/latest/streaming/additional-information.html),
-  RisingWave [architecture](https://docs.risingwave.com/get-started/architecture), and Arroyo
+  RisingWave [stable vnode mapping](https://risingwavelabs.github.io/risingwave/design/consistent-hash.html),
+  Apache Kafka 4.3 [task and partition assignment](https://kafka.apache.org/43/streams/developer-guide/streams-rebalance-protocol/),
+  Apache Arrow 57.2 [row encoding](https://arrow.apache.org/rust/arrow_row/struct.RowConverter.html), and Arroyo
   [architecture](https://doc.arroyo.dev/architecture/)
 - PostgreSQL 18 [replication protocol](https://www.postgresql.org/docs/18/protocol-replication.html),
   [logical decoding](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html), and

@@ -5,6 +5,7 @@ pub mod avro;
 pub mod config;
 pub mod metrics;
 pub mod offsets;
+pub mod partition_assignment;
 pub mod rebalance;
 pub mod source;
 

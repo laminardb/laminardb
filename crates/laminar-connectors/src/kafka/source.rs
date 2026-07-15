@@ -16,20 +16,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use super::rebalance::LaminarConsumerContext;
-
-/// Locks a mutex, recovering from poison if a prior holder panicked.
-///
-/// Used for state shared with rdkafka's rebalance callback thread.
-/// Poison indicates a panic in the callback — the data may be stale
-/// but is structurally sound, so we recover rather than propagate.
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        tracing::warn!("mutex poisoned, recovering");
-        poisoned.into_inner()
-    })
-}
-
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
@@ -50,14 +36,42 @@ use super::offsets::{OffsetTracker, KAFKA_PARTITION_BASELINE_PREFIX};
 use super::rebalance::RebalanceState;
 use super::schema_registry::SchemaRegistryClient;
 
+use super::rebalance::LaminarConsumerContext;
 use crate::schema::evolution::SchemaEvolution;
 use crate::schema::traits::{CompatibilityMode, EvolutionVerdict};
+
+/// Locks a mutex, recovering from poison if a prior holder panicked.
+///
+/// Used for state shared with rdkafka's rebalance callback thread.
+/// Poison indicates a panic in the callback — the data may be stale
+/// but is structurally sound, so we recover rather than propagate.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("mutex poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
+fn publish_reader_fault(
+    fault: &Mutex<Option<Arc<str>>>,
+    data_ready: &Notify,
+    reason: impl Into<Arc<str>>,
+) {
+    let mut published = lock_or_recover(fault);
+    if published.is_none() {
+        *published = Some(reason.into());
+    }
+    drop(published);
+    data_ready.notify_one();
+}
 
 /// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
 struct KafkaPayload {
     data: Vec<u8>,
     topic: Arc<str>,
     partition: i32,
+    /// Precomputed route for cluster-owned inputs; absent for local readers.
+    partition_vnode: Option<u32>,
     offset: i64,
     timestamp_ms: Option<i64>,
     /// Message headers as a JSON string; populated only when `include_headers` is set.
@@ -119,6 +133,7 @@ const KAFKA_POSITION_LOOKUP_CONCURRENCY: usize = 32;
 
 type KafkaPartitionSet = std::collections::HashSet<(String, i32)>;
 type KafkaPartitionBaselines = std::collections::HashMap<(String, i32), i64>;
+type KafkaPartitionRoutes = std::collections::HashMap<Arc<str>, Arc<[u32]>>;
 type KafkaRotationBaselines =
     std::collections::HashMap<Arc<str>, std::collections::HashMap<i32, i64>>;
 
@@ -161,25 +176,35 @@ fn kafka_drain_cursor_digest(cut: &[KafkaDrainPosition]) -> [u8; 32] {
 
 fn kafka_drain_partitions(
     request: &SourceDrainRequest,
+    source_identity: &str,
     vnode_count: u32,
     topic_meta: &[(Arc<str>, i32)],
-) -> Arc<[KafkaDrainPartition]> {
+) -> Result<Arc<[KafkaDrainPartition]>, ConnectorError> {
     let revoking: std::collections::HashSet<u32> =
         request.revoking_vnodes.iter().copied().collect();
-    let mut inputs: Vec<KafkaDrainPartition> = topic_meta
-        .iter()
-        .flat_map(|(topic, count)| {
-            (0..*count).filter_map(|partition| {
-                u32::try_from(partition)
-                    .ok()
-                    .filter(|partition| revoking.contains(&(*partition % vnode_count)))
-                    .map(|_| KafkaDrainPartition {
-                        topic: Arc::clone(topic),
-                        partition,
-                    })
-            })
-        })
-        .collect();
+    let mut inputs = Vec::new();
+    for (topic, count) in topic_meta {
+        if *count < 0 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka topic '{}' reported a negative partition count {count}",
+                topic
+            )));
+        }
+        for partition in 0..*count {
+            let vnode = super::partition_assignment::partition_vnode(
+                source_identity,
+                topic,
+                partition,
+                vnode_count,
+            )?;
+            if revoking.contains(&vnode) {
+                inputs.push(KafkaDrainPartition {
+                    topic: Arc::clone(topic),
+                    partition,
+                });
+            }
+        }
+    }
     inputs.sort_unstable_by(|left, right| {
         left.topic
             .as_ref()
@@ -187,7 +212,71 @@ fn kafka_drain_partitions(
             .then(left.partition.cmp(&right.partition))
     });
     inputs.dedup();
-    inputs.into()
+    Ok(inputs.into())
+}
+
+fn kafka_partition_routes(
+    source_identity: &str,
+    vnode_count: u32,
+    topic_meta: &[(Arc<str>, i32)],
+) -> Result<KafkaPartitionRoutes, ConnectorError> {
+    let mut routes = KafkaPartitionRoutes::with_capacity(topic_meta.len());
+    for (topic, count) in topic_meta {
+        if *count < 0 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka topic '{}' reported a negative partition count {count}",
+                topic
+            )));
+        }
+        let mut topic_routes = Vec::with_capacity(usize::try_from(*count).map_err(|_| {
+            ConnectorError::ConfigurationError(format!(
+                "Kafka topic '{}' partition count cannot be represented on this platform",
+                topic
+            ))
+        })?);
+        for partition in 0..*count {
+            topic_routes.push(super::partition_assignment::partition_vnode(
+                source_identity,
+                topic,
+                partition,
+                vnode_count,
+            )?);
+        }
+        if routes
+            .insert(Arc::clone(topic), topic_routes.into())
+            .is_some()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka vnode assignment contains duplicate topic '{}'",
+                topic
+            )));
+        }
+    }
+    Ok(routes)
+}
+
+fn cached_partition_vnode(
+    topic_routes: Option<&[u32]>,
+    partition: i32,
+) -> Result<Option<u32>, ConnectorError> {
+    let Some(topic_routes) = topic_routes else {
+        return Ok(None);
+    };
+    let partition_index = usize::try_from(partition).map_err(|_| {
+        ConnectorError::ConfigurationError(format!(
+            "Kafka payload has negative partition id {partition}"
+        ))
+    })?;
+    topic_routes
+        .get(partition_index)
+        .copied()
+        .map(Some)
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "Kafka payload partition {partition} is outside the activated topic inventory {}",
+                topic_routes.len()
+            ))
+        })
 }
 
 fn kafka_partition_result_errors(tpl: &TopicPartitionList) -> Vec<String> {
@@ -448,6 +537,8 @@ pub struct KafkaSource {
     msg_rx: Option<KafkaReaderRx>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// First terminal reader reason, published before an assignment wait can hide its exit.
+    reader_fault: Arc<Mutex<Option<Arc<str>>>>,
     /// Allocated only for a vnode-assigned instance; embedded/single readers have no drain path.
     reader_drain_tx: Option<tokio::sync::mpsc::UnboundedSender<KafkaReaderDrainCommand>>,
     source_drain: Option<KafkaSourceDrain>,
@@ -464,9 +555,9 @@ pub struct KafkaSource {
     /// Stable catalog source identity for namespaced cluster handoff offsets.
     source_name: Arc<str>,
 
-    /// Cluster vnode assignment: when set, `start()` manually `assign()`s the
-    /// partitions this node owns (`partition % vnode_count`) instead of
-    /// `subscribe()`, and the reader re-binds on version rotation.
+    /// Cluster vnode assignment: when set, `start()` manually `assign()`s this
+    /// source's vnode-owned partitions instead of `subscribe()`, and the reader
+    /// re-binds on version rotation.
     vnode_assignment: Option<(
         Arc<laminar_core::state::VnodeRegistry>,
         laminar_core::state::NodeId,
@@ -474,6 +565,8 @@ pub struct KafkaSource {
     /// `(topic, partition_count)` from `start()`, so the reader can recompute
     /// owned partitions on rotation without re-fetching metadata.
     vnode_topic_meta: Vec<(Arc<str>, i32)>,
+    /// Precomputed source/topic/partition routes used by the per-record stale-owner fence.
+    vnode_partition_routes: KafkaPartitionRoutes,
     /// Canonical non-vnode manual assignment used by local guaranteed, specific, and timestamp
     /// starts. Checkpointing trusts this engine-owned inventory, never a fallible broker query.
     manual_topic_partitions: KafkaPartitionSet,
@@ -594,6 +687,7 @@ impl KafkaSource {
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
+            reader_fault: Arc::new(Mutex::new(None)),
             reader_drain_tx: None,
             source_drain: None,
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
@@ -601,6 +695,7 @@ impl KafkaSource {
             source_name: Arc::from(""),
             vnode_assignment: None,
             vnode_topic_meta: Vec::new(),
+            vnode_partition_routes: KafkaPartitionRoutes::new(),
             manual_topic_partitions: std::collections::HashSet::new(),
             manual_partition_baselines: std::collections::HashMap::new(),
             rotation_partition_baselines: Arc::new(Mutex::new(Arc::new(
@@ -695,7 +790,26 @@ impl KafkaSource {
         Ok(cut.into())
     }
 
+    fn check_reader_health(&self, operation: &str) -> Result<(), ConnectorError> {
+        if let Some(reason) = lock_or_recover(&self.reader_fault).clone() {
+            return Err(ConnectorError::Internal(format!(
+                "Kafka reader terminated while {operation}: {reason}"
+            )));
+        }
+        if self
+            .reader_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(ConnectorError::Internal(format!(
+                "Kafka reader task exited while {operation}"
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_active_drain_cursor(&self) -> Result<(), ConnectorError> {
+        self.check_reader_health("validating a drain cursor")?;
         let Some(active) = self.source_drain.as_ref() else {
             return Ok(());
         };
@@ -742,6 +856,7 @@ impl KafkaSource {
             (None, None)
         };
         let data_ready = Arc::clone(&self.data_ready);
+        let reader_fault = Arc::clone(&self.reader_fault);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
         let reader_channel_capacity = self.config.reader_channel_capacity;
@@ -753,6 +868,7 @@ impl KafkaSource {
         // -- Reader task: message consumption, backpressure, revoke pruning --
         // Engine-controlled re-assignment inputs (cluster mode; `None` otherwise).
         let vnode_topic_meta = self.vnode_topic_meta.clone();
+        let vnode_partition_routes = std::mem::take(&mut self.vnode_partition_routes);
         let reassign_snapshot = Arc::clone(&self.offset_snapshot);
         let reassign_baselines = self.manual_partition_baselines.clone();
         let rotation_baselines = Arc::clone(&self.rotation_partition_baselines);
@@ -767,6 +883,7 @@ impl KafkaSource {
         let mut reader_shutdown = shutdown_rx;
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
+            let mut cached_topic_routes: Option<Arc<[u32]>> = None;
             let mut is_paused = false;
             let mut last_assign_gen: u64 = 0;
             // start() records the exact publication used for its initial Kafka assignment.
@@ -808,11 +925,31 @@ impl KafkaSource {
                         let mut owned_set: std::collections::HashSet<(String, i32)> =
                             std::collections::HashSet::new();
                         for (topic, count) in &vnode_topic_meta {
-                            for p in crate::partition_assignment::owned_partitions_in_assignment(
-                                *count,
-                                published.owners(),
-                                *self_id,
-                            ) {
+                            let owned =
+                                match super::partition_assignment::owned_partitions_in_assignment(
+                                    source_name.as_ref(),
+                                    topic.as_ref(),
+                                    *count,
+                                    published.owners(),
+                                    *self_id,
+                                ) {
+                                    Ok(owned) => owned,
+                                    Err(error) => {
+                                        warn!(
+                                            source = source_name.as_ref(),
+                                            topic = topic.as_ref(),
+                                            %error,
+                                            "Kafka source rejected a non-canonical partition route"
+                                        );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            format!("non-canonical partition route: {error}"),
+                                        );
+                                        return;
+                                    }
+                                };
+                            for p in owned {
                                 owned_set.insert((topic.to_string(), p));
                             }
                         }
@@ -821,21 +958,39 @@ impl KafkaSource {
                         // fenced (for example consecutive dead-node shedding). The latest owner
                         // set then matches the live Kafka assignment even though the partition
                         // must be unassigned and re-seeked to the latest durable handoff.
-                        let reacquired: KafkaPartitionSet = vnode_topic_meta
-                            .iter()
-                            .flat_map(|(topic, count)| {
-                                (0..*count)
-                                    .filter(|partition| {
-                                        partition_reacquired_after(
-                                            &published,
-                                            *partition,
-                                            *self_id,
-                                            last_assignment_version,
-                                        )
-                                    })
-                                    .map(|partition| (topic.to_string(), partition))
-                            })
-                            .collect();
+                        let mut reacquired = KafkaPartitionSet::new();
+                        for (topic, count) in &vnode_topic_meta {
+                            for partition in 0..*count {
+                                match partition_reacquired_after(
+                                    &published,
+                                    source_name.as_ref(),
+                                    topic.as_ref(),
+                                    partition,
+                                    *self_id,
+                                    last_assignment_version,
+                                ) {
+                                    Ok(true) => {
+                                        reacquired.insert((topic.to_string(), partition));
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        warn!(
+                                            source = source_name.as_ref(),
+                                            topic = topic.as_ref(),
+                                            partition,
+                                            %error,
+                                            "Kafka source rejected a non-canonical reacquisition route"
+                                        );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            format!("non-canonical reacquisition route: {error}"),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
 
                         let mut to_remove = TopicPartitionList::new();
                         for e in current.elements() {
@@ -858,6 +1013,11 @@ impl KafkaSource {
                                         error = %error,
                                         "Kafka source rejected durable checkpoint handoff"
                                     );
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        format!("invalid durable checkpoint handoff: {error}"),
+                                    );
                                     return;
                                 }
                             }
@@ -867,11 +1027,31 @@ impl KafkaSource {
                         let mut to_add = TopicPartitionList::new();
                         let mut acquired_positions = KafkaPartitionBaselines::new();
                         for (topic, count) in &vnode_topic_meta {
-                            for p in crate::partition_assignment::owned_partitions_in_assignment(
-                                *count,
-                                published.owners(),
-                                *self_id,
-                            ) {
+                            let owned =
+                                match super::partition_assignment::owned_partitions_in_assignment(
+                                    source_name.as_ref(),
+                                    topic.as_ref(),
+                                    *count,
+                                    published.owners(),
+                                    *self_id,
+                                ) {
+                                    Ok(owned) => owned,
+                                    Err(error) => {
+                                        warn!(
+                                            source = source_name.as_ref(),
+                                            topic = topic.as_ref(),
+                                            %error,
+                                            "Kafka source rejected a non-canonical acquisition route"
+                                        );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            format!("non-canonical acquisition route: {error}"),
+                                        );
+                                        return;
+                                    }
+                                };
+                            for p in owned {
                                 if current_set.contains(&(topic.to_string(), p))
                                     && !reacquired.contains(&(topic.to_string(), p))
                                 {
@@ -895,6 +1075,11 @@ impl KafkaSource {
                                             %error,
                                             "Kafka source rejected an invalid handoff position"
                                         );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            format!("invalid handoff position: {error}"),
+                                        );
                                         return;
                                     }
                                 } {
@@ -912,6 +1097,11 @@ impl KafkaSource {
                                         partition = p,
                                         "acquired Kafka partition has no durable next-to-read baseline"
                                     );
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "acquired partition has no durable baseline",
+                                    );
                                     return;
                                 } else if deterministic_unrecorded.load(Ordering::Acquire) {
                                     let Some(initial_offset) = deterministic_default else {
@@ -919,6 +1109,11 @@ impl KafkaSource {
                                             topic = topic.as_ref(),
                                             partition = p,
                                             "cannot deterministically position acquired Kafka partition"
+                                        );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            "acquired partition has no deterministic position",
                                         );
                                         return;
                                     };
@@ -940,6 +1135,11 @@ impl KafkaSource {
                                         partition = p,
                                         %error,
                                         "failed to build Kafka rotation assignment"
+                                    );
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        format!("invalid rotation assignment: {error}"),
                                     );
                                     return;
                                 }
@@ -994,6 +1194,11 @@ impl KafkaSource {
                                     version,
                                     %error,
                                     "Kafka source rejected an expired handoff position"
+                                );
+                                publish_reader_fault(
+                                    &reader_fault,
+                                    &data_ready,
+                                    format!("expired handoff position: {error}"),
                                 );
                                 return;
                             }
@@ -1073,11 +1278,21 @@ impl KafkaSource {
                                         requested = ?request.round,
                                         "Kafka reader received a conflicting drain round"
                                     );
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "conflicting Kafka drain round",
+                                    );
                                     return;
                                 }
                             } else {
                                 let Some((registry, _)) = vnode_reassign.as_ref() else {
                                     warn!("Kafka reader received drain control without vnode ownership");
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "drain control has no vnode ownership",
+                                    );
                                     return;
                                 };
                                 if registry.assignment_version()
@@ -1088,13 +1303,34 @@ impl KafkaSource {
                                         predecessor = request.round.predecessor_version,
                                         "Kafka reader rejected drain for a stale predecessor"
                                     );
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "drain predecessor does not match current assignment",
+                                    );
                                     return;
                                 }
-                                let revoked = kafka_drain_partitions(
+                                let revoked = match kafka_drain_partitions(
                                     &request,
+                                    source_name.as_ref(),
                                     registry.vnode_count(),
                                     &vnode_topic_meta,
-                                );
+                                ) {
+                                    Ok(revoked) => revoked,
+                                    Err(error) => {
+                                        warn!(
+                                            source = source_name.as_ref(),
+                                            %error,
+                                            "Kafka reader rejected a non-canonical drain route"
+                                        );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            format!("non-canonical drain route: {error}"),
+                                        );
+                                        return;
+                                    }
+                                };
                                 active_drain = Some(KafkaReaderDrain {
                                     request,
                                     revoked,
@@ -1194,6 +1430,13 @@ impl KafkaSource {
                         };
                         if !sent {
                             channel_len.fetch_sub(1, Ordering::Relaxed);
+                            if !*reader_shutdown.borrow() {
+                                publish_reader_fault(
+                                    &reader_fault,
+                                    &data_ready,
+                                    "reader drain-boundary channel closed unexpectedly",
+                                );
+                            }
                             break;
                         }
                         active.boundary_queued = true;
@@ -1243,6 +1486,11 @@ impl KafkaSource {
                         Ok(tpl) => tpl,
                         Err(e) => {
                             warn!(error = %e, "failed to build Kafka recovery assignment");
+                            publish_reader_fault(
+                                &reader_fault,
+                                &data_ready,
+                                format!("invalid recovery assignment: {e}"),
+                            );
                             return;
                         }
                     };
@@ -1435,10 +1683,16 @@ impl KafkaSource {
                             let topic = msg.topic();
                             if active_drain.as_ref().is_some_and(|drain| {
                                 drain.boundary_queued
-                                    && drain.revoked.iter().any(|input| {
-                                        input.topic.as_ref() == topic
-                                            && input.partition == msg.partition()
-                                    })
+                                    && drain
+                                        .revoked
+                                        .binary_search_by(|input| {
+                                            input
+                                                .topic
+                                                .as_ref()
+                                                .cmp(topic)
+                                                .then(input.partition.cmp(&msg.partition()))
+                                        })
+                                        .is_ok()
                             }) {
                                 // librdkafka may return records prefetched before pause. They are
                                 // deliberately outside Laminar's cut: do not enqueue them or
@@ -1452,8 +1706,48 @@ impl KafkaSource {
                                 continue;
                             }
                             if &*cached_topic != topic {
-                                cached_topic = Arc::from(topic);
+                                if vnode_reassign.is_some() {
+                                    let Some((canonical_topic, routes)) =
+                                        vnode_partition_routes.get_key_value(topic)
+                                    else {
+                                        warn!(
+                                            topic,
+                                            "Kafka reader received a topic outside its activated vnode inventory"
+                                        );
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            "payload topic is outside the activated inventory",
+                                        );
+                                        return;
+                                    };
+                                    cached_topic = Arc::clone(canonical_topic);
+                                    cached_topic_routes = Some(Arc::clone(routes));
+                                } else {
+                                    cached_topic = Arc::from(topic);
+                                    cached_topic_routes = None;
+                                }
                             }
+                            let partition_vnode = match cached_partition_vnode(
+                                cached_topic_routes.as_deref(),
+                                msg.partition(),
+                            ) {
+                                Ok(vnode) => vnode,
+                                Err(error) => {
+                                    warn!(
+                                        topic,
+                                        partition = msg.partition(),
+                                        %error,
+                                        "Kafka reader rejected a payload outside its activated vnode inventory"
+                                    );
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        format!("payload route is outside the activated inventory: {error}"),
+                                    );
+                                    return;
+                                }
+                            };
                             let timestamp_ms = match msg.timestamp() {
                                 rdkafka::Timestamp::CreateTime(ts)
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
@@ -1483,6 +1777,7 @@ impl KafkaSource {
                                 data: payload.to_vec(),
                                 topic: Arc::clone(&cached_topic),
                                 partition: msg.partition(),
+                                partition_vnode,
                                 offset: msg.offset(),
                                 timestamp_ms,
                                 headers_json,
@@ -1529,10 +1824,26 @@ impl KafkaSource {
                                     };
                                     if !send_ok {
                                         channel_len.fetch_sub(1, Ordering::Relaxed);
+                                        if !*reader_shutdown.borrow() {
+                                            publish_reader_fault(
+                                                &reader_fault,
+                                                &data_ready,
+                                                "reader output channel closed unexpectedly",
+                                            );
+                                        }
                                         break;
                                     }
                                 }
-                                Err(crossfire::TrySendError::Disconnected(_)) => break,
+                                Err(crossfire::TrySendError::Disconnected(_)) => {
+                                    if !*reader_shutdown.borrow() {
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            "reader output channel disconnected unexpectedly",
+                                        );
+                                    }
+                                    break;
+                                }
                             }
                             data_ready.notify_one();
                         }
@@ -1542,6 +1853,11 @@ impl KafkaSource {
                     }
                     Err(e) => {
                         warn!(error = %e, "Kafka consumer error");
+                        publish_reader_fault(
+                            &reader_fault,
+                            &data_ready,
+                            format!("terminal Kafka consumer error: {e}"),
+                        );
                         break;
                     }
                 }
@@ -1565,20 +1881,19 @@ impl KafkaSource {
         published: &laminar_core::state::VnodeAssignmentSnapshot,
         self_id: laminar_core::state::NodeId,
         rotation: &KafkaRotationPublication,
-    ) -> SourceCheckpoint {
-        let owned: KafkaPartitionSet = self
-            .vnode_topic_meta
-            .iter()
-            .flat_map(|(topic, count)| {
-                crate::partition_assignment::owned_partitions_in_assignment(
-                    *count,
-                    published.owners(),
-                    self_id,
-                )
-                .into_iter()
-                .map(move |partition| (topic.to_string(), partition))
-            })
-            .collect();
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        let mut owned = KafkaPartitionSet::new();
+        for (topic, count) in &self.vnode_topic_meta {
+            for partition in super::partition_assignment::owned_partitions_in_assignment(
+                self.source_name.as_ref(),
+                topic.as_ref(),
+                *count,
+                published.owners(),
+                self_id,
+            )? {
+                owned.insert((topic.to_string(), partition));
+            }
+        }
         let offset_owned: KafkaPartitionSet = owned
             .iter()
             .filter(|(topic, partition)| {
@@ -1593,7 +1908,7 @@ impl KafkaSource {
             KAFKA_ASSIGNMENT_VERSION_METADATA,
             published.version().to_string(),
         );
-        checkpoint
+        Ok(checkpoint)
     }
 
     fn capture_non_vnode_checkpoint(&self) -> SourceCheckpoint {
@@ -1619,22 +1934,13 @@ impl KafkaSource {
     }
 
     fn try_capture_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        self.check_reader_health("capturing a checkpoint cursor")?;
         let Some((registry, self_id)) = &self.vnode_assignment else {
             return Ok(Some(self.capture_non_vnode_checkpoint()));
         };
         if self.vnode_topic_meta.is_empty() {
             return Ok(Some(self.capture_non_vnode_checkpoint()));
         }
-        if self
-            .reader_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            return Err(ConnectorError::Internal(
-                "Kafka reader task exited while capturing its checkpoint cursor".into(),
-            ));
-        }
-
         // The read guard is the linearization point: ownership cannot publish a
         // new version between the reconciliation check and cursor capture.
         let published = registry.read_assignment();
@@ -1646,9 +1952,8 @@ impl KafkaSource {
         if rotation.assignment_version != version {
             return Ok(None);
         }
-        Ok(Some(
-            self.capture_vnode_checkpoint(&published, *self_id, &rotation),
-        ))
+        self.capture_vnode_checkpoint(&published, *self_id, &rotation)
+            .map(Some)
     }
 }
 
@@ -1662,9 +1967,9 @@ fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitio
     tpl
 }
 
-/// Partition list for the initial `start()` assignment of a vnode-assigned source:
-/// owned partitions (`partition % vnode_count`) at their checkpointed offset + 1,
-/// else `default_offset`. Rotations rebind incrementally in the reader loop.
+/// Partition list for the initial `start()` assignment of a vnode-assigned source.
+/// Owned partitions start at their checkpointed offset + 1, otherwise at
+/// `default_offset`. Rotations rebind incrementally in the reader loop.
 #[derive(Clone, Copy)]
 struct VnodeResumeCursors<'a> {
     local_offsets: &'a OffsetTracker,
@@ -1674,6 +1979,7 @@ struct VnodeResumeCursors<'a> {
 }
 
 fn build_vnode_assignment_tpl(
+    source_identity: &str,
     assignment: &[laminar_core::state::NodeId],
     self_id: laminar_core::state::NodeId,
     topic_meta: &[(Arc<str>, i32)],
@@ -1682,9 +1988,13 @@ fn build_vnode_assignment_tpl(
 ) -> Result<TopicPartitionList, ConnectorError> {
     let mut tpl = TopicPartitionList::new();
     for (topic, count) in topic_meta {
-        for partition in
-            crate::partition_assignment::owned_partitions_in_assignment(*count, assignment, self_id)
-        {
+        for partition in super::partition_assignment::owned_partitions_in_assignment(
+            source_identity,
+            topic.as_ref(),
+            *count,
+            assignment,
+            self_id,
+        )? {
             let offset = match cursors
                 .local_offsets
                 .get(topic.as_ref(), partition)
@@ -1999,37 +2309,65 @@ fn attach_rotation_baselines(
 
 fn vnode_payload_is_current(
     ownership: Option<(&[laminar_core::state::NodeId], laminar_core::state::NodeId)>,
+    partition_vnode: Option<u32>,
     required_next: Option<i64>,
-    partition: i32,
     offset: i64,
-) -> bool {
-    let owned = ownership.is_none_or(|(assignment, self_id)| {
-        usize::try_from(partition).is_ok_and(|partition| {
-            !assignment.is_empty() && assignment[partition % assignment.len()] == self_id
-        })
-    });
-    owned && required_next.is_none_or(|next| offset >= next)
+) -> Result<bool, ConnectorError> {
+    let owned = if let Some((assignment, self_id)) = ownership {
+        let vnode = partition_vnode.ok_or_else(|| {
+            ConnectorError::ConfigurationError(
+                "Kafka payload has no canonical source/topic/partition vnode route".into(),
+            )
+        })?;
+        let vnode_index = usize::try_from(vnode).map_err(|_| {
+            ConnectorError::ConfigurationError(
+                "Kafka vnode id cannot be represented on this platform".into(),
+            )
+        })?;
+        let owner = assignment.get(vnode_index).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "Kafka cached vnode {vnode} is outside owner map cardinality {}",
+                assignment.len()
+            ))
+        })?;
+        *owner == self_id
+    } else {
+        true
+    };
+    Ok(owned && required_next.is_none_or(|next| offset >= next))
 }
 
 fn partition_reacquired_after(
     published: &laminar_core::state::VnodeAssignmentSnapshot,
+    source_identity: &str,
+    topic: &str,
     partition: i32,
     self_id: laminar_core::state::NodeId,
     reconciled_version: u64,
-) -> bool {
-    if reconciled_version == 0 || published.owners().is_empty() {
-        return false;
+) -> Result<bool, ConnectorError> {
+    if reconciled_version == 0 {
+        return Ok(false);
     }
-    let Some(vnode) = usize::try_from(partition)
-        .ok()
-        .map(|partition| partition % published.owners().len())
-    else {
-        return false;
-    };
-    published.owners()[vnode] == self_id
+    let vnode_count = u32::try_from(published.owners().len()).map_err(|_| {
+        ConnectorError::ConfigurationError(
+            "Kafka vnode owner map exceeds the supported u32 range".into(),
+        )
+    })?;
+    let vnode = super::partition_assignment::partition_vnode(
+        source_identity,
+        topic,
+        partition,
+        vnode_count,
+    )?;
+    let vnode_index = usize::try_from(vnode).map_err(|_| {
+        ConnectorError::ConfigurationError(
+            "Kafka vnode id cannot be represented on this platform".into(),
+        )
+    })?;
+    Ok(published.owners()[vnode_index] == self_id
         && published
-            .owner_changed_version(u32::try_from(vnode).unwrap_or(u32::MAX))
-            .is_some_and(|changed| changed > reconciled_version)
+            .owner_changed_version(vnode)
+            .is_some_and(|changed| changed > reconciled_version))
 }
 
 fn retire_accepted_rotation_baselines(
@@ -2284,15 +2622,29 @@ impl SourceConnector for KafkaSource {
 
     fn set_vnode_assignment(
         &mut self,
+        source_identity: &str,
         registry: Arc<laminar_core::state::VnodeRegistry>,
         self_id: laminar_core::state::NodeId,
-    ) {
+    ) -> Result<(), ConnectorError> {
+        if source_identity.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka vnode assignment requires a non-empty canonical source identity".into(),
+            ));
+        }
+        if self_id.is_unassigned() {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka vnode assignment requires a nonzero node identity".into(),
+            ));
+        }
         info!(
+            source = source_identity,
             self_id = self_id.0,
             vnode_count = registry.vnode_count(),
             "Kafka source: engine-controlled partition→vnode assignment enabled"
         );
+        self.source_name = Arc::from(source_identity);
         self.vnode_assignment = Some((registry, self_id));
+        Ok(())
     }
 
     fn vnode_drain_enabled(&self) -> bool {
@@ -2303,6 +2655,7 @@ impl SourceConnector for KafkaSource {
         &mut self,
         request: &SourceDrainRequest,
     ) -> Result<SourceDrainStart, ConnectorError> {
+        self.check_reader_health("starting a vnode drain")?;
         let Some((registry, _)) = self.vnode_assignment.as_ref() else {
             return Err(ConnectorError::InvalidState {
                 expected: "Kafka vnode assignment installed before source drain".into(),
@@ -2317,6 +2670,14 @@ impl SourceConnector for KafkaSource {
                 ),
                 actual: registry.assignment_version().to_string(),
             });
+        }
+        if let Some(&vnode) = request.revoking_vnodes.last() {
+            if vnode >= registry.vnode_count() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "Kafka drain vnode {vnode} is outside the configured 0..{} range",
+                    registry.vnode_count()
+                )));
+            }
         }
         if let Some(active) = self.source_drain.as_ref() {
             if active.request.round != request.round || active.request != *request {
@@ -2347,6 +2708,7 @@ impl SourceConnector for KafkaSource {
         &mut self,
         round: laminar_core::checkpoint::AssignmentDrainId,
     ) -> Result<Option<ConnectorDrainCut>, ConnectorError> {
+        self.check_reader_health("capturing a vnode drain cut")?;
         let Some(active) = self.source_drain.as_ref() else {
             return Err(ConnectorError::InvalidState {
                 expected: format!("active Kafka drain {round:?}"),
@@ -2388,6 +2750,7 @@ impl SourceConnector for KafkaSource {
         &mut self,
         resolution: SourceDrainResolution,
     ) -> Result<(), ConnectorError> {
+        self.check_reader_health("resolving a vnode drain")?;
         let active = self
             .source_drain
             .as_ref()
@@ -2538,8 +2901,22 @@ impl SourceConnector for KafkaSource {
         // topology change is picked up only by a fresh, checkpoint-positioned source instance.
 
         let deterministic_unrecorded = is_resume || delivery != DeliveryGuarantee::BestEffort;
+        let configured_source_name = config.get("laminar.source.name");
+        if self.vnode_assignment.is_some() {
+            if configured_source_name
+                .is_some_and(|configured| configured != self.source_name.as_ref())
+            {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "Kafka vnode assignment identity '{}' does not match canonical source name \
+                     '{}'",
+                    self.source_name,
+                    configured_source_name.unwrap_or_default()
+                )));
+            }
+        } else {
+            self.source_name = Arc::from(configured_source_name.unwrap_or_default());
+        }
         self.state = ConnectorState::Initializing;
-        self.source_name = Arc::from(config.get("laminar.source.name").unwrap_or(""));
         self.config = kafka_config.clone();
         self.offsets = installed_offsets;
         self.manual_topic_partitions.clear();
@@ -2641,16 +3018,16 @@ impl SourceConnector for KafkaSource {
         let consumer = Arc::new(consumer);
         self.consumer = Some(Arc::clone(&consumer));
 
-        // Engine-controlled partition assignment (cluster mode): bind each
-        // partition to a vnode (`partition % vnode_count`) and manually
-        // `assign()` only those this node owns, instead of consumer-group
-        // `subscribe()`. Manual assign bypasses the broker rebalance callbacks,
+        // Engine-controlled partition assignment (cluster mode): map the
+        // canonical source/topic/partition identity to a vnode and manually
+        // `assign()` only those this node owns. Manual assign bypasses the broker callbacks,
         // so partitions are positioned here directly (checkpointed offset, else
         // the startup default). The reader loop re-binds on assignment rotation.
         //
         // Reset stale metadata so a re-`start()` that falls back to subscribe
         // doesn't leave `checkpoint()` filtering by a prior run's vnode ownership.
         self.vnode_topic_meta.clear();
+        self.vnode_partition_routes.clear();
         let vnode = self
             .vnode_assignment
             .as_ref()
@@ -2660,6 +3037,11 @@ impl SourceConnector for KafkaSource {
                 let published = registry.versioned_snapshot();
                 let topic_meta =
                     fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone()).await?;
+                let partition_routes = kafka_partition_routes(
+                    self.source_name.as_ref(),
+                    registry.vnode_count(),
+                    &topic_meta,
+                )?;
                 let all_partitions: KafkaPartitionSet = topic_meta
                     .iter()
                     .flat_map(|(topic, count)| {
@@ -2722,6 +3104,7 @@ impl SourceConnector for KafkaSource {
                 let no_resume = OffsetTracker::new();
                 let no_resume_baselines = KafkaPartitionBaselines::new();
                 let tpl = build_vnode_assignment_tpl(
+                    self.source_name.as_ref(),
                     published.owners(),
                     self_id,
                     &topic_meta,
@@ -2747,6 +3130,7 @@ impl SourceConnector for KafkaSource {
                 self.reconciled_assignment_version
                     .store(published.version(), Ordering::Release);
                 self.vnode_topic_meta = topic_meta;
+                self.vnode_partition_routes = partition_routes;
                 info!(
                     owned_partitions = owned,
                     "Kafka source assigned vnode-owned partitions (engine-controlled)"
@@ -3159,6 +3543,7 @@ impl SourceConnector for KafkaSource {
 
         // Lazily spawn the background reader task on first poll.
         self.ensure_reader_started();
+        self.check_reader_health("polling source data")?;
 
         let limit = max_records.min(self.config.max_poll_records);
 
@@ -3270,6 +3655,7 @@ impl SourceConnector for KafkaSource {
                             vnode_ownership
                                 .as_ref()
                                 .map(|(assignment, self_id)| (*assignment, *self_id)),
+                            kp.partition_vnode,
                             rotation_baselines.as_deref().and_then(|publication| {
                                 rotation_partition_baseline(
                                     &publication.baselines,
@@ -3277,9 +3663,8 @@ impl SourceConnector for KafkaSource {
                                     kp.partition,
                                 )
                             }),
-                            kp.partition,
                             kp.offset,
-                        ) {
+                        )? {
                             debug!(
                                 topic = kp.topic.as_ref(),
                                 partition = kp.partition,
@@ -3652,15 +4037,7 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
-        if self
-            .reader_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            return Err(ConnectorError::Internal(
-                "Kafka reader task exited while reconciling source ownership".into(),
-            ));
-        }
+        self.check_reader_health("reconciling source ownership")?;
         Ok(self.vnode_assignment.as_ref().is_none_or(|(registry, _)| {
             self.reconciled_assignment_version.load(Ordering::Acquire)
                 == registry.assignment_version()
@@ -3895,6 +4272,7 @@ mod tests {
             data: vec![u8::try_from(offset).unwrap_or_default()],
             topic: Arc::from("events"),
             partition: 1,
+            partition_vnode: None,
             offset,
             timestamp_ms: None,
             headers_json: None,
@@ -3903,14 +4281,32 @@ mod tests {
 
     #[test]
     fn drain_partition_set_is_canonical_and_vnode_scoped() {
-        let inputs =
-            kafka_drain_partitions(&drain_request(&[1, 3]), 4, &[(Arc::from("events"), 8)]);
+        let inputs = kafka_drain_partitions(
+            &drain_request(&[1, 3]),
+            "orders_source",
+            4,
+            &[(Arc::from("events"), 8)],
+        )
+        .unwrap();
+        let expected: Vec<i32> = (0..8)
+            .filter(|partition| {
+                [1, 3].contains(
+                    &crate::kafka::partition_assignment::partition_vnode(
+                        "orders_source",
+                        "events",
+                        *partition,
+                        4,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
         assert_eq!(
             inputs
                 .iter()
                 .map(|input| input.partition)
                 .collect::<Vec<_>>(),
-            [1, 3, 5, 7]
+            expected
         );
         assert_ne!(kafka_drain_input_digest(&inputs), [0; 32]);
     }
@@ -4133,11 +4529,13 @@ mod tests {
         let mut config = test_config();
         config.subscription = TopicSubscription::Pattern("events-.*".into());
         let mut source = KafkaSource::new(test_schema(), config, None);
-        source.set_vnode_assignment(
-            Arc::new(laminar_core::state::VnodeRegistry::new(4)),
-            laminar_core::state::NodeId(0),
-        );
-
+        source
+            .set_vnode_assignment(
+                "events_source",
+                Arc::new(laminar_core::state::VnodeRegistry::new(4)),
+                laminar_core::state::NodeId(1),
+            )
+            .unwrap();
         let error = source
             .start(SourceStart {
                 config: ConnectorConfig::new("kafka"),
@@ -4153,6 +4551,164 @@ mod tests {
         ));
         assert_eq!(source.state(), ConnectorState::Created);
         assert!(source.consumer.is_none());
+    }
+
+    #[test]
+    fn vnode_assignment_rejects_invalid_identity_or_owner() {
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        let error = source
+            .set_vnode_assignment(
+                "",
+                Arc::new(laminar_core::state::VnodeRegistry::new(4)),
+                laminar_core::state::NodeId(1),
+            )
+            .expect_err("vnode ownership requires a canonical source identity");
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("canonical source identity")
+        ));
+
+        let error = source
+            .set_vnode_assignment(
+                "events_source",
+                Arc::new(laminar_core::state::VnodeRegistry::new(4)),
+                laminar_core::state::NodeId::UNASSIGNED,
+            )
+            .expect_err("the reserved unassigned node must never own Kafka inputs");
+
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("nonzero node identity")
+        ));
+        assert!(source.vnode_assignment.is_none());
+    }
+
+    #[tokio::test]
+    async fn vnode_assignment_rejects_a_mismatched_catalog_identity_before_io() {
+        let node = laminar_core::state::NodeId(1);
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source
+            .set_vnode_assignment(
+                "events_source",
+                Arc::new(laminar_core::state::VnodeRegistry::single_owner(4, node)),
+                node,
+            )
+            .unwrap();
+        let mut request_config = ConnectorConfig::new("kafka");
+        request_config.set("bootstrap.servers", "unreachable.invalid:9092");
+        request_config.set("group.id", "test-group");
+        request_config.set("topic", "events");
+        request_config.set("startup.mode", "earliest");
+        request_config.set("laminar.source.name", "other_source");
+
+        let error = source
+            .start(SourceStart {
+                config: request_config,
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("catalog identity mismatch must fail before Kafka construction");
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("events_source") && message.contains("other_source")
+        ));
+        assert_eq!(source.state(), ConnectorState::Created);
+        assert!(source.consumer.is_none());
+        assert!(source.reader_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_reader_fault_preempts_assignment_wait_and_control_plane() {
+        let node = laminar_core::state::NodeId(1);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node));
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.state = ConnectorState::Running;
+        source.source_name = Arc::from("events_source");
+        source.vnode_assignment = Some((Arc::clone(&registry), node));
+        source
+            .reconciled_assignment_version
+            .store(registry.assignment_version(), Ordering::Release);
+
+        // Make the control-plane publication newer than the reader fence. Before
+        // the terminal-fault latch, poll_batch returned Ok(None) forever here.
+        registry.set_assignment(registry.snapshot());
+        assert_ne!(
+            source.reconciled_assignment_version.load(Ordering::Acquire),
+            registry.assignment_version()
+        );
+        let data_ready = Arc::clone(&source.data_ready);
+        let wake = data_ready.notified();
+        publish_reader_fault(
+            &source.reader_fault,
+            &source.data_ready,
+            "injected terminal reader fault",
+        );
+        wake.await;
+
+        for error in [
+            source
+                .poll_batch(1)
+                .await
+                .expect_err("poll must fail closed"),
+            source
+                .checkpoint_ready()
+                .expect_err("checkpoint readiness must fail closed"),
+            source
+                .try_checkpoint()
+                .expect_err("checkpoint capture must fail closed"),
+            source
+                .begin_drain(&drain_request(&[0]))
+                .expect_err("drain start must fail closed"),
+            source
+                .take_drain_cut(drain_request(&[0]).round)
+                .expect_err("drain cut must fail closed"),
+            source
+                .finish_drain(SourceDrainResolution {
+                    round: drain_request(&[0]).round,
+                    outcome: SourceDrainOutcome::Abort,
+                })
+                .await
+                .expect_err("drain resolution must fail closed"),
+        ] {
+            assert!(
+                error.to_string().contains("injected terminal reader fault"),
+                "unexpected terminal-fault error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_rejects_out_of_range_vnodes_before_starting_the_reader() {
+        let node = laminar_core::state::NodeId(1);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(4, node));
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.source_name = Arc::from("events_source");
+        source.vnode_assignment = Some((Arc::clone(&registry), node));
+        let request = SourceDrainRequest::new(
+            laminar_core::checkpoint::AssignmentDrainId {
+                predecessor_version: registry.assignment_version(),
+                target_version: registry.assignment_version() + 1,
+                digest: [9; 32],
+            },
+            Arc::from([registry.vnode_count()]),
+        )
+        .unwrap();
+
+        let error = source
+            .begin_drain(&request)
+            .expect_err("out-of-range drain ownership must fail closed");
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("outside the configured")
+        ));
+        assert!(source.reader_handle.is_none());
+        assert!(source.reader_drain_tx.is_none());
+        assert!(source.source_drain.is_none());
     }
 
     #[tokio::test]
@@ -4340,28 +4896,96 @@ mod tests {
 
     #[test]
     fn vnode_payload_filter_rejects_revoked_and_pre_handoff_records() {
-        let node0 = laminar_core::state::NodeId(0);
         let node1 = laminar_core::state::NodeId(1);
-        let assignment = [node0, node1];
+        let node2 = laminar_core::state::NodeId(2);
+        let assignment = [node1, node2];
+        let owned_partition = (0..100)
+            .find(|partition| {
+                crate::kafka::partition_assignment::partition_vnode(
+                    "events_source",
+                    "events",
+                    *partition,
+                    2,
+                )
+                .unwrap()
+                    == 0
+            })
+            .unwrap();
+        let revoked_partition = (0..100)
+            .find(|partition| {
+                crate::kafka::partition_assignment::partition_vnode(
+                    "events_source",
+                    "events",
+                    *partition,
+                    2,
+                )
+                .unwrap()
+                    == 1
+            })
+            .unwrap();
 
         assert!(vnode_payload_is_current(
-            Some((&assignment, node0)),
+            Some((&assignment, node1)),
+            Some(
+                crate::kafka::partition_assignment::partition_vnode(
+                    "events_source",
+                    "events",
+                    owned_partition,
+                    2,
+                )
+                .unwrap(),
+            ),
             Some(10),
-            0,
             10,
-        ));
+        )
+        .unwrap());
         assert!(!vnode_payload_is_current(
-            Some((&assignment, node0)),
+            Some((&assignment, node1)),
+            Some(
+                crate::kafka::partition_assignment::partition_vnode(
+                    "events_source",
+                    "events",
+                    owned_partition,
+                    2,
+                )
+                .unwrap(),
+            ),
             Some(10),
-            0,
             9,
-        ));
+        )
+        .unwrap());
+        let error = vnode_payload_is_current(Some((&assignment, node1)), Some(2), None, 10)
+            .expect_err("a stale route table must fault instead of dropping a consumed payload");
+        assert!(error.to_string().contains("outside owner map cardinality"));
         assert!(!vnode_payload_is_current(
-            Some((&assignment, node0)),
+            Some((&assignment, node1)),
+            Some(
+                crate::kafka::partition_assignment::partition_vnode(
+                    "events_source",
+                    "events",
+                    revoked_partition,
+                    2,
+                )
+                .unwrap(),
+            ),
             None,
-            1,
             10,
-        ));
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn cached_payload_route_rejects_partition_inventory_drift() {
+        assert_eq!(cached_partition_vnode(None, 9).unwrap(), None);
+        assert_eq!(cached_partition_vnode(Some(&[7, 11]), 1).unwrap(), Some(11));
+        assert!(cached_partition_vnode(Some(&[7, 11]), -1)
+            .unwrap_err()
+            .to_string()
+            .contains("negative partition"));
+        assert!(cached_partition_vnode(Some(&[7, 11]), 2)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the activated topic inventory"));
     }
 
     #[test]
@@ -4374,8 +4998,14 @@ mod tests {
         registry.set_assignment_and_version_carrying_source_handoff(vec![self_id].into(), 3);
 
         let published = registry.versioned_snapshot();
-        assert!(partition_reacquired_after(&published, 0, self_id, 1,));
-        assert!(!partition_reacquired_after(&published, 0, self_id, 3,));
+        assert!(
+            partition_reacquired_after(&published, "events_source", "events", 0, self_id, 1,)
+                .unwrap()
+        );
+        assert!(
+            !partition_reacquired_after(&published, "events_source", "events", 0, self_id, 3,)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -4421,13 +5051,14 @@ mod tests {
         source.offsets.update("events", 2, 300);
         source.offsets.update("events", 3, 400);
 
-        // 4 vnodes; node 0 owns vnodes 0 and 2, node 1 owns 1 and 3.
+        // Four vnodes split across two valid cluster node identities.
         let registry = Arc::new(laminar_core::state::VnodeRegistry::new(4));
-        let node0 = laminar_core::state::NodeId(0);
         let node1 = laminar_core::state::NodeId(1);
-        registry.set_assignment(vec![node0, node1, node0, node1].into());
+        let node2 = laminar_core::state::NodeId(2);
+        registry.set_assignment(vec![node1, node2, node1, node2].into());
 
-        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.source_name = Arc::from("events_source");
+        source.vnode_assignment = Some((Arc::clone(&registry), node1));
         source.vnode_topic_meta = vec![(Arc::from("events"), 4)];
         source.manual_partition_baselines = KafkaPartitionBaselines::from([
             (("events".to_string(), 0), 10),
@@ -4448,25 +5079,43 @@ mod tests {
         // rebalance_state is empty (no callbacks under manual assign): the old
         // code returned an empty checkpoint here.
         let cp = source.checkpoint();
-        assert_eq!(cp.get_offset("events:0"), Some("100")); // vnode 0 → node0
-        assert_eq!(cp.get_offset("events:1"), None); // vnode 1 → node1
-        assert_eq!(cp.get_offset("events:2"), Some("300")); // vnode 2 → node0
-        assert_eq!(cp.get_offset("events:3"), None); // vnode 3 → node1
+        let owned = crate::kafka::partition_assignment::owned_partitions_in_assignment(
+            "events_source",
+            "events",
+            4,
+            &registry.snapshot(),
+            node1,
+        )
+        .unwrap();
+        for partition in 0..4 {
+            let expected = owned.contains(&partition).then(|| match partition {
+                0 => "100",
+                1 => "200",
+                2 => "300",
+                3 => "400",
+                _ => unreachable!(),
+            });
+            assert_eq!(cp.get_offset(&format!("events:{partition}")), expected);
+        }
         assert_eq!(
             decode_partition_baselines(&cp).unwrap(),
-            KafkaPartitionBaselines::from([
-                (("events".to_string(), 0), 10),
-                (("events".to_string(), 2), 30),
-            ])
+            owned
+                .into_iter()
+                .map(|partition| {
+                    let next = i64::from(partition + 1) * 10;
+                    (("events".to_string(), partition), next)
+                })
+                .collect::<KafkaPartitionBaselines>()
         );
     }
 
     #[test]
     fn vnode_checkpoint_keeps_handoff_baseline_authoritative_until_accept() {
-        let node0 = laminar_core::state::NodeId(0);
-        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node0));
+        let node1 = laminar_core::state::NodeId(1);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node1));
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.source_name = Arc::from("events_source");
+        source.vnode_assignment = Some((Arc::clone(&registry), node1));
         source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
         source.offsets.update_force("events", 0, 250); // stale prior stint
         source.manual_partition_baselines =
@@ -4508,10 +5157,11 @@ mod tests {
 
     #[test]
     fn assignment_flip_fences_checkpoint_until_exact_version_reconciles() {
-        let node0 = laminar_core::state::NodeId(1);
-        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node0));
+        let node1 = laminar_core::state::NodeId(1);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node1));
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        source.vnode_assignment = Some((Arc::clone(&registry), node0));
+        source.source_name = Arc::from("events-source");
+        source.vnode_assignment = Some((Arc::clone(&registry), node1));
         source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
         source
             .reconciled_assignment_version
@@ -4587,8 +5237,8 @@ mod tests {
     #[test]
     fn build_vnode_assignment_tpl_offset_precedence() {
         // local offset > resume (manifest handoff) offset > startup default.
-        let node0 = laminar_core::state::NodeId(0);
-        let registry = laminar_core::state::VnodeRegistry::single_owner(4, node0);
+        let node1 = laminar_core::state::NodeId(1);
+        let registry = laminar_core::state::VnodeRegistry::single_owner(4, node1);
         let topic_meta = vec![(Arc::from("events"), 4)];
 
         let mut local = OffsetTracker::new();
@@ -4601,8 +5251,9 @@ mod tests {
 
         let empty_baselines = KafkaPartitionBaselines::new();
         let tpl = build_vnode_assignment_tpl(
+            "events_source",
             &registry.snapshot(),
-            node0,
+            node1,
             &topic_meta,
             VnodeResumeCursors {
                 local_offsets: &local,

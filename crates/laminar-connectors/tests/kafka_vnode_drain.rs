@@ -22,9 +22,12 @@ use tokio::time::sleep;
 
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
-    DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart,
+    DeliveryGuarantee, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
+    SourceDrainResolution, SourceDrainStart, SourcePosition, SourceStart,
 };
+use laminar_connectors::kafka::partition_assignment::partition_vnode;
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription};
+use laminar_core::checkpoint::AssignmentDrainId;
 use laminar_core::state::{NodeId, VnodeRegistry};
 
 const DEFAULT_BROKERS: &str = "127.0.0.1:19092";
@@ -104,9 +107,19 @@ async fn source_pauses_draining_vnode_partitions() {
     create_topic(&brokers, &topic, PARTS).await;
     produce(&brokers, &topic, 0, 400).await;
 
-    // One node owns every vnode; with vnode_count == partition count, partition p
-    // binds to vnode p, so the source manually assigns all four partitions.
-    let registry = Arc::new(VnodeRegistry::single_owner(PARTS as u32, NodeId(0)));
+    // One node owns every vnode, so the source initially assigns all partitions.
+    let registry = Arc::new(VnodeRegistry::single_owner(PARTS as u32, NodeId(1)));
+    let (source_identity, routes) = (0..1_024)
+        .find_map(|salt| {
+            let identity = format!("vnode_drain_source_{salt}");
+            let routes: Vec<u32> = (0..PARTS)
+                .map(|partition| {
+                    partition_vnode(&identity, &topic, partition, PARTS as u32).unwrap()
+                })
+                .collect();
+            (routes.iter().any(|route| *route != routes[0])).then_some((identity, routes))
+        })
+        .expect("test input must cover at least two vnodes");
     let cfg = KafkaSourceConfig {
         bootstrap_servers: brokers.clone(),
         group_id: format!("vnode-drain-grp-{}", std::process::id()),
@@ -115,7 +128,9 @@ async fn source_pauses_draining_vnode_partitions() {
         ..KafkaSourceConfig::default()
     };
     let mut source = KafkaSource::new(schema(), cfg, None);
-    source.set_vnode_assignment(Arc::clone(&registry), NodeId(0));
+    source
+        .set_vnode_assignment(&source_identity, Arc::clone(&registry), NodeId(1))
+        .unwrap();
     source
         .start(SourceStart {
             config: ConnectorConfig::new("kafka"),
@@ -135,36 +150,70 @@ async fn source_pauses_draining_vnode_partitions() {
             .collect::<Vec<_>>(),
     );
 
-    // Drain vnode 1 → the source pauses partition 1. Let the pause take effect and
-    // any already-buffered partition-1 records flush, then snapshot the cut.
-    registry.mark_draining(&[1]);
-    poll_for(&mut source, Duration::from_secs(3)).await;
-    let cut_p1 = part_offset(&source, &topic, 1);
-    let pre_p0 = part_offset(&source, &topic, 0);
+    let draining_vnode = routes[0];
+    let draining_partitions: Vec<i32> = (0..PARTS)
+        .filter(|partition| routes[*partition as usize] == draining_vnode)
+        .collect();
+    let active_partition = (0..PARTS)
+        .find(|partition| routes[*partition as usize] != draining_vnode)
+        .unwrap();
+    let predecessor_version = registry.assignment_version();
+    let round = AssignmentDrainId {
+        predecessor_version,
+        target_version: predecessor_version + 1,
+        digest: [9; 32],
+    };
+    let request = SourceDrainRequest::new(round, Arc::from([draining_vnode])).unwrap();
+    assert_eq!(
+        source.begin_drain(&request).unwrap(),
+        SourceDrainStart::Pending
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let cut = loop {
+        source.poll_batch(1_000).await.unwrap();
+        if let Some(cut) = source.take_drain_cut(round).unwrap() {
+            break cut;
+        }
+        assert!(Instant::now() < deadline, "Kafka drain boundary timed out");
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(cut.revoked_input_count as usize, draining_partitions.len());
+    let cut_offsets: Vec<(i32, i64)> = draining_partitions
+        .iter()
+        .map(|partition| (*partition, part_offset(&source, &topic, *partition)))
+        .collect();
+    let active_before = part_offset(&source, &topic, active_partition);
 
     // Produce more to every partition; only the non-draining ones should advance.
     produce(&brokers, &topic, 400, 600).await;
     poll_for(&mut source, Duration::from_secs(6)).await;
 
-    assert_eq!(
-        part_offset(&source, &topic, 1),
-        cut_p1,
-        "draining partition 1 must not advance past the cut",
-    );
+    for (partition, cut_offset) in &cut_offsets {
+        assert_eq!(
+            part_offset(&source, &topic, *partition),
+            *cut_offset,
+            "draining partition {partition} advanced past the cut"
+        );
+    }
     assert!(
-        part_offset(&source, &topic, 0) > pre_p0,
-        "a non-draining partition must keep consuming (p0 {pre_p0} -> {})",
-        part_offset(&source, &topic, 0),
+        part_offset(&source, &topic, active_partition) > active_before,
+        "a non-draining partition must keep consuming"
     );
 
-    // Clear the drain → partition 1 resumes.
-    registry.clear_draining();
+    source
+        .finish_drain(SourceDrainResolution {
+            round,
+            outcome: SourceDrainOutcome::Abort,
+        })
+        .await
+        .unwrap();
     poll_for(&mut source, Duration::from_secs(6)).await;
-    assert!(
-        part_offset(&source, &topic, 1) > cut_p1,
-        "partition 1 must resume after the drain clears ({cut_p1} -> {})",
-        part_offset(&source, &topic, 1),
-    );
+    for (partition, cut_offset) in cut_offsets {
+        assert!(
+            part_offset(&source, &topic, partition) > cut_offset,
+            "aborted drain did not resume partition {partition}"
+        );
+    }
 
     source.close().await.unwrap();
 }

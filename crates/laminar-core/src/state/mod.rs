@@ -20,6 +20,7 @@ pub use config::{
 pub use in_process::InProcessBackend;
 pub use object_store::ObjectStoreBackend;
 pub use vnode::{
-    key_hash, owned_vnodes, owners_per_domain, peer_owners, rendezvous_assignment, Locality,
-    NodeId, VnodeAssignmentReadGuard, VnodeAssignmentSnapshot, VnodeLifecycleState, VnodeRegistry,
+    key_hash, owned_vnodes, owners_per_domain, peer_owners, rendezvous_assignment,
+    InvalidKeyGroupCount, KeyGroupCount, Locality, NodeId, VnodeAssignmentReadGuard,
+    VnodeAssignmentSnapshot, VnodeLifecycleState, VnodeRegistry, PARTITIONING_ABI_VERSION,
 };

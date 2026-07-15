@@ -57,6 +57,7 @@ fn mongodb_options(config: &ConnectorConfig) -> Result<BTreeMap<String, String>,
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "postgres-cdc", feature = "mongodb-cdc"))]
     use super::*;
 
     #[cfg(feature = "postgres-cdc")]

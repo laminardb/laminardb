@@ -231,6 +231,26 @@ fn contains_builtin_join_without_cluster_lifecycle(plan: &Arc<dyn ExecutionPlan>
             .any(contains_builtin_join_without_cluster_lifecycle)
 }
 
+pub(crate) fn logical_aggregate_stage_count(plan: &datafusion_expr::LogicalPlan) -> usize {
+    usize::from(matches!(plan, datafusion_expr::LogicalPlan::Aggregate(_)))
+        + plan
+            .inputs()
+            .into_iter()
+            .map(logical_aggregate_stage_count)
+            .sum::<usize>()
+}
+
+pub(crate) fn physical_aggregate_stage_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    use datafusion::physical_plan::aggregates::AggregateExec;
+
+    usize::from(plan.as_any().is::<AggregateExec>())
+        + plan
+            .children()
+            .into_iter()
+            .map(physical_aggregate_stage_count)
+            .sum::<usize>()
+}
+
 fn unsupported_cluster_aggregate(
     plan: &Arc<dyn ExecutionPlan>,
     reads_changelog: bool,
@@ -2339,8 +2359,7 @@ impl LaminarDB {
                 &format!("cluster shape could not be validated: {error}"),
             )
         })?;
-        let has_aggregate =
-            crate::aggregate_state::find_aggregate(dataframe.logical_plan()).is_some();
+        let logical_aggregate_stages = logical_aggregate_stage_count(dataframe.logical_plan());
         let physical = self
             .ctx
             .state()
@@ -2358,6 +2377,16 @@ impl LaminarDB {
                 "a built-in DataFusion join has no distributed shuffle and vnode state lifecycle",
             );
         }
+        let physical_aggregate_stages = physical_aggregate_stage_count(&physical);
+        let has_aggregate = match (logical_aggregate_stages, physical_aggregate_stages) {
+            (0, 0) => false,
+            (1, 1) => true,
+            (logical, physical) => {
+                return reject(&format!(
+                    "aggregate plan has {logical} logical and {physical} physical aggregate stages; cluster admission requires exactly one of each until aggregate distribution stages are planner-certified"
+                ));
+            }
+        };
         let incremental_mvs = self.incremental_mv_names();
         let reads_changelog = crate::sql_analysis::extract_table_references(query_sql)
             .iter()

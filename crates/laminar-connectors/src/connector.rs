@@ -637,18 +637,27 @@ pub trait SourceConnector: Send {
         Ok(())
     }
 
-    /// Install the cluster vnode assignment so a partitioned source can bind
-    /// its input partitions to vnodes (`partition % vnode_count`) and consume
-    /// only those it owns, re-binding when the assignment rotates. Called by
-    /// the cluster startup wiring before [`start`](Self::start).
+    /// Install the cluster vnode assignment for a source that advertises
+    /// [`SourceTopology::Splittable`]. The source identity is the stable,
+    /// canonical catalog object name and must be part of any external split
+    /// mapping ABI.
     ///
-    /// Default: no-op — single-node deployments and sources without a natural
-    /// partitioning ignore it. Only the Kafka source overrides it today.
+    /// Embedded, single-node, singleton, and node-local sources are not sent
+    /// this hook. The default fails closed so an extension cannot advertise
+    /// splittable placement while every cluster node reads the full input.
+    ///
+    /// # Errors
+    /// Returns a configuration error unless the connector implements exact
+    /// vnode-scoped input ownership.
     fn set_vnode_assignment(
         &mut self,
+        _source_identity: &str,
         _registry: Arc<laminar_core::state::VnodeRegistry>,
         _self_id: laminar_core::state::NodeId,
-    ) {
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "source advertises splittable placement but does not implement vnode assignment".into(),
+        ))
     }
 
     /// Close the connection and release resources.
@@ -999,6 +1008,7 @@ impl CoordinatedCommitBatch {
     /// Every variable-length field is length framed so distinct batches cannot
     /// share an input byte stream before hashing.
     #[must_use]
+    #[cfg(any(test, feature = "delta-lake"))]
     pub(crate) fn exact_fingerprint(&self) -> [u8; 32] {
         fn update_length(hasher: &mut Sha256, length: usize) {
             let source = length.to_be_bytes();

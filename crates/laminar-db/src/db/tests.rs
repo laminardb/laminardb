@@ -5709,6 +5709,15 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  SELECT SUM(value) / COUNT(value) AS ratio FROM left_events",
             )
             .await;
+            assert_cluster_rejection(
+                &db,
+                "rejected_nested_aggregate",
+                "CREATE STREAM rejected_nested_aggregate AS \
+                 SELECT SUM(inner_total) AS total FROM (\
+                     SELECT SUM(value) AS inner_total FROM left_events\
+                 ) nested",
+            )
+            .await;
 
             assert_cluster_rejection(
                 &db,
@@ -5731,6 +5740,26 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .await
             .expect("stateless projection/filter is cluster-safe");
             assert!(db.catalog.get_stream_entry("projection_ok").is_some());
+
+            let aggregate = db
+                .ctx
+                .sql("SELECT SUM(value) AS total FROM left_events")
+                .await
+                .unwrap();
+            let aggregate_physical = db
+                .ctx
+                .state()
+                .create_physical_plan(aggregate.logical_plan())
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    crate::ddl::logical_aggregate_stage_count(aggregate.logical_plan()),
+                    crate::ddl::physical_aggregate_stage_count(&aggregate_physical),
+                ),
+                (1, 1),
+                "the admitted global aggregate must use the single certified stage shape"
+            );
             db.execute(
                 "CREATE STREAM global_sum_ok AS \
                  SELECT SUM(value) AS total FROM left_events",
@@ -6517,6 +6546,15 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
 
     #[async_trait]
     impl SourceConnector for CapturingSource {
+        fn set_vnode_assignment(
+            &mut self,
+            _source_identity: &str,
+            _registry: Arc<VnodeRegistry>,
+            _self_id: NodeId,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
         async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
             *self.observed.lock() = request.config.get("password").map(str::to_owned);
             Ok(())

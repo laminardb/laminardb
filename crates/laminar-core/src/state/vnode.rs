@@ -3,7 +3,7 @@
 //! Replaces the compile-time `VNODE_COUNT` constant that previously
 //! lived in `laminar-storage`. A registry owns:
 //!
-//! - the current vnode count (configurable; 256 by default),
+//! - the runtime-selected vnode count,
 //! - the node-per-vnode assignment (for distributed modes),
 //! - a monotonically increasing `assignment_version` used by
 //!   [`ObjectStoreBackend`](super::object_store::ObjectStoreBackend) to
@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -23,6 +24,114 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::{CheckpointWatermark, CommittedSourceHandoff, SourceHandoffState};
 use crate::state::CheckpointAttempt;
+
+/// Durable encoding and hashing contract used to map keys to key groups.
+///
+/// Any change to Arrow row encoding, key hashing, or modulo mapping requires a
+/// version bump and a coordinated compatibility fence. Placement is not part of
+/// this ABI: durable assignment publications are the ownership authority.
+pub const PARTITIONING_ABI_VERSION: u16 = 1;
+
+/// Validated number of stable key groups in a pipeline.
+///
+/// Zero and values above [`u16::MAX`] are rejected. The compact upper bound keeps
+/// ownership metadata bounded while providing substantially more rescale slots
+/// than a production pipeline should need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct KeyGroupCount(NonZeroU16);
+
+impl KeyGroupCount {
+    /// Build from a nonzero value.
+    #[must_use]
+    pub const fn new(value: NonZeroU16) -> Self {
+        Self(value)
+    }
+
+    /// Exact underlying count.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    /// Exact nonzero representation.
+    #[must_use]
+    pub const fn into_non_zero(self) -> NonZeroU16 {
+        self.0
+    }
+}
+
+impl fmt::Display for KeyGroupCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+/// A key-group count outside the supported `1..=65535` range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("key-group count {value} is outside 1..={}", u16::MAX)]
+pub struct InvalidKeyGroupCount {
+    value: u32,
+}
+
+impl InvalidKeyGroupCount {
+    /// Rejected input value.
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.value
+    }
+}
+
+impl TryFrom<u16> for KeyGroupCount {
+    type Error = InvalidKeyGroupCount;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        NonZeroU16::new(value)
+            .map(Self)
+            .ok_or(InvalidKeyGroupCount {
+                value: u32::from(value),
+            })
+    }
+}
+
+impl TryFrom<u32> for KeyGroupCount {
+    type Error = InvalidKeyGroupCount;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        let narrowed = u16::try_from(value).map_err(|_| InvalidKeyGroupCount { value })?;
+        Self::try_from(narrowed).map_err(|_| InvalidKeyGroupCount { value })
+    }
+}
+
+impl From<NonZeroU16> for KeyGroupCount {
+    fn from(value: NonZeroU16) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<KeyGroupCount> for NonZeroU16 {
+    fn from(value: KeyGroupCount) -> Self {
+        value.into_non_zero()
+    }
+}
+
+impl From<KeyGroupCount> for u16 {
+    fn from(value: KeyGroupCount) -> Self {
+        value.get()
+    }
+}
+
+impl From<KeyGroupCount> for u32 {
+    fn from(value: KeyGroupCount) -> Self {
+        u32::from(value.get())
+    }
+}
+
+impl From<KeyGroupCount> for usize {
+    fn from(value: KeyGroupCount) -> Self {
+        usize::from(value.get())
+    }
+}
 
 /// Unique identifier for a node. Also the owner id for vnodes; cluster
 /// membership and vnode ownership identify the same thing.
@@ -754,6 +863,71 @@ mod tests {
 
     fn digest(byte: u8) -> String {
         format!("{byte:02x}").repeat(32)
+    }
+
+    #[test]
+    fn partitioning_key_group_count_rejects_every_out_of_range_value() {
+        assert_eq!(KeyGroupCount::try_from(0_u16).unwrap_err().value(), 0);
+        assert_eq!(KeyGroupCount::try_from(0_u32).unwrap_err().value(), 0);
+        assert_eq!(
+            KeyGroupCount::try_from(u32::from(u16::MAX) + 1)
+                .unwrap_err()
+                .value(),
+            u32::from(u16::MAX) + 1
+        );
+
+        let one = KeyGroupCount::try_from(1_u16).unwrap();
+        let max = KeyGroupCount::try_from(u32::from(u16::MAX)).unwrap();
+        assert_eq!(u16::from(one), 1);
+        assert_eq!(u32::from(max), u32::from(u16::MAX));
+        assert_eq!(usize::from(max), usize::from(u16::MAX));
+        assert_eq!(NonZeroU16::from(one), NonZeroU16::MIN);
+    }
+
+    #[test]
+    fn partitioning_abi_v1_raw_key_hash_golden_vectors() {
+        assert_eq!(PARTITIONING_ABI_VERSION, 1);
+        let actual = [
+            key_hash(b""),
+            key_hash(b"a"),
+            key_hash(b"laminardb"),
+            key_hash(&[0, 1, 0xff]),
+            key_hash("key-☃".as_bytes()),
+        ];
+        assert_eq!(
+            actual,
+            [
+                3_244_421_341_483_603_138,
+                16_629_034_431_890_738_719,
+                16_801_042_214_008_847_674,
+                10_014_172_824_849_140_082,
+                17_604_077_472_932_801_374,
+            ]
+        );
+    }
+
+    #[test]
+    fn rendezvous_placement_policy_golden_vector() {
+        // Placement can evolve through an assignment transition; this vector
+        // detects accidental churn in the current policy but is not ABI v1.
+        let actual = rendezvous_assignment(12, &[NodeId(7), NodeId(3), NodeId(5)]);
+        assert_eq!(
+            actual.as_ref(),
+            &[
+                NodeId(5),
+                NodeId(7),
+                NodeId(3),
+                NodeId(5),
+                NodeId(5),
+                NodeId(7),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+            ]
+        );
     }
 
     fn committed_handoff(

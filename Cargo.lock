@@ -4950,6 +4950,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-ipc",
+ "arrow-row",
  "arrow-schema",
  "async-trait",
  "base64 0.22.1",

@@ -2383,14 +2383,29 @@ impl LaminarDB {
                 ))
             })?;
             #[cfg(feature = "cluster")]
-            if let (Some(registry), Some(self_id)) = (
-                self.vnode_registry.lock().clone(),
-                self.cluster_controller
+            if runtime_mode == RuntimeMode::Cluster
+                && contract.topology == SourceTopology::Splittable
+            {
+                let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+                    DbError::Config(format!("cluster source '{name}' has no vnode registry"))
+                })?;
+                let self_id = self
+                    .cluster_controller
                     .lock()
                     .as_ref()
-                    .map(|c| laminar_core::state::NodeId(c.instance_id().0)),
-            ) {
-                source.set_vnode_assignment(registry, self_id);
+                    .map(|controller| laminar_core::state::NodeId(controller.instance_id().0))
+                    .ok_or_else(|| {
+                        DbError::Config(format!(
+                            "cluster source '{name}' has no cluster controller identity"
+                        ))
+                    })?;
+                source
+                    .set_vnode_assignment(name, registry, self_id)
+                    .map_err(|error| {
+                        DbError::Config(format!(
+                            "source '{name}' rejected cluster vnode assignment: {error}"
+                        ))
+                    })?;
             }
             // WebSocket extraction can synthesize event time from an inbound JSON field. Kafka
             // uses the SQL `WATERMARK FOR` declaration as its single event-time authority.
@@ -5644,14 +5659,64 @@ mod cluster_fault_watcher_tests {
     use laminar_core::state::{
         InProcessBackend, NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     struct IdleClusterTestSource;
 
+    static REJECTING_SPLITTABLE_STARTED: AtomicBool = AtomicBool::new(false);
+
+    struct RejectingSplittableSource;
+
     #[async_trait]
     impl SourceConnector for IdleClusterTestSource {
         async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn poll_batch(
+            &mut self,
+            _max_records: usize,
+        ) -> Result<Option<SourceBatch>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
+            ]))
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            SourceCheckpoint::new()
+        }
+
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            Ok(SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Splittable,
+            ))
+        }
+
+        fn set_vnode_assignment(
+            &mut self,
+            _source_identity: &str,
+            _registry: Arc<VnodeRegistry>,
+            _self_id: StateNodeId,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for RejectingSplittableSource {
+        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            REJECTING_SPLITTABLE_STARTED.store(true, Ordering::Release);
             Ok(())
         }
 
@@ -5765,6 +5830,18 @@ mod cluster_fault_watcher_tests {
                         config_keys: vec![],
                     },
                     Arc::new(|_| Box::new(IdleClusterTestSource)),
+                )?;
+                registry.register_source(
+                    "rejecting-splittable-test",
+                    ConnectorInfo {
+                        name: "rejecting-splittable-test".into(),
+                        display_name: "Rejecting splittable test source".into(),
+                        version: "1".into(),
+                        is_source: true,
+                        is_sink: false,
+                        config_keys: vec![],
+                    },
+                    Arc::new(|_| Box::new(RejectingSplittableSource)),
                 )
             })
             .build()
@@ -5784,6 +5861,54 @@ mod cluster_fault_watcher_tests {
             .unwrap());
         assert!(!db.source_gate.load(std::sync::atomic::Ordering::Acquire));
         assert!(!controller.is_recovering());
+    }
+
+    #[tokio::test]
+    async fn splittable_source_without_assignment_hook_fails_before_start() {
+        REJECTING_SPLITTABLE_STARTED.store(false, Ordering::Release);
+        let (db, _controller, _kv, _round, manifest_store, proof) = startup_db().await;
+        let state_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
+            state_store,
+            "node-7",
+            1,
+        )));
+        manifest_store
+            .seal(
+                &CatalogManifest::new(vec![
+                    CatalogManifestEntry {
+                        canonical_name: "unsafe_input".into(),
+                        kind: CatalogObjectKind::Source,
+                        ddl: "CREATE SOURCE unsafe_input (id BIGINT) WITH ('connector' = \
+                              'rejecting-splittable-test')"
+                            .into(),
+                    },
+                    CatalogManifestEntry {
+                        canonical_name: "unsafe_output".into(),
+                        kind: CatalogObjectKind::Stream,
+                        ddl: "CREATE STREAM unsafe_output AS SELECT id FROM unsafe_input".into(),
+                    },
+                ])
+                .unwrap(),
+                &proof,
+            )
+            .await
+            .unwrap();
+
+        let error = db.start().await.unwrap_err().to_string();
+        assert!(
+            error.contains("rejected cluster vnode assignment"),
+            "{error}"
+        );
+        assert!(
+            error.contains("does not implement vnode assignment"),
+            "{error}"
+        );
+        assert!(
+            !REJECTING_SPLITTABLE_STARTED.load(Ordering::Acquire),
+            "source I/O must not start before assignment admission succeeds"
+        );
     }
 
     #[tokio::test]

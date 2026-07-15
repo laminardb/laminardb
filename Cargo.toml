@@ -68,15 +68,17 @@ humantime-serde = "1.1"
 notify = "8"
 globset = "0.4"
 
-# DataFusion and Arrow - using latest versions
-arrow = { version = "57.2", default-features = true }
-arrow-array = "57.2"
-arrow-schema = "57.2"
-arrow-cast = "57.2"
-arrow-csv = "57.2"
-arrow-ipc = "57.2"
-arrow-json = "57.2"
-arrow-select = "57.2"
+# Arrow row encoding participates in the partitioning ABI. Upgrade these exact
+# pins only with an ABI version bump and updated golden vectors.
+arrow = { version = "=57.2.0", default-features = true }
+arrow-array = "=57.2.0"
+arrow-schema = "=57.2.0"
+arrow-cast = "=57.2.0"
+arrow-csv = "=57.2.0"
+arrow-ipc = "=57.2.0"
+arrow-json = "=57.2.0"
+arrow-row = "=57.2.0"
+arrow-select = "=57.2.0"
 datafusion = "52.3"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
@@ -122,7 +124,9 @@ iceberg-storage-opendal = "0.9.1"
 # Cluster (distributed mode)
 chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
+# bump and updated golden vectors.
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }

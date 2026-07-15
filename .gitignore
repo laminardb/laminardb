@@ -80,3 +80,6 @@ agent_rules.md
 
 # Machine-local cargo config (linker overrides etc.)
 /.cargo/config.toml
+
+# Vendored library packages use the workspace lockfile.
+/vendor/*/Cargo.lock

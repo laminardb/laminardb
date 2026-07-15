@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::compute::take;
-use arrow::row::{RowConverter, SortField};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_row::{RowConverter, SortField};
 
 use crate::state::{key_hash, NodeId, VnodeAssignmentSnapshot};
 
@@ -116,6 +116,14 @@ pub enum ShuffleRoutingError {
         /// Available columns.
         columns: usize,
     },
+    /// ABI v1 admits only scalar, non-floating key types.
+    #[error("shuffle key column {index} has unsupported partition type {data_type}")]
+    UnsupportedKeyType {
+        /// Requested zero-based index.
+        index: usize,
+        /// Rejected Arrow type.
+        data_type: arrow_schema::DataType,
+    },
     /// Arrow row encoding or slicing failed.
     #[error("shuffle Arrow routing: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -182,18 +190,24 @@ pub fn row_vnodes(
     if vnode_count == 0 {
         return Err(ShuffleRoutingError::EmptyVnodeSpace);
     }
-    let cols: Vec<ArrayRef> =
-        columns
-            .iter()
-            .map(|&index| {
-                batch.columns().get(index).cloned().ok_or(
-                    ShuffleRoutingError::KeyColumnOutOfRange {
-                        index,
-                        columns: batch.num_columns(),
-                    },
-                )
-            })
-            .collect::<Result<_, _>>()?;
+    let cols: Vec<ArrayRef> = columns
+        .iter()
+        .map(|&index| {
+            let column = batch.columns().get(index).cloned().ok_or(
+                ShuffleRoutingError::KeyColumnOutOfRange {
+                    index,
+                    columns: batch.num_columns(),
+                },
+            )?;
+            if !is_supported_key_type(column.data_type()) {
+                return Err(ShuffleRoutingError::UnsupportedKeyType {
+                    index,
+                    data_type: column.data_type().clone(),
+                });
+            }
+            Ok(column)
+        })
+        .collect::<Result<_, _>>()?;
     let fields: Vec<SortField> = cols
         .iter()
         .map(|column| SortField::new(column.data_type().clone()))
@@ -206,6 +220,30 @@ pub fn row_vnodes(
                 .map_err(|_| ShuffleRoutingError::EmptyVnodeSpace)
         })
         .collect()
+}
+
+fn is_supported_key_type(data_type: &arrow_schema::DataType) -> bool {
+    match data_type {
+        // Dictionary indices are an encoding detail. Hash the hydrated scalar
+        // value, but apply the same ABI gate recursively to that value type.
+        arrow_schema::DataType::Dictionary(indices, values) => {
+            matches!(
+                indices.as_ref(),
+                arrow_schema::DataType::Int8
+                    | arrow_schema::DataType::Int16
+                    | arrow_schema::DataType::Int32
+                    | arrow_schema::DataType::Int64
+                    | arrow_schema::DataType::UInt8
+                    | arrow_schema::DataType::UInt16
+                    | arrow_schema::DataType::UInt32
+                    | arrow_schema::DataType::UInt64
+            ) && is_supported_key_type(values)
+        }
+        // Run-end encoding is also representation-level, but is excluded until
+        // equivalence with plain arrays is frozen by vectors.
+        arrow_schema::DataType::RunEndEncoded(_, _) => false,
+        data_type => !data_type.is_floating() && !data_type.is_nested(),
+    }
 }
 
 /// Build a complete local/remote plan from one caller-pinned assignment.
@@ -347,8 +385,12 @@ fn take_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch, Shuffl
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array as _, Int64Array, RecordBatch, StringArray, StringViewArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::types::{Int16Type, Int8Type};
+    use arrow_array::{
+        Array as _, DictionaryArray, Float64Array, Int16Array, Int64Array, Int8Array, RecordBatch,
+        StringArray, StringViewArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 
     use super::*;
     use crate::state::VnodeRegistry;
@@ -584,5 +626,181 @@ mod tests {
             row_vnodes(&batch, &[1], 1),
             Err(ShuffleRoutingError::KeyColumnOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn partitioning_abi_v1_arrow_row_golden_vectors() {
+        const KEY_GROUPS: u32 = 257;
+
+        let strings = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![
+                None,
+                Some(""),
+                Some("alpha"),
+                Some("snowman-☃"),
+            ]))],
+        )
+        .unwrap();
+        let string_groups = row_vnodes(&strings, &[0], KEY_GROUPS).unwrap();
+
+        let integers = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                Some(-1),
+                None,
+                Some(0),
+                Some(1),
+                Some(i64::MAX),
+            ]))],
+        )
+        .unwrap();
+        let integer_groups = row_vnodes(&integers, &[0], KEY_GROUPS).unwrap();
+
+        let composite = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tenant", DataType::Utf8, true),
+                Field::new("account", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), None, None])),
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(1), None])),
+            ],
+        )
+        .unwrap();
+        let composite_groups = row_vnodes(&composite, &[0, 1], KEY_GROUPS).unwrap();
+
+        let dictionary =
+            DictionaryArray::<Int8Type>::from_iter([Some("alpha"), None, Some(""), Some("alpha")]);
+        let dictionary = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "key",
+                dictionary.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(dictionary)],
+        )
+        .unwrap();
+        let dictionary_groups = row_vnodes(&dictionary, &[0], KEY_GROUPS).unwrap();
+
+        assert_eq!(
+            (
+                string_groups,
+                integer_groups,
+                composite_groups,
+                dictionary_groups,
+            ),
+            (
+                vec![211, 224, 44, 94],
+                vec![111, 202, 114, 90, 180, 32],
+                vec![26, 208, 118, 52],
+                vec![44, 211, 224, 44],
+            )
+        );
+    }
+
+    #[test]
+    fn partitioning_abi_v1_rejects_non_scalar_and_floating_point_keys() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "key",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![0.0, -0.0, f64::NAN]))],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            row_vnodes(&batch, &[0], 257),
+            Err(ShuffleRoutingError::UnsupportedKeyType {
+                index: 0,
+                data_type: DataType::Float64,
+            })
+        ));
+
+        let item = Arc::new(Field::new("item", DataType::Int64, true));
+        let nested = [
+            DataType::List(Arc::clone(&item)),
+            DataType::ListView(Arc::clone(&item)),
+            DataType::LargeList(Arc::clone(&item)),
+            DataType::LargeListView(Arc::clone(&item)),
+            DataType::FixedSizeList(Arc::clone(&item), 2),
+            DataType::Struct(vec![Field::new("item", DataType::Int64, true)].into()),
+            DataType::Union(
+                UnionFields::try_new([0], [Field::new("item", DataType::Int64, true)]).unwrap(),
+                UnionMode::Sparse,
+            ),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+        ];
+        assert!(nested
+            .iter()
+            .all(|data_type| !is_supported_key_type(data_type)));
+        assert!(!is_supported_key_type(&DataType::Dictionary(
+            Box::new(DataType::Int8),
+            Box::new(DataType::Float64),
+        )));
+        assert!(!is_supported_key_type(&DataType::Dictionary(
+            Box::new(DataType::Int8),
+            Box::new(DataType::List(item)),
+        )));
+        assert!(!is_supported_key_type(&DataType::Dictionary(
+            Box::new(DataType::Float64),
+            Box::new(DataType::Utf8),
+        )));
+    }
+
+    #[test]
+    fn dictionary_encoding_does_not_change_partitioning() {
+        const KEY_GROUPS: u32 = 257;
+
+        let int8 = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), None, Some(1), Some(0)]),
+            Arc::new(StringArray::from(vec!["alpha", ""])),
+        )
+        .unwrap();
+        let int16 = DictionaryArray::<Int16Type>::try_new(
+            Int16Array::from(vec![Some(2), None, Some(0), Some(2)]),
+            Arc::new(StringArray::from(vec!["", "unused", "alpha"])),
+        )
+        .unwrap();
+
+        let int8 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "key",
+                int8.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(int8)],
+        )
+        .unwrap();
+        let int16 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "key",
+                int16.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(int16)],
+        )
+        .unwrap();
+
+        let int8_groups = row_vnodes(&int8, &[0], KEY_GROUPS).unwrap();
+        let int16_groups = row_vnodes(&int16, &[0], KEY_GROUPS).unwrap();
+        assert_eq!(int8_groups, vec![44, 211, 224, 44]);
+        assert_eq!(int16_groups, int8_groups);
     }
 }
