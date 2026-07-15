@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
-    JoinOperator, Select, TableFactor, TableVersion,
+    JoinOperator, ObjectName, ObjectNamePart, Select, TableFactor, TableVersion,
 };
 
 use super::window_rewriter::WindowRewriter;
@@ -63,36 +63,73 @@ impl std::fmt::Display for AsofSqlDirection {
 /// Unresolved time column refs from a BETWEEN clause.
 #[derive(Debug, Clone)]
 struct RawTimeCols {
-    expr_qualifier: Option<String>,
+    expr_qualifier: String,
     expr_col: String,
-    low_qualifier: Option<String>,
+    low_qualifier: String,
     low_col: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JoinSides<'a> {
+    left_table: &'a str,
+    right_table: &'a str,
+    left_alias: Option<&'a str>,
+    right_alias: Option<&'a str>,
+}
+
+impl JoinSides<'_> {
+    fn resolve_qualifier(&self, qualifier: &str, context: &str) -> Result<JoinSide, ParseError> {
+        let is_left =
+            qualifier == self.left_table || self.left_alias.is_some_and(|alias| qualifier == alias);
+        let is_right = qualifier == self.right_table
+            || self.right_alias.is_some_and(|alias| qualifier == alias);
+
+        match (is_left, is_right) {
+            (true, false) => Ok(JoinSide::Left),
+            (false, true) => Ok(JoinSide::Right),
+            (true, true) => Err(ParseError::StreamingError(format!(
+                "{context} must use unambiguous left and right join input names; qualifier '{qualifier}' names both inputs"
+            ))),
+            (false, false) => Err(ParseError::StreamingError(format!(
+                "{context} must use unambiguous left and right join input names; qualifier '{qualifier}' names neither input"
+            ))),
+        }
+    }
+}
+
 /// Resolve BETWEEN time columns to `(left_time_col, right_time_col)` using
-/// table qualifiers. Falls back to positional (low=left, expr=right).
+/// table qualifiers.
 fn resolve_time_cols(
     raw: &RawTimeCols,
     left_table: &str,
     right_table: &str,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
-) -> (String, String) {
-    let matches_left = |q: &Option<String>| -> bool {
-        q.as_ref()
-            .is_some_and(|t| t == left_table || left_alias.is_some_and(|a| a == t))
+) -> Result<(String, String), ParseError> {
+    let sides = JoinSides {
+        left_table,
+        right_table,
+        left_alias,
+        right_alias,
     };
-    let matches_right = |q: &Option<String>| -> bool {
-        q.as_ref()
-            .is_some_and(|t| t == right_table || right_alias.is_some_and(|a| a == t))
-    };
+    let expr_side = sides.resolve_qualifier(&raw.expr_qualifier, "streaming interval timestamp")?;
+    let low_side = sides.resolve_qualifier(&raw.low_qualifier, "streaming interval timestamp")?;
 
-    if matches_right(&raw.expr_qualifier) && matches_left(&raw.low_qualifier) {
-        (raw.low_col.clone(), raw.expr_col.clone())
-    } else if matches_left(&raw.expr_qualifier) && matches_right(&raw.low_qualifier) {
-        (raw.expr_col.clone(), raw.low_col.clone())
-    } else {
-        (raw.low_col.clone(), raw.expr_col.clone())
+    match (expr_side, low_side) {
+        (JoinSide::Right, JoinSide::Left) => Ok((raw.low_col.clone(), raw.expr_col.clone())),
+        (JoinSide::Left, JoinSide::Right) => Err(ParseError::StreamingError(
+            "streaming interval joins require the right timestamp BETWEEN the left timestamp and left timestamp + interval"
+                .to_string(),
+        )),
+        _ => Err(ParseError::StreamingError(
+            "streaming interval join timestamps must reference opposite join inputs".to_string(),
+        )),
     }
 }
 
@@ -298,6 +335,12 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
     let right_alias = extract_table_alias(&join.relation);
 
     let join_type = map_join_operator(&join.join_operator);
+    let sides = JoinSides {
+        left_table: &left_table,
+        right_table: &right_table,
+        left_alias: left_alias.as_deref(),
+        right_alias: right_alias.as_deref(),
+    };
 
     // Handle ASOF JOIN specially
     if let JoinOperator::AsOf {
@@ -306,10 +349,10 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
     } = &join.join_operator
     {
         let (direction, left_time, right_time, tolerance) =
-            analyze_asof_match_condition(match_condition)?;
+            analyze_asof_match_condition(match_condition, &sides)?;
 
         // Extract key columns from the ON constraint
-        let (left_key, right_key) = analyze_asof_constraint(constraint)?;
+        let (left_key, right_key) = analyze_asof_constraint(constraint, &sides)?;
 
         let mut analysis = JoinAnalysis::asof(
             left_table,
@@ -328,7 +371,8 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     // Check for temporal join (FOR SYSTEM_TIME AS OF)
     if let Some(version_col) = extract_temporal_version(&join.relation) {
-        let (left_key, right_key, additional, _, _) = analyze_join_constraint(&join.join_operator)?;
+        let (left_key, right_key, additional, _, _) =
+            analyze_join_constraint(&join.join_operator, &sides)?;
         let mut analysis = JoinAnalysis::temporal(
             left_table,
             right_table,
@@ -345,7 +389,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     // Analyze the join constraint
     let (left_key, right_key, additional, time_bound, time_cols) =
-        analyze_join_constraint(&join.join_operator)?;
+        analyze_join_constraint(&join.join_operator, &sides)?;
 
     let mut analysis = if let Some(tb) = time_bound {
         JoinAnalysis::stream_stream(left_table, right_table, left_key, right_key, tb, join_type)
@@ -364,7 +408,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
             &analysis.right_table,
             left_alias.as_deref(),
             right_alias.as_deref(),
-        );
+        )?;
         analysis.left_time_column = Some(lt);
         analysis.right_time_column = Some(rt);
     }
@@ -375,7 +419,13 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 /// Extract table name from a TableFactor.
 fn extract_table_name(factor: &TableFactor) -> Result<String, ParseError> {
     match factor {
-        TableFactor::Table { name, .. } => Ok(name.to_string()),
+        TableFactor::Table { name, .. } => match name.0.as_slice() {
+            [ObjectNamePart::Identifier(ident)] => Ok(ident.value.clone()),
+            _ => Err(ParseError::StreamingError(
+                "streaming joins require single-part relation names; qualify the relation in the catalog before planning the join"
+                    .to_string(),
+            )),
+        },
         TableFactor::Derived { alias, .. } => {
             if let Some(alias) = alias {
                 Ok(alias.name.value.clone())
@@ -453,6 +503,7 @@ fn map_join_operator(op: &JoinOperator) -> JoinType {
 #[allow(clippy::type_complexity)]
 fn analyze_join_constraint(
     op: &JoinOperator,
+    sides: &JoinSides<'_>,
 ) -> Result<
     (
         String,
@@ -467,7 +518,7 @@ fn analyze_join_constraint(
 
     match constraint {
         JoinConstraint::On(expr) => {
-            let (key_pairs, time_bound, time_cols) = analyze_on_expression(expr)?;
+            let (key_pairs, time_bound, time_cols) = analyze_on_expression(expr, sides)?;
             if key_pairs.is_empty() {
                 return Ok((String::new(), String::new(), vec![], time_bound, time_cols));
             }
@@ -482,15 +533,15 @@ fn analyze_join_constraint(
                 ));
             }
             // First column is the primary key pair
-            let first_col = cols[0].to_string();
+            let first_col = extract_using_column(&cols[0])?;
             // Remaining columns are additional key pairs
             let additional: Vec<(String, String)> = cols[1..]
                 .iter()
                 .map(|c| {
-                    let col = c.to_string();
-                    (col.clone(), col)
+                    let col = extract_using_column(c)?;
+                    Ok((col.clone(), col))
                 })
-                .collect();
+                .collect::<Result<_, ParseError>>()?;
             Ok((first_col.clone(), first_col, additional, None, None))
         }
         JoinConstraint::Natural => Err(ParseError::StreamingError(
@@ -498,6 +549,15 @@ fn analyze_join_constraint(
         )),
         JoinConstraint::None => Err(ParseError::StreamingError(
             "JOIN without condition not supported for streaming".to_string(),
+        )),
+    }
+}
+
+fn extract_using_column(name: &ObjectName) -> Result<String, ParseError> {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => Ok(ident.value.clone()),
+        _ => Err(ParseError::StreamingError(
+            "streaming JOIN USING keys must be single column identifiers".to_string(),
         )),
     }
 }
@@ -531,6 +591,7 @@ fn get_join_constraint(op: &JoinOperator) -> Result<&JoinConstraint, ParseError>
 #[allow(clippy::type_complexity)]
 fn analyze_on_expression(
     expr: &Expr,
+    sides: &JoinSides<'_>,
 ) -> Result<(Vec<(String, String)>, Option<Duration>, Option<RawTimeCols>), ParseError> {
     // Handle compound expressions (AND)
     match expr {
@@ -539,136 +600,174 @@ fn analyze_on_expression(
             op: BinaryOperator::And,
             right,
         } => {
-            // Recursively analyze both sides
-            let left_result = analyze_on_expression(left);
-            let right_result = analyze_on_expression(right);
+            let (mut key_pairs, left_bound, left_cols) = analyze_on_expression(left, sides)?;
+            let (right_keys, right_bound, right_cols) = analyze_on_expression(right, sides)?;
 
-            // Combine results - collect all key pairs and time bounds
-            match (left_result, right_result) {
-                (Ok((mut lk, lt, ltc)), Ok((rk, rt, rtc))) => {
-                    lk.extend(rk);
-                    Ok((lk, lt.or(rt), ltc.or(rtc)))
-                }
-                (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
-                (Err(e), Err(_)) => Err(e),
+            if left_bound.is_some() && right_bound.is_some() {
+                return Err(ParseError::StreamingError(
+                    "streaming interval joins require exactly one time-bound predicate".to_string(),
+                ));
             }
+
+            key_pairs.extend(right_keys);
+            Ok((
+                key_pairs,
+                left_bound.or(right_bound),
+                left_cols.or(right_cols),
+            ))
         }
         // Equality condition: a.col = b.col
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
-        } => {
-            let left_col = extract_column_ref(left);
-            let right_col = extract_column_ref(right);
-
-            match (left_col, right_col) {
-                (Some(l), Some(r)) => Ok((vec![(l, r)], None, None)),
-                _ => Err(ParseError::StreamingError(
-                    "Cannot extract column references from equality condition".to_string(),
-                )),
-            }
-        }
+        } => Ok((
+            vec![orient_equality_columns(
+                left,
+                right,
+                sides,
+                "join equality",
+            )?],
+            None,
+            None,
+        )),
         // BETWEEN clause for time bound: p.ts BETWEEN o.ts AND o.ts + INTERVAL
         Expr::Between {
             expr: between_expr,
+            negated,
             low,
             high,
-            ..
         } => {
-            // Try to extract time bound from high expression
-            let time_bound = extract_time_bound_from_expr(high).ok();
-            let between_col = extract_qualified_column_ref(between_expr);
-            let low_col = extract_qualified_column_ref(low);
-            let time_cols = if let (Some((bt, bc)), Some((lt, lc))) = (between_col, low_col) {
+            if *negated {
+                return Err(ParseError::StreamingError(
+                    "NOT BETWEEN is not supported for streaming interval joins".to_string(),
+                ));
+            }
+
+            let (expr_qualifier, expr_col) = extract_qualified_column_ref(between_expr)
+                .ok_or_else(|| {
+                    ParseError::StreamingError(
+                        "streaming interval join timestamps must be qualified column references"
+                            .to_string(),
+                    )
+                })?;
+            let (low_qualifier, low_col) = extract_qualified_column_ref(low).ok_or_else(|| {
+                ParseError::StreamingError(
+                    "streaming interval join timestamps must be qualified column references"
+                        .to_string(),
+                )
+            })?;
+            let time_bound = extract_strict_interval_bound(high, &low_qualifier, &low_col)?;
+
+            Ok((
+                vec![],
+                Some(time_bound),
                 Some(RawTimeCols {
-                    expr_qualifier: bt,
-                    expr_col: bc,
-                    low_qualifier: lt,
-                    low_col: lc,
-                })
-            } else {
-                if time_bound.is_some() {
-                    tracing::warn!(
-                        "BETWEEN clause has time bound but time column references \
-                         could not be extracted (expressions must be simple column refs)"
-                    );
-                }
-                None
-            };
-            Ok((vec![], time_bound, time_cols))
+                    expr_qualifier,
+                    expr_col,
+                    low_qualifier,
+                    low_col,
+                }),
+            ))
         }
-        // Comparison operators for time bounds
-        Expr::BinaryOp {
-            left: _,
-            op:
-                BinaryOperator::LtEq | BinaryOperator::Lt | BinaryOperator::GtEq | BinaryOperator::Gt,
-            right,
-        } => {
-            // Try to extract time bound from right side
-            let time_bound = extract_time_bound_from_expr(right).ok();
-            Ok((vec![], time_bound, None))
-        }
+        Expr::Nested(inner) => analyze_on_expression(inner, sides),
         _ => Err(ParseError::StreamingError(format!(
             "Unsupported join condition expression: {expr:?}"
         ))),
     }
 }
 
-/// Extract column reference from a function argument.
-fn extract_column_from_func_arg(arg: &FunctionArg) -> Option<String> {
-    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-    | FunctionArg::Named {
-        arg: FunctionArgExpr::Expr(expr),
-        ..
-    }
-    | FunctionArg::ExprNamed {
-        arg: FunctionArgExpr::Expr(expr),
-        ..
-    }) = arg
-    else {
-        return None;
-    };
-    extract_column_ref(expr)
-}
-
-/// Extract column reference from expression (e.g., "a.id" -> "id")
-fn extract_column_ref(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.value.clone()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
-        _ => None,
-    }
-}
-
-fn extract_qualified_column_ref(expr: &Expr) -> Option<(Option<String>, String)> {
-    match expr {
-        Expr::Identifier(ident) => Some((None, ident.value.clone())),
+fn extract_qualified_column_ref(expr: &Expr) -> Option<(String, String)> {
+    match strip_nested(expr) {
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            Some((Some(parts[0].value.clone()), parts[1].value.clone()))
+            Some((parts[0].value.clone(), parts[1].value.clone()))
         }
-        Expr::CompoundIdentifier(parts) => parts.last().map(|p| (None, p.value.clone())),
         _ => None,
     }
 }
 
-/// Extract time bound from an expression like "o.ts + INTERVAL '1' HOUR"
-fn extract_time_bound_from_expr(expr: &Expr) -> Result<Duration, ParseError> {
-    match expr {
-        // Direct interval
-        Expr::Interval(_) => WindowRewriter::parse_interval_to_duration(expr),
-        // Addition or subtraction: col +/- INTERVAL
-        Expr::BinaryOp {
-            left: _,
-            op: BinaryOperator::Plus | BinaryOperator::Minus,
-            right,
-        } => extract_time_bound_from_expr(right),
-        // Nested expression
-        Expr::Nested(inner) => extract_time_bound_from_expr(inner),
+fn orient_equality_columns(
+    expression_left: &Expr,
+    expression_right: &Expr,
+    sides: &JoinSides<'_>,
+    context: &str,
+) -> Result<(String, String), ParseError> {
+    let (left_qualifier, left_column) =
+        extract_qualified_column_ref(expression_left).ok_or_else(|| {
+            ParseError::StreamingError(format!(
+                "Cannot extract column references from {context}; operands must be qualified column references"
+            ))
+        })?;
+    let (right_qualifier, right_column) = extract_qualified_column_ref(expression_right)
+        .ok_or_else(|| {
+            ParseError::StreamingError(format!(
+                "Cannot extract column references from {context}; operands must be qualified column references"
+            ))
+        })?;
+    let left_side = sides.resolve_qualifier(&left_qualifier, context)?;
+    let right_side = sides.resolve_qualifier(&right_qualifier, context)?;
+
+    match (left_side, right_side) {
+        (JoinSide::Left, JoinSide::Right) => Ok((left_column, right_column)),
+        (JoinSide::Right, JoinSide::Left) => Ok((right_column, left_column)),
         _ => Err(ParseError::StreamingError(format!(
-            "Cannot extract time bound from: {expr:?}"
+            "{context} must compare one left-input column with one right-input column"
         ))),
     }
+}
+
+fn strip_nested(mut expr: &Expr) -> &Expr {
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
+/// Parse the only admitted interval upper bound: the exact lower timestamp
+/// column plus a positive interval.
+fn extract_strict_interval_bound(
+    high: &Expr,
+    low_qualifier: &str,
+    low_col: &str,
+) -> Result<Duration, ParseError> {
+    let Expr::BinaryOp { left, op, right } = strip_nested(high) else {
+        return Err(ParseError::StreamingError(
+            "streaming interval join upper bound must be the left timestamp plus an interval"
+                .to_string(),
+        ));
+    };
+    if !matches!(op, BinaryOperator::Plus) {
+        return Err(ParseError::StreamingError(
+            "streaming interval join upper bound must use addition".to_string(),
+        ));
+    }
+
+    let Some((high_qualifier, high_col)) = extract_qualified_column_ref(left) else {
+        return Err(ParseError::StreamingError(
+            "streaming interval join upper bound must repeat the qualified lower timestamp"
+                .to_string(),
+        ));
+    };
+    if high_qualifier != low_qualifier || high_col != low_col {
+        return Err(ParseError::StreamingError(
+            "streaming interval join upper bound must use the same timestamp as its lower bound"
+                .to_string(),
+        ));
+    }
+
+    let interval = strip_nested(right);
+    if !matches!(interval, Expr::Interval(_)) {
+        return Err(ParseError::StreamingError(
+            "streaming interval join upper bound must end with an INTERVAL".to_string(),
+        ));
+    }
+    let duration = WindowRewriter::parse_interval_to_duration(interval)?;
+    if duration.is_zero() {
+        return Err(ParseError::StreamingError(
+            "streaming interval joins require a positive finite time bound".to_string(),
+        ));
+    }
+    Ok(duration)
 }
 
 /// Analyze ASOF JOIN MATCH_CONDITION expression.
@@ -676,85 +775,113 @@ fn extract_time_bound_from_expr(expr: &Expr) -> Result<Duration, ParseError> {
 /// Extracts direction, time column names, and optional tolerance.
 fn analyze_asof_match_condition(
     expr: &Expr,
+    sides: &JoinSides<'_>,
 ) -> Result<(AsofSqlDirection, String, String, Option<Duration>), ParseError> {
     if let Expr::BinaryOp {
         left,
         op: BinaryOperator::And,
         right,
-    } = expr
+    } = strip_nested(expr)
     {
-        // Try to get direction from left, tolerance from right
-        let dir_result = analyze_asof_direction(left);
-        let tol_result = extract_asof_tolerance(right);
-
-        match (dir_result, tol_result) {
-            (Ok((dir, lt, rt)), Ok(tol)) => Ok((dir, lt, rt, Some(tol))),
-            (Ok((dir, lt, rt)), Err(_)) => {
-                // Maybe tolerance is on left and direction on right
-                let dir2 = analyze_asof_direction(right);
-                let tol2 = extract_asof_tolerance(left);
-                match (dir2, tol2) {
-                    (Ok((d, l, r)), Ok(t)) => Ok((d, l, r, Some(t))),
-                    _ => Ok((dir, lt, rt, None)),
+        let left_direction = analyze_asof_direction(left, sides);
+        let right_direction = analyze_asof_direction(right, sides);
+        match (left_direction, right_direction) {
+            (Ok(_), Ok(_)) => Err(ParseError::StreamingError(
+                "ASOF MATCH_CONDITION requires exactly one time-direction predicate".to_string(),
+            )),
+            (Ok((direction, left_time, right_time)), Err(_)) => {
+                if direction == AsofSqlDirection::Nearest {
+                    return Err(ParseError::StreamingError(
+                        "ASOF NEAREST does not support a tolerance predicate".to_string(),
+                    ));
                 }
+                let tolerance = extract_asof_tolerance(
+                    right,
+                    sides,
+                    direction,
+                    &left_time,
+                    &right_time,
+                )?;
+                Ok((direction, left_time, right_time, Some(tolerance)))
             }
-            (Err(_), _) => {
-                // Try reversed
-                let dir2 = analyze_asof_direction(right);
-                let tol2 = extract_asof_tolerance(left);
-                match (dir2, tol2) {
-                    (Ok((d, l, r)), Ok(t)) => Ok((d, l, r, Some(t))),
-                    (Ok((d, l, r)), Err(_)) => Ok((d, l, r, None)),
-                    _ => Err(ParseError::StreamingError(
-                        "Cannot extract ASOF direction from MATCH_CONDITION".to_string(),
-                    )),
+            (Err(_), Ok((direction, left_time, right_time))) => {
+                if direction == AsofSqlDirection::Nearest {
+                    return Err(ParseError::StreamingError(
+                        "ASOF NEAREST does not support a tolerance predicate".to_string(),
+                    ));
                 }
+                let tolerance = extract_asof_tolerance(
+                    left,
+                    sides,
+                    direction,
+                    &left_time,
+                    &right_time,
+                )?;
+                Ok((direction, left_time, right_time, Some(tolerance)))
             }
+            (Err(_), Err(_)) => Err(ParseError::StreamingError(
+                "ASOF MATCH_CONDITION must contain exactly one qualified >=, <=, or NEAREST time predicate and at most one valid tolerance"
+                    .to_string(),
+            )),
         }
     } else {
-        let (dir, lt, rt) = analyze_asof_direction(expr)?;
+        let (dir, lt, rt) = analyze_asof_direction(expr, sides)?;
         Ok((dir, lt, rt, None))
     }
 }
 
 /// Extract ASOF direction and time columns from a comparison expression.
-fn analyze_asof_direction(expr: &Expr) -> Result<(AsofSqlDirection, String, String), ParseError> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::GtEq,
-            right,
-        } => {
-            let left_col = extract_column_ref(left).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract left time column from MATCH_CONDITION".to_string(),
-                )
-            })?;
-            let right_col = extract_column_ref(right).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract right time column from MATCH_CONDITION".to_string(),
-                )
-            })?;
-            Ok((AsofSqlDirection::Backward, left_col, right_col))
+fn analyze_asof_direction(
+    expr: &Expr,
+    sides: &JoinSides<'_>,
+) -> Result<(AsofSqlDirection, String, String), ParseError> {
+    match strip_nested(expr) {
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::GtEq | BinaryOperator::LtEq) =>
+        {
+            let (expression_left_qualifier, expression_left_column) =
+                extract_qualified_column_ref(left).ok_or_else(|| {
+                    ParseError::StreamingError(
+                        "ASOF time operands must be qualified column references".to_string(),
+                    )
+                })?;
+            let (expression_right_qualifier, expression_right_column) =
+                extract_qualified_column_ref(right).ok_or_else(|| {
+                    ParseError::StreamingError(
+                        "ASOF time operands must be qualified column references".to_string(),
+                    )
+                })?;
+            let expression_left_side =
+                sides.resolve_qualifier(&expression_left_qualifier, "ASOF time predicate")?;
+            let expression_right_side =
+                sides.resolve_qualifier(&expression_right_qualifier, "ASOF time predicate")?;
+
+            let (left_time, right_time, left_first) =
+                match (expression_left_side, expression_right_side) {
+                    (JoinSide::Left, JoinSide::Right) => {
+                        (expression_left_column, expression_right_column, true)
+                    }
+                    (JoinSide::Right, JoinSide::Left) => {
+                        (expression_right_column, expression_left_column, false)
+                    }
+                    _ => {
+                        return Err(ParseError::StreamingError(
+                            "ASOF time predicate must compare one left-input timestamp with one right-input timestamp"
+                                .to_string(),
+                        ))
+                    }
+                };
+            let direction = match (op, left_first) {
+                (BinaryOperator::GtEq, true) | (BinaryOperator::LtEq, false) => {
+                    AsofSqlDirection::Backward
+                }
+                (BinaryOperator::LtEq, true) | (BinaryOperator::GtEq, false) => {
+                    AsofSqlDirection::Forward
+                }
+                _ => unreachable!("comparison operator was restricted above"),
+            };
+            Ok((direction, left_time, right_time))
         }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::LtEq,
-            right,
-        } => {
-            let left_col = extract_column_ref(left).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract left time column from MATCH_CONDITION".to_string(),
-                )
-            })?;
-            let right_col = extract_column_ref(right).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract right time column from MATCH_CONDITION".to_string(),
-                )
-            })?;
-            Ok((AsofSqlDirection::Forward, left_col, right_col))
-        }
-        // NEAREST(left_col, right_col) — function-style syntax
         Expr::Function(func) => {
             let name = func.name.to_string().to_uppercase();
             if name != "NEAREST" {
@@ -776,16 +903,14 @@ fn analyze_asof_direction(expr: &Expr) -> Result<(AsofSqlDirection, String, Stri
                     args.len()
                 )));
             }
-            let left_col = extract_column_from_func_arg(&args[0]).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract left time column from NEAREST()".to_string(),
-                )
+            let first = extract_expr_from_function_arg(&args[0]).ok_or_else(|| {
+                ParseError::StreamingError("NEAREST arguments must be columns".to_string())
             })?;
-            let right_col = extract_column_from_func_arg(&args[1]).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract right time column from NEAREST()".to_string(),
-                )
+            let second = extract_expr_from_function_arg(&args[1]).ok_or_else(|| {
+                ParseError::StreamingError("NEAREST arguments must be columns".to_string())
             })?;
+            let (left_col, right_col) =
+                orient_equality_columns(first, second, sides, "ASOF NEAREST")?;
             Ok((AsofSqlDirection::Nearest, left_col, right_col))
         }
         _ => Err(ParseError::StreamingError(
@@ -794,87 +919,147 @@ fn analyze_asof_direction(expr: &Expr) -> Result<(AsofSqlDirection, String, Stri
     }
 }
 
+fn extract_expr_from_function_arg(arg: &FunctionArg) -> Option<&Expr> {
+    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+    | FunctionArg::Named {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }
+    | FunctionArg::ExprNamed {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }) = arg
+    else {
+        return None;
+    };
+    Some(expr)
+}
+
 /// Extract tolerance duration from an ASOF tolerance expression.
 ///
 /// Handles: `left - right <= value` or `left - right <= INTERVAL '...'`
-fn extract_asof_tolerance(expr: &Expr) -> Result<Duration, ParseError> {
-    match expr {
-        Expr::BinaryOp {
-            left: _,
-            op: BinaryOperator::LtEq,
-            right,
-        } => {
-            // right side is either a literal number or INTERVAL
-            match right.as_ref() {
-                Expr::Value(v) => {
-                    if let sqlparser::ast::Value::Number(n, _) = &v.value {
-                        let ms: u64 = n.parse().map_err(|_| {
-                            ParseError::StreamingError(format!(
-                                "Cannot parse tolerance as number: {n}"
-                            ))
-                        })?;
-                        Ok(Duration::from_millis(ms))
-                    } else {
-                        Err(ParseError::StreamingError(
-                            "ASOF tolerance must be a number or INTERVAL".to_string(),
-                        ))
-                    }
-                }
-                Expr::Interval(_) => WindowRewriter::parse_interval_to_duration(right),
-                _ => Err(ParseError::StreamingError(
-                    "ASOF tolerance must be a number or INTERVAL".to_string(),
-                )),
-            }
-        }
-        _ => Err(ParseError::StreamingError(
+fn extract_asof_tolerance(
+    expr: &Expr,
+    sides: &JoinSides<'_>,
+    direction: AsofSqlDirection,
+    left_time: &str,
+    right_time: &str,
+) -> Result<Duration, ParseError> {
+    let Expr::BinaryOp {
+        left: delta,
+        op: BinaryOperator::LtEq,
+        right: bound,
+    } = strip_nested(expr)
+    else {
+        return Err(ParseError::StreamingError(
             "ASOF tolerance expression must be <= comparison".to_string(),
-        )),
+        ));
+    };
+    let Expr::BinaryOp {
+        left: delta_left,
+        op: BinaryOperator::Minus,
+        right: delta_right,
+    } = strip_nested(delta)
+    else {
+        return Err(ParseError::StreamingError(
+            "ASOF tolerance left side must subtract the matched timestamps".to_string(),
+        ));
+    };
+    let (delta_left_qualifier, delta_left_column) = extract_qualified_column_ref(delta_left)
+        .ok_or_else(|| {
+            ParseError::StreamingError(
+                "ASOF tolerance timestamps must be qualified column references".to_string(),
+            )
+        })?;
+    let (delta_right_qualifier, delta_right_column) = extract_qualified_column_ref(delta_right)
+        .ok_or_else(|| {
+            ParseError::StreamingError(
+                "ASOF tolerance timestamps must be qualified column references".to_string(),
+            )
+        })?;
+    let delta_left_side = sides.resolve_qualifier(&delta_left_qualifier, "ASOF tolerance")?;
+    let delta_right_side = sides.resolve_qualifier(&delta_right_qualifier, "ASOF tolerance")?;
+    let matches_direction = match direction {
+        AsofSqlDirection::Backward => {
+            delta_left_side == JoinSide::Left
+                && delta_left_column == left_time
+                && delta_right_side == JoinSide::Right
+                && delta_right_column == right_time
+        }
+        AsofSqlDirection::Forward => {
+            delta_left_side == JoinSide::Right
+                && delta_left_column == right_time
+                && delta_right_side == JoinSide::Left
+                && delta_right_column == left_time
+        }
+        AsofSqlDirection::Nearest => false,
+    };
+    if !matches_direction {
+        return Err(ParseError::StreamingError(
+            "ASOF tolerance must subtract the same timestamps in the match direction".to_string(),
+        ));
     }
+
+    let duration = match strip_nested(bound) {
+        Expr::Value(v) => {
+            let sqlparser::ast::Value::Number(number, _) = &v.value else {
+                return Err(ParseError::StreamingError(
+                    "ASOF tolerance must be a positive number of milliseconds or INTERVAL"
+                        .to_string(),
+                ));
+            };
+            let milliseconds: u64 = number.parse().map_err(|_| {
+                ParseError::StreamingError(format!(
+                    "ASOF tolerance is not a valid millisecond count: {number}"
+                ))
+            })?;
+            Duration::from_millis(milliseconds)
+        }
+        interval @ Expr::Interval(_) => WindowRewriter::parse_interval_to_duration(interval)?,
+        _ => {
+            return Err(ParseError::StreamingError(
+                "ASOF tolerance must be a positive number of milliseconds or INTERVAL".to_string(),
+            ))
+        }
+    };
+    if duration.is_zero() {
+        return Err(ParseError::StreamingError(
+            "ASOF tolerance must be positive".to_string(),
+        ));
+    }
+    Ok(duration)
 }
 
 /// Extract key columns from an ASOF JOIN constraint (ON clause).
-fn analyze_asof_constraint(constraint: &JoinConstraint) -> Result<(String, String), ParseError> {
+fn analyze_asof_constraint(
+    constraint: &JoinConstraint,
+    sides: &JoinSides<'_>,
+) -> Result<(String, String), ParseError> {
     match constraint {
-        JoinConstraint::On(expr) => extract_equality_columns(expr),
-        JoinConstraint::Using(cols) => {
-            if cols.is_empty() {
+        JoinConstraint::On(expr) => {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = strip_nested(expr)
+            else {
                 return Err(ParseError::StreamingError(
-                    "USING clause requires at least one column".to_string(),
+                    "ASOF JOIN ON requires exactly one equality condition".to_string(),
+                ));
+            };
+            orient_equality_columns(left, right, sides, "ASOF join equality")
+        }
+        JoinConstraint::Using(cols) => {
+            if cols.len() != 1 {
+                return Err(ParseError::StreamingError(
+                    "ASOF JOIN USING requires exactly one key column".to_string(),
                 ));
             }
-            let col = cols[0].to_string();
+            let col = extract_using_column(&cols[0])?;
             Ok((col.clone(), col))
         }
         _ => Err(ParseError::StreamingError(
             "ASOF JOIN requires ON or USING constraint".to_string(),
-        )),
-    }
-}
-
-/// Extract left and right column names from an equality expression.
-fn extract_equality_columns(expr: &Expr) -> Result<(String, String), ParseError> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            let left_col = extract_column_ref(left).ok_or_else(|| {
-                ParseError::StreamingError("Cannot extract left key column".to_string())
-            })?;
-            let right_col = extract_column_ref(right).ok_or_else(|| {
-                ParseError::StreamingError("Cannot extract right key column".to_string())
-            })?;
-            Ok((left_col, right_col))
-        }
-        // If there's an AND, find the equality part
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => extract_equality_columns(left).or_else(|_| extract_equality_columns(right)),
-        _ => Err(ParseError::StreamingError(
-            "ASOF JOIN ON clause must contain an equality condition".to_string(),
         )),
     }
 }
@@ -971,6 +1156,12 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
         tables.push(right_table.clone());
 
         let join_type = map_join_operator(&join.join_operator);
+        let sides = JoinSides {
+            left_table: &prev_left_table,
+            right_table: &right_table,
+            left_alias: prev_left_alias.as_deref(),
+            right_alias: right_alias.as_deref(),
+        };
 
         // Handle ASOF JOIN
         if let JoinOperator::AsOf {
@@ -979,8 +1170,8 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
         } = &join.join_operator
         {
             let (direction, left_time, right_time, tolerance) =
-                analyze_asof_match_condition(match_condition)?;
-            let (left_key, right_key) = analyze_asof_constraint(constraint)?;
+                analyze_asof_match_condition(match_condition, &sides)?;
+            let (left_key, right_key) = analyze_asof_constraint(constraint, &sides)?;
 
             let mut analysis = JoinAnalysis::asof(
                 prev_left_table.clone(),
@@ -998,7 +1189,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
         } else if let Some(version_col) = extract_temporal_version(&join.relation) {
             // Temporal join: right side has FOR SYSTEM_TIME AS OF
             let (left_key, right_key, additional, _, _) =
-                analyze_join_constraint(&join.join_operator)?;
+                analyze_join_constraint(&join.join_operator, &sides)?;
 
             let mut analysis = JoinAnalysis::temporal(
                 prev_left_table.clone(),
@@ -1015,7 +1206,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
         } else {
             // Regular join (inner, left, right, full)
             let (left_key, right_key, additional, time_bound, time_cols) =
-                analyze_join_constraint(&join.join_operator)?;
+                analyze_join_constraint(&join.join_operator, &sides)?;
 
             let mut analysis = if let Some(tb) = time_bound {
                 JoinAnalysis::stream_stream(
@@ -1046,7 +1237,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
                     &analysis.right_table,
                     prev_left_alias.as_deref(),
                     right_alias.as_deref(),
-                );
+                )?;
                 analysis.left_time_column = Some(lt);
                 analysis.right_time_column = Some(rt);
             }
@@ -1080,6 +1271,10 @@ mod tests {
             }
         }
         panic!("Expected SELECT query");
+    }
+
+    fn join_error(sql: &str) -> String {
+        analyze_join(&parse_select(sql)).unwrap_err().to_string()
     }
 
     #[test]
@@ -1132,6 +1327,255 @@ mod tests {
         assert!(!analysis.is_lookup_join);
         assert!(analysis.time_bound.is_some());
         assert_eq!(analysis.time_bound.unwrap(), Duration::from_secs(3600));
+        assert_eq!(analysis.left_time_column.as_deref(), Some("ts"));
+        assert_eq!(analysis.right_time_column.as_deref(), Some("ts"));
+    }
+
+    #[test]
+    fn test_interval_join_accepts_table_qualifiers() {
+        let sql = "SELECT * FROM orders
+                   JOIN payments ON orders.order_id = payments.order_id
+                   AND payments.received_at BETWEEN orders.created_at
+                       AND orders.created_at + INTERVAL '250' MILLISECOND";
+
+        let analysis = analyze_join(&parse_select(sql)).unwrap().unwrap();
+
+        assert_eq!(analysis.time_bound, Some(Duration::from_millis(250)));
+        assert_eq!(analysis.left_time_column.as_deref(), Some("created_at"));
+        assert_eq!(analysis.right_time_column.as_deref(), Some("received_at"));
+    }
+
+    #[test]
+    fn test_interval_join_preserves_composite_equality_keys() {
+        let sql = "SELECT * FROM orders o JOIN payments p
+                   ON o.tenant_id = p.tenant_id
+                   AND o.order_id = p.order_id
+                   AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND";
+
+        let analysis = analyze_join(&parse_select(sql)).unwrap().unwrap();
+
+        assert_eq!(analysis.left_key_column, "tenant_id");
+        assert_eq!(analysis.right_key_column, "tenant_id");
+        assert_eq!(
+            analysis.additional_key_columns,
+            vec![("order_id".to_string(), "order_id".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_join_orients_reversed_different_name_keys() {
+        let analysis = analyze_join(&parse_select(
+            "SELECT * FROM orders o JOIN payments p ON p.order_id = o.id",
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(analysis.left_key_column, "id");
+        assert_eq!(analysis.right_key_column, "order_id");
+    }
+
+    #[test]
+    fn test_composite_join_orients_each_key_independently() {
+        let analysis = analyze_join(&parse_select(
+            "SELECT * FROM orders o JOIN payments p
+             ON p.order_id = o.id AND o.tenant = p.account",
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(analysis.left_key_column, "id");
+        assert_eq!(analysis.right_key_column, "order_id");
+        assert_eq!(
+            analysis.additional_key_columns,
+            vec![("tenant".to_string(), "account".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_join_accepts_quoted_relation_and_key_identity() {
+        let analysis = analyze_join(&parse_select(
+            "SELECT * FROM \"Orders\"
+             JOIN \"Payments\"
+             ON \"Payments\".\"order id\" = \"Orders\".\"id\"",
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(analysis.left_table, "Orders");
+        assert_eq!(analysis.right_table, "Payments");
+        assert_eq!(analysis.left_key_column, "id");
+        assert_eq!(analysis.right_key_column, "order id");
+    }
+
+    #[test]
+    fn test_join_accepts_quoted_alias_identity() {
+        let analysis = analyze_join(&parse_select(
+            "SELECT * FROM orders AS \"left input\"
+             JOIN payments AS \"right input\"
+             ON \"left input\".id = \"right input\".order_id",
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(analysis.left_alias.as_deref(), Some("left input"));
+        assert_eq!(analysis.right_alias.as_deref(), Some("right input"));
+        assert_eq!(analysis.left_key_column, "id");
+        assert_eq!(analysis.right_key_column, "order_id");
+    }
+
+    #[test]
+    fn test_join_rejects_unqualified_key() {
+        let error = join_error("SELECT * FROM orders o JOIN payments p ON id = p.order_id");
+        assert!(error.contains("qualified column references"), "{error}");
+    }
+
+    #[test]
+    fn test_join_rejects_unknown_key_qualifier() {
+        let error = join_error("SELECT * FROM orders o JOIN payments p ON missing.id = p.order_id");
+        assert!(error.contains("names neither input"), "{error}");
+    }
+
+    #[test]
+    fn test_join_rejects_same_side_key_expression() {
+        let error = join_error("SELECT * FROM orders o JOIN payments p ON o.id = o.parent_id");
+        assert!(error.contains("one left-input column"), "{error}");
+    }
+
+    #[test]
+    fn test_join_rejects_ambiguous_qualifier() {
+        let error = join_error(
+            "SELECT * FROM orders duplicate JOIN payments duplicate
+             ON duplicate.id = payments.order_id",
+        );
+        assert!(error.contains("names both inputs"), "{error}");
+    }
+
+    #[test]
+    fn test_join_rejects_compound_relation_identity() {
+        let error = join_error(
+            "SELECT * FROM catalog.orders JOIN payments
+             ON catalog.orders.id = payments.order_id",
+        );
+        assert!(error.contains("single-part relation names"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_unqualified_timestamp() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN ts AND ts + INTERVAL '1' SECOND",
+        );
+        assert!(error.contains("qualified column references"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_unknown_qualifier() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND unknown.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND",
+        );
+        assert!(error.contains("unambiguous left and right"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_reversed_timestamps() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND o.ts BETWEEN p.ts AND p.ts + INTERVAL '1' SECOND",
+        );
+        assert!(
+            error.contains("right timestamp BETWEEN the left"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_interval_join_rejects_not_between() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts NOT BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND",
+        );
+        assert!(error.contains("NOT BETWEEN"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_mismatched_upper_timestamp() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN o.ts AND o.other_ts + INTERVAL '1' SECOND",
+        );
+        assert!(error.contains("same timestamp"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_subtracted_bound() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN o.ts AND o.ts - INTERVAL '1' SECOND",
+        );
+        assert!(error.contains("must use addition"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_direct_interval_upper_bound() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN o.ts AND INTERVAL '1' SECOND",
+        );
+        assert!(error.contains("left timestamp plus an interval"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_zero_bound() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '0' SECOND",
+        );
+        assert!(error.contains("positive finite"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_negative_bound() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '-1' SECOND",
+        );
+        assert!(error.contains("Invalid interval value"), "{error}");
+    }
+
+    #[test]
+    fn test_interval_join_rejects_multiple_time_bounds() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p ON o.id = p.id
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND
+             AND p.created_at BETWEEN o.created_at
+                 AND o.created_at + INTERVAL '1' SECOND",
+        );
+        assert!(
+            error.contains("exactly one time-bound predicate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_join_rejects_non_equi_residual_conjunct() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p
+             ON o.id = p.id AND p.amount > o.amount",
+        );
+        assert!(error.contains("Unsupported join condition"), "{error}");
+    }
+
+    #[test]
+    fn test_join_rejects_unsupported_equality_conjunct() {
+        let error = join_error(
+            "SELECT * FROM orders o JOIN payments p
+             ON o.id = p.id AND ABS(o.amount) = ABS(p.amount)",
+        );
+        assert!(
+            error.contains("Cannot extract column references"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1201,6 +1645,12 @@ mod tests {
         panic!("Expected SELECT query");
     }
 
+    fn asof_join_error(sql: &str) -> String {
+        analyze_join(&parse_select_snowflake(sql))
+            .unwrap_err()
+            .to_string()
+    }
+
     #[test]
     fn test_asof_join_backward() {
         let sql = "SELECT * FROM trades t \
@@ -1227,6 +1677,21 @@ mod tests {
 
         assert!(analysis.is_asof_join);
         assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Forward));
+    }
+
+    #[test]
+    fn test_asof_join_orients_reversed_time_and_key_operands() {
+        let sql = "SELECT * FROM trades t
+                   ASOF JOIN quotes q
+                   MATCH_CONDITION(q.ts <= t.trade_ts)
+                   ON q.symbol_id = t.symbol";
+        let analysis = analyze_join(&parse_select_snowflake(sql)).unwrap().unwrap();
+
+        assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Backward));
+        assert_eq!(analysis.left_time_column.as_deref(), Some("trade_ts"));
+        assert_eq!(analysis.right_time_column.as_deref(), Some("ts"));
+        assert_eq!(analysis.left_key_column, "symbol");
+        assert_eq!(analysis.right_key_column, "symbol_id");
     }
 
     #[test]
@@ -1270,6 +1735,114 @@ mod tests {
         assert!(analysis.is_asof_join);
         assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Backward));
         assert_eq!(analysis.asof_tolerance, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_asof_forward_tolerance_uses_forward_difference() {
+        let sql = "SELECT * FROM trades t
+                   ASOF JOIN quotes q
+                   MATCH_CONDITION(t.ts <= q.ts AND q.ts - t.ts <= 5000)
+                   ON t.symbol = q.symbol";
+        let analysis = analyze_join(&parse_select_snowflake(sql)).unwrap().unwrap();
+
+        assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Forward));
+        assert_eq!(analysis.asof_tolerance, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_asof_rejects_unqualified_time_operand() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(ts >= q.ts) ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("qualified column references"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_unknown_time_qualifier() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(missing.ts >= q.ts) ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("names neither input"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_same_side_time_expression() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts >= t.previous_ts) ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("one left-input timestamp"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_composite_or_residual_on_clause() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts >= q.ts)
+             ON t.symbol = q.symbol AND t.venue = q.venue",
+        );
+        assert!(error.contains("exactly one equality"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_unqualified_on_key() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts >= q.ts) ON symbol = q.symbol",
+        );
+        assert!(error.contains("qualified column references"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_ignored_match_residual() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts >= q.ts AND q.price > 0)
+             ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("tolerance"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_tolerance_with_wrong_time_column() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts >= q.ts AND t.other_ts - q.ts <= 5000)
+             ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("same timestamps"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_tolerance_with_wrong_direction() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts <= q.ts AND t.ts - q.ts <= 5000)
+             ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("match direction"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_zero_tolerance() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(t.ts >= q.ts AND t.ts - q.ts <= 0)
+             ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("must be positive"), "{error}");
+    }
+
+    #[test]
+    fn test_asof_rejects_tolerance_with_nearest() {
+        let error = asof_join_error(
+            "SELECT * FROM trades t ASOF JOIN quotes q
+             MATCH_CONDITION(NEAREST(t.ts, q.ts) AND t.ts - q.ts <= 5000)
+             ON t.symbol = q.symbol",
+        );
+        assert!(error.contains("NEAREST does not support"), "{error}");
     }
 
     #[test]
@@ -1344,7 +1917,7 @@ mod tests {
 
     #[test]
     fn test_multi_join_two_way() {
-        let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id";
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON c.b_id = b.id";
         let select = parse_select(sql);
         let multi = analyze_joins(&select).unwrap().unwrap();
 
@@ -1397,7 +1970,7 @@ mod tests {
         let sql = "SELECT * FROM orders o \
                     JOIN payments p ON o.id = p.order_id \
                         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR \
-                    JOIN customers c ON o.customer_id = c.id";
+                    JOIN customers c ON p.customer_id = c.id";
         let select = parse_select(sql);
         let multi = analyze_joins(&select).unwrap().unwrap();
 
@@ -1405,6 +1978,18 @@ mod tests {
         assert!(!multi.joins[0].is_lookup_join); // stream-stream
         assert!(multi.joins[0].time_bound.is_some());
         assert!(multi.joins[1].is_lookup_join); // lookup
+    }
+
+    #[test]
+    fn test_multi_join_rejects_key_from_non_current_left_relation() {
+        let select = parse_select(
+            "SELECT * FROM a
+             JOIN b ON a.id = b.a_id
+             JOIN c ON a.id = c.a_id",
+        );
+        let error = analyze_joins(&select).unwrap_err().to_string();
+
+        assert!(error.contains("names neither input"), "{error}");
     }
 
     #[test]
@@ -1546,5 +2131,14 @@ mod tests {
         );
         assert_eq!(analysis.additional_key_columns[0].0, "region");
         assert_eq!(analysis.additional_key_columns[0].1, "region");
+    }
+
+    #[test]
+    fn test_using_preserves_quoted_key_identity() {
+        let sql = "SELECT * FROM orders o JOIN shipments s USING (\"order id\")";
+        let analysis = analyze_join(&parse_select(sql)).unwrap().unwrap();
+
+        assert_eq!(analysis.left_key_column, "order id");
+        assert_eq!(analysis.right_key_column, "order id");
     }
 }

@@ -240,10 +240,10 @@ impl SourceConnector for IcebergSource {
     }
 
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(SourceContract {
-            consistency: SourceConsistency::Ephemeral,
-            topology: SourceTopology::Singleton,
-        })
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::Singleton,
+        ))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

@@ -2,30 +2,28 @@
 
 pub mod change_event;
 pub mod config;
-pub mod large_event;
 pub mod lookup;
 pub mod metrics;
-pub mod resume_token;
 pub mod sink;
 pub mod source;
 pub mod timeseries;
 pub mod write_model;
 
 // Re-export primary types at module level.
-pub use config::{
-    FullDocumentMode, MongoDbSinkConfig, MongoDbSourceConfig, WriteConcernConfig, WriteConcernLevel,
-};
-pub use resume_token::{
-    FileResumeTokenStore, InMemoryResumeTokenStore, ResumeToken, ResumeTokenStore,
-    ResumeTokenStoreConfig,
-};
+pub use config::{FullDocumentMode, MongoDbSinkConfig, MongoDbSourceConfig};
 pub use sink::MongoDbSink;
 pub use source::{mongodb_cdc_envelope_schema, MongoDbCdcSource};
 pub use timeseries::{CollectionKind, TimeSeriesConfig, TimeSeriesGranularity};
 pub use write_model::WriteMode;
 
-#[cfg(feature = "mongodb-cdc")]
-pub use resume_token::MongoResumeTokenStore;
+const MONGODB_LOOKUP_PROPERTIES: &[&str] = &[
+    "connection.uri",
+    "database",
+    "collection",
+    "laminar.source.name",
+    "_arrow_schema",
+    "_primary_key_columns",
+];
 
 use std::sync::Arc;
 
@@ -33,7 +31,9 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `MongoDB` CDC source connector with the given registry.
-pub fn register_mongodb_cdc_source(registry: &ConnectorRegistry) {
+pub fn register_mongodb_cdc_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "mongodb-cdc".to_string(),
         display_name: "MongoDB CDC Source".to_string(),
@@ -52,10 +52,21 @@ pub fn register_mongodb_cdc_source(registry: &ConnectorRegistry) {
                 registry,
             ))
         }),
-    );
+    )?;
 
     // On-demand (partial cache mode) lookup source: find({ pk: { $in: [...] } }).
-    registry.register_lookup_source("mongodb", Arc::new(MongoLookupFactory));
+    registry.register_lookup_source(
+        "mongodb",
+        ConnectorInfo {
+            name: "mongodb".to_string(),
+            display_name: "MongoDB Lookup Source".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            is_source: true,
+            is_sink: false,
+            config_keys: mongodb_lookup_config_keys(),
+        },
+        Arc::new(MongoLookupFactory),
+    )
 }
 
 struct MongoLookupFactory;
@@ -89,11 +100,11 @@ impl crate::registry::LookupSourceFactory for MongoLookupFactory {
             ));
         }
 
-        let src = MongoDbSourceConfig::from_config(&config)?;
+        config.reject_unknown_properties(MONGODB_LOOKUP_PROPERTIES, "MongoDB lookup")?;
         let lookup_config = MongoLookupSourceConfig {
-            connection_uri: src.connection_uri,
-            database: src.database,
-            collection: src.collection,
+            connection_uri: config.require("connection.uri")?.to_string(),
+            database: config.require("database")?.to_string(),
+            collection: config.require("collection")?.to_string(),
             primary_key_columns: pk_columns,
             schema,
         };
@@ -104,9 +115,9 @@ impl crate::registry::LookupSourceFactory for MongoLookupFactory {
 }
 
 /// Registers the `MongoDB` sink connector with the given registry.
-pub fn register_mongodb_sink(registry: &ConnectorRegistry) {
-    use arrow_schema::{DataType, Field, Schema};
-
+pub fn register_mongodb_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "mongodb-sink".to_string(),
         display_name: "MongoDB Sink".to_string(),
@@ -119,42 +130,32 @@ pub fn register_mongodb_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "mongodb-sink",
         info,
-        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Ok(Box::new(MongoDbSink::new(
-                schema,
-                MongoDbSinkConfig::default(),
-                registry,
-            )))
+        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+            MongoDbSink::from_connector_config(config, registry)
+                .map(|sink| Box::new(sink) as Box<dyn crate::connector::SinkConnector>)
         }),
-    );
+    )
 }
 
 fn mongodb_cdc_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         ConfigKeySpec::required("connection.uri", "MongoDB connection URI"),
         ConfigKeySpec::required("database", "Database name"),
-        ConfigKeySpec::required("collection", "Collection name (* for all)"),
+        ConfigKeySpec::required("collection", "Fixed collection name"),
         ConfigKeySpec::optional(
             "full.document.mode",
-            "Full document mode (delta/update_lookup/required/when_available)",
+            "Deterministic full document mode (delta or required post-image)",
             "delta",
         ),
         ConfigKeySpec::optional(
-            "split.large.events",
-            "Enable $changeStreamSplitLargeEvent (requires MongoDB >= 6.0.9)",
-            "false",
+            "pipeline",
+            "JSON array of up to 64 $match stages (maximum 256 KiB)",
+            "[]",
         ),
-        ConfigKeySpec::optional("max.await.time.ms", "getMore await timeout (ms)", "1000"),
-        ConfigKeySpec::optional("batch.size", "Cursor batch size", "1000"),
-        ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
         ConfigKeySpec::optional(
-            "max.buffered.events",
-            "Max events to buffer before backpressure",
-            "100000",
+            "max.buffered.bytes",
+            "Max retained decoded bytes before backpressure (1 MiB to 4 GiB)",
+            config::DEFAULT_MAX_BUFFERED_BYTES.to_string(),
         ),
     ]
 }
@@ -164,36 +165,15 @@ fn mongodb_sink_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::required("connection.uri", "MongoDB connection URI"),
         ConfigKeySpec::required("database", "Target database name"),
         ConfigKeySpec::required("collection", "Target collection name"),
-        ConfigKeySpec::optional("batch.size", "Max documents per flush", "500"),
-        ConfigKeySpec::optional("flush.interval.ms", "Max time between flushes (ms)", "1000"),
-        ConfigKeySpec::optional(
-            "ordered",
-            "Ordered writes (fail-fast) vs unordered (higher throughput)",
-            "true",
-        ),
+        ConfigKeySpec::optional("flush.interval.ms", "Max time between flushes (ms)", "250"),
         ConfigKeySpec::optional(
             "write.mode",
-            "Write operation mode (insert, upsert, replace, cdc_replay)",
+            "Write operation mode (insert, upsert, cdc_replay)",
             "insert",
         ),
         ConfigKeySpec::optional(
             "write.mode.key_fields",
             "Comma-separated key fields to match documents in upsert mode",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "write.mode.upsert_on_missing",
-            "Insert the document if not found in replace mode",
-            "false",
-        ),
-        ConfigKeySpec::optional(
-            "write_concern.journal",
-            "Request acknowledgment after the write has been journaled",
-            "true",
-        ),
-        ConfigKeySpec::optional(
-            "write_concern.timeout_ms",
-            "Timeout for the write concern to be satisfied",
             "",
         ),
         ConfigKeySpec::optional(
@@ -226,17 +206,44 @@ fn mongodb_sink_config_keys() -> Vec<ConfigKeySpec> {
             "TTL in seconds (automatically delete documents after this span)",
             "",
         ),
+        ConfigKeySpec::optional(
+            "sink.write.timeout.ms",
+            "Complete MongoDB sink write deadline in milliseconds",
+            "30000",
+        ),
+    ]
+}
+
+fn mongodb_lookup_config_keys() -> Vec<ConfigKeySpec> {
+    vec![
+        ConfigKeySpec::required("connection.uri", "MongoDB connection URI"),
+        ConfigKeySpec::required("database", "Database name"),
+        ConfigKeySpec::required("collection", "Collection name"),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn sink_factory_config() -> crate::config::ConnectorConfig {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let mut config = crate::config::ConnectorConfig::new("mongodb-sink");
+        config.set("connection.uri", "mongodb://localhost:27017");
+        config.set("database", "db");
+        config.set("collection", "out");
+        config.set(
+            "_arrow_schema",
+            crate::config::encode_arrow_schema_ipc(&schema),
+        );
+        config
+    }
 
     #[test]
     fn test_register_mongodb_cdc_source() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_cdc_source(&registry);
+        register_mongodb_cdc_source(&registry).unwrap();
 
         let info = registry.source_info("mongodb-cdc");
         assert!(info.is_some());
@@ -250,7 +257,7 @@ mod tests {
     #[test]
     fn test_register_mongodb_sink() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_sink(&registry);
+        register_mongodb_sink(&registry).unwrap();
 
         let info = registry.sink_info("mongodb-sink");
         assert!(info.is_some());
@@ -272,6 +279,43 @@ mod tests {
         assert!(required.contains(&"connection.uri"));
         assert!(required.contains(&"database"));
         assert!(required.contains(&"collection"));
+        let byte_budget = keys
+            .iter()
+            .find(|key| key.key == "max.buffered.bytes")
+            .expect("MongoDB CDC byte budget must be discoverable");
+        assert_eq!(
+            byte_budget
+                .default
+                .as_deref()
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(config::DEFAULT_MAX_BUFFERED_BYTES)
+        );
+        let pipeline = keys
+            .iter()
+            .find(|key| key.key == "pipeline")
+            .expect("MongoDB CDC pipeline must be discoverable");
+        assert_eq!(pipeline.default.as_deref(), Some("[]"));
+        for removed in [
+            "batch.size",
+            "max.buffered.events",
+            "max.await.time.ms",
+            "resume.token.store",
+            "split.large.events",
+            "max.poll.records",
+        ] {
+            assert!(keys.iter().all(|key| key.key != removed));
+        }
+    }
+
+    #[test]
+    fn lookup_config_keys_are_minimal() {
+        let keys = mongodb_lookup_config_keys();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|key| key.required));
+        assert!(keys.iter().all(|key| !matches!(
+            key.key.as_str(),
+            "full.document.mode" | "max.buffered.bytes"
+        )));
     }
 
     #[test]
@@ -285,12 +329,26 @@ mod tests {
         assert!(required.contains(&"connection.uri"));
         assert!(required.contains(&"database"));
         assert!(required.contains(&"collection"));
+        for removed in [
+            "batch.size",
+            "ordered",
+            "write.mode.upsert_on_missing",
+            "write_concern.journal",
+            "write_concern.timeout_ms",
+        ] {
+            assert!(keys.iter().all(|key| key.key != removed));
+        }
+        let write_timeout = keys
+            .iter()
+            .find(|key| key.key == "sink.write.timeout.ms")
+            .expect("write timeout must be discoverable");
+        assert_eq!(write_timeout.default.as_deref(), Some("30000"));
     }
 
     #[test]
     fn test_factory_creates_source() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_cdc_source(&registry);
+        register_mongodb_cdc_source(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("mongodb-cdc");
         let source = registry.create_source(&config, None);
@@ -300,10 +358,38 @@ mod tests {
     #[test]
     fn test_factory_creates_sink() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_sink(&registry);
+        register_mongodb_sink(&registry).unwrap();
 
-        let config = crate::config::ConnectorConfig::new("mongodb-sink");
-        let sink = registry.create_sink(&config, None);
-        assert!(sink.is_ok());
+        let sink = registry.create_sink(&sink_factory_config(), None).unwrap();
+        assert_eq!(sink.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn sink_factory_rejects_missing_and_malformed_schema() {
+        let registry = ConnectorRegistry::new();
+        register_mongodb_sink(&registry).unwrap();
+
+        let mut missing = sink_factory_config();
+        let mut properties = missing.properties().clone();
+        properties.remove("_arrow_schema");
+        missing = crate::config::ConnectorConfig::with_properties("mongodb-sink", properties);
+        let missing_error = registry
+            .create_sink(&missing, None)
+            .err()
+            .expect("missing schema must fail")
+            .to_string();
+        assert!(missing_error.contains("_arrow_schema"), "{missing_error}");
+
+        let mut malformed = sink_factory_config();
+        malformed.set("_arrow_schema", "not-arrow-ipc");
+        let malformed_error = registry
+            .create_sink(&malformed, None)
+            .err()
+            .expect("malformed schema must fail")
+            .to_string();
+        assert!(
+            malformed_error.contains("invalid") && malformed_error.contains("_arrow_schema"),
+            "{malformed_error}"
+        );
     }
 }

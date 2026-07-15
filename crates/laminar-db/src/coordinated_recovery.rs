@@ -10,73 +10,105 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::runtime::Handle;
 
+use laminar_core::cluster::control::controller::{RecoveryAnnouncement, RecoveryRound};
 use laminar_core::cluster::control::{ClusterController, RecoverPhase};
 use laminar_core::cluster::discovery::NodeId;
 
 use crate::LaminarDB;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Healthy-state monitor cadence. Observation is one direct current-driver read, so static
+/// `ObjectStore` discovery performs about one GET per node per second rather than an N-way scan.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STOP_QUORUM_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTORE_QUORUM_TIMEOUT: Duration = Duration::from_secs(90);
+const RELEASE_QUORUM_TIMEOUT: Duration = Duration::from_secs(30);
+const DECISION_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const RECOVERY_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a node stopped by `Prepare` waits for a `Start` before giving up on the round.
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(60);
-/// Must exceed `rebalance_debounce` (5s) + `watcher_poll` (2s) so a pending rotation lands inside
-/// the round.
-const ASSIGNMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Must exceed a peer's observe cycle plus the gossip round trip for its `stopped` ack, or a fast
-/// round retires `Start` before its peers ever see it.
-const PREPARE_MIN_DWELL: Duration = Duration::from_secs(2);
 /// How many times the leader retries restoring itself before abandoning the round.
 const SELF_RESTORE_ATTEMPTS: u32 = 3;
-
-/// Recovery generation, max-wins across leader change so a round keeps a stable id.
-const RECOVERY_GEN_KEY: &str = "control:recovery-gen";
 
 /// Recovery target meaning "no committed cut exists": start fresh.
 const GENESIS: u64 = 0;
 
-/// Boot-unique so a second kill of a node never reports the value the leader already handled
-/// (a per-process counter resets to 1 and collides, and no round fires). Stable within a boot,
-/// so repeated reports dedup to one round.
-fn boot_fault_nonce() -> u64 {
-    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *NONCE.get_or_init(unix_nanos)
-}
-
-/// Wall-clock nanos, clamped into `u64`. Monotonic enough to order rounds across leader changes.
-fn unix_nanos() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |d| d.as_nanos());
-    u64::try_from(nanos).unwrap_or(u64::MAX).max(1)
+/// Boot-bound, process-local fault sequence. Wall-clock rollback cannot repeat it, and a same-id
+/// process restart changes the UUID-derived prefix.
+fn next_fault_sequence(controller: &ClusterController) -> u64 {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let boot = controller.recovery_incarnation().as_u128();
+    let prefix = u64::try_from(boot & u128::from(u64::MAX)).unwrap_or_default()
+        ^ u64::try_from(boot >> 64).unwrap_or_default();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    prefix
+        .rotate_left(17)
+        .wrapping_add(sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .max(1)
 }
 
 /// Publish a fault so the leader drives a global restart; this node's monitor then
 /// restores it on observing the round.
-pub(crate) async fn report_local_fault(controller: &ClusterController) {
-    let seq = boot_fault_nonce();
-    controller.report_fault(seq).await;
-    tracing::warn!(seq, "reported local fault for coordinated cluster recovery");
+pub(crate) async fn report_local_fault(controller: &ClusterController) -> Result<(), String> {
+    let seq = next_fault_sequence(controller);
+    match controller.report_fault(seq).await {
+        Ok(()) => {
+            tracing::warn!(seq, "reported local fault for coordinated cluster recovery");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(seq, %error, "could not persist local recovery fault");
+            Err(error)
+        }
+    }
 }
 
 /// A fresh identity, not the boot nonce: the leader already handled that one, so only a new value
 /// drives the round an orphaned node needs.
 async fn report_fresh_fault(controller: &ClusterController) {
-    let seq = unix_nanos();
-    controller.report_fault(seq).await;
-    tracing::warn!(seq, "reported fresh fault after an orphaned recovery round");
+    let seq = next_fault_sequence(controller);
+    match controller.report_fault(seq).await {
+        Ok(()) => tracing::warn!(seq, "reported fresh fault after an orphaned recovery round"),
+        Err(error) => tracing::error!(seq, %error, "could not persist fresh recovery fault"),
+    }
 }
 
-/// Spawn the long-lived per-node monitor. It drives stop/start, so it must outlive those
-/// cycles — not spawned from `start_inner`.
-pub(crate) fn spawn_monitor(db: &Arc<LaminarDB>) {
+/// Spawn the long-lived per-node recovery supervisor. It drives stop/start, so it must outlive
+/// those cycles. An unexpected monitor panic closes intake, publishes a fresh durable fault, and
+/// reconstructs the monitor from the durable control plane instead of silently disabling cluster
+/// recovery.
+pub(crate) fn spawn_monitor(db: &Arc<LaminarDB>, runtime: &Handle) -> tokio::task::JoinHandle<()> {
     let weak = Arc::downgrade(db);
-    tokio::spawn(async move {
-        RecoveryMonitor::default().run(weak).await;
-    });
+    runtime.spawn(async move {
+        loop {
+            let outcome =
+                std::panic::AssertUnwindSafe(RecoveryMonitor::default().run(Weak::clone(&weak)))
+                    .catch_unwind()
+                    .await;
+            if outcome.is_ok() {
+                return;
+            }
+            let Some(db) = weak.upgrade() else {
+                return;
+            };
+            if db.is_closed() {
+                return;
+            }
+            db.set_source_gate(true);
+            let controller = { db.cluster_controller.lock().clone() };
+            if let Some(controller) = controller {
+                controller.set_recovering(true);
+                report_fresh_fault(&controller).await;
+            }
+            tracing::error!(
+                "coordinated recovery monitor panicked; intake fenced and monitor restarting"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
 }
 
 #[derive(Default)]
@@ -84,7 +116,21 @@ struct RecoveryMonitor {
     applied_gen: u64,
     handled_faults: FxHashMap<NodeId, u64>,
     /// Round this node stopped for at `Prepare`, until its `Start` restores it.
-    stopped_for: Option<(u64, tokio::time::Instant)>,
+    stopped_for: Option<(RecoveryRound, tokio::time::Instant)>,
+    /// Exact Start this process restored and acknowledged. Sources remain gated until the
+    /// identical Release arrives.
+    restored_for: Option<(RecoveryAnnouncement, tokio::time::Instant)>,
+    /// Deduplicates a persistent malformed/conflicting control-plane report.
+    last_protocol_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryQuorum {
+    Reached,
+    Superseded,
+    Conflicted,
+    ParticipantsChanged,
+    TimedOut,
 }
 
 impl RecoveryMonitor {
@@ -103,6 +149,25 @@ impl RecoveryMonitor {
 
             self.observe(&db, &controller).await;
             if controller.is_leader() {
+                // `drive_round` owns every nonterminal local Prepare/Start synchronously. Seeing
+                // one here means that owner disappeared or returned early. Retire only the exact
+                // orphan before requesting a fresh generation. Release is a terminal
+                // record: leave it in place, but do not let it mask later faults.
+                match controller.observe_recover().await {
+                    Ok(Some(active)) if controller.recovery_driver_is_current(&active.round) => {
+                        match active.phase {
+                            RecoverPhase::Release { .. } => {}
+                            RecoverPhase::Prepare | RecoverPhase::Start { .. }
+                                if active.round.id.driver == controller.instance_id() =>
+                            {
+                                let _ = controller.clear_recover(&active.round).await;
+                                report_fresh_fault(&controller).await;
+                            }
+                            RecoverPhase::Prepare | RecoverPhase::Start { .. } => continue,
+                        }
+                    }
+                    Ok(_) | Err(_) => {}
+                }
                 let pending = self.pending_faults(&controller).await;
                 if !pending.is_empty() {
                     self.drive_round(&db, &controller, pending).await;
@@ -113,74 +178,197 @@ impl RecoveryMonitor {
 
     /// Act on the leader's announcement: stop on `Prepare`, restore on `Start`.
     async fn observe(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
-        match controller.observe_recover().await {
-            Some((RecoverPhase::Prepare, gen))
-                if gen > self.applied_gen && self.stopped_for.map(|(g, _)| g) != Some(gen) =>
+        let observed = match controller.observe_recover().await {
+            Ok(observed) => {
+                self.last_protocol_error = None;
+                observed
+            }
+            Err(error) => {
+                controller.set_recovering(true);
+                db.set_source_gate(true);
+                if self.last_protocol_error.as_deref() != Some(error.as_str()) {
+                    tracing::error!(%error, "invalid coordinated-recovery control state");
+                    self.last_protocol_error = Some(error);
+                    report_fresh_fault(controller).await;
+                }
+                return;
+            }
+        };
+        let current = observed.filter(|announcement| {
+            controller.recovery_driver_is_current(&announcement.round)
+                && controller.recovery_round_contains_current_process(&announcement.round)
+                && round_assignment_is_current(db, controller, &announcement.round)
+        });
+        match current {
+            Some(RecoveryAnnouncement {
+                round,
+                phase: RecoverPhase::Prepare,
+            }) if round.id.generation > self.applied_gen
+                && self.stopped_for.as_ref().map(|(stopped, _)| stopped) != Some(&round) =>
             {
-                controller.set_recovering(true);
-                if !stop_and_purge(db).await {
-                    tracing::error!(
-                        gen,
-                        "recovery prepare could not quiesce this node; withholding stopped acknowledgement"
-                    );
-                    return;
-                }
-                controller.announce_stopped(gen).await;
-                self.stopped_for = Some((gen, tokio::time::Instant::now()));
-                tracing::warn!(gen, "stopped for recovery round; awaiting target");
+                self.observe_prepare(db, controller, round).await;
             }
-            Some((RecoverPhase::Start { epoch }, gen)) if gen > self.applied_gen => {
-                controller.set_recovering(true);
-                if self.stopped_for.map(|(g, _)| g) == Some(gen) {
-                    // Peers may have kept sending between our stop and theirs; now that the
-                    // round has quiesced, drop those stragglers too.
-                    db.purge_shuffle_receiver_buffers();
-                } else {
-                    // Missed the prepare (joined late / slow poll) — stop now.
-                    if !stop_and_purge(db).await {
-                        tracing::error!(
-                            gen,
-                            "recovery start could not quiesce this node; refusing restore"
-                        );
-                        return;
-                    }
-                }
-                if self.restore_and_ack(db, controller, epoch, gen).await {
-                    // Nobody emits at the new generation until everyone is at it, so a peer's
-                    // older-generation frame is provably pre-rewind and safe to discard.
-                    let quorum = wait_gen_quorum(
-                        || controller.read_recovered(),
-                        controller,
-                        gen,
-                        RESTORE_QUORUM_TIMEOUT,
-                    )
-                    .await;
-                    // Unfence before the settle wait: the rotation it waits on must checkpoint.
-                    controller.set_recovering(false);
-                    if !quorum || !await_assignment_settled(db, controller).await {
-                        hold_intake_and_request_retry(db, controller, gen, quorum).await;
-                        return;
-                    }
-                    log_release_diagnostic(db, controller, gen, epoch);
-                    db.set_source_gate(false);
-                    tracing::warn!(target_epoch = epoch, gen, "node restored to recovery epoch");
-                }
-                // Failure: state untouched, `Start` still visible → retried next tick.
+            Some(
+                start @ RecoveryAnnouncement {
+                    phase: RecoverPhase::Start { epoch },
+                    ..
+                },
+            ) if start.round.id.generation > self.applied_gen => {
+                self.observe_start(db, controller, start, epoch).await;
             }
-            _ => {
-                if let Some((gen, at)) = self.stopped_for {
-                    if at.elapsed() > ORPHAN_STOP_TIMEOUT {
-                        // Resuming here would emit at the pre-round generation from an unknown cut:
-                        // rewound peers discard those frames, un-rewound ones double-count them.
-                        if let Some(m) = db.engine_metrics.lock().clone() {
-                            m.coordinated_recovery_failures_total.inc();
-                        }
-                        tracing::error!(gen, "recovery round orphaned (no Start); holding intake");
-                        self.stopped_for = None;
-                        report_fresh_fault(controller).await;
-                    }
-                }
+            Some(
+                release @ RecoveryAnnouncement {
+                    phase: RecoverPhase::Release { epoch },
+                    ..
+                },
+            ) => {
+                self.observe_release(db, controller, release, epoch).await;
             }
+            _ => self.observe_orphans(db, controller).await,
+        }
+    }
+
+    async fn observe_prepare(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        round: RecoveryRound,
+    ) {
+        let gen = round.id.generation;
+        if let Err(error) = replicate_recovery_gen(controller, gen).await {
+            controller.set_recovering(true);
+            db.set_source_gate(true);
+            tracing::error!(
+                gen,
+                %error,
+                "could not durably adopt recovery generation; withholding stopped acknowledgement"
+            );
+            return;
+        }
+        controller.set_recovering(true);
+        db.set_source_gate(true);
+        if !stop_and_purge(db).await {
+            tracing::error!(
+                gen,
+                "recovery prepare could not quiesce this node; withholding stopped acknowledgement"
+            );
+            return;
+        }
+        if let Err(error) = controller.announce_stopped(&round).await {
+            tracing::error!(gen, %error, "could not acknowledge recovery Prepare");
+            return;
+        }
+        self.stopped_for = Some((round, tokio::time::Instant::now()));
+        tracing::warn!(gen, "stopped for recovery round; awaiting target");
+    }
+
+    async fn observe_start(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        start: RecoveryAnnouncement,
+        epoch: u64,
+    ) {
+        let round = start.round.clone();
+        let gen = round.id.generation;
+        if let Err(error) = replicate_recovery_gen(controller, gen).await {
+            controller.set_recovering(true);
+            db.set_source_gate(true);
+            tracing::error!(
+                gen,
+                %error,
+                "could not durably adopt recovery generation; refusing restore"
+            );
+            return;
+        }
+        controller.set_recovering(true);
+        db.set_source_gate(true);
+        if self.stopped_for.as_ref().map(|(stopped, _)| stopped) == Some(&round) {
+            // Peers may have kept sending between our stop and theirs; now that the
+            // round has quiesced, drop those stragglers too.
+            db.purge_shuffle_receiver_buffers();
+        } else if !stop_and_purge(db).await {
+            // Missed the prepare (joined late / slow poll) — stop now.
+            tracing::error!(
+                gen,
+                "recovery start could not quiesce this node; refusing restore"
+            );
+            return;
+        }
+        if self.restore_and_ack(db, controller, &start, epoch).await {
+            tracing::warn!(
+                target_epoch = epoch,
+                gen,
+                "node restored to recovery epoch; source gate awaits Release"
+            );
+        }
+        // Failure: state untouched, `Start` still visible → retried next tick.
+    }
+
+    async fn observe_release(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        release: RecoveryAnnouncement,
+        epoch: u64,
+    ) {
+        let exact_start = self.restored_for.as_ref().is_some_and(|(start, _)| {
+            start.round == release.round && start.phase == (RecoverPhase::Start { epoch })
+        });
+        if exact_start {
+            if self.release_and_ack(db, controller, &release, epoch).await {
+                tracing::warn!(
+                    target_epoch = epoch,
+                    gen = release.round.id.generation,
+                    "recovery Release consumed; source gate opened"
+                );
+            }
+        } else if release.round.id.generation > self.applied_gen {
+            // A process that missed Start must never interpret a persisted Release as an
+            // instruction to rewind alone. Fence it and request a fresh complete round.
+            self.applied_gen = release.round.id.generation;
+            controller.set_recovering(true);
+            db.set_source_gate(true);
+            tracing::error!(
+                gen = release.round.id.generation,
+                "Release observed without restoring its exact Start; holding intake"
+            );
+            report_fresh_fault(controller).await;
+        }
+    }
+
+    async fn observe_orphans(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
+        if let Some((round, at)) = self.stopped_for.as_ref() {
+            if at.elapsed() > ORPHAN_STOP_TIMEOUT {
+                // Resuming here would emit at the pre-round generation from an unknown cut:
+                // rewound peers discard those frames, un-rewound ones double-count them.
+                if let Some(m) = db.engine_metrics.lock().clone() {
+                    m.coordinated_recovery_failures_total.inc();
+                }
+                tracing::error!(
+                    gen = round.id.generation,
+                    "recovery round orphaned (no Start); holding intake"
+                );
+                self.stopped_for = None;
+                report_fresh_fault(controller).await;
+            }
+        }
+        let orphaned_start = self
+            .restored_for
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() > ORPHAN_STOP_TIMEOUT)
+            .map(|(start, _)| start.clone());
+        if let Some(start) = orphaned_start {
+            let gen = start.round.id.generation;
+            tracing::error!(
+                gen,
+                "recovery Start orphaned without Release; holding intake"
+            );
+            if start.round.id.driver == controller.instance_id() {
+                let _ = controller.clear_recover(&start.round).await;
+            }
+            self.restored_for = None;
+            hold_intake_and_request_retry(db, controller, gen, false).await;
         }
     }
 
@@ -189,7 +377,14 @@ impl RecoveryMonitor {
     /// once a round actually runs (`drive_round`), so a deferred round retries next poll.
     async fn pending_faults(&mut self, controller: &ClusterController) -> Vec<(NodeId, u64)> {
         let mut pending = Vec::new();
-        for (node, seq) in controller.read_fault_reports().await {
+        let reports = match controller.read_fault_reports().await {
+            Ok(reports) => reports,
+            Err(error) => {
+                tracing::error!(%error, "could not read recovery fault reports");
+                return pending;
+            }
+        };
+        for (node, seq) in reports {
             if seq == 0 {
                 self.handled_faults.remove(&node);
             } else if self.handled_faults.get(&node) != Some(&seq) {
@@ -211,71 +406,129 @@ impl RecoveryMonitor {
     ) {
         // Precheck readability before stopping anything — a transient decision-store error
         // must defer the round (faults stay pending), not flap a stop-the-world cycle.
-        if read_committed_cut(db).await.is_err() {
+        if read_committed_cut_bounded(db).await.is_err() {
             tracing::warn!("coordinated recovery: decision store unreadable; deferring round");
             return;
         }
-        // A gossip-KV `max + 1` collides when the leader that recorded the previous gen dies and
-        // its slot vanishes; clock-derived gens stay monotonic across leader changes, and the KV
-        // max still wins if a new leader's clock lags.
-        let gen_id = read_recovery_gen(controller)
-            .await
-            .saturating_add(1)
-            .max(unix_nanos());
-        write_recovery_gen(controller, gen_id).await;
+        let Some(assignment_fence) = current_assignment_fence(db, controller) else {
+            tracing::warn!(
+                "coordinated recovery: no current owner-complete assignment certificate; deferring round"
+            );
+            return;
+        };
+        // Every participant replicates an accepted generation before quiescing. Allocating from
+        // that replicated maximum remains monotonic when the previous driver's slot disappears
+        // and does not make wall-clock synchronisation part of recovery correctness.
+        let max_generation = match read_recovery_gen(controller).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                tracing::error!(%error, "could not read the replicated recovery generation");
+                return;
+            }
+        };
+        let Some(gen_id) = max_generation.checked_add(1) else {
+            tracing::error!("recovery generation space exhausted");
+            return;
+        };
+        let round = match RecoveryRound::new(gen_id, controller.instance_id(), assignment_fence) {
+            Ok(round) => round,
+            Err(error) => {
+                tracing::error!(gen = gen_id, %error, "could not construct recovery round");
+                return;
+            }
+        };
+        if let Err(error) = replicate_recovery_gen(controller, gen_id).await {
+            tracing::error!(gen = gen_id, %error, "could not publish recovery generation");
+            return;
+        }
 
         controller.set_recovering(true);
-        controller.announce_recover_prepare(gen_id).await;
+        db.set_source_gate(true);
+        if let Err(error) = controller.announce_recover_prepare(&round).await {
+            tracing::warn!(gen = gen_id, %error, "could not publish recovery Prepare");
+            controller.set_recovering(false);
+            return;
+        }
         tracing::warn!(gen = gen_id, "leader announced recovery prepare");
         if !stop_and_purge(db).await {
             tracing::error!(
                 gen = gen_id,
                 "leader could not quiesce its decision writer; abandoning recovery round"
             );
-            self.abandon_round(db, controller, gen_id).await;
+            self.abandon_round(db, controller, &round).await;
             return;
         }
-        controller.announce_stopped(gen_id).await;
-        // Peers must observe `Prepare` and ack `stopped` before `Start`, or a driver with a stale
-        // membership view races the whole round through in under a poll interval.
-        tokio::time::sleep(PREPARE_MIN_DWELL).await;
-        if !wait_gen_quorum(
-            || controller.read_stopped(),
-            controller,
-            gen_id,
-            STOP_QUORUM_TIMEOUT,
-        )
-        .await
-        {
-            // A straggler can still publish an ambiguous decision/state write, so selecting a
-            // recovery cut without every round participant stopped would violate the exact-cut
-            // premise and could resurrect a live timeline.
-            tracing::error!(
+        if let Err(error) = controller.announce_stopped(&round).await {
+            tracing::error!(gen = gen_id, %error, "could not acknowledge recovery Prepare");
+            self.abandon_round(db, controller, &round).await;
+            return;
+        }
+        match wait_stopped_quorum(controller, &round, STOP_QUORUM_TIMEOUT).await {
+            RecoveryQuorum::Reached => {}
+            RecoveryQuorum::Superseded | RecoveryQuorum::Conflicted => {
+                tracing::warn!(
+                    gen = gen_id,
+                    "recovery Prepare superseded; yielding old driver"
+                );
+                let _ = controller.clear_recover(&round).await;
+                hold_intake_and_request_retry(db, controller, gen_id, false).await;
+                return;
+            }
+            RecoveryQuorum::ParticipantsChanged | RecoveryQuorum::TimedOut => {
+                // A straggler can still publish an ambiguous decision/state write, so selecting a
+                // recovery cut without every round participant stopped would violate the exact-cut
+                // premise and could resurrect a live timeline.
+                tracing::error!(
+                    gen = gen_id,
+                    "stop quorum timed out; abandoning recovery round"
+                );
+                self.abandon_round(db, controller, &round).await;
+                return;
+            }
+        }
+
+        if !driver_owns_prepare(controller, &round).await {
+            tracing::warn!(
                 gen = gen_id,
-                "stop quorum timed out; abandoning recovery round"
+                "recovery driver lost ownership before target selection; yielding"
             );
-            self.abandon_round(db, controller, gen_id).await;
+            let _ = controller.clear_recover(&round).await;
+            hold_intake_and_request_retry(db, controller, gen_id, false).await;
             return;
         }
 
         // The world is stopped: the decision store is quiescent, so this read IS the cut — no
         // seal fallback and no probe. No committed epoch means a fresh start.
-        let target = match read_committed_cut(db).await {
+        let target = match read_committed_cut_bounded(db).await {
             Ok(cut) => cut.unwrap_or(GENESIS),
             Err(e) => {
                 tracing::error!(error = %e, gen = gen_id, "target read failed; abandoning round");
-                self.abandon_round(db, controller, gen_id).await;
+                self.abandon_round(db, controller, &round).await;
                 return;
             }
         };
+        if !driver_owns_prepare(controller, &round).await {
+            tracing::warn!(
+                gen = gen_id,
+                "recovery driver was superseded during target selection; yielding"
+            );
+            let _ = controller.clear_recover(&round).await;
+            hold_intake_and_request_retry(db, controller, gen_id, false).await;
+            return;
+        }
         // Prepared state above the decision is harmless: every object is namespaced by its
         // globally unique checkpoint ID and every recovery/adoption read is decision-bound.
         // Background retention collects abandoned attempts without an O(store) rewind scan.
-        for (node, seq) in pending {
-            self.handled_faults.insert(node, seq);
-        }
         db.purge_shuffle_receiver_buffers();
-        controller.announce_recover_start(target, gen_id).await;
+        if let Err(error) = controller.announce_recover_start(&round, target).await {
+            tracing::error!(gen = gen_id, %error, "could not transition recovery to Start");
+            self.abandon_round(db, controller, &round).await;
+            return;
+        }
+        let start = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Start { epoch: target },
+        };
         tracing::warn!(
             target_epoch = target,
             gen = gen_id,
@@ -285,7 +538,7 @@ impl RecoveryMonitor {
         // Retry self-restore inline so the round and its cleanup stay in the leader's control.
         let mut restored = false;
         for attempt in 1..=SELF_RESTORE_ATTEMPTS {
-            if self.restore_and_ack(db, controller, target, gen_id).await {
+            if self.restore_and_ack(db, controller, &start, target).await {
                 restored = true;
                 break;
             }
@@ -295,45 +548,67 @@ impl RecoveryMonitor {
                 "leader self-restore failed; retrying"
             );
         }
-        let quorum_met = if restored {
-            wait_gen_quorum(
-                || controller.read_recovered(),
-                controller,
-                gen_id,
-                RESTORE_QUORUM_TIMEOUT,
-            )
-            .await
+        let quorum = if restored {
+            wait_restored_quorum(controller, &start, RESTORE_QUORUM_TIMEOUT).await
         } else {
             tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
-            false
+            RecoveryQuorum::TimedOut
         };
-        // Unfence before the settle wait: the rotation it waits on must checkpoint.
-        controller.set_recovering(false);
-        // Sources stay gated across the rotation so vnodes move with no data in flight. Releasing
-        // without a full restore would emit at a generation the stragglers haven't reached.
-        if !quorum_met || !await_assignment_settled(db, controller).await {
-            hold_intake_and_request_retry(db, controller, gen_id, quorum_met).await;
-            controller.clear_recover().await;
+        if quorum != RecoveryQuorum::Reached {
+            tracing::error!(
+                gen = gen_id,
+                ?quorum,
+                "exact recovery restore quorum was not reached; Start will not be released"
+            );
+            let _ = controller.clear_recover(&round).await;
+            controller.set_recovering(false);
+            hold_intake_and_request_retry(db, controller, gen_id, false).await;
             return;
         }
-        log_release_diagnostic(db, controller, gen_id, target);
-        db.set_source_gate(false);
-        // Always retire the announcement — a lingering target would be replayed by a later
-        // fresh restart (applied_gen resets to 0); a still-faulted straggler re-triggers.
-        controller.clear_recover().await;
-        // Counts keep this honest: a round that restored only its driver must not read as complete.
-        let participants = round_participants(controller, gen_id).await.len();
-        let restored_count = controller
-            .read_recovered()
-            .await
-            .into_iter()
-            .filter(|(_, g)| *g >= gen_id)
-            .count();
+        if !round_is_current(db, controller, &round).await {
+            tracing::error!(
+                gen = gen_id,
+                "recovery certificate changed after restore quorum; refusing Release"
+            );
+            let _ = controller.clear_recover(&round).await;
+            controller.set_recovering(false);
+            hold_intake_and_request_retry(db, controller, gen_id, true).await;
+            return;
+        }
+        if let Err(error) = controller.announce_recover_release(&round, target).await {
+            tracing::error!(gen = gen_id, %error, "could not publish recovery Release");
+            let _ = controller.clear_recover(&round).await;
+            controller.set_recovering(false);
+            hold_intake_and_request_retry(db, controller, gen_id, true).await;
+            return;
+        }
+        let release = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Release { epoch: target },
+        };
+        if !self.release_and_ack(db, controller, &release, target).await {
+            controller.set_recovering(false);
+            hold_intake_and_request_retry(db, controller, gen_id, true).await;
+            return;
+        }
+        let release_quorum =
+            wait_released_quorum(controller, &release, RELEASE_QUORUM_TIMEOUT).await;
+        if release_quorum != RecoveryQuorum::Reached {
+            controller.set_recovering(false);
+            hold_intake_and_request_retry(db, controller, gen_id, true).await;
+            return;
+        }
+        // Suppress a briefly stale gossip report only after this generation is complete. Marking
+        // faults handled before `Start`/restore quorum would strand the cluster if a newer driver
+        // superseded this round and then disappeared.
+        for (node, seq) in pending {
+            self.handled_faults.insert(node, seq);
+        }
+        let participants = round.assignment_fence.participants.len();
         tracing::warn!(
             gen = gen_id,
             participants,
-            restored = restored_count,
-            "coordinated recovery complete; fence released"
+            "coordinated recovery complete; Release retained"
         );
     }
 
@@ -344,12 +619,13 @@ impl RecoveryMonitor {
         &mut self,
         db: &Arc<LaminarDB>,
         controller: &ClusterController,
-        gen_id: u64,
+        round: &RecoveryRound,
     ) {
+        let gen_id = round.id.generation;
         if let Some(m) = db.engine_metrics.lock().clone() {
             m.coordinated_recovery_failures_total.inc();
         }
-        controller.clear_recover().await;
+        let _ = controller.clear_recover(round).await;
         db.set_source_gate(true);
         start_pipeline(db, None).await;
         controller.set_recovering(false);
@@ -359,34 +635,156 @@ impl RecoveryMonitor {
         );
     }
 
-    /// Restart this node to `target`, then ack the generation and clear its fault report.
-    /// Fence-neutral. `false` on failure (state untouched so the next tick retries).
+    /// Restart this node to `target`, then ack the generation. The fault report remains live until
+    /// the exact restore quorum and assignment fence both complete, so a crash or supersession
+    /// can only cause a safe redundant round rather than losing the retry trigger.
     async fn restore_and_ack(
         &mut self,
         db: &Arc<LaminarDB>,
         controller: &ClusterController,
+        start: &RecoveryAnnouncement,
         target: u64,
-        gen_id: u64,
     ) -> bool {
+        let gen_id = start.round.id.generation;
         // Sources come up paused: the restart re-reads and re-shuffles the replay window, and a
         // node that restarts first would shuffle into peers whose receivers haven't rebound.
         db.set_source_gate(true);
+        // Fence delayed pre-rewind frames before the restored compute loop can drain the receiver.
+        // Advancing this after `start_pipeline` leaves a window in which old data can be folded
+        // onto restored state. The monotonic generation remains safe if startup fails and retries.
+        db.set_shuffle_recovery_gen(gen_id);
         if !start_pipeline(db, Some(target)).await {
             // Starting from the selected cut failed. Keep intake fenced while `Start` remains
             // visible so the next monitor tick can retry without exposing pre-recovery state.
+            // The lifecycle deadline may have expired while the owned start thread continued;
+            // forget the old stop marker so the retry first quiesces any late successful start.
+            self.stopped_for = None;
             return false;
         }
-        // Bump before the gate opens so a peer's pre-rewind frames are discarded on arrival rather
-        // than folded onto the restored state and then re-applied by that peer's replay.
-        db.set_shuffle_recovery_gen(gen_id);
-        db.coordinated_restores.fetch_add(1, Ordering::SeqCst);
-        if let Some(m) = db.engine_metrics.lock().clone() {
-            m.coordinated_recoveries_total.inc();
+        match controller.announce_recovered(start).await {
+            Ok(()) => {
+                if let Some(m) = db.engine_metrics.lock().clone() {
+                    m.coordinated_recoveries_total.inc();
+                }
+                self.applied_gen = gen_id;
+                self.stopped_for = None;
+                self.restored_for = Some((start.clone(), tokio::time::Instant::now()));
+                true
+            }
+            Err(error) => {
+                tracing::error!(gen = gen_id, %error, "could not acknowledge recovery restore");
+                false
+            }
         }
-        self.applied_gen = gen_id;
-        self.stopped_for = None;
-        controller.announce_recovered(gen_id).await;
-        controller.clear_fault_report().await;
+    }
+
+    /// Consume the exact terminal Release this process's restored Start was waiting for. The
+    /// release acknowledgement is persisted before source intake opens; a failed acknowledgement
+    /// leaves the gate closed and is retried from the Release on the next monitor tick.
+    async fn release_and_ack(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        release: &RecoveryAnnouncement,
+        target: u64,
+    ) -> bool {
+        let authority_deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
+        let authority_revision = db.assignment_authority_revision.load(Ordering::Acquire);
+        if !matches!(
+            tokio::time::timeout_at(
+                authority_deadline,
+                round_is_current(db, controller, &release.round),
+            )
+            .await,
+            Ok(true)
+        ) {
+            return false;
+        }
+        let released =
+            tokio::time::timeout_at(authority_deadline, controller.announce_released(release))
+                .await;
+        if let Err(error) = released.unwrap_or_else(|_| {
+            Err("recovery Release acknowledgement exceeded its authority deadline".into())
+        }) {
+            tracing::error!(
+                gen = release.round.id.generation,
+                %error,
+                "could not acknowledge recovery Release"
+            );
+            return false;
+        }
+        let cleared =
+            tokio::time::timeout_at(authority_deadline, controller.clear_fault_report()).await;
+        if let Err(error) = cleared.unwrap_or_else(|_| {
+            Err("released recovery fault clear exceeded its authority deadline".into())
+        }) {
+            tracing::error!(
+                gen = release.round.id.generation,
+                %error,
+                "could not durably clear released recovery fault"
+            );
+            return false;
+        }
+        // The release acknowledgement and fault clear both awaited remote authority. Re-read the
+        // complete round before mutating local delivery state or attempting to open intake.
+        if !matches!(
+            tokio::time::timeout_at(
+                authority_deadline,
+                round_is_current(db, controller, &release.round),
+            )
+            .await,
+            Ok(true)
+        ) {
+            report_fresh_fault(controller).await;
+            return false;
+        }
+        if !db.complete_shuffle_recovery(release.round.id.generation) {
+            tracing::error!(
+                gen = release.round.id.generation,
+                "shuffle loss cutoff did not match the released recovery generation"
+            );
+            return false;
+        }
+        log_release_diagnostic(db, controller, release.round.id.generation, target);
+        controller.set_recovering(false);
+        let drain_transition = controller
+            .checkpoint_drain_transition()
+            .filter(|transition| transition.predecessor == release.round.assignment_fence);
+        let activation = db
+            .activate_assignment_authority(
+                &release.round.assignment_fence,
+                drain_transition,
+                authority_revision,
+                authority_deadline,
+            )
+            .await;
+        match activation {
+            Ok(activation) if activation.installed && activation.intake_open => {}
+            Ok(_) => {
+                controller.set_recovering(true);
+                db.set_source_gate(true);
+                report_fresh_fault(controller).await;
+                return false;
+            }
+            Err(error) => {
+                controller.set_recovering(true);
+                db.set_source_gate(true);
+                tracing::error!(
+                    gen = release.round.id.generation,
+                    %error,
+                    "could not serialize released assignment authority"
+                );
+                report_fresh_fault(controller).await;
+                return false;
+            }
+        }
+        if !round_assignment_is_current(db, controller, &release.round) {
+            controller.set_recovering(true);
+            db.set_source_gate(true);
+            report_fresh_fault(controller).await;
+            return false;
+        }
+        self.restored_for = None;
         true
     }
 }
@@ -415,18 +813,46 @@ async fn start_pipeline(db: &Arc<LaminarDB>, target: Option<u64>) -> bool {
     .await
 }
 
-/// Run a stop/start lifecycle future on a dedicated thread since `start()` is `!Send`.
+struct LifecycleActiveGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for LifecycleActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Run a recovery lifecycle future on an independent owner thread. The stable DB runtime drives
+/// it, so loss of the monitor's original caller runtime cannot cancel a stop/start round.
 async fn run_lifecycle<F, Fut>(db: &Arc<LaminarDB>, f: F) -> bool
 where
     F: FnOnce(Arc<LaminarDB>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::DbError>>,
 {
+    if db
+        .coordinated_lifecycle_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        tracing::warn!(
+            "coordinated recovery lifecycle operation is still active; refusing overlap"
+        );
+        return false;
+    }
+
+    let active = LifecycleActiveGuard(Arc::clone(&db.coordinated_lifecycle_active));
+    let handle = match db.control_runtime.handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!(%error, "coordinated recovery: DB control runtime is unavailable");
+            return false;
+        }
+    };
     let db = Arc::clone(db);
-    let handle = Handle::current();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name("laminar-coord-recover".into())
         .spawn(move || {
+            let _active = active;
             let res = handle.block_on(f(db));
             let _ = tx.send(res);
         });
@@ -434,63 +860,63 @@ where
         tracing::error!(error = %e, "coordinated recovery: failed to spawn lifecycle thread");
         return false;
     }
-    match rx.await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
+    match tokio::time::timeout(RECOVERY_LIFECYCLE_TIMEOUT, rx).await {
+        Err(_) => {
+            tracing::error!(
+                timeout = ?RECOVERY_LIFECYCLE_TIMEOUT,
+                "coordinated recovery lifecycle step timed out; owner remains fenced"
+            );
+            false
+        }
+        Ok(Ok(Ok(()))) => true,
+        Ok(Ok(Err(e))) => {
             tracing::error!(error = %e, "coordinated recovery lifecycle step failed");
             false
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             tracing::error!("coordinated recovery lifecycle thread dropped");
             false
         }
     }
 }
 
-/// Whether the vnode assignment reflects current live membership — every vnode owned, every
-/// owner still assignable, and (when there are at least as many vnodes as nodes) every live node
-/// owning a share. A stale assignment means a rebalance rotation is still pending.
-fn assignment_reflects_membership(db: &Arc<LaminarDB>, controller: &ClusterController) -> bool {
+/// Current owner-complete assignment certificate. Recovery cannot invent a quorum from a
+/// transient membership view; it freezes this already-proven cut instead.
+fn current_assignment_fence(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+) -> Option<laminar_core::checkpoint::CheckpointAssignmentFence> {
     let guard = db.vnode_registry.lock();
-    let Some(reg) = guard.as_ref() else {
-        return true;
-    };
-    let mut owners: FxHashSet<u64> = FxHashSet::default();
-    let assignment = reg.snapshot();
-    for owner in assignment.iter().copied() {
-        if owner.0 == 0 {
-            return false; // unassigned vnode: rotation still in flight
-        }
-        owners.insert(owner.0);
-    }
-    let live: FxHashSet<u64> = controller
-        .assignable_instances()
-        .into_iter()
-        .map(|n| n.0)
-        .collect();
-    let all_owners_live = owners.iter().all(|o| live.contains(o));
-    let covers_live = (reg.vnode_count() as usize) < live.len() || owners.len() == live.len();
-    all_owners_live && covers_live
+    let reg = guard.as_ref()?;
+    let assignment = reg.versioned_snapshot();
+    let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+    controller
+        .checkpoint_assignment_fence(assignment.version())
+        .filter(|fence| fence.matches_owner_map(&owners))
 }
 
-/// Hold the round's quiet period open until a pending rebalance rotation has landed and been
-/// adopted. Ownership rotates on a separate, un-gated membership path, so releasing first lets it
-/// move vnodes mid-stream: the gainer double-folds a rehydrated chain over records it already
-/// counted, and records shuffled to the old owner are dropped. `false` if it never converged.
-async fn await_assignment_settled(db: &Arc<LaminarDB>, controller: &ClusterController) -> bool {
-    if assignment_reflects_membership(db, controller) {
-        return true;
-    }
-    tracing::warn!("assignment does not reflect live membership; holding sources for the rotation");
-    let deadline = tokio::time::Instant::now() + ASSIGNMENT_SETTLE_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        if assignment_reflects_membership(db, controller) {
-            tracing::warn!("assignment converged inside the round; releasing sources");
-            return true;
-        }
-    }
-    false
+/// Whether the local registry and locally published owner-complete certificate are still the
+/// exact cut frozen into this round. A merely newer converged assignment cannot release this
+/// round: it needs a new stop/restore proof with its own roster.
+fn round_assignment_is_current(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+) -> bool {
+    current_assignment_fence(db, controller).as_ref() == Some(&round.assignment_fence)
+}
+
+/// Both the assignment cut and every participant process must still be the exact frozen round.
+async fn round_is_current(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+) -> bool {
+    round_assignment_is_current(db, controller, round)
+        && matches!(
+            controller.recovery_incarnations_match(round).await,
+            Ok(true)
+        )
 }
 
 /// Fail closed and make the hold live: resuming without the whole round restored, or against a
@@ -545,92 +971,566 @@ fn log_release_diagnostic(
     );
 }
 
-/// Highest epoch committed cluster-wide per the 2PC decision store — the only sound rewind
+/// Highest epoch committed cluster-wide per the immutable outcome store — the only sound rewind
 /// target (the durable seal is node-local durability, not a cluster commit). `Ok(None)`
 /// means nothing ever committed; `Err` means the store is unreadable right now.
 async fn read_committed_cut(db: &LaminarDB) -> Result<Option<u64>, String> {
     // Bind the clone before awaiting — an if-let scrutinee would hold the lock guard across it.
-    let ds = db.decision_store.lock().clone();
-    match ds {
-        Some(ds) => {
-            // A durable intent is emitted only after the exact seal. Completing its idempotent
-            // commit create is therefore the only safe way to make progress; merely returning
-            // InDoubt here wedges automatic recovery before startup reconciliation can run.
-            ds.resolve_in_doubt().await.map_err(|e| e.to_string())?;
-            ds.highest_committed()
-                .await
-                .map(|decision| decision.map(|d| d.epoch))
-                .map_err(|e| e.to_string())
-        }
-        None => Err("checkpoint decision store is not configured".into()),
-    }
-}
-
-async fn read_recovery_gen(controller: &ClusterController) -> u64 {
-    controller
-        .kv()
-        .scan(RECOVERY_GEN_KEY)
+    let controller = db
+        .cluster_controller
+        .lock()
+        .clone()
+        .ok_or_else(|| "cluster controller is not configured".to_owned())?;
+    let authority = controller
+        .checkpoint_authority()
+        .map_err(|error| error.to_string())?;
+    authority
+        .highest_cluster_committed_outcome()
         .await
-        .into_iter()
-        .filter_map(|(_, v)| v.parse::<u64>().ok())
-        .max()
-        .unwrap_or(0)
+        .map(|outcome| outcome.map(|outcome| outcome.epoch))
+        .map_err(|error| error.to_string())
 }
 
-async fn write_recovery_gen(controller: &ClusterController, gen_id: u64) {
-    controller
-        .kv()
-        .write(RECOVERY_GEN_KEY, gen_id.to_string())
-        .await;
+async fn read_committed_cut_bounded(db: &LaminarDB) -> Result<Option<u64>, String> {
+    tokio::time::timeout(DECISION_IO_TIMEOUT, read_committed_cut(db))
+        .await
+        .map_err(|_| {
+            format!("decision-store recovery read timed out after {DECISION_IO_TIMEOUT:?}")
+        })?
 }
 
-/// The live view UNION everyone that acked `stopped` for this generation. The union matters: a
-/// just-restarted node driving its own round can see `live == {self}`, and awaiting only that
-/// makes both quorums vacuous. A node that acked `stopped` is stopped and must be restored,
-/// whatever the local view says.
-async fn round_participants(controller: &ClusterController, gen_id: u64) -> FxHashSet<NodeId> {
-    let mut set: FxHashSet<NodeId> = controller.live_instances().into_iter().collect();
-    for (node, gen) in controller.read_stopped().await {
-        if gen >= gen_id {
-            set.insert(node);
-        }
+async fn read_recovery_gen(controller: &ClusterController) -> Result<u64, String> {
+    controller.max_recovery_generation().await
+}
+
+/// Monotonically replicate `gen_id` into this participant's own slot and read it back before the
+/// node quiesces or restores. `ClusterKv::write` is intentionally transport-neutral and cannot
+/// report a backend error, so verification is the acknowledgement boundary.
+async fn replicate_recovery_gen(controller: &ClusterController, gen_id: u64) -> Result<(), String> {
+    controller.adopt_recovery_generation(gen_id).await
+}
+
+async fn driver_owns_prepare(controller: &ClusterController, round: &RecoveryRound) -> bool {
+    if !controller.is_leader()
+        || controller
+            .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+            .as_ref()
+            != Some(&round.assignment_fence)
+        || !matches!(
+            controller.recovery_incarnations_match(round).await,
+            Ok(true)
+        )
+    {
+        return false;
     }
-    set
+    matches!(
+        controller.observe_recover().await,
+        Ok(Some(RecoveryAnnouncement {
+            round: active,
+            phase: RecoverPhase::Prepare,
+        })) if active == *round
+    )
 }
 
-/// Wait until every participant reports `gen >= gen_id` via `read`, or the deadline. Participants
-/// are re-derived each iteration so a late `stopped` acker joins the set instead of being stranded.
-async fn wait_gen_quorum<R, Fut>(
-    read: R,
+fn frozen_pending<T>(
+    round: &RecoveryRound,
+    reports: impl IntoIterator<Item = (NodeId, T)>,
+    matches: impl Fn(&T) -> bool,
+) -> Vec<NodeId> {
+    let acked: FxHashSet<NodeId> = reports
+        .into_iter()
+        .filter(|(node, report)| round.contains(*node) && matches(report))
+        .map(|(node, _)| node)
+        .collect();
+    round
+        .participants()
+        .into_iter()
+        .filter(|node| !acked.contains(node))
+        .collect()
+}
+
+/// Wait for every member of the immutable certified roster to stop. Membership is checked only
+/// for invalidating the driver's certificate; it never grows or shrinks this quorum.
+async fn wait_stopped_quorum(
     controller: &ClusterController,
-    gen_id: u64,
+    round: &RecoveryRound,
     timeout: Duration,
-) -> bool
-where
-    R: Fn() -> Fut,
-    Fut: std::future::Future<Output = Vec<(NodeId, u64)>>,
-{
+) -> RecoveryQuorum {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let participants = round_participants(controller, gen_id).await;
-        let acked: FxHashSet<NodeId> = read()
-            .await
-            .into_iter()
-            .filter(|(_, g)| *g >= gen_id)
-            .map(|(n, _)| n)
-            .collect();
-        let pending: Vec<NodeId> = participants
+        if !controller.is_leader() {
+            return RecoveryQuorum::Superseded;
+        }
+        if controller
+            .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+            .as_ref()
+            != Some(&round.assignment_fence)
+            || !matches!(
+                controller.recovery_incarnations_match(round).await,
+                Ok(true)
+            )
+        {
+            return RecoveryQuorum::ParticipantsChanged;
+        }
+        match controller.observe_recover().await {
+            Err(_) => return RecoveryQuorum::Conflicted,
+            Ok(Some(active)) if active.round.id.generation > round.id.generation => {
+                return RecoveryQuorum::Superseded;
+            }
+            Ok(Some(active)) if active.round != *round || active.phase != RecoverPhase::Prepare => {
+                return RecoveryQuorum::Conflicted;
+            }
+            Ok(None) => return RecoveryQuorum::Superseded,
+            Ok(Some(_)) => {}
+        }
+        let Ok(reports) = controller.read_stopped().await else {
+            return RecoveryQuorum::Conflicted;
+        };
+        if reports
             .iter()
-            .copied()
-            .filter(|n| !acked.contains(n))
-            .collect();
+            .any(|(node, ack)| round.contains(*node) && ack.id.generation > round.id.generation)
+        {
+            return RecoveryQuorum::Superseded;
+        }
+        if reports.iter().any(|(node, ack)| {
+            round.contains(*node) && ack.id.generation == round.id.generation && ack != round
+        }) {
+            return RecoveryQuorum::Conflicted;
+        }
+        let pending = frozen_pending(round, reports, |ack| ack == round);
         if pending.is_empty() {
-            return true;
+            return RecoveryQuorum::Reached;
         }
         if tokio::time::Instant::now() >= deadline {
-            tracing::error!(gen = gen_id, missing = ?pending, "recovery quorum timed out");
-            return false;
+            tracing::error!(gen = round.id.generation, missing = ?pending, "recovery stop quorum timed out");
+            return RecoveryQuorum::TimedOut;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait for the frozen roster to acknowledge the identical round and `Start` target. A cleared
+/// announcement is acceptable after acknowledgements exist; their payload is itself the durable
+/// target-bound proof.
+async fn wait_restored_quorum(
+    controller: &ClusterController,
+    start: &RecoveryAnnouncement,
+    timeout: Duration,
+) -> RecoveryQuorum {
+    let round = &start.round;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !controller.is_leader()
+            || controller
+                .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+                .as_ref()
+                != Some(&round.assignment_fence)
+            || !matches!(
+                controller.recovery_incarnations_match(round).await,
+                Ok(true)
+            )
+        {
+            return RecoveryQuorum::ParticipantsChanged;
+        }
+        match controller.observe_recover().await {
+            Err(_) => return RecoveryQuorum::Conflicted,
+            Ok(Some(active)) if active.round.id.generation > round.id.generation => {
+                return RecoveryQuorum::Superseded;
+            }
+            Ok(Some(active))
+                if active.round.id.generation == round.id.generation && active != *start =>
+            {
+                return RecoveryQuorum::Conflicted;
+            }
+            Ok(None) => return RecoveryQuorum::Superseded,
+            Ok(Some(_)) => {}
+        }
+        let Ok(reports) = controller.read_recovered().await else {
+            return RecoveryQuorum::Conflicted;
+        };
+        if reports.iter().any(|(node, ack)| {
+            round.contains(*node) && ack.round.id.generation > round.id.generation
+        }) {
+            return RecoveryQuorum::Superseded;
+        }
+        if reports.iter().any(|(node, ack)| {
+            round.contains(*node) && ack.round.id.generation == round.id.generation && ack != start
+        }) {
+            return RecoveryQuorum::Conflicted;
+        }
+        let pending = frozen_pending(round, reports, |ack| ack == start);
+        if pending.is_empty() {
+            return RecoveryQuorum::Reached;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!(gen = round.id.generation, missing = ?pending, "recovery restore quorum timed out");
+            return RecoveryQuorum::TimedOut;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until every frozen process has consumed the identical Release terminal record.
+async fn wait_released_quorum(
+    controller: &ClusterController,
+    release: &RecoveryAnnouncement,
+    timeout: Duration,
+) -> RecoveryQuorum {
+    let round = &release.round;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !controller.is_leader()
+            || controller
+                .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+                .as_ref()
+                != Some(&round.assignment_fence)
+            || !matches!(
+                controller.recovery_incarnations_match(round).await,
+                Ok(true)
+            )
+        {
+            return RecoveryQuorum::ParticipantsChanged;
+        }
+        match controller.observe_recover().await {
+            Ok(Some(active)) if active == *release => {}
+            Ok(Some(active)) if active.round.id.generation > round.id.generation => {
+                return RecoveryQuorum::Superseded;
+            }
+            Err(_) | Ok(_) => return RecoveryQuorum::Conflicted,
+        }
+        let Ok(reports) = controller.read_released().await else {
+            return RecoveryQuorum::Conflicted;
+        };
+        let pending = frozen_pending(round, reports, |ack| ack == release);
+        if pending.is_empty() {
+            return RecoveryQuorum::Reached;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!(gen = round.id.generation, missing = ?pending, "recovery Release quorum timed out");
+            return RecoveryQuorum::TimedOut;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laminar_core::checkpoint::CheckpointAssignmentFence;
+    use laminar_core::cluster::control::{CheckpointParticipant, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
+    use tokio::sync::watch;
+
+    fn info(id: u64) -> NodeInfo {
+        NodeInfo {
+            id: NodeId(id),
+            name: format!("n{id}"),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        }
+    }
+
+    fn controller(
+        peers: Vec<NodeInfo>,
+    ) -> (
+        ClusterController,
+        watch::Sender<Vec<NodeInfo>>,
+        Arc<InMemoryKv>,
+    ) {
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let (members_tx, members_rx) = watch::channel(peers);
+        (
+            ClusterController::new(self_id, kv.clone(), None, members_rx),
+            members_tx,
+            kv,
+        )
+    }
+
+    fn round(
+        controller: &ClusterController,
+        generation: u64,
+        participants: &[u64],
+    ) -> RecoveryRound {
+        let checkpoint_participants = participants
+            .iter()
+            .map(|node_id| CheckpointParticipant {
+                node_id: *node_id,
+                boot_incarnation: controller.recovery_incarnation(),
+            })
+            .collect();
+        let owners = participants.to_vec();
+        RecoveryRound::new(
+            generation,
+            NodeId(1),
+            CheckpointAssignmentFence::from_owner_map(7, &owners, checkpoint_participants).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn publish_round_roster(
+        controller: &ClusterController,
+        kv: &InMemoryKv,
+        round: &RecoveryRound,
+    ) {
+        controller.publish_recovery_incarnation().await.unwrap();
+        for participant in &round.assignment_fence.participants {
+            if participant.node_id != controller.instance_id().0 {
+                kv.seed(
+                    NodeId(participant.node_id),
+                    "control:recovery-incarnation",
+                    participant.boot_incarnation.to_string(),
+                );
+            }
+        }
+        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+    }
+
+    async fn activate_start(
+        controller: &ClusterController,
+        kv: &InMemoryKv,
+        round: &RecoveryRound,
+        epoch: u64,
+    ) {
+        publish_round_roster(controller, kv, round).await;
+        controller.announce_recover_prepare(round).await.unwrap();
+        controller
+            .announce_recover_start(round, epoch)
+            .await
+            .unwrap();
+    }
+
+    fn start(round: RecoveryRound, epoch: u64) -> RecoveryAnnouncement {
+        RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Start { epoch },
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_replica_keeps_takeover_generation_monotonic_without_a_clock() {
+        // Model the old driver slot disappearing after this participant accepted generation 41.
+        // The surviving participant becomes leader and must allocate from its replica, not from
+        // wall time or the vanished driver's slot.
+        let (controller, _members_tx, _kv) = controller(Vec::new());
+        replicate_recovery_gen(&controller, 41).await.unwrap();
+
+        let replicated_max = read_recovery_gen(&controller).await.unwrap();
+
+        assert_eq!(replicated_max.checked_add(1), Some(42));
+        assert!(replicate_recovery_gen(&controller, 40).await.is_err());
+        assert_eq!(read_recovery_gen(&controller).await.unwrap(), 41);
+    }
+
+    #[tokio::test]
+    async fn recovery_quorum_requires_the_exact_round_and_target() {
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let exact_round = round(&controller, 7, &[1]);
+        activate_start(&controller, &kv, &exact_round, 4).await;
+        let start = start(exact_round, 4);
+        controller.announce_recovered(&start).await.unwrap();
+
+        let outcome = wait_restored_quorum(&controller, &start, Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, RecoveryQuorum::Reached);
+    }
+
+    #[tokio::test]
+    async fn newer_recovery_ack_supersedes_instead_of_satisfying_old_quorum() {
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let expected_round = round(&controller, 7, &[1]);
+        activate_start(&controller, &kv, &expected_round, 4).await;
+        let expected = start(expected_round, 4);
+        let newer = start(round(&controller, 8, &[1]), 4);
+        controller.announce_recovered(&newer).await.unwrap();
+
+        let outcome = wait_restored_quorum(&controller, &expected, Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, RecoveryQuorum::Superseded);
+    }
+
+    #[tokio::test]
+    async fn same_generation_nonce_conflict_never_satisfies_quorum() {
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let expected_round = round(&controller, 7, &[1]);
+        activate_start(&controller, &kv, &expected_round, 4).await;
+        let expected = start(expected_round, 4);
+        let conflicting = start(round(&controller, 7, &[1]), 4);
+        controller.announce_recovered(&conflicting).await.unwrap();
+
+        let outcome = wait_restored_quorum(&controller, &expected, Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, RecoveryQuorum::Conflicted);
+    }
+
+    #[tokio::test]
+    async fn different_start_target_never_satisfies_restore_quorum() {
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let exact_round = round(&controller, 7, &[1]);
+        activate_start(&controller, &kv, &exact_round, 4).await;
+        let expected = start(exact_round.clone(), 4);
+        controller
+            .announce_recovered(&start(exact_round, 5))
+            .await
+            .unwrap();
+
+        let outcome = wait_restored_quorum(&controller, &expected, Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, RecoveryQuorum::Conflicted);
+    }
+
+    #[tokio::test]
+    async fn restore_quorum_does_not_shrink_when_membership_changes() {
+        let (controller, members_tx, kv) = controller(vec![info(2)]);
+        let exact_round = round(&controller, 7, &[1, 2]);
+        activate_start(&controller, &kv, &exact_round, 4).await;
+        let start = start(exact_round, 4);
+        controller.announce_recovered(&start).await.unwrap();
+        members_tx.send(Vec::new()).unwrap();
+
+        let outcome = wait_restored_quorum(&controller, &start, Duration::from_millis(20)).await;
+
+        assert_eq!(outcome, RecoveryQuorum::ParticipantsChanged);
+    }
+
+    #[tokio::test]
+    async fn prepare_quorum_fails_when_its_assignment_certificate_changes() {
+        let (controller, members_tx, kv) = controller(vec![info(2)]);
+        let round = round(&controller, 7, &[1, 2]);
+        publish_round_roster(&controller, &kv, &round).await;
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.announce_stopped(&round).await.unwrap();
+        members_tx.send(Vec::new()).unwrap();
+
+        let outcome = wait_stopped_quorum(&controller, &round, Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, RecoveryQuorum::ParticipantsChanged);
+    }
+
+    #[tokio::test]
+    async fn restarted_same_id_process_invalidates_persisted_stop_ack() {
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let round = round(&controller, 9, &[1]);
+        publish_round_roster(&controller, &kv, &round).await;
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.announce_stopped(&round).await.unwrap();
+
+        let (_replacement_tx, replacement_rx) = watch::channel(Vec::new());
+        let replacement = ClusterController::new(NodeId(1), kv, None, replacement_rx);
+        replacement.publish_recovery_incarnation().await.unwrap();
+
+        let outcome = wait_stopped_quorum(&controller, &round, Duration::from_secs(1)).await;
+        assert_eq!(outcome, RecoveryQuorum::ParticipantsChanged);
+    }
+
+    #[tokio::test]
+    async fn release_quorum_requires_the_exact_durable_terminal() {
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let round = round(&controller, 11, &[1]);
+        activate_start(&controller, &kv, &round, 6).await;
+        let start = start(round.clone(), 6);
+        controller.announce_recovered(&start).await.unwrap();
+        assert_eq!(
+            wait_restored_quorum(&controller, &start, Duration::from_secs(1)).await,
+            RecoveryQuorum::Reached
+        );
+
+        controller
+            .announce_recover_release(&round, 6)
+            .await
+            .unwrap();
+        let release = RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Release { epoch: 6 },
+        };
+        controller.announce_released(&release).await.unwrap();
+
+        assert_eq!(
+            wait_released_quorum(&controller, &release, Duration::from_secs(1)).await,
+            RecoveryQuorum::Reached
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+        let (controller, _members_tx, kv) = controller(Vec::new());
+        let controller = Arc::new(controller);
+        let round = round(&controller, 7, &[1]);
+        activate_start(&controller, &kv, &round, 4).await;
+        let start = start(round.clone(), 4);
+        controller.announce_recovered(&start).await.unwrap();
+        controller
+            .announce_recover_release(&round, 4)
+            .await
+            .unwrap();
+        let release = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Release { epoch: 4 },
+        };
+
+        let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
+        registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
+        let boot = controller.recovery_incarnation();
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), boot)
+                .await
+                .unwrap(),
+        );
+        let sender = Arc::new(ShuffleSender::new(1, boot));
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .vnode_registry(registry)
+            .shuffle_sender(sender)
+            .shuffle_receiver(receiver)
+            .build()
+            .await
+            .unwrap();
+        db.set_source_gate(true);
+        db.set_shuffle_recovery_gen(7);
+        controller.set_recovering(true);
+        let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+        let releasing = {
+            let db = Arc::clone(&db);
+            let controller = Arc::clone(&controller);
+            let release = release.clone();
+            tokio::spawn(async move {
+                let mut monitor = RecoveryMonitor {
+                    restored_for: Some((start, tokio::time::Instant::now())),
+                    ..RecoveryMonitor::default()
+                };
+                let opened = monitor.release_and_ack(&db, &controller, &release, 4).await;
+                (opened, monitor.restored_for)
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if db.assignment_adoption_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("release must reach the serialized activation boundary");
+
+        db.set_source_gate(true);
+        controller.publish_checkpoint_assignment_fence(None);
+        db.suspend_shuffle_assignment_fence();
+        drop(execution);
+
+        let (opened, restored_for) = releasing.await.unwrap();
+        assert!(!opened);
+        assert!(restored_for.is_some());
+        assert!(db.cluster_intake_fenced());
+        assert!(controller.is_recovering());
+        assert_eq!(controller.checkpoint_assignment_fence(7), None);
     }
 }

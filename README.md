@@ -145,8 +145,9 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 * **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
 
 > [!IMPORTANT]
-> Cluster exactly-once currently fails closed with `[LDB-0013]`. The renewable leader lease is not yet atomically bound to both checkpoint decisions and external sink commits, so a term change cannot be fenced end to end. Use cluster `at_least_once`; local `exactly_once` remains limited to compatible connectors and the built-in local checkpoint/decision store.
-> Embedded/single-node exactly-once requires node-durable state and that built-in local store, held under an OS-released exclusive deployment lock. Any configured checkpoint/object-store URL (including `file://`) or injected decision store fails closed with `[LDB-0014]` because its writer-fencing provenance cannot be proved.
+> Cluster exactly-once currently fails closed with `[LDB-0013]`. Checkpoint decisions are term-fenced, but no supported connector path yet has both certified term-fenced source handoff and an external sink cursor commit. Use cluster `at_least_once`; the only admitted local exact candidate is the certified deterministic generator with append-mode Delta, and it is not yet production-certified end to end.
+> Embedded/single-node exactly-once requires node-durable state and the built-in local checkpoint/decision store, held under an OS-released exclusive deployment lock. For the standalone server, a `file://` checkpoint URL selects that store. Shared object-store URLs and library-injected object or decision stores fail closed with `[LDB-0014]` because their writer-fencing provenance cannot yet be proved.
+> Cluster materialized views currently fail closed with `[LDB-4007]`; their output does not yet have a planner-certified distribution plus assignment-fenced checkpoint/read lifecycle. Stateless `CREATE STREAM` remains supported, while embedded and single-node materialized views are unaffected.
 
 ### Cluster Configuration Example
 
@@ -169,10 +170,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
 [state]
 backend = "object_store"
 url = "s3://my-bucket/laminardb/state"
-instance_id = "node-1"
 vnode_capacity = 256
-discovery = "dynamic"
-seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"
@@ -181,7 +179,7 @@ timeout = "120s"
 ```
 
 > [!NOTE]
-> If `server.mode` is set to `"embedded"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.
+> If `server.mode` is set to `"single"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.
 
 
 ---
@@ -252,9 +250,15 @@ TEMPORAL PROBE JOIN prices r
     RANGE FROM 0s TO 30s STEP 5s AS p;
 
 -- Lookup join against external Postgres table
-CREATE LOOKUP TABLE instruments FROM POSTGRES (
-    hostname = 'db.example.com', port = '5432',
-    database = 'market', query = 'SELECT * FROM instruments'
+CREATE LOOKUP TABLE instruments (
+    symbol VARCHAR NOT NULL,
+    sector VARCHAR,
+    exchange VARCHAR,
+    PRIMARY KEY (symbol)
+) WITH (
+    'connector' = 'postgres',
+    'connection' = 'host=db.example.com port=5432 dbname=market',
+    'table' = 'instruments'
 );
 
 SELECT t.symbol, t.price, i.sector, i.exchange
@@ -293,7 +297,7 @@ CREATE SOURCE ... [FROM connector(...)]
 CREATE STREAM ... AS SELECT ...                    [WITH ('retain_history' = '64mb')]
 CREATE MATERIALIZED VIEW ... AS SELECT ...
 CREATE SINK ... INTO connector(...) AS SELECT ...
-CREATE LOOKUP TABLE ... FROM POSTGRES(...) | PARQUET(...)
+CREATE LOOKUP TABLE ... (...) WITH ('connector' = '<lookup-connector>', ...)
 DROP SOURCE | STREAM | SINK | MATERIALIZED VIEW
 SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
 SHOW CREATE SOURCE name
@@ -303,7 +307,7 @@ SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- live tail of a stream
 DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 ```
 
-`retain_history` keeps a bounded ring of recent committed epochs in memory; combined with `SUBSCRIBE … AS OF EPOCH n`, a client can resume from the last epoch it saw and reconnect without gaps.
+`retain_history` keeps a bounded suffix of committed epochs in memory. Resume only from a progress marker the client durably recorded: WebSocket emits `type=progress` frames, while pgwire emits `__laminar_kind=progress` rows with epoch and checkpoint ID. `SUBSCRIBE … AS OF EPOCH n` then starts strictly after that committed cut or fails visibly if it is unavailable.
 
 All aggregation functions from DataFusion 52 are available: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `STDDEV`, `PERCENTILE_CONT`, `APPROX_COUNT_DISTINCT`, `LAG`, `LEAD`, `ROW_NUMBER`, and 40+ more. JSON extraction, array/struct/map functions, and `UNNEST` are also supported.
 
@@ -341,18 +345,16 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 
 | Connector | Feature Flag | Notes | Status |
 |-----------|-------------|-------|--------|
-| Kafka | `kafka` | Consumer group, Schema Registry, Avro/JSON/CSV/Debezium | ✅ |
-| PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
-| MySQL CDC | `mysql-cdc` | Single-table binlog capture; best-effort only (checkpoint resume is not certified) | ✅ |
-| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | ✅ |
+| Kafka | `kafka` | Replayable at-least-once; exact delivery rejected pending certification | ✅ |
+| PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | ✅ |
+| MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | ✅ |
 | OpenTelemetry OTLP | `otel` | OTLP/gRPC receiver for traces, metrics, and logs | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
-| Delta Lake | `delta-lake` | Read from Delta Lake tables, version polling | ✅ |
-| Iceberg | `iceberg` | Apache Iceberg table source (REST/Glue/Hive catalogs) | ✅ |
+| Delta Lake | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
+| Iceberg | `iceberg` | REST catalog polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
 | Files (AutoLoader) | `files` | Glob pattern discovery, watch mode, Parquet/CSV | ✅ |
-| Parquet Lookup | `parquet-lookup` | Read Parquet files as reference tables | ✅ |
-| Postgres Lookup | `postgres-cdc` | Query external Postgres tables for enrichment | ✅ |
+| Postgres Lookup | `postgres-cdc` | Connector name `postgres`; external table enrichment | ✅ |
 
 ### Sinks
 
@@ -360,9 +362,9 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 |-----------|-------------|-------|--------|
 | Kafka | `kafka` | Durable at-least-once, configurable partitioning | ✅ |
 | PostgreSQL | `postgres-sink` | COPY BINARY and upsert, durable at-least-once | ✅ |
-| MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | ✅ |
-| Delta Lake | `delta-lake` | S3/Azure/GCS, coordinated checkpoint commits | ✅ |
-| Iceberg | `iceberg` | Coordinated Apache Iceberg checkpoint commits | ✅ |
+| MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | ✅ |
+| Delta Lake | `delta-lake` | Coordinated append candidate; not production-certified end to end | ✅ |
+| Iceberg | `iceberg` | REST catalog append, durable at-least-once; never checkpoint-committable | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
@@ -432,7 +434,6 @@ The HTTP API binds to `bind` configured under `[server]`. It serves the followin
 
 * **DDL & SQL Execution**: `POST /api/v1/sql` accepts SQL queries. It returns JSON-formatted results (including Arrow record batches, metadata, and error diagnostics).
 * **Lineage & Dependency Graph**: `GET /api/v1/graph` traces upstream and downstream relationship edges (`source -> stream -> MV -> sink`) to generate dependency DAGs.
-* **Ad-hoc Live Streaming Queries**: `POST /api/v1/queries` registers an ephemeral query stream, returning a unique `ws_url`. The UI opens a WebSocket connection to `GET /ws/{stream_id}` to subscribe to and tail live output. The ephemeral stream is dropped once the WebSocket closes or times out.
 * **Cluster Management**:
   * `GET /api/v1/cluster/nodes` returns the list of active/draining/suspected nodes.
   * `GET /api/v1/cluster/vnodes` returns the 256 vnode partition assignments.
@@ -732,9 +733,8 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | Flag | Description |
 |------|-------------|
 | `kafka` | Kafka source/sink, Avro serde, Schema Registry |
-| `postgres-cdc` | PostgreSQL CDC source via logical replication (also enables Postgres lookup) |
+| `postgres-cdc` | PostgreSQL CDC source via logical replication (also builds the standalone `postgres` lookup connector) |
 | `postgres-sink` | PostgreSQL sink via COPY BINARY |
-| `mysql-cdc` | MySQL CDC source via binlog replication |
 | `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake source and sink |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
@@ -743,7 +743,7 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source (AutoLoader) and sink (rolling Parquet/CSV/JSON) |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
-| `parquet-lookup` | Parquet lookup source for reference tables |
+| `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `api` / `ffi` | C FFI layer with Arrow C Data Interface |
 
 ---
@@ -762,7 +762,7 @@ cargo bench                    # Run all benchmarks
 cargo doc --no-deps --open     # Generate API docs
 
 # With optional connectors
-cargo test --features kafka,postgres-cdc,mysql-cdc,delta-lake,websocket
+cargo test --features kafka,postgres-cdc,mongodb-cdc,delta-lake,websocket
 
 # Run the Binance WebSocket demo
 cargo run -p binance-ws
@@ -774,7 +774,7 @@ cargo run -p binance-ws
 crates/
   laminar-core/        Core engine: operators, windows, streaming channels, checkpoint barriers, error codes, storage/checkpoint stores
   laminar-sql/         SQL parser, planner, DataFusion integration, streaming optimizer, watermark pushdown
-  laminar-connectors/  Kafka, CDC (PG/MySQL/Mongo), WebSocket, Files, Delta Lake, Iceberg, OTEL
+  laminar-connectors/  Kafka, CDC (PostgreSQL/MongoDB), WebSocket, Files, Delta Lake, Iceberg, OTEL
   laminar-db/          Unified database facade, StreamingCoordinator, checkpoint coordination, recovery, FFI
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (HTTP API, Docker, Helm)

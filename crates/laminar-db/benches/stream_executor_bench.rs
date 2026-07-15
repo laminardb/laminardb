@@ -94,9 +94,23 @@ impl laminar_db::FromBatch for RowCount {
 }
 
 /// Wait for at least one output batch on the given stream (with timeout).
-fn wait_for_output(db: &LaminarDB, stream: &str, timeout: Duration) {
-    let mut sub = db.subscribe::<RowCount>(stream).unwrap();
-    let _ = sub.recv_timeout(timeout);
+fn wait_for_output(
+    runtime: &tokio::runtime::Runtime,
+    subscription: &mut laminar_db::TypedSubscription<RowCount>,
+    timeout: Duration,
+) {
+    runtime
+        .block_on(tokio::time::timeout(timeout, async {
+            loop {
+                match subscription.next_frame().await {
+                    Ok(Some(laminar_db::TypedSubscriptionFrame::Rows { .. })) => return,
+                    Ok(Some(laminar_db::TypedSubscriptionFrame::Barrier { .. })) => {}
+                    Ok(None) => panic!("benchmark subscription closed before output"),
+                    Err(error) => panic!("benchmark subscription failed: {error}"),
+                }
+            }
+        }))
+        .expect("benchmark stream did not emit before timeout");
 }
 
 /// Benchmark: `SELECT id, region, price FROM t WHERE quantity > 10`
@@ -129,24 +143,28 @@ fn bench_plain_select(c: &mut Criterion) {
                                     config_keys: vec![],
                                 },
                                 std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
-                            );
+                            )
                         })
                         .build()
                         .await
                         .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
+                    db.start().await.unwrap();
                     db
                 });
                 let source = db.source_untyped("trades").unwrap();
+                let mut subscription = rt
+                    .block_on(db.subscribe::<RowCount>("filtered"))
+                    .unwrap();
                 // Warm up: first cycle triggers compilation
                 source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&db, "filtered", Duration::from_secs(2));
-                (db, source, batch.clone())
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+                (db, source, batch.clone(), subscription)
             },
-            |(db, source, batch)| {
+            |(db, source, batch, mut subscription)| {
                 source.push_arrow(batch).unwrap();
-                wait_for_output(&db, "filtered", Duration::from_secs(2));
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -185,23 +203,27 @@ fn bench_agg_group_by(c: &mut Criterion) {
                                     config_keys: vec![],
                                 },
                                 std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
-                            );
+                            )
                         })
                         .build()
                         .await
                         .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
+                    db.start().await.unwrap();
                     db
                 });
                 let source = db.source_untyped("trades").unwrap();
+                let mut subscription = rt
+                    .block_on(db.subscribe::<RowCount>("agg_result"))
+                    .unwrap();
                 source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&db, "agg_result", Duration::from_secs(2));
-                (db, source, batch.clone())
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+                (db, source, batch.clone(), subscription)
             },
-            |(db, source, batch)| {
+            |(db, source, batch, mut subscription)| {
                 source.push_arrow(batch).unwrap();
-                wait_for_output(&db, "agg_result", Duration::from_secs(2));
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -240,23 +262,27 @@ fn bench_sort_limit(c: &mut Criterion) {
                                     config_keys: vec![],
                                 },
                                 std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
-                            );
+                            )
                         })
                         .build()
                         .await
                         .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
+                    db.start().await.unwrap();
                     db
                 });
                 let source = db.source_untyped("trades").unwrap();
+                let mut subscription = rt
+                    .block_on(db.subscribe::<RowCount>("sorted"))
+                    .unwrap();
                 source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&db, "sorted", Duration::from_secs(2));
-                (db, source, batch.clone())
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+                (db, source, batch.clone(), subscription)
             },
-            |(db, source, batch)| {
+            |(db, source, batch, mut subscription)| {
                 source.push_arrow(batch).unwrap();
-                wait_for_output(&db, "sorted", Duration::from_secs(2));
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -295,7 +321,7 @@ fn bench_query_chain(c: &mut Criterion) {
                                     config_keys: vec![],
                                 },
                                 std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
-                            );
+                            )
                         })
                         .build()
                         .await
@@ -304,17 +330,21 @@ fn bench_query_chain(c: &mut Criterion) {
                     db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
                     db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
                     db.execute("CREATE STREAM step_c AS SELECT COUNT(*) AS cnt FROM step_b").await.unwrap();
+                    db.start().await.unwrap();
                     db
                 });
                 let source = db.source_untyped("trades").unwrap();
+                let mut subscription = rt
+                    .block_on(db.subscribe::<RowCount>("step_c"))
+                    .unwrap();
                 source.push_arrow(batch.clone()).unwrap();
                 // Wait for the terminal stream
-                wait_for_output(&db, "step_c", Duration::from_secs(2));
-                (db, source, batch.clone())
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+                (db, source, batch.clone(), subscription)
             },
-            |(db, source, batch)| {
+            |(db, source, batch, mut subscription)| {
                 source.push_arrow(batch).unwrap();
-                wait_for_output(&db, "step_c", Duration::from_secs(2));
+                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -326,16 +356,26 @@ fn bench_query_chain(c: &mut Criterion) {
 /// Subscribe, push, then poll until one emit lands. Subscribe-before-push so the
 /// emit isn't missed; `poll` is non-blocking so no tokio context is needed (the
 /// pipeline runs on the runtime workers started by `db.start()`).
-fn push_and_wait(db: &LaminarDB, source: &laminar_db::UntypedSourceHandle, batch: RecordBatch) {
-    let mut sub = db.subscribe::<RowCount>("agg_hc").unwrap();
+fn push_and_wait(
+    runtime: &tokio::runtime::Runtime,
+    db: &LaminarDB,
+    source: &laminar_db::UntypedSourceHandle,
+    batch: RecordBatch,
+) {
+    let mut sub = runtime
+        .block_on(db.subscribe::<RowCount>("agg_hc"))
+        .unwrap();
     source.push_arrow(batch).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
-        if sub.poll().is_some() {
-            return;
+        match sub.poll() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => panic!("benchmark subscription failed: {error}"),
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    panic!("benchmark stream did not emit before timeout");
 }
 
 /// High-cardinality `GROUP BY id`: warm the group table to `num_groups`, then push
@@ -368,11 +408,11 @@ fn bench_agg_high_cardinality(c: &mut Criterion) {
                             db.source_untyped("trades").unwrap()
                         });
                         // Warm: populate all num_groups groups.
-                        push_and_wait(&db, &source, keyed_batch(num_groups, num_groups, 0));
+                        push_and_wait(&rt, &db, &source, keyed_batch(num_groups, num_groups, 0));
                         (db, source, keyed_batch(64, num_groups, 0))
                     },
                     |(db, source, small)| {
-                        push_and_wait(&db, &source, small);
+                        push_and_wait(&rt, &db, &source, small);
                         std::hint::black_box(&db);
                     },
                     BatchSize::SmallInput,

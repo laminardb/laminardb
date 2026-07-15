@@ -31,6 +31,15 @@ pub trait WatermarkGenerator: Send {
     /// was not higher than the current watermark.
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
 
+    /// Replaces the generator's watermark with an exact recovered value.
+    ///
+    /// Unlike [`Self::advance_watermark`], this may move the watermark
+    /// backwards. It is exclusively for restoring a committed checkpoint
+    /// while source intake and computation are fenced. Calling it while the
+    /// pipeline is running can make already-finalized event-time state visible
+    /// again and is therefore incorrect.
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64);
+
     /// Whether the watermark is processing-time based (wall clock), rather than
     /// derived from the event-time column. Such a watermark lives in a different
     /// time domain than the event timestamps, so comparing the two to drop "late"
@@ -147,6 +156,15 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
             None
         }
     }
+
+    #[inline]
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+        // `on_event` only considers timestamps above this baseline. Restoring
+        // it along with the watermark prevents pre-recovery observations from
+        // suppressing valid replay after a backwards restore.
+        self.current_max_timestamp = timestamp.saturating_add(self.max_out_of_orderness);
+    }
 }
 
 /// Watermark generator for strictly ascending timestamps; the watermark
@@ -217,6 +235,11 @@ impl WatermarkGenerator for AscendingTimestampsGenerator {
         } else {
             None
         }
+    }
+
+    #[inline]
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
     }
 }
 
@@ -293,6 +316,12 @@ impl<G: WatermarkGenerator> WatermarkGenerator for PeriodicGenerator<G> {
             self.last_emit_time = Instant::now();
         }
         wm
+    }
+
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.inner.restore_watermark_for_recovery(timestamp);
+        self.last_emitted_watermark = timestamp;
+        self.last_emit_time = Instant::now();
     }
 
     fn is_processing_time(&self) -> bool {
@@ -378,6 +407,21 @@ where
             None
         }
     }
+
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+    }
+}
+
+/// A recovered tracker snapshot did not match the tracker's source topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "watermark recovery source count mismatch: expected {expected}, got {watermarks} watermarks and {idle_statuses} idle statuses"
+)]
+pub struct WatermarkRestoreError {
+    expected: usize,
+    watermarks: usize,
+    idle_statuses: usize,
 }
 
 /// Tracks watermarks across multiple input sources.
@@ -505,6 +549,53 @@ impl WatermarkTracker {
         } else {
             None
         }
+    }
+
+    /// Replaces all watermark state from a committed recovery snapshot.
+    ///
+    /// This is the only tracker operation allowed to lower source or combined
+    /// watermarks. The caller must hold the intake/compute recovery fence so no
+    /// events, idle transitions, or watermark reads race with the replacement.
+    /// Configured idle timeouts are preserved and activity timers restart at
+    /// the instant of restoration.
+    ///
+    /// `None` represents a source or combined frontier that has not been
+    /// initialized. `combined_watermark` is installed exactly rather than
+    /// recomputed because a committed cluster frontier may intentionally lag
+    /// this tracker's local source frontiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WatermarkRestoreError`] when either input does not contain
+    /// exactly one entry for every tracked source. No state is changed on
+    /// error.
+    pub fn restore_for_recovery(
+        &mut self,
+        source_watermarks: &[Option<i64>],
+        idle_sources: &[bool],
+        combined_watermark: Option<i64>,
+    ) -> Result<(), WatermarkRestoreError> {
+        let expected = self.source_watermarks.len();
+        if source_watermarks.len() != expected || idle_sources.len() != expected {
+            return Err(WatermarkRestoreError {
+                expected,
+                watermarks: source_watermarks.len(),
+                idle_statuses: idle_sources.len(),
+            });
+        }
+
+        for (target, recovered) in self
+            .source_watermarks
+            .iter_mut()
+            .zip(source_watermarks.iter())
+        {
+            *target = recovered.unwrap_or(i64::MIN);
+        }
+        self.idle_sources.copy_from_slice(idle_sources);
+        self.combined_watermark = combined_watermark.unwrap_or(i64::MIN);
+        let restored_at = Instant::now();
+        self.last_activity.fill(restored_at);
+        Ok(())
     }
 
     /// Returns the current combined watermark.
@@ -645,6 +736,11 @@ impl WatermarkGenerator for SourceProvidedGenerator {
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
         self.on_source_watermark(timestamp)
     }
+
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.source_watermark = timestamp;
+        self.fallback.restore_watermark_for_recovery(timestamp);
+    }
 }
 
 /// Processing-time watermark generator.
@@ -722,6 +818,11 @@ impl WatermarkGenerator for ProcessingTimeGenerator {
     }
 
     #[inline]
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+    }
+
+    #[inline]
     fn is_processing_time(&self) -> bool {
         true
     }
@@ -778,6 +879,18 @@ mod tests {
     }
 
     #[test]
+    fn bounded_recovery_restore_lowers_timestamp_baseline() {
+        let mut gen = BoundedOutOfOrdernessGenerator::new(100).with_max_future_skew(0);
+        assert_eq!(gen.on_event(2_000), Some(Watermark::new(1_900)));
+
+        gen.restore_watermark_for_recovery(500);
+        assert_eq!(gen.current_watermark(), 500);
+        // This event is below the pre-recovery maximum but above the restored
+        // baseline, so it proves stale generator state was not retained.
+        assert_eq!(gen.on_event(650), Some(Watermark::new(550)));
+    }
+
+    #[test]
     fn test_bounded_generator_from_duration() {
         let gen = BoundedOutOfOrdernessGenerator::from_duration(Duration::from_secs(5));
         assert_eq!(gen.max_out_of_orderness(), 5000);
@@ -812,6 +925,16 @@ mod tests {
     }
 
     #[test]
+    fn ascending_recovery_restore_lowers_then_advances() {
+        let mut gen = AscendingTimestampsGenerator::new().with_max_future_skew(0);
+        gen.on_event(2_000);
+
+        gen.restore_watermark_for_recovery(500);
+        assert_eq!(gen.current_watermark(), 500);
+        assert_eq!(gen.on_event(600), Some(Watermark::new(600)));
+    }
+
+    #[test]
     fn test_periodic_generator_passes_through() {
         let inner = BoundedOutOfOrdernessGenerator::new(100);
         let mut gen = PeriodicGenerator::new(inner, Duration::from_millis(100));
@@ -826,6 +949,18 @@ mod tests {
         let gen = PeriodicGenerator::new(inner, Duration::from_millis(100));
 
         assert_eq!(gen.inner().max_out_of_orderness(), 100);
+    }
+
+    #[test]
+    fn periodic_recovery_restore_resets_inner_and_emission_frontier() {
+        let inner = AscendingTimestampsGenerator::new().with_max_future_skew(0);
+        let mut gen = PeriodicGenerator::new(inner, Duration::from_millis(100));
+        gen.on_event(2_000);
+
+        gen.restore_watermark_for_recovery(500);
+        assert_eq!(gen.current_watermark(), 500);
+        assert_eq!(gen.last_emitted_watermark, 500);
+        assert_eq!(gen.on_event(600), Some(Watermark::new(600)));
     }
 
     #[test]
@@ -854,6 +989,16 @@ mod tests {
 
         assert_eq!(wm, None);
         assert_eq!(gen.current_watermark(), 2000);
+    }
+
+    #[test]
+    fn punctuated_recovery_restore_lowers_then_advances() {
+        let mut gen = PunctuatedGenerator::new(|ts| Some(Watermark::new(ts)));
+        gen.on_event(2_000);
+
+        gen.restore_watermark_for_recovery(500);
+        assert_eq!(gen.current_watermark(), 500);
+        assert_eq!(gen.on_event(600), Some(Watermark::new(600)));
     }
 
     #[test]
@@ -987,6 +1132,45 @@ mod tests {
     }
 
     #[test]
+    fn tracker_recovery_restore_is_exact_and_runtime_progress_resumes() {
+        let mut tracker = WatermarkTracker::new(2);
+        tracker.update_source(0, 9_000);
+        tracker.update_source(1, 8_000);
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(8_000)));
+
+        tracker
+            .restore_for_recovery(&[Some(1_000), None], &[false, true], Some(750))
+            .unwrap();
+
+        assert_eq!(tracker.source_watermark(0), Some(1_000));
+        assert_eq!(tracker.source_watermark(1), Some(i64::MIN));
+        assert!(!tracker.is_idle(0));
+        assert!(tracker.is_idle(1));
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(750)));
+
+        assert_eq!(tracker.update_source(0, 1_200), Some(Watermark::new(1_200)));
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(1_200)));
+    }
+
+    #[test]
+    fn tracker_recovery_restore_rejects_topology_mismatch_without_mutation() {
+        let mut tracker = WatermarkTracker::new(2);
+        tracker.update_source(0, 2_000);
+        tracker.update_source(1, 1_000);
+
+        let error = tracker
+            .restore_for_recovery(&[Some(500)], &[false, true], Some(500))
+            .unwrap_err();
+
+        assert_eq!(error.expected, 2);
+        assert_eq!(error.watermarks, 1);
+        assert_eq!(error.idle_statuses, 2);
+        assert_eq!(tracker.source_watermark(0), Some(2_000));
+        assert_eq!(tracker.source_watermark(1), Some(1_000));
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(1_000)));
+    }
+
+    #[test]
     fn test_source_provided_fallback() {
         let mut gen = SourceProvidedGenerator::new(100, false);
 
@@ -1001,6 +1185,19 @@ mod tests {
         let wm = gen.on_source_watermark(500);
         assert_eq!(wm, Some(Watermark::new(500)));
         assert_eq!(gen.current_watermark(), 500);
+    }
+
+    #[test]
+    fn source_provided_recovery_restore_resets_source_and_fallback() {
+        let mut gen = SourceProvidedGenerator::new(100, false);
+        gen.on_source_watermark(2_000);
+        gen.on_event(2_000);
+
+        gen.restore_watermark_for_recovery(500);
+        assert_eq!(gen.source_watermark, 500);
+        assert_eq!(gen.fallback.current_watermark(), 500);
+        assert_eq!(gen.on_event(700), Some(Watermark::new(600)));
+        assert_eq!(gen.current_watermark(), 600);
     }
 
     // --- advance_watermark() tests ---
@@ -1148,6 +1345,16 @@ mod tests {
         // Further advance
         let wm = gen.advance_watermark(1000);
         assert_eq!(wm, Some(Watermark::new(1000)));
+    }
+
+    #[test]
+    fn processing_time_recovery_restore_lowers_then_advances() {
+        let mut gen = ProcessingTimeGenerator::new();
+        gen.advance_watermark(2_000);
+
+        gen.restore_watermark_for_recovery(500);
+        assert_eq!(gen.current_watermark(), 500);
+        assert_eq!(gen.advance_watermark(600), Some(Watermark::new(600)));
     }
 
     #[test]

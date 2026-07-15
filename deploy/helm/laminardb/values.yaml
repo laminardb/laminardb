@@ -1,4 +1,4 @@
-# -- Number of replicas (use 1 for embedded, >1 for cluster mode)
+# -- Number of replicas (use 1 for single-node, >1 for cluster mode)
 replicaCount: 1
 
 # -- StatefulSet pod launch ordering: "Parallel" or "OrderedReady".
@@ -31,8 +31,8 @@ testConnection:
 
 # -- LaminarDB server configuration
 laminardb:
-  # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering)
-  mode: embedded
+  # -- Server mode: "single" (standalone) or "cluster" (multi-node clustering)
+  mode: single
   # -- Pipeline-wide delivery contract. Cluster mode currently requires at_least_once.
   delivery: at_least_once
   # -- Log level: trace, debug, info, warn, error
@@ -54,23 +54,8 @@ laminardb:
     path: /var/lib/laminardb/state
     # -- URL for shared storage (required when backend=object_store, e.g. "s3://bucket/prefix")
     url: ""
-    # -- Node identity written into state commit markers (defaults to ${HOSTNAME})
-    instanceId: ""
     # -- Number of vnodes the backend should size for
     vnodeCapacity: 256
-    # -- Optional static vnode list (only for object_store backend)
-    vnodes: []
-    # -- Node-level memory budget for operator state, in bytes (0 = unlimited).
-    # -- Crossing it backpressures intake, or demotes to the cold tier below.
-    memoryBudgetBytes: 0
-    # -- Disk cold tier for demoted state. Needs memoryBudgetBytes > 0 and a
-    # -- durable backend. Scratch only: wiped on restart, rebuilt from checkpoints.
-    tier:
-      enabled: false
-      path: /var/lib/laminardb/tier
-      # -- emptyDir medium for tier scratch ("Memory" for tmpfs).
-      emptyDirMedium: ""
-
   # -- Checkpoint configuration
   checkpoint:
     # -- Checkpoint interval (Go/humantime duration)

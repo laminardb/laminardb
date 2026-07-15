@@ -61,7 +61,6 @@ delivery     = "exactly_once"
 [state]
 backend      = "local"
 path         = "./.laminardb/state"
-instance_id  = "kafka-iceberg-demo"
 
 [checkpoint]
 url      = "file://./.laminardb/checkpoints"

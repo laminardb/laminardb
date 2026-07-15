@@ -45,7 +45,7 @@ pub struct JoinKeyPair {
 /// Metadata about a lookup table for plan construction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LookupTableMetadata {
-    /// Connector type (e.g., "postgres-cdc").
+    /// Connector type (e.g., "postgres").
     pub connector: String,
     /// Lookup strategy (e.g., "replicated").
     pub strategy: String,
@@ -359,7 +359,7 @@ mod tests {
 
     fn test_metadata() -> LookupTableMetadata {
         LookupTableMetadata {
-            connector: "postgres-cdc".to_string(),
+            connector: "postgres".to_string(),
             strategy: "replicated".to_string(),
             pushdown_mode: "auto".to_string(),
             primary_key: vec!["id".to_string()],

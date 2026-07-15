@@ -3,12 +3,43 @@
 //! Provides [`PostgresCdcConfig`] with all settings needed to connect to
 //! a `PostgreSQL` database and stream logical replication changes.
 
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
-use super::lsn::Lsn;
+const REMOVED_CONFIG_KEYS: &[&str] = &[
+    "backpressure.high.watermark",
+    "keepalive.interval.ms",
+    "max.buffered.events",
+    "max.poll.records",
+    "poll.timeout.ms",
+    "snapshot.mode",
+    "start.lsn",
+    "wal.sender.timeout.ms",
+];
+
+const DEFAULT_BUFFERED_BYTES: usize = 256 * 1024 * 1024;
+const MIN_BUFFERED_BYTES: usize = 1024 * 1024;
+const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const WORKING_SET_STAGES: usize = 3;
+
+const ALLOWED_CONFIG_KEYS: &[&str] = &[
+    "_arrow_schema",
+    "database",
+    "host",
+    "laminar.source.name",
+    "max.buffered.bytes",
+    "password",
+    "port",
+    "publication",
+    "slot.name",
+    "ssl.ca.cert.path",
+    "ssl.mode",
+    "table.exclude",
+    "table.include",
+    "username",
+];
 
 /// Configuration for the `PostgreSQL` CDC source connector.
 #[derive(Debug, Clone)]
@@ -32,17 +63,8 @@ pub struct PostgresCdcConfig {
     /// SSL mode for the connection.
     pub ssl_mode: SslMode,
 
-    /// Path to CA certificate PEM file (for `VerifyCa` / `VerifyFull`).
-    pub ca_cert_path: Option<String>,
-
-    /// Path to client certificate PEM file (for mTLS).
-    pub client_cert_path: Option<String>,
-
-    /// Path to client private key PEM file (for mTLS).
-    pub client_key_path: Option<String>,
-
-    /// SNI hostname override (for proxy/load-balancer scenarios).
-    pub sni_hostname: Option<String>,
+    /// Optional PEM file containing trusted CA certificates.
+    pub ssl_ca_cert_path: Option<PathBuf>,
 
     // ── Replication ──
     /// Name of the logical replication slot.
@@ -51,29 +73,6 @@ pub struct PostgresCdcConfig {
     /// Name of the publication to subscribe to.
     pub publication: String,
 
-    /// LSN to start replication from (None = slot's `confirmed_flush_lsn`).
-    pub start_lsn: Option<Lsn>,
-
-    /// Output plugin name (always `pgoutput` for logical replication).
-    pub output_plugin: String,
-
-    // ── Snapshot ──
-    /// How to handle the initial data snapshot.
-    pub snapshot_mode: SnapshotMode,
-
-    // ── Tuning ──
-    /// Timeout for each poll operation.
-    pub poll_timeout: Duration,
-
-    /// Maximum records to return per poll.
-    pub max_poll_records: usize,
-
-    /// Interval for sending keepalive/status updates to `PostgreSQL`.
-    pub keepalive_interval: Duration,
-
-    /// Maximum WAL sender timeout before the server drops the connection.
-    pub wal_sender_timeout: Duration,
-
     // ── Schema ──
     /// Tables to include (empty = all tables in publication).
     pub table_include: Vec<String>,
@@ -81,13 +80,8 @@ pub struct PostgresCdcConfig {
     /// Tables to exclude from replication.
     pub table_exclude: Vec<String>,
 
-    /// Maximum events to buffer (default: 100,000).
-    pub max_buffered_events: usize,
-
-    /// High watermark ratio (0.0–1.0) of `max_buffered_events`. When the
-    /// buffer reaches this level, stop draining the WAL reader channel to
-    /// apply backpressure (default: 0.8).
-    pub backpressure_high_watermark: f64,
+    /// Total connector-owned payload budget across raw WAL, decoded state, and Arrow construction.
+    pub max_buffered_bytes: usize,
 }
 
 impl Default for PostgresCdcConfig {
@@ -98,38 +92,48 @@ impl Default for PostgresCdcConfig {
             database: "postgres".to_string(),
             username: "postgres".to_string(),
             password: None,
-            ssl_mode: SslMode::Prefer,
-            ca_cert_path: None,
-            client_cert_path: None,
-            client_key_path: None,
-            sni_hostname: None,
+            ssl_mode: SslMode::VerifyFull,
+            ssl_ca_cert_path: None,
             slot_name: "laminar_slot".to_string(),
             publication: "laminar_pub".to_string(),
-            start_lsn: None,
-            output_plugin: "pgoutput".to_string(),
-            snapshot_mode: SnapshotMode::Initial,
-            poll_timeout: Duration::from_millis(100),
-            max_poll_records: 1000,
-            keepalive_interval: Duration::from_secs(10),
-            wal_sender_timeout: Duration::from_secs(60),
             table_include: Vec::new(),
             table_exclude: Vec::new(),
-            max_buffered_events: 100_000,
-            backpressure_high_watermark: 0.8,
+            max_buffered_bytes: DEFAULT_BUFFERED_BYTES,
         }
     }
 }
 
 impl PostgresCdcConfig {
-    /// Returns the high watermark as an absolute event count.
+    /// Decoded-stage high watermark used to stop admitting raw WAL before the hard limit.
     #[must_use]
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    pub fn backpressure_high_watermark(&self) -> usize {
-        (self.max_buffered_events as f64 * self.backpressure_high_watermark) as usize
+    pub(super) fn decoded_high_watermark_bytes(&self) -> usize {
+        self.decoded_event_bytes()
+            .saturating_sub(self.decoded_event_bytes() / 5)
+    }
+
+    /// Raw pgwire/frame ownership share of the private working-set limit.
+    #[must_use]
+    pub(crate) fn raw_wal_bytes(&self) -> usize {
+        self.max_buffered_bytes / WORKING_SET_STAGES
+    }
+
+    /// Decoded transaction ownership share of the private working-set limit.
+    #[must_use]
+    pub(crate) fn decoded_event_bytes(&self) -> usize {
+        self.max_buffered_bytes / WORKING_SET_STAGES
+    }
+
+    /// Arrow construction share, including division remainder.
+    #[must_use]
+    pub(crate) fn arrow_build_bytes(&self) -> usize {
+        self.max_buffered_bytes
+            .saturating_sub(self.raw_wal_bytes())
+            .saturating_sub(self.decoded_event_bytes())
+    }
+
+    pub(crate) fn normalize_table_filters(&mut self) {
+        normalize_table_list(&mut self.table_include);
+        normalize_table_list(&mut self.table_exclude);
     }
 
     /// Creates a new config with required fields.
@@ -144,21 +148,31 @@ impl PostgresCdcConfig {
         }
     }
 
-    /// Builds a `PostgreSQL` connection string.
-    #[must_use]
-    pub fn connection_string(&self) -> String {
-        use std::fmt::Write;
-        let mut s = format!(
-            "host={} port={} dbname={} user={}",
-            self.host, self.port, self.database, self.username
-        );
-        if let Some(ref pw) = self.password {
-            // Escape for libpq: wrap in single quotes, escape \ and '
-            let escaped = pw.replace('\\', "\\\\").replace('\'', "\\'");
-            let _ = write!(s, " password='{escaped}'");
+    /// Builds the typed control-plane connection configuration.
+    ///
+    /// Using setters keeps credentials and database names out of libpq-style
+    /// tokenization, so whitespace, quotes, and backslashes are data rather
+    /// than connection-string syntax.
+    pub(super) fn control_connection_config(
+        &self,
+    ) -> Result<tokio_postgres::Config, ConnectorError> {
+        self.validate()?;
+
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&self.host)
+            .port(self.port)
+            .dbname(&self.database)
+            .user(&self.username)
+            .ssl_mode(match self.ssl_mode {
+                SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+                SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
+            })
+            .connect_timeout(super::postgres_io::CONNECT_TIMEOUT);
+        if let Some(password) = &self.password {
+            config.password(password);
         }
-        let _ = write!(s, " sslmode={}", self.ssl_mode);
-        s
+        Ok(config)
     }
 
     /// Parses configuration from a generic [`ConnectorConfig`].
@@ -168,11 +182,17 @@ impl PostgresCdcConfig {
     /// Returns `ConnectorError` if required keys are missing or values are
     /// invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        Self::reject_removed_keys(config)?;
+        config.reject_unknown_properties(ALLOWED_CONFIG_KEYS, "PostgreSQL CDC")?;
+
         let mut cfg = Self {
             host: config.require("host")?.to_string(),
             database: config.require("database")?.to_string(),
             slot_name: config.require("slot.name")?.to_string(),
             publication: config.require("publication")?.to_string(),
+            ssl_mode: config
+                .get_parsed::<SslMode>("ssl.mode")?
+                .unwrap_or_default(),
             ..Self::default()
         };
 
@@ -183,45 +203,41 @@ impl PostgresCdcConfig {
             cfg.username = user.to_string();
         }
         cfg.password = config.get("password").map(String::from);
+        cfg.ssl_ca_cert_path = config.get("ssl.ca.cert.path").map(PathBuf::from);
 
-        if let Some(ssl) = config.get_parsed::<SslMode>("ssl.mode")? {
-            cfg.ssl_mode = ssl;
-        }
-        cfg.ca_cert_path = config.get("ssl.ca.cert.path").map(String::from);
-        cfg.client_cert_path = config.get("ssl.client.cert.path").map(String::from);
-        cfg.client_key_path = config.get("ssl.client.key.path").map(String::from);
-        cfg.sni_hostname = config.get("ssl.sni.hostname").map(String::from);
-
-        if let Some(lsn) = config.get_parsed::<Lsn>("start.lsn")? {
-            cfg.start_lsn = Some(lsn);
-        }
-        if let Some(mode) = config.get_parsed::<SnapshotMode>("snapshot.mode")? {
-            cfg.snapshot_mode = mode;
-        }
-        if let Some(timeout) = config.get_parsed::<u64>("poll.timeout.ms")? {
-            cfg.poll_timeout = Duration::from_millis(timeout);
-        }
-        if let Some(max) = config.get_parsed::<usize>("max.poll.records")? {
-            cfg.max_poll_records = max;
-        }
-        if let Some(interval) = config.get_parsed::<u64>("keepalive.interval.ms")? {
-            cfg.keepalive_interval = Duration::from_millis(interval);
-        }
         if let Some(tables) = config.get("table.include") {
-            cfg.table_include = tables.split(',').map(|s| s.trim().to_string()).collect();
+            cfg.table_include = tables.split(',').map(str::to_string).collect();
         }
         if let Some(tables) = config.get("table.exclude") {
-            cfg.table_exclude = tables.split(',').map(|s| s.trim().to_string()).collect();
+            cfg.table_exclude = tables.split(',').map(str::to_string).collect();
         }
-        if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
-            cfg.max_buffered_events = max;
+        if let Some(max) = config.get_parsed::<usize>("max.buffered.bytes")? {
+            cfg.max_buffered_bytes = max;
         }
-        if let Some(hw) = config.get_parsed::<f64>("backpressure.high.watermark")? {
-            cfg.backpressure_high_watermark = hw;
-        }
-
+        cfg.normalize_table_filters();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn reject_removed_keys(config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if let Some(key) = REMOVED_CONFIG_KEYS
+            .iter()
+            .find(|key| config.get(key).is_some())
+        {
+            let reason = match *key {
+                "start.lsn" => {
+                    "recovery cursors are owned by a validated engine checkpoint or the durable slot"
+                }
+                "max.buffered.events" => {
+                    "resource ownership is bounded by max.buffered.bytes instead"
+                }
+                _ => "the connector did not execute it",
+            };
+            return Err(ConnectorError::ConfigurationError(format!(
+                "PostgreSQL CDC property '{key}' is not supported: {reason}"
+            )));
+        }
+        Ok(())
     }
 
     /// Validates the configuration.
@@ -232,96 +248,136 @@ impl PostgresCdcConfig {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         crate::config::require_non_empty(&self.host, "host")?;
         crate::config::require_non_empty(&self.database, "database")?;
+        crate::config::require_non_empty(&self.username, "username")?;
         crate::config::require_non_empty(&self.slot_name, "slot.name")?;
         crate::config::require_non_empty(&self.publication, "publication")?;
+        for (value, label) in [
+            (&self.host, "host"),
+            (&self.database, "database"),
+            (&self.username, "username"),
+            (&self.slot_name, "slot.name"),
+            (&self.publication, "publication"),
+        ] {
+            if value.contains('\0') {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "{label} must not contain NUL"
+                )));
+            }
+        }
+        if self.slot_name.len() > 63
+            || !self
+                .slot_name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "slot.name must be at most 63 bytes and contain only lower-case ASCII letters, digits, or underscore"
+                    .into(),
+            ));
+        }
+        if self.publication.len() > 63 {
+            return Err(ConnectorError::ConfigurationError(
+                "publication must be at most 63 bytes".into(),
+            ));
+        }
+        if self
+            .password
+            .as_deref()
+            .is_some_and(|value| value.contains('\0'))
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "password must not contain NUL".into(),
+            ));
+        }
         if self.port == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "port must be > 0".to_string(),
             ));
         }
-        if self.max_poll_records == 0 {
-            return Err(ConnectorError::ConfigurationError(
-                "max.poll.records must be > 0".to_string(),
-            ));
-        }
-        if self.max_buffered_events == 0 {
-            return Err(ConnectorError::ConfigurationError(
-                "max.buffered.events must be > 0".to_string(),
-            ));
-        }
-        if !(self.backpressure_high_watermark.is_finite()
-            && 0.0 < self.backpressure_high_watermark
-            && self.backpressure_high_watermark <= 1.0)
-        {
-            return Err(ConnectorError::ConfigurationError(
-                "backpressure.high.watermark must be finite and in (0, 1]".to_string(),
-            ));
-        }
-        for (name, timeout) in [
-            ("poll.timeout.ms", self.poll_timeout),
-            ("keepalive.interval.ms", self.keepalive_interval),
-        ] {
-            if timeout.is_zero() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "{name} must be > 0"
-                )));
-            }
-        }
-        // VerifyCa/VerifyFull require a CA certificate path
-        if matches!(self.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull)
-            && self.ca_cert_path.is_none()
-        {
+        if !(MIN_BUFFERED_BYTES..=MAX_BUFFERED_BYTES).contains(&self.max_buffered_bytes) {
             return Err(ConnectorError::ConfigurationError(format!(
-                "ssl.mode={} requires ssl.ca.cert.path",
-                self.ssl_mode
+                "max.buffered.bytes must be between {MIN_BUFFERED_BYTES} and {MAX_BUFFERED_BYTES}"
             )));
         }
-        // Client cert without key (or vice versa) is invalid
-        if self.client_cert_path.is_some() != self.client_key_path.is_some() {
+        if self
+            .ssl_ca_cert_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
             return Err(ConnectorError::ConfigurationError(
-                "ssl.client.cert.path and ssl.client.key.path must both be set for mTLS"
-                    .to_string(),
+                "ssl.ca.cert.path must not be empty".to_string(),
             ));
+        }
+        if self.ssl_mode == SslMode::Disable && self.ssl_ca_cert_path.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "ssl.ca.cert.path requires ssl.mode=verify-full".to_string(),
+            ));
+        }
+        for (label, tables) in [
+            ("table.include", &self.table_include),
+            ("table.exclude", &self.table_exclude),
+        ] {
+            for table in tables {
+                let Some((schema, relation)) = table.split_once('.') else {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "{label} entry '{table}' must be schema-qualified as schema.table"
+                    )));
+                };
+                if table.trim() != table || schema.is_empty() || relation.is_empty() {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "{label} entry '{table}' must contain nonempty schema and table names"
+                    )));
+                }
+            }
         }
         Ok(())
     }
 
     /// Returns whether a table should be included based on include/exclude lists.
     #[must_use]
-    pub fn should_include_table(&self, table: &str) -> bool {
-        if self.table_exclude.iter().any(|t| t == table) {
+    pub(crate) fn should_include_table(&self, table: &str) -> bool {
+        debug_assert!(self.table_include.is_sorted());
+        debug_assert!(self.table_exclude.is_sorted());
+        if self
+            .table_exclude
+            .binary_search_by(|candidate| candidate.as_str().cmp(table))
+            .is_ok()
+        {
             return false;
         }
         if self.table_include.is_empty() {
             return true;
         }
-        self.table_include.iter().any(|t| t == table)
+        self.table_include
+            .binary_search_by(|candidate| candidate.as_str().cmp(table))
+            .is_ok()
     }
+}
+
+fn normalize_table_list(tables: &mut Vec<String>) {
+    for table in tables.iter_mut() {
+        *table = table.trim().to_string();
+    }
+    tables.retain(|table| !table.is_empty());
+    tables.sort_unstable();
+    tables.dedup();
 }
 
 pub use crate::connector::PostgresSslMode as SslMode;
 
-/// How to handle the initial snapshot when no prior checkpoint exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SnapshotMode {
-    /// Take a full snapshot on first start, then switch to streaming.
-    #[default]
-    Initial,
-    /// Never take a snapshot; only stream from the replication slot's position.
-    Never,
-    /// Always take a snapshot on startup, even if a checkpoint exists.
-    Always,
-}
-
-str_enum!(SnapshotMode, lowercase_nodash, String, "unknown snapshot mode",
-    Initial => "initial";
-    Never => "never";
-    Always => "always"
-);
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connector_config() -> ConnectorConfig {
+        let mut config = ConnectorConfig::new("postgres-cdc");
+        config.set("host", "localhost");
+        config.set("database", "db");
+        config.set("slot.name", "s");
+        config.set("publication", "p");
+        config.set("ssl.mode", "disable");
+        config
+    }
 
     #[test]
     fn test_default_config() {
@@ -331,10 +387,23 @@ mod tests {
         assert_eq!(cfg.database, "postgres");
         assert_eq!(cfg.slot_name, "laminar_slot");
         assert_eq!(cfg.publication, "laminar_pub");
-        assert_eq!(cfg.output_plugin, "pgoutput");
-        assert_eq!(cfg.ssl_mode, SslMode::Prefer);
-        assert_eq!(cfg.snapshot_mode, SnapshotMode::Initial);
-        assert_eq!(cfg.max_poll_records, 1000);
+        assert_eq!(cfg.ssl_mode, SslMode::VerifyFull);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn replication_identity_rejects_invalid_slot_and_nul() {
+        let mut cfg = PostgresCdcConfig::default();
+        cfg.slot_name = "Mixed-Case".into();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("slot.name"));
+
+        cfg.slot_name = "valid_slot".into();
+        cfg.publication = "bad\0publication".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("NUL"));
     }
 
     #[test]
@@ -344,41 +413,46 @@ mod tests {
         assert_eq!(cfg.database, "mydb");
         assert_eq!(cfg.slot_name, "my_slot");
         assert_eq!(cfg.publication, "my_pub");
+        assert_eq!(cfg.ssl_mode, SslMode::VerifyFull);
     }
 
     #[test]
-    fn test_connection_string() {
-        let mut cfg = PostgresCdcConfig::new("db.example.com", "mydb", "s", "p");
-        cfg.password = Some("secret".to_string());
-        let conn = cfg.connection_string();
-        assert!(conn.contains("host=db.example.com"));
-        assert!(conn.contains("dbname=mydb"));
-        assert!(conn.contains("password='secret'"));
-        assert!(conn.contains("sslmode=prefer"));
+    fn typed_control_config_preserves_adversarial_values() {
+        let mut cfg =
+            PostgresCdcConfig::new(" db\\host' ", " db name'\\ ", "valid_slot", "publication");
+        cfg.username = " user name'\\ ".into();
+        cfg.password = Some(" password with 'quotes' and \\slashes\\ ".into());
+
+        let control = cfg.control_connection_config().unwrap();
+        assert_eq!(
+            control.get_hosts(),
+            &[tokio_postgres::config::Host::Tcp(" db\\host' ".into())]
+        );
+        assert_eq!(control.get_ports(), &[5432]);
+        assert_eq!(control.get_dbname(), Some(" db name'\\ "));
+        assert_eq!(control.get_user(), Some(" user name'\\ "));
+        assert_eq!(
+            control.get_password(),
+            Some(" password with 'quotes' and \\slashes\\ ".as_bytes())
+        );
+        assert_eq!(
+            control.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
+        );
+        assert_eq!(
+            control.get_connect_timeout().copied(),
+            Some(crate::cdc::postgres::postgres_io::CONNECT_TIMEOUT)
+        );
     }
 
     #[test]
-    fn test_connection_string_password_with_spaces() {
-        let mut cfg = PostgresCdcConfig::new("h", "d", "s", "p");
-        cfg.password = Some("my secret pass".to_string());
-        let conn = cfg.connection_string();
-        assert!(conn.contains("password='my secret pass'"));
-    }
-
-    #[test]
-    fn test_connection_string_password_with_quotes() {
-        let mut cfg = PostgresCdcConfig::new("h", "d", "s", "p");
-        cfg.password = Some("it's a p@ss'word".to_string());
-        let conn = cfg.connection_string();
-        assert!(conn.contains(r"password='it\'s a p@ss\'word'"));
-    }
-
-    #[test]
-    fn test_connection_string_password_with_backslash() {
-        let mut cfg = PostgresCdcConfig::new("h", "d", "s", "p");
-        cfg.password = Some(r"pass\word".to_string());
-        let conn = cfg.connection_string();
-        assert!(conn.contains(r"password='pass\\word'"));
+    fn typed_control_config_maps_disabled_tls_exactly() {
+        let mut cfg = PostgresCdcConfig::default();
+        cfg.ssl_mode = SslMode::Disable;
+        assert_eq!(
+            cfg.control_connection_config().unwrap().get_ssl_mode(),
+            tokio_postgres::config::SslMode::Disable
+        );
     }
 
     #[test]
@@ -388,18 +462,38 @@ mod tests {
         config.set("database", "testdb");
         config.set("slot.name", "test_slot");
         config.set("publication", "test_pub");
+        config.set("ssl.mode", "disable");
         config.set("port", "5433");
-        config.set("ssl.mode", "require");
-        config.set("snapshot.mode", "never");
-        config.set("max.poll.records", "500");
+        config.set("max.buffered.bytes", "67108864");
 
         let cfg = PostgresCdcConfig::from_config(&config).unwrap();
         assert_eq!(cfg.host, "pg.local");
         assert_eq!(cfg.port, 5433);
         assert_eq!(cfg.database, "testdb");
-        assert_eq!(cfg.ssl_mode, SslMode::Require);
-        assert_eq!(cfg.snapshot_mode, SnapshotMode::Never);
-        assert_eq!(cfg.max_poll_records, 500);
+        assert_eq!(cfg.max_buffered_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn total_byte_budget_is_partitioned_without_loss() {
+        let mut cfg = PostgresCdcConfig::default();
+        cfg.max_buffered_bytes = MIN_BUFFERED_BYTES;
+        assert_eq!(
+            cfg.decoded_high_watermark_bytes(),
+            cfg.decoded_event_bytes() - cfg.decoded_event_bytes() / 5
+        );
+        assert_eq!(
+            cfg.raw_wal_bytes() + cfg.decoded_event_bytes() + cfg.arrow_build_bytes(),
+            MIN_BUFFERED_BYTES
+        );
+    }
+
+    #[test]
+    fn total_byte_budget_rejects_values_outside_the_operational_range() {
+        for bytes in [MIN_BUFFERED_BYTES - 1, MAX_BUFFERED_BYTES + 1] {
+            let mut cfg = PostgresCdcConfig::default();
+            cfg.max_buffered_bytes = bytes;
+            assert!(cfg.validate().is_err(), "{bytes}");
+        }
     }
 
     #[test]
@@ -410,13 +504,37 @@ mod tests {
 
     #[test]
     fn test_from_config_invalid_port() {
+        let mut config = connector_config();
+        config.set("port", "not_a_number");
+        assert!(PostgresCdcConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn omitted_ssl_mode_uses_verified_tls() {
         let mut config = ConnectorConfig::new("postgres-cdc");
         config.set("host", "localhost");
         config.set("database", "db");
         config.set("slot.name", "s");
         config.set("publication", "p");
-        config.set("port", "not_a_number");
-        assert!(PostgresCdcConfig::from_config(&config).is_err());
+        let config = PostgresCdcConfig::from_config(&config).unwrap();
+        assert_eq!(config.ssl_mode, SslMode::VerifyFull);
+    }
+
+    #[test]
+    fn unknown_properties_are_rejected_deterministically() {
+        let mut config = connector_config();
+        config.set("z.invalid", "1");
+        config.set("a.invalid", "2");
+        let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("a.invalid"), "{error}");
+    }
+
+    #[test]
+    fn engine_metadata_properties_are_admitted() {
+        let mut config = connector_config();
+        config.set("laminar.source.name", "orders");
+        config.set("_arrow_schema", "engine-owned");
+        PostgresCdcConfig::from_config(&config).unwrap();
     }
 
     #[test]
@@ -427,40 +545,36 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_zero_max_poll() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.max_poll_records = 0;
-        assert!(cfg.validate().is_err());
+    fn removed_properties_are_rejected_explicitly() {
+        for key in REMOVED_CONFIG_KEYS {
+            let mut config = ConnectorConfig::new("postgres-cdc");
+            config.set("host", "localhost");
+            config.set("database", "db");
+            config.set("slot.name", "s");
+            config.set("publication", "p");
+            config.set(*key, "removed-value");
+            let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains(key));
+        }
     }
 
     #[test]
     fn test_ssl_mode_fromstr() {
         assert_eq!("disable".parse::<SslMode>().unwrap(), SslMode::Disable);
-        assert_eq!("prefer".parse::<SslMode>().unwrap(), SslMode::Prefer);
-        assert_eq!("require".parse::<SslMode>().unwrap(), SslMode::Require);
-        assert_eq!("verify-ca".parse::<SslMode>().unwrap(), SslMode::VerifyCa);
         assert_eq!(
             "verify-full".parse::<SslMode>().unwrap(),
             SslMode::VerifyFull
         );
-        assert!("invalid".parse::<SslMode>().is_err());
-    }
-
-    #[test]
-    fn test_snapshot_mode_fromstr() {
-        assert_eq!(
-            "initial".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::Initial
-        );
-        assert_eq!(
-            "never".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::Never
-        );
-        assert_eq!(
-            "always".parse::<SnapshotMode>().unwrap(),
-            SnapshotMode::Always
-        );
-        assert!("bad".parse::<SnapshotMode>().is_err());
+        for rejected in [
+            "off",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify_full",
+            "verifyfull",
+        ] {
+            assert!(rejected.parse::<SslMode>().is_err(), "{rejected}");
+        }
     }
 
     #[test]
@@ -477,6 +591,7 @@ mod tests {
 
         // Include list
         cfg.table_include = vec!["public.users".to_string(), "public.orders".to_string()];
+        cfg.normalize_table_filters();
         assert!(cfg.should_include_table("public.users"));
         assert!(!cfg.should_include_table("public.logs"));
 
@@ -486,119 +601,69 @@ mod tests {
     }
 
     #[test]
-    fn test_from_config_with_start_lsn() {
-        let mut config = ConnectorConfig::new("postgres-cdc");
-        config.set("host", "localhost");
-        config.set("database", "db");
-        config.set("slot.name", "s");
-        config.set("publication", "p");
+    fn manual_start_lsn_is_rejected() {
+        let mut config = connector_config();
         config.set("start.lsn", "0/1234ABCD");
-
-        let cfg = PostgresCdcConfig::from_config(&config).unwrap();
-        assert!(cfg.start_lsn.is_some());
-        assert_eq!(cfg.start_lsn.unwrap().as_u64(), 0x1234_ABCD);
+        let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("start.lsn"));
     }
 
     #[test]
     fn test_from_config_table_include() {
-        let mut config = ConnectorConfig::new("postgres-cdc");
-        config.set("host", "localhost");
-        config.set("database", "db");
-        config.set("slot.name", "s");
-        config.set("publication", "p");
+        let mut config = connector_config();
         config.set("table.include", "public.users, public.orders");
 
         let cfg = PostgresCdcConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.table_include, vec!["public.users", "public.orders"]);
-    }
-
-    // ── TLS cert path fields ──
-
-    #[test]
-    fn test_default_tls_fields_are_none() {
-        let cfg = PostgresCdcConfig::default();
-        assert!(cfg.ca_cert_path.is_none());
-        assert!(cfg.client_cert_path.is_none());
-        assert!(cfg.client_key_path.is_none());
-        assert!(cfg.sni_hostname.is_none());
+        assert_eq!(cfg.table_include, vec!["public.orders", "public.users"]);
     }
 
     #[test]
-    fn test_from_config_tls_cert_paths() {
-        let mut config = ConnectorConfig::new("postgres-cdc");
-        config.set("host", "localhost");
-        config.set("database", "db");
-        config.set("slot.name", "s");
-        config.set("publication", "p");
-        config.set("ssl.mode", "verify-full");
-        config.set("ssl.ca.cert.path", "/certs/ca.pem");
-        config.set("ssl.client.cert.path", "/certs/client.pem");
-        config.set("ssl.client.key.path", "/certs/client-key.pem");
-        config.set("ssl.sni.hostname", "db.example.com");
+    fn table_filters_are_trimmed_nonempty_sorted_and_deduplicated_once() {
+        let mut config = connector_config();
+        config.set(
+            "table.include",
+            " public.users,public.orders,, public.users,   ",
+        );
+        config.set(
+            "table.exclude",
+            " public.audit, ,public.archive,public.audit ",
+        );
 
         let cfg = PostgresCdcConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.ssl_mode, SslMode::VerifyFull);
-        assert_eq!(cfg.ca_cert_path.as_deref(), Some("/certs/ca.pem"));
-        assert_eq!(cfg.client_cert_path.as_deref(), Some("/certs/client.pem"));
+        assert_eq!(cfg.table_include, vec!["public.orders", "public.users"]);
+        assert_eq!(cfg.table_exclude, vec!["public.archive", "public.audit"]);
+        assert!(cfg.should_include_table("public.users"));
+        assert!(!cfg.should_include_table("public.audit"));
+        assert!(!cfg.should_include_table("users"));
+    }
+
+    #[test]
+    fn table_filters_reject_unqualified_or_empty_components() {
+        for table in ["users", ".users", "public."] {
+            let mut config = connector_config();
+            config.set("table.include", table);
+            let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains("schema"), "{table}: {error}");
+        }
+    }
+
+    #[test]
+    fn custom_ca_is_admitted_for_verified_tls() {
+        let mut config = connector_config();
+        config.set("ssl.mode", "verify-full");
+        config.set("ssl.ca.cert.path", "/certs/ca.pem");
+        let parsed = PostgresCdcConfig::from_config(&config).unwrap();
         assert_eq!(
-            cfg.client_key_path.as_deref(),
-            Some("/certs/client-key.pem")
+            parsed.ssl_ca_cert_path,
+            Some(PathBuf::from("/certs/ca.pem"))
         );
-        assert_eq!(cfg.sni_hostname.as_deref(), Some("db.example.com"));
     }
 
     #[test]
-    fn test_validate_verify_ca_requires_ca_path() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.ssl_mode = SslMode::VerifyCa;
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("ssl.ca.cert.path"));
-    }
-
-    #[test]
-    fn test_validate_verify_full_requires_ca_path() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.ssl_mode = SslMode::VerifyFull;
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("ssl.ca.cert.path"));
-    }
-
-    #[test]
-    fn test_validate_verify_ca_with_ca_path_ok() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.ssl_mode = SslMode::VerifyCa;
-        cfg.ca_cert_path = Some("/certs/ca.pem".to_string());
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_validate_client_cert_without_key() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.client_cert_path = Some("/certs/client.pem".to_string());
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("mTLS"));
-    }
-
-    #[test]
-    fn test_validate_client_key_without_cert() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.client_key_path = Some("/certs/client-key.pem".to_string());
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("mTLS"));
-    }
-
-    #[test]
-    fn test_validate_client_cert_and_key_ok() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.client_cert_path = Some("/certs/client.pem".to_string());
-        cfg.client_key_path = Some("/certs/client-key.pem".to_string());
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_require_mode_no_ca_path_ok() {
-        let mut cfg = PostgresCdcConfig::default();
-        cfg.ssl_mode = SslMode::Require;
-        assert!(cfg.validate().is_ok());
+    fn plaintext_rejects_unused_ca_path() {
+        let mut config = connector_config();
+        config.set("ssl.ca.cert.path", "/certs/ca.pem");
+        let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("ssl.mode=verify-full"));
     }
 }

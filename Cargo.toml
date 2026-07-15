@@ -10,6 +10,8 @@ members = [
 exclude = [
     "examples/*",
     "tools/*",
+    "vendor/pgwire",
+    "vendor/pgwire-replication",
 ]
 resolver = "2"
 
@@ -127,6 +129,10 @@ criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.11"
 tempfile = "3.27"
 
+[patch.crates-io]
+pgwire = { path = "vendor/pgwire" }
+pgwire-replication = { path = "vendor/pgwire-replication" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -138,3 +144,9 @@ strip = "debuginfo"
 inherits = "release"
 debug = false
 strip = "debuginfo"
+
+# Optimized real-process fault tests retain the test-only checkpoint gate.
+[profile.soak]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

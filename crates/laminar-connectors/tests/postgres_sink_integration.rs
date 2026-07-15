@@ -10,16 +10,23 @@
 #![cfg(not(target_os = "windows"))]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::{
+    BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SinkConnector;
-use laminar_connectors::postgres::{PostgresSink, PostgresSinkConfig, WriteMode};
+use laminar_connectors::postgres::{
+    register_postgres_sink, PostgresSink, PostgresSinkConfig, WriteMode,
+};
+use laminar_connectors::registry::ConnectorRegistry;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -50,7 +57,7 @@ fn sink_config(host: &str, port: u16, mode: WriteMode) -> PostgresSinkConfig {
     cfg.port = port;
     cfg.write_mode = mode;
     cfg.auto_create_table = true;
-    cfg.batch_size = 1000;
+    cfg.ssl_mode = laminar_connectors::postgres::SslMode::Disable;
     if mode == WriteMode::Upsert {
         cfg.primary_key_columns = vec!["id".to_string()];
     }
@@ -80,6 +87,160 @@ async fn start_pg() -> (testcontainers::ContainerAsync<Postgres>, String, u16) {
     let host = container.get_host().await.expect("get host").to_string();
     let port = container.get_host_port_ipv4(5432).await.expect("get port");
     (container, host, port)
+}
+
+#[tokio::test]
+async fn test_factory_schema_drives_ddl_and_duplicate_upsert_is_last_row_wins() {
+    let (_container, host, port) = start_pg().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("sequence", DataType::Int64, false),
+        Field::new("enabled", DataType::Boolean, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let mut config = ConnectorConfig::new("postgres-sink");
+    config.set("hostname", host.as_str());
+    config.set("port", port.to_string());
+    config.set("database", "postgres");
+    config.set("username", "postgres");
+    config.set("password", "postgres");
+    config.set("table.name", "factory_events");
+    config.set("write.mode", "upsert");
+    config.set("primary.key", "tenant, sequence");
+    config.set("auto.create.table", "true");
+    config.set("ssl.mode", "disable");
+    config.set(
+        "_arrow_schema",
+        laminar_connectors::config::encode_arrow_schema_ipc(schema.as_ref()),
+    );
+
+    let registry = ConnectorRegistry::new();
+    register_postgres_sink(&registry).unwrap();
+    let mut sink = registry.create_sink(&config, None).unwrap();
+    assert_eq!(sink.schema(), schema);
+    sink.open(&config).await.expect("factory sink open");
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["acme", "beta", "acme"])),
+            Arc::new(Int64Array::from(vec![7, 8, 7])),
+            Arc::new(BooleanArray::from(vec![false, true, true])),
+            Arc::new(StringArray::from(vec!["old", "other", "new"])),
+        ],
+    )
+    .unwrap();
+    sink.write_batch(&batch).await.expect("upsert batch");
+    sink.flush().await.expect("upsert flush");
+
+    let pg = connect(&host, port).await;
+    let rows = pg
+        .query(
+            "SELECT tenant, sequence, enabled, payload \
+             FROM public.factory_events ORDER BY tenant",
+            &[],
+        )
+        .await
+        .expect("select factory table");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, &str>(0), "acme");
+    assert_eq!(rows[0].get::<_, i64>(1), 7);
+    assert!(rows[0].get::<_, bool>(2));
+    assert_eq!(rows[0].get::<_, &str>(3), "new");
+    assert_eq!(rows[1].get::<_, &str>(0), "beta");
+
+    sink.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn test_quoted_identifiers_uint64_and_negative_timestamp_upsert() {
+    let (_container, host, port) = start_pg().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("select", DataType::UInt64, false),
+        Field::new(
+            "EventTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("_private", DataType::Utf8, false),
+    ]));
+    let mut config = PostgresSinkConfig::new(&host, "postgres", "Order\"Events");
+    config.username = "postgres".into();
+    config.password = "postgres".into();
+    config.port = port;
+    config.ssl_mode = laminar_connectors::postgres::SslMode::Disable;
+    config.write_mode = WriteMode::Upsert;
+    config.primary_key_columns = vec!["select".into()];
+    config.auto_create_table = true;
+
+    let mut sink = PostgresSink::new(schema.clone(), config, None);
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open quoted sink");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from(vec![u64::try_from(i64::MAX).unwrap()])),
+            Arc::new(TimestampMillisecondArray::from(vec![-1])),
+            Arc::new(StringArray::from(vec!["kept"])),
+        ],
+    )
+    .unwrap();
+    sink.write_batch(&batch).await.expect("write quoted row");
+    sink.flush().await.expect("flush quoted row");
+
+    let pg = connect(&host, port).await;
+    let row = pg
+        .query_one(
+            "SELECT \"select\", \"EventTime\", \"_private\" \
+             FROM \"public\".\"Order\"\"Events\"",
+            &[],
+        )
+        .await
+        .expect("select quoted row");
+    assert_eq!(row.get::<_, i64>(0), i64::MAX);
+    let timestamp = row.get::<_, chrono::NaiveDateTime>(1).and_utc();
+    assert_eq!(timestamp.timestamp(), -1);
+    assert_eq!(timestamp.timestamp_subsec_nanos(), 999_000_000);
+    assert_eq!(row.get::<_, &str>(2), "kept");
+
+    sink.close().await.expect("close quoted sink");
+
+    // COPY must use the same BIGINT contract rather than pgpq's native UInt64-to-NUMERIC mapping.
+    let copy_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]));
+    let mut copy_config = PostgresSinkConfig::new(&host, "postgres", "CopyUInt64");
+    copy_config.username = "postgres".into();
+    copy_config.password = "postgres".into();
+    copy_config.port = port;
+    copy_config.ssl_mode = laminar_connectors::postgres::SslMode::Disable;
+    copy_config.auto_create_table = true;
+    let mut copy_sink = PostgresSink::new(copy_schema.clone(), copy_config, None);
+    copy_sink
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open UInt64 COPY sink");
+    let copy_batch = RecordBatch::try_new(
+        copy_schema,
+        vec![Arc::new(UInt64Array::from(vec![
+            u64::try_from(i64::MAX).unwrap()
+        ]))],
+    )
+    .unwrap();
+    copy_sink
+        .write_batch(&copy_batch)
+        .await
+        .expect("write UInt64 COPY row");
+    copy_sink.flush().await.expect("flush UInt64 COPY row");
+    let copied = pg
+        .query_one("SELECT \"value\" FROM \"public\".\"CopyUInt64\"", &[])
+        .await
+        .unwrap();
+    assert_eq!(copied.get::<_, i64>(0), i64::MAX);
+    copy_sink.close().await.expect("close UInt64 COPY sink");
 }
 
 // ── Append (COPY BINARY) tests ──────────────────────────────────────
@@ -197,41 +358,6 @@ async fn test_upsert_insert_and_update() {
     sink.close().await.expect("close");
 }
 
-// ── Auto-flush on batch_size ────────────────────────────────────────
-
-#[tokio::test]
-async fn test_auto_flush_on_batch_size() {
-    let (_container, host, port) = start_pg().await;
-
-    let mut config = sink_config(&host, port, WriteMode::Append);
-    config.batch_size = 5; // Flush after 5 rows.
-    let mut sink = PostgresSink::new(test_schema(), config, None);
-    sink.open(&ConnectorConfig::new("postgres-sink"))
-        .await
-        .expect("open");
-
-    // Write 6 rows — should trigger auto-flush at >=5.
-    let batch = make_batch(
-        &[1, 2, 3, 4, 5, 6],
-        &["a", "b", "c", "d", "e", "f"],
-        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-    );
-    let result = sink.write_batch(&batch).await.expect("write");
-
-    // Auto-flush happened: records_written > 0.
-    assert!(result.records_written > 0, "expected auto-flush");
-
-    let pg = connect(&host, port).await;
-    let count: i64 = pg
-        .query_one("SELECT COUNT(*) FROM public.test_events", &[])
-        .await
-        .expect("count")
-        .get(0);
-    assert_eq!(count, 6);
-
-    sink.close().await.expect("close");
-}
-
 // ── Auto-create table test ──────────────────────────────────────────
 
 #[tokio::test]
@@ -268,6 +394,41 @@ async fn test_auto_create_table() {
     assert!(exists_after, "table should exist after open");
 
     sink.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn test_statement_timeout_is_applied_to_pool_connections() {
+    let (_container, host, port) = start_pg().await;
+    let mut config = sink_config(&host, port, WriteMode::Append);
+    config.statement_timeout = Duration::from_secs(1);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open");
+
+    let pg = connect(&host, port).await;
+    pg.batch_execute(
+        "CREATE FUNCTION slow_sink_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; \
+         CREATE TRIGGER slow_sink_insert BEFORE INSERT ON public.test_events \
+         FOR EACH ROW EXECUTE FUNCTION slow_sink_insert()",
+    )
+    .await
+    .expect("create slow trigger");
+
+    sink.write_batch(&make_batch(&[1], &["slow"], &[1.0]))
+        .await
+        .expect("buffer slow row");
+    let started = Instant::now();
+    let error = sink
+        .flush()
+        .await
+        .expect_err("server-side statement timeout must cancel COPY");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "statement timeout was not applied: {error}"
+    );
+    sink.close().await.expect("close after timeout");
 }
 
 // ── Changelog (upsert + delete) test ────────────────────────────────

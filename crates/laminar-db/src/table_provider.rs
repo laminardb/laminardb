@@ -61,6 +61,7 @@ impl TableProvider for ReferenceTableProvider {
             .table_store
             .read()
             .to_record_batch(&self.table_name)
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
             .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
 
         let schema = batch.schema();

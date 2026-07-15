@@ -1,91 +1,101 @@
-//! Per-subscriber portal: pump task forwards broadcast updates to the wire.
+//! Per-subscriber cursor over the shared subscription log.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use datafusion::physical_expr::PhysicalExpr;
-use tokio::sync::{broadcast, Notify};
+use futures::FutureExt;
 
-use super::registry::MvUpdate;
+use super::registry::{ChargedUpdate, MvUpdate, SubscriptionRead, SubscriptionReader};
+
+/// Keeps the process-wide subscription charge alive with an emitted batch.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SubscriptionFrameLease {
+    _owner: ChargedUpdate,
+}
+
+impl std::fmt::Debug for SubscriptionFrameLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SubscriptionFrameLease")
+    }
+}
 
 /// One frame emitted toward the wire.
 #[derive(Debug, Clone)]
 pub enum PortalFrame {
     /// Rows produced in a cycle.
-    Batch(RecordBatch),
-    /// Rows preceding this marker are durable as of `epoch`.
+    Batch {
+        /// Arrow rows in the shared-log entry.
+        batch: RecordBatch,
+        /// Physical sequence within this in-memory object incarnation; not a durable resume token.
+        sequence: u64,
+        /// Internal process-memory ownership token.
+        #[doc(hidden)]
+        lease: SubscriptionFrameLease,
+    },
+    /// Progress frontier for a durably committed checkpoint.
     Barrier {
+        /// Physical sequence of this progress entry within the current object incarnation.
+        sequence: u64,
         /// Engine checkpoint epoch.
         epoch: u64,
         /// Engine checkpoint id.
         checkpoint_id: u64,
+        /// Every shared-log entry with sequence below this value is covered by the cut.
+        through_sequence: u64,
     },
-    /// Consumer fell behind by `skipped` messages and the broadcast dropped
-    /// them. The portal closes immediately after this frame; the wire layer
-    /// translates it into a client-visible error so the disconnect isn't
-    /// silent.
+    /// Consumer fell behind by exactly `skipped` shared-log entries. This is
+    /// terminal because continuing would hide rows or checkpoint markers.
     Lagged(u64),
+    /// The subscription cannot continue without returning an invalid result.
+    Error {
+        /// Human-readable failure detail.
+        message: String,
+    },
 }
 
-const OUTBOUND_CAPACITY: usize = 256;
-pub(crate) const MAX_SUBSCRIBERS_PER_MV: usize = 64;
-
-/// One SUBSCRIBE consumer.
+/// One `SUBSCRIBE` consumer.
 #[derive(Debug)]
 pub struct SubscriptionPortal {
+    name: String,
     schema: SchemaRef,
-    outbound: AsyncRx<mpsc::Array<PortalFrame>>,
-    closed: Arc<AtomicBool>,
-    wake: Arc<Notify>,
+    reader: Option<SubscriptionReader>,
+    closed: bool,
+    filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
 impl SubscriptionPortal {
     pub(crate) fn open(
         name: impl Into<String>,
         schema: SchemaRef,
-        replay: Vec<MvUpdate>,
-        rx: broadcast::Receiver<MvUpdate>,
+        reader: SubscriptionReader,
     ) -> Self {
-        Self::spawn(name, schema, replay, rx, None)
+        Self::new_inner(name, schema, reader, None)
     }
 
     pub(crate) fn open_with_filter(
         name: impl Into<String>,
         schema: SchemaRef,
-        replay: Vec<MvUpdate>,
-        rx: broadcast::Receiver<MvUpdate>,
+        reader: SubscriptionReader,
         filter: Arc<dyn PhysicalExpr>,
     ) -> Self {
-        Self::spawn(name, schema, replay, rx, Some(filter))
+        Self::new_inner(name, schema, reader, Some(filter))
     }
 
-    fn spawn(
+    fn new_inner(
         name: impl Into<String>,
         schema: SchemaRef,
-        replay: Vec<MvUpdate>,
-        rx: broadcast::Receiver<MvUpdate>,
+        reader: SubscriptionReader,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
-        let (tx, outbound) = mpsc::bounded_async::<PortalFrame>(OUTBOUND_CAPACITY);
-        let closed = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new(Notify::new());
-        tokio::spawn(pump_loop(
-            name.into(),
-            replay,
-            rx,
-            tx,
-            Arc::clone(&closed),
-            Arc::clone(&wake),
-            filter,
-        ));
         Self {
+            name: name.into(),
             schema,
-            outbound,
-            closed,
-            wake,
+            reader: Some(reader),
+            closed: false,
+            filter,
         }
     }
 
@@ -95,22 +105,105 @@ impl SubscriptionPortal {
         Arc::clone(&self.schema)
     }
 
-    /// Next frame, or `None` once the pump exits.
+    /// Next frame, or `None` after a terminal frame or explicit close.
     pub async fn next_frame(&mut self) -> Option<PortalFrame> {
-        self.outbound.recv().await.ok()
+        if self.closed {
+            return None;
+        }
+
+        loop {
+            let read = self.reader.as_mut()?.next().await;
+            if let Some(frame) = self.process_read(read) {
+                return Some(frame);
+            }
+        }
     }
 
-    /// Signal the pump to stop. Idempotent. Wakes the pump if it's parked
-    /// on `broadcast_rx.recv()` so it can re-check the flag and exit.
-    pub fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.wake.notify_waiters();
+    /// Return the next immediately available frame without waiting.
+    pub fn try_next_frame(&mut self) -> Option<PortalFrame> {
+        if self.closed {
+            return None;
+        }
+
+        loop {
+            let read = self.reader.as_mut()?.next().now_or_never()?;
+            if let Some(frame) = self.process_read(read) {
+                return Some(frame);
+            }
+        }
+    }
+
+    fn process_read(&mut self, read: SubscriptionRead) -> Option<PortalFrame> {
+        let frame = match read {
+            SubscriptionRead::Update { sequence, update } => translate(sequence, update),
+            SubscriptionRead::Lagged(skipped) => {
+                tracing::warn!(
+                    subscription = %self.name,
+                    skipped,
+                    "subscription cursor was evicted; closing"
+                );
+                self.close();
+                return Some(PortalFrame::Lagged(skipped));
+            }
+            SubscriptionRead::Terminal(message) => {
+                tracing::warn!(
+                    subscription = %self.name,
+                    %message,
+                    "subscription log terminated; closing"
+                );
+                self.close();
+                return Some(PortalFrame::Error { message });
+            }
+        };
+
+        let PortalFrame::Batch {
+            batch,
+            sequence,
+            lease,
+        } = frame
+        else {
+            if matches!(&frame, PortalFrame::Error { .. }) {
+                self.close();
+            }
+            return Some(frame);
+        };
+        let Some(filter) = self.filter.as_ref() else {
+            return Some(PortalFrame::Batch {
+                batch,
+                sequence,
+                lease,
+            });
+        };
+        match crate::filter_compile::apply(&batch, filter.as_ref()) {
+            Ok(Some(filtered)) => Some(PortalFrame::Batch {
+                batch: filtered,
+                sequence,
+                lease,
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    subscription = %self.name,
+                    %error,
+                    "subscription filter failed; closing"
+                );
+                let message = error.to_string();
+                self.close();
+                Some(PortalFrame::Error { message })
+            }
+        }
+    }
+
+    /// Stop reading and release the subscriber registration. Idempotent.
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.reader = None;
     }
 
     /// True after `close()` has been called.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.closed
     }
 }
 
@@ -120,82 +213,29 @@ impl Drop for SubscriptionPortal {
     }
 }
 
-/// `Ok(None)` when the filter excluded the batch; `Err(())` when the
-/// filter itself failed (caller should close the pump).
-fn translate(
-    msg: MvUpdate,
-    filter: Option<&Arc<dyn PhysicalExpr>>,
-    name: &str,
-) -> Result<Option<PortalFrame>, ()> {
-    match msg {
-        MvUpdate::Batch(batch) => match filter {
-            Some(f) => match crate::filter_compile::apply(&batch, f.as_ref()) {
-                Ok(Some(b)) => Ok(Some(PortalFrame::Batch(b))),
-                Ok(None) => Ok(None),
-                Err(e) => {
-                    tracing::warn!(subscription = %name, error = %e, "filter failed; closing");
-                    Err(())
-                }
-            },
-            None => Ok(Some(PortalFrame::Batch(batch))),
-        },
+fn translate(sequence: u64, update: ChargedUpdate) -> PortalFrame {
+    match update.as_ref() {
+        MvUpdate::Batch(batch) => {
+            let batch = batch.clone();
+            PortalFrame::Batch {
+                batch,
+                sequence,
+                lease: SubscriptionFrameLease { _owner: update },
+            }
+        }
         MvUpdate::Barrier {
             epoch,
             checkpoint_id,
-        } => Ok(Some(PortalFrame::Barrier {
-            epoch,
-            checkpoint_id,
-        })),
-    }
-}
-
-async fn pump_loop(
-    name: String,
-    replay: Vec<MvUpdate>,
-    mut broadcast_rx: broadcast::Receiver<MvUpdate>,
-    tx: MAsyncTx<mpsc::Array<PortalFrame>>,
-    closed: Arc<AtomicBool>,
-    wake: Arc<Notify>,
-    filter: Option<Arc<dyn PhysicalExpr>>,
-) {
-    for msg in replay {
-        if closed.load(Ordering::Acquire) {
-            return;
-        }
-        match translate(msg, filter.as_ref(), &name) {
-            Ok(Some(frame)) => {
-                if tx.send(frame).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => {}
-            Err(()) => return,
-        }
-    }
-    while !closed.load(Ordering::Acquire) {
-        let recv = tokio::select! {
-            biased;
-            () = wake.notified() => continue,
-            r = broadcast_rx.recv() => r,
-        };
-        let msg = match recv {
-            Ok(m) => m,
-            Err(broadcast::error::RecvError::Closed) => return,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(subscription = %name, skipped = n, "lagged; closing");
-                let _ = tx.send(PortalFrame::Lagged(n)).await;
-                return;
-            }
-        };
-        match translate(msg, filter.as_ref(), &name) {
-            Ok(Some(frame)) => {
-                if tx.send(frame).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => {}
-            Err(()) => return,
-        }
+            through_sequence,
+        } => PortalFrame::Barrier {
+            sequence,
+            epoch: *epoch,
+            checkpoint_id: *checkpoint_id,
+            through_sequence: *through_sequence,
+        },
+        MvUpdate::Error(message) => PortalFrame::Error {
+            message: message.clone(),
+        },
     }
 }
 
@@ -204,139 +244,253 @@ mod tests {
     use std::sync::Arc as StdArc;
     use std::time::Duration;
 
-    use arrow_array::Int64Array;
+    use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::super::registry::{SubscribeStart, SubscriptionRegistry};
+    use super::super::registry::{
+        approx_size, MvUpdate, SubscribeStart, SubscriptionRegistry, MAX_LIVE_BATCH_BYTES,
+    };
     use super::*;
 
     fn schema() -> SchemaRef {
         StdArc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    fn batch(ids: &[i64]) -> RecordBatch {
-        RecordBatch::try_new(schema(), vec![StdArc::new(Int64Array::from(ids.to_vec()))]).unwrap()
+    fn batch(ids: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(schema(), vec![StdArc::new(Int64Array::from(ids))]).unwrap()
+    }
+
+    fn open(registry: &SubscriptionRegistry, start: SubscribeStart) -> SubscriptionPortal {
+        let reader = registry.subscribe("mv", start).unwrap();
+        SubscriptionPortal::open("mv", schema(), reader)
     }
 
     #[tokio::test]
     async fn portal_forwards_batch_and_barrier() {
-        let reg = SubscriptionRegistry::new();
-        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
-        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
+        let registry = SubscriptionRegistry::new();
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        registry.send_batch("mv", batch(vec![1, 2])).unwrap();
+        registry.broadcast_barrier(7, 99);
 
-        reg.send_batch("mv", batch(&[1, 2]));
-        reg.broadcast_barrier(7, 99);
+        assert!(matches!(
+            portal.next_frame().await,
+            Some(PortalFrame::Batch { batch, sequence: 0, .. }) if batch.num_rows() == 2
+        ));
+        assert!(matches!(
+            portal.next_frame().await,
+            Some(PortalFrame::Barrier {
+                sequence: 1,
+                epoch: 7,
+                checkpoint_id: 99,
+                through_sequence: 1,
+            })
+        ));
+    }
 
-        let f1 = portal.next_frame().await.expect("frame 1");
-        let PortalFrame::Batch(b) = f1 else {
-            panic!("expected batch, got {f1:?}");
-        };
-        assert_eq!(b.num_rows(), 2);
+    #[test]
+    fn portal_try_next_is_non_blocking_and_ordered() {
+        let registry = SubscriptionRegistry::new();
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        assert!(portal.try_next_frame().is_none());
 
-        let f2 = portal.next_frame().await.expect("frame 2");
-        let PortalFrame::Barrier {
-            epoch,
-            checkpoint_id,
-        } = f2
-        else {
-            panic!("expected barrier, got {f2:?}");
-        };
-        assert_eq!(epoch, 7);
-        assert_eq!(checkpoint_id, 99);
+        registry.send_batch("mv", batch(vec![1])).unwrap();
+        registry.broadcast_barrier(3, 4);
+        assert!(matches!(
+            portal.try_next_frame(),
+            Some(PortalFrame::Batch { batch, sequence: 0, .. }) if batch.num_rows() == 1
+        ));
+        assert!(matches!(
+            portal.try_next_frame(),
+            Some(PortalFrame::Barrier {
+                sequence: 1,
+                epoch: 3,
+                checkpoint_id: 4,
+                through_sequence: 1,
+            })
+        ));
+        assert!(portal.try_next_frame().is_none());
     }
 
     #[tokio::test]
-    async fn portal_closes_on_drop_name() {
-        let reg = SubscriptionRegistry::new();
-        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
-        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
-
-        reg.send_batch("mv", batch(&[1]));
-        let _ = portal.next_frame().await;
-
-        reg.drop_name("mv");
+    async fn portal_reports_object_drop_then_closes() {
+        let registry = SubscriptionRegistry::new();
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        assert!(registry.drop_name("mv"));
 
         let frame = tokio::time::timeout(Duration::from_millis(500), portal.next_frame())
             .await
             .unwrap();
-        assert!(frame.is_none());
+        assert!(matches!(
+            frame,
+            Some(PortalFrame::Error { message }) if message == "object dropped"
+        ));
+        assert!(portal.next_frame().await.is_none());
     }
 
     #[tokio::test]
-    async fn portal_emits_lagged_as_final_frame() {
-        let reg = SubscriptionRegistry::new();
-        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
-        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
-
-        for i in 0..1024 {
-            reg.send_batch("mv", batch(&[i]));
+    async fn portal_emits_exact_lag_as_final_frame() {
+        let registry = SubscriptionRegistry::new();
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        let rows = (MAX_LIVE_BATCH_BYTES / 2) / std::mem::size_of::<i64>();
+        for value in 0..6_i64 {
+            registry.send_batch("mv", batch(vec![value; rows])).unwrap();
         }
 
-        let frames = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut frames = Vec::new();
-            while let Some(frame) = portal.next_frame().await {
-                frames.push(frame);
-            }
-            frames
-        })
-        .await
-        .expect("portal must close after lag");
-
-        assert!(
-            matches!(frames.last(), Some(PortalFrame::Lagged(_))),
-            "last frame must be Lagged, got: {:?}",
-            frames.last()
-        );
+        assert!(matches!(
+            portal.next_frame().await,
+            Some(PortalFrame::Lagged(skipped)) if skipped > 0
+        ));
+        assert!(portal.next_frame().await.is_none());
     }
 
     #[tokio::test]
-    async fn portal_drains_replay_before_live() {
-        let reg = SubscriptionRegistry::new();
-        reg.configure("mv", 1 << 20);
+    async fn portal_reads_shared_as_of_suffix_before_new_live_entries() {
+        let registry = SubscriptionRegistry::new();
+        registry.configure("mv", 1 << 20);
+        registry.broadcast_barrier(1, 1);
+        registry.send_batch("mv", batch(vec![10])).unwrap();
+        registry.broadcast_barrier(2, 2);
+        registry.send_batch("mv", batch(vec![20])).unwrap();
+        let mut portal = open(&registry, SubscribeStart::AsOfEpoch(1));
+        registry.send_batch("mv", batch(vec![30])).unwrap();
 
-        // Two epochs of pre-existing history.
-        reg.broadcast_barrier(1, 1);
-        reg.send_batch("mv", batch(&[10]));
-        reg.broadcast_barrier(2, 2);
-        reg.send_batch("mv", batch(&[20]));
-
-        // Subscribe AS OF EPOCH 1: the client has everything up to and
-        // including the epoch-1 barrier; replay must cover everything after
-        // it. That's batch[10], then barrier(2), then batch[20].
-        let (replay, rx) = reg.subscribe("mv", SubscribeStart::AsOfEpoch(1)).unwrap();
-        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
-
-        reg.send_batch("mv", batch(&[30]));
-
-        let mut row_seq = Vec::new();
+        let mut rows = Vec::new();
         let mut barriers = Vec::new();
         for _ in 0..4 {
             match portal.next_frame().await.unwrap() {
-                PortalFrame::Batch(b) => {
-                    let v = b
+                PortalFrame::Batch { batch, .. } => rows.push(
+                    batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .unwrap()
-                        .value(0);
-                    row_seq.push(v);
-                }
+                        .value(0),
+                ),
                 PortalFrame::Barrier { epoch, .. } => barriers.push(epoch),
-                PortalFrame::Lagged(n) => panic!("unexpected lag: {n}"),
+                PortalFrame::Lagged(skipped) => panic!("unexpected lag of {skipped}"),
+                PortalFrame::Error { message } => panic!("unexpected error: {message}"),
             }
         }
-        assert_eq!(row_seq, vec![10, 20, 30]);
+        assert_eq!(rows, vec![10, 20, 30]);
         assert_eq!(barriers, vec![2]);
     }
 
-    #[tokio::test]
-    async fn close_is_idempotent() {
-        let reg = SubscriptionRegistry::new();
-        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
-        let portal = SubscriptionPortal::open("mv", schema(), replay, rx);
+    #[test]
+    fn close_releases_registration_once() {
+        let registry = SubscriptionRegistry::new();
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        assert_eq!(registry.subscriber_count("mv"), 1);
+        portal.close();
+        portal.close();
+        assert_eq!(registry.subscriber_count("mv"), 0);
+    }
 
-        portal.close();
-        portal.close();
-        assert!(portal.is_closed());
+    #[tokio::test]
+    async fn held_batch_frame_blocks_process_budget_reuse() {
+        let sample = batch(vec![1, 2, 3]);
+        let entry_bytes = approx_size(&MvUpdate::Batch(sample.clone()));
+        let registry = SubscriptionRegistry::with_storage_budget(entry_bytes);
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        registry.send_batch("mv", sample.clone()).unwrap();
+
+        let frame = portal.next_frame().await.unwrap();
+        assert!(matches!(&frame, PortalFrame::Batch { .. }));
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+
+        registry.configure("contender", entry_bytes.saturating_mul(4));
+        assert!(registry.send_batch("contender", sample.clone()).is_err());
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+
+        drop(frame);
+        assert_eq!(registry.charged_bytes(), 0);
+        registry.configure("replacement", entry_bytes.saturating_mul(4));
+        registry.send_batch("replacement", sample).unwrap();
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+    }
+
+    #[tokio::test]
+    async fn two_portals_share_one_charge_until_both_frames_drop() {
+        let sample = batch(vec![1, 2, 3]);
+        let entry_bytes = approx_size(&MvUpdate::Batch(sample.clone()));
+        let registry = SubscriptionRegistry::with_storage_budget(entry_bytes);
+        let mut first = open(&registry, SubscribeStart::Tail);
+        let mut second = open(&registry, SubscribeStart::Tail);
+        registry.send_batch("mv", sample).unwrap();
+
+        let first_frame = first.next_frame().await.unwrap();
+        let second_frame = second.next_frame().await.unwrap();
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+
+        drop(first_frame);
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+        drop(second_frame);
+        assert_eq!(registry.charged_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn filtered_batch_keeps_the_original_entry_charge() {
+        let sample = batch(vec![-1, 2]);
+        let entry_bytes = approx_size(&MvUpdate::Batch(sample.clone()));
+        let registry = SubscriptionRegistry::with_storage_budget(entry_bytes);
+        let reader = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
+        let context = datafusion::prelude::SessionContext::new();
+        let filter = crate::filter_compile::compile(&context, "id > 0", &schema())
+            .await
+            .unwrap();
+        let mut portal = SubscriptionPortal::open_with_filter("mv", schema(), reader, filter);
+        registry.send_batch("mv", sample).unwrap();
+
+        let frame = portal.next_frame().await.unwrap();
+        assert!(matches!(
+            &frame,
+            PortalFrame::Batch { batch, .. } if batch.num_rows() == 1
+        ));
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+
+        drop(frame);
+        assert_eq!(registry.charged_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn object_drop_does_not_release_a_held_frame_charge() {
+        let sample = batch(vec![1]);
+        let entry_bytes = approx_size(&MvUpdate::Batch(sample.clone()));
+        let registry = SubscriptionRegistry::with_storage_budget(entry_bytes);
+        let mut portal = open(&registry, SubscribeStart::Tail);
+        registry.send_batch("mv", sample).unwrap();
+        let frame = portal.next_frame().await.unwrap();
+
+        assert!(registry.drop_name("mv"));
+        assert_eq!(registry.charged_bytes(), entry_bytes);
+
+        drop(frame);
+        assert_eq!(registry.charged_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_evaluation_failure_is_terminal_and_visible() {
+        let registry = SubscriptionRegistry::new();
+        let reader = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
+        let context = datafusion::prelude::SessionContext::new();
+        let filter = crate::filter_compile::compile(&context, "id > 0", &schema())
+            .await
+            .unwrap();
+        let mut portal = SubscriptionPortal::open_with_filter("mv", schema(), reader, filter);
+
+        let incompatible_schema =
+            StdArc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let incompatible = RecordBatch::try_new(
+            incompatible_schema,
+            vec![StdArc::new(arrow_array::StringArray::from(vec!["bad"]))],
+        )
+        .unwrap();
+        registry.send_batch("mv", incompatible).unwrap();
+
+        assert!(matches!(
+            portal.next_frame().await,
+            Some(PortalFrame::Error { message }) if message.contains("filter")
+        ));
+        assert!(portal.next_frame().await.is_none());
+        assert_eq!(registry.subscriber_count("mv"), 0);
     }
 }

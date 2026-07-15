@@ -1,23 +1,124 @@
 //! DDL handlers — reopens `impl LaminarDB` to keep `db.rs` focused on dispatch.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::physical_plan::ExecutionPlan;
+use laminar_core::catalog::CatalogObjectKind;
 use laminar_sql::parser::StreamingStatement;
 use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
 
 use crate::connector_manager::normalize_connector_type;
-use crate::db::{parse_duration_str, LaminarDB};
+use crate::db::{
+    canonical_object_name, exact_table_reference, parse_duration_str, DbState, LaminarDB,
+};
 use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
+use crate::pipeline::{ControlMutation, ControlMutationState};
+
+pub(crate) const CONTROL_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum ControlAck {
+    Response(Result<(), DbError>),
+    Closed,
+    TimedOut,
+}
+
+async fn resolve_control_ack(
+    operation: &str,
+    acknowledgement: tokio::sync::oneshot::Receiver<Result<(), DbError>>,
+    mutation: &ControlMutation,
+) -> Result<(), DbError> {
+    let acknowledgement = match tokio::time::timeout(CONTROL_ACK_DEADLINE, acknowledgement).await {
+        Ok(Ok(response)) => ControlAck::Response(response),
+        Ok(Err(_)) => ControlAck::Closed,
+        Err(_) => ControlAck::TimedOut,
+    };
+
+    // The mutation CAS, not delivery of the best-effort acknowledgement, is the
+    // linearization point. This also closes the timeout/receiver-drop race: either
+    // the coordinator applied first or the caller atomically prevents application.
+    match mutation.cancel() {
+        ControlMutationState::Applied => {
+            match acknowledgement {
+                ControlAck::Response(Err(ref error)) => tracing::warn!(
+                    operation,
+                    error = %error,
+                    "control mutation was applied before an inconsistent error acknowledgement"
+                ),
+                ControlAck::Closed => tracing::warn!(
+                    operation,
+                    "control mutation was applied but its acknowledgement sender closed"
+                ),
+                ControlAck::TimedOut => tracing::warn!(
+                    operation,
+                    "control mutation was applied but its acknowledgement missed the deadline"
+                ),
+                ControlAck::Response(Ok(())) => {}
+            }
+            Ok(())
+        }
+        ControlMutationState::Cancelled => match acknowledgement {
+            ControlAck::Response(Err(error)) => Err(error),
+            ControlAck::Response(Ok(())) => Err(DbError::Pipeline(format!(
+                "pipeline acknowledged {operation} without committing it"
+            ))),
+            ControlAck::Closed => Err(DbError::Pipeline(format!(
+                "pipeline stopped before acknowledging {operation}"
+            ))),
+            ControlAck::TimedOut => Err(DbError::Pipeline(format!(
+                "pipeline did not acknowledge {operation} within {} seconds",
+                CONTROL_ACK_DEADLINE.as_secs()
+            ))),
+        },
+        ControlMutationState::Pending => {
+            unreachable!("cancelling a control mutation must resolve pending state")
+        }
+    }
+}
 
 /// Which connector registry `prepare_connector` validates against.
 #[derive(Clone, Copy)]
 enum ConnectorKind {
     Source,
     Sink,
+}
+
+pub(crate) struct CatalogNameReservation<'a> {
+    db: &'a LaminarDB,
+    name: String,
+    kind: CatalogObjectKind,
+    control_mutation: Option<Arc<ControlMutation>>,
+    committed: bool,
+}
+
+impl CatalogNameReservation<'_> {
+    fn bind_control_mutation(&mut self, mutation: Arc<ControlMutation>) {
+        debug_assert!(self.control_mutation.is_none());
+        self.control_mutation = Some(mutation);
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CatalogNameReservation<'_> {
+    fn drop(&mut self) {
+        let applied = self
+            .control_mutation
+            .as_ref()
+            .is_some_and(|mutation| mutation.state() == ControlMutationState::Applied);
+        if !self.committed && !applied {
+            self.db.rollback_catalog_create_or_fence(
+                &self.name,
+                self.kind,
+                "catalog create rollback",
+            );
+        }
+    }
 }
 
 /// Incremental-emit store decision for a non-windowed MV.
@@ -30,6 +131,75 @@ enum IncEmit {
     None,
 }
 
+struct StreamCreateGuard<'a> {
+    db: &'a LaminarDB,
+    name: String,
+    mutation: Arc<ControlMutation>,
+}
+
+impl Drop for StreamCreateGuard<'_> {
+    fn drop(&mut self) {
+        if self.mutation.cancel() != ControlMutationState::Applied {
+            self.db.rollback_catalog_create_or_fence(
+                &self.name,
+                CatalogObjectKind::Stream,
+                "stream create rollback",
+            );
+        }
+    }
+}
+
+struct MaterializedViewCreateGuard<'a> {
+    db: &'a LaminarDB,
+    name: String,
+    mutation: Arc<ControlMutation>,
+}
+
+impl Drop for MaterializedViewCreateGuard<'_> {
+    fn drop(&mut self) {
+        if self.mutation.cancel() != ControlMutationState::Applied {
+            self.db.rollback_catalog_create_or_fence(
+                &self.name,
+                CatalogObjectKind::MaterializedView,
+                "materialized-view create rollback",
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogDropTarget {
+    name: String,
+    kind: CatalogObjectKind,
+}
+
+struct StreamingDropGuard<'a> {
+    db: &'a LaminarDB,
+    targets: Vec<CatalogDropTarget>,
+    mutation: Arc<ControlMutation>,
+    finished: bool,
+}
+
+impl StreamingDropGuard<'_> {
+    fn finish(mut self) -> Result<(), DbError> {
+        debug_assert_eq!(self.mutation.state(), ControlMutationState::Applied);
+        let result = self
+            .db
+            .teardown_catalog_targets(&self.targets, "catalog drop");
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for StreamingDropGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished && self.mutation.cancel() == ControlMutationState::Applied {
+            self.db
+                .teardown_catalog_targets_or_fence(&self.targets, "cancelled catalog drop");
+        }
+    }
+}
+
 /// Reject object names in the reserved `laminar` namespace, which is owned by
 /// the system catalog (`laminar.models`, `laminar.ai_calls`).
 fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
@@ -40,6 +210,87 @@ fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
         )));
     }
     Ok(())
+}
+
+fn contains_builtin_join_without_cluster_lifecycle(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::joins::{
+        CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PiecewiseMergeJoinExec, SortMergeJoinExec,
+        SymmetricHashJoinExec,
+    };
+
+    let plan_type = plan.as_any();
+    plan_type.is::<CrossJoinExec>()
+        || plan_type.is::<HashJoinExec>()
+        || plan_type.is::<NestedLoopJoinExec>()
+        || plan_type.is::<PiecewiseMergeJoinExec>()
+        || plan_type.is::<SortMergeJoinExec>()
+        || plan_type.is::<SymmetricHashJoinExec>()
+        || plan
+            .children()
+            .into_iter()
+            .any(contains_builtin_join_without_cluster_lifecycle)
+}
+
+fn unsupported_cluster_aggregate(
+    plan: &Arc<dyn ExecutionPlan>,
+    reads_changelog: bool,
+) -> Option<String> {
+    use datafusion::physical_plan::aggregates::AggregateExec;
+
+    if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
+        if !aggregate.group_expr().expr().is_empty() {
+            return Some(
+                "keyed aggregates retain operator-owned map state without a live-state byte budget"
+                    .into(),
+            );
+        }
+        for expression in aggregate.aggr_expr() {
+            let name = expression.fun().name().to_ascii_lowercase();
+            if expression.is_distinct() {
+                return Some(format!(
+                    "DISTINCT aggregate '{name}' has unbounded per-key state and no spillable vnode lifecycle"
+                ));
+            }
+            let extrema = matches!(name.as_str(), "min" | "max");
+            if reads_changelog && extrema {
+                return Some(format!(
+                    "aggregate '{name}' over a changelog uses an unbounded counted multiset and has no spillable vnode lifecycle"
+                ));
+            }
+            // These are the only aggregate state formats exercised by the vnode checkpoint and
+            // rebalance path. Expand this list only with recovery and resource-bound tests.
+            let bounded = matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max");
+            if !bounded {
+                return Some(format!(
+                    "aggregate '{name}' has unbounded or unclassified per-key state and no spillable vnode lifecycle"
+                ));
+            }
+        }
+    }
+    plan.children()
+        .into_iter()
+        .find_map(|child| unsupported_cluster_aggregate(child, reads_changelog))
+}
+
+fn distinct_streaming_aggregate(sql: &str) -> Option<String> {
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.first()? else {
+        return None;
+    };
+    laminar_sql::parser::aggregation_parser::analyze_aggregates(statement.as_ref())
+        .aggregates
+        .into_iter()
+        .find(|aggregate| aggregate.distinct)
+        .map(|aggregate| format!("{:?}", aggregate.aggregate_type).to_ascii_lowercase())
+}
+
+pub(crate) struct PlannedStreamingQuery {
+    pub(crate) emit_clause: Option<laminar_sql::parser::EmitClause>,
+    pub(crate) window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
+    pub(crate) order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
+    pub(crate) join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
+    pub(crate) has_analytic: bool,
+    pub(crate) has_frame: bool,
 }
 
 /// Terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
@@ -58,59 +309,321 @@ struct CreateTableWith {
     connector_options: HashMap<String, String>,
     format: Option<String>,
     format_options: HashMap<String, String>,
-    refresh_mode: Option<laminar_connectors::reference::RefreshMode>,
-    cache_mode: Option<crate::table_cache_mode::TableCacheMode>,
-    cache_max_entries: Option<usize>,
-    cache_max_bytes: Option<usize>,
-    cache_ttl: Option<std::time::Duration>,
     storage: Option<String>,
 }
 
-fn build_table_fields(create: &sqlparser::ast::CreateTable) -> Result<Vec<Field>, DbError> {
-    create
-        .columns
-        .iter()
-        .map(|col| {
-            let data_type = streaming_ddl::sql_type_to_arrow(&col.data_type).map_err(|e| {
-                DbError::InvalidOperation(format!(
-                    "unsupported column type for '{}': {e}",
-                    col.name
-                ))
-            })?;
-            let nullable = !col
-                .options
-                .iter()
-                .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
-            Ok(Field::new(col.name.value.clone(), data_type, nullable))
-        })
-        .collect()
+/// Reject every `sqlparser` CREATE TABLE extension that `LaminarDB` does not
+/// implement. Keep this destructuring exhaustive: a parser upgrade that adds a
+/// field must make this function fail to compile until its semantics are
+/// reviewed.
+fn validate_create_table_envelope(create: &sqlparser::ast::CreateTable) -> Result<(), DbError> {
+    let sqlparser::ast::CreateTable {
+        or_replace: _,
+        temporary: _,
+        external: _,
+        dynamic: _,
+        global: _,
+        if_not_exists: _,
+        transient: _,
+        volatile: _,
+        iceberg: _,
+        name: _,
+        columns: _,
+        constraints: _,
+        hive_distribution: _,
+        hive_formats: _,
+        table_options: _,
+        file_format: _,
+        location: _,
+        query: _,
+        without_rowid: _,
+        like: _,
+        clone: _,
+        version: _,
+        comment: _,
+        on_commit: _,
+        on_cluster: _,
+        primary_key: _,
+        order_by: _,
+        partition_by: _,
+        cluster_by: _,
+        clustered_by: _,
+        inherits: _,
+        strict: _,
+        copy_grants: _,
+        enable_schema_evolution: _,
+        change_tracking: _,
+        data_retention_time_in_days: _,
+        max_data_extension_time_in_days: _,
+        default_ddl_collation: _,
+        with_aggregation_policy: _,
+        with_row_access_policy: _,
+        with_tags: _,
+        external_volume: _,
+        base_location: _,
+        catalog: _,
+        catalog_sync: _,
+        storage_serialization_policy: _,
+        target_lag: _,
+        warehouse: _,
+        refresh_mode: _,
+        initialize: _,
+        require_user: _,
+    } = create;
+
+    if create.or_replace {
+        return Err(DbError::InvalidOperation(
+            "CREATE OR REPLACE TABLE is unsupported; use DROP TABLE followed by CREATE TABLE"
+                .into(),
+        ));
+    }
+
+    macro_rules! reject_clause {
+        ($condition:expr, $clause:literal) => {
+            if $condition {
+                return Err(DbError::InvalidOperation(format!(
+                    "CREATE TABLE clause '{}' is unsupported",
+                    $clause
+                )));
+            }
+        };
+    }
+
+    reject_clause!(create.temporary, "TEMPORARY");
+    reject_clause!(create.external, "EXTERNAL");
+    reject_clause!(create.dynamic, "DYNAMIC");
+    reject_clause!(create.global.is_some(), "GLOBAL/LOCAL");
+    reject_clause!(create.transient, "TRANSIENT");
+    reject_clause!(create.volatile, "VOLATILE");
+    reject_clause!(create.iceberg, "ICEBERG");
+    reject_clause!(
+        !matches!(
+            &create.hive_distribution,
+            sqlparser::ast::HiveDistributionStyle::NONE
+        ),
+        "Hive distribution"
+    );
+    reject_clause!(
+        create
+            .hive_formats
+            .as_ref()
+            .is_some_and(|formats| formats != &sqlparser::ast::HiveFormat::default()),
+        "Hive format"
+    );
+    reject_clause!(create.file_format.is_some(), "STORED AS");
+    reject_clause!(create.location.is_some(), "LOCATION");
+    reject_clause!(create.query.is_some(), "AS query");
+    reject_clause!(create.without_rowid, "WITHOUT ROWID");
+    reject_clause!(create.like.is_some(), "LIKE");
+    reject_clause!(create.clone.is_some(), "CLONE");
+    reject_clause!(create.version.is_some(), "VERSION");
+    reject_clause!(create.comment.is_some(), "COMMENT");
+    reject_clause!(create.on_commit.is_some(), "ON COMMIT");
+    reject_clause!(create.on_cluster.is_some(), "ON CLUSTER");
+    reject_clause!(create.primary_key.is_some(), "top-level PRIMARY KEY");
+    reject_clause!(create.order_by.is_some(), "ORDER BY");
+    reject_clause!(create.partition_by.is_some(), "PARTITION BY");
+    reject_clause!(create.cluster_by.is_some(), "CLUSTER BY");
+    reject_clause!(create.clustered_by.is_some(), "CLUSTERED BY");
+    reject_clause!(create.inherits.is_some(), "INHERITS");
+    reject_clause!(create.strict, "STRICT");
+    reject_clause!(create.copy_grants, "COPY GRANTS");
+    reject_clause!(
+        create.enable_schema_evolution.is_some(),
+        "ENABLE_SCHEMA_EVOLUTION"
+    );
+    reject_clause!(create.change_tracking.is_some(), "CHANGE_TRACKING");
+    reject_clause!(
+        create.data_retention_time_in_days.is_some(),
+        "DATA_RETENTION_TIME_IN_DAYS"
+    );
+    reject_clause!(
+        create.max_data_extension_time_in_days.is_some(),
+        "MAX_DATA_EXTENSION_TIME_IN_DAYS"
+    );
+    reject_clause!(
+        create.default_ddl_collation.is_some(),
+        "DEFAULT_DDL_COLLATION"
+    );
+    reject_clause!(
+        create.with_aggregation_policy.is_some(),
+        "AGGREGATION POLICY"
+    );
+    reject_clause!(create.with_row_access_policy.is_some(), "ROW ACCESS POLICY");
+    reject_clause!(create.with_tags.is_some(), "TAG");
+    reject_clause!(create.external_volume.is_some(), "EXTERNAL_VOLUME");
+    reject_clause!(create.base_location.is_some(), "BASE_LOCATION");
+    reject_clause!(create.catalog.is_some(), "CATALOG");
+    reject_clause!(create.catalog_sync.is_some(), "CATALOG_SYNC");
+    reject_clause!(
+        create.storage_serialization_policy.is_some(),
+        "STORAGE_SERIALIZATION_POLICY"
+    );
+    reject_clause!(create.target_lag.is_some(), "TARGET_LAG");
+    reject_clause!(create.warehouse.is_some(), "WAREHOUSE");
+    reject_clause!(create.refresh_mode.is_some(), "REFRESH_MODE");
+    reject_clause!(create.initialize.is_some(), "INITIALIZE");
+    reject_clause!(create.require_user, "REQUIRE USER");
+    Ok(())
 }
 
-fn extract_primary_key(create: &sqlparser::ast::CreateTable) -> Option<String> {
-    for col in &create.columns {
-        for opt in &col.options {
-            if matches!(
-                opt.option,
-                sqlparser::ast::ColumnOption::Unique {
-                    is_primary: true,
-                    ..
+fn build_table_fields_and_primary_key(
+    create: &sqlparser::ast::CreateTable,
+) -> Result<(Vec<Field>, String), DbError> {
+    use sqlparser::ast::{ColumnOption, Expr, TableConstraint};
+
+    fn ident_identity(ident: &sqlparser::ast::Ident) -> String {
+        if ident.quote_style.is_some() {
+            format!("quoted:{}", ident.value)
+        } else {
+            format!("unquoted:{}", ident.value.to_ascii_lowercase())
+        }
+    }
+
+    let mut column_names = HashSet::with_capacity(create.columns.len());
+    let mut nullability = HashMap::with_capacity(create.columns.len());
+    let mut primary_keys = Vec::new();
+
+    for column in &create.columns {
+        let name = column.name.value.clone();
+        let identity = ident_identity(&column.name);
+        if !column_names.insert(identity.clone()) {
+            return Err(DbError::InvalidOperation(format!(
+                "duplicate CREATE TABLE column '{name}'"
+            )));
+        }
+
+        let mut explicit_nullable = None;
+        for option in &column.options {
+            if option.name.is_some() {
+                return Err(DbError::InvalidOperation(format!(
+                    "named column constraints are unsupported for '{name}': {option}"
+                )));
+            }
+            match &option.option {
+                ColumnOption::Null => {
+                    if explicit_nullable.replace(true).is_some() {
+                        return Err(DbError::InvalidOperation(format!(
+                            "column '{name}' has repeated or conflicting NULL/NOT NULL constraints"
+                        )));
+                    }
                 }
-            ) {
-                return Some(col.name.value.clone());
+                ColumnOption::NotNull => {
+                    if explicit_nullable.replace(false).is_some() {
+                        return Err(DbError::InvalidOperation(format!(
+                            "column '{name}' has repeated or conflicting NULL/NOT NULL constraints"
+                        )));
+                    }
+                }
+                ColumnOption::Unique {
+                    is_primary: true,
+                    characteristics: None,
+                } => primary_keys.push(vec![identity.clone()]),
+                unsupported => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "unsupported CREATE TABLE option for column '{name}': {unsupported}"
+                    )));
+                }
             }
         }
+        nullability.insert(identity, (name, explicit_nullable));
     }
+
     for constraint in &create.constraints {
-        if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
-            if let Some(first) = columns.first() {
-                return Some(match &first.column.expr {
-                    sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
-                    other => other.to_string(),
-                });
-            }
+        let TableConstraint::PrimaryKey {
+            name,
+            index_name,
+            index_type,
+            columns,
+            index_options,
+            characteristics,
+        } = constraint
+        else {
+            return Err(DbError::InvalidOperation(format!(
+                "unsupported CREATE TABLE constraint: {constraint}"
+            )));
+        };
+
+        if name.is_some()
+            || index_name.is_some()
+            || index_type.is_some()
+            || !index_options.is_empty()
+            || characteristics.is_some()
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "PRIMARY KEY decorations are unsupported: {constraint}"
+            )));
         }
+
+        let mut key_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            if column.operator_class.is_some()
+                || column.column.options.asc.is_some()
+                || column.column.options.nulls_first.is_some()
+                || column.column.with_fill.is_some()
+            {
+                return Err(DbError::InvalidOperation(format!(
+                    "PRIMARY KEY column decorations are unsupported: {column}"
+                )));
+            }
+            let Expr::Identifier(ident) = &column.column.expr else {
+                return Err(DbError::InvalidOperation(format!(
+                    "CREATE TABLE primary key expressions are unsupported: {}",
+                    column.column.expr
+                )));
+            };
+            key_columns.push(ident_identity(ident));
+        }
+        primary_keys.push(key_columns);
     }
-    None
+
+    let [columns] = primary_keys.as_slice() else {
+        return Err(DbError::InvalidOperation(
+            "CREATE TABLE requires exactly one PRIMARY KEY constraint".into(),
+        ));
+    };
+    let [primary_key] = columns.as_slice() else {
+        return Err(DbError::InvalidOperation(
+            "composite PRIMARY KEY is unsupported until TableStore supports composite keys".into(),
+        ));
+    };
+    let Some((primary_key_name, explicit_nullable)) = nullability.get(primary_key) else {
+        return Err(DbError::InvalidOperation(
+            "PRIMARY KEY references a column that is not declared".into(),
+        ));
+    };
+    if *explicit_nullable == Some(true) {
+        return Err(DbError::InvalidOperation(format!(
+            "PRIMARY KEY column '{primary_key}' cannot be declared NULL"
+        )));
+    }
+
+    let fields = create
+        .columns
+        .iter()
+        .map(|column| {
+            let data_type =
+                streaming_ddl::sql_type_to_arrow(&column.data_type).map_err(|error| {
+                    DbError::InvalidOperation(format!(
+                        "unsupported column type for '{}': {error}",
+                        column.name
+                    ))
+                })?;
+            let name = column.name.value.clone();
+            let identity = ident_identity(&column.name);
+            let nullable = if identity == primary_key.as_str() {
+                false
+            } else {
+                nullability
+                    .get(&identity)
+                    .and_then(|(_, nullable)| *nullable)
+                    .unwrap_or(true)
+            };
+            Ok(Field::new(name, data_type, nullable))
+        })
+        .collect::<Result<Vec<_>, DbError>>()?;
+
+    Ok((fields, primary_key_name.clone()))
 }
 
 fn parse_create_table_with(
@@ -121,59 +634,36 @@ fn parse_create_table_with(
         format_options: HashMap::with_capacity(4),
         ..Default::default()
     };
+    let mut seen = HashSet::with_capacity(with_options.len());
     for opt in with_options {
         let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
-            continue;
+            return Err(DbError::InvalidOperation(format!(
+                "unsupported CREATE TABLE option: {opt}"
+            )));
         };
         let k = key.to_string().to_lowercase();
+        if !seen.insert(k.clone()) {
+            return Err(DbError::InvalidOperation(format!(
+                "duplicate CREATE TABLE option '{k}'"
+            )));
+        }
         let val = value.to_string().trim_matches('\'').to_string();
         match k.as_str() {
             "connector" => out.connector_type = Some(val),
             "format" => out.format = Some(val),
             "refresh" => {
-                out.refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
+                return Err(DbError::InvalidOperation(
+                    "CREATE TABLE option 'refresh' is unsupported; reference tables load one \
+                     authoritative startup snapshot"
+                        .into(),
+                ));
             }
-            "cache_mode" | "cache.mode" => {
-                out.cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
-            }
-            "cache_max_entries" | "cache.max_entries" => {
-                let entries = val.parse::<usize>().map_err(|_| {
-                    DbError::InvalidOperation(format!(
-                        "Invalid cache_max_entries '{val}': expected positive integer"
-                    ))
-                })?;
-                if entries == 0 {
-                    return Err(DbError::InvalidOperation(format!(
-                        "Invalid cache_max_entries '{val}': expected positive integer"
-                    )));
-                }
-                out.cache_max_entries = Some(entries);
-            }
-            "cache_max_bytes" | "cache.max_bytes" | "cache.memory" => {
-                let bytes = val.parse::<usize>().map_err(|_| {
-                    DbError::InvalidOperation(format!(
-                        "Invalid cache_max_bytes '{val}': expected positive integer"
-                    ))
-                })?;
-                if bytes == 0 {
-                    return Err(DbError::InvalidOperation(format!(
-                        "Invalid cache_max_bytes '{val}': expected positive integer"
-                    )));
-                }
-                out.cache_max_bytes = Some(bytes);
-            }
-            "cache_ttl" | "cache.ttl" => {
-                let secs = val.parse::<u64>().map_err(|_| {
-                    DbError::InvalidOperation(format!(
-                        "Invalid cache_ttl '{val}': expected positive integer seconds"
-                    ))
-                })?;
-                if secs == 0 {
-                    return Err(DbError::InvalidOperation(format!(
-                        "Invalid cache_ttl '{val}': expected positive integer seconds"
-                    )));
-                }
-                out.cache_ttl = Some(std::time::Duration::from_secs(secs));
+            "cache_mode" | "cache.mode" | "cache_max_entries" | "cache.max_entries"
+            | "cache_max_bytes" | "cache.max_bytes" | "cache.memory" | "cache_ttl"
+            | "cache.ttl" => {
+                return Err(DbError::InvalidOperation(format!(
+                    "CREATE TABLE option '{k}' is unsupported; use CREATE LOOKUP TABLE for a bounded on-demand cache"
+                )));
             }
             "storage" => out.storage = Some(val),
             kk if kk.starts_with("format.") => {
@@ -188,16 +678,536 @@ fn parse_create_table_with(
     Ok(out)
 }
 
+fn validate_create_table_with(opts: &CreateTableWith) -> Result<(), DbError> {
+    if let Some(storage) = &opts.storage {
+        return Err(DbError::InvalidOperation(format!(
+            "CREATE TABLE storage option '{storage}' is unsupported"
+        )));
+    }
+
+    if !opts.format_options.is_empty() && opts.format.is_none() {
+        return Err(DbError::InvalidOperation(
+            "format.* options require a format".into(),
+        ));
+    }
+
+    if opts.connector_type.is_none()
+        && (!opts.connector_options.is_empty() || opts.format.is_some())
+    {
+        return Err(DbError::InvalidOperation(
+            "connector and format options require a connector".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 impl LaminarDB {
-    fn ensure_topology_ddl_allowed(&self, operation: &str) -> Result<(), DbError> {
-        if self.checkpointed_topology_ddl_rejected() {
-            Err(DbError::Pipeline(format!(
+    fn catalog_object_is_present(
+        &self,
+        name: &str,
+        kind: CatalogObjectKind,
+    ) -> Result<bool, DbError> {
+        match kind {
+            CatalogObjectKind::Source => Ok(self.catalog.get_source(name).is_some()
+                && self
+                    .ctx
+                    .table_exist(exact_table_reference(name))
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "could not verify source provider for '{name}': {error}"
+                        ))
+                    })?
+                && self.planner.lock().get_source(name).is_some()
+                && self.mv_registry.lock().is_base_table(name)),
+            CatalogObjectKind::Sink => Ok(self.catalog.get_sink_input(name).is_some()
+                && self.planner.lock().get_sink(name).is_some()),
+            CatalogObjectKind::Table => Ok(self.table_store.read().has_table(name)
+                && self
+                    .ctx
+                    .table_exist(exact_table_reference(name))
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "could not verify table provider for '{name}': {error}"
+                        ))
+                    })?),
+            CatalogObjectKind::LookupTable => Ok(self.table_store.read().has_table(name)
+                && self.planner.lock().get_lookup_table(name).is_some()
+                && self
+                    .ctx
+                    .table_exist(exact_table_reference(name))
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "could not verify lookup provider for '{name}': {error}"
+                        ))
+                    })?),
+            CatalogObjectKind::Stream => Ok(self.catalog.get_stream_entry(name).is_some()
+                && self.connector_manager.lock().streams().contains_key(name)),
+            CatalogObjectKind::MaterializedView => Ok(self.mv_registry.lock().get(name).is_some()
+                && self.connector_manager.lock().streams().contains_key(name)
+                && self.mv_store.read().has_mv(name)
+                && self
+                    .ctx
+                    .table_exist(exact_table_reference(name))
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "could not verify materialized-view provider for '{name}': {error}"
+                        ))
+                    })?),
+        }
+    }
+
+    pub(crate) fn reserve_catalog_name(
+        &self,
+        name: &str,
+        kind: CatalogObjectKind,
+        if_not_exists: bool,
+    ) -> Result<Option<CatalogNameReservation<'_>>, DbError> {
+        self.ensure_catalog_cleanup_unfenced("catalog create")?;
+        reject_reserved_namespace(name)?;
+        let existing = self.catalog_namespace.lock().get(name).copied();
+        if let Some(existing) = existing {
+            if existing != kind {
+                return Err(DbError::InvalidOperation(format!(
+                    "cannot create {kind} '{name}': the identifier is owned by a {existing}"
+                )));
+            }
+            if !self.catalog_object_is_present(name, kind)? {
+                return Err(DbError::InvalidOperation(format!(
+                    "catalog namespace for {kind} '{name}' is inconsistent"
+                )));
+            }
+            if if_not_exists {
+                return Ok(None);
+            }
+            return Err(DbError::InvalidOperation(format!(
+                "{kind} '{name}' already exists"
+            )));
+        }
+
+        if self
+            .ctx
+            .table_exist(exact_table_reference(name))
+            .map_err(|error| {
+                DbError::InvalidOperation(format!(
+                    "could not inspect catalog namespace for '{name}': {error}"
+                ))
+            })?
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "cannot create {kind} '{name}': an untyped table provider already owns the identifier"
+            )));
+        }
+
+        let replaced = self.catalog_namespace.lock().insert(name.to_string(), kind);
+        debug_assert!(replaced.is_none());
+        Ok(Some(CatalogNameReservation {
+            db: self,
+            name: name.to_string(),
+            kind,
+            control_mutation: None,
+            committed: false,
+        }))
+    }
+
+    pub(crate) fn require_catalog_kind(
+        &self,
+        name: &str,
+        expected: CatalogObjectKind,
+        if_exists: bool,
+    ) -> Result<bool, DbError> {
+        self.ensure_catalog_cleanup_unfenced("catalog drop")?;
+        let Some(actual) = self.catalog_namespace.lock().get(name).copied() else {
+            if if_exists {
+                return Ok(false);
+            }
+            return Err(match expected {
+                CatalogObjectKind::Source => DbError::SourceNotFound(name.to_string()),
+                CatalogObjectKind::Sink => DbError::SinkNotFound(name.to_string()),
+                CatalogObjectKind::Table => DbError::TableNotFound(name.to_string()),
+                CatalogObjectKind::Stream => DbError::StreamNotFound(name.to_string()),
+                CatalogObjectKind::MaterializedView => {
+                    DbError::MaterializedView(format!("materialized view not found: {name}"))
+                }
+                CatalogObjectKind::LookupTable => {
+                    DbError::InvalidOperation(format!("lookup table '{name}' does not exist"))
+                }
+            });
+        };
+        if actual != expected {
+            return Err(DbError::InvalidOperation(format!(
+                "cannot drop {expected} '{name}': the identifier is owned by a {actual}"
+            )));
+        }
+        if !self.catalog_object_is_present(name, expected)? {
+            return Err(DbError::InvalidOperation(format!(
+                "catalog namespace for {expected} '{name}' is inconsistent"
+            )));
+        }
+        Ok(true)
+    }
+
+    fn deregister_catalog_provider(&self, name: &str, errors: &mut Vec<String>) {
+        #[cfg(test)]
+        if self.catalog_cleanup_deregister_fault.lock().as_deref() == Some(name) {
+            errors.push("injected DataFusion provider deregistration failure".into());
+            return;
+        }
+
+        if let Err(error) = self.ctx.deregister_table(exact_table_reference(name)) {
+            errors.push(format!(
+                "DataFusion provider deregistration failed: {error}"
+            ));
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // exhaustive cleanup and residue matrix
+    fn cleanup_catalog_object(&self, name: &str, kind: CatalogObjectKind) -> Result<(), DbError> {
+        let mut errors = Vec::new();
+
+        if matches!(
+            kind,
+            CatalogObjectKind::Source
+                | CatalogObjectKind::Table
+                | CatalogObjectKind::LookupTable
+                | CatalogObjectKind::Stream
+                | CatalogObjectKind::MaterializedView
+        ) {
+            self.deregister_catalog_provider(name, &mut errors);
+        }
+
+        match kind {
+            CatalogObjectKind::Source => {
+                self.catalog.drop_source(name);
+                self.connector_manager.lock().unregister_source(name);
+                self.planner.lock().unregister_source(name);
+                self.mv_registry.lock().unregister_base_table(name);
+            }
+            CatalogObjectKind::Sink => {
+                self.catalog.drop_sink(name);
+                self.connector_manager.lock().unregister_sink(name);
+                self.planner.lock().unregister_sink(name);
+            }
+            CatalogObjectKind::Table => {
+                self.table_store.write().drop_table(name);
+                self.connector_manager.lock().unregister_table(name);
+            }
+            CatalogObjectKind::LookupTable => {
+                self.table_store.write().drop_table(name);
+                self.connector_manager.lock().unregister_table(name);
+                self.lookup_registry.unregister(name);
+                self.planner.lock().unregister_lookup_table(name);
+                self.refresh_lookup_optimizer_rule();
+            }
+            CatalogObjectKind::Stream => {
+                self.catalog.drop_stream(name);
+                self.connector_manager.lock().unregister_stream(name);
+                self.subscription_registry.drop_name(name);
+                self.planner.lock().unregister_query(name);
+                self.stream_schemas.write().remove(name);
+            }
+            CatalogObjectKind::MaterializedView => {
+                let mut registry = self.mv_registry.lock();
+                if registry.get(name).is_some() {
+                    if let Err(error) = registry.unregister(name) {
+                        errors.push(format!(
+                            "materialized-view registry deregistration failed: {error}"
+                        ));
+                    }
+                }
+                drop(registry);
+                self.connector_manager.lock().unregister_stream(name);
+                self.mv_store.write().drop_mv(name);
+                self.subscription_registry.drop_name(name);
+                self.planner.lock().unregister_query(name);
+                self.stream_schemas.write().remove(name);
+            }
+        }
+        self.connector_manager.lock().remove_ddl(name);
+
+        let mut residues = Vec::new();
+        if matches!(
+            kind,
+            CatalogObjectKind::Source
+                | CatalogObjectKind::Table
+                | CatalogObjectKind::LookupTable
+                | CatalogObjectKind::Stream
+                | CatalogObjectKind::MaterializedView
+        ) {
+            match self.ctx.table_exist(exact_table_reference(name)) {
+                Ok(false) => {}
+                Ok(true) => residues.push("DataFusion provider"),
+                Err(error) => errors.push(format!(
+                    "DataFusion provider absence verification failed: {error}"
+                )),
+            }
+        }
+
+        let (has_ddl, has_source, has_sink, has_stream, has_table) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.get_ddl(name).is_some(),
+                manager.sources().contains_key(name),
+                manager.sinks().contains_key(name),
+                manager.streams().contains_key(name),
+                manager.tables().contains_key(name),
+            )
+        };
+        if has_ddl {
+            residues.push("stored DDL");
+        }
+        match kind {
+            CatalogObjectKind::Source => {
+                if self.catalog.get_source(name).is_some() {
+                    residues.push("source catalog");
+                }
+                if has_source {
+                    residues.push("source connector registration");
+                }
+                if self.planner.lock().get_source(name).is_some() {
+                    residues.push("source planner registration");
+                }
+                if self.mv_registry.lock().is_base_table(name) {
+                    residues.push("materialized-view base-table registration");
+                }
+            }
+            CatalogObjectKind::Sink => {
+                if self.catalog.get_sink_input(name).is_some() {
+                    residues.push("sink catalog");
+                }
+                if has_sink {
+                    residues.push("sink connector registration");
+                }
+                if self.planner.lock().get_sink(name).is_some() {
+                    residues.push("sink planner registration");
+                }
+            }
+            CatalogObjectKind::Table => {
+                if self.table_store.read().has_table(name) {
+                    residues.push("table store");
+                }
+                if has_table {
+                    residues.push("table connector registration");
+                }
+            }
+            CatalogObjectKind::LookupTable => {
+                if self.table_store.read().has_table(name) {
+                    residues.push("table store");
+                }
+                if has_table {
+                    residues.push("table connector registration");
+                }
+                if self.lookup_registry.get_entry(name).is_some() {
+                    residues.push("lookup snapshot registry");
+                }
+                if self.planner.lock().get_lookup_table(name).is_some() {
+                    residues.push("lookup planner registration");
+                }
+            }
+            CatalogObjectKind::Stream => {
+                if self.catalog.get_stream_entry(name).is_some() {
+                    residues.push("stream catalog");
+                }
+                if has_stream {
+                    residues.push("stream registration");
+                }
+                if self.subscription_registry.contains_name(name) {
+                    residues.push("subscription registry");
+                }
+                if self.planner.lock().has_query(name) {
+                    residues.push("query planner registration");
+                }
+                if self.stream_schemas.read().contains_key(name) {
+                    residues.push("stream schema cache");
+                }
+            }
+            CatalogObjectKind::MaterializedView => {
+                if self.mv_registry.lock().get(name).is_some() {
+                    residues.push("materialized-view registry");
+                }
+                if has_stream {
+                    residues.push("stream registration");
+                }
+                if self.mv_store.read().has_mv(name) {
+                    residues.push("materialized-view store");
+                }
+                if self.subscription_registry.contains_name(name) {
+                    residues.push("subscription registry");
+                }
+                if self.planner.lock().has_query(name) {
+                    residues.push("query planner registration");
+                }
+                if self.stream_schemas.read().contains_key(name) {
+                    residues.push("stream schema cache");
+                }
+            }
+        }
+        if !errors.is_empty() || !residues.is_empty() {
+            let mut details = errors;
+            if !residues.is_empty() {
+                details.push(format!("residual state: {}", residues.join(", ")));
+            }
+            return Err(DbError::InvalidOperation(format!(
+                "could not prove complete cleanup of {kind} '{name}': {}",
+                details.join("; ")
+            )));
+        }
+
+        let mut namespace = self.catalog_namespace.lock();
+        match namespace.get(name).copied() {
+            Some(owner) if owner != kind => {
+                return Err(DbError::InvalidOperation(format!(
+                    "cannot release cleanup ownership for {kind} '{name}': namespace is owned by {owner}"
+                )));
+            }
+            Some(_) => {
+                namespace.remove(name);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn terminal_catalog_cleanup_error(
+        &self,
+        context: &str,
+        name: &str,
+        kind: CatalogObjectKind,
+        error: DbError,
+    ) -> DbError {
+        let reason = format!(
+            "[LDB-6044] {context} left {kind} '{name}' incompletely cleaned; this LaminarDB instance is permanently fenced: {error}"
+        );
+        let was_fenced = self
+            .catalog_cleanup_fenced
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let recorded = {
+            let mut fault = self.last_fault.lock();
+            if !was_fenced || fault.is_none() {
+                *fault = Some(reason);
+            }
+            fault.clone().unwrap_or_else(|| {
+                "[LDB-6044] catalog cleanup failed and the instance is permanently fenced".into()
+            })
+        };
+        DbState::Faulted.store(&self.state);
+        self.shutdown_signal.notify_one();
+        tracing::error!(reason = %recorded, "catalog cleanup terminally fenced the database");
+        DbError::Pipeline(recorded)
+    }
+
+    pub(crate) fn rollback_catalog_create(
+        &self,
+        name: &str,
+        kind: CatalogObjectKind,
+        context: &str,
+    ) -> Result<(), DbError> {
+        self.cleanup_catalog_object(name, kind)
+            .map_err(|error| self.terminal_catalog_cleanup_error(context, name, kind, error))
+    }
+
+    pub(crate) fn rollback_catalog_create_or_fence(
+        &self,
+        name: &str,
+        kind: CatalogObjectKind,
+        context: &str,
+    ) {
+        if let Err(error) = self.rollback_catalog_create(name, kind, context) {
+            tracing::error!(%error, "catalog rollback guard could not complete cleanup");
+        }
+    }
+
+    pub(crate) fn ensure_catalog_cleanup_unfenced(&self, operation: &str) -> Result<(), DbError> {
+        if !self
+            .catalog_cleanup_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let reason = self.last_fault.lock().clone().unwrap_or_else(|| {
+            "[LDB-6044] catalog cleanup is incomplete and this LaminarDB instance is permanently fenced"
+                .into()
+        });
+        Err(DbError::Pipeline(format!(
+            "{operation} rejected by terminal catalog cleanup fence: {reason}"
+        )))
+    }
+
+    /// Streams and materialized views have a synchronous coordinator control path.
+    /// Lifecycle transitions never do; a running local, uncheckpointed pipeline is
+    /// the only live topology that can admit them safely.
+    pub(crate) fn ensure_topology_ddl_allowed(&self, operation: &str) -> Result<(), DbError> {
+        self.ensure_catalog_cleanup_unfenced(operation)?;
+        if crate::db::catalog_manifest_replay_active() {
+            return Ok(());
+        }
+        match DbState::load(&self.state) {
+            DbState::Starting | DbState::ShuttingDown | DbState::Faulted => {
+                Err(DbError::Pipeline(format!(
+                    "[LDB-6043] {operation} cannot change topology while the pipeline is \
+                     starting, shutting down, or faulted; stop the pipeline first"
+                )))
+            }
+            DbState::Running if self.is_cluster_runtime() => Err(DbError::Pipeline(format!(
+                "[LDB-6043] {operation} cannot change an active cluster topology until a \
+                 replicated topology-version barrier is implemented; stop the pipeline first"
+            ))),
+            DbState::Running if self.config.checkpoint.is_some() => {
+                Err(DbError::Pipeline(format!(
                 "[LDB-6043] {operation} cannot change a running checkpointed topology; stop the \
                  pipeline and reset/migrate its checkpoint state first"
             )))
-        } else {
-            Ok(())
+            }
+            DbState::Running if self.control_tx.lock().is_none() => {
+                Err(DbError::Pipeline(format!(
+                    "[LDB-6043] {operation} cannot change a running topology because its control \
+                 coordinator is unavailable"
+                )))
+            }
+            DbState::Created | DbState::Running | DbState::Stopped => Ok(()),
         }
+    }
+
+    fn apply_without_live_control(
+        &self,
+        operation: &str,
+        mutation: &ControlMutation,
+    ) -> Result<(), DbError> {
+        if crate::db::catalog_manifest_replay_active()
+            || matches!(
+                DbState::load(&self.state),
+                DbState::Created | DbState::Stopped
+            )
+        {
+            let applied = mutation.try_apply();
+            debug_assert!(applied);
+            Ok(())
+        } else {
+            Err(DbError::Pipeline(format!(
+                "[LDB-6043] {operation} lost its live control coordinator before admission"
+            )))
+        }
+    }
+
+    /// Connector, source, sink, lookup, continuous-query, and table DDL has no
+    /// coordinator control implementation. Reject it in every active runtime mode.
+    pub(crate) fn ensure_offline_topology_ddl_allowed(
+        &self,
+        operation: &str,
+    ) -> Result<(), DbError> {
+        self.ensure_catalog_cleanup_unfenced(operation)?;
+        if crate::db::catalog_manifest_replay_active() {
+            return Ok(());
+        }
+        if matches!(
+            DbState::load(&self.state),
+            DbState::Starting | DbState::Running | DbState::ShuttingDown | DbState::Faulted
+        ) {
+            return Err(DbError::Pipeline(format!(
+                "[LDB-6043] {operation} is not wired into a live runtime; stop the pipeline first"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve `${VAR}` in connector + format options (config vars, then env) and
@@ -253,27 +1263,30 @@ impl LaminarDB {
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
-        self.ensure_topology_ddl_allowed("CREATE SOURCE")?;
-        // Connectors are instantiated in start() — reject mid-run DDL. Match the
-        // `connector` key case-insensitively, as `resolve_connector_info` does.
+        self.ensure_offline_topology_ddl_allowed("CREATE SOURCE")?;
+        if create.or_replace {
+            return Err(DbError::InvalidOperation(
+                "CREATE OR REPLACE SOURCE is not atomic; use DROP SOURCE followed by CREATE SOURCE"
+                    .to_string(),
+            ));
+        }
         let has_connector =
             create.connector_type.is_some() || has_connector_key(&create.with_options);
-        if has_connector && self.connector_ddl_rejected() {
-            let name = &create.name;
-            return Err(DbError::Pipeline(format!(
-                "Cannot create source '{name}' with connector while pipeline is running. \
-                 Stop the pipeline first."
-            )));
-        }
 
-        let source_name = create.name.to_string();
+        let source_name = canonical_object_name(&create.name)?;
         reject_reserved_namespace(&source_name)?;
-        if create.if_not_exists && self.catalog.get_source(&source_name).is_some() {
+        let Some(reservation) = self.reserve_catalog_name(
+            &source_name,
+            CatalogObjectKind::Source,
+            create.if_not_exists,
+        )?
+        else {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE SOURCE".to_string(),
                 object_name: source_name,
+                applied: false,
             }));
-        }
+        };
 
         // Validate before mutating catalog/planner — no half-created source on error.
         let resolved = self.prepare_connector(
@@ -284,36 +1297,54 @@ impl LaminarDB {
             ConnectorKind::Source,
         )?;
 
-        let source_def = self
+        let mut source_def = self
             .build_source_definition(create, resolved.as_ref(), has_connector, &source_name)
             .await?;
+        source_def.name.clone_from(&source_name);
+
+        {
+            let mut planner = self.planner.lock();
+            let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
+            planner
+                .plan(&stmt)
+                .map_err(|error| laminar_sql::Error::from(error))?;
+        }
 
         let entry = self.register_source_entry(create, &source_def)?;
         let name = &source_def.name;
 
         if let Some(ref entry) = entry {
-            if create.or_replace {
-                let _ = self.ctx.deregister_table(name);
-            }
             let num_partitions = self.ctx.state().config().target_partitions();
             let provider = crate::table_provider::SourceSnapshotProvider::new(
                 Arc::clone(entry),
                 num_partitions,
             );
-            if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
-                tracing::warn!(table = %name, error = %e, "failed to register source table in DataFusion");
+            match self
+                .ctx
+                .register_table(exact_table_reference(name), Arc::new(provider))
+            {
+                Ok(None) => {}
+                Ok(Some(previous)) => {
+                    let _ = self
+                        .ctx
+                        .register_table(exact_table_reference(name), previous);
+                    return Err(DbError::InvalidOperation(format!(
+                        "cannot create source '{name}': its table provider was claimed concurrently"
+                    )));
+                }
+                Err(error) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "failed to register source '{name}' table provider: {error}"
+                    )));
+                }
             }
+        } else {
+            return Err(DbError::InvalidOperation(format!(
+                "source '{name}' lost its catalog reservation during creation"
+            )));
         }
 
         self.mv_registry.lock().register_base_table(name);
-
-        {
-            let mut planner = self.planner.lock();
-            let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
-            if let Err(e) = planner.plan(&stmt) {
-                tracing::warn!(source = %name, error = %e, "failed to register source in planner");
-            }
-        }
 
         if let Some(resolved) = resolved {
             if let Some(ct) = resolved.connector_type {
@@ -328,9 +1359,12 @@ impl LaminarDB {
             }
         }
 
+        reservation.commit();
+
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE SOURCE".to_string(),
             object_name: name.clone(),
+            applied: true,
         }))
     }
 
@@ -416,16 +1450,7 @@ impl LaminarDB {
             None
         };
 
-        let entry = if create.or_replace {
-            Some(self.catalog.register_source_or_replace(
-                name,
-                schema,
-                watermark_col,
-                max_ooo,
-                buffer_size,
-                None,
-            ))
-        } else if create.if_not_exists {
+        let entry = if create.if_not_exists {
             if self.catalog.get_source(name).is_none() {
                 Some(self.catalog.register_source(
                     name,
@@ -466,20 +1491,27 @@ impl LaminarDB {
         &self,
         create: &laminar_sql::parser::CreateSinkStatement,
     ) -> Result<ExecuteResult, DbError> {
-        self.ensure_topology_ddl_allowed("CREATE SINK")?;
-        let has_connector =
-            create.connector_type.is_some() || has_connector_key(&create.with_options);
-        if has_connector && self.connector_ddl_rejected() {
-            let name = &create.name;
-            return Err(DbError::Pipeline(format!(
-                "Cannot create sink '{name}' with connector while pipeline is running. \
-                 Stop the pipeline first."
-            )));
+        self.ensure_offline_topology_ddl_allowed("CREATE SINK")?;
+        if create.or_replace {
+            return Err(DbError::InvalidOperation(
+                "CREATE OR REPLACE SINK is not atomic; use DROP SINK followed by CREATE SINK"
+                    .to_string(),
+            ));
         }
 
-        let name = create.name.to_string();
+        let name = canonical_object_name(&create.name)?;
+        reject_reserved_namespace(&name)?;
+        let Some(reservation) =
+            self.reserve_catalog_name(&name, CatalogObjectKind::Sink, create.if_not_exists)?
+        else {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "CREATE SINK".to_string(),
+                object_name: name,
+                applied: false,
+            }));
+        };
         let input = match &create.from {
-            laminar_sql::parser::SinkFrom::Table(t) => t.to_string(),
+            laminar_sql::parser::SinkFrom::Table(t) => canonical_object_name(t)?,
             laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
         };
 
@@ -498,22 +1530,15 @@ impl LaminarDB {
             ConnectorKind::Sink,
         )?;
 
-        if create.or_replace {
-            self.catalog.drop_sink(&name);
-            self.catalog.register_sink(&name, &input)?;
-        } else if create.if_not_exists {
-            let _ = self.catalog.register_sink(&name, &input);
-        } else {
-            self.catalog.register_sink(&name, &input)?;
-        }
-
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSink(Box::new(create.clone()));
-            if let Err(e) = planner.plan(&stmt) {
-                tracing::warn!(sink = %name, error = %e, "failed to register sink in planner");
-            }
+            planner
+                .plan(&stmt)
+                .map_err(|error| laminar_sql::Error::from(error))?;
         }
+
+        self.catalog.register_sink(&name, &input)?;
 
         if let Some(resolved) = resolved {
             if let Some(ct) = resolved.connector_type {
@@ -530,9 +1555,12 @@ impl LaminarDB {
             }
         }
 
+        reservation.commit();
+
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE SINK".to_string(),
             object_name: name,
+            applied: true,
         }))
     }
 
@@ -540,66 +1568,67 @@ impl LaminarDB {
         &self,
         create: &sqlparser::ast::CreateTable,
     ) -> Result<ExecuteResult, DbError> {
-        self.ensure_topology_ddl_allowed("CREATE TABLE")?;
-        let name = create.name.to_string();
+        self.ensure_offline_topology_ddl_allowed("CREATE TABLE")?;
+        validate_create_table_envelope(create)?;
+        let name = canonical_object_name(&create.name)?;
         reject_reserved_namespace(&name)?;
-
-        let schema = Arc::new(Schema::new(build_table_fields(create)?));
-        let primary_key = extract_primary_key(create);
 
         let with_options = match &create.table_options {
             sqlparser::ast::CreateTableOptions::With(opts) => opts.as_slice(),
-            _ => &[],
-        };
-        let opts = parse_create_table_with(with_options)?;
-
-        let resolved_cache_mode = match (&opts.cache_mode, opts.cache_max_entries) {
-            (Some(crate::table_cache_mode::TableCacheMode::Partial { .. }), Some(max)) => {
-                Some(crate::table_cache_mode::TableCacheMode::Partial { max_entries: max })
+            sqlparser::ast::CreateTableOptions::None => &[],
+            unsupported => {
+                return Err(DbError::InvalidOperation(format!(
+                    "unsupported CREATE TABLE options: {unsupported}"
+                )));
             }
-            _ => opts.cache_mode.clone(),
         };
-
-        let is_persistent = opts.storage.as_deref() == Some("persistent");
-
-        if let Some(ref pk) = primary_key {
-            let cache = resolved_cache_mode
-                .clone()
-                .unwrap_or(crate::table_cache_mode::TableCacheMode::Full);
-
-            if is_persistent {
-                return Err(DbError::InvalidOperation(
-                    "storage = 'persistent' is no longer supported; use in-memory tables with in-memory caching instead".to_string(),
-                ));
-            } else if resolved_cache_mode.is_some() {
-                let mut ts = self.table_store.write();
-                ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
-            } else {
-                let mut ts = self.table_store.write();
-                ts.create_table(&name, schema.clone(), pk)?;
+        let mut opts = parse_create_table_with(with_options)?;
+        validate_create_table_with(&opts)?;
+        if let Some(connector_type) = opts.connector_type.as_mut() {
+            let normalized = normalize_connector_type(connector_type);
+            if !self.connector_registry.has_table_source(&normalized) {
+                return Err(DbError::Connector(format!(
+                    "connector '{connector_type}' is not a registered reference-table source. Available: {:?}",
+                    self.connector_registry.list_table_sources()
+                )));
             }
+            *connector_type = normalized;
         }
+        let (fields, primary_key) = build_table_fields_and_primary_key(create)?;
+        let schema = Arc::new(Schema::new(fields));
 
-        if opts.connector_type.is_some() || !opts.connector_options.is_empty() {
-            if let Some(ref pk) = primary_key {
-                if let Some(ref ct) = opts.connector_type {
-                    let mut ts = self.table_store.write();
-                    ts.set_connector(&name, ct);
-                }
+        let Some(reservation) =
+            self.reserve_catalog_name(&name, CatalogObjectKind::Table, create.if_not_exists)?
+        else {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "CREATE TABLE".to_string(),
+                object_name: name,
+                applied: false,
+            }));
+        };
 
-                let mut mgr = self.connector_manager.lock();
-                mgr.register_table(crate::connector_manager::TableRegistration {
-                    name: name.clone(),
-                    primary_key: pk.clone(),
-                    connector_type: opts.connector_type.clone(),
-                    connector_options: opts.connector_options,
-                    format: opts.format,
-                    format_options: opts.format_options,
-                    refresh: opts.refresh_mode,
-                    cache_max_bytes: opts.cache_max_bytes,
-                    cache_ttl: opts.cache_ttl,
-                });
+        self.table_store
+            .write()
+            .create_table(&name, schema.clone(), &primary_key)?;
+
+        if let Some(ref connector_type) = opts.connector_type {
+            {
+                let mut ts = self.table_store.write();
+                ts.set_connector(&name, connector_type);
             }
+
+            let mut mgr = self.connector_manager.lock();
+            mgr.register_table(crate::connector_manager::TableRegistration {
+                name: name.clone(),
+                primary_key: primary_key.clone(),
+                connector_type: opts.connector_type.clone(),
+                connector_options: opts.connector_options,
+                format: opts.format,
+                format_options: opts.format_options,
+                on_demand: false,
+                cache_max_bytes: None,
+                cache_ttl: None,
+            });
         }
 
         // scan() reads current TableStore rows; no re-register needed after INSERTs.
@@ -609,14 +1638,33 @@ impl LaminarDB {
                 schema.clone(),
                 self.table_store.clone(),
             );
-            self.ctx
-                .register_table(&name, Arc::new(provider))
-                .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+            match self
+                .ctx
+                .register_table(exact_table_reference(&name), Arc::new(provider))
+            {
+                Ok(None) => {}
+                Ok(Some(previous)) => {
+                    let _ = self
+                        .ctx
+                        .register_table(exact_table_reference(&name), previous);
+                    return Err(DbError::InvalidOperation(format!(
+                        "cannot create table '{name}': its provider was claimed concurrently"
+                    )));
+                }
+                Err(error) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "failed to register table '{name}': {error}"
+                    )));
+                }
+            }
         }
+
+        reservation.commit();
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE TABLE".to_string(),
             object_name: name,
+            applied: true,
         }))
     }
 
@@ -626,184 +1674,115 @@ impl LaminarDB {
         if_exists: bool,
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
-        self.ensure_topology_ddl_allowed("DROP SOURCE")?;
-        let name_str = name.to_string();
-
-        if self.connector_ddl_rejected() {
-            return Err(DbError::Pipeline(format!(
-                "Cannot drop source '{name_str}' while pipeline is running. \
-                 Stop the pipeline first."
-            )));
+        self.ensure_offline_topology_ddl_allowed("DROP SOURCE")?;
+        let name_str = canonical_object_name(name)?;
+        if !self.require_catalog_kind(&name_str, CatalogObjectKind::Source, if_exists)? {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "DROP SOURCE".to_string(),
+                object_name: name_str,
+                applied: false,
+            }));
         }
-
-        if cascade {
-            self.cascade_drop_dependents(&name_str);
-        } else {
-            let dependents = self.find_dependents(&name_str);
-            if !dependents.is_empty() {
-                return Err(DbError::InvalidOperation(format!(
-                    "Cannot drop source '{name_str}': depended on by {}. \
-                     Use CASCADE to drop dependents.",
-                    dependents.join(", ")
-                )));
-            }
-        }
-
-        let dropped = self.catalog.drop_source(&name_str);
-        if !dropped && !if_exists {
-            return Err(DbError::SourceNotFound(name_str));
-        }
-        let _ = self.ctx.deregister_table(&name_str);
-        self.connector_manager.lock().unregister_source(&name_str);
+        let targets = self.build_drop_plan(&name_str, CatalogObjectKind::Source, cascade)?;
+        self.teardown_catalog_targets(&targets, "DROP SOURCE")?;
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP SOURCE".to_string(),
             object_name: name_str,
+            applied: true,
         }))
-    }
-
-    pub(crate) fn handle_alter_source(
-        &self,
-        name: &sqlparser::ast::ObjectName,
-        operation: &laminar_sql::parser::AlterSourceOperation,
-    ) -> Result<ExecuteResult, DbError> {
-        use laminar_sql::parser::AlterSourceOperation;
-        let name_str = name.to_string();
-
-        let existing_schema = self
-            .catalog
-            .describe_source(&name_str)
-            .ok_or_else(|| DbError::SourceNotFound(name_str.clone()))?;
-
-        match operation {
-            AlterSourceOperation::AddColumn { column_def } => {
-                let col_name = column_def.name.value.clone();
-                let arrow_type = laminar_sql::translator::streaming_ddl::sql_type_to_arrow(
-                    &column_def.data_type,
-                )
-                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
-
-                let mut fields: Vec<arrow::datatypes::FieldRef> =
-                    existing_schema.fields().iter().cloned().collect();
-                fields.push(Arc::new(Field::new(&col_name, arrow_type, true)));
-                let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
-
-                let entry = self.catalog.get_source(&name_str);
-                let (wm_col, max_ooo) = entry.as_ref().map_or((None, None), |e| {
-                    (e.watermark_column.clone(), e.max_out_of_orderness)
-                });
-
-                self.catalog.register_source_or_replace(
-                    &name_str,
-                    new_schema.clone(),
-                    wm_col,
-                    max_ooo,
-                    None,
-                    None,
-                );
-
-                let _ = self.ctx.deregister_table(&name_str);
-                let provider = datafusion::datasource::MemTable::try_new(new_schema, vec![vec![]])
-                    .map_err(|e| {
-                        DbError::InvalidOperation(format!("Failed to re-register table: {e}"))
-                    })?;
-                self.ctx
-                    .register_table(&name_str, Arc::new(provider))
-                    .map_err(|e| {
-                        DbError::InvalidOperation(format!("Failed to re-register table: {e}"))
-                    })?;
-
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "ALTER SOURCE".to_string(),
-                    object_name: name_str,
-                }))
-            }
-            AlterSourceOperation::SetProperties { properties } => {
-                let mut props = self.session_properties.lock();
-                for (key, value) in properties {
-                    props.insert(format!("{name_str}.{key}"), value.clone());
-                }
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "ALTER SOURCE".to_string(),
-                    object_name: name_str,
-                }))
-            }
-        }
     }
 
     pub(crate) fn handle_drop_sink(
         &self,
         name: &sqlparser::ast::ObjectName,
         if_exists: bool,
-        _cascade: bool,
+        cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
-        self.ensure_topology_ddl_allowed("DROP SINK")?;
-        let name_str = name.to_string();
-
-        if self.connector_ddl_rejected() {
-            return Err(DbError::Pipeline(format!(
-                "Cannot drop sink '{name_str}' while pipeline is running. \
-                 Stop the pipeline first."
-            )));
+        self.ensure_offline_topology_ddl_allowed("DROP SINK")?;
+        let name_str = canonical_object_name(name)?;
+        if !self.require_catalog_kind(&name_str, CatalogObjectKind::Sink, if_exists)? {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "DROP SINK".to_string(),
+                object_name: name_str,
+                applied: false,
+            }));
         }
-
-        let dropped = self.catalog.drop_sink(&name_str);
-        if !dropped && !if_exists {
-            return Err(DbError::SinkNotFound(name_str));
-        }
-        self.connector_manager.lock().unregister_sink(&name_str);
+        let targets = self.build_drop_plan(&name_str, CatalogObjectKind::Sink, cascade)?;
+        self.teardown_catalog_targets(&targets, "DROP SINK")?;
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP SINK".to_string(),
             object_name: name_str,
+            applied: true,
         }))
     }
 
     pub(crate) async fn handle_create_stream(
         &self,
+        sql: &str,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<&laminar_sql::parser::EmitClause>,
+        if_not_exists: bool,
         query_sql: &str,
         retention_bytes: Option<u64>,
     ) -> Result<ExecuteResult, DbError> {
         self.ensure_topology_ddl_allowed("CREATE STREAM")?;
-        let name_str = name.to_string();
+        let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        let Some(mut reservation) =
+            self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, if_not_exists)?
+        else {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "CREATE STREAM".to_string(),
+                object_name: name_str,
+                applied: false,
+            }));
+        };
+
+        self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
+        let planned = self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql)?;
+        self.validate_cluster_query_shape("stream", &name_str, query_sql, &planned)
+            .await?;
+        let PlannedStreamingQuery {
+            emit_clause: plan_emit,
+            window_config: plan_window,
+            order_config: plan_order,
+            join_config: plan_joins,
+            has_analytic: plan_has_analytic,
+            has_frame: plan_has_frame,
+        } = planned;
+
         // A stream over an incremental MV must net the changelog — an aggregate or a simple
         // projection/filter; a complex shape (e.g. a join) is rejected.
         self.reject_unsupported_reading_incremental_mv(query_sql, "a stream")
             .await?;
+        let query_sql = query_sql.to_string();
+
+        // The typed namespace reservation prevents rollback from erasing another object.
         self.catalog.register_stream(&name_str)?;
+        let mutation = Arc::new(ControlMutation::new());
+        reservation.bind_control_mutation(Arc::clone(&mutation));
+        let _create_guard = StreamCreateGuard {
+            db: self,
+            name: name_str.clone(),
+            mutation: Arc::clone(&mutation),
+        };
+
+        #[cfg(test)]
+        let topology_planning_gate = { self.topology_planning_gate.lock().clone() };
+        #[cfg(test)]
+        if let Some((entered, release)) = topology_planning_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+
+        let placeholder_schema =
+            crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await;
 
         if let Some(bytes) = retention_bytes {
             let cap = usize::try_from(bytes).unwrap_or(usize::MAX);
             self.subscription_registry.configure(&name_str, cap);
         }
-
-        let query_sql = query_sql.to_string();
-
-        // Planning errors surface to the caller — DDL must not silently fall back.
-        let (plan_emit, plan_window, plan_order, plan_joins) = {
-            let mut planner = self.planner.lock();
-            let stmt = StreamingStatement::CreateStream {
-                name: name.clone(),
-                query: Box::new(query.clone()),
-                emit_clause: emit_clause.cloned(),
-                or_replace: false,
-                if_not_exists: false,
-                query_sql: query_sql.clone(),
-                retention_bytes: None,
-            };
-            match planner.plan(&stmt) {
-                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
-                    qp.emit_clause.clone(),
-                    qp.window_config.clone(),
-                    qp.order_config.clone(),
-                    qp.join_config.clone(),
-                ),
-                Ok(_) => (emit_clause.cloned(), None, None, None),
-                Err(e) => return Err(laminar_sql::Error::from(e).into()),
-            }
-        };
 
         {
             let mut mgr = self.connector_manager.lock();
@@ -814,105 +1793,283 @@ impl LaminarDB {
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
+                has_analytic: plan_has_analytic,
+                has_frame: plan_has_frame,
                 incremental: false,
             });
+            // Local replay identity participates in the same cancellation guard as
+            // graph/catalog admission. Once the coordinator CAS is Applied, caller
+            // cancellation must not leave an unreplayable live topology.
+            mgr.store_ddl(&name_str, sql);
         }
 
         // Register as a DataFusion placeholder for plan-time name resolution by downstream MVs.
-        // Best-effort: if planning fails, the stream still runs.
-        if let Some(schema) =
-            crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await
-        {
+        if let Some(schema) = placeholder_schema {
             use datafusion::datasource::empty::EmptyTable;
-            let _ = self.ctx.deregister_table(&name_str);
-            if let Err(e) = self
-                .ctx
-                .register_table(&name_str, Arc::new(EmptyTable::new(schema)))
-            {
-                // Roll back the catalog + connector registration so a failed
-                // CREATE STREAM doesn't leave the stream half-registered.
-                self.catalog.drop_stream(&name_str);
-                self.connector_manager.lock().unregister_stream(&name_str);
-                self.subscription_registry.drop_name(&name_str);
+            if let Err(e) = self.ctx.register_table(
+                exact_table_reference(&name_str),
+                Arc::new(EmptyTable::new(schema)),
+            ) {
                 return Err(DbError::Pipeline(format!(
                     "could not register stream '{name_str}' for downstream planning: {e}"
                 )));
             }
         }
 
-        // Hot-add the query while running; a saturated channel is a retryable error.
-        if let Some(ref tx) = *self.control_tx.lock() {
-            tx.try_send(crate::pipeline::ControlMsg::AddStream {
-                name: name_str.clone(),
-                sql: query_sql,
-                emit_clause: plan_emit,
-                window_config: plan_window,
-                order_config: plan_order,
-                join_config: plan_joins,
-                incremental: false,
-            })
-            .map_err(|e| {
-                self.catalog.drop_stream(&name_str);
-                self.connector_manager.lock().unregister_stream(&name_str);
-                self.subscription_registry.drop_name(&name_str);
-                DbError::Pipeline(format!(
-                    "control channel busy, retry CREATE STREAM '{name_str}': {e}"
+        // Hot-add is acknowledged only after graph admission and wiring complete.
+        // The oneshot closes if the pipeline exits, so a rejected/stopped runtime rolls DDL back.
+        let admission = {
+            let guard = self.control_tx.lock();
+            guard.as_ref().map(|tx| {
+                let (reply, admission) = tokio::sync::oneshot::channel();
+                tx.try_send(crate::pipeline::ControlMsg::add_stream(
+                    name_str.clone(),
+                    query_sql,
+                    plan_emit,
+                    plan_window,
+                    plan_order,
+                    plan_joins,
+                    false,
+                    reply,
+                    Arc::clone(&mutation),
                 ))
-            })?;
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "control channel busy, retry CREATE STREAM '{name_str}': {e}"
+                    ))
+                })?;
+                Ok::<_, DbError>(admission)
+            })
         }
+        .transpose();
+        let admission_result = match admission {
+            Ok(Some(admission)) => {
+                resolve_control_ack(&format!("CREATE STREAM '{name_str}'"), admission, &mutation)
+                    .await
+            }
+            Ok(None) => {
+                self.apply_without_live_control(&format!("CREATE STREAM '{name_str}'"), &mutation)
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = admission_result {
+            return Err(error);
+        }
+
+        reservation.commit();
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE STREAM".to_string(),
             object_name: name_str,
+            applied: true,
         }))
     }
 
-    pub(crate) fn handle_drop_stream(
+    pub(crate) async fn handle_drop_stream(
         &self,
         name: &sqlparser::ast::ObjectName,
         if_exists: bool,
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         self.ensure_topology_ddl_allowed("DROP STREAM")?;
-        let name_str = name.to_string();
-
-        if cascade {
-            self.cascade_drop_dependents(&name_str);
-        } else {
-            let dependents = self.find_dependents(&name_str);
-            if !dependents.is_empty() {
-                return Err(DbError::InvalidOperation(format!(
-                    "Cannot drop stream '{name_str}': depended on by {}. \
-                     Use CASCADE to drop dependents.",
-                    dependents.join(", ")
-                )));
-            }
+        let name_str = canonical_object_name(name)?;
+        if !self.require_catalog_kind(&name_str, CatalogObjectKind::Stream, if_exists)? {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "DROP STREAM".to_string(),
+                object_name: name_str,
+                applied: false,
+            }));
         }
-
-        let dropped = self.catalog.drop_stream(&name_str);
-        if !dropped && !if_exists {
-            return Err(DbError::StreamNotFound(name_str));
-        }
-        self.connector_manager.lock().unregister_stream(&name_str);
-
-        self.subscription_registry.drop_name(&name_str);
-
-        // A saturated channel surfaces as a retryable error rather than a silent no-op.
-        if let Some(ref tx) = *self.control_tx.lock() {
-            tx.try_send(crate::pipeline::ControlMsg::DropStream {
-                name: name_str.clone(),
+        let targets = self.build_drop_plan(&name_str, CatalogObjectKind::Stream, cascade)?;
+        let graph_names: Vec<String> = targets
+            .iter()
+            .filter(|target| {
+                matches!(
+                    target.kind,
+                    CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                )
             })
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "control channel busy, retry DROP STREAM '{name_str}': {e}"
-                ))
-            })?;
-        }
+            .map(|target| target.name.clone())
+            .collect();
+
+        let mutation = Arc::new(ControlMutation::new());
+        let drop_guard = StreamingDropGuard {
+            db: self,
+            targets,
+            mutation: Arc::clone(&mutation),
+            finished: false,
+        };
+        self.acknowledge_runtime_drop("DROP STREAM", &graph_names, Arc::clone(&mutation))
+            .await?;
+        drop_guard.finish()?;
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP STREAM".to_string(),
             object_name: name_str,
+            applied: true,
         }))
+    }
+
+    async fn acknowledge_runtime_drop(
+        &self,
+        statement: &str,
+        names: &[String],
+        mutation: Arc<ControlMutation>,
+    ) -> Result<(), DbError> {
+        if names.is_empty() {
+            return self.apply_without_live_control(statement, &mutation);
+        }
+
+        let acknowledgement = {
+            let guard = self.control_tx.lock();
+            guard.as_ref().map(|tx| {
+                let (reply, acknowledgement) = tokio::sync::oneshot::channel();
+                tx.try_send(crate::pipeline::ControlMsg::drop_streams(
+                    names.to_vec(),
+                    reply,
+                    Arc::clone(&mutation),
+                ))
+                .map_err(|error| {
+                    DbError::Pipeline(format!("control channel busy, retry {statement}: {error}"))
+                })?;
+                Ok::<_, DbError>(acknowledgement)
+            })
+        }
+        .transpose()?;
+
+        match acknowledgement {
+            Some(acknowledgement) => {
+                resolve_control_ack(statement, acknowledgement, &mutation).await
+            }
+            None => self.apply_without_live_control(statement, &mutation),
+        }
+    }
+
+    fn direct_dependents(&self, name: &str) -> Result<Vec<CatalogDropTarget>, DbError> {
+        let mut names = HashSet::new();
+        {
+            let manager = self.connector_manager.lock();
+            for (stream_name, registration) in manager.streams() {
+                if crate::sql_analysis::extract_table_references(&registration.query_sql)
+                    .contains(name)
+                {
+                    names.insert(stream_name.clone());
+                }
+            }
+        }
+        for sink_name in self.catalog.list_sinks() {
+            if self.catalog.get_sink_input(&sink_name).as_deref() == Some(name) {
+                names.insert(sink_name);
+            }
+        }
+        {
+            let registry = self.mv_registry.lock();
+            names.extend(registry.get_dependents(name).map(str::to_owned));
+        }
+
+        let namespace = self.catalog_namespace.lock();
+        let mut targets = Vec::with_capacity(names.len());
+        for dependent in names {
+            let kind = namespace.get(&dependent).copied().ok_or_else(|| {
+                DbError::InvalidOperation(format!(
+                    "dependent '{dependent}' has no typed catalog owner"
+                ))
+            })?;
+            if !matches!(
+                kind,
+                CatalogObjectKind::Sink
+                    | CatalogObjectKind::Stream
+                    | CatalogObjectKind::MaterializedView
+            ) {
+                return Err(DbError::InvalidOperation(format!(
+                    "dependent '{dependent}' has invalid catalog kind {kind}"
+                )));
+            }
+            targets.push(CatalogDropTarget {
+                name: dependent,
+                kind,
+            });
+        }
+        targets.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(targets)
+    }
+
+    fn build_drop_plan(
+        &self,
+        name: &str,
+        expected: CatalogObjectKind,
+        cascade: bool,
+    ) -> Result<Vec<CatalogDropTarget>, DbError> {
+        self.require_catalog_kind(name, expected, false)?;
+        let direct = self.direct_dependents(name)?;
+        if !cascade && !direct.is_empty() {
+            let names = direct
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(DbError::InvalidOperation(format!(
+                "cannot drop {expected} '{name}': depended on by {names}; use CASCADE"
+            )));
+        }
+
+        fn visit(
+            db: &LaminarDB,
+            target: CatalogDropTarget,
+            seen: &mut HashSet<String>,
+            result: &mut Vec<CatalogDropTarget>,
+        ) -> Result<(), DbError> {
+            if !seen.insert(target.name.clone()) {
+                return Ok(());
+            }
+            for dependent in db.direct_dependents(&target.name)? {
+                visit(db, dependent, seen, result)?;
+            }
+            result.push(target);
+            Ok(())
+        }
+
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        if cascade {
+            for dependent in direct {
+                visit(self, dependent, &mut seen, &mut result)?;
+            }
+        }
+        seen.insert(name.to_string());
+        result.push(CatalogDropTarget {
+            name: name.to_string(),
+            kind: expected,
+        });
+
+        if DbState::load(&self.state) == DbState::Running
+            && result
+                .iter()
+                .any(|target| target.kind == CatalogObjectKind::Sink)
+        {
+            return Err(DbError::Pipeline(
+                "a running cascade cannot remove sinks because sink teardown is not wired into live control"
+                    .into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn teardown_catalog_targets(
+        &self,
+        targets: &[CatalogDropTarget],
+        context: &str,
+    ) -> Result<(), DbError> {
+        for target in targets {
+            self.rollback_catalog_create(&target.name, target.kind, context)?;
+        }
+        Ok(())
+    }
+
+    fn teardown_catalog_targets_or_fence(&self, targets: &[CatalogDropTarget], context: &str) {
+        if let Err(error) = self.teardown_catalog_targets(targets, context) {
+            tracing::error!(%error, "catalog teardown guard could not complete cleanup");
+        }
     }
 
     pub(crate) fn handle_set(
@@ -943,6 +2100,7 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "SET".to_string(),
                     object_name: key,
+                    applied: true,
                 }))
             }
             _ => Err(DbError::InvalidOperation(
@@ -975,105 +2133,273 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "SET".to_string(),
             object_name: "checkpoint_interval".to_string(),
+            applied: true,
         }))
     }
 
-    /// Find streams and MVs that depend on the given object name.
-    pub(crate) fn find_dependents(&self, name: &str) -> Vec<String> {
-        let mut dependents = Vec::new();
-
-        {
-            let mgr = self.connector_manager.lock();
-            for (stream_name, reg) in mgr.streams() {
-                let refs = crate::sql_analysis::extract_table_references(&reg.query_sql);
-                if refs.contains(name) {
-                    dependents.push(stream_name.clone());
-                }
-            }
-        }
-
-        {
-            let registry = self.mv_registry.lock();
-            for dep in registry.get_dependents(name) {
-                dependents.push(dep.to_string());
-            }
-        }
-
-        dependents
-    }
-
-    /// Drop all streams and MVs that depend on the given object, recursively.
-    pub(crate) fn cascade_drop_dependents(&self, name: &str) {
-        let dependents = self.find_dependents(name);
-        for dep in &dependents {
-            if self.catalog.drop_stream(dep) {
-                self.connector_manager.lock().unregister_stream(dep);
-                self.subscription_registry.drop_name(dep);
-            }
-            {
-                let mut registry = self.mv_registry.lock();
-                if let Ok(views) = registry.unregister_cascade(dep) {
-                    drop(registry);
-                    let mut mgr = self.connector_manager.lock();
-                    for v in &views {
-                        mgr.unregister_stream(&v.name);
-                        self.subscription_registry.drop_name(&v.name);
-                    }
-                }
-            }
-        }
-    }
-
-    /// `true` if more than one node currently owns vnodes (a genuine multi-node cluster). A single-node
-    /// deployment — embedded (no registry) or a registry whose vnodes all map to one node — is `false`.
-    fn is_multi_node(&self) -> bool {
-        use laminar_core::state::NodeId;
-        self.vnode_registry.lock().as_ref().is_some_and(|r| {
-            let mut seen: Option<NodeId> = None;
-            for &n in r.snapshot().iter() {
-                if n == NodeId::UNASSIGNED {
-                    continue;
-                }
-                match seen {
-                    None => seen = Some(n),
-                    Some(s) if s != n => return true,
-                    _ => {}
-                }
-            }
-            false
+    fn plan_streaming_query(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        query: &StreamingStatement,
+        emit_clause: Option<laminar_sql::parser::EmitClause>,
+        query_sql: &str,
+    ) -> Result<PlannedStreamingQuery, DbError> {
+        let mut planner = self.planner.lock();
+        let statement = StreamingStatement::CreateStream {
+            name: name.clone(),
+            query: Box::new(query.clone()),
+            emit_clause,
+            or_replace: false,
+            if_not_exists: false,
+            query_sql: query_sql.to_string(),
+            retention_bytes: None,
+        };
+        let laminar_sql::planner::StreamingPlan::Query(plan) =
+            planner.plan(&statement).map_err(laminar_sql::Error::from)?
+        else {
+            return Err(DbError::InvalidOperation(format!(
+                "planner did not produce a streaming query for '{name}'"
+            )));
+        };
+        Ok(PlannedStreamingQuery {
+            emit_clause: plan.emit_clause,
+            window_config: plan.window_config,
+            order_config: plan.order_config,
+            join_config: plan.join_config,
+            has_analytic: plan.analytic_config.is_some(),
+            has_frame: plan.frame_config.is_some(),
         })
     }
 
-    /// Create one MV of a decomposed multi-way join by parsing + handling it directly, bypassing the
-    /// DDL persistence in `execute` (the chain is re-derived from the parent's stored N-way DDL on a
-    /// cold restart, so persisting the intermediates would double-create them).
-    async fn create_decomposed_mv(&self, create_sql: &str) -> Result<ExecuteResult, DbError> {
-        let statements = laminar_sql::parse_streaming_sql(create_sql)
-            .map_err(|e| DbError::MaterializedView(format!("multi-way decompose parse: {e}")))?;
-        let Some(StreamingStatement::CreateMaterializedView {
-            name,
-            query,
-            emit_clause,
-            or_replace,
-            if_not_exists,
-            query_sql,
-            ..
-        }) = statements.first()
-        else {
-            return Err(DbError::MaterializedView(
-                "multi-way decompose produced a non-CREATE-MV statement".into(),
-            ));
+    fn cluster_state_lifecycle_error(object_kind: &str, name: &str, reason: &str) -> DbError {
+        DbError::InvalidOperation(format!(
+            "[{}] {object_kind} '{name}' is not supported in cluster mode: {reason}",
+            laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED
+        ))
+    }
+
+    fn validate_cluster_query_shape_before_plan(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        emit_clause: Option<&laminar_sql::parser::EmitClause>,
+    ) -> Result<(), DbError> {
+        use laminar_sql::parser::EmitClause;
+
+        if !self.is_cluster_runtime() {
+            return Ok(());
+        }
+        let reject = |reason: &str| {
+            Err(Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                reason,
+            ))
         };
-        self.handle_create_materialized_view(
-            create_sql,
+
+        if let Some(aggregate) = distinct_streaming_aggregate(query_sql) {
+            return reject(&format!(
+                "DISTINCT aggregate '{aggregate}' has unbounded per-key state and no spillable vnode lifecycle"
+            ));
+        }
+
+        if emit_clause
+            .is_some_and(|emit| matches!(emit, EmitClause::OnWindowClose | EmitClause::Final))
+        {
+            return reject(
+                "window-close/final emission has whole-operator window state without a vnode lifecycle",
+            );
+        }
+        if crate::sql_analysis::plan_frame_query(query_sql).is_some() {
+            return reject(
+                "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+        if !crate::sql_analysis::detect_ai_functions(query_sql).is_empty() {
+            return reject(
+                "AI inference has checkpointed in-flight rows but no vnode-keyed rebalance lifecycle",
+            );
+        }
+        if !matches!(
+            crate::sql_analysis::analyze_temporal_filter(query_sql),
+            crate::sql_analysis::TemporalFilterAnalysis::NotPresent
+        ) {
+            return reject(
+                "retracting temporal-filter state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+
+        let incremental_mvs = self.incremental_mv_names();
+        if crate::sql_analysis::detect_changelog_incremental_join(query_sql, &incremental_mvs)
+            .is_some()
+            || crate::sql_analysis::is_multiway_incremental_join(query_sql, &incremental_mvs)
+        {
+            return reject(
+                "incremental changelog join state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+        if crate::sql_analysis::detect_temporal_probe_query(query_sql)
+            .0
+            .is_some()
+        {
+            return reject(
+                "temporal-probe join state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+        if crate::sql_analysis::detect_asof_query(query_sql)
+            .0
+            .is_some()
+        {
+            return reject("ASOF join state has no vnode-keyed checkpoint and rebalance lifecycle");
+        }
+        if crate::sql_analysis::detect_temporal_query(query_sql)
+            .0
+            .is_some()
+        {
+            return reject(
+                "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+        Ok(())
+    }
+
+    /// Cluster admission is based on configured runtime mode, never the current owner count.
+    /// Every stateful route admitted here must implement key shuffle plus vnode capture, restore,
+    /// and revoke. Joins fail closed until their operator and output state have that lifecycle.
+    pub(crate) async fn validate_cluster_query_shape(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        use laminar_sql::translator::{JoinOperatorConfig, OrderOperatorConfig};
+
+        if !self.is_cluster_runtime() {
+            return Ok(());
+        }
+        self.validate_cluster_query_shape_before_plan(
+            object_kind,
             name,
-            query,
-            emit_clause.clone(),
-            *or_replace,
-            *if_not_exists,
             query_sql,
-        )
-        .await
+            plan.emit_clause.as_ref(),
+        )?;
+        let reject = |reason: &str| {
+            Err(Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                reason,
+            ))
+        };
+
+        if plan.has_analytic || plan.has_frame {
+            return reject(
+                "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+        if plan
+            .order_config
+            .as_ref()
+            .is_some_and(|order| !matches!(order, OrderOperatorConfig::SourceSatisfied))
+        {
+            return reject(
+                "ORDER BY/TOP-K has no distributed merge and vnode-keyed state lifecycle",
+            );
+        }
+        if let Some(joins) = &plan.join_config {
+            let reason = match joins.first() {
+                Some(JoinOperatorConfig::StreamStream(_)) => {
+                    "stream join state has no vnode-keyed checkpoint and rebalance lifecycle"
+                }
+                Some(JoinOperatorConfig::Asof(_)) => {
+                    "ASOF join state has no vnode-keyed checkpoint and rebalance lifecycle"
+                }
+                Some(JoinOperatorConfig::Temporal(_)) => {
+                    "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle"
+                }
+                Some(JoinOperatorConfig::TemporalProbe(_)) => {
+                    "temporal-probe join state has no vnode-keyed checkpoint and rebalance lifecycle"
+                }
+                Some(JoinOperatorConfig::Lookup(_)) | None => {
+                    "lookup join operator and output state have no vnode lifecycle"
+                }
+            };
+            return reject(reason);
+        } else if crate::sql_analysis::detect_stream_join_query(query_sql).is_some() {
+            return reject(
+                "stream join state has no vnode-keyed checkpoint and rebalance lifecycle",
+            );
+        }
+
+        let dataframe = self.ctx.sql(query_sql).await.map_err(|error| {
+            Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                &format!("cluster shape could not be validated: {error}"),
+            )
+        })?;
+        let has_aggregate =
+            crate::aggregate_state::find_aggregate(dataframe.logical_plan()).is_some();
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(dataframe.logical_plan())
+            .await
+            .map_err(|error| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    &format!("cluster physical plan could not be validated: {error}"),
+                )
+            })?;
+        if contains_builtin_join_without_cluster_lifecycle(&physical) {
+            return reject(
+                "a built-in DataFusion join has no distributed shuffle and vnode state lifecycle",
+            );
+        }
+        let incremental_mvs = self.incremental_mv_names();
+        let reads_changelog = crate::sql_analysis::extract_table_references(query_sql)
+            .iter()
+            .any(|table| incremental_mvs.contains(table));
+        if let Some(reason) = unsupported_cluster_aggregate(&physical, reads_changelog) {
+            return reject(&reason);
+        }
+        if has_aggregate {
+            #[cfg(feature = "cluster")]
+            if self.shuffle_sender.lock().is_none()
+                || self.shuffle_receiver.lock().is_none()
+                || self.vnode_registry.lock().is_none()
+            {
+                return reject(
+                    "aggregate has no complete distributed shuffle and vnode ownership scope",
+                );
+            }
+            let emit_changelog = plan
+                .emit_clause
+                .as_ref()
+                .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
+            match crate::aggregate_state::IncrementalAggState::try_from_sql(
+                &self.ctx,
+                query_sql,
+                emit_changelog,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return reject(
+                        "aggregate cannot be constructed on the exact incremental execution path; node-local DataFusion fallback would produce partial cluster results",
+                    );
+                }
+                Err(error) => {
+                    return reject(&format!(
+                        "aggregate incremental execution path could not be constructed: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Register a materialized view and wire it into the running pipeline.
@@ -1089,82 +2415,50 @@ impl LaminarDB {
         query_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
         self.ensure_topology_ddl_allowed("CREATE MATERIALIZED VIEW")?;
-        let name_str = name.to_string();
+        let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
-
-        if self.mv_exists_guard(&name_str, if_not_exists, or_replace)? {
+        if or_replace {
+            return Err(DbError::InvalidOperation(
+                "CREATE OR REPLACE MATERIALIZED VIEW is not atomic; use DROP MATERIALIZED VIEW followed by CREATE MATERIALIZED VIEW"
+                    .into(),
+            ));
+        }
+        if self.is_cluster_runtime() {
+            return Err(Self::cluster_state_lifecycle_error(
+                "materialized view",
+                &name_str,
+                "materialized state has no planner-certified distribution and assignment-fenced checkpoint/read lifecycle",
+            ));
+        }
+        let Some(mut reservation) = self.reserve_catalog_name(
+            &name_str,
+            CatalogObjectKind::MaterializedView,
+            if_not_exists,
+        )?
+        else {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE MATERIALIZED VIEW".to_string(),
                 object_name: name_str,
+                applied: false,
             }));
-        }
+        };
 
-        // The incremental changelog⋈changelog join is single-node only (its inputs are not
-        // key-shuffled). In a multi-node cluster each node would join only node-local slices → wrong
-        // results, so reject it (2-way or decomposed N-way) rather than build silently-wrong state.
-        if self.is_multi_node() {
-            let inc = self.incremental_mv_names();
-            if crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
-                || crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
-                    .is_some()
-            {
-                return Err(DbError::MaterializedView(format!(
-                    "[{}] incremental changelog join '{name_str}' is single-node only and cannot be \
-                     created in a multi-node cluster",
-                    laminar_core::error_codes::JOIN_CLUSTER_UNSUPPORTED
-                )));
-            }
+        let incremental_names = self.incremental_mv_names();
+        if crate::sql_analysis::is_multiway_incremental_join(query_sql, &incremental_names) {
+            return Err(DbError::MaterializedView(format!(
+                "multi-way incremental join '{name_str}' is disabled until the runtime supports \
+                 atomic batch topology admission"
+            )));
         }
-
-        // Single-statement N-way join → decompose into a left-deep chain of 2-way changelog-join MVs
-        // (hidden `__ivm_{name}_*` intermediates + a rewritten 2-way final under `name`), each created
-        // directly. Only the original N-way DDL is persisted, so a cold restart re-decomposes.
-        {
-            let inc = self.incremental_mv_names();
-            if let Some(plan) =
-                crate::sql_analysis::plan_multiway_incremental_join(&name_str, query_sql, &inc)
-            {
-                // OR REPLACE: drop the previous definition (its DROP cascade also removes the old
-                // hidden intermediates) before rebuilding the chain.
-                if or_replace {
-                    let _ = Box::pin(
-                        self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {name_str}")),
-                    )
-                    .await;
-                }
-                // Create the chain; on any failure, unwind the intermediates already created so CREATE
-                // stays all-or-nothing (no orphan `__ivm_*` MVs left behind).
-                let mut created: Vec<String> = Vec::new();
-                let outcome: Result<ExecuteResult, DbError> = 'chain: {
-                    for (iname, ibody) in &plan.intermediates {
-                        if let Err(e) = Box::pin(self.create_decomposed_mv(&format!(
-                            "CREATE MATERIALIZED VIEW {iname} AS {ibody}"
-                        )))
-                        .await
-                        {
-                            break 'chain Err(e);
-                        }
-                        created.push(iname.clone());
-                    }
-                    Box::pin(self.create_decomposed_mv(&format!(
-                        "CREATE MATERIALIZED VIEW {name_str} AS {}",
-                        plan.final_query
-                    )))
-                    .await
-                };
-                if outcome.is_err() {
-                    // Leaf-first: a later intermediate reads an earlier one, so dropping in reverse
-                    // creation order clears each before its dependency (no HasDependents no-op).
-                    for iname in created.iter().rev() {
-                        let _ = Box::pin(
-                            self.execute(&format!("DROP MATERIALIZED VIEW IF EXISTS {iname}")),
-                        )
-                        .await;
-                    }
-                }
-                return outcome;
-            }
-        }
+        let planned = self.plan_streaming_query(name, query, emit_clause, query_sql)?;
+        let PlannedStreamingQuery {
+            emit_clause: plan_emit,
+            window_config: plan_window,
+            order_config: plan_order,
+            join_config: plan_joins,
+            has_analytic: plan_has_analytic,
+            has_frame: plan_has_frame,
+        } = planned;
 
         let query_sql = query_sql.to_string();
         // A chained MV over an incremental MV must net the changelog — an aggregate or a simple
@@ -1180,36 +2474,16 @@ impl LaminarDB {
 
             let mut registry = self.mv_registry.lock();
 
-            if or_replace {
-                let _ = registry.unregister_cascade(&name_str);
-            }
-
             registry
                 .register(mv)
                 .map_err(|e| DbError::MaterializedView(e.to_string()))?;
         }
-
-        // EMIT ON WINDOW CLOSE routes to EowcQueryOperator; other emit modes use SqlQueryOperator.
-        let (plan_emit, plan_window, plan_order, plan_joins) = {
-            let mut planner = self.planner.lock();
-            let stmt = StreamingStatement::CreateStream {
-                name: name.clone(),
-                query: Box::new(query.clone()),
-                emit_clause,
-                or_replace: false,
-                if_not_exists: false,
-                query_sql: query_sql.clone(),
-                retention_bytes: None,
-            };
-            match planner.plan(&stmt) {
-                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
-                    qp.emit_clause.clone(),
-                    qp.window_config.clone(),
-                    qp.order_config.clone(),
-                    qp.join_config.clone(),
-                ),
-                _ => (None, None, None, None),
-            }
+        let mutation = Arc::new(ControlMutation::new());
+        reservation.bind_control_mutation(Arc::clone(&mutation));
+        let _create_guard = MaterializedViewCreateGuard {
+            db: self,
+            name: name_str.clone(),
+            mutation: Arc::clone(&mutation),
         };
 
         // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
@@ -1228,65 +2502,73 @@ impl LaminarDB {
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
+                has_analytic: plan_has_analytic,
+                has_frame: plan_has_frame,
                 incremental,
             });
+            mgr.store_ddl(&name_str, sql);
         }
 
-        self.register_mv_provider(
+        if let Err(error) = self.register_mv_provider(
             &name_str,
             &schema,
             plan_window.is_some(),
             inc,
             has_aggregate,
-        )?;
-
-        // Hot-add to running pipeline; roll back on a saturated channel so retry is clean.
-        if let Some(ref tx) = *self.control_tx.lock() {
-            tx.try_send(crate::pipeline::ControlMsg::AddStream {
-                name: name_str.clone(),
-                sql: query_sql,
-                emit_clause: plan_emit,
-                window_config: plan_window,
-                order_config: plan_order,
-                join_config: plan_joins,
-                incremental,
-            })
-            .map_err(|e| {
-                let _ = self.ctx.deregister_table(&name_str);
-                let _ = self.mv_registry.lock().unregister(&name_str);
-                self.connector_manager.lock().unregister_stream(&name_str);
-                self.mv_store.write().drop_mv(&name_str);
-                DbError::Pipeline(format!(
-                    "control channel busy, retry CREATE MATERIALIZED VIEW '{name_str}': {e}"
-                ))
-            })?;
+        ) {
+            return Err(error);
         }
+
+        let admission = {
+            let guard = self.control_tx.lock();
+            guard.as_ref().map(|tx| {
+                let (reply, admission) = tokio::sync::oneshot::channel();
+                tx.try_send(crate::pipeline::ControlMsg::add_stream(
+                    name_str.clone(),
+                    query_sql,
+                    plan_emit,
+                    plan_window,
+                    plan_order,
+                    plan_joins,
+                    incremental,
+                    reply,
+                    Arc::clone(&mutation),
+                ))
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "control channel busy, retry CREATE MATERIALIZED VIEW '{name_str}': {e}"
+                    ))
+                })?;
+                Ok::<_, DbError>(admission)
+            })
+        }
+        .transpose();
+        let admission_result = match admission {
+            Ok(Some(admission)) => {
+                resolve_control_ack(
+                    &format!("CREATE MATERIALIZED VIEW '{name_str}'"),
+                    admission,
+                    &mutation,
+                )
+                .await
+            }
+            Ok(None) => self.apply_without_live_control(
+                &format!("CREATE MATERIALIZED VIEW '{name_str}'"),
+                &mutation,
+            ),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = admission_result {
+            return Err(error);
+        }
+
+        reservation.commit();
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE MATERIALIZED VIEW".to_string(),
             object_name: name_str,
+            applied: true,
         }))
-    }
-
-    /// `true` ⇒ an existing MV should make the caller no-op (`IF NOT EXISTS`).
-    fn mv_exists_guard(
-        &self,
-        name_str: &str,
-        if_not_exists: bool,
-        or_replace: bool,
-    ) -> Result<bool, DbError> {
-        let registry = self.mv_registry.lock();
-        if registry.get(name_str).is_some() {
-            if if_not_exists {
-                return Ok(true);
-            }
-            if !or_replace {
-                return Err(DbError::MaterializedView(format!(
-                    "Materialized view '{name_str}' already exists"
-                )));
-            }
-        }
-        Ok(false)
     }
 
     /// Falls back to executing the query for shapes `DataFusion` can't plan (e.g. ASOF).
@@ -1432,7 +2714,6 @@ impl LaminarDB {
         (IncEmit::None, false)
     }
 
-    /// Cluster mode wraps the provider to union peer vnode slices on read.
     fn register_mv_provider(
         &self,
         name_str: &str,
@@ -1456,132 +2737,104 @@ impl LaminarDB {
             .write()
             .create_mv(name_str, schema.clone(), mode)?;
 
-        let mv_provider = crate::table_provider::MvTableProvider::new(
-            name_str.to_string(),
-            schema.clone(),
-            self.mv_store.clone(),
-        );
-
-        #[cfg(feature = "cluster")]
         let provider: Arc<dyn datafusion::datasource::TableProvider> =
-            if let Some(controller) = self.cluster_controller.lock().clone() {
-                Arc::new(
-                    laminar_sql::datafusion::distributed_scan::DistributedTableProvider::new(
-                        name_str.to_string(),
-                        schema.clone(),
-                        Arc::new(mv_provider),
-                        controller,
-                    ),
-                )
-            } else {
-                Arc::new(mv_provider)
-            };
-        #[cfg(not(feature = "cluster"))]
-        let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(mv_provider);
+            Arc::new(crate::table_provider::MvTableProvider::new(
+                name_str.to_string(),
+                schema.clone(),
+                self.mv_store.clone(),
+            ));
 
-        let _ = self.ctx.deregister_table(name_str);
-        self.ctx.register_table(name_str, provider).map_err(|e| {
-            DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
-        })?;
-        Ok(())
+        match self
+            .ctx
+            .register_table(exact_table_reference(name_str), provider)
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(previous)) => {
+                let _ = self
+                    .ctx
+                    .register_table(exact_table_reference(name_str), previous);
+                Err(DbError::MaterializedView(format!(
+                    "cannot create materialized view '{name_str}': the table namespace was \
+                     claimed concurrently"
+                )))
+            }
+            Err(error) => Err(DbError::MaterializedView(format!(
+                "Failed to register MV table provider: {error}"
+            ))),
+        }
     }
 
     /// Handle DROP MATERIALIZED VIEW statement.
-    pub(crate) fn handle_drop_materialized_view(
+    pub(crate) async fn handle_drop_materialized_view(
         &self,
         name: &sqlparser::ast::ObjectName,
         if_exists: bool,
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         self.ensure_topology_ddl_allowed("DROP MATERIALIZED VIEW")?;
-        let name_str = name.to_string();
-
-        let mut dropped_names;
-        {
-            let mut registry = self.mv_registry.lock();
-
-            let result = if cascade {
-                registry.unregister_cascade(&name_str)
-            } else {
-                registry.unregister(&name_str).map(|v| vec![v])
-            };
-
-            match result {
-                Ok(views) => {
-                    dropped_names = views
-                        .into_iter()
-                        .map(|v| v.name.clone())
-                        .collect::<Vec<_>>();
-                }
-                Err(_) if if_exists => {
-                    dropped_names = vec![];
-                }
-                Err(e) => return Err(DbError::MaterializedView(e.to_string())),
-            }
+        let name_str = canonical_object_name(name)?;
+        if !self.require_catalog_kind(&name_str, CatalogObjectKind::MaterializedView, if_exists)? {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "DROP MATERIALIZED VIEW".to_string(),
+                object_name: name_str,
+                applied: false,
+            }));
         }
+        let targets =
+            self.build_drop_plan(&name_str, CatalogObjectKind::MaterializedView, cascade)?;
+        let graph_names: Vec<String> = targets
+            .iter()
+            .filter(|target| {
+                matches!(
+                    target.kind,
+                    CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                )
+            })
+            .map(|target| target.name.clone())
+            .collect();
 
-        // Also drop the hidden intermediate MVs of a decomposed multi-way join. They are UPSTREAM of
-        // the parent (the parent reads them), so unregister_cascade — which follows downstream deps —
-        // never reaches them.
-        {
-            let prefix = format!(
-                "{}{name_str}_",
-                crate::sql_analysis::MULTIWAY_INTERMEDIATE_PREFIX
-            );
-            // Numeric-suffix only: a bare starts_with would also sweep a name-prefix sibling
-            // (dropping `sales` would hit `__ivm_sales_daily_0`).
-            let mut intermediates: Vec<(u64, String)> = self
-                .connector_manager
-                .lock()
-                .streams()
-                .keys()
-                .filter_map(|n| {
-                    n.strip_prefix(&prefix)
-                        .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-                        .and_then(|rest| rest.parse::<u64>().ok())
-                        .map(|k| (k, n.clone()))
-                })
-                .collect();
-            // I_k reads I_{k-1}; drop highest suffix first so unregister never hits a live dependent.
-            intermediates.sort_unstable_by_key(|&(k, _)| std::cmp::Reverse(k));
-            for (_, it) in intermediates {
-                let _ = self.mv_registry.lock().unregister(&it);
-                if !dropped_names.contains(&it) {
-                    dropped_names.push(it);
-                }
-            }
-        }
-
-        // Notify before local teardown so a saturated channel stays retryable.
-        if let Some(ref tx) = *self.control_tx.lock() {
-            for dropped in &dropped_names {
-                tx.try_send(crate::pipeline::ControlMsg::DropStream {
-                    name: dropped.clone(),
-                })
-                .map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "control channel busy, retry DROP MATERIALIZED VIEW '{dropped}': {e}"
-                    ))
-                })?;
-            }
-        }
-
-        {
-            let mut mgr = self.connector_manager.lock();
-            let mut mv_store = self.mv_store.write();
-            for dropped in &dropped_names {
-                mgr.unregister_stream(dropped);
-                mv_store.drop_mv(dropped);
-                let _ = self.ctx.deregister_table(dropped);
-            }
-        }
-        for dropped in &dropped_names {
-            self.subscription_registry.drop_name(dropped);
-        }
+        let mutation = Arc::new(ControlMutation::new());
+        let drop_guard = StreamingDropGuard {
+            db: self,
+            targets,
+            mutation: Arc::clone(&mutation),
+            finished: false,
+        };
+        self.acknowledge_runtime_drop(
+            "DROP MATERIALIZED VIEW",
+            &graph_names,
+            Arc::clone(&mutation),
+        )
+        .await?;
+        drop_guard.finish()?;
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP MATERIALIZED VIEW".to_string(),
             object_name: name_str,
+            applied: true,
+        }))
+    }
+
+    pub(crate) fn handle_drop_lookup_table(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        if_exists: bool,
+    ) -> Result<ExecuteResult, DbError> {
+        self.ensure_offline_topology_ddl_allowed("DROP LOOKUP TABLE")?;
+        let name = canonical_object_name(name)?;
+        if !self.require_catalog_kind(&name, CatalogObjectKind::LookupTable, if_exists)? {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "DROP LOOKUP TABLE".into(),
+                object_name: name,
+                applied: false,
+            }));
+        }
+        let targets = self.build_drop_plan(&name, CatalogObjectKind::LookupTable, false)?;
+        self.teardown_catalog_targets(&targets, "DROP LOOKUP TABLE")?;
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "DROP LOOKUP TABLE".into(),
+            object_name: name,
+            applied: true,
         }))
     }
 
@@ -1590,25 +2843,25 @@ impl LaminarDB {
         &self,
         names: &[sqlparser::ast::ObjectName],
         if_exists: bool,
+        cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
-        self.ensure_topology_ddl_allowed("DROP TABLE")?;
+        self.ensure_offline_topology_ddl_allowed("DROP TABLE")?;
+        let mut plans = Vec::new();
         for obj_name in names {
-            let name_str = obj_name.to_string();
-
-            self.table_store.write().drop_table(&name_str);
-            self.connector_manager.lock().unregister_table(&name_str);
-            match self.ctx.deregister_table(&name_str) {
-                Ok(None) if !if_exists => {
-                    return Err(DbError::TableNotFound(name_str));
-                }
-                Ok(Some(_) | None) => {}
-                Err(e) => {
-                    return Err(DbError::InvalidOperation(format!(
-                        "Failed to drop table '{name_str}': {e}"
-                    )));
-                }
+            let name_str = canonical_object_name(obj_name)?;
+            if self.require_catalog_kind(&name_str, CatalogObjectKind::Table, if_exists)? {
+                plans.push(self.build_drop_plan(&name_str, CatalogObjectKind::Table, cascade)?);
             }
         }
+
+        let mut seen = HashSet::new();
+        let targets: Vec<_> = plans
+            .into_iter()
+            .flatten()
+            .filter(|target| seen.insert(target.name.clone()))
+            .collect();
+        let applied = !targets.is_empty();
+        self.teardown_catalog_targets(&targets, "DROP TABLE")?;
 
         let name = names
             .first()
@@ -1618,17 +2871,17 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP TABLE".to_string(),
             object_name: name,
+            applied,
         }))
     }
 
     /// Re-publish a lookup table's snapshot after a write so lookup joins don't
     /// probe stale rows. No-op for non-lookup tables.
-    #[allow(clippy::unnecessary_wraps)] // signature kept fallible for call sites
     pub(crate) fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
         if self.lookup_registry.get_entry(name).is_none() {
             return Ok(());
         }
-        if let Some(batch) = self.table_store.read().to_record_batch(name) {
+        if let Some(batch) = self.table_store.read().to_record_batch(name)? {
             self.lookup_registry
                 .register(name, laminar_sql::datafusion::LookupSnapshot { batch });
         }
@@ -1743,4 +2996,155 @@ pub(crate) fn extract_connector_from_with_options(
     }
 
     (connector_options, format, format_options)
+}
+
+#[cfg(test)]
+mod create_table_shape_tests {
+    use arrow::datatypes::DataType;
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    use super::{
+        build_table_fields_and_primary_key, distinct_streaming_aggregate,
+        validate_create_table_envelope,
+    };
+
+    fn parse_create_table(sql: &str) -> sqlparser::ast::CreateTable {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match statements.remove(0) {
+            Statement::CreateTable(create) => create,
+            statement => panic!("expected CREATE TABLE, got {statement}"),
+        }
+    }
+
+    #[test]
+    fn cluster_distinct_aggregate_preflight_is_exact() {
+        assert_eq!(
+            distinct_streaming_aggregate("SELECT k, COUNT(DISTINCT v) FROM events GROUP BY k")
+                .as_deref(),
+            Some("countdistinct")
+        );
+        assert_eq!(
+            distinct_streaming_aggregate("SELECT k, COUNT(v) FROM events GROUP BY k"),
+            None
+        );
+    }
+
+    #[test]
+    fn primary_key_is_single_column_and_non_nullable() {
+        for sql in [
+            "CREATE TABLE t (id INT PRIMARY KEY, value VARCHAR NULL)",
+            "CREATE TABLE t (id INT, value VARCHAR, PRIMARY KEY (id))",
+        ] {
+            let create = parse_create_table(sql);
+            validate_create_table_envelope(&create).unwrap();
+            let (fields, primary_key) = build_table_fields_and_primary_key(&create).unwrap();
+            assert_eq!(primary_key, "id");
+            assert_eq!(fields[0].data_type(), &DataType::Int32);
+            assert!(!fields[0].is_nullable());
+            assert!(fields[1].is_nullable());
+        }
+    }
+
+    #[test]
+    fn duplicate_columns_and_ambiguous_nullability_are_rejected() {
+        for (sql, expected) in [
+            (
+                "CREATE TABLE t (id INT PRIMARY KEY, id INT)",
+                "duplicate CREATE TABLE column 'id'",
+            ),
+            (
+                "CREATE TABLE t (id INT PRIMARY KEY, ID INT)",
+                "duplicate CREATE TABLE column 'ID'",
+            ),
+            (
+                "CREATE TABLE t (id INT NULL PRIMARY KEY)",
+                "cannot be declared NULL",
+            ),
+            (
+                "CREATE TABLE t (id INT PRIMARY KEY, value INT NULL NOT NULL)",
+                "repeated or conflicting NULL/NOT NULL",
+            ),
+            (
+                "CREATE TABLE t (id INT PRIMARY KEY, value INT NOT NULL NOT NULL)",
+                "repeated or conflicting NULL/NOT NULL",
+            ),
+        ] {
+            let create = parse_create_table(sql);
+            let error = build_table_fields_and_primary_key(&create).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected rejection for {sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquoted_primary_key_reference_is_case_insensitive() {
+        let create = parse_create_table("CREATE TABLE t (id INT, PRIMARY KEY (ID))");
+        let (fields, primary_key) = build_table_fields_and_primary_key(&create).unwrap();
+        assert_eq!(primary_key, "id");
+        assert!(!fields[0].is_nullable());
+
+        let quoted =
+            parse_create_table("CREATE TABLE t (id INT, \"ID\" INT, PRIMARY KEY (\"ID\"))");
+        let (fields, primary_key) = build_table_fields_and_primary_key(&quoted).unwrap();
+        assert_eq!(primary_key, "ID");
+        assert!(fields[0].is_nullable());
+        assert!(!fields[1].is_nullable());
+    }
+
+    #[test]
+    fn unsupported_column_and_table_constraints_are_rejected() {
+        for sql in [
+            "CREATE TABLE t (id INT PRIMARY KEY, value INT DEFAULT 1)",
+            "CREATE TABLE t (id INT PRIMARY KEY, value INT UNIQUE)",
+            "CREATE TABLE t (id INT PRIMARY KEY, value INT CHECK (value > 0))",
+            "CREATE TABLE t (id INT, value INT, PRIMARY KEY (id), UNIQUE (value))",
+            "CREATE TABLE t (id INT, CONSTRAINT named_pk PRIMARY KEY (id))",
+        ] {
+            let create = parse_create_table(sql);
+            let error = build_table_fields_and_primary_key(&create).unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported"),
+                "unexpected rejection for {sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_top_level_shape_is_rejected() {
+        let base = parse_create_table("CREATE TABLE t (id INT PRIMARY KEY)");
+
+        let mut create = base.clone();
+        create.temporary = true;
+        assert!(validate_create_table_envelope(&create)
+            .unwrap_err()
+            .to_string()
+            .contains("TEMPORARY"));
+
+        let mut create = base.clone();
+        create.without_rowid = true;
+        assert!(validate_create_table_envelope(&create)
+            .unwrap_err()
+            .to_string()
+            .contains("WITHOUT ROWID"));
+
+        let mut create = base;
+        create.query = Some(Box::new(
+            match Parser::parse_sql(&GenericDialect {}, "SELECT 1")
+                .unwrap()
+                .remove(0)
+            {
+                Statement::Query(query) => *query,
+                statement => panic!("expected query, got {statement}"),
+            },
+        ));
+        assert!(validate_create_table_envelope(&create)
+            .unwrap_err()
+            .to_string()
+            .contains("AS query"));
+    }
 }

@@ -49,9 +49,6 @@ data/
 checkpoints/
 wal/
 /tools/*
-!/tools/state-tier-bench
-/tools/state-tier-bench/target
-/tools/state-tier-bench/Cargo.lock
 
 # Private configs (symlinked from private repo)
 CLAUDE.md

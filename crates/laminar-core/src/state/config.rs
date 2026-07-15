@@ -1,6 +1,6 @@
-//! [`StateBackendConfig`]: tagged enum selecting the runtime state
-//! backend. Three shapes: `in_process`, `local` (filesystem path),
-//! `object_store` (s3/gcs/file url).
+//! [`StateBackendConfig`]: tagged enum selecting storage for checkpointed
+//! vnode artifacts. Three shapes: `in_process`, `local` (filesystem path),
+//! `object_store` (S3/GCS/Azure/file URL).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,25 +16,13 @@ use super::{
 /// Default number of vnodes if the user does not override.
 pub const DEFAULT_VNODE_CAPACITY: u32 = 256;
 
+/// Largest vnode count representable by the persisted checkpoint ABI.
+pub const MAX_VNODE_CAPACITY: u32 = 65_535;
+
+const LOCAL_STATE_WRITER_ID: &str = "local";
+
 fn default_vnode_capacity() -> u32 {
     DEFAULT_VNODE_CAPACITY
-}
-
-fn default_instance_id() -> String {
-    "local".to_string()
-}
-
-/// How nodes discover one another in `object_store` mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscoveryMode {
-    /// Static vnode assignment. `vnodes` and (optionally) `merger_instance`
-    /// are required in this mode.
-    #[default]
-    Static,
-    /// Dynamic membership — peers gossip via chitchat; vnode assignment
-    /// is chosen by the coordination layer.
-    Dynamic,
 }
 
 /// Cloud credential/config overrides for the state object store.
@@ -52,11 +40,9 @@ impl std::fmt::Debug for StorageOptions {
     }
 }
 
-/// Tagged-union config that selects the runtime [`StateBackend`].
-///
-/// See module docs for the five deployment shapes.
+/// Tagged-union config that selects checkpoint-artifact storage.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "backend", rename_all = "snake_case")]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StateBackendConfig {
     /// Non-durable in-process backend. The default.
     InProcess {
@@ -70,9 +56,6 @@ pub enum StateBackendConfig {
     Local {
         /// Filesystem root for state.
         path: PathBuf,
-        /// Node identity (written into exact-attempt state seals for audit).
-        #[serde(default = "default_instance_id")]
-        instance_id: String,
         /// Number of vnodes the backend should size for.
         #[serde(default = "default_vnode_capacity")]
         vnode_capacity: u32,
@@ -90,26 +73,9 @@ pub enum StateBackendConfig {
         /// vars (`AWS_ACCESS_KEY_ID`, ...).
         #[serde(default)]
         storage: StorageOptions,
-        /// This node's identity. Written into epoch manifests and used
-        /// by the assignment-version fence to reject stale writes.
-        instance_id: String,
         /// Number of vnodes the backend should size for.
         #[serde(default = "default_vnode_capacity")]
         vnode_capacity: u32,
-        /// Static vnode subset for this instance. `None` means "all
-        /// vnodes" (useful for the merger instance or for dynamic mode).
-        #[serde(default)]
-        vnodes: Option<Vec<u32>>,
-        /// Optional merger instance — the node that fans in partials
-        /// for sink emission. Only meaningful in static mode.
-        #[serde(default)]
-        merger_instance: Option<String>,
-        /// Discovery strategy: static assignment or chitchat gossip.
-        #[serde(default)]
-        discovery: DiscoveryMode,
-        /// Seed peers for dynamic discovery.
-        #[serde(default)]
-        seed_peers: Vec<String>,
     },
 }
 
@@ -124,6 +90,10 @@ impl Default for StateBackendConfig {
 /// Failure modes for [`StateBackendConfig::build`].
 #[derive(Debug, thiserror::Error)]
 pub enum StateBackendBuildError {
+    /// Configuration cannot be represented safely by the runtime/checkpoint ABI.
+    #[error("invalid state backend configuration: {0}")]
+    InvalidConfig(String),
+
     /// Object store construction failed (bad URL, missing feature
     /// flag for the scheme, missing credentials, ...).
     #[error("state backend object store: {0}")]
@@ -148,25 +118,19 @@ impl StateBackendConfig {
     pub fn local(path: impl Into<PathBuf>) -> Self {
         Self::Local {
             path: path.into(),
-            instance_id: default_instance_id(),
             vnode_capacity: DEFAULT_VNODE_CAPACITY,
         }
     }
 
-    /// Builder: distributed-embedded over an object store, static mode.
+    /// Builder: object-store-backed state for an embedded or single-node runtime.
     /// Credentials resolve from the provider's standard env vars; use
     /// the `storage` config field for explicit overrides.
     #[must_use]
-    pub fn object_store(url: impl Into<String>, instance_id: impl Into<String>) -> Self {
+    pub fn object_store(url: impl Into<String>) -> Self {
         Self::ObjectStore {
             url: url.into(),
             storage: StorageOptions::default(),
-            instance_id: instance_id.into(),
             vnode_capacity: DEFAULT_VNODE_CAPACITY,
-            vnodes: None,
-            merger_instance: None,
-            discovery: DiscoveryMode::Static,
-            seed_peers: Vec::new(),
         }
     }
 
@@ -184,13 +148,13 @@ impl StateBackendConfig {
     /// - [`StateBackendBuildError::Io`] on filesystem setup.
     #[allow(clippy::unused_async)]
     pub async fn build(&self) -> Result<Arc<dyn StateBackend>, StateBackendBuildError> {
+        self.validate()?;
         match self {
             Self::InProcess { vnode_capacity } => {
                 Ok(Arc::new(InProcessBackend::new(*vnode_capacity)))
             }
             Self::Local {
                 path,
-                instance_id,
                 vnode_capacity,
             } => {
                 std::fs::create_dir_all(path)
@@ -199,28 +163,31 @@ impl StateBackendConfig {
                     .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
                 Ok(Arc::new(ObjectStoreBackend::node_durable(
                     Arc::new(fs),
-                    instance_id,
+                    LOCAL_STATE_WRITER_ID,
                     *vnode_capacity,
                 )))
             }
             Self::ObjectStore {
                 url,
                 storage,
-                instance_id,
                 vnode_capacity,
                 ..
             } => {
                 let store = cloud_store(url, storage)?;
                 let backend = match self.durability_scope() {
                     StateBackendDurability::Volatile => {
-                        ObjectStoreBackend::new(store, instance_id, *vnode_capacity)
+                        ObjectStoreBackend::new(store, LOCAL_STATE_WRITER_ID, *vnode_capacity)
                     }
-                    StateBackendDurability::NodeDurable => {
-                        ObjectStoreBackend::node_durable(store, instance_id, *vnode_capacity)
-                    }
-                    StateBackendDurability::ClusterShared => {
-                        ObjectStoreBackend::cluster_shared(store, instance_id, *vnode_capacity)
-                    }
+                    StateBackendDurability::NodeDurable => ObjectStoreBackend::node_durable(
+                        store,
+                        LOCAL_STATE_WRITER_ID,
+                        *vnode_capacity,
+                    ),
+                    StateBackendDurability::ClusterShared => ObjectStoreBackend::cluster_shared(
+                        store,
+                        LOCAL_STATE_WRITER_ID,
+                        *vnode_capacity,
+                    ),
                 };
                 Ok(Arc::new(backend))
             }
@@ -283,6 +250,21 @@ impl StateBackendConfig {
             | Self::ObjectStore { vnode_capacity, .. } => *vnode_capacity,
         }
     }
+
+    /// Validate invariants shared by every runtime mode.
+    ///
+    /// # Errors
+    /// Returns [`StateBackendBuildError::InvalidConfig`] when the vnode count cannot be encoded
+    /// by the persisted checkpoint format.
+    pub fn validate(&self) -> Result<(), StateBackendBuildError> {
+        let capacity = self.vnode_capacity();
+        if !(1..=MAX_VNODE_CAPACITY).contains(&capacity) {
+            return Err(StateBackendBuildError::InvalidConfig(format!(
+                "vnode_capacity must be between 1 and {MAX_VNODE_CAPACITY}, got {capacity}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Cloud-store construction shared by [`StateBackendConfig::build`] and
@@ -306,6 +288,20 @@ fn cloud_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persisted_seal_writer(
+        root: &std::path::Path,
+        attempt: crate::state::CheckpointAttempt,
+    ) -> String {
+        let path = root
+            .join("state-v2")
+            .join(format!("epoch={}", attempt.epoch))
+            .join(format!("checkpoint={}", attempt.checkpoint_id))
+            .join("_SEAL");
+        let bytes = std::fs::read(path).unwrap();
+        let seal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        seal["instance_id"].as_str().unwrap().to_owned()
+    }
 
     #[test]
     fn parse_in_process_minimal() {
@@ -362,55 +358,50 @@ vnode_capacity = 128
     }
 
     #[test]
-    fn parse_object_store_static() {
+    fn parse_object_store() {
         let toml = r#"
 backend = "object_store"
 url = "s3://bucket/laminar"
-instance_id = "node-0"
-vnodes = [0, 1, 2, 3]
-merger_instance = "node-0"
 "#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
         assert_eq!(c.durability_scope(), StateBackendDurability::ClusterShared);
         match c {
-            StateBackendConfig::ObjectStore {
-                url,
-                instance_id,
-                vnodes,
-                merger_instance,
-                discovery,
-                ..
-            } => {
+            StateBackendConfig::ObjectStore { url, .. } => {
                 assert_eq!(url, "s3://bucket/laminar");
-                assert_eq!(instance_id, "node-0");
-                assert_eq!(vnodes, Some(vec![0, 1, 2, 3]));
-                assert_eq!(merger_instance.as_deref(), Some("node-0"));
-                assert_eq!(discovery, DiscoveryMode::Static);
             }
             _ => panic!("expected ObjectStore"),
         }
     }
 
     #[test]
-    fn parse_object_store_dynamic() {
-        let toml = r#"
-backend = "object_store"
-url = "s3://bucket/laminar"
-instance_id = "node-0"
-discovery = "dynamic"
-seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
-"#;
-        let c: StateBackendConfig = toml::from_str(toml).unwrap();
-        match c {
-            StateBackendConfig::ObjectStore {
-                discovery,
-                seed_peers,
-                ..
-            } => {
-                assert_eq!(discovery, DiscoveryMode::Dynamic);
-                assert_eq!(seed_peers.len(), 2);
-            }
-            _ => panic!("expected ObjectStore dynamic"),
+    fn reject_public_state_writer_identity() {
+        for toml in [
+            "backend = \"local\"\npath = \"/var/laminar\"\ninstance_id = \"node-0\"\n",
+            "backend = \"local\"\npath = \"/var/laminar\"\ninstanceId = \"node-0\"\n",
+            "backend = \"object_store\"\nurl = \"s3://bucket/laminar\"\ninstance_id = \"node-0\"\n",
+            "backend = \"object_store\"\nurl = \"s3://bucket/laminar\"\ninstanceId = \"node-0\"\n",
+        ] {
+            assert!(
+                toml::from_str::<StateBackendConfig>(toml).is_err(),
+                "public writer identity was silently accepted: {toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unwired_object_store_fields() {
+        for retired in [
+            "vnodes = [0, 1]",
+            "merger_instance = \"node-0\"",
+            "discovery = \"dynamic\"",
+            "seed_peers = [\"10.0.0.1:7946\"]",
+        ] {
+            let toml =
+                format!("backend = \"object_store\"\nurl = \"s3://bucket/laminar\"\n{retired}\n");
+            assert!(
+                toml::from_str::<StateBackendConfig>(&toml).is_err(),
+                "retired field was silently accepted: {retired}"
+            );
         }
     }
 
@@ -447,6 +438,11 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
             .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
+        assert!(backend
+            .seal_checkpoint(attempt, None, &[0], &[])
+            .await
+            .unwrap());
+        assert_eq!(persisted_seal_writer(dir.path(), attempt), "local");
         assert_eq!(
             &backend.read_partial(attempt, 0).await.unwrap().unwrap()[..],
             b"z",
@@ -461,7 +457,7 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
             "file://{}",
             dir.path().display().to_string().replace('\\', "/")
         );
-        let c = StateBackendConfig::object_store(url, "node-0");
+        let c = StateBackendConfig::object_store(url);
         let backend = c.build().await.unwrap();
         assert_eq!(
             backend.durability_scope(),
@@ -472,6 +468,11 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
             .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
+        assert!(backend
+            .seal_checkpoint(attempt, None, &[0], &[])
+            .await
+            .unwrap());
+        assert_eq!(persisted_seal_writer(dir.path(), attempt), "local");
         let got = backend.read_partial(attempt, 0).await.unwrap().unwrap();
         assert_eq!(&got[..], b"z");
     }
@@ -483,7 +484,7 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
     async fn build_object_store_s3_requires_aws_feature() {
         use crate::checkpoint::object_store_builder::ObjectStoreBuilderError;
 
-        let c = StateBackendConfig::object_store("s3://bucket/path", "node-0");
+        let c = StateBackendConfig::object_store("s3://bucket/path");
         let Err(err) = c.build().await else {
             panic!("s3 must not build without the aws feature");
         };
@@ -505,7 +506,6 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         let toml = r#"
 backend = "object_store"
 url = "s3://bucket/laminar"
-instance_id = "node-0"
 
 [storage]
 endpoint = "http://127.0.0.1:9000"
@@ -534,5 +534,16 @@ allow_http = "true"
             StateBackendConfig::in_process(),
             StateBackendConfig::local("/tmp/x")
         );
+    }
+
+    #[tokio::test]
+    async fn build_rejects_vnode_capacity_outside_persisted_range() {
+        for vnode_capacity in [0, MAX_VNODE_CAPACITY + 1] {
+            let config = StateBackendConfig::InProcess { vnode_capacity };
+            let Err(error) = config.build().await else {
+                panic!("out-of-range vnode capacity was accepted");
+            };
+            assert!(matches!(error, StateBackendBuildError::InvalidConfig(_)));
+        }
     }
 }

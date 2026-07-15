@@ -29,11 +29,6 @@ use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 
-#[cfg(feature = "cluster")]
-use crate::operator::sql_query::ClusterShuffleConfig;
-#[cfg(feature = "cluster")]
-use laminar_core::shuffle::ShuffleMessage;
-
 const SUBMIT_CAPACITY: usize = 256;
 const RESULT_CAPACITY: usize = 256;
 const MAX_IN_FLIGHT_ROWS: usize = 8192;
@@ -127,9 +122,6 @@ struct Resolved {
 
 pub(crate) struct LookupEnrichOperator {
     table_name: String,
-    // Shuffle stage tag in cluster mode so peers route rows back here.
-    #[cfg(feature = "cluster")]
-    op_name: Arc<str>,
     key_columns: Vec<String>,
     join_type: LookupJoinType,
     registry: Arc<LookupTableRegistry>,
@@ -142,9 +134,6 @@ pub(crate) struct LookupEnrichOperator {
     next_batch_id: u64,
     max_in_flight: usize,
     metrics: Option<Arc<EngineMetrics>>,
-    // When set, process key-shards by lookup key for cache affinity.
-    #[cfg(feature = "cluster")]
-    cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
 impl LookupEnrichOperator {
@@ -159,8 +148,6 @@ impl LookupEnrichOperator {
     ) -> Self {
         Self {
             table_name: config.table_name,
-            #[cfg(feature = "cluster")]
-            op_name: Arc::from(name),
             key_columns: config.key_columns,
             join_type: config.join_type,
             registry,
@@ -173,14 +160,7 @@ impl LookupEnrichOperator {
             next_batch_id: 0,
             max_in_flight: MAX_IN_FLIGHT_ROWS,
             metrics,
-            #[cfg(feature = "cluster")]
-            cluster_shuffle: None,
         }
-    }
-
-    #[cfg(feature = "cluster")]
-    pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
-        self.cluster_shuffle = Some(config);
     }
 
     fn record_cache(&self, hits: u64, misses: u64) {
@@ -280,10 +260,19 @@ impl LookupEnrichOperator {
         Ok(())
     }
 
+    fn retained_pending_rows(&self) -> usize {
+        // A single unresolved lookup keeps the complete input batch and its shuffle admission
+        // alive. Count retained input rows here, not just unresolved keys, or cache-heavy batches
+        // can exceed the active-work cap by orders of magnitude.
+        self.pending
+            .values()
+            .map(|batch| batch.batch.num_rows())
+            .sum()
+    }
+
     fn in_flight_rows(&self) -> usize {
-        let pending: usize = self.pending.values().map(|pb| pb.pending).sum();
-        let queued: usize = self.unsubmitted.iter().map(|i| i.keys.len()).sum();
-        pending + queued
+        let replay: usize = self.replay.iter().map(|(_, batch)| batch.num_rows()).sum();
+        self.retained_pending_rows().saturating_add(replay)
     }
 
     // Resolves key-column indices on the first call; fails fast on type mismatch.
@@ -546,85 +535,30 @@ impl LookupEnrichOperator {
         }
     }
 
-    #[cfg(feature = "cluster")]
-    async fn shuffle_input(
-        &mut self,
-        batches: &[RecordBatch],
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let Some(cfg) = self.cluster_shuffle.clone() else {
-            return Ok(batches.to_vec());
-        };
-        let vnode_count = cfg.registry.vnode_count();
-        let mut local: Vec<RecordBatch> = Vec::new();
-        let mut outbound: Vec<(u64, ShuffleMessage)> = Vec::new();
-
-        for batch in batches {
+    fn ingest_replay(&mut self, out: &mut Vec<RecordBatch>) -> Result<(), DbError> {
+        loop {
+            let available = self
+                .max_in_flight
+                .saturating_sub(self.retained_pending_rows());
+            if available == 0 {
+                return Ok(());
+            }
+            let Some((watermark, batch)) = self.replay.pop_front() else {
+                return Ok(());
+            };
             if batch.num_rows() == 0 {
                 continue;
             }
-            self.ensure_key_indices(batch)?;
-            // Hash by the same key columns the cache uses so vnode ownership and cache slot agree.
-            let key_indices = &self.resolved.as_ref().expect("resolved").key_indices;
-            let vnodes = laminar_core::shuffle::row_vnodes(batch, key_indices, vnode_count);
-            let assignment = cfg.registry.snapshot();
-            for &v in &vnodes {
-                let owner = usize::try_from(v)
-                    .ok()
-                    .and_then(|vnode| assignment.get(vnode))
-                    .copied()
-                    .unwrap_or(laminar_core::state::NodeId::UNASSIGNED);
-                if owner.is_unassigned() {
-                    // Must NOT defer: this operator has already drained completed async lookups this
-                    // cycle (removed from self.pending, pushed to `enriched`), so deferring would
-                    // discard them. Fault instead — under exactly-once recovery restores self.pending
-                    // and re-fetches. (Formation/rebalance transient; a full replay is acceptable.)
-                    return Err(DbError::Pipeline(format!(
-                        "lookup-enrich: shuffle vnode {v} is unassigned — refusing to drop rows"
-                    )));
-                }
-            }
-
-            let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
-                batch,
-                &vnodes,
-                &cfg.registry,
-                cfg.self_id,
-            );
-
-            for (_v, slice) in local_slices {
-                local.push(slice);
-            }
-
-            for (owner, slice) in remote_slices {
-                outbound.push((
-                    owner.0,
-                    ShuffleMessage::VnodeData(self.op_name.to_string(), 0, slice),
-                ));
+            if batch.num_rows() > available {
+                let head = batch.slice(0, available);
+                let remaining = batch.num_rows() - available;
+                self.replay
+                    .push_front((watermark, batch.slice(available, remaining)));
+                self.ingest(head, watermark, out)?;
+            } else {
+                self.ingest(batch, watermark, out)?;
             }
         }
-
-        // Send the staged frames. A send failure must NOT defer (this operator already drained
-        // completed async results this cycle — deferring would drop them) and must NOT be replayed
-        // locally (re-sending would double-count on peers that already folded). ShufflePartialSend
-        // faults for a rewind-all domain replay under exactly-once, and drops the cycle under
-        // at-least-once, but never double-counts (CL-1).
-        for (peer, msg) in outbound {
-            cfg.sender.send_to(peer, &msg).await.map_err(|e| {
-                DbError::ShufflePartialSend(format!(
-                    "lookup-enrich: shuffle send to peer {peer}: {e}"
-                ))
-            })?;
-        }
-
-        if self.wants_input() {
-            for batch in cfg.receiver.drain_vnode_data_for(&self.op_name) {
-                if batch.num_rows() > 0 {
-                    local.push(batch);
-                }
-            }
-        }
-
-        Ok(local)
     }
 }
 
@@ -670,22 +604,19 @@ impl GraphOperator for LookupEnrichOperator {
         let watermark = watermarks.first().copied().unwrap_or(i64::MIN);
         let mut enriched = Vec::new();
 
+        let new_input = inputs.first().map_or(&[][..], Vec::as_slice);
+        let to_ingest: Vec<RecordBatch> = new_input.to_vec();
+
+        self.replay.extend(
+            to_ingest
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .map(|batch| (watermark, batch)),
+        );
+
         self.flush_unsubmitted();
         self.drain_results(&mut enriched)?;
-        while let Some((wm, batch)) = self.replay.pop_front() {
-            self.ingest(batch, wm, &mut enriched)?;
-        }
-
-        let new_input = inputs.first().map_or(&[][..], Vec::as_slice);
-        #[cfg(feature = "cluster")]
-        let to_ingest = self.shuffle_input(new_input).await?;
-        #[cfg(not(feature = "cluster"))]
-        let to_ingest: Vec<RecordBatch> = new_input.to_vec();
-        for batch in to_ingest {
-            if batch.num_rows() > 0 {
-                self.ingest(batch, watermark, &mut enriched)?;
-            }
-        }
+        self.ingest_replay(&mut enriched)?;
 
         self.publish_in_flight();
         self.projection.apply(enriched).await
@@ -718,50 +649,31 @@ impl GraphOperator for LookupEnrichOperator {
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let blobs: Vec<(i64, Vec<u8>)> =
             rkyv::from_bytes::<Vec<(i64, Vec<u8>)>, rkyv::rancor::Error>(&checkpoint.data)
-                .map_err(|e| DbError::Pipeline(format!("lookup-enrich: checkpoint decode: {e}")))?;
-        self.pending.clear();
-        self.unsubmitted.clear();
-        self.replay.clear();
+                .map_err(|e| {
+                    DbError::Checkpoint(format!("lookup-enrich: checkpoint decode: {e}"))
+                })?;
+        let mut replay = VecDeque::with_capacity(blobs.len());
         for (wm, blob) in &blobs {
             let batch = deserialize_batch_stream(blob)
-                .map_err(|e| DbError::Pipeline(format!("lookup-enrich: restore: {e}")))?;
-            self.replay.push_back((*wm, batch));
+                .map_err(|e| DbError::Checkpoint(format!("lookup-enrich: restore: {e}")))?;
+            replay.push_back((*wm, batch));
         }
+        self.pending.clear();
+        self.unsubmitted.clear();
+        self.replay = replay;
         Ok(())
     }
 
-    fn estimated_state_bytes(&self) -> usize {
-        let pending: usize = self
-            .pending
-            .values()
-            .map(|pb| pb.batch.get_array_memory_size())
-            .sum();
-        let replay: usize = self
-            .replay
-            .iter()
-            .map(|(_, b)| b.get_array_memory_size())
-            .sum();
-        pending + replay
-    }
-
     fn watermark_hold(&self) -> Option<i64> {
-        self.pending.values().map(|pb| pb.ingest_watermark).min()
+        self.pending
+            .values()
+            .map(|batch| batch.ingest_watermark)
+            .chain(self.replay.iter().map(|(watermark, _)| *watermark))
+            .min()
     }
 
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn ingest_shuffle(
-        &mut self,
-        _stage: &str,
-        batch: RecordBatch,
-        watermark: i64,
-    ) -> Result<(), DbError> {
-        // Replay path is checkpointed and bypasses the shuffle, so restore is idempotent.
-        self.replay.push_back((watermark, batch));
-        Ok(())
     }
 }
 
@@ -894,6 +806,56 @@ mod tests {
             Handle::current(),
             metrics,
         )
+    }
+
+    #[tokio::test]
+    async fn late_checkpoint_decode_failure_preserves_replay_state() {
+        let source = Arc::new(MapSource {
+            rows: FxHashMap::default(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut op = operator_with(LookupJoinType::Inner, source);
+        op.replay.push_back((7, stream_batch(&[1], &[Some(10)])));
+        let valid = serialize_batch_stream(&stream_batch(&[2], &[Some(20)])).unwrap();
+        let blobs = vec![(8, valid), (9, b"not-arrow-ipc".to_vec())];
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&blobs)
+            .unwrap()
+            .to_vec();
+
+        let error = op.restore(OperatorCheckpoint { data }).unwrap_err();
+
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.replay.len(), 1);
+        assert_eq!(op.replay.front().map(|(watermark, _)| *watermark), Some(7));
+    }
+
+    #[tokio::test]
+    async fn replay_respects_active_row_cap_and_holds_its_watermark() {
+        let source = Arc::new(MapSource {
+            rows: FxHashMap::default(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut op = operator_with(LookupJoinType::Inner, source);
+        op.max_in_flight = 2;
+        let batch = stream_batch(
+            &[1, 2, 3, 4, 5],
+            &[Some(10), Some(20), Some(30), Some(40), Some(50)],
+        );
+
+        let output = op.process(&[vec![batch]], &[42]).await.unwrap();
+
+        assert!(output.is_empty());
+        assert_eq!(op.retained_pending_rows(), 2);
+        assert_eq!(
+            op.replay
+                .iter()
+                .map(|(_, batch)| batch.num_rows())
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(op.watermark_hold(), Some(42));
+        assert!(!op.wants_input());
     }
 
     #[tokio::test]
@@ -1075,171 +1037,5 @@ mod tests {
         let mut op = operator_with(LookupJoinType::LeftOuter, source);
         let out = run_until_output(&mut op, stream_batch(&[100], &[None])).await;
         assert_eq!(out.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-    }
-
-    /// A cluster node: owns its vnodes per `assignment`, ships to `peer` at
-    /// `peer_addr`, receives on `receiver`, and looks `keys` up in an in-memory
-    /// source. Inner join over `customers(id)` on `customer_id`.
-    #[cfg(feature = "cluster")]
-    async fn cluster_node(
-        self_id: u64,
-        peer: u64,
-        peer_addr: std::net::SocketAddr,
-        receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
-        assignment: &Arc<[laminar_core::state::NodeId]>,
-        keys: &[i64],
-    ) -> LookupEnrichOperator {
-        use laminar_core::state::{NodeId, VnodeRegistry};
-
-        let registry = Arc::new(VnodeRegistry::new(u32::try_from(assignment.len()).unwrap()));
-        registry.set_assignment(Arc::clone(assignment));
-        let sender = laminar_core::shuffle::ShuffleSender::new(self_id);
-        sender.register_peer(peer, peer_addr).await;
-
-        let lookups = Arc::new(LookupTableRegistry::new());
-        lookups.register_partial(
-            "customers",
-            PartialLookupState {
-                lookup_cache: Arc::new(LookupMemoryCache::with_defaults(0)),
-                schema: lookup_schema(),
-                key_columns: vec!["id".into()],
-                key_sort_fields: vec![SortField::new(DataType::Int64)],
-                source: Some(Arc::new(MapSource {
-                    rows: keys.iter().map(|&k| (k, "x")).collect(),
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                }) as Arc<dyn LookupSourceDyn>),
-                fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
-                projection: Vec::new(),
-            },
-        );
-        let mut op = LookupEnrichOperator::new(
-            "out",
-            LookupEnrichConfig {
-                table_name: "customers".into(),
-                key_columns: vec!["customer_id".into()],
-                join_type: LookupJoinType::Inner,
-            },
-            None,
-            laminar_sql::create_session_context(),
-            lookups,
-            Handle::current(),
-            None,
-        );
-        op.attach_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
-            registry,
-            sender: Arc::new(sender),
-            receiver,
-            self_id: NodeId(self_id),
-        });
-        op
-    }
-
-    /// A row whose lookup-key vnode a node doesn't own is shipped to the owner,
-    /// enriched there, and emitted there — so every input key surfaces on
-    /// exactly one node, the one that owns it.
-    #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cluster_key_shuffle_routes_remote_keys_to_owner() {
-        use laminar_core::shuffle::ShuffleReceiver;
-        use laminar_core::state::NodeId;
-
-        const VNODES: u32 = 4;
-        let assignment: Arc<[NodeId]> = vec![NodeId(1), NodeId(2), NodeId(1), NodeId(2)].into();
-        // Oracle: a key's owner under the exact hashing the operator uses.
-        let owner = |id: i64| {
-            let v =
-                laminar_core::shuffle::row_vnodes(&stream_batch(&[0], &[Some(id)]), &[1], VNODES);
-            assignment[v[0] as usize]
-        };
-
-        let n1: Vec<i64> = (1..500)
-            .filter(|&k| owner(k) == NodeId(1))
-            .take(3)
-            .collect();
-        let n2: Vec<i64> = (1..500)
-            .filter(|&k| owner(k) == NodeId(2))
-            .take(3)
-            .collect();
-        assert!(
-            !n1.is_empty() && !n2.is_empty(),
-            "need keys owned by both nodes"
-        );
-        let all: Vec<i64> = n1.iter().chain(&n2).copied().collect();
-
-        let recv1 = Arc::new(
-            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap(),
-        );
-        let recv2 = Arc::new(
-            ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap(),
-        );
-        let mut node1 = cluster_node(
-            1,
-            2,
-            recv2.local_addr(),
-            Arc::clone(&recv1),
-            &assignment,
-            &all,
-        )
-        .await;
-        let mut node2 = cluster_node(
-            2,
-            1,
-            recv1.local_addr(),
-            Arc::clone(&recv2),
-            &assignment,
-            &all,
-        )
-        .await;
-
-        // node1 sees every key, keeps its own, ships node2's; pump both until
-        // all keys surface (the worker + loopback are async). The budget is
-        // generous (breaks early on delivery): under a fully parallel test
-        // run with CPU-heavy neighbors, 500ms of pumping was not enough on
-        // an 8-core box.
-        let customers: Vec<Option<i64>> = all.iter().map(|&k| Some(k)).collect();
-        let input = stream_batch(&vec![0; all.len()], &customers);
-        let mut a = node1.process(&[vec![input]], &[0]).await.unwrap();
-        let mut b = node2.process(&[vec![]], &[0]).await.unwrap();
-        for _ in 0..600 {
-            if a.iter().chain(&b).map(RecordBatch::num_rows).sum::<usize>() >= all.len() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            a.extend(node1.process(&[vec![]], &[0]).await.unwrap());
-            b.extend(node2.process(&[vec![]], &[0]).await.unwrap());
-        }
-
-        let ids = |batches: &[RecordBatch]| {
-            let mut out: Vec<i64> = batches
-                .iter()
-                .flat_map(|x| {
-                    let c = x.column(x.schema().index_of("customer_id").unwrap());
-                    let c = c.as_any().downcast_ref::<Int64Array>().unwrap();
-                    (0..x.num_rows()).map(|i| c.value(i)).collect::<Vec<_>>()
-                })
-                .collect();
-            out.sort_unstable();
-            out
-        };
-        let (a_ids, b_ids) = (ids(&a), ids(&b));
-
-        assert!(
-            a_ids.iter().all(|&k| owner(k) == NodeId(1)),
-            "node1 has a foreign key: {a_ids:?}"
-        );
-        assert!(
-            b_ids.iter().all(|&k| owner(k) == NodeId(2)),
-            "node2 has a foreign key: {b_ids:?}"
-        );
-        assert!(!b_ids.is_empty(), "node2 never received the shuffled keys");
-        let mut got: Vec<i64> = a_ids.into_iter().chain(b_ids).collect();
-        got.sort_unstable();
-        let mut want = all.clone();
-        want.sort_unstable();
-        assert_eq!(got, want, "each input key enriched on exactly its owner");
     }
 }

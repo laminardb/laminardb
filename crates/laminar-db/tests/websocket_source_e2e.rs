@@ -84,7 +84,7 @@ async fn websocket_source_decodes_nested_json_into_materialized_view() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while rows.len() < 2 && Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), portal.next_frame()).await {
-            Ok(Some(PortalFrame::Batch(b))) => {
+            Ok(Some(PortalFrame::Batch { batch: b, .. })) => {
                 let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
                 let regions = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
                 let tags = b.column(2).as_any().downcast_ref::<ListArray>().unwrap();

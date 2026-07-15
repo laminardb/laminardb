@@ -14,7 +14,7 @@
 //! - `delete` — document removed; only `document_key` present
 //! - `drop` — collection dropped (lifecycle event)
 //! - `rename` — collection renamed (lifecycle event)
-//! - `invalidate` — stream invalidated; must restart with `startAfter`
+//! - `invalidate` — stream invalidated; `resumeAfter` is no longer legal
 
 use std::collections::HashMap;
 
@@ -59,21 +59,6 @@ impl OperationType {
             Self::Other(s) => s.as_str(),
         }
     }
-
-    /// Returns `true` if this is a DML operation (insert/update/replace/delete).
-    #[must_use]
-    pub fn is_dml(&self) -> bool {
-        matches!(
-            self,
-            Self::Insert | Self::Update | Self::Replace | Self::Delete
-        )
-    }
-
-    /// Returns `true` if this is a lifecycle event (drop/rename/invalidate).
-    #[must_use]
-    pub fn is_lifecycle(&self) -> bool {
-        !self.is_dml()
-    }
 }
 
 impl std::fmt::Display for OperationType {
@@ -98,6 +83,13 @@ pub struct UpdateDescription {
     /// Arrays that were truncated (`MongoDB` 6.0+).
     #[serde(default)]
     pub truncated_arrays: Vec<TruncatedArray>,
+
+    /// Ambiguous update paths mapped to their exact path components.
+    ///
+    /// Replay must not treat these keys as ordinary dotted paths. The MongoDB sink rejects a
+    /// non-empty map until it can express the update faithfully with `$setField` semantics.
+    #[serde(default)]
+    pub disambiguated_paths: HashMap<String, serde_json::Value>,
 }
 
 /// Describes a truncated array in an update operation (`MongoDB` 6.0+).
@@ -185,25 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_type_is_dml() {
-        assert!(OperationType::Insert.is_dml());
-        assert!(OperationType::Update.is_dml());
-        assert!(OperationType::Replace.is_dml());
-        assert!(OperationType::Delete.is_dml());
-        assert!(!OperationType::Drop.is_dml());
-        assert!(!OperationType::Rename.is_dml());
-        assert!(!OperationType::Invalidate.is_dml());
-    }
-
-    #[test]
-    fn test_operation_type_is_lifecycle() {
-        assert!(!OperationType::Insert.is_lifecycle());
-        assert!(OperationType::Drop.is_lifecycle());
-        assert!(OperationType::Rename.is_lifecycle());
-        assert!(OperationType::Invalidate.is_lifecycle());
-    }
-
-    #[test]
     fn test_namespace_full_name() {
         let ns = Namespace {
             db: "mydb".to_string(),
@@ -219,6 +192,7 @@ mod tests {
         assert!(ud.updated_fields.is_empty());
         assert!(ud.removed_fields.is_empty());
         assert!(ud.truncated_arrays.is_empty());
+        assert!(ud.disambiguated_paths.is_empty());
     }
 
     #[test]

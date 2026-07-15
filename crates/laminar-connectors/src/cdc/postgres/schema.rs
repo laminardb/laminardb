@@ -4,10 +4,11 @@
 //! `pgoutput` Relation messages. Required because DML messages only
 //! reference relations by OID --- the schema must be looked up from this cache.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+use crate::error::ConnectorError;
 
 use super::types::PgColumn;
 
@@ -33,38 +34,61 @@ pub struct RelationInfo {
 
 impl RelationInfo {
     /// Returns the fully qualified table name: `namespace.name`.
-    #[must_use]
-    pub fn full_name(&self) -> String {
-        if self.namespace.is_empty() || self.namespace == "public" {
-            self.name.clone()
-        } else {
-            format!("{}.{}", self.namespace, self.name)
+    pub(crate) fn full_name(&self) -> Result<String, ConnectorError> {
+        if self.namespace.is_empty() || self.name.is_empty() {
+            return Err(ConnectorError::ReadError(
+                "PostgreSQL CDC relation has an empty schema or table name".into(),
+            ));
         }
+        let length = self
+            .namespace
+            .len()
+            .checked_add(1)
+            .and_then(|length| length.checked_add(self.name.len()))
+            .ok_or_else(|| {
+                ConnectorError::ReadError(
+                    "PostgreSQL CDC schema-qualified table name size overflow".into(),
+                )
+            })?;
+        let mut table = String::new();
+        table.try_reserve_exact(length).map_err(|error| {
+            ConnectorError::ReadError(format!(
+                "PostgreSQL CDC could not reserve {length} table-name bytes: {error}"
+            ))
+        })?;
+        table.push_str(&self.namespace);
+        table.push('.');
+        table.push_str(&self.name);
+        debug_assert_eq!(table.len(), length);
+        Ok(table)
     }
 
-    /// Generates an Arrow schema from the relation's columns.
-    #[must_use]
-    pub fn arrow_schema(&self) -> SchemaRef {
-        let fields: Vec<Field> = self
-            .columns
-            .iter()
-            .map(|col| {
-                // All CDC columns are nullable since DELETE may have
-                // unchanged TOAST values or partial replica identity.
-                Field::new(&col.name, col.arrow_type(), true)
+    pub(crate) fn variable_retained_bytes(&self) -> Result<usize, ConnectorError> {
+        let mut retained = self
+            .namespace
+            .capacity()
+            .checked_add(self.name.capacity())
+            .and_then(|bytes| {
+                self.columns
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<PgColumn>())
+                    .and_then(|column_bytes| bytes.checked_add(column_bytes))
             })
-            .collect();
-        Arc::new(Schema::new(fields))
-    }
-
-    /// Returns the key column names based on replica identity.
-    #[must_use]
-    pub fn key_columns(&self) -> Vec<&str> {
-        self.columns
-            .iter()
-            .filter(|c| c.is_key)
-            .map(|c| c.name.as_str())
-            .collect()
+            .ok_or_else(|| {
+                ConnectorError::ReadError(
+                    "PostgreSQL CDC relation-cache retained-byte size overflow".into(),
+                )
+            })?;
+        for column in &self.columns {
+            retained = retained
+                .checked_add(column.name.capacity())
+                .ok_or_else(|| {
+                    ConnectorError::ReadError(
+                        "PostgreSQL CDC relation-cache retained-byte size overflow".into(),
+                    )
+                })?;
+        }
+        Ok(retained)
     }
 }
 
@@ -74,7 +98,8 @@ impl RelationInfo {
 /// DML decoders look up column metadata by relation ID.
 #[derive(Debug, Clone, Default)]
 pub struct RelationCache {
-    relations: HashMap<u32, RelationInfo>,
+    relations: Vec<RelationInfo>,
+    variable_retained_bytes: usize,
 }
 
 impl RelationCache {
@@ -85,14 +110,108 @@ impl RelationCache {
     }
 
     /// Adds or replaces a relation in the cache.
-    pub fn insert(&mut self, info: RelationInfo) {
-        self.relations.insert(info.relation_id, info);
+    pub(crate) fn try_reserve_for(&mut self, relation_id: u32) -> Result<(), ConnectorError> {
+        if self
+            .relations
+            .binary_search_by_key(&relation_id, |relation| relation.relation_id)
+            .is_err()
+        {
+            self.relations.try_reserve_exact(1).map_err(|error| {
+                ConnectorError::ReadError(format!(
+                    "PostgreSQL CDC could not reserve relation-cache storage: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reservation_growth_bytes(
+        &self,
+        relation_id: u32,
+    ) -> Result<usize, ConnectorError> {
+        if self
+            .relations
+            .binary_search_by_key(&relation_id, |relation| relation.relation_id)
+            .is_ok()
+            || self.relations.len() < self.relations.capacity()
+        {
+            return Ok(0);
+        }
+        self.relations
+            .capacity()
+            .max(1)
+            .checked_mul(std::mem::size_of::<RelationInfo>())
+            .ok_or_else(|| {
+                ConnectorError::ReadError(
+                    "PostgreSQL CDC relation-cache growth size overflow".into(),
+                )
+            })
+    }
+
+    pub(crate) fn insert(&mut self, info: RelationInfo) -> Result<(), ConnectorError> {
+        self.try_reserve_for(info.relation_id)?;
+        let new_bytes = info.variable_retained_bytes()?;
+        match self
+            .relations
+            .binary_search_by_key(&info.relation_id, |relation| relation.relation_id)
+        {
+            Ok(index) => {
+                let old_bytes = self.relations[index].variable_retained_bytes()?;
+                self.variable_retained_bytes = self
+                    .variable_retained_bytes
+                    .checked_sub(old_bytes)
+                    .and_then(|bytes| bytes.checked_add(new_bytes))
+                    .ok_or_else(|| {
+                        ConnectorError::Internal(
+                            "PostgreSQL CDC relation-cache retained-byte invariant failed".into(),
+                        )
+                    })?;
+                self.relations[index] = info;
+            }
+            Err(index) => {
+                self.variable_retained_bytes = self
+                    .variable_retained_bytes
+                    .checked_add(new_bytes)
+                    .ok_or_else(|| {
+                        ConnectorError::ReadError(
+                            "PostgreSQL CDC relation-cache retained-byte accounting overflow"
+                                .into(),
+                        )
+                    })?;
+                self.relations.insert(index, info);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Result<usize, ConnectorError> {
+        self.container_retained_bytes()?
+            .checked_add(self.variable_retained_bytes)
+            .ok_or_else(|| {
+                ConnectorError::ReadError(
+                    "PostgreSQL CDC relation-cache retained-byte accounting overflow".into(),
+                )
+            })
+    }
+
+    fn container_retained_bytes(&self) -> Result<usize, ConnectorError> {
+        self.relations
+            .capacity()
+            .checked_mul(std::mem::size_of::<RelationInfo>())
+            .ok_or_else(|| {
+                ConnectorError::ReadError(
+                    "PostgreSQL CDC relation-cache container size overflow".into(),
+                )
+            })
     }
 
     /// Looks up a relation by its OID.
     #[must_use]
     pub fn get(&self, relation_id: u32) -> Option<&RelationInfo> {
-        self.relations.get(&relation_id)
+        self.relations
+            .binary_search_by_key(&relation_id, |relation| relation.relation_id)
+            .ok()
+            .map(|index| &self.relations[index])
     }
 
     /// Returns the number of cached relations.
@@ -109,7 +228,8 @@ impl RelationCache {
 
     /// Clears the cache.
     pub fn clear(&mut self) {
-        self.relations.clear();
+        self.relations = Vec::new();
+        self.variable_retained_bytes = 0;
     }
 }
 
@@ -156,32 +276,24 @@ mod tests {
     #[test]
     fn test_relation_full_name_public() {
         let rel = sample_relation();
-        assert_eq!(rel.full_name(), "users");
+        assert_eq!(rel.full_name().unwrap(), "public.users");
     }
 
     #[test]
     fn test_relation_full_name_custom_schema() {
         let mut rel = sample_relation();
         rel.namespace = "app".to_string();
-        assert_eq!(rel.full_name(), "app.users");
+        assert_eq!(rel.full_name().unwrap(), "app.users");
     }
 
     #[test]
-    fn test_arrow_schema_generation() {
-        let rel = sample_relation();
-        let schema = rel.arrow_schema();
-        assert_eq!(schema.fields().len(), 3);
-        assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(*schema.field(0).data_type(), DataType::Int64);
-        assert_eq!(schema.field(1).name(), "name");
-        assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
-    }
-
-    #[test]
-    fn test_key_columns() {
-        let rel = sample_relation();
-        let keys = rel.key_columns();
-        assert_eq!(keys, vec!["id"]);
+    fn test_relation_full_name_rejects_empty_components() {
+        let mut rel = sample_relation();
+        rel.namespace.clear();
+        assert!(rel.full_name().is_err());
+        rel.namespace = "public".into();
+        rel.name.clear();
+        assert!(rel.full_name().is_err());
     }
 
     #[test]
@@ -189,7 +301,7 @@ mod tests {
         let mut cache = RelationCache::new();
         assert!(cache.is_empty());
 
-        cache.insert(sample_relation());
+        cache.insert(sample_relation()).unwrap();
         assert_eq!(cache.len(), 1);
         assert!(cache.get(16384).is_some());
         assert!(cache.get(99999).is_none());
@@ -198,13 +310,13 @@ mod tests {
     #[test]
     fn test_cache_replace() {
         let mut cache = RelationCache::new();
-        cache.insert(sample_relation());
+        cache.insert(sample_relation()).unwrap();
 
         let mut updated = sample_relation();
         updated
             .columns
             .push(PgColumn::new("email".to_string(), TEXT_OID, -1, false));
-        cache.insert(updated);
+        cache.insert(updated).unwrap();
 
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(16384).unwrap().columns.len(), 4);
@@ -213,7 +325,7 @@ mod tests {
     #[test]
     fn test_cache_clear() {
         let mut cache = RelationCache::new();
-        cache.insert(sample_relation());
+        cache.insert(sample_relation()).unwrap();
         cache.clear();
         assert!(cache.is_empty());
     }

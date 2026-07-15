@@ -4,13 +4,6 @@
 
 use crate::error::DbError;
 
-/// One operator's delta: changed groups + removed-key tombstones. Both empty = carry-forward.
-#[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct OpDelta {
-    pub changed: Vec<u8>,
-    pub tombstones_ipc: Vec<u8>,
-}
-
 /// Operator-state slices for one vnode at one epoch, in one of three shapes:
 ///
 /// - FULL: `operators` non-empty, `base = None`, `deltas` empty.
@@ -25,8 +18,8 @@ pub(crate) struct VnodePartial {
     pub operators: Vec<(String, Vec<u8>)>,
     /// Exact parent attempt for a reference or delta chain.
     pub base: Option<laminar_core::state::CheckpointAttempt>,
-    /// `(operator_name, delta)`. Non-empty only for delta partials.
-    pub deltas: Vec<(String, OpDelta)>,
+    /// `(operator_name, changed-state bytes)`. Non-empty only for delta partials.
+    pub deltas: Vec<(String, Vec<u8>)>,
 }
 
 impl VnodePartial {
@@ -106,6 +99,20 @@ mod tests {
             Some(laminar_core::state::CheckpointAttempt::new(4, 9))
         );
         assert!(back.operators.is_empty());
+    }
+
+    #[test]
+    fn delta_round_trips_changed_state() {
+        let parent = laminar_core::state::CheckpointAttempt::new(4, 9);
+        let p = VnodePartial {
+            operators: Vec::new(),
+            base: Some(parent),
+            deltas: vec![("agg".to_string(), vec![4, 5, 6])],
+        };
+        let bytes = p.encode().unwrap();
+        let back = VnodePartial::decode(&bytes).unwrap();
+        assert_eq!(back.base, Some(parent));
+        assert_eq!(back.deltas, vec![("agg".to_string(), vec![4, 5, 6])]);
     }
 
     #[test]

@@ -71,14 +71,6 @@ pub const JOIN_TIME_BOUND_MISSING: &str = "LDB-3002";
 pub const TEMPORAL_JOIN_NO_PK: &str = "LDB-3003";
 /// Unsupported join type for streaming queries.
 pub const JOIN_TYPE_UNSUPPORTED: &str = "LDB-3004";
-/// Tier-backed join: a demoted cold join key could not be fetched back (the cold
-/// tier lost it). The operator escalates rather than wedging behind the hold.
-pub const JOIN_STATE_FETCH_MISS: &str = "LDB-3005";
-/// Incremental changelog⋈changelog join in a multi-node cluster. The operator is
-/// single-node only (inputs are not key-shuffled), so it is rejected when >1 node
-/// owns vnodes — it would join only node-local slices and produce wrong results.
-pub const JOIN_CLUSTER_UNSUPPORTED: &str = "LDB-3006";
-
 // ── Serialization / State (LDB-4xxx) ──
 
 /// State serialization failed for an operator.
@@ -93,7 +85,8 @@ pub const BASE64_DECODE_ERROR: &str = "LDB-4004";
 pub const STATE_KEY_MISSING: &str = "LDB-4005";
 /// State corruption detected (checksum mismatch, invalid data).
 pub const STATE_CORRUPTION: &str = "LDB-4006";
-
+/// A cluster query shape has no vnode-keyed checkpoint and rebalance lifecycle.
+pub const CLUSTER_STATE_LIFECYCLE_UNSUPPORTED: &str = "LDB-4007";
 // ── Connector / I/O (LDB-5xxx) ──
 
 /// Connector failed to establish a connection.
@@ -126,6 +119,14 @@ pub const EXACTLY_ONCE_SINK_UNSUPPORTED: &str = "LDB-5031";
 pub const EXACTLY_ONCE_NO_CHECKPOINT: &str = "LDB-5032";
 /// Mixed delivery capabilities — some sources are non-replayable.
 pub const MIXED_DELIVERY_CAPABILITIES: &str = "LDB-5033";
+/// A source requires checkpointing to release upstream progress or resources.
+pub const SOURCE_CHECKPOINT_REQUIRED: &str = "LDB-5034";
+/// The configured exactly-once source/sink protocol is incomplete.
+pub const EXACTLY_ONCE_PROTOCOL_INCOMPLETE: &str = "LDB-5035";
+/// Delivery requires a stronger state/checkpoint durability scope.
+pub const DELIVERY_STATE_DURABILITY_MISMATCH: &str = "LDB-5036";
+/// A replayable source has not passed production exactly-once certification.
+pub const EXACTLY_ONCE_SOURCE_UNCERTIFIED: &str = "LDB-5037";
 
 // ── Checkpoint / Recovery (LDB-6xxx) ──
 
@@ -309,6 +310,7 @@ mod tests {
     fn error_codes_are_stable_strings() {
         assert_eq!(INVALID_CONFIG, "LDB-0001");
         assert_eq!(SERIALIZATION_FAILED, "LDB-4001");
+        assert_eq!(EXACTLY_ONCE_SOURCE_UNCERTIFIED, "LDB-5037");
         assert_eq!(CHECKPOINT_FAILED, "LDB-6001");
         assert_eq!(INTERNAL, "LDB-8001");
     }

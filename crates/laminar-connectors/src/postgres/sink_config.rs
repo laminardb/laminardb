@@ -3,10 +3,36 @@
 //! [`PostgresSinkConfig`] encapsulates all settings for writing Arrow
 //! `RecordBatch` data to `PostgreSQL`, parsed from SQL `WITH (...)` clauses.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
+
+const MAX_POSTGRES_IDENTIFIER_BYTES: usize = 63;
+const MAX_POSTGRES_STATEMENT_TIMEOUT_MS: u128 = 2_147_483_647;
+
+const REMOVED_CONFIG_KEYS: &[&str] = &["batch.size", "pool.size"];
+
+const ALLOWED_CONFIG_KEYS: &[&str] = &[
+    "_arrow_schema",
+    "auto.create.table",
+    "changelog.mode",
+    "connect.timeout.ms",
+    "database",
+    "flush.interval.ms",
+    "hostname",
+    "password",
+    "port",
+    "primary.key",
+    "schema.name",
+    "ssl.ca.cert.path",
+    "ssl.mode",
+    "statement.timeout.ms",
+    "table.name",
+    "username",
+    "write.mode",
+];
 
 /// Configuration for the `PostgreSQL` sink connector.
 ///
@@ -40,20 +66,17 @@ pub struct PostgresSinkConfig {
     /// Primary key columns (required for upsert mode).
     pub primary_key_columns: Vec<String>,
 
-    /// Maximum records to buffer before flushing.
-    pub batch_size: usize,
-
     /// Maximum time to buffer before flushing.
     pub flush_interval: Duration,
-
-    /// Connection pool size.
-    pub pool_size: usize,
 
     /// Connection timeout.
     pub connect_timeout: Duration,
 
     /// SSL mode for connections.
     pub ssl_mode: SslMode,
+
+    /// Optional PEM file containing trusted CA certificates.
+    pub ssl_ca_cert_path: Option<PathBuf>,
 
     /// Whether to create the target table if it doesn't exist.
     pub auto_create_table: bool,
@@ -71,17 +94,16 @@ impl Default for PostgresSinkConfig {
             hostname: "localhost".to_string(),
             port: 5432,
             database: String::new(),
-            username: String::new(),
+            username: "postgres".to_string(),
             password: String::new(),
             schema_name: "public".to_string(),
             table_name: String::new(),
             write_mode: WriteMode::Append,
             primary_key_columns: Vec::new(),
-            batch_size: 4096,
             flush_interval: Duration::from_millis(250),
-            pool_size: 4,
             connect_timeout: Duration::from_secs(10),
-            ssl_mode: SslMode::Prefer,
+            ssl_mode: SslMode::VerifyFull,
+            ssl_ca_cert_path: None,
             auto_create_table: false,
             changelog_mode: false,
             statement_timeout: Duration::from_secs(30),
@@ -116,6 +138,9 @@ impl PostgresSinkConfig {
     /// or `ConnectorError::ConfigurationError` on invalid values.
     #[allow(clippy::field_reassign_with_default)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        Self::reject_removed_keys(config)?;
+        config.reject_unknown_properties(ALLOWED_CONFIG_KEYS, "PostgreSQL sink")?;
+
         let mut cfg = Self::default();
 
         cfg.hostname = config.require("hostname")?.to_string();
@@ -140,23 +165,23 @@ impl PostgresSinkConfig {
             })?;
         }
         if let Some(v) = config.get("primary.key") {
-            cfg.primary_key_columns = v.split(',').map(|c| c.trim().to_string()).collect();
-        }
-        if let Some(v) = config.get("batch.size") {
-            cfg.batch_size = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid batch.size: '{v}'"))
-            })?;
+            if v.trim().is_empty() {
+                cfg.primary_key_columns.clear();
+            } else {
+                let columns: Vec<_> = v.split(',').map(str::trim).collect();
+                if columns.iter().any(|column| column.is_empty()) {
+                    return Err(ConnectorError::ConfigurationError(
+                        "primary.key contains an empty column name".into(),
+                    ));
+                }
+                cfg.primary_key_columns = columns.into_iter().map(str::to_string).collect();
+            }
         }
         if let Some(v) = config.get("flush.interval.ms") {
             let ms: u64 = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!("invalid flush.interval.ms: '{v}'"))
             })?;
             cfg.flush_interval = Duration::from_millis(ms);
-        }
-        if let Some(v) = config.get("pool.size") {
-            cfg.pool_size = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid pool.size: '{v}'"))
-            })?;
         }
         if let Some(v) = config.get("connect.timeout.ms") {
             let ms: u64 = v.parse().map_err(|_| {
@@ -167,10 +192,11 @@ impl PostgresSinkConfig {
         if let Some(v) = config.get("ssl.mode") {
             cfg.ssl_mode = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
-                    "invalid ssl.mode: '{v}' (expected disable/prefer/require/verify-ca/verify-full)"
+                    "invalid ssl.mode: '{v}' (expected 'disable' or 'verify-full')"
                 ))
             })?;
         }
+        cfg.ssl_ca_cert_path = config.get("ssl.ca.cert.path").map(PathBuf::from);
         if let Some(v) = config.get("auto.create.table") {
             cfg.auto_create_table = v.eq_ignore_ascii_case("true");
         }
@@ -187,14 +213,58 @@ impl PostgresSinkConfig {
         Ok(cfg)
     }
 
+    fn reject_removed_keys(config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if let Some(key) = REMOVED_CONFIG_KEYS
+            .iter()
+            .find(|key| config.get(key).is_some())
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "PostgreSQL sink property '{key}' is not supported: batching is owned by the runtime and retained-byte limit"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates the configuration for consistency.
     ///
     /// # Errors
     ///
     /// Returns `ConnectorError::ConfigurationError` on invalid combinations.
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.table_name.is_empty() {
-            return Err(ConnectorError::missing_config("table.name"));
+        crate::config::require_non_empty(&self.hostname, "hostname")?;
+        crate::config::require_non_empty(&self.database, "database")?;
+        crate::config::require_non_empty(&self.username, "username")?;
+        crate::config::require_non_empty(&self.schema_name, "schema.name")?;
+        crate::config::require_non_empty(&self.table_name, "table.name")?;
+        validate_sql_identifier(&self.schema_name, "schema.name")?;
+        validate_sql_identifier(&self.table_name, "table.name")?;
+        let mut primary_keys = std::collections::HashSet::new();
+        for column in &self.primary_key_columns {
+            validate_sql_identifier(column, "primary.key column")?;
+            if !primary_keys.insert(column) {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "primary.key contains duplicate column '{column}'"
+                )));
+            }
+        }
+        if self.port == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "port must be > 0".into(),
+            ));
+        }
+        if self
+            .ssl_ca_cert_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "ssl.ca.cert.path must not be empty".into(),
+            ));
+        }
+        if self.ssl_mode == SslMode::Disable && self.ssl_ca_cert_path.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "ssl.ca.cert.path requires ssl.mode=verify-full".into(),
+            ));
         }
         if self.write_mode == WriteMode::Upsert && self.primary_key_columns.is_empty() {
             return Err(ConnectorError::ConfigurationError(
@@ -206,14 +276,14 @@ impl PostgresSinkConfig {
                 "changelog mode requires write.mode = 'upsert'".into(),
             ));
         }
-        if self.batch_size == 0 {
+        if self.flush_interval.is_zero() {
             return Err(ConnectorError::ConfigurationError(
-                "batch.size must be > 0".into(),
+                "flush.interval.ms must be > 0".into(),
             ));
         }
-        if self.pool_size == 0 {
+        if self.connect_timeout.is_zero() {
             return Err(ConnectorError::ConfigurationError(
-                "pool.size must be > 0".into(),
+                "connect.timeout.ms must be > 0".into(),
             ));
         }
         if self.statement_timeout < Duration::from_secs(1) {
@@ -221,14 +291,63 @@ impl PostgresSinkConfig {
                 "statement.timeout.ms must be >= 1000 (1 second)".into(),
             ));
         }
+        if self.statement_timeout.as_millis() > MAX_POSTGRES_STATEMENT_TIMEOUT_MS {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "statement.timeout.ms must be <= {MAX_POSTGRES_STATEMENT_TIMEOUT_MS}"
+            )));
+        }
+        if self.statement_timeout.subsec_nanos() % 1_000_000 != 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "statement timeout must be an integer number of milliseconds".into(),
+            ));
+        }
         Ok(())
     }
 
-    /// Returns the fully qualified table name (`schema.table`).
+    /// PostgreSQL startup option applied to every connection created by the pool.
+    #[must_use]
+    pub(super) fn statement_timeout_startup_option(&self) -> String {
+        format!(
+            "-c statement_timeout={}",
+            self.statement_timeout.as_millis()
+        )
+    }
+
+    /// Returns the safely quoted fully qualified table name (`"schema"."table"`).
     #[must_use]
     pub fn qualified_table_name(&self) -> String {
-        format!("{}.{}", self.schema_name, self.table_name)
+        format!(
+            "{}.{}",
+            quote_sql_identifier(&self.schema_name),
+            quote_sql_identifier(&self.table_name)
+        )
     }
+}
+
+/// Validates one PostgreSQL identifier segment before it can reach generated SQL.
+pub(super) fn validate_sql_identifier(identifier: &str, label: &str) -> Result<(), ConnectorError> {
+    if identifier.is_empty() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{label} must not be empty"
+        )));
+    }
+    if identifier.contains('\0') {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{label} must not contain NUL"
+        )));
+    }
+    if identifier.len() > MAX_POSTGRES_IDENTIFIER_BYTES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{label} exceeds PostgreSQL's {MAX_POSTGRES_IDENTIFIER_BYTES}-byte identifier limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Quotes one already-validated identifier segment. PostgreSQL escapes embedded quotes by
+/// doubling them; dots remain literal characters within the segment.
+pub(super) fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 /// Write mode for the `PostgreSQL` sink.
@@ -316,11 +435,10 @@ mod tests {
             ("schema.name", "analytics"),
             ("write.mode", "upsert"),
             ("primary.key", "id, region"),
-            ("batch.size", "8192"),
             ("flush.interval.ms", "500"),
-            ("pool.size", "8"),
             ("connect.timeout.ms", "5000"),
-            ("ssl.mode", "require"),
+            ("ssl.mode", "verify-full"),
+            ("ssl.ca.cert.path", "/certs/ca.pem"),
             ("auto.create.table", "true"),
             ("changelog.mode", "true"),
         ]);
@@ -332,11 +450,10 @@ mod tests {
         assert_eq!(cfg.schema_name, "analytics");
         assert_eq!(cfg.write_mode, WriteMode::Upsert);
         assert_eq!(cfg.primary_key_columns, vec!["id", "region"]);
-        assert_eq!(cfg.batch_size, 8192);
         assert_eq!(cfg.flush_interval, Duration::from_millis(500));
-        assert_eq!(cfg.pool_size, 8);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
-        assert_eq!(cfg.ssl_mode, SslMode::Require);
+        assert_eq!(cfg.ssl_mode, SslMode::VerifyFull);
+        assert_eq!(cfg.ssl_ca_cert_path, Some(PathBuf::from("/certs/ca.pem")));
         assert!(cfg.auto_create_table);
         assert!(cfg.changelog_mode);
     }
@@ -361,29 +478,47 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_size_zero_rejected() {
-        let mut pairs = required_pairs();
-        pairs.push(("batch.size", "0"));
-        let config = make_config(&pairs);
-        assert!(PostgresSinkConfig::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_pool_size_zero_rejected() {
-        let mut pairs = required_pairs();
-        pairs.push(("pool.size", "0"));
-        let config = make_config(&pairs);
-        assert!(PostgresSinkConfig::from_config(&config).is_err());
+    fn removed_buffer_and_pool_options_are_rejected() {
+        for key in REMOVED_CONFIG_KEYS {
+            let mut pairs = required_pairs();
+            pairs.push((*key, "1"));
+            let error = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+            assert!(error.to_string().contains(key));
+        }
     }
 
     #[test]
     fn test_qualified_table_name() {
         let cfg = PostgresSinkConfig::new("localhost", "db", "events");
-        assert_eq!(cfg.qualified_table_name(), "public.events");
+        assert_eq!(cfg.qualified_table_name(), "\"public\".\"events\"");
 
         let mut cfg2 = cfg;
         cfg2.schema_name = "analytics".to_string();
-        assert_eq!(cfg2.qualified_table_name(), "analytics.events");
+        cfg2.table_name = "order\"items".to_string();
+        assert_eq!(
+            cfg2.qualified_table_name(),
+            "\"analytics\".\"order\"\"items\""
+        );
+    }
+
+    #[test]
+    fn identifiers_fail_closed_before_sql_generation() {
+        for invalid in ["", "bad\0name"] {
+            let mut cfg = PostgresSinkConfig::new("localhost", "db", invalid);
+            assert!(cfg.validate().is_err(), "table identifier {invalid:?}");
+            cfg.table_name = "events".into();
+            cfg.schema_name = invalid.into();
+            assert!(cfg.validate().is_err(), "schema identifier {invalid:?}");
+        }
+
+        let mut cfg = PostgresSinkConfig::new("localhost", "db", "events");
+        cfg.write_mode = WriteMode::Upsert;
+        cfg.primary_key_columns = vec!["id".into(), "id".into()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
     }
 
     #[test]
@@ -393,9 +528,8 @@ mod tests {
         assert_eq!(cfg.port, 5432);
         assert_eq!(cfg.schema_name, "public");
         assert_eq!(cfg.write_mode, WriteMode::Append);
-        assert_eq!(cfg.batch_size, 4096);
-        assert_eq!(cfg.pool_size, 4);
-        assert_eq!(cfg.ssl_mode, SslMode::Prefer);
+        assert_eq!(cfg.flush_interval, Duration::from_millis(250));
+        assert_eq!(cfg.ssl_mode, SslMode::VerifyFull);
         assert!(!cfg.auto_create_table);
         assert!(!cfg.changelog_mode);
     }
@@ -418,23 +552,48 @@ mod tests {
     #[test]
     fn test_ssl_mode_parse() {
         assert_eq!("disable".parse::<SslMode>().unwrap(), SslMode::Disable);
-        assert_eq!("prefer".parse::<SslMode>().unwrap(), SslMode::Prefer);
-        assert_eq!("require".parse::<SslMode>().unwrap(), SslMode::Require);
-        assert_eq!("verify-ca".parse::<SslMode>().unwrap(), SslMode::VerifyCa);
         assert_eq!(
             "verify-full".parse::<SslMode>().unwrap(),
             SslMode::VerifyFull
         );
-        assert!("unknown".parse::<SslMode>().is_err());
+        for rejected in [
+            "off",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify_full",
+            "verifyfull",
+        ] {
+            assert!(rejected.parse::<SslMode>().is_err(), "{rejected}");
+        }
     }
 
     #[test]
     fn test_ssl_mode_display() {
         assert_eq!(SslMode::Disable.to_string(), "disable");
-        assert_eq!(SslMode::Prefer.to_string(), "prefer");
-        assert_eq!(SslMode::Require.to_string(), "require");
-        assert_eq!(SslMode::VerifyCa.to_string(), "verify-ca");
         assert_eq!(SslMode::VerifyFull.to_string(), "verify-full");
+    }
+
+    #[test]
+    fn legacy_ssl_modes_are_rejected() {
+        for mode in ["off", "prefer", "require", "verify-ca"] {
+            let mut pairs = required_pairs();
+            pairs.push(("ssl.mode", mode));
+            let error = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("invalid ssl.mode"), "{message}");
+        }
+    }
+
+    #[test]
+    fn plaintext_rejects_unused_ca_path() {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("ssl.mode", "disable"),
+            ("ssl.ca.cert.path", "/certs/ca.pem"),
+        ]);
+        let error = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(error.to_string().contains("ssl.mode=verify-full"));
     }
 
     #[test]
@@ -446,10 +605,39 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_batch_size() {
+    fn test_zero_flush_interval_rejected() {
         let mut pairs = required_pairs();
-        pairs.push(("batch.size", "abc"));
-        let config = make_config(&pairs);
-        assert!(PostgresSinkConfig::from_config(&config).is_err());
+        pairs.push(("flush.interval.ms", "0"));
+        let error = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(error.to_string().contains("flush.interval.ms must be > 0"));
+    }
+
+    #[test]
+    fn zero_connect_timeout_is_rejected() {
+        let mut pairs = required_pairs();
+        pairs.push(("connect.timeout.ms", "0"));
+        let error = PostgresSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(error.to_string().contains("connect.timeout.ms must be > 0"));
+    }
+
+    #[test]
+    fn statement_timeout_is_a_bounded_integer_startup_setting() {
+        let mut cfg = PostgresSinkConfig::new("localhost", "db", "events");
+        cfg.statement_timeout = Duration::from_millis(30_000);
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.statement_timeout_startup_option(),
+            "-c statement_timeout=30000"
+        );
+
+        cfg.statement_timeout =
+            Duration::from_millis(u64::try_from(MAX_POSTGRES_STATEMENT_TIMEOUT_MS).unwrap());
+        cfg.validate().unwrap();
+        cfg.statement_timeout =
+            Duration::from_millis(u64::try_from(MAX_POSTGRES_STATEMENT_TIMEOUT_MS + 1).unwrap());
+        assert!(cfg.validate().is_err());
+
+        cfg.statement_timeout = Duration::from_secs(1) + Duration::from_micros(1);
+        assert!(cfg.validate().is_err());
     }
 }

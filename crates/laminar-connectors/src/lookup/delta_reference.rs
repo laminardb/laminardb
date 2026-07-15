@@ -1,98 +1,84 @@
-//! Delta Lake reference table source for lookup/enrichment joins.
-//!
-//! Implements `ReferenceTableSource` to populate lookup tables from Delta
-//! Lake tables. Supports catalog resolution (Unity, Glue) via the existing
-//! `resolve_catalog_options` function in `delta_io`.
+//! Delta Lake startup snapshot source for reference tables.
 
+#[cfg(feature = "delta-lake")]
 use std::collections::VecDeque;
 
 use arrow_array::RecordBatch;
-use tracing::info;
-
-#[cfg(feature = "delta-lake")]
-use std::time::Instant;
-
-#[cfg(feature = "delta-lake")]
-use tracing::{debug, warn};
-
+use arrow_schema::SchemaRef;
 #[cfg(feature = "delta-lake")]
 use deltalake::DeltaTable;
+#[cfg(feature = "delta-lake")]
+use tracing::info;
 
-use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::lakehouse::delta_source_config::DeltaSourceConfig;
-#[cfg(feature = "delta-lake")]
-use crate::lakehouse::delta_source_config::SchemaEvolutionAction;
 use crate::reference::ReferenceTableSource;
+#[cfg(feature = "delta-lake")]
+use crate::reference::{conform_snapshot_batch, validate_snapshot_schema};
 
-/// Lifecycle phase.
-#[allow(dead_code)] // Variants used only with delta-lake feature
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    Init,
-    Snapshot,
-    Changes,
+    Ready,
+    #[cfg(feature = "delta-lake")]
+    Draining,
+    #[cfg(feature = "delta-lake")]
+    Done,
     Closed,
 }
 
-/// Delta Lake reference table source for `CREATE LOOKUP TABLE`.
-///
-/// Reads a Delta Lake table as a dimension/reference table for enrichment
-/// joins. The table is loaded as a full snapshot on first access, then
-/// incrementally refreshed as new Delta versions appear.
+/// A finite snapshot of one Delta Lake table.
 pub struct DeltaReferenceTableSource {
-    #[allow(dead_code)] // read in feature-gated methods
+    #[cfg(feature = "delta-lake")]
     config: DeltaSourceConfig,
+    #[cfg(feature = "delta-lake")]
+    declared_schema: SchemaRef,
     phase: Phase,
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
-    current_version: i64,
-    /// Version being drained. Promoted to `current_version` only when
-    /// `pending_batches` is fully consumed, so checkpoint is safe.
     #[cfg(feature = "delta-lake")]
-    inflight_version: Option<i64>,
     pending_batches: VecDeque<RecordBatch>,
-    #[cfg(feature = "delta-lake")]
-    last_version_check: Option<Instant>,
-    #[cfg(feature = "delta-lake")]
-    known_schema: Option<arrow_schema::SchemaRef>,
 }
 
 impl DeltaReferenceTableSource {
-    /// Creates a new Delta Lake reference table source from a pre-parsed config.
+    /// Creates a source from parsed connector configuration and the declared table schema.
     #[must_use]
-    pub fn from_source_config(config: DeltaSourceConfig) -> Self {
+    pub fn from_source_config(config: DeltaSourceConfig, declared_schema: SchemaRef) -> Self {
+        #[cfg(not(feature = "delta-lake"))]
+        let _ = (config, declared_schema);
         Self {
+            #[cfg(feature = "delta-lake")]
             config,
-            phase: Phase::Init,
+            #[cfg(feature = "delta-lake")]
+            declared_schema,
+            phase: Phase::Ready,
             #[cfg(feature = "delta-lake")]
             table: None,
-            current_version: -1,
             #[cfg(feature = "delta-lake")]
-            inflight_version: None,
             pending_batches: VecDeque::new(),
-            #[cfg(feature = "delta-lake")]
-            last_version_check: None,
-            #[cfg(feature = "delta-lake")]
-            known_schema: None,
         }
     }
 
-    /// Creates a new source from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Creates a source from SQL connector properties and the declared table schema.
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError` if required config keys are missing.
-    pub fn from_connector_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let source_config = DeltaSourceConfig::from_config(config)?;
-        Ok(Self::from_source_config(source_config))
+    /// Returns an error when the Delta connector configuration is invalid.
+    pub fn from_connector_config(
+        config: &ConnectorConfig,
+        declared_schema: SchemaRef,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self::from_source_config(
+            DeltaSourceConfig::from_config(config)?,
+            declared_schema,
+        ))
     }
 
     #[cfg(feature = "delta-lake")]
     async fn open_table(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
-        let (resolved_path, resolved_opts) = delta_io::resolve_catalog_options(
+        let (resolved_path, resolved_options) = delta_io::resolve_catalog_options(
             &self.config.catalog_type,
             self.config.catalog_database.as_deref(),
             self.config.catalog_name.as_deref(),
@@ -101,77 +87,59 @@ impl DeltaReferenceTableSource {
             &self.config.storage_options,
         )
         .await?;
-
-        info!(
-            table_path = %self.config.table_path,
-            resolved_path = %resolved_path,
-            catalog = %self.config.catalog_type,
-            "delta lookup: resolved catalog"
-        );
-
-        let table = delta_io::open_or_create_table(&resolved_path, resolved_opts, None).await?;
-
-        info!(
-            resolved_path = %resolved_path,
-            table_version = table.version().unwrap_or(0),
-            "delta lookup: table opened"
-        );
-
-        self.table = Some(table);
+        self.table =
+            Some(delta_io::open_or_create_table(&resolved_path, resolved_options, None).await?);
         Ok(())
     }
 
-    /// Loads all batches at the latest version into `pending_batches`.
-    /// When `partition_filter` is set, applies it as a WHERE clause.
     #[cfg(feature = "delta-lake")]
     async fn load_snapshot(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
-        let table = self
-            .table
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Internal("table not opened".into()))?;
-
-        let latest = delta_io::get_latest_version(table).await?;
-
+        let version = delta_io::get_latest_version(
+            self.table
+                .as_mut()
+                .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
+        )
+        .await?;
         let batches = if self.config.partition_filter.is_some() {
-            self.load_snapshot_filtered(latest).await?
+            self.load_filtered_snapshot(version).await?
         } else {
-            let (b, _) = delta_io::read_batches_at_version(table, latest, usize::MAX).await?;
-            b
+            delta_io::read_batches_at_version(
+                self.table
+                    .as_mut()
+                    .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
+                version,
+                usize::MAX,
+            )
+            .await?
+            .0
         };
 
-        // Seed schema from table metadata if no rows returned (empty/filtered table).
-        if let Some(first) = batches.first() {
-            self.known_schema = Some(first.schema());
-        } else if self.known_schema.is_none() {
-            let table = self
-                .table
-                .as_ref()
-                .ok_or_else(|| ConnectorError::Internal("table not opened".into()))?;
-            if let Ok(s) = delta_io::get_table_schema(table) {
-                self.known_schema = Some(s);
-            }
+        if batches.is_empty() {
+            let table_schema = delta_io::get_table_schema(
+                self.table
+                    .as_ref()
+                    .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
+            )
+            .map_err(|error| {
+                ConnectorError::ReadError(format!("read Delta snapshot schema: {error}"))
+            })?;
+            validate_snapshot_schema(table_schema.as_ref(), self.declared_schema.as_ref())?;
         }
 
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        info!(
-            version = latest,
-            batches = batches.len(),
-            rows = total_rows,
-            partition_filter = ?self.config.partition_filter,
-            "delta lookup: snapshot loaded"
-        );
-
-        self.pending_batches = VecDeque::from(batches);
-        self.current_version = latest;
-        self.last_version_check = Some(Instant::now());
+        let batches = batches
+            .into_iter()
+            .map(|batch| conform_snapshot_batch(&batch, &self.declared_schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        info!(version, rows, "Delta reference snapshot loaded");
+        self.pending_batches = batches.into();
         Ok(())
     }
 
-    /// Loads snapshot with partition filter via `DataFusion` WHERE clause.
     #[cfg(feature = "delta-lake")]
-    async fn load_snapshot_filtered(
+    async fn load_filtered_snapshot(
         &mut self,
         version: i64,
     ) -> Result<Vec<RecordBatch>, ConnectorError> {
@@ -180,352 +148,188 @@ impl DeltaReferenceTableSource {
         let table = self
             .table
             .as_mut()
-            .ok_or_else(|| ConnectorError::Internal("table not opened".into()))?;
-
+            .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?;
         table
             .load_version(version)
             .await
-            .map_err(|e| ConnectorError::ReadError(format!("load version {version}: {e}")))?;
-
+            .map_err(|error| ConnectorError::ReadError(format!("load Delta version: {error}")))?;
         let provider = table
             .table_provider()
             .build()
             .await
-            .map_err(|e| ConnectorError::ReadError(format!("build table provider: {e}")))?;
+            .map_err(|error| ConnectorError::ReadError(format!("build Delta scan: {error}")))?;
 
-        let ctx = datafusion::prelude::SessionContext::new();
-        ctx.register_table("delta_lookup_scan", std::sync::Arc::new(provider))
-            .map_err(|e| ConnectorError::ReadError(format!("register scan: {e}")))?;
-
-        // Caller guarantees partition_filter is Some.
-        let filter = self.config.partition_filter.as_deref().unwrap_or("1=1");
-        let sql = format!("SELECT * FROM delta_lookup_scan WHERE {filter}");
-
-        let df = ctx
-            .sql(&sql)
+        let context = datafusion::prelude::SessionContext::new();
+        context
+            .register_table("delta_reference_scan", std::sync::Arc::new(provider))
+            .map_err(|error| ConnectorError::ReadError(format!("register Delta scan: {error}")))?;
+        let filter = self.config.partition_filter.as_deref().ok_or_else(|| {
+            ConnectorError::Internal("filtered Delta snapshot has no filter".into())
+        })?;
+        let dataframe = context
+            .sql(&format!(
+                "SELECT * FROM delta_reference_scan WHERE {filter}"
+            ))
             .await
-            .map_err(|e| ConnectorError::ReadError(format!("filtered scan: {e}")))?;
-
-        let mut stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| ConnectorError::ReadError(format!("stream: {e}")))?;
-
+            .map_err(|error| {
+                ConnectorError::ReadError(format!("plan filtered Delta scan: {error}"))
+            })?;
+        let mut stream = dataframe.execute_stream().await.map_err(|error| {
+            ConnectorError::ReadError(format!("execute filtered Delta scan: {error}"))
+        })?;
         let mut batches = Vec::new();
-        while let Some(result) = stream.next().await {
-            let batch = result.map_err(|e| ConnectorError::ReadError(format!("batch: {e}")))?;
-            if batch.num_rows() > 0 {
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|error| {
+                ConnectorError::ReadError(format!("read filtered Delta batch: {error}"))
+            })?;
+            if batch.num_rows() != 0 {
                 batches.push(batch);
             }
         }
-
         Ok(batches)
-    }
-
-    /// Checks for new Delta versions and loads diffs, capped at
-    /// `MAX_VERSIONS_PER_POLL` per call to avoid blocking the pipeline.
-    #[cfg(feature = "delta-lake")]
-    async fn check_for_changes(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        use crate::lakehouse::delta_io;
-
-        /// Max versions to read per `poll_changes()` call.
-        const MAX_VERSIONS_PER_POLL: i64 = 10;
-
-        // Throttle version checks to poll_interval.
-        if let Some(last) = self.last_version_check {
-            if last.elapsed() < self.config.poll_interval {
-                return Ok(None);
-            }
-        }
-
-        let table = self
-            .table
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Internal("table not opened".into()))?;
-
-        let latest = delta_io::get_latest_version(table).await?;
-
-        if latest <= self.current_version {
-            self.last_version_check = Some(Instant::now());
-            return Ok(None);
-        }
-
-        let target = latest.min(self.current_version + MAX_VERSIONS_PER_POLL);
-
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-        for v in (self.current_version + 1)..=target {
-            let (batches, _) = delta_io::read_version_diff(
-                table,
-                v,
-                usize::MAX,
-                self.config.partition_filter.as_deref(),
-            )
-            .await?;
-
-            if let Some(first) = batches.first() {
-                let new_schema = first.schema();
-                if let Some(known) = &self.known_schema {
-                    if known.as_ref() != new_schema.as_ref() {
-                        match self.config.schema_evolution_action {
-                            SchemaEvolutionAction::Warn => {
-                                warn!(version = v, "delta lookup: schema changed between versions");
-                                self.known_schema = Some(new_schema);
-                            }
-                            SchemaEvolutionAction::Error => {
-                                if v > self.current_version + 1 {
-                                    self.current_version = v - 1;
-                                }
-                                return Err(ConnectorError::Internal(format!(
-                                    "delta lookup: schema evolution detected at version {v} \
-                                     (action=error)"
-                                )));
-                            }
-                        }
-                    }
-                } else {
-                    self.known_schema = Some(new_schema);
-                }
-            }
-
-            all_batches.extend(batches);
-        }
-
-        let total_rows: usize = all_batches.iter().map(RecordBatch::num_rows).sum();
-        if total_rows > 0 {
-            debug!(
-                from = self.current_version + 1,
-                to = target,
-                latest,
-                rows = total_rows,
-                "delta lookup: version diff loaded"
-            );
-        }
-
-        // If more versions remain, skip throttle so next poll re-enters immediately.
-        if target < latest {
-            self.last_version_check = None;
-        } else {
-            self.last_version_check = Some(Instant::now());
-        }
-
-        let mut batch_iter = all_batches.into_iter();
-        let first = batch_iter.next();
-        self.pending_batches.extend(batch_iter);
-
-        // Defer version advancement: only promote when buffer is drained,
-        // so checkpoint() never reports a version ahead of consumed data.
-        if self.pending_batches.is_empty() {
-            self.current_version = target;
-        } else {
-            self.inflight_version = Some(target);
-        }
-        Ok(first)
     }
 }
 
 #[async_trait::async_trait]
 impl ReferenceTableSource for DeltaReferenceTableSource {
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        if matches!(self.phase, Phase::Init) {
-            #[cfg(feature = "delta-lake")]
-            {
-                self.open_table().await?;
-                self.load_snapshot().await?;
-                self.phase = Phase::Snapshot;
-            }
-
-            #[cfg(not(feature = "delta-lake"))]
-            {
-                return Err(ConnectorError::ConfigurationError(
-                    "Delta Lake lookup requires the 'delta-lake' feature. \
-                     Build with: cargo build --features delta-lake"
-                        .into(),
-                ));
-            }
-        }
-
-        if !matches!(self.phase, Phase::Snapshot) {
-            return Ok(None);
-        }
-
-        if let Some(batch) = self.pending_batches.pop_front() {
-            return Ok(Some(batch));
-        }
-
-        self.phase = Phase::Changes;
-        Ok(None)
-    }
-
-    fn is_snapshot_complete(&self) -> bool {
-        matches!(self.phase, Phase::Changes | Phase::Closed)
-    }
-
-    async fn poll_changes(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        if !matches!(self.phase, Phase::Changes) {
-            return Ok(None);
-        }
-
-        if let Some(batch) = self.pending_batches.pop_front() {
-            // Promote inflight version when buffer is fully drained.
-            #[cfg(feature = "delta-lake")]
-            if self.pending_batches.is_empty() {
-                if let Some(v) = self.inflight_version.take() {
-                    self.current_version = v;
-                }
-            }
-            return Ok(Some(batch));
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            return match self.phase {
+                Phase::Closed => Err(ConnectorError::InvalidState {
+                    expected: "open reference snapshot source".into(),
+                    actual: "closed".into(),
+                }),
+                Phase::Ready => Err(ConnectorError::ConfigurationError(
+                    "Delta reference tables require the 'delta-lake' feature".into(),
+                )),
+            };
         }
 
         #[cfg(feature = "delta-lake")]
         {
-            return self.check_for_changes().await;
+            match self.phase {
+                Phase::Closed => {
+                    return Err(ConnectorError::InvalidState {
+                        expected: "open reference snapshot source".into(),
+                        actual: "closed".into(),
+                    });
+                }
+                Phase::Done => return Ok(None),
+                Phase::Ready => {
+                    self.open_table().await?;
+                    self.load_snapshot().await?;
+                    self.phase = Phase::Draining;
+                }
+                Phase::Draining => {}
+            }
+
+            if let Some(batch) = self.pending_batches.pop_front() {
+                return Ok(Some(batch));
+            }
+            self.phase = Phase::Done;
+            Ok(None)
         }
-
-        #[cfg(not(feature = "delta-lake"))]
-        Ok(None)
-    }
-
-    fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new();
-        cp.set_offset("delta_version", self.current_version.to_string());
-        cp
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        if let Some(v) = checkpoint.get_offset("delta_version") {
-            self.current_version = v.parse().map_err(|_| {
-                ConnectorError::Internal(format!("invalid delta_version in checkpoint: '{v}'"))
-            })?;
-            info!(
-                version = self.current_version,
-                "delta lookup: restored from checkpoint"
-            );
-        }
-        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.phase = Phase::Closed;
         #[cfg(feature = "delta-lake")]
+        self.pending_batches.clear();
+        #[cfg(feature = "delta-lake")]
         {
             self.table = None;
         }
-        self.pending_batches.clear();
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
-    use crate::lakehouse::delta_source_config::DeltaSourceConfig;
 
+    fn declared_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    #[cfg(feature = "delta-lake")]
     #[test]
-    fn test_from_source_config() {
-        let config = DeltaSourceConfig::new("/tmp/test_delta");
-        let src = DeltaReferenceTableSource::from_source_config(config);
-        assert!(!src.is_snapshot_complete());
-        assert_eq!(src.current_version, -1);
+    fn construction_carries_declared_schema() {
+        let source = DeltaReferenceTableSource::from_source_config(
+            DeltaSourceConfig::new("/tmp/test_delta"),
+            declared_schema(),
+        );
+        assert_eq!(source.declared_schema.field(0).name(), "id");
+        assert!(!source.declared_schema.field(0).is_nullable());
     }
 
     #[test]
-    fn test_from_connector_config() {
-        let mut config = ConnectorConfig::new("delta-lake");
-        config.set("table.path", "/tmp/test_delta");
-        let src = DeltaReferenceTableSource::from_connector_config(&config).unwrap();
-        assert!(!src.is_snapshot_complete());
-    }
-
-    #[test]
-    fn test_from_connector_config_missing_path() {
+    fn missing_table_path_is_rejected() {
         let config = ConnectorConfig::new("delta-lake");
-        assert!(DeltaReferenceTableSource::from_connector_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_checkpoint_round_trip() {
-        let config = DeltaSourceConfig::new("/tmp/test");
-        let mut src = DeltaReferenceTableSource::from_source_config(config);
-        src.current_version = 42;
-        let cp = src.checkpoint();
-        assert_eq!(cp.get_offset("delta_version"), Some("42"));
+        assert!(
+            DeltaReferenceTableSource::from_connector_config(&config, declared_schema()).is_err()
+        );
     }
 
     #[tokio::test]
-    async fn test_restore_from_checkpoint() {
-        let config = DeltaSourceConfig::new("/tmp/test");
-        let mut src = DeltaReferenceTableSource::from_source_config(config);
-        let mut cp = SourceCheckpoint::new();
-        cp.set_offset("delta_version", "17");
-        src.restore(&cp).await.unwrap();
-        assert_eq!(src.current_version, 17);
-    }
-
-    #[tokio::test]
-    async fn test_restore_invalid_version() {
-        let config = DeltaSourceConfig::new("/tmp/test");
-        let mut src = DeltaReferenceTableSource::from_source_config(config);
-        let mut cp = SourceCheckpoint::new();
-        cp.set_offset("delta_version", "not_a_number");
-        assert!(src.restore(&cp).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_close_sets_phase() {
-        let config = DeltaSourceConfig::new("/tmp/test");
-        let mut src = DeltaReferenceTableSource::from_source_config(config);
-        src.close().await.unwrap();
-        assert!(src.is_snapshot_complete());
-    }
-
-    #[tokio::test]
-    async fn test_poll_changes_before_snapshot_returns_none() {
-        let config = DeltaSourceConfig::new("/tmp/test");
-        let mut src = DeltaReferenceTableSource::from_source_config(config);
-        assert!(src.poll_changes().await.unwrap().is_none());
+    async fn close_is_idempotent_and_prevents_reads() {
+        let mut source = DeltaReferenceTableSource::from_source_config(
+            DeltaSourceConfig::new("/tmp/test_delta"),
+            declared_schema(),
+        );
+        source.close().await.unwrap();
+        source.close().await.unwrap();
+        assert!(source.poll_snapshot().await.is_err());
     }
 
     #[cfg(feature = "delta-lake")]
     mod integration {
-        use super::*;
-        use arrow_array::{Int64Array, StringArray};
-        use arrow_schema::{DataType, Field, Schema, SchemaRef};
         use std::collections::HashMap;
-        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, StringArray};
+        use deltalake::protocol::SaveMode;
         use tempfile::TempDir;
 
-        fn test_schema() -> SchemaRef {
+        use super::*;
+
+        fn physical_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, true),
+            ]))
+        }
+
+        fn declared_schema() -> SchemaRef {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("name", DataType::Utf8, true),
             ]))
         }
 
-        fn test_batch(ids: &[i64], names: &[&str]) -> RecordBatch {
-            RecordBatch::try_new(
-                test_schema(),
+        async fn write_table(path: &str) {
+            use crate::lakehouse::delta_io;
+
+            let schema = physical_schema();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
                 vec![
-                    Arc::new(Int64Array::from(ids.to_vec())),
-                    Arc::new(StringArray::from(names.to_vec())),
+                    Arc::new(Int64Array::from(vec![1, 2])),
+                    Arc::new(StringArray::from(vec!["one", "two"])),
                 ],
             )
-            .unwrap()
-        }
-
-        async fn write_delta_version(path: &str, batches: Vec<RecordBatch>, epoch: u64) -> i64 {
-            use crate::lakehouse::delta_io;
-            use deltalake::protocol::SaveMode;
-
-            let schema = test_schema();
+            .unwrap();
             let table = delta_io::open_or_create_table(path, HashMap::new(), Some(&schema))
                 .await
                 .unwrap();
-
-            let (_table, version) = delta_io::write_batches(
+            delta_io::write_batches(
                 table,
-                batches,
-                "test-writer",
-                epoch,
+                vec![batch],
+                "reference-test",
+                1,
                 SaveMode::Append,
                 None,
                 false,
@@ -535,102 +339,40 @@ mod tests {
             )
             .await
             .unwrap();
-            version
         }
 
         #[tokio::test]
-        async fn test_snapshot_lifecycle() {
-            let temp_dir = TempDir::new().unwrap();
-            let table_path = temp_dir.path().to_str().unwrap();
-
-            let batch = test_batch(&[1, 2, 3], &["Alice", "Bob", "Carol"]);
-            write_delta_version(table_path, vec![batch], 1).await;
-
-            let config = DeltaSourceConfig::new(table_path);
-            let mut src = DeltaReferenceTableSource::from_source_config(config);
-
-            assert!(!src.is_snapshot_complete());
-
-            let mut total_rows = 0;
-            while let Some(batch) = src.poll_snapshot().await.unwrap() {
-                total_rows += batch.num_rows();
-            }
-            assert_eq!(total_rows, 3);
-            assert!(src.is_snapshot_complete());
-            assert!(src.poll_snapshot().await.unwrap().is_none());
-            assert!(src.poll_changes().await.unwrap().is_none());
-
-            src.close().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn test_checkpoint_preserves_version() {
-            let temp_dir = TempDir::new().unwrap();
-            let table_path = temp_dir.path().to_str().unwrap();
-
-            write_delta_version(table_path, vec![test_batch(&[1], &["Alice"])], 1).await;
-
-            let config = DeltaSourceConfig::new(table_path);
-            let mut src = DeltaReferenceTableSource::from_source_config(config);
-            while src.poll_snapshot().await.unwrap().is_some() {}
-
-            let cp = src.checkpoint();
-            assert!(src.current_version >= 0);
-            assert_eq!(
-                cp.get_offset("delta_version"),
-                Some(src.current_version.to_string().as_str())
+        async fn snapshot_uses_declared_schema_and_exhausts() {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().to_str().unwrap();
+            write_table(path).await;
+            let mut source = DeltaReferenceTableSource::from_source_config(
+                DeltaSourceConfig::new(path),
+                declared_schema(),
             );
-            src.close().await.unwrap();
+
+            let batch = source.poll_snapshot().await.unwrap().unwrap();
+            assert_eq!(batch.schema(), declared_schema());
+            assert_eq!(batch.num_rows(), 2);
+            assert!(source.poll_snapshot().await.unwrap().is_none());
+            assert!(source.poll_snapshot().await.unwrap().is_none());
         }
 
         #[tokio::test]
-        async fn test_poll_changes_picks_up_new_version() {
-            let temp_dir = TempDir::new().unwrap();
-            let table_path = temp_dir.path().to_str().unwrap();
+        async fn incompatible_declared_schema_fails_closed() {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().to_str().unwrap();
+            write_table(path).await;
+            let incompatible = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let mut source = DeltaReferenceTableSource::from_source_config(
+                DeltaSourceConfig::new(path),
+                incompatible,
+            );
 
-            // Version 1.
-            write_delta_version(table_path, vec![test_batch(&[1, 2], &["Alice", "Bob"])], 1).await;
-
-            // Snapshot.
-            let mut config = DeltaSourceConfig::new(table_path);
-            config.poll_interval = std::time::Duration::from_millis(0);
-            let mut src = DeltaReferenceTableSource::from_source_config(config);
-            while src.poll_snapshot().await.unwrap().is_some() {}
-            let v1 = src.current_version;
-
-            // Write version 2.
-            write_delta_version(table_path, vec![test_batch(&[3], &["Carol"])], 2).await;
-
-            // poll_changes should pick it up.
-            let mut change_rows = 0;
-            while let Some(batch) = src.poll_changes().await.unwrap() {
-                change_rows += batch.num_rows();
-            }
-            assert_eq!(change_rows, 1);
-            assert!(src.current_version > v1);
-            src.close().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn test_from_connector_config_with_catalog_none() {
-            let temp_dir = TempDir::new().unwrap();
-            let table_path = temp_dir.path().to_str().unwrap();
-
-            write_delta_version(table_path, vec![test_batch(&[10], &["Test"])], 1).await;
-
-            let mut config = ConnectorConfig::new("delta-lake");
-            config.set("table.path", table_path);
-            config.set("catalog.type", "none");
-
-            let mut src = DeltaReferenceTableSource::from_connector_config(&config).unwrap();
-
-            let mut total_rows = 0;
-            while let Some(batch) = src.poll_snapshot().await.unwrap() {
-                total_rows += batch.num_rows();
-            }
-            assert_eq!(total_rows, 1);
-            assert!(src.is_snapshot_complete());
-            src.close().await.unwrap();
+            assert!(source.poll_snapshot().await.is_err());
         }
     }
 }

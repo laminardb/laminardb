@@ -23,23 +23,16 @@ pub enum WriteMode {
         key_fields: Vec<String>,
     },
 
-    /// Full document replacement. Fails if the document is absent
-    /// unless `upsert_on_missing` is `true`.
-    Replace {
-        /// If `true`, insert the document when no match is found.
-        upsert_on_missing: bool,
-    },
-
     /// Routes operations based on the incoming event's `operationType`.
     ///
     /// Only valid for `LaminarEvent<MongoDbChangeEvent>` (CDC fan-out
     /// replication). Maps operations as follows:
     ///
-    /// - `insert` → `insertOne`
+    /// - `insert` → idempotent `replaceOne(..., upsert: true)` by document key
     /// - `update` → `updateOne` using `$set`/`$unset` from `updateDescription`
     /// - `replace` → `replaceOne` with `upsert: true`
     /// - `delete` → `deleteOne` using `documentKey._id`
-    /// - `drop`/`rename`/`invalidate` → lifecycle events, no write issued
+    /// - lifecycle and expanded events → rejected because a fixed destination cannot replay them
     CdcReplay,
 }
 

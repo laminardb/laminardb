@@ -288,7 +288,7 @@ impl SinkConnector for MockSinkConnector {
 }
 
 /// Registers a mock source connector with the registry.
-pub fn register_mock_source(registry: &ConnectorRegistry) {
+pub fn register_mock_source(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
     registry.register_source(
         "mock",
         ConnectorInfo {
@@ -300,11 +300,11 @@ pub fn register_mock_source(registry: &ConnectorRegistry) {
             config_keys: vec![],
         },
         Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
-    );
+    )
 }
 
 /// Registers a mock sink connector with the registry.
-pub fn register_mock_sink(registry: &ConnectorRegistry) {
+pub fn register_mock_sink(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
     registry.register_sink(
         "mock",
         ConnectorInfo {
@@ -316,7 +316,7 @@ pub fn register_mock_sink(registry: &ConnectorRegistry) {
             config_keys: vec![],
         },
         Arc::new(|_config, _registry| Ok(Box::new(MockSinkConnector::new()))),
-    );
+    )
 }
 
 #[cfg(test)]
@@ -411,8 +411,8 @@ mod tests {
     #[test]
     fn test_register_helpers() {
         let registry = ConnectorRegistry::new();
-        register_mock_source(&registry);
-        register_mock_sink(&registry);
+        register_mock_source(&registry).unwrap();
+        register_mock_sink(&registry).unwrap();
 
         assert!(registry.source_info("mock").is_some());
         assert!(registry.sink_info("mock").is_some());

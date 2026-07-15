@@ -1,7 +1,7 @@
-# MinIO + Iceberg REST catalog for the coordinated-commit integration test.
+# MinIO + Iceberg REST catalog for the Iceberg append integration test.
 #
 #   docker compose -f tests/docker/iceberg-compose.yml up -d --wait
-#   cargo test -p laminar-connectors --test iceberg_coordinated_commit \
+#   cargo test -p laminar-connectors --test iceberg_append \
 #     --features iceberg -- --ignored
 #   docker compose -f tests/docker/iceberg-compose.yml down -v
 #

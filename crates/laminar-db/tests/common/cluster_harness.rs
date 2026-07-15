@@ -1,17 +1,25 @@
 //! Shared cluster harness for `cluster_e2e_*` tests: per-node checkpoint dirs,
-//! one shared state backend dir (production's single-bucket layout). Issue DDL
-//! before [`ClusterEngineHarness::start_all`].
+//! one shared state backend dir (production's single-bucket layout). Bootstrap
+//! DDL through [`ClusterEngineHarness::bootstrap_catalog`] before startup.
 
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
-#![allow(dead_code)] // not every test binary uses every helper
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use laminar_connectors::checkpoint::SourceCheckpoint;
+use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
+use laminar_connectors::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology,
+};
+use laminar_connectors::error::ConnectorError;
 use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
 use laminar_core::cluster::control::{
-    AssignmentSnapshot, AssignmentSnapshotStore, CheckpointDecisionStore,
+    AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifestStore, CheckpointDecisionStore,
+    CheckpointParticipant, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore, ProcessLease,
+    ProcessLeaseConfig, ProcessLeaseManager, ProcessLeaseOutcome, ProcessLeaseStore, RotateOutcome,
 };
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
@@ -23,8 +31,84 @@ use laminar_db::LaminarDB;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(10);
+const TEST_LEASE_TTL: Duration = Duration::from_secs(2);
+const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
+pub const TEST_SOURCE_DDL: &str =
+    "CREATE SOURCE src (key BIGINT, value BIGINT) WITH ('connector' = 'cluster-harness-idle')";
+
+struct IdleClusterHarnessSource;
+
+#[async_trait]
+impl SourceConnector for IdleClusterHarnessSource {
+    async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    async fn poll_batch(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        Ok(None)
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Int64, true),
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, true),
+        ]))
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        SourceCheckpoint::new()
+    }
+
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Splittable,
+        ))
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+struct ControlLeaseRuntime {
+    process_shutdown: CancellationToken,
+    process_task: Option<tokio::task::JoinHandle<()>>,
+    leader_shutdown: CancellationToken,
+    leader_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ControlLeaseRuntime {
+    async fn shutdown(&mut self) {
+        self.leader_shutdown.cancel();
+        self.process_shutdown.cancel();
+        if let Some(task) = self.leader_task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.process_task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ControlLeaseRuntime {
+    fn drop(&mut self) {
+        self.leader_shutdown.cancel();
+        self.process_shutdown.cancel();
+        if let Some(task) = self.leader_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.process_task.take() {
+            task.abort();
+        }
+    }
+}
 
 /// Per-node engine state. Owned by [`ClusterEngineHarness`].
 pub struct NodeRuntime {
@@ -32,11 +116,12 @@ pub struct NodeRuntime {
     pub instance_id: NodeId,
     pub vnode_registry: Arc<VnodeRegistry>,
     pub state_backend: Arc<dyn StateBackend>,
-    /// Shared across all nodes — the point of a cluster-wide marker.
-    pub decision_store: Arc<CheckpointDecisionStore>,
+    pub shuffle_sender: Arc<ShuffleSender>,
+    pub shuffle_receiver: Arc<ShuffleReceiver>,
     pub assignment_snapshot_store: Arc<AssignmentSnapshotStore>,
     pub rebalance_shutdown: Arc<tokio::sync::Notify>,
     pub rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
+    control_leases: ControlLeaseRuntime,
 }
 
 impl NodeRuntime {
@@ -57,6 +142,8 @@ pub struct ClusterEngineHarness {
     pub shared_state_dir: TempDir,
     /// Per-node checkpoint dirs. Survives `shutdown_keep_dirs`.
     pub checkpoint_dirs: Vec<TempDir>,
+    /// Shared immutable startup catalog authority.
+    pub catalog_manifest_store: Arc<CatalogManifestStore>,
 }
 
 impl ClusterEngineHarness {
@@ -71,80 +158,34 @@ impl ClusterEngineHarness {
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(
-            n,
-            vnode_count,
-            shared_state_dir,
-            checkpoint_dirs,
-            None,
-            None,
-        )
-        .await
+        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs).await
     }
 
-    /// Like `spawn`, with incremental delta checkpoints (`chain_max`); the
-    /// per-vnode chain becomes the primary aggregate checkpoint.
-    pub async fn spawn_delta(n: usize, vnode_count: u32, chain_max: u32) -> Self {
-        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
-        let checkpoint_dirs: Vec<TempDir> = (0..n)
-            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
-            .collect();
-        Self::spawn_with_dirs(
-            n,
-            vnode_count,
-            shared_state_dir,
-            checkpoint_dirs,
-            Some(chain_max),
-            None,
-        )
-        .await
-    }
-
-    /// Like `spawn_delta`, but also opens a per-node cold tier (`budget_bytes`)
-    /// with group demotion ON; demotion needs the delta chain (`chain_max`).
-    #[cfg(feature = "state-tier")]
-    pub async fn spawn_delta_tier(
-        n: usize,
-        vnode_count: u32,
-        chain_max: u32,
-        budget_bytes: usize,
-    ) -> Self {
-        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
-        let checkpoint_dirs: Vec<TempDir> = (0..n)
-            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
-            .collect();
-        Self::spawn_with_dirs(
-            n,
-            vnode_count,
-            shared_state_dir,
-            checkpoint_dirs,
-            Some(chain_max),
-            Some(budget_bytes),
-        )
-        .await
-    }
-
-    /// Like `spawn`, reusing dirs from `shutdown_keep_dirs`. `delta` is
-    /// `Some(chain_max)` for chain-primary delta checkpoints; `tier_budget` is
-    /// `Some(bytes)` to open a per-node cold tier with group demotion (needs `delta`).
+    /// Like `spawn`, reusing dirs from `shutdown_keep_dirs`.
     pub async fn spawn_with_dirs(
         n: usize,
         vnode_count: u32,
         shared_state_dir: TempDir,
         checkpoint_dirs: Vec<TempDir>,
-        delta: Option<u32>,
-        tier_budget: Option<usize>,
+    ) -> Self {
+        Self::spawn_inner(n, vnode_count, shared_state_dir, checkpoint_dirs).await
+    }
+
+    async fn spawn_inner(
+        n: usize,
+        vnode_count: u32,
+        shared_state_dir: TempDir,
+        checkpoint_dirs: Vec<TempDir>,
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
+        let shared_store: Arc<dyn ObjectStore> = Arc::new(
+            LocalFileSystem::new_with_prefix(shared_state_dir.path())
+                .expect("LocalFileSystem over shared state dir"),
+        );
+
         // Shared snapshot store — one CAS-creator wins, peers adopt.
-        let snapshot_store: Arc<AssignmentSnapshotStore> = {
-            let fs: Arc<dyn ObjectStore> = Arc::new(
-                LocalFileSystem::new_with_prefix(shared_state_dir.path())
-                    .expect("LocalFileSystem over shared state dir for snapshot"),
-            );
-            Arc::new(AssignmentSnapshotStore::new(fs))
-        };
+        let snapshot_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&shared_store)));
 
         let cluster = MiniCluster::spawn_with_snapshot(n, Arc::clone(&snapshot_store)).await;
         cluster
@@ -154,6 +195,92 @@ impl ClusterEngineHarness {
 
         // Lowest id wins leader election; tests rely on nodes[0].
         assert!(cluster.nodes[0].controller.is_leader());
+
+        let process_config = ProcessLeaseConfig {
+            ttl: TEST_LEASE_TTL,
+            renew_interval: TEST_LEASE_RENEW_INTERVAL,
+        };
+        let process_leases = futures::future::join_all(cluster.nodes.iter().map(|node| {
+            let store = Arc::new(ProcessLeaseStore::new(
+                Arc::clone(&shared_store),
+                node.instance_id,
+                i64::try_from(TEST_LEASE_TTL.as_millis()).expect("test lease TTL fits i64"),
+            ));
+            let owner = node.controller.recovery_incarnation();
+            async move {
+                let lease = acquire_process_lease(&store, owner).await;
+                (store, lease)
+            }
+        }))
+        .await;
+
+        let leader_config = LeaderLeaseConfig {
+            ttl: TEST_LEASE_TTL,
+            renew_interval: TEST_LEASE_RENEW_INTERVAL,
+        };
+        let leader_store = Arc::new(LeaderLeaseStore::new(
+            Arc::clone(&shared_store),
+            i64::try_from(TEST_LEASE_TTL.as_millis()).expect("test lease TTL fits i64"),
+        ));
+        let catalog_store = Arc::new(CatalogManifestStore::new(Arc::clone(&leader_store)));
+        let mut control_leases = Vec::with_capacity(n);
+        for (node, (process_store, process_lease)) in
+            cluster.nodes.iter().zip(process_leases.into_iter())
+        {
+            let process_manager = ProcessLeaseManager::new(
+                process_store,
+                process_lease.owner,
+                process_config,
+                &process_lease,
+            )
+            .expect("process lease manager");
+            node.controller
+                .set_process_lease_deadline(process_manager.deadline());
+            node.controller
+                .publish_leased_recovery_incarnation(&process_lease)
+                .await
+                .expect("publish leased recovery incarnation");
+
+            node.controller
+                .set_leader_lease_store(Arc::clone(&leader_store));
+            let leader_manager =
+                LeaderLeaseManager::new(Arc::clone(&leader_store), &process_lease, leader_config)
+                    .expect("leader lease manager");
+            node.controller
+                .set_leader_lease_watch(
+                    leader_manager.lease_watch(),
+                    leader_manager.owner().clone(),
+                    leader_manager.deadline(),
+                )
+                .expect("install leader lease watch");
+
+            let process_shutdown = CancellationToken::new();
+            let process_task = process_manager.spawn(process_shutdown.clone());
+            let leader_shutdown = CancellationToken::new();
+            let leader_task = leader_manager.spawn(
+                leader_shutdown.clone(),
+                node.controller.leader_candidacy_watch(),
+            );
+            control_leases.push(ControlLeaseRuntime {
+                process_shutdown,
+                process_task: Some(process_task),
+                leader_shutdown,
+                leader_task: Some(leader_task),
+            });
+        }
+
+        let deadline = std::time::Instant::now() + CONVERGENCE_DEADLINE;
+        while cluster.nodes[0]
+            .controller
+            .capture_catalog_bootstrap_proof()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable test leader lease was not acquired",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         // Mirror production cluster startup: the barrier and remote-query services share one
         // control-plane listener, and its address is published through the cluster KV. Starting
@@ -169,35 +296,44 @@ impl ClusterEngineHarness {
                 .expect("cluster control-plane server start");
         }
 
-        let shared_store: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(shared_state_dir.path())
-                .expect("LocalFileSystem over shared state dir"),
-        );
-
         let peer_ids: Vec<NodeId> = cluster
             .nodes
             .iter()
             .map(|nh| NodeId(nh.instance_id.0))
             .collect();
+        let mut participants: Vec<CheckpointParticipant> = cluster
+            .nodes
+            .iter()
+            .map(|node| CheckpointParticipant {
+                node_id: node.instance_id.0,
+                boot_incarnation: node.controller.recovery_incarnation(),
+            })
+            .collect();
+        participants.sort_unstable_by_key(|participant| participant.node_id);
 
         // Resolve one cluster-wide vnode assignment; every node shares it.
         let (assignment, snapshot_version) =
-            resolve_assignment(&snapshot_store, vnode_count, &peer_ids).await;
+            resolve_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
 
         // Bind receivers up front so senders can cross-register addresses below.
         let mut receivers: Vec<Arc<ShuffleReceiver>> = Vec::with_capacity(n);
         for nh in &cluster.nodes {
-            let recv = ShuffleReceiver::bind(nh.instance_id.0, "127.0.0.1:0".parse().unwrap())
-                .await
-                .expect("ShuffleReceiver::bind");
+            let recv = ShuffleReceiver::bind(
+                nh.instance_id.0,
+                "127.0.0.1:0".parse().unwrap(),
+                nh.controller.recovery_incarnation(),
+            )
+            .await
+            .expect("ShuffleReceiver::bind");
             receivers.push(Arc::new(recv));
         }
 
+        let mut control_leases = control_leases.into_iter();
         let mut node_runtimes = Vec::with_capacity(n);
         for (idx, nh) in cluster.nodes.iter().enumerate() {
             let self_id = nh.instance_id;
 
-            let sender = ShuffleSender::new(self_id.0);
+            let sender = ShuffleSender::new(self_id.0, nh.controller.recovery_incarnation());
             for (p_idx, p_nh) in cluster.nodes.iter().enumerate() {
                 if p_idx == idx {
                     continue;
@@ -221,24 +357,20 @@ impl ClusterEngineHarness {
             registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
 
             let cp_cfg = StreamCheckpointConfig {
-                interval_ms: None, // manual only — tests drive checkpoint() explicitly
+                // Cluster at-least-once admission requires a periodic coordinator. Keep the
+                // interval outside the test horizon so manual checkpoints remain deterministic.
+                interval_ms: Some(3_600_000),
                 data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
-                delta_chain_max: delta,
                 ..StreamCheckpointConfig::default()
             };
 
-            // Skip `.profile(Cluster)`: `ObjectStoreCheckpointStore` `block_on`s
-            // internally and panics inside a tokio runtime.
+            // Reuse the same shared namespace for checkpoint participants and decisions.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
 
-            #[cfg_attr(not(feature = "state-tier"), allow(unused_mut))]
-            let mut builder = LaminarDB::builder()
+            let builder = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
                 .checkpoint(cp_cfg)
-                // Cold tier only demotes changelog aggregates; incremental emit makes the tier
-                // test's GROUP BY one (no-op for non-tier callers).
-                .incremental_emit(tier_budget.is_some())
                 .cluster_controller(Arc::clone(&nh.controller))
                 .state_backend(Arc::clone(&state_backend))
                 .vnode_registry(Arc::clone(&registry))
@@ -246,27 +378,37 @@ impl ClusterEngineHarness {
                 .shuffle_receiver(Arc::clone(&receivers[idx]))
                 .decision_store(Arc::clone(&decision_store))
                 .assignment_snapshot_store(Arc::clone(&snapshot_store))
+                .catalog_manifest_store(Arc::clone(&catalog_store))
+                .cluster_checkpoint_object_store(Arc::clone(&shared_store))
+                .register_connector(|registry| {
+                    registry.register_source(
+                        "cluster-harness-idle",
+                        ConnectorInfo {
+                            name: "cluster-harness-idle".into(),
+                            display_name: "Cluster harness idle source".into(),
+                            version: "1".into(),
+                            is_source: true,
+                            is_sink: false,
+                            config_keys: vec![],
+                        },
+                        Arc::new(|_| Box::new(IdleClusterHarnessSource)),
+                    )
+                })
                 // Mirror production: DataFusion partitions track vnode count.
                 .target_partitions(vnode_count as usize);
-            // Per-node cold tier (node-local, wiped on restart). Group demotion ON.
-            #[cfg(feature = "state-tier")]
-            if let Some(budget) = tier_budget {
-                builder = builder
-                    .state_tier_dir(checkpoint_dirs[idx].path().join("state-tier"))
-                    .state_memory_budget_bytes(budget)
-                    .state_tier_group_demotion(true);
-            }
-            let db = Arc::new(builder.build().await.expect("LaminarDB::builder().build()"));
+            let db = builder.build().await.expect("LaminarDB::builder().build()");
 
             node_runtimes.push(NodeRuntime {
                 db,
                 instance_id: self_id,
                 vnode_registry: Arc::clone(&registry),
                 state_backend: Arc::clone(&state_backend),
-                decision_store: Arc::clone(&decision_store),
+                shuffle_sender: Arc::clone(&sender),
+                shuffle_receiver: Arc::clone(&receivers[idx]),
                 assignment_snapshot_store: Arc::clone(&snapshot_store),
                 rebalance_shutdown: Arc::new(tokio::sync::Notify::new()),
                 rebalance_tasks: Vec::new(),
+                control_leases: control_leases.next().expect("one lease runtime per node"),
             });
         }
 
@@ -275,11 +417,16 @@ impl ClusterEngineHarness {
             nodes: node_runtimes,
             shared_state_dir,
             checkpoint_dirs,
+            catalog_manifest_store: catalog_store,
         }
     }
 
-    /// `db.start()` every node, then spawn the rebalance tasks.
+    /// Start every pipeline under the production assignment fence, certify shuffle ownership,
+    /// then open source intake.
     pub async fn start_all(&mut self) {
+        for node in &self.nodes {
+            node.db.fence_cluster_startup();
+        }
         for node in &self.nodes {
             node.db.start().await.expect("db.start()");
         }
@@ -342,6 +489,52 @@ impl ClusterEngineHarness {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let assignments_ready =
+                self.nodes
+                    .iter()
+                    .zip(&self.cluster.nodes)
+                    .all(|(runtime, cluster_node)| {
+                        let version = runtime.vnode_registry.assignment_version();
+                        cluster_node
+                            .controller
+                            .checkpoint_assignment_fence(version)
+                            .is_some_and(|fence| {
+                                let digest = Some(fence.digest());
+                                runtime.shuffle_sender.assignment_version() == version
+                                    && runtime.shuffle_receiver.assignment_version() == version
+                                    && runtime.shuffle_sender.active_assignment_digest() == digest
+                                    && runtime.shuffle_receiver.active_assignment_digest() == digest
+                            })
+                    });
+            if assignments_ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shuffle assignment certificates never became active",
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let authority_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        for node in &self.nodes {
+            assert!(
+                node.db
+                    .finish_cluster_startup(authority_deadline)
+                    .await
+                    .expect("fresh cluster startup authority activation"),
+                "fresh cluster startup remained fenced on node {}",
+                node.instance_id.0,
+            );
+            assert!(
+                !node.db.cluster_intake_fenced(),
+                "source intake remained fenced on node {}",
+                node.instance_id.0,
+            );
+        }
     }
 
     /// Index of the current leader in `nodes` (always 0 today).
@@ -362,6 +555,23 @@ impl ClusterEngineHarness {
             .collect()
     }
 
+    /// Seal the complete catalog on the durable leader, then replay that exact manifest on peers.
+    pub async fn bootstrap_catalog(&self, ddl: &[&str]) -> Result<(), laminar_db::DbError> {
+        let entries = ddl.iter().map(|sql| (*sql).to_owned()).collect::<Vec<_>>();
+        let leader = self.leader_idx();
+        self.nodes[leader]
+            .db
+            .execute_cluster_bootstrap_batch(&entries)
+            .await?;
+        for follower in self.follower_idxs() {
+            self.nodes[follower]
+                .db
+                .execute_cluster_bootstrap_batch(&entries)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Shut down and return the durable dirs for a restart scenario.
     pub async fn shutdown_keep_dirs(self) -> (TempDir, Vec<TempDir>) {
         let Self {
@@ -369,6 +579,7 @@ impl ClusterEngineHarness {
             nodes,
             shared_state_dir,
             checkpoint_dirs,
+            catalog_manifest_store: _,
         } = self;
         for mut node in nodes {
             node.rebalance_shutdown.notify_waiters();
@@ -379,6 +590,7 @@ impl ClusterEngineHarness {
                 let _ = task.await;
             }
             let _ = node.db.shutdown().await;
+            node.control_leases.shutdown().await;
         }
         cluster.shutdown().await;
         (shared_state_dir, checkpoint_dirs)
@@ -390,18 +602,74 @@ impl ClusterEngineHarness {
     }
 }
 
+async fn acquire_process_lease(store: &Arc<ProcessLeaseStore>, owner: uuid::Uuid) -> ProcessLease {
+    match store
+        .try_acquire(owner, unix_time_millis())
+        .await
+        .expect("acquire process lease")
+    {
+        ProcessLeaseOutcome::Acquired(lease) => lease,
+        ProcessLeaseOutcome::Held(incumbent) => {
+            let observation = store
+                .observe_rival(&incumbent)
+                .expect("observe prior process lease");
+            tokio::time::sleep(TEST_LEASE_TTL).await;
+            match store
+                .try_takeover(owner, &observation, unix_time_millis())
+                .await
+                .expect("take over prior process lease")
+            {
+                ProcessLeaseOutcome::Acquired(lease) => lease,
+                ProcessLeaseOutcome::Held(current) => panic!(
+                    "prior process lease was renewed during clean restart: node={}, term={}",
+                    current.node.0, current.term
+                ),
+            }
+        }
+    }
+}
+
+fn unix_time_millis() -> i64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis();
+    i64::try_from(millis).expect("current Unix time fits i64 milliseconds")
+}
+
 /// Load the shared assignment (with its version), or CAS-create one on first boot.
 async fn resolve_assignment(
     store: &AssignmentSnapshotStore,
     vnode_count: u32,
     peer_ids: &[NodeId],
+    participants: Vec<CheckpointParticipant>,
 ) -> (Arc<[NodeId]>, u64) {
-    if let Some(snap) = store.load().await.expect("load snapshot") {
-        return (snap.to_vnode_vec(vnode_count).into(), snap.version);
+    if let Some(mut snap) = store.load().await.expect("load snapshot") {
+        if snap.participants != participants {
+            let next = snap
+                .next_for_participants(snap.vnodes.clone(), participants)
+                .expect("restart participant snapshot");
+            snap = match store
+                .save_if_version(&next, snap.version)
+                .await
+                .expect("save restart participant snapshot")
+            {
+                RotateOutcome::Rotated => next,
+                RotateOutcome::Conflict(winner) => winner,
+            };
+        }
+        return (
+            snap.to_vnode_vec(vnode_count)
+                .expect("snapshot cardinality")
+                .into(),
+            snap.version,
+        );
     }
 
     let fresh = rendezvous_assignment(vnode_count, peer_ids);
-    let snap = AssignmentSnapshot::empty().next(AssignmentSnapshot::vnodes_from_vec(&fresh));
+    let snap = AssignmentSnapshot::empty()
+        .next_for_participants(AssignmentSnapshot::vnodes_from_vec(&fresh), participants)
+        .expect("canonical assignment snapshot");
     match store.save_if_absent(&snap).await.expect("save_if_absent") {
         Some(winner) => (fresh, winner.version),
         None => {
@@ -410,166 +678,16 @@ async fn resolve_assignment(
                 .await
                 .expect("load after CAS loss")
                 .expect("snapshot present after CAS loss");
-            (loaded.to_vnode_vec(vnode_count).into(), loaded.version)
+            (
+                loaded
+                    .to_vnode_vec(vnode_count)
+                    .expect("snapshot cardinality")
+                    .into(),
+                loaded.version,
+            )
         }
-    }
-}
-
-/// Build a `file:///` URL from an absolute filesystem path.
-fn file_url_from_path(path: &std::path::Path) -> String {
-    let abs = path.to_string_lossy().into_owned();
-    let normalized = abs.replace('\\', "/");
-    if normalized.starts_with('/') {
-        format!("file://{normalized}")
-    } else {
-        format!("file:///{normalized}")
     }
 }
 
 /// Diagnostic tuple `(instance_id, owned_vnodes)`.
 pub type NodeIdView = (NodeId, Vec<u32>);
-
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
-
-/// `(key BIGINT, value BIGINT)` schema.
-#[must_use]
-pub fn input_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("key", DataType::Int64, false),
-        Field::new("value", DataType::Int64, false),
-    ]))
-}
-
-/// Build a `(key, value)` batch where `value = key * 10`.
-#[must_use]
-pub fn input_batch(keys: &[i64]) -> RecordBatch {
-    let values: Vec<i64> = keys.iter().map(|k| k * 10).collect();
-    RecordBatch::try_new(
-        input_schema(),
-        vec![
-            Arc::new(Int64Array::from(keys.to_vec())),
-            Arc::new(Int64Array::from(values)),
-        ],
-    )
-    .expect("input_batch")
-}
-
-/// Compute the vnode a `key` lands on, matching `ClusterRepartitionExec` hashing.
-#[must_use]
-pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
-    use arrow::row::{RowConverter, SortField};
-    use laminar_core::state::key_hash;
-
-    let col: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(vec![key]));
-    let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("RowConverter");
-    let rows = converter.convert_columns(&[col]).expect("convert_columns");
-    #[allow(clippy::cast_possible_truncation)]
-    let v = (key_hash(rows.row(0).as_ref()) % u64::from(vnode_count)) as u32;
-    v
-}
-
-/// Pick `per_owner` keys from `0..1000` that land on each owner's vnodes.
-///
-/// # Errors
-/// Returns `Err` when 1000 candidates aren't enough.
-pub fn pick_keys_per_owner(
-    vnode_count: u32,
-    owners: &[(NodeId, Vec<u32>)],
-    per_owner: usize,
-) -> Result<Vec<(NodeId, Vec<i64>)>, String> {
-    let mut out: Vec<(NodeId, Vec<i64>)> = owners.iter().map(|(id, _)| (*id, Vec::new())).collect();
-    for k in 0i64..1000 {
-        let v = vnode_for_key(k, vnode_count);
-        for ((_, vnodes), (_, bucket)) in owners.iter().zip(out.iter_mut()) {
-            if vnodes.contains(&v) && bucket.len() < per_owner {
-                bucket.push(k);
-                break;
-            }
-        }
-        if out.iter().all(|(_, b)| b.len() >= per_owner) {
-            return Ok(out);
-        }
-    }
-    let summary: Vec<String> = out
-        .iter()
-        .map(|(id, b)| format!("{:?}={}", id, b.len()))
-        .collect();
-    Err(format!(
-        "ran out of candidates in 0..1000 wanting {per_owner}/owner: {}",
-        summary.join(", ")
-    ))
-}
-
-/// Latest persisted manifest epoch on this engine, or `0` when none exists.
-/// Reads through the engine's own `CheckpointStore`, so the result reflects
-/// what a restart would load.
-pub async fn manifest_epoch(db: &LaminarDB) -> u64 {
-    let store = match db.checkpoint_store() {
-        Some(s) => s,
-        None => return 0,
-    };
-    store
-        .load_latest()
-        .await
-        .ok()
-        .flatten()
-        .map_or(0, |m| m.epoch)
-}
-
-async fn collect_mv_sums(
-    context: &datafusion::prelude::SessionContext,
-    mv: &str,
-) -> Vec<(i64, i64)> {
-    let sql = format!("SELECT key, total FROM {mv}");
-    let df = context.sql(&sql).await.expect("plan SELECT");
-    let batches = df.collect().await.expect("collect SELECT");
-    let mut rows: Vec<(i64, i64)> = Vec::new();
-    for batch in batches {
-        let key = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("key Int64");
-        let total = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("total Int64");
-        for i in 0..batch.num_rows() {
-            rows.push((key.value(i), total.value(i)));
-        }
-    }
-    rows.sort_by_key(|(k, _)| *k);
-    rows
-}
-
-/// Read the node-local materialized-view slice, sorted by key.
-///
-/// Cluster user queries intentionally fan out to every live peer. Placement and rehydration tests
-/// need the wrapped provider's local slice so duplicate ownership cannot be hidden by querying a
-/// second node and unioning the same distributed result twice.
-pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
-    let provider = db
-        .session_context()
-        .table_provider(mv)
-        .await
-        .expect("materialized-view provider");
-    let local = match provider
-        .as_any()
-        .downcast_ref::<laminar_sql::datafusion::DistributedTableProvider>()
-    {
-        Some(distributed) => distributed.local_table_provider(),
-        None => provider,
-    };
-    let local_context = datafusion::prelude::SessionContext::new();
-    local_context
-        .register_table(mv, local)
-        .expect("register node-local materialized-view provider");
-    collect_mv_sums(&local_context, mv).await
-}
-
-/// Read the production distributed materialized-view view from one coordinator.
-pub async fn read_distributed_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
-    collect_mv_sums(db.session_context(), mv).await
-}

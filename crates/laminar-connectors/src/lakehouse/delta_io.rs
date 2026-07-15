@@ -19,10 +19,16 @@
 //! they are not a distributed checkpoint protocol by themselves.
 
 #[cfg(feature = "delta-lake")]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[cfg(feature = "delta-lake")]
 use std::sync::Arc;
+
+#[cfg(feature = "delta-lake")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(feature = "delta-lake")]
+use std::time::Duration;
 
 #[cfg(feature = "delta-lake")]
 use arrow_array::RecordBatch;
@@ -57,6 +63,49 @@ use url::Url;
 
 #[cfg(feature = "delta-lake")]
 use crate::error::ConnectorError;
+
+#[cfg(feature = "delta-lake")]
+use crate::connector::{
+    CoordinatedCommitBatch, CoordinatedCommitCursor, MAX_COORDINATED_COMMIT_BATCH_BYTES,
+};
+
+#[cfg(feature = "delta-lake")]
+use super::commit_descriptor::{DeltaCommitDescriptor, DeltaTableBinding};
+
+#[cfg(feature = "delta-lake")]
+const SET_TRANSACTION_RETENTION: &str = "delta.setTransactionRetentionDuration";
+
+#[cfg(feature = "delta-lake")]
+const COORDINATED_HEAD_CONCURRENCY: usize = 16;
+
+#[cfg(all(feature = "delta-lake", test))]
+#[derive(Clone)]
+pub(super) struct DelayedCoordinatedCatalogCommit {
+    pub(super) started: Arc<tokio::sync::Notify>,
+    pub(super) release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(feature = "delta-lake", test))]
+tokio::task_local! {
+    pub(super) static DELAY_COORDINATED_CATALOG_COMMIT: DelayedCoordinatedCatalogCommit;
+}
+
+#[cfg(feature = "delta-lake")]
+pub(super) const MAX_COORDINATED_ADD_ACTIONS: usize = 4_096;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_PATH_BYTES: usize = 1_024;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_STATS_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_PARTITION_ENTRIES: usize = 1_024;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_PARTITION_BYTES: usize = 256 * 1024;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_TAG_ENTRIES: usize = 1_024;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_TAG_BYTES: usize = 256 * 1024;
+#[cfg(feature = "delta-lake")]
+const MAX_COORDINATED_TABLE_ID_BYTES: usize = 1_024;
 
 /// Converts a path string to a URL.
 #[cfg(feature = "delta-lake")]
@@ -330,74 +379,1008 @@ pub async fn get_last_committed_version(
     }
 }
 
-/// Serialize a writer's flushed `Add` actions into a commit descriptor.
-///
-/// # Errors
-/// Returns `ConnectorError::WriteError` if serialization fails.
 #[cfg(feature = "delta-lake")]
-pub fn encode_commit_descriptor(
-    adds: Vec<deltalake::kernel::Add>,
-) -> Result<Vec<u8>, ConnectorError> {
-    super::commit_descriptor::encode(adds)
+fn coordinated_transaction_ids(external_key: &str) -> (String, String) {
+    (
+        format!("{external_key}.checkpoint"),
+        format!("{external_key}.fence"),
+    )
 }
 
-/// Decode and flatten every writer's descriptor into one set of `Add` actions.
-///
-/// # Errors
-/// Returns `ConnectorError::TransactionError` on a malformed/incompatible descriptor.
 #[cfg(feature = "delta-lake")]
-pub fn decode_commit_descriptors(
-    descriptors: &[Vec<u8>],
-) -> Result<Vec<deltalake::kernel::Add>, ConnectorError> {
-    let mut out = Vec::new();
-    for bytes in descriptors {
-        let adds: Vec<deltalake::kernel::Add> = super::commit_descriptor::decode(bytes)?;
-        out.extend(adds);
+fn reject_transaction_retention(table: &DeltaTable) -> Result<(), ConnectorError> {
+    let snapshot = table.snapshot().map_err(|error| {
+        ConnectorError::TransactionError(format!("read Delta snapshot: {error}"))
+    })?;
+    if let Some(value) = snapshot
+        .metadata()
+        .configuration()
+        .get(SET_TRANSACTION_RETENTION)
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta coordinated commits require durable transaction cursors; table property \
+             '{SET_TRANSACTION_RETENTION}'='{value}' can expire them"
+        )));
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Append `adds` from all writers in one transaction, stamped with the
-/// committer's application transaction (`committer_id`, `checkpoint_id`) for idempotency.
+/// Read the atomic checkpoint/fencing cursor for one coordinated namespace.
 ///
-/// # Errors
-/// Returns `ConnectorError::TransactionError` on commit failure.
+/// Both Delta `txn` actions must be present or absent. A partial pair is
+/// corruption, never a fresh target. Delta transaction versions are treated as
+/// opaque persisted values and checked explicitly rather than assumed to be
+/// monotonic.
 #[cfg(feature = "delta-lake")]
-pub async fn commit_adds_coordinated(
+pub async fn get_coordinated_cursor(
     table: &DeltaTable,
-    adds: Vec<deltalake::kernel::Add>,
-    committer_id: &str,
-    checkpoint_id: u64,
-) -> Result<i64, ConnectorError> {
+    external_key: &str,
+) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
+    reject_transaction_retention(table)?;
+    let snapshot = table.snapshot().map_err(|error| {
+        ConnectorError::TransactionError(format!("read Delta snapshot: {error}"))
+    })?;
+    let log_store = table.log_store();
+    let (checkpoint_id, fencing_token) = coordinated_transaction_ids(external_key);
+    let (checkpoint, token) = tokio::try_join!(
+        async {
+            snapshot
+                .transaction_version(log_store.as_ref(), &checkpoint_id)
+                .await
+                .map_err(|error| {
+                    ConnectorError::TransactionError(format!(
+                        "read Delta checkpoint cursor '{checkpoint_id}': {error}"
+                    ))
+                })
+        },
+        async {
+            snapshot
+                .transaction_version(log_store.as_ref(), &fencing_token)
+                .await
+                .map_err(|error| {
+                    ConnectorError::TransactionError(format!(
+                        "read Delta fencing cursor '{fencing_token}': {error}"
+                    ))
+                })
+        }
+    )?;
+
+    match (checkpoint, token) {
+        (None, None) => Ok(None),
+        (Some(checkpoint), Some(token)) => {
+            let checkpoint_id = u64::try_from(checkpoint).map_err(|_| {
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated checkpoint cursor '{external_key}' is negative"
+                ))
+            })?;
+            let fencing_token = u64::try_from(token).map_err(|_| {
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated fencing token '{external_key}' is negative"
+                ))
+            })?;
+            if fencing_token == 0 {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta coordinated fencing token '{external_key}' is zero"
+                )));
+            }
+            Ok(Some(CoordinatedCommitCursor {
+                checkpoint_id,
+                fencing_token,
+            }))
+        }
+        _ => Err(ConnectorError::TransactionError(format!(
+            "Delta coordinated cursor '{external_key}' is corrupt: checkpoint and fence \
+             transaction actions must be present together"
+        ))),
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+#[derive(serde::Serialize)]
+struct DeltaProtocolFingerprint {
+    min_reader_version: i32,
+    min_writer_version: i32,
+    reader_features: Vec<String>,
+    writer_features: Vec<String>,
+}
+
+#[cfg(feature = "delta-lake")]
+#[derive(serde::Serialize)]
+struct DeltaWriteMetadataFingerprint<'a> {
+    table_id: &'a str,
+    schema: &'a deltalake::kernel::StructType,
+    partition_columns: &'a [String],
+    configuration: BTreeMap<&'a str, &'a str>,
+    protocol: DeltaProtocolFingerprint,
+}
+
+#[cfg(feature = "delta-lake")]
+fn sorted_protocol_features<T: ToString>(features: Option<&[T]>) -> Vec<String> {
+    let mut features: Vec<String> = features
+        .unwrap_or_default()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    features.sort_unstable();
+    features
+}
+
+#[cfg(feature = "delta-lake")]
+pub(super) fn coordinated_table_binding(
+    table: &DeltaTable,
+) -> Result<DeltaTableBinding, ConnectorError> {
+    let snapshot = table.snapshot().map_err(|error| {
+        ConnectorError::TransactionError(format!("read Delta staging snapshot: {error}"))
+    })?;
+    let metadata = snapshot.metadata();
+    let table_id = metadata.id();
+    if table_id.is_empty() || table_id.len() > MAX_COORDINATED_TABLE_ID_BYTES {
+        return Err(ConnectorError::TransactionError(
+            "Delta table id is empty or exceeds the coordinated descriptor limit".into(),
+        ));
+    }
+    let schema = metadata.parse_schema().map_err(|error| {
+        ConnectorError::TransactionError(format!("parse Delta table schema: {error}"))
+    })?;
+    let configuration = metadata
+        .configuration()
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let protocol = snapshot.protocol();
+    let fingerprint = DeltaWriteMetadataFingerprint {
+        table_id,
+        schema: &schema,
+        partition_columns: metadata.partition_columns(),
+        configuration,
+        protocol: DeltaProtocolFingerprint {
+            min_reader_version: protocol.min_reader_version(),
+            min_writer_version: protocol.min_writer_version(),
+            reader_features: sorted_protocol_features(protocol.reader_features()),
+            writer_features: sorted_protocol_features(protocol.writer_features()),
+        },
+    };
+    let write_metadata_sha256 = laminar_core::checkpoint::canonical_json_sha256(&fingerprint)
+        .map_err(|error| {
+            ConnectorError::TransactionError(format!("canonicalize Delta write metadata: {error}"))
+        })?;
+    Ok(DeltaTableBinding {
+        table_id: table_id.to_owned(),
+        write_metadata_sha256,
+    })
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_table_binding(binding: &DeltaTableBinding) -> Result<(), ConnectorError> {
+    if binding.table_id.is_empty() || binding.table_id.len() > MAX_COORDINATED_TABLE_ID_BYTES {
+        return Err(ConnectorError::TransactionError(
+            "Delta coordinated descriptor has an invalid table id".into(),
+        ));
+    }
+    if binding.write_metadata_sha256.len() != 64
+        || !binding
+            .write_metadata_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConnectorError::TransactionError(
+            "Delta coordinated descriptor has a non-canonical metadata digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
+fn ensure_publication_deadline(
+    deadline: tokio::time::Instant,
+    operation: &str,
+) -> Result<(), ConnectorError> {
+    if deadline <= tokio::time::Instant::now() {
+        Err(ConnectorError::TransactionError(format!(
+            "Delta coordinated publication deadline elapsed during {operation}; the external outcome must be reconciled from its cursor"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Serialize table-bound `Add` actions into one durable descriptor.
+#[cfg(feature = "delta-lake")]
+pub(super) fn encode_commit_descriptor(
+    binding: &DeltaTableBinding,
+    adds: &[deltalake::kernel::Add],
+) -> Result<Vec<u8>, ConnectorError> {
+    super::commit_descriptor::encode(binding, adds)
+}
+
+#[cfg(feature = "delta-lake")]
+pub(super) fn encoded_add_array_len(
+    adds: &[deltalake::kernel::Add],
+) -> Result<usize, ConnectorError> {
+    super::commit_descriptor::encoded_add_array_len(adds)
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_descriptor_batch_lengths(
+    lengths: impl IntoIterator<Item = usize>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
+    let mut total_bytes = 0usize;
+    for (index, length) in lengths.into_iter().enumerate() {
+        if index % 64 == 0 {
+            ensure_publication_deadline(deadline, "descriptor batch admission")?;
+        }
+        if length > crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated descriptor exceeds the fixed {} byte per-participant limit",
+                crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES
+            )));
+        }
+        total_bytes = total_bytes.checked_add(length).ok_or_else(|| {
+            ConnectorError::TransactionError(
+                "Delta coordinated descriptor byte count overflow".into(),
+            )
+        })?;
+        if total_bytes > MAX_COORDINATED_COMMIT_BATCH_BYTES {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated descriptors exceed the fixed {MAX_COORDINATED_COMMIT_BATCH_BYTES} byte batch limit"
+            )));
+        }
+    }
+    ensure_publication_deadline(deadline, "descriptor batch admission")
+}
+
+#[cfg(feature = "delta-lake")]
+fn decode_commit_descriptors_until(
+    descriptors: &[Vec<u8>],
+    deadline: tokio::time::Instant,
+) -> Result<Option<DeltaCommitDescriptor>, ConnectorError> {
+    validate_descriptor_batch_lengths(descriptors.iter().map(Vec::len), deadline)?;
+
+    let mut binding = None;
+    let mut adds = Vec::new();
+    for bytes in descriptors {
+        ensure_publication_deadline(deadline, "descriptor decoding")?;
+        let descriptor = super::commit_descriptor::decode(bytes)?;
+        ensure_publication_deadline(deadline, "descriptor decoding")?;
+        validate_table_binding(&descriptor.binding)?;
+        if descriptor.adds.is_empty() {
+            return Err(ConnectorError::TransactionError(
+                "Delta coordinated payload contains an empty descriptor".into(),
+            ));
+        }
+        match &binding {
+            Some(expected) if expected != &descriptor.binding => {
+                return Err(ConnectorError::TransactionError(
+                    "Delta coordinated descriptors bind different table metadata".into(),
+                ));
+            }
+            None => binding = Some(descriptor.binding),
+            Some(_) => {}
+        }
+        let projected = adds
+            .len()
+            .checked_add(descriptor.adds.len())
+            .ok_or_else(|| {
+                ConnectorError::TransactionError(
+                    "Delta coordinated Add action count overflow".into(),
+                )
+            })?;
+        if projected > MAX_COORDINATED_ADD_ACTIONS {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated publication exceeds the fixed {MAX_COORDINATED_ADD_ACTIONS} Add action limit"
+            )));
+        }
+        adds.extend(descriptor.adds);
+    }
+    Ok(binding.map(|binding| DeltaCommitDescriptor { binding, adds }))
+}
+
+#[cfg(all(feature = "delta-lake", test))]
+pub(super) fn decode_commit_descriptors(
+    descriptors: &[Vec<u8>],
+) -> Result<Option<DeltaCommitDescriptor>, ConnectorError> {
+    decode_commit_descriptors_until(
+        descriptors,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+}
+
+#[cfg(feature = "delta-lake")]
+#[derive(Clone)]
+struct CoordinatedObject {
+    path: deltalake::Path,
+    expected_size: u64,
+}
+
+#[cfg(feature = "delta-lake")]
+fn decode_percent_once(value: &str) -> Result<Option<String>, ConnectorError> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut changed = false;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                decoded.push((high << 4) | low);
+                index += 3;
+                changed = true;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    String::from_utf8(decoded).map(Some).map_err(|_| {
+        ConnectorError::TransactionError(
+            "Delta coordinated Add path contains non-UTF-8 percent encoding".into(),
+        )
+    })
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_path_segment(segment: &str, first: bool) -> Result<String, ConnectorError> {
+    let mut current = segment.to_owned();
+    for _ in 0..=4 {
+        let trimmed = current.trim_end_matches(['.', ' ']);
+        if trimmed.len() != current.len()
+            || trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || current.contains('/')
+            || current.contains('\\')
+            || (first && trimmed.eq_ignore_ascii_case("_delta_log"))
+            || (first
+                && trimmed.as_bytes().get(1) == Some(&b':')
+                && trimmed.as_bytes()[0].is_ascii_alphabetic())
+        {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add path has an unsafe segment: '{segment}'"
+            )));
+        }
+        let Some(decoded) = decode_percent_once(&current)? else {
+            return Ok(current.to_ascii_lowercase());
+        };
+        if decoded == current {
+            return Ok(current.to_ascii_lowercase());
+        }
+        current = decoded;
+    }
+    Err(ConnectorError::TransactionError(format!(
+        "Delta coordinated Add path has excessive percent-encoding depth: '{segment}'"
+    )))
+}
+
+#[cfg(feature = "delta-lake")]
+fn bounded_map_bytes<'a>(
+    entries: impl Iterator<Item = (&'a String, Option<&'a String>)>,
+    limit: usize,
+    context: &str,
+) -> Result<(), ConnectorError> {
+    let mut total = 0usize;
+    for (key, value) in entries {
+        total = total
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.map_or(0, String::len)))
+            .ok_or_else(|| {
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated Add {context} byte count overflow"
+                ))
+            })?;
+        if total > limit {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add {context} exceeds the fixed {limit} byte limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_coordinated_descriptors(
+    adds: &[deltalake::kernel::Add],
+    partition_columns: &[String],
+    deadline: tokio::time::Instant,
+) -> Result<Vec<CoordinatedObject>, ConnectorError> {
+    if adds.len() > MAX_COORDINATED_ADD_ACTIONS {
+        return Err(ConnectorError::TransactionError(format!(
+            "Delta coordinated publication exceeds the fixed {MAX_COORDINATED_ADD_ACTIONS} Add action limit"
+        )));
+    }
+    let expected_partitions: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
+    let mut normalized_paths = HashSet::with_capacity(adds.len());
+    let mut objects = Vec::with_capacity(adds.len());
+
+    for (index, add) in adds.iter().enumerate() {
+        if index % 64 == 0 {
+            ensure_publication_deadline(deadline, "descriptor validation")?;
+        }
+        let raw_path = add.path.as_str();
+        if raw_path.is_empty()
+            || raw_path.len() > MAX_COORDINATED_PATH_BYTES
+            || raw_path.starts_with('/')
+            || raw_path.starts_with('\\')
+            || raw_path.ends_with('/')
+            || raw_path.contains('\\')
+            || Url::parse(raw_path).is_ok()
+        {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add path must be a non-empty relative object path: \
+                 '{raw_path}'"
+            )));
+        }
+        let path = deltalake::Path::parse(raw_path).map_err(|error| {
+            ConnectorError::TransactionError(format!(
+                "invalid Delta coordinated Add path '{raw_path}': {error}"
+            ))
+        })?;
+        let mut normalized_path = String::with_capacity(raw_path.len());
+        for (segment_index, segment) in raw_path.split('/').enumerate() {
+            if segment_index != 0 {
+                normalized_path.push('/');
+            }
+            normalized_path.push_str(&validate_path_segment(segment, segment_index == 0)?);
+        }
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+        {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add path is not a Parquet data file: '{raw_path}'"
+            )));
+        }
+        if !normalized_paths.insert(normalized_path) {
+            return Err(ConnectorError::TransactionError(format!(
+                "duplicate Windows-equivalent Delta coordinated Add path '{raw_path}'"
+            )));
+        }
+        let expected_size = u64::try_from(add.size).map_err(|_| {
+            ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' has negative size {}",
+                add.size
+            ))
+        })?;
+        if expected_size == 0 {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' has zero size"
+            )));
+        }
+        if add.modification_time < 0 {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' has negative modification time {}",
+                add.modification_time
+            )));
+        }
+        if !add.data_change {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' must be a data change"
+            )));
+        }
+        if add.deletion_vector.is_some() {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated append Add '{raw_path}' cannot reference a deletion vector (the fixed limit is zero)"
+            )));
+        }
+        if add.partition_values.len() > MAX_COORDINATED_PARTITION_ENTRIES {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' exceeds the fixed {MAX_COORDINATED_PARTITION_ENTRIES} partition entry limit"
+            )));
+        }
+        if add.partition_values.len() != expected_partitions.len()
+            || !add
+                .partition_values
+                .keys()
+                .all(|column| expected_partitions.contains(column.as_str()))
+        {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' partition values do not match the live table"
+            )));
+        }
+        bounded_map_bytes(
+            add.partition_values
+                .iter()
+                .map(|(key, value)| (key, value.as_ref())),
+            MAX_COORDINATED_PARTITION_BYTES,
+            "partition metadata",
+        )?;
+        if let Some(stats) = &add.stats {
+            if stats.len() > MAX_COORDINATED_STATS_BYTES {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta coordinated Add '{raw_path}' statistics exceed the fixed {MAX_COORDINATED_STATS_BYTES} byte limit"
+                )));
+            }
+            let value: serde_json::Value = serde_json::from_str(stats).map_err(|error| {
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated Add '{raw_path}' has invalid statistics: {error}"
+                ))
+            })?;
+            if !value.is_object() {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta coordinated Add '{raw_path}' statistics must be a JSON object"
+                )));
+            }
+        }
+        if let Some(tags) = &add.tags {
+            if tags.len() > MAX_COORDINATED_TAG_ENTRIES {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta coordinated Add '{raw_path}' exceeds the fixed {MAX_COORDINATED_TAG_ENTRIES} tag entry limit"
+                )));
+            }
+            bounded_map_bytes(
+                tags.iter().map(|(key, value)| (key, value.as_ref())),
+                MAX_COORDINATED_TAG_BYTES,
+                "tag metadata",
+            )?;
+        }
+        if add
+            .clustering_provider
+            .as_ref()
+            .is_some_and(|provider| provider.len() > 256)
+        {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated Add '{raw_path}' clustering provider exceeds 256 bytes"
+            )));
+        }
+
+        objects.push(CoordinatedObject {
+            path,
+            expected_size,
+        });
+    }
+
+    ensure_publication_deadline(deadline, "descriptor validation")?;
+    Ok(objects)
+}
+
+#[cfg(feature = "delta-lake")]
+async fn validate_coordinated_objects(
+    table: &DeltaTable,
+    objects: Vec<CoordinatedObject>,
+    deleted_file_retention: Duration,
+    required_alive_until: chrono::DateTime<chrono::Utc>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+
+    let retention = chrono::Duration::from_std(deleted_file_retention).map_err(|_| {
+        ConnectorError::TransactionError(
+            "Delta deleted-file retention duration exceeds the supported clock range".into(),
+        )
+    })?;
+    let objects = Arc::new(objects);
+    let next = Arc::new(AtomicUsize::new(0));
+    let store = table.log_store().object_store(None);
+    let mut workers = tokio::task::JoinSet::new();
+
+    for _ in 0..COORDINATED_HEAD_CONCURRENCY.min(objects.len()) {
+        let objects = Arc::clone(&objects);
+        let next = Arc::clone(&next);
+        let store = Arc::clone(&store);
+        workers.spawn(async move {
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(object) = objects.get(index) else {
+                    return Ok::<(), ConnectorError>(());
+                };
+                let metadata = tokio::time::timeout_at(deadline, store.head(&object.path))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::TransactionError(format!(
+                            "Delta coordinated object HEAD exceeded the publication deadline for '{}'",
+                            object.path
+                        ))
+                    })?
+                    .map_err(|error| {
+                        ConnectorError::TransactionError(format!(
+                            "HEAD Delta coordinated object '{}': {error}",
+                            object.path
+                        ))
+                    })?;
+                if metadata.size != object.expected_size {
+                    return Err(ConnectorError::TransactionError(format!(
+                        "Delta coordinated object '{}' size mismatch: descriptor {}, physical {}",
+                        object.path, object.expected_size, metadata.size
+                    )));
+                }
+                let vacuum_eligible_at = metadata
+                    .last_modified
+                    .checked_add_signed(retention)
+                    .ok_or_else(|| {
+                        ConnectorError::TransactionError(format!(
+                            "Delta coordinated object '{}' recovery horizon exceeds the supported \
+                             clock range",
+                            object.path
+                        ))
+                    })?;
+                if vacuum_eligible_at <= required_alive_until {
+                    return Err(ConnectorError::TransactionError(format!(
+                        "Delta coordinated object '{}' is at or inside the recovery-horizon safety \
+                         margin: vacuum eligible at {vacuum_eligible_at}, publication must remain \
+                         safe through {required_alive_until}",
+                        object.path
+                    )));
+                }
+            }
+        });
+    }
+
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                workers.abort_all();
+                return Err(error);
+            }
+            Err(error) => {
+                workers.abort_all();
+                return Err(ConnectorError::Internal(format!(
+                    "Delta coordinated object validation worker failed: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
+enum PreparedCoordinatedPublication {
+    AlreadyCommitted,
+    Commit {
+        adds: Vec<deltalake::kernel::Add>,
+        binding: Option<DeltaTableBinding>,
+        cursor: CoordinatedCommitCursor,
+        descriptor_count: usize,
+    },
+}
+
+#[cfg(feature = "delta-lake")]
+struct CoordinatedPublicationOutcome {
+    descriptor_count: usize,
+}
+
+#[cfg(feature = "delta-lake")]
+async fn publish_coordinated<F>(
+    table: &DeltaTable,
+    external_key: &str,
+    deadline: tokio::time::Instant,
+    prepare: F,
+) -> Result<CoordinatedPublicationOutcome, ConnectorError>
+where
+    F: FnOnce(
+            Option<CoordinatedCommitCursor>,
+        ) -> Result<PreparedCoordinatedPublication, ConnectorError>
+        + Send,
+{
     use deltalake::kernel::transaction::CommitBuilder;
     use deltalake::kernel::Action;
     use deltalake::protocol::DeltaOperation;
+    use deltalake::table::config::TablePropertiesExt as _;
 
-    let snapshot = table
+    ensure_publication_deadline(deadline, "admission")?;
+    let publication_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let budget_on_clock = chrono::Duration::from_std(publication_budget).map_err(|_| {
+        ConnectorError::TransactionError(
+            "Delta coordinated publication budget exceeds the supported clock range".into(),
+        )
+    })?;
+    let required_alive_until = chrono::Utc::now()
+        .checked_add_signed(budget_on_clock)
+        .ok_or_else(|| {
+            ConnectorError::TransactionError(
+                "Delta coordinated recovery horizon exceeds the supported clock range".into(),
+            )
+        })?;
+
+    // Cursor filtering and the commit base share one freshly updated snapshot.
+    let mut current = table.clone();
+    tokio::time::timeout_at(deadline, current.update_state())
+        .await
+        .map_err(|_| {
+            ConnectorError::TransactionError(
+                "Delta coordinated snapshot refresh exceeded the publication deadline".into(),
+            )
+        })?
+        .map_err(|error| {
+            ConnectorError::TransactionError(format!(
+                "refresh Delta coordinated publication snapshot: {error}"
+            ))
+        })?;
+    ensure_publication_deadline(deadline, "snapshot refresh")?;
+    let observed =
+        tokio::time::timeout_at(deadline, get_coordinated_cursor(&current, external_key))
+            .await
+            .map_err(|_| {
+                ConnectorError::TransactionError(
+                    "Delta coordinated cursor read exceeded the publication deadline".into(),
+                )
+            })??;
+    ensure_publication_deadline(deadline, "cursor read")?;
+    let PreparedCoordinatedPublication::Commit {
+        adds,
+        binding,
+        cursor,
+        descriptor_count,
+    } = prepare(observed)?
+    else {
+        current.version().ok_or_else(|| {
+            ConnectorError::TransactionError(
+                "Delta coordinated cursor exists on an unversioned table".into(),
+            )
+        })?;
+        return Ok(CoordinatedPublicationOutcome {
+            descriptor_count: 0,
+        });
+    };
+    if cursor.fencing_token == 0 {
+        return Err(ConnectorError::TransactionError(
+            "Delta coordinated fencing token must be non-zero".into(),
+        ));
+    }
+    let checkpoint_id = i64::try_from(cursor.checkpoint_id).map_err(|_| {
+        ConnectorError::TransactionError(
+            "checkpoint id exceeds Delta transaction-version range".into(),
+        )
+    })?;
+    let fencing_token = i64::try_from(cursor.fencing_token).map_err(|_| {
+        ConnectorError::TransactionError(
+            "fencing token exceeds Delta transaction-version range".into(),
+        )
+    })?;
+
+    let snapshot = current
         .snapshot()
-        .map_err(|e| ConnectorError::TransactionError(format!("snapshot: {e}")))?;
-    let partition_cols = snapshot.metadata().partition_columns().clone();
-    let partition_by = (!partition_cols.is_empty()).then_some(partition_cols);
+        .map_err(|error| ConnectorError::TransactionError(format!("snapshot: {error}")))?;
+    if adds.is_empty() {
+        if binding.is_some() {
+            return Err(ConnectorError::TransactionError(
+                "empty Delta coordinated publication unexpectedly carries a table binding".into(),
+            ));
+        }
+    } else {
+        let binding = binding.as_ref().ok_or_else(|| {
+            ConnectorError::TransactionError(
+                "non-empty Delta coordinated publication has no table binding".into(),
+            )
+        })?;
+        let current_binding = coordinated_table_binding(&current)?;
+        if binding != &current_binding {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated descriptor table binding changed before publication (staged table '{}', live table '{}')",
+                binding.table_id, current_binding.table_id
+            )));
+        }
+    }
+    let partition_columns = snapshot.metadata().partition_columns().clone();
+    let objects = validate_coordinated_descriptors(&adds, &partition_columns, deadline)?;
+    validate_coordinated_objects(
+        &current,
+        objects,
+        snapshot.table_config().deleted_file_retention_duration(),
+        required_alive_until,
+        deadline,
+    )
+    .await?;
+    ensure_publication_deadline(deadline, "object validation")?;
+
+    let partition_by = (!partition_columns.is_empty()).then_some(partition_columns);
     let operation = DeltaOperation::Write {
         mode: SaveMode::Append,
         partition_by,
         predicate: None,
     };
-
     let actions: Vec<Action> = adds.into_iter().map(Action::Add).collect();
-    let checkpoint_id = i64::try_from(checkpoint_id).map_err(|_| {
-        ConnectorError::TransactionError(
-            "checkpoint id exceeds Delta transaction-version range".into(),
-        )
-    })?;
-    let props = CommitProperties::default()
-        .with_application_transaction(Transaction::new(committer_id, checkpoint_id));
-    let finalized = CommitBuilder::from(props)
-        .with_actions(actions)
-        .build(Some(snapshot), table.log_store(), operation)
+    let (checkpoint_transaction_id, fence_transaction_id) =
+        coordinated_transaction_ids(external_key);
+    let props = CommitProperties::default().with_application_transactions(vec![
+        Transaction::new(checkpoint_transaction_id, checkpoint_id),
+        Transaction::new(fence_transaction_id, fencing_token),
+    ]);
+    ensure_publication_deadline(deadline, "catalog commit admission")?;
+    let catalog_commit = async {
+        #[cfg(test)]
+        if let Ok(delay) = DELAY_COORDINATED_CATALOG_COMMIT.try_with(Clone::clone) {
+            let snapshot = (*snapshot).clone();
+            let log_store = current.log_store();
+            return tokio::spawn(async move {
+                delay.started.notify_one();
+                delay.release.notified().await;
+                CommitBuilder::from(props)
+                    .with_actions(actions)
+                    .build(Some(&snapshot), log_store, operation)
+                    .await
+            })
+            .await
+            .map_err(|error| {
+                deltalake::DeltaTableError::Generic(format!(
+                    "delayed coordinated catalog commit task failed: {error}"
+                ))
+            })?;
+        }
+        CommitBuilder::from(props)
+            .with_actions(actions)
+            .build(Some(snapshot), current.log_store(), operation)
+            .await
+    };
+    let commit_result = tokio::time::timeout_at(deadline, catalog_commit)
         .await
-        .map_err(|e| ConnectorError::TransactionError(format!("coordinated commit: {e}")))?;
-    Ok(finalized.version())
+        .map_err(|_| {
+            ConnectorError::TransactionError(
+                "Delta coordinated catalog commit exceeded the publication deadline; the external outcome must be reconciled from its cursor"
+                    .into(),
+            )
+        })?;
+    match commit_result {
+        Ok(_) => {}
+        Err(deltalake::DeltaTableError::Transaction {
+            source:
+                deltalake::kernel::transaction::TransactionError::CommitConflict(
+                    deltalake::kernel::transaction::CommitConflictError::ConcurrentTransaction,
+                ),
+        }) => {
+            ensure_publication_deadline(deadline, "concurrent transaction reconciliation")?;
+            let mut reconciled = table.clone();
+            tokio::time::timeout_at(deadline, reconciled.update_state())
+                .await
+                .map_err(|_| {
+                    ConnectorError::TransactionError(
+                        "Delta coordinated conflict reconciliation exceeded the publication deadline"
+                            .into(),
+                    )
+                })?
+                .map_err(|error| {
+                    ConnectorError::TransactionError(format!(
+                        "refresh Delta coordinated conflict snapshot: {error}"
+                    ))
+                })?;
+            let observed = tokio::time::timeout_at(
+                deadline,
+                get_coordinated_cursor(&reconciled, external_key),
+            )
+            .await
+            .map_err(|_| {
+                ConnectorError::TransactionError(
+                    "Delta coordinated conflict cursor read exceeded the publication deadline"
+                        .into(),
+                )
+            })??;
+            if observed != Some(cursor) {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta coordinated transaction conflict did not prove exact target cursor {} with fencing token {}",
+                    cursor.checkpoint_id, cursor.fencing_token
+                )));
+            }
+        }
+        Err(error) => {
+            return Err(ConnectorError::TransactionError(format!(
+                "coordinated commit: {error}"
+            )));
+        }
+    }
+    Ok(CoordinatedPublicationOutcome { descriptor_count })
+}
+
+/// Filter a validated checkpoint batch against one freshly observed cursor,
+/// then publish the remaining Adds and target cursor from that same snapshot.
+///
+/// # Errors
+/// Returns `ConnectorError::TransactionError` on validation or commit failure.
+#[cfg(feature = "delta-lake")]
+pub(super) async fn commit_batch_coordinated(
+    table: &DeltaTable,
+    batch: &CoordinatedCommitBatch,
+    deadline: tokio::time::Instant,
+) -> Result<usize, ConnectorError> {
+    let external_key = batch.namespace.external_key();
+    let outcome = publish_coordinated(table, &external_key, deadline, |observed_cursor| {
+        batch
+            .validate_observed_cursor(observed_cursor)
+            .map_err(|error| {
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated cursor continuity check failed: {error}"
+                ))
+            })?;
+        if let Some(cursor) = observed_cursor {
+            if cursor.checkpoint_id == batch.target.checkpoint_id
+                && cursor.fencing_token == batch.fencing_token
+            {
+                return Ok(PreparedCoordinatedPublication::AlreadyCommitted);
+            }
+            if cursor.checkpoint_id > batch.target.checkpoint_id
+                && cursor.fencing_token == batch.fencing_token
+            {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta coordinated cursor {} is already above exact target {}; the target cannot be inferred as the timed-out publication",
+                    cursor.checkpoint_id, batch.target.checkpoint_id
+                )));
+            }
+        }
+
+        let observed_checkpoint_id = observed_cursor.map_or(0, |cursor| cursor.checkpoint_id);
+        let descriptors: Vec<Vec<u8>> = batch
+            .entries
+            .iter()
+            .filter(|entry| entry.attempt.checkpoint_id > observed_checkpoint_id)
+            .filter_map(|entry| entry.payload.clone())
+            .collect();
+        let descriptor = decode_commit_descriptors_until(&descriptors, deadline)?;
+        let (binding, adds) = descriptor.map_or((None, Vec::new()), |descriptor| {
+            (Some(descriptor.binding), descriptor.adds)
+        });
+        Ok(PreparedCoordinatedPublication::Commit {
+            adds,
+            binding,
+            cursor: CoordinatedCommitCursor {
+                checkpoint_id: batch.target.checkpoint_id,
+                fencing_token: batch.fencing_token,
+            },
+            descriptor_count: descriptors.len(),
+        })
+    })
+    .await?;
+    Ok(outcome.descriptor_count)
+}
+
+/// Low-level cursor primitive retained only for focused unit tests. Production
+/// must use `commit_batch_coordinated` so overlap filtering occurs after refresh.
+#[cfg(all(feature = "delta-lake", test))]
+pub(super) async fn commit_adds_coordinated(
+    table: &DeltaTable,
+    adds: Vec<deltalake::kernel::Add>,
+    external_key: &str,
+    cursor: CoordinatedCommitCursor,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
+    let binding = (!adds.is_empty())
+        .then(|| coordinated_table_binding(table))
+        .transpose()?;
+    publish_coordinated(table, external_key, deadline, |observed_cursor| {
+        if let Some(observed) = observed_cursor {
+            if observed.fencing_token > cursor.fencing_token {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta fencing token {} is stale; target already records {}",
+                    cursor.fencing_token, observed.fencing_token
+                )));
+            }
+            if observed.checkpoint_id > cursor.checkpoint_id {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Delta checkpoint cursor would roll back from {} to {}",
+                    observed.checkpoint_id, cursor.checkpoint_id
+                )));
+            }
+            if observed.checkpoint_id == cursor.checkpoint_id {
+                if observed.fencing_token != cursor.fencing_token {
+                    return Err(ConnectorError::TransactionError(format!(
+                        "Delta checkpoint {} already records fencing token {}; it cannot \
+                             change to {}",
+                        cursor.checkpoint_id, observed.fencing_token, cursor.fencing_token
+                    )));
+                }
+                return Ok(PreparedCoordinatedPublication::AlreadyCommitted);
+            }
+        }
+        Ok(PreparedCoordinatedPublication::Commit {
+            adds,
+            binding,
+            cursor,
+            descriptor_count: 1,
+        })
+    })
+    .await?;
+    Ok(())
 }
 
 /// Returns the table's partition columns, or an empty list if the snapshot is

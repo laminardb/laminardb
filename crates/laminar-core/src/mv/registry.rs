@@ -102,6 +102,19 @@ impl MvRegistry {
         self.base_tables.insert(name.into());
     }
 
+    /// Remove a base-table identity after its dependents have been dropped.
+    pub fn unregister_base_table(&mut self, name: &str) -> bool {
+        if self
+            .dependents
+            .get(name)
+            .is_some_and(|dependents| !dependents.is_empty())
+        {
+            return false;
+        }
+        self.dependents.remove(name);
+        self.base_tables.remove(name)
+    }
+
     /// Returns true if the given name is a registered base table.
     #[must_use]
     pub fn is_base_table(&self, name: &str) -> bool {

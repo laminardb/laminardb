@@ -24,7 +24,9 @@ pub use text_decoder::TextLineDecoder;
 /// This is called by `LaminarDB::register_builtin_connectors()` when the
 /// `files` feature is enabled, and makes `connector = 'files'` available
 /// in `CREATE SOURCE` statements.
-pub fn register_file_source(registry: &ConnectorRegistry) {
+pub fn register_file_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
         name: "files".to_string(),
@@ -52,13 +54,15 @@ pub fn register_file_source(registry: &ConnectorRegistry) {
         Arc::new(|registry: Option<&prometheus::Registry>| {
             Box::new(FileSource::with_registry(registry))
         }),
-    );
+    )
 }
 
 /// Registers the file sink connector in the registry.
 ///
 /// Makes `connector = 'files'` available in `CREATE SINK` statements.
-pub fn register_file_sink(registry: &ConnectorRegistry) {
+pub fn register_file_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
         name: "files".to_string(),
@@ -78,7 +82,7 @@ pub fn register_file_sink(registry: &ConnectorRegistry) {
         Arc::new(|_config, registry: Option<&prometheus::Registry>| {
             Ok(Box::new(FileSink::with_registry(registry)))
         }),
-    );
+    )
 }
 
 #[cfg(test)]
@@ -88,7 +92,7 @@ mod tests {
     #[test]
     fn test_register_file_source() {
         let registry = ConnectorRegistry::new();
-        register_file_source(&registry);
+        register_file_source(&registry).unwrap();
 
         let sources = registry.list_sources();
         assert!(sources.contains(&"files".to_string()));
@@ -102,7 +106,7 @@ mod tests {
     #[test]
     fn test_register_file_sink() {
         let registry = ConnectorRegistry::new();
-        register_file_sink(&registry);
+        register_file_sink(&registry).unwrap();
 
         let sinks = registry.list_sinks();
         assert!(sinks.contains(&"files".to_string()));
@@ -116,7 +120,7 @@ mod tests {
     #[test]
     fn test_create_source_from_registry() {
         let registry = ConnectorRegistry::new();
-        register_file_source(&registry);
+        register_file_source(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("files");
         let source = registry.create_source(&config, None);
@@ -126,7 +130,7 @@ mod tests {
     #[test]
     fn test_create_sink_from_registry() {
         let registry = ConnectorRegistry::new();
-        register_file_sink(&registry);
+        register_file_sink(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("files");
         let sink = registry.create_sink(&config, None);

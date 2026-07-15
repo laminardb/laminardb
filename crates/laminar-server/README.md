@@ -54,29 +54,11 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node at-least-once)
+mode = "single"             # "single" (standalone) or "cluster" (multi-node at-least-once)
 bind = "0.0.0.0:8080"       # HTTP API bind address
 delivery = "at_least_once"  # pipeline-wide; exactly_once is single-node only
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
-# Optional node-level cap on total operator state held in memory, in bytes.
-# Crossing it pauses source intake (backpressure, not failure) until state
-# drains below the budget; watch `state_bytes` / `state_over_budget` in
-# /metrics. Unset = unlimited.
-# state_memory_budget_bytes = 8589934592
-# Optional disk cold tier (experimental; needs a `state-tier` build). With a
-# memory budget set, idle aggregate state approaching the budget is demoted
-# here (local NVMe) and fetched back on demand instead of backpressuring.
-# Watch `state_tier_bytes` / `state_tier_slices` / `state_tier_demote_total`.
-# Works single-node (no cluster) — the server derives the vnode topology from
-# [state]. Requires a durable [state] backend (`local`/`object_store`): the
-# tier's demoted state is replayed from it on restart, so an `in_process`
-# backend is rejected. Set a memory budget too, or nothing is demoted.
-# state_tier_dir = "/var/lib/laminardb/state-tier"
-# Demote at GROUP granularity (shed individual idle aggregate groups) instead of
-# whole idle vnodes. Requires the cold tier. Unset defaults ON; set false to
-# force the coarser vnode-granular path.
-# state_tier_group_demotion = true
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.
@@ -89,16 +71,15 @@ log_level = "info"
 backend = "local"           # "in_process", "local", or "object_store"
 path = "./data/state"       # required when backend = "local"
 # When backend = "object_store": url = "s3://bucket/state" (same schemes as
-# [checkpoint]) and instance_id = "node-0" (required, unique per node);
-# credentials from provider env vars or [state.storage].
+# [checkpoint]); credentials from provider env vars or [state.storage].
 # Local state paths are node-durable and valid for embedded/single-node
-# exactly-once. The checkpoint/decision store must be the built-in local
-# directory protected by its exclusive OS lock; any configured checkpoint URL
-# (including file://) or injected decision store fails with LDB-0014 because
-# its writer-fencing provenance cannot be proved. Cluster mode requires cloud
+# exactly-once. A file:// checkpoint URL selects the built-in local directory
+# protected by its exclusive OS lock. Shared object-store URLs and
+# library-injected object or decision stores fail with LDB-0014 because their
+# writer-fencing provenance cannot be proved. Cluster mode requires cloud
 # object storage shared by every node.
-# Cluster exactly-once currently fails closed with LDB-0013 because the leader
-# term is not atomically bound to checkpoint decisions and external sink commits.
+# Cluster exactly-once currently fails closed with LDB-0013 because supported
+# connectors lack certified term-fenced source handoff and external sink cursors.
 
 [checkpoint]
 # Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the

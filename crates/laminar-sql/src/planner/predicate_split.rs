@@ -652,7 +652,7 @@ mod tests {
 
     fn test_metadata() -> LookupTableMetadata {
         LookupTableMetadata {
-            connector: "postgres-cdc".to_string(),
+            connector: "postgres".to_string(),
             strategy: "replicated".to_string(),
             pushdown_mode: "auto".to_string(),
             primary_key: vec!["id".to_string()],

@@ -21,6 +21,7 @@ fn main() {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
+        .bytes(".laminar.shuffle.v1.RoutedData.arrow_ipc")
         .compile_protos(
             &[
                 "proto/shuffle.proto",

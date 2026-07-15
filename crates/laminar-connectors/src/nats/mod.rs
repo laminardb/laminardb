@@ -19,7 +19,9 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the NATS source connector.
-pub fn register_nats_source(registry: &ConnectorRegistry) {
+pub fn register_nats_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "nats".to_string(),
         display_name: "NATS Source".to_string(),
@@ -32,11 +34,13 @@ pub fn register_nats_source(registry: &ConnectorRegistry) {
         "nats",
         info,
         Arc::new(|reg| Box::new(NatsSource::new(Arc::new(Schema::empty()), reg))),
-    );
+    )
 }
 
 /// Registers the NATS sink connector.
-pub fn register_nats_sink(registry: &ConnectorRegistry) {
+pub fn register_nats_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "nats".to_string(),
         display_name: "NATS Sink".to_string(),
@@ -51,7 +55,7 @@ pub fn register_nats_sink(registry: &ConnectorRegistry) {
         Arc::new(|_config, registry| {
             Ok(Box::new(NatsSink::new(Arc::new(Schema::empty()), registry)))
         }),
-    );
+    )
 }
 
 fn auth_and_tls_keys() -> Vec<ConfigKeySpec> {
@@ -199,14 +203,14 @@ mod tests {
     #[test]
     fn register_source_appears_in_registry() {
         let registry = ConnectorRegistry::new();
-        register_nats_source(&registry);
+        register_nats_source(&registry).unwrap();
         assert!(registry.list_sources().contains(&"nats".to_string()));
     }
 
     #[test]
     fn register_sink_appears_in_registry() {
         let registry = ConnectorRegistry::new();
-        register_nats_sink(&registry);
+        register_nats_sink(&registry).unwrap();
         assert!(registry.list_sinks().contains(&"nats".to_string()));
     }
 }

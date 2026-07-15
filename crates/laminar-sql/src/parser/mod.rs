@@ -1048,6 +1048,29 @@ mod tests {
     }
 
     #[test]
+    fn custom_catalog_parsers_reject_duplicate_options_and_trailing_tokens() {
+        let duplicates = [
+            "CREATE SOURCE events (id BIGINT) FROM KAFKA ('topic' = 'a', 'TOPIC' = 'b')",
+            "CREATE SINK output FROM events INTO KAFKA ('topic' = 'a', 'TOPIC' = 'b')",
+            "CREATE LOOKUP TABLE users (id BIGINT, PRIMARY KEY (id)) WITH ('connector' = 'postgres', 'CONNECTOR' = 'redis')",
+        ];
+        for sql in duplicates {
+            let error = StreamingParser::parse_sql(sql).unwrap_err().to_string();
+            assert!(error.contains("duplicate connector option"), "{error}");
+        }
+
+        let trailing = [
+            "CREATE SOURCE events (id BIGINT) WITH ('connector' = 'kafka') TRAILING",
+            "CREATE SINK output FROM events WITH ('topic' = 'a') TRAILING",
+            "CREATE LOOKUP TABLE users (id BIGINT, PRIMARY KEY (id)) WITH ('connector' = 'postgres') TRAILING",
+        ];
+        for sql in trailing {
+            let error = StreamingParser::parse_sql(sql).unwrap_err().to_string();
+            assert!(error.contains("unexpected trailing token"), "{error}");
+        }
+    }
+
+    #[test]
     fn test_parse_drop_source() {
         let stmt = parse_one("DROP SOURCE events");
         match stmt {

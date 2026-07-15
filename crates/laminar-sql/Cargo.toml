@@ -11,16 +11,11 @@ description = "SQL layer for LaminarDB with streaming extensions"
 
 [features]
 default = []
-# Enables `cluster_repartition::ClusterRepartitionExec`, the cross-
-# instance hash repartition ExecutionPlan used in cluster mode.
 cluster = ["laminar-core/cluster"]
 
 [dependencies]
 # Core dependency
 laminar-core = { path = "../laminar-core", version = "0.28.0" }
-
-# Runtime glue for ClusterRepartitionExec's per-partition channels.
-tokio-stream = { workspace = true }
 
 # DataFusion for SQL processing
 datafusion = { workspace = true }

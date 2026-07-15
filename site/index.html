@@ -76,7 +76,7 @@
           "Tumbling, sliding, hopping, and session windows",
           "ASOF, temporal, temporal probe, interval, and lookup joins",
           "Exactly-once sinks via two-phase commit barrier checkpoints",
-          "Kafka, PostgreSQL/MySQL/MongoDB CDC, Delta Lake, Iceberg, and OpenTelemetry connectors",
+          "Kafka, PostgreSQL/MongoDB CDC, Delta Lake, Iceberg, and OpenTelemetry connectors",
           "Embed in Rust or Python, or run as a standalone server",
           "Sub-microsecond state lookup target"
         ]
@@ -127,7 +127,7 @@
             "name": "What connectors does LaminarDB support?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "LaminarDB ships with sources and sinks for Apache Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use."
+              "text": "LaminarDB ships with sources and sinks for Apache Kafka, PostgreSQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use."
             }
           },
           {
@@ -860,7 +860,7 @@ INNER JOIN payments p ON o.order_id = p.order_id
           <div class="connector-card">
             <div class="connector-header">
               <span class="connector-name">PostgreSQL CDC</span>
-              <span class="connector-badge stable">Stable</span>
+              <span class="connector-badge">Preview</span>
             </div>
             <div class="connector-direction">Source (pgoutput)</div>
             <div class="connector-flag">--features postgres-cdc</div>
@@ -876,21 +876,11 @@ INNER JOIN payments p ON o.order_id = p.order_id
             <div class="connector-flag">--features postgres-sink</div>
           </div>
 
-          <!-- Card MySQL CDC -->
-          <div class="connector-card">
-            <div class="connector-header">
-              <span class="connector-name">MySQL CDC</span>
-              <span class="connector-badge stable">Stable</span>
-            </div>
-            <div class="connector-direction">Source (Binlog)</div>
-            <div class="connector-flag">--features mysql-cdc</div>
-          </div>
-
           <!-- Card MongoDB CDC -->
           <div class="connector-card">
             <div class="connector-header">
               <span class="connector-name">MongoDB CDC</span>
-              <span class="connector-badge stable">Stable</span>
+              <span class="connector-badge">Preview</span>
             </div>
             <div class="connector-direction">Source + Sink</div>
             <div class="connector-flag">--features mongodb-cdc</div>
@@ -1165,7 +1155,7 @@ FROM tickets;</code></pre>
           </details>
           <details>
             <summary>What connectors does LaminarDB support?</summary>
-            <p>LaminarDB ships with sources and sinks for Apache Kafka, NATS, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use.</p>
+            <p>LaminarDB ships with sources and sinks for Apache Kafka, NATS, PostgreSQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use.</p>
           </details>
           <details>
             <summary>Is LaminarDB production-ready?</summary>

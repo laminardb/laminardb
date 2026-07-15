@@ -4,16 +4,18 @@
 //! inbound queue on the consuming side. The real transport is compiled under
 //! `cluster`; the default build keeps a networking-free shim.
 
-pub mod barrier_tracker;
 pub mod message;
 pub mod routing;
 pub mod transport;
 
-pub use barrier_tracker::BarrierTracker;
 pub use message::ShuffleMessage;
 pub use routing::{
-    row_vnodes, slice_batch_by_targets, slice_batch_by_vnode, slice_batch_by_vnodes,
+    route_checkpointed_batch, row_vnodes, CheckpointRoutePlan, LocalRoute, RemoteRoute,
+    ShuffleRoutingError, ROUTE_MAX_BATCH_BYTES, ROUTE_MAX_BATCH_ROWS, ROUTE_TARGET_BATCH_BYTES,
 };
 #[cfg(feature = "cluster")]
 pub use transport::SHUFFLE_ADDR_KEY;
-pub use transport::{ShufflePeerId, ShuffleReceiver, ShuffleSender};
+pub use transport::{
+    ReceivedBatch, ReceivedShuffle, ShuffleBatchAdmission, ShufflePeerId, ShuffleReceiver,
+    ShuffleSender,
+};

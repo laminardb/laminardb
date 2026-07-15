@@ -45,7 +45,9 @@ use crate::registry::ConnectorRegistry;
 ///
 /// After registration, the runtime can instantiate `WebSocketSource` by
 /// name when processing `CREATE SOURCE ... WITH (connector = 'websocket')`.
-pub fn register_websocket_source(registry: &ConnectorRegistry) {
+pub fn register_websocket_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "websocket".to_string(),
         display_name: "WebSocket Source".to_string(),
@@ -71,7 +73,7 @@ pub fn register_websocket_source(registry: &ConnectorRegistry) {
                 registry,
             ))
         }),
-    );
+    )
 }
 
 /// Registers the WebSocket sink connector with the given registry.
@@ -80,7 +82,9 @@ pub fn register_websocket_source(registry: &ConnectorRegistry) {
 /// before either implementation performs network I/O.
 /// If `_arrow_schema` is absent, it uses the legacy nullable `key: Utf8` and
 /// required `value: Utf8` placeholder schema.
-pub fn register_websocket_sink(registry: &ConnectorRegistry) {
+pub fn register_websocket_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "websocket".to_string(),
         display_name: "WebSocket Sink".to_string(),
@@ -119,7 +123,7 @@ pub fn register_websocket_sink(registry: &ConnectorRegistry) {
             };
             Ok(sink)
         }),
-    );
+    )
 }
 
 fn websocket_source_config_keys() -> Vec<ConfigKeySpec> {
@@ -267,7 +271,7 @@ mod tests {
     #[test]
     fn sink_factory_dispatches_server_without_opening_a_socket() {
         let registry = ConnectorRegistry::new();
-        register_websocket_sink(&registry);
+        register_websocket_sink(&registry).unwrap();
         let mut config = config_with_schema("server");
         config.set("bind.address", "127.0.0.1:0");
 
@@ -280,7 +284,7 @@ mod tests {
     #[test]
     fn sink_factory_dispatches_client_without_opening_a_socket() {
         let registry = ConnectorRegistry::new();
-        register_websocket_sink(&registry);
+        register_websocket_sink(&registry).unwrap();
         let mut config = config_with_schema("client");
         config.set("url", "wss://example.test/events");
 
@@ -293,7 +297,7 @@ mod tests {
     #[test]
     fn sink_factory_rejects_missing_or_invalid_mode_specific_config() {
         let registry = ConnectorRegistry::new();
-        register_websocket_sink(&registry);
+        register_websocket_sink(&registry).unwrap();
 
         let missing_server_bind = config_with_schema("server");
         assert!(factory_error(&registry, &missing_server_bind).contains("bind.address"));
@@ -317,7 +321,7 @@ mod tests {
     #[test]
     fn bind_address_metadata_is_mode_conditional() {
         let registry = ConnectorRegistry::new();
-        register_websocket_sink(&registry);
+        register_websocket_sink(&registry).unwrap();
         let info = registry.sink_info("websocket").unwrap();
         let bind = info
             .config_keys

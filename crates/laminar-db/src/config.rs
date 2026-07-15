@@ -89,19 +89,6 @@ pub struct LaminarConfig {
     pub http_auth_token: Option<SecretString>,
     /// Delivery guarantee.
     pub delivery_guarantee: DeliveryGuarantee,
-    /// Per-operator state limit. At 80% warns, at 100% errors. `None` = unlimited.
-    pub max_state_bytes_per_operator: Option<usize>,
-    /// Node-level cap on in-memory operator state; crossing it backpressures
-    /// source intake until state drains below it. `None` = unlimited.
-    pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier. With `state_memory_budget_bytes`,
-    /// state near the budget is demoted here instead of backpressuring. `None` = no tier.
-    /// Requires the `state-tier` build feature; ignored otherwise.
-    pub state_tier_dir: Option<PathBuf>,
-    /// Demote at GROUP granularity: shed individual idle aggregate groups to the tier instead of
-    /// only whole idle vnodes. Requires the `state-tier` feature and delta checkpoints; else a no-op.
-    pub state_tier_group_demotion: bool,
-
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
     /// Micro-batch coalescing window. `None` = 5ms connectors / 0 embedded.
@@ -135,10 +122,6 @@ impl Default for LaminarConfig {
             object_store_options: HashMap::new(),
             http_auth_token: None,
             delivery_guarantee: DeliveryGuarantee::default(),
-            max_state_bytes_per_operator: None,
-            state_memory_budget_bytes: None,
-            state_tier_dir: None,
-            state_tier_group_demotion: false,
             pipeline_channel_capacity: None,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,

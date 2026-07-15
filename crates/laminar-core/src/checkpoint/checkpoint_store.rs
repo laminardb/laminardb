@@ -122,6 +122,101 @@ pub struct ValidationResult {
     pub issues: Vec<ValidationIssue>,
 }
 
+/// Manifest and optional operator-state sidecar loaded for one exact checkpoint.
+///
+/// The sidecar is present only when the manifest's checksum shape requires it. Keeping both
+/// artifacts together lets recovery validate and restore the same bytes without a second read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointArtifacts {
+    /// Parsed checkpoint manifest.
+    pub manifest: CheckpointManifest,
+    /// Exact checksum-required `state.bin` bytes, if the manifest uses a sidecar.
+    pub state_data: Option<Vec<u8>>,
+}
+
+impl CheckpointArtifacts {
+    /// Validate these already-loaded bytes against the runtime and storage namespace.
+    #[must_use]
+    pub fn validate(
+        &self,
+        checkpoint_id: u64,
+        participant_id: u64,
+        vnode_count: u16,
+    ) -> ValidationResult {
+        let manifest = &self.manifest;
+        let mut issues = manifest
+            .validate(vnode_count)
+            .into_iter()
+            .map(|error| {
+                ValidationIssue::ManifestIncompatibility(format!("manifest validation: {error}"))
+            })
+            .collect::<Vec<_>>();
+
+        if manifest.participant_id != participant_id {
+            issues.push(ValidationIssue::ManifestIncompatibility(format!(
+                "manifest participant {} does not match store participant {participant_id}",
+                manifest.participant_id
+            )));
+        }
+        if manifest.checkpoint_id != checkpoint_id {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "storage checkpoint {checkpoint_id} contains manifest checkpoint {}",
+                manifest.checkpoint_id
+            )));
+        }
+
+        if let Some(expected) = &manifest.state_checksum {
+            let (any_inline, any_external) = operator_state_shape(manifest);
+            let actual = match (any_inline, any_external, self.state_data.as_deref()) {
+                (true, true, Some(data)) => {
+                    sha256_hex_mixed(&manifest.operator_states, std::iter::once(data))
+                }
+                (true, false, _) => sha256_hex_inline_states(&manifest.operator_states),
+                (false, _, Some(data)) => sha256_hex(data),
+                (_, _, None) => {
+                    issues.push(ValidationIssue::IntegrityFailure(
+                        "state.bin referenced by checksum but not found".into(),
+                    ));
+                    String::new()
+                }
+            };
+            if !actual.is_empty() && actual != *expected {
+                let label = if any_inline && any_external {
+                    "mixed state checksum mismatch"
+                } else if any_inline {
+                    "inline state checksum mismatch"
+                } else {
+                    "state.bin checksum mismatch"
+                };
+                issues.push(ValidationIssue::IntegrityFailure(format!(
+                    "{label}: expected {expected}, got {actual}"
+                )));
+            }
+        }
+
+        // Retain this integrity classification in addition to the manifest compatibility finding.
+        if manifest.epoch == 0 || manifest.checkpoint_id == 0 {
+            issues.push(ValidationIssue::IntegrityFailure(
+                "epoch or checkpoint_id is 0 — likely corrupted".into(),
+            ));
+        }
+
+        ValidationResult {
+            checkpoint_id,
+            valid: issues.is_empty(),
+            issues,
+        }
+    }
+}
+
+fn artifact_load_failure(checkpoint_id: u64, message: String) -> ValidationResult {
+    ValidationResult {
+        checkpoint_id,
+        valid: false,
+        issues: vec![ValidationIssue::IntegrityFailure(message)],
+    }
+}
+
 /// Report from a crash-safe recovery walk.
 ///
 /// Captures which checkpoints were tried, which were skipped (and why),
@@ -231,6 +326,23 @@ fn sha256_hex_inline_states(
         }
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn operator_state_shape(manifest: &CheckpointManifest) -> (bool, bool) {
+    manifest
+        .operator_states
+        .values()
+        .fold((false, false), |(inline, external), operator| {
+            (inline || !operator.external, external || operator.external)
+        })
+}
+
+fn requires_state_data(manifest: &CheckpointManifest) -> bool {
+    if manifest.state_checksum.is_none() {
+        return false;
+    }
+    let (any_inline, any_external) = operator_state_shape(manifest);
+    any_external || !any_inline
 }
 
 /// Trait for checkpoint persistence backends.
@@ -408,6 +520,59 @@ pub trait CheckpointStore: Send + Sync {
     /// Returns [`CheckpointStoreError`] on I/O failure.
     async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError>;
 
+    /// Load operator state sidecar bytes from a participant namespace.
+    ///
+    /// Stores without a shared participant namespace reject non-local reads.
+    async fn load_state_data_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+        if participant_id != self.participant_id() {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint store participant {} cannot read participant {participant_id}",
+                self.participant_id()
+            )));
+        }
+        self.load_state_data(id).await
+    }
+
+    /// Load the manifest and checksum-required sidecar for a local checkpoint exactly once.
+    async fn load_checkpoint_artifacts(
+        &self,
+        id: u64,
+    ) -> Result<Option<CheckpointArtifacts>, CheckpointStoreError> {
+        self.load_checkpoint_artifacts_for_participant(self.participant_id(), id)
+            .await
+    }
+
+    /// Load the manifest and checksum-required sidecar from a participant namespace exactly once.
+    ///
+    /// Inline-only checkpoints do not read `state.bin`. External, mixed, and legacy sidecar-only
+    /// checksum shapes perform one sidecar read after the manifest has selected that shape.
+    async fn load_checkpoint_artifacts_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<CheckpointArtifacts>, CheckpointStoreError> {
+        let Some(manifest) = self
+            .load_manifest_for_participant(participant_id, id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let state_data = if requires_state_data(&manifest) {
+            self.load_state_data_for_participant(participant_id, id)
+                .await?
+        } else {
+            None
+        };
+        Ok(Some(CheckpointArtifacts {
+            manifest,
+            state_data,
+        }))
+    }
+
     /// Validate a specific checkpoint's integrity.
     ///
     /// Checks that the manifest is parseable and, if a `state_checksum` is
@@ -417,100 +582,23 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     async fn validate_checkpoint(&self, id: u64) -> Result<ValidationResult, CheckpointStoreError> {
-        let mut issues = Vec::new();
-
-        // Load manifest — corrupt JSON is a validation failure, not an I/O error.
-        let manifest = match self.load_by_id(id).await {
-            Ok(Some(m)) => m,
+        let artifacts = match self.load_checkpoint_artifacts(id).await {
+            Ok(Some(artifacts)) => artifacts,
             Ok(None) => {
-                return Ok(ValidationResult {
-                    checkpoint_id: id,
-                    valid: false,
-                    issues: vec![ValidationIssue::IntegrityFailure(format!(
-                        "manifest not found for checkpoint {id}"
-                    ))],
-                });
+                return Ok(artifact_load_failure(
+                    id,
+                    format!("manifest not found for checkpoint {id}"),
+                ));
             }
-            Err(CheckpointStoreError::Serde(e)) => {
-                return Ok(ValidationResult {
-                    checkpoint_id: id,
-                    valid: false,
-                    issues: vec![ValidationIssue::IntegrityFailure(format!(
-                        "corrupt manifest: {e}"
-                    ))],
-                });
+            Err(CheckpointStoreError::Serde(error)) => {
+                return Ok(artifact_load_failure(
+                    id,
+                    format!("corrupt manifest: {error}"),
+                ));
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         };
-
-        for err in manifest.validate(self.vnode_count()) {
-            issues.push(ValidationIssue::ManifestIncompatibility(format!(
-                "manifest validation: {err}"
-            )));
-        }
-        if manifest.participant_id != self.participant_id() {
-            issues.push(ValidationIssue::ManifestIncompatibility(format!(
-                "manifest participant {} does not match store participant {}",
-                manifest.participant_id,
-                self.participant_id()
-            )));
-        }
-
-        // `state_checksum` covers, depending on shape: the sidecar bytes
-        // (purely-external), the inline operator_states (purely-inline),
-        // or both (mixed) — see `sha256_hex_mixed`.
-        if let Some(expected) = &manifest.state_checksum {
-            let any_inline = manifest.operator_states.values().any(|o| !o.external);
-            let any_external = manifest.operator_states.values().any(|o| o.external);
-            let needs_sidecar = any_external || !any_inline;
-            let sidecar = if needs_sidecar {
-                self.load_state_data(id).await?
-            } else {
-                None
-            };
-            let actual = match (any_inline, &sidecar) {
-                (true, Some(data)) => {
-                    sha256_hex_mixed(&manifest.operator_states, std::iter::once(data.as_slice()))
-                }
-                (true, None) if !any_external => {
-                    sha256_hex_inline_states(&manifest.operator_states)
-                }
-                (_, Some(data)) => sha256_hex(data),
-                (_, None) => {
-                    issues.push(ValidationIssue::IntegrityFailure(
-                        "state.bin referenced by checksum but not found".into(),
-                    ));
-                    String::new()
-                }
-            };
-            if !actual.is_empty() && actual != *expected {
-                let label = if any_inline && any_external {
-                    "mixed state checksum mismatch"
-                } else if any_inline {
-                    "inline state checksum mismatch"
-                } else {
-                    "state.bin checksum mismatch"
-                };
-                issues.push(ValidationIssue::IntegrityFailure(format!(
-                    "{label}: expected {expected}, got {actual}"
-                )));
-            }
-        }
-
-        // epoch=0 or checkpoint_id=0 indicates a corrupted or nonsensical
-        // manifest — reject as invalid regardless of other issues.
-        if manifest.epoch == 0 || manifest.checkpoint_id == 0 {
-            issues.push(ValidationIssue::IntegrityFailure(
-                "epoch or checkpoint_id is 0 — likely corrupted".into(),
-            ));
-        }
-
-        let valid = issues.is_empty();
-        Ok(ValidationResult {
-            checkpoint_id: id,
-            valid,
-            issues,
-        })
+        Ok(artifacts.validate(id, self.participant_id(), self.vnode_count()))
     }
 
     /// Walk backward from latest to find the first valid checkpoint.
@@ -533,28 +621,32 @@ pub trait CheckpointStore: Send + Sync {
         let examined = ids.len();
 
         for id in &ids {
-            let result = self.validate_checkpoint(*id).await?;
+            let (result, durable_phase) = match self.load_checkpoint_artifacts(*id).await {
+                Ok(Some(artifacts)) => (
+                    artifacts.validate(*id, self.participant_id(), self.vnode_count()),
+                    Some(artifacts.manifest.durable_phase),
+                ),
+                Ok(None) => (
+                    artifact_load_failure(*id, format!("manifest not found for checkpoint {id}")),
+                    None,
+                ),
+                Err(CheckpointStoreError::Serde(error)) => (
+                    artifact_load_failure(*id, format!("corrupt manifest: {error}")),
+                    None,
+                ),
+                Err(error) => return Err(error),
+            };
             if result.valid {
-                match self.load_by_id(*id).await? {
-                    Some(manifest)
-                        if manifest.durable_phase == DurableCheckpointPhase::Finalized =>
-                    {
-                        return Ok(RecoveryReport {
-                            chosen_id: Some(*id),
-                            skipped,
-                            examined,
-                            elapsed: start.elapsed(),
-                        });
-                    }
-                    Some(_) => {
-                        skipped.push((*id, "checkpoint is prepared but not finalized".into()));
-                        continue;
-                    }
-                    None => {
-                        skipped.push((*id, "manifest disappeared during validation".into()));
-                        continue;
-                    }
+                if durable_phase == Some(DurableCheckpointPhase::Finalized) {
+                    return Ok(RecoveryReport {
+                        chosen_id: Some(*id),
+                        skipped,
+                        examined,
+                        elapsed: start.elapsed(),
+                    });
                 }
+                skipped.push((*id, "checkpoint is prepared but not finalized".into()));
+                continue;
             }
             let reason = result
                 .issues
@@ -1164,6 +1256,17 @@ impl ObjectStoreCheckpointStore {
         )))
     }
 
+    fn state_path_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<object_store::path::Path, CheckpointStoreError> {
+        let prefix = self.prefix_for_participant(participant_id)?;
+        Ok(object_store::path::Path::from(format!(
+            "{prefix}checkpoints/state-{id:06}.bin"
+        )))
+    }
+
     /// Read the recovery pointer without loading its manifest. Retention must
     /// preserve this exact ID even if newer prepared attempts sort after it.
     async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
@@ -1615,6 +1718,15 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             .map(|d| d.to_vec()))
     }
 
+    async fn load_state_data_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+        let path = self.state_path_for_participant(participant_id, id)?;
+        Ok(self.get_bytes(&path).await?.map(|data| data.to_vec()))
+    }
+
     async fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {
         use futures::{StreamExt, TryStreamExt};
 
@@ -1658,6 +1770,7 @@ mod tests {
     use crate::checkpoint::checkpoint_manifest::{ConnectorCheckpoint, OperatorCheckpoint};
     #[allow(clippy::disallowed_types)] // cold path: checkpoint store
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_store(dir: &Path) -> FileSystemCheckpointStore {
         FileSystemCheckpointStore::new(dir)
@@ -1667,6 +1780,110 @@ mod tests {
         let mut manifest = CheckpointManifest::new(id, epoch);
         manifest.durable_phase = DurableCheckpointPhase::Finalized;
         manifest
+    }
+
+    #[derive(Debug)]
+    struct GetCountingStore {
+        inner: Arc<dyn ObjectStore>,
+        manifest_gets: AtomicUsize,
+        state_gets: AtomicUsize,
+    }
+
+    impl GetCountingStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                manifest_gets: AtomicUsize::new(0),
+                state_gets: AtomicUsize::new(0),
+            }
+        }
+
+        fn reset(&self) {
+            self.manifest_gets.store(0, Ordering::Relaxed);
+            self.state_gets.store(0, Ordering::Relaxed);
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.manifest_gets.load(Ordering::Relaxed),
+                self.state_gets.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    impl std::fmt::Display for GetCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("GetCountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GetCountingStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let path = location.as_ref();
+            if path.contains("manifests/manifest-") {
+                self.manifest_gets.fetch_add(1, Ordering::Relaxed);
+            } else if path.contains("checkpoints/state-") {
+                self.state_gets.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
     }
 
     #[tokio::test]
@@ -1819,6 +2036,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
         assert!(store.load_state_data(99).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn participant_state_read_delegates_to_local_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path()).with_participant_id(11);
+        let mut manifest = make_manifest(7, 70);
+        manifest.participant_id = 11;
+        store
+            .save_with_state(
+                &manifest,
+                Some(&[bytes::Bytes::from_static(b"local-state")]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load_state_data_for_participant(11, 7)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"local-state"
+        );
+        let artifacts = store
+            .load_checkpoint_artifacts_for_participant(11, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(artifacts.validate(7, 11, store.vnode_count()).valid);
+    }
+
+    #[tokio::test]
+    async fn filesystem_rejects_foreign_participant_state_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path()).with_participant_id(11);
+
+        let error = store
+            .load_state_data_for_participant(22, 7)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid checkpoint: checkpoint store participant 11 cannot read participant 22"
+        );
+
+        let error = store
+            .load_checkpoint_artifacts_for_participant(22, 7)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid checkpoint: checkpoint store participant 11 cannot read participant 22"
+        );
     }
 
     #[tokio::test]
@@ -2125,6 +2396,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_reads_and_validates_peer_participant_state() {
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let participant_11 =
+            ObjectStoreCheckpointStore::new(inner.clone(), "nodes/11/".to_string())
+                .with_participant_id(11);
+        let participant_22 =
+            ObjectStoreCheckpointStore::new(inner.clone(), "nodes/22/".to_string())
+                .with_participant_id(22);
+        let mut manifest = make_manifest(7, 202);
+        manifest.participant_id = 22;
+        participant_22
+            .save_with_state(&manifest, Some(&[bytes::Bytes::from_static(b"peer-state")]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            participant_11
+                .load_state_data_for_participant(22, 7)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"peer-state"
+        );
+        assert!(participant_11
+            .load_state_data_for_participant(22, 8)
+            .await
+            .unwrap()
+            .is_none());
+        let artifacts = participant_11
+            .load_checkpoint_artifacts_for_participant(22, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            artifacts
+                .validate(7, 22, participant_11.vnode_count())
+                .valid
+        );
+
+        inner
+            .put_opts(
+                &participant_22.state_path(7),
+                PutPayload::from_bytes(bytes::Bytes::from_static(b"tampered")),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let artifacts = participant_11
+            .load_checkpoint_artifacts_for_participant(22, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        let validation = artifacts.validate(7, 22, participant_11.vnode_count());
+        assert!(!validation.valid);
+        assert!(validation
+            .issues
+            .iter()
+            .any(|issue| issue.message().contains("state.bin checksum mismatch")));
+    }
+
+    #[tokio::test]
+    async fn external_artifact_load_reads_manifest_and_sidecar_once_and_rejects_tamper() {
+        let raw = Arc::new(object_store::memory::InMemory::new());
+        let raw_store: Arc<dyn ObjectStore> = raw.clone();
+        let counting = Arc::new(GetCountingStore::new(raw_store));
+        let counted_store: Arc<dyn ObjectStore> = counting.clone();
+        let reader =
+            ObjectStoreCheckpointStore::new(Arc::clone(&counted_store), "nodes/11/".to_string())
+                .with_participant_id(11);
+        let writer = ObjectStoreCheckpointStore::new(counted_store, "nodes/22/".to_string())
+            .with_participant_id(22);
+        let state = b"peer-external-state";
+        let mut manifest = make_manifest(7, 202);
+        manifest.participant_id = 22;
+        manifest.operator_states.insert(
+            "external".into(),
+            OperatorCheckpoint::external(0, state.len() as u64),
+        );
+        writer
+            .save_with_state(&manifest, Some(&[bytes::Bytes::from_static(state)]))
+            .await
+            .unwrap();
+
+        counting.reset();
+        let artifacts = reader
+            .load_checkpoint_artifacts_for_participant(22, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifacts.state_data.as_deref(), Some(state.as_slice()));
+        assert!(artifacts.validate(7, 22, reader.vnode_count()).valid);
+        assert_eq!(counting.counts(), (1, 1));
+
+        raw.put_opts(
+            &writer.state_path(7),
+            PutPayload::from_bytes(bytes::Bytes::from_static(b"tampered")),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        counting.reset();
+        let artifacts = reader
+            .load_checkpoint_artifacts_for_participant(22, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        let validation = artifacts.validate(7, 22, reader.vnode_count());
+        assert!(!validation.valid);
+        assert!(validation
+            .issues
+            .iter()
+            .any(|issue| issue.message().contains("state.bin checksum mismatch")));
+        assert_eq!(counting.counts(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn inline_validation_reads_manifest_once_and_never_reads_sidecar() {
+        let raw = Arc::new(object_store::memory::InMemory::new());
+        let raw_store: Arc<dyn ObjectStore> = raw.clone();
+        let counting = Arc::new(GetCountingStore::new(raw_store));
+        let counted_store: Arc<dyn ObjectStore> = counting.clone();
+        let reader =
+            ObjectStoreCheckpointStore::new(Arc::clone(&counted_store), "nodes/11/".to_string())
+                .with_participant_id(11);
+        let writer = ObjectStoreCheckpointStore::new(counted_store, "nodes/22/".to_string())
+            .with_participant_id(22);
+        let mut manifest = make_manifest(8, 203);
+        manifest.participant_id = 22;
+        manifest
+            .operator_states
+            .insert("inline".into(), OperatorCheckpoint::inline(b"inline-state"));
+        let mut persisted = writer.save_with_state(&manifest, None).await.unwrap();
+
+        counting.reset();
+        let artifacts = reader
+            .load_checkpoint_artifacts_for_participant(22, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        let validation = artifacts.validate(8, 22, reader.vnode_count());
+        assert!(validation.valid, "inline artifact: {:?}", validation.issues);
+        assert_eq!(counting.counts(), (1, 0));
+
+        persisted.operator_states.insert(
+            "inline".into(),
+            OperatorCheckpoint::inline(b"tampered-inline-state"),
+        );
+        raw.put_opts(
+            &writer.manifest_path(8),
+            PutPayload::from_bytes(bytes::Bytes::from(
+                serde_json::to_vec_pretty(&persisted).unwrap(),
+            )),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        counting.reset();
+        let artifacts = reader
+            .load_checkpoint_artifacts_for_participant(22, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        let validation = artifacts.validate(8, 22, reader.vnode_count());
+        assert!(!validation.valid);
+        assert!(validation
+            .issues
+            .iter()
+            .any(|issue| issue.message().contains("inline state checksum mismatch")));
+        assert_eq!(counting.counts(), (1, 0));
+    }
+
+    #[tokio::test]
     async fn test_obj_rejects_manifest_for_wrong_participant() {
         let store = ObjectStoreCheckpointStore::new(
             Arc::new(object_store::memory::InMemory::new()),
@@ -2322,6 +2766,59 @@ mod tests {
         let result = store.validate_checkpoint(1).await.unwrap();
         assert!(result.valid, "valid checkpoint: {:?}", result.issues);
         assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn loaded_artifact_validation_binds_manifest_to_storage_checkpoint_id() {
+        let artifacts = CheckpointArtifacts {
+            manifest: make_manifest(8, 80),
+            state_data: None,
+        };
+
+        let validation = artifacts.validate(
+            7,
+            artifacts.manifest.participant_id,
+            artifacts.manifest.vnode_count,
+        );
+
+        assert!(!validation.valid);
+        assert!(validation.issues.iter().any(|issue| issue
+            .message()
+            .contains("storage checkpoint 7 contains manifest checkpoint 8")));
+    }
+
+    #[test]
+    fn loaded_artifact_validation_preserves_mixed_checksum_rule() {
+        let state = bytes::Bytes::from_static(b"external-state");
+        let mut manifest = make_manifest(9, 90);
+        manifest
+            .operator_states
+            .insert("inline".into(), OperatorCheckpoint::inline(b"inline-state"));
+        manifest.operator_states.insert(
+            "external".into(),
+            OperatorCheckpoint::external(0, state.len() as u64),
+        );
+        manifest.state_checksum = Some(stamp_checksum(
+            &manifest.operator_states,
+            Some(std::slice::from_ref(&state)),
+        ));
+        let mut artifacts = CheckpointArtifacts {
+            manifest,
+            state_data: Some(state.to_vec()),
+        };
+
+        assert!(
+            artifacts
+                .validate(9, 0, artifacts.manifest.vnode_count)
+                .valid
+        );
+        artifacts.state_data = Some(b"tampered".to_vec());
+        let validation = artifacts.validate(9, 0, artifacts.manifest.vnode_count);
+        assert!(!validation.valid);
+        assert!(validation
+            .issues
+            .iter()
+            .any(|issue| issue.message().contains("mixed state checksum mismatch")));
     }
 
     #[tokio::test]

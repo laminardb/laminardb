@@ -3,12 +3,11 @@
 //! [`RebalanceState`] tracks which topic-partitions are currently
 //! assigned to this consumer and counts rebalance events.
 //!
-//! [`LaminarConsumerContext`] is an rdkafka `ConsumerContext` that
-//! signals a checkpoint request on partition revocation, enabling
-//! the pipeline to persist offsets before ownership changes.
+//! [`LaminarConsumerContext`] is an rdkafka `ConsumerContext` that tracks
+//! assignment changes and broker offset-commit outcomes.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use prometheus::IntCounter;
@@ -74,17 +73,16 @@ impl RebalanceState {
     }
 }
 
-/// rdkafka consumer context that signals a checkpoint on partition revocation.
+/// rdkafka consumer context that tracks partition assignment changes.
 ///
-/// When a consumer group rebalance revokes partitions from this consumer,
-/// the context notifies the pipeline coordinator to trigger an immediate
-/// checkpoint before the partitions are reassigned. This prevents offset
-/// loss during rebalance.
+/// The callback does not request an asynchronous engine checkpoint: Kafka may revoke ownership as
+/// soon as this callback returns, so a later checkpoint cannot certify the revoked cut. Guaranteed
+/// delivery uses engine-owned manual assignment instead; this state is for dynamic best-effort
+/// subscriptions and observability.
 ///
 /// Rebalance callbacks run on rdkafka's background thread, so all shared
 /// state uses `Arc` + atomic types for thread safety.
 pub struct LaminarConsumerContext {
-    checkpoint_requested: Arc<AtomicBool>,
     rebalance_count: AtomicU64,
     /// Shared rebalance state updated on Assign/Revoke events.
     rebalance_state: Arc<Mutex<RebalanceState>>,
@@ -109,11 +107,9 @@ pub struct LaminarConsumerContext {
 }
 
 impl LaminarConsumerContext {
-    /// Wires checkpoint signaling, partition tracking, and rebalance metrics.
+    /// Wires partition tracking, commit outcomes, and rebalance metrics.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        checkpoint_requested: Arc<AtomicBool>,
         rebalance_state: Arc<Mutex<RebalanceState>>,
         rebalance_metric: Arc<AtomicU64>,
         revoke_generation: Arc<AtomicU64>,
@@ -122,7 +118,6 @@ impl LaminarConsumerContext {
         commit_failures_counter: IntCounter,
     ) -> Self {
         Self {
-            checkpoint_requested,
             rebalance_count: AtomicU64::new(0),
             rebalance_state,
             rebalance_metric,
@@ -169,7 +164,7 @@ impl ConsumerContext for LaminarConsumerContext {
                 let count = tpl.count();
                 info!(
                     partitions_revoked = count,
-                    "kafka rebalance: partitions being revoked, requesting checkpoint"
+                    "kafka rebalance: partitions being revoked"
                 );
                 // Update shared rebalance state.
                 let partitions: Vec<(String, i32)> = tpl
@@ -184,7 +179,6 @@ impl ConsumerContext for LaminarConsumerContext {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.checkpoint_requested.store(true, Ordering::Release);
             }
             Rebalance::Assign(tpl) => {
                 let count = tpl.count();
@@ -323,43 +317,26 @@ mod tests {
         assert!(!state.is_assigned("events", 0));
     }
 
-    fn make_context() -> (Arc<AtomicBool>, LaminarConsumerContext) {
-        let flag = Arc::new(AtomicBool::new(false));
+    fn make_context() -> LaminarConsumerContext {
         let state = Arc::new(Mutex::new(RebalanceState::new()));
         let metric = Arc::new(AtomicU64::new(0));
         let revoke_gen = Arc::new(AtomicU64::new(0));
         let assign_gen = Arc::new(AtomicU64::new(0));
         let commits = IntCounter::new("test_commits", "test").unwrap();
         let commit_failures = IntCounter::new("test_commit_failures", "test").unwrap();
-        let ctx = LaminarConsumerContext::new(
-            Arc::clone(&flag),
+        LaminarConsumerContext::new(
             state,
             metric,
             revoke_gen,
             assign_gen,
             commits,
             commit_failures,
-        );
-        (flag, ctx)
+        )
     }
 
     #[test]
     fn test_consumer_context_initial_state() {
-        let (flag, ctx) = make_context();
-        assert!(!flag.load(Ordering::Relaxed));
+        let ctx = make_context();
         assert_eq!(ctx.rebalance_count(), 0);
-    }
-
-    #[test]
-    fn test_consumer_context_shared_flag() {
-        let (flag, _ctx) = make_context();
-
-        // Simulate what pre_rebalance(Revoke) does.
-        flag.store(true, Ordering::Relaxed);
-        assert!(flag.load(Ordering::Relaxed));
-
-        // Coordinator would swap-clear the flag.
-        assert!(flag.swap(false, Ordering::Relaxed));
-        assert!(!flag.load(Ordering::Relaxed));
     }
 }

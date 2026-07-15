@@ -179,7 +179,36 @@ mod exactly_once {
             Ok(CycleOutcome::clean(FxHashMap::default()))
         }
 
-        fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
+        async fn drain_checkpoint_edges_until(
+            &mut self,
+            _deadline: tokio::time::Instant,
+        ) -> Result<(), CycleError> {
+            Ok(())
+        }
+
+        async fn abandon_checkpoint_attempt(
+            &mut self,
+            _attempt: CheckpointAttempt,
+            _reason: &str,
+            _assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn cancel_source_barrier_attempt(
+            &mut self,
+            _attempt: CheckpointAttempt,
+            _reason: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn push_to_streams(
+            &self,
+            _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        ) -> Result<(), CycleError> {
+            Ok(())
+        }
 
         async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
@@ -199,11 +228,14 @@ mod exactly_once {
                 String,
                 laminar_connectors::checkpoint::SourceCheckpoint,
             >,
-        ) -> Option<u64> {
+        ) -> laminar_db::pipeline::CheckpointControlOutcome {
             if self.should_trigger.load(Ordering::Relaxed) {
-                Some(1)
+                laminar_db::pipeline::CheckpointControlOutcome::Started {
+                    attempt: CheckpointAttempt::new(1, 1),
+                    captured: true,
+                }
             } else {
-                None
+                laminar_db::pipeline::CheckpointControlOutcome::Idle
             }
         }
 
@@ -224,6 +256,7 @@ mod exactly_once {
             source_checkpoints: FxHashMap<String, SourceCheckpoint>,
             attempt: CheckpointAttempt,
             _attempt_started: std::time::Instant,
+            _assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
         ) -> laminar_db::pipeline::BarrierOutcome {
             self.barrier_checkpoints.push(source_checkpoints);
             if let Some(ref counter) = self.barrier_counter {
@@ -233,8 +266,6 @@ mod exactly_once {
         }
 
         fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}
-
-        async fn poll_tables(&mut self) {}
 
         fn apply_control(&mut self, _msg: laminar_db::pipeline::ControlMsg) {}
     }

@@ -202,6 +202,57 @@ async fn incremental_emit_survives_checkpoint_restart() {
     }
 }
 
+/// A counted multiset MV must preserve duplicate rows at the durable cut. After restart, changing
+/// one upstream group retracts exactly one copy of the duplicate rather than both copies.
+#[tokio::test]
+async fn counted_multiset_survives_coordinator_checkpoint_restart_and_retraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.execute("CREATE MATERIALIZED VIEW totals AS SELECT total FROM agg")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 10])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        read_query(&db, "SELECT total FROM totals", 1).await,
+        vec![vec![10], vec![10]],
+        "the key-dropping projection must retain both equal rows"
+    );
+
+    let checkpoint = db.checkpoint().await.unwrap();
+    assert!(checkpoint.success, "checkpoint must succeed");
+    db.stop_pipeline().await.unwrap();
+    db.start().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        read_query(&db, "SELECT total FROM totals", 1).await,
+        vec![vec![10], vec![10]],
+        "restart must restore the duplicate multiplicity from the committed image"
+    );
+
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(batch(&[1], &[5]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        read_query(&db, "SELECT total FROM totals", 1).await,
+        vec![vec![10], vec![15]],
+        "the post-restart update must retract exactly one copy of total=10"
+    );
+    assert_eq!(
+        read_mv(&db, "agg").await,
+        vec![(1, 15, 2), (2, 10, 1)],
+        "the aggregate state feeding the retraction must also resume at the durable cut"
+    );
+    db.shutdown().await.unwrap();
+}
+
 /// A `changelog ⋈ static dimension` enrich join maintains a correct snapshot under UPDATES —
 /// the dimension enriches each changelog row and the retraction drops the stale row.
 #[tokio::test]
@@ -730,10 +781,10 @@ async fn incremental_join_rejects_duplicate_output_column() {
     );
 }
 
-/// A SINGLE-statement 3-way join `FROM a JOIN b JOIN c` is decomposed into a hidden intermediate MV +
-/// a rewritten 2-way final, producing the same result as the explicit chained-pairwise form.
+/// Multi-way incremental joins require atomic batch topology admission; until that exists they
+/// fail before registering the requested MV.
 #[tokio::test]
-async fn single_statement_multiway_join_decomposes() {
+async fn single_statement_multiway_join_fails_without_partial_registration() {
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     for s in ["ev_a", "ev_b", "ev_c"] {
@@ -750,73 +801,18 @@ async fn single_statement_multiway_join_decomposes() {
     db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
         .await
         .unwrap();
-    // ONE statement, three tables — decomposed into __ivm_abc_0 (= agg_a ⋈ agg_b) then abc (⋈ agg_c).
-    db.execute(
-        "CREATE MATERIALIZED VIEW abc AS \
+    let error = db
+        .execute(
+            "CREATE MATERIALIZED VIEW abc AS \
          SELECT a.k, a.ta, b.tb, c.tc \
          FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
-    )
-    .await
-    .expect("single-statement 3-way join accepted + decomposed");
-    db.start().await.unwrap();
-
-    let (sa, sb, sc) = (
-        db.source_untyped("ev_a").unwrap(),
-        db.source_untyped("ev_b").unwrap(),
-        db.source_untyped("ev_c").unwrap(),
-    );
-    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
-    sc.push_arrow(batch(&[1, 2], &[1000, 2000])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    sa.push_arrow(batch(&[1], &[5])).unwrap();
-    sb.push_arrow(batch(&[2], &[50])).unwrap();
-    sc.push_arrow(batch(&[1], &[500])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
-    assert_eq!(
-        read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
-        vec![vec![1, 15, 100, 1500], vec![2, 20, 250, 2000]]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// Dropping a single-statement multi-way join cascades to its hidden intermediate (upstream) MVs.
-#[tokio::test]
-async fn single_statement_multiway_drop_cascades_intermediate() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    for (m, c) in [("agg_a", "ev_a"), ("agg_b", "ev_b"), ("agg_c", "ev_c")] {
-        db.execute(&format!(
-            "CREATE MATERIALIZED VIEW {m} AS SELECT k, SUM(v) AS t FROM {c} GROUP BY k"
-        ))
+        )
         .await
-        .unwrap();
-    }
-    db.execute(
-        "CREATE MATERIALIZED VIEW abc AS \
-         SELECT a.k, a.t AS at, b.t AS bt, c.t AS ct \
-         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
-    )
-    .await
-    .unwrap();
-    db.start().await.unwrap();
-
-    assert!(
-        db.execute("SELECT * FROM __ivm_abc_0").await.is_ok(),
-        "hidden intermediate exists before drop"
-    );
-    db.execute("DROP MATERIALIZED VIEW abc").await.unwrap();
-    assert!(
-        db.execute("SELECT * FROM __ivm_abc_0").await.is_err(),
-        "intermediate dropped with the parent"
-    );
-    db.shutdown().await.unwrap();
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("atomic batch topology admission"));
+    assert!(db.execute("SELECT * FROM abc").await.is_err());
 }
 
 /// A multi-way join whose participant is a non-incremental source is rejected (not decomposed).
@@ -848,190 +844,8 @@ async fn single_statement_multiway_rejects_non_incremental_participant() {
     );
 }
 
-/// A STAR multi-way join: the third table joins the FIRST (agg_a), not the preceding one. The
-/// decomposition's own qualifier-aware ON analysis carries agg_a's key into the intermediate so the
-/// later step can reference it (analyze_joins' immediate-previous model could not).
-#[tokio::test]
-async fn single_statement_multiway_star_join() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
-        .await
-        .unwrap();
-    // Star: `JOIN agg_c c ON a.k = c.k` (references agg_a, two relations back), not `b.k = c.k`.
-    db.execute(
-        "CREATE MATERIALIZED VIEW abc AS \
-         SELECT a.k, a.ta, b.tb, c.tc \
-         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON a.k = c.k",
-    )
-    .await
-    .expect("star 3-way join accepted");
-    db.start().await.unwrap();
-
-    let (sa, sb, sc) = (
-        db.source_untyped("ev_a").unwrap(),
-        db.source_untyped("ev_b").unwrap(),
-        db.source_untyped("ev_c").unwrap(),
-    );
-    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
-    sc.push_arrow(batch(&[1, 2], &[1000, 2000])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    sc.push_arrow(batch(&[2], &[500])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-
-    assert_eq!(
-        read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
-        vec![vec![1, 10, 100, 1000], vec![2, 20, 200, 2500]]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// Like `read_query` but tolerates NULLs (LEFT-join pads), returning `None` for a NULL cell.
-async fn read_query_nullable(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<Option<i64>>> {
-    let result = db.execute(sql).await.unwrap();
-    let ExecuteResult::Query(mut q) = result else {
-        panic!("expected Query result");
-    };
-    tokio::task::yield_now().await;
-    let mut sub = q.subscribe_raw().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let mut rows = Vec::new();
-    for _ in 0..4096 {
-        match sub.poll() {
-            Some(b) => {
-                for r in 0..b.num_rows() {
-                    let row: Vec<Option<i64>> = (0..ncols)
-                        .map(|c| {
-                            let col = b.column(c).as_any().downcast_ref::<Int64Array>().unwrap();
-                            (!col.is_null(r)).then(|| col.value(r))
-                        })
-                        .collect();
-                    rows.push(row);
-                }
-            }
-            None => break,
-        }
-    }
-    rows.sort();
-    rows
-}
-
-/// A single-statement 4-way join (2 hidden intermediates) nets correctly under updates on every side.
-#[tokio::test]
-async fn single_statement_multiway_4way_join() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c", "ev_d"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    for (m, c, col) in [
-        ("agg_a", "ev_a", "ta"),
-        ("agg_b", "ev_b", "tb"),
-        ("agg_c", "ev_c", "tc"),
-        ("agg_d", "ev_d", "td"),
-    ] {
-        db.execute(&format!(
-            "CREATE MATERIALIZED VIEW {m} AS SELECT k, SUM(v) AS {col} FROM {c} GROUP BY k"
-        ))
-        .await
-        .unwrap();
-    }
-    db.execute(
-        "CREATE MATERIALIZED VIEW abcd AS \
-         SELECT a.k, a.ta, b.tb, c.tc, d.td \
-         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k JOIN agg_d d ON c.k = d.k",
-    )
-    .await
-    .expect("single-statement 4-way join accepted");
-    db.start().await.unwrap();
-
-    let src = |n: &str| db.source_untyped(n).unwrap();
-    src("ev_a").push_arrow(batch(&[1], &[10])).unwrap();
-    src("ev_b").push_arrow(batch(&[1], &[100])).unwrap();
-    src("ev_c").push_arrow(batch(&[1], &[1000])).unwrap();
-    src("ev_d").push_arrow(batch(&[1], &[10000])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    src("ev_d").push_arrow(batch(&[1], &[5000])).unwrap(); // td 10000 -> 15000
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-
-    assert_eq!(
-        read_query(&db, "SELECT k, ta, tb, tc, td FROM abcd", 5).await,
-        vec![vec![1, 10, 100, 1000, 15000]]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// A single-statement chain with a LEFT step: a key present up to the LEFT boundary but with no
-/// right match is NULL-padded through the decomposed final join.
-#[tokio::test]
-async fn single_statement_multiway_left_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
-        .await
-        .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW abc AS \
-         SELECT a.k, a.ta, b.tb, c.tc \
-         FROM agg_a a JOIN agg_b b ON a.k = b.k LEFT JOIN agg_c c ON b.k = c.k",
-    )
-    .await
-    .expect("LEFT step in a multi-way chain accepted");
-    db.start().await.unwrap();
-
-    // Keys 1,2 on a+b; agg_c only for key 1 → key 2's tc is NULL.
-    db.source_untyped("ev_a")
-        .unwrap()
-        .push_arrow(batch(&[1, 2], &[10, 20]))
-        .unwrap();
-    db.source_untyped("ev_b")
-        .unwrap()
-        .push_arrow(batch(&[1, 2], &[100, 200]))
-        .unwrap();
-    db.source_untyped("ev_c")
-        .unwrap()
-        .push_arrow(batch(&[1], &[1000]))
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
-    assert_eq!(
-        read_query_nullable(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
-        vec![
-            vec![Some(1), Some(10), Some(100), Some(1000)],
-            vec![Some(2), Some(20), Some(200), None],
-        ]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// SUBSCRIBE to an incremental MV is allowed (was `[LDB-1300]`) and delivers PLAIN rows: a Tail
-/// subscriber is seeded with the current snapshot, and a subsequent change arrives as a fresh
-/// consolidated snapshot — never the raw `__weight` changelog.
+/// SUBSCRIBE to an incremental MV delivers plain consolidated snapshots for updates emitted after
+/// a Tail subscriber attaches, never the raw `__weight` changelog.
 #[tokio::test]
 async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
     use laminar_db::subscription::{PortalFrame, SubscribeStart};
@@ -1041,10 +855,7 @@ async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
     db.execute(MV).await.unwrap();
     db.start().await.unwrap();
     let source = db.source_untyped("events").unwrap();
-    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Previously rejected; now returns a portal.
     let mut portal = db
         .open_subscription("agg", None, SubscribeStart::Tail)
         .await
@@ -1055,32 +866,40 @@ async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
         "SUBSCRIBE wire schema must be plain rows"
     );
 
-    // Seeded with the current snapshot (k1=10, k2=20), as plain rows.
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
     let frame = tokio::time::timeout(std::time::Duration::from_secs(5), portal.next_frame())
         .await
         .expect("a frame within the deadline")
         .expect("a portal frame");
-    let PortalFrame::Batch(b) = frame else {
+    let PortalFrame::Batch { batch: b, .. } = frame else {
         panic!("expected a Batch frame, got {frame:?}");
     };
     assert!(
         b.schema().index_of("__weight").is_err(),
         "snapshot batch must be plain rows (no __weight)"
     );
-    assert_eq!(rows_of(&b), vec![(1, 10, 1), (2, 20, 1)], "seeded snapshot");
+    assert_eq!(
+        rows_of(&b),
+        vec![(1, 10, 1), (2, 20, 1)],
+        "post-attach snapshot"
+    );
 
     // A change arrives as a fresh consolidated snapshot (k1: 10 -> 15).
     source.push_arrow(batch(&[1], &[5])).unwrap();
     let mut saw_update = false;
     for _ in 0..20 {
         match tokio::time::timeout(std::time::Duration::from_secs(3), portal.next_frame()).await {
-            Ok(Some(PortalFrame::Batch(b))) => {
+            Ok(Some(PortalFrame::Batch { batch: b, .. })) => {
                 if rows_of(&b).iter().any(|&(k, t, _)| k == 1 && t == 15) {
                     saw_update = true;
                     break;
                 }
             }
-            Ok(Some(_)) => {} // Barrier/Lagged — keep polling
+            Ok(Some(PortalFrame::Barrier { .. })) => {}
+            Ok(Some(PortalFrame::Lagged(n))) => panic!("subscriber lagged by {n} messages"),
+            Ok(Some(PortalFrame::Error { message })) => {
+                panic!("subscription failed: {message}")
+            }
             Ok(None) | Err(_) => break,
         }
     }

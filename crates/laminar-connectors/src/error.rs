@@ -7,6 +7,24 @@ use thiserror::Error;
 /// variants directly — the variant set has changed in the past.
 #[derive(Debug, Error)]
 pub enum ConnectorError {
+    /// A connector factory was registered more than once in the same registry category.
+    #[error("{kind} connector factory '{name}' is already registered")]
+    FactoryAlreadyRegistered {
+        /// Registry category (`source`, `sink`, `table source`, or `lookup source`).
+        kind: &'static str,
+        /// Duplicate connector type name.
+        name: String,
+    },
+
+    /// Connector factory registration was attempted after construction completed.
+    #[error("connector registry is frozen; cannot register {kind} factory '{name}'")]
+    RegistryFrozen {
+        /// Registry category (`source`, `sink`, `table source`, or `lookup source`).
+        kind: &'static str,
+        /// Connector type name that was rejected.
+        name: String,
+    },
+
     /// Failed to connect to the external system (network error, DNS
     /// failure, TLS negotiation failure, auth rejection).
     #[error("connection failed: {0}")]
@@ -110,6 +128,8 @@ impl ConnectorError {
             | Self::ConnectionFailed(_) => true,
 
             Self::ConfigurationError(_)
+            | Self::FactoryAlreadyRegistered { .. }
+            | Self::RegistryFrozen { .. }
             | Self::SchemaMismatch(_)
             | Self::InvalidState { .. }
             | Self::TransactionError(_)

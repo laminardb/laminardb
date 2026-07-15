@@ -4,25 +4,25 @@
 //! per fetch, so all missed keys of a probe fold into one index-served round
 //! trip. [`KeyAligner`](laminar_core::lookup::KeyAligner) handles key decode and result realignment.
 //!
-//! TLS is server-auth via `rustls`: `sslmode = disable` (default) leaves the
-//! connection plaintext; `require` / `verify-ca` / `verify-full` all enable
-//! TLS with full server-certificate verification (chain + hostname) against
-//! `sslrootcert` (CA PEM) or, absent that, the Mozilla webpki roots. There is
-//! deliberately no insecure skip-verify, and the weaker libpq variants are not
-//! emulated (the three modes are aliases for "verified TLS"). v1 limits:
-//! single-column key, server-auth only (no mTLS client certs).
+//! TLS is server-auth via `rustls`: verified chain and hostname is the default,
+//! using `ssl.ca.cert.path` when set and Mozilla roots otherwise. Plaintext is
+//! available only through explicit `ssl.mode=disable`. Weaker libpq modes are
+//! rejected rather than presented as aliases. v1 limits: single-column key,
+//! server-auth only (no mTLS client certs).
 
 #[cfg(feature = "postgres-cdc")]
 use std::collections::HashMap;
 #[cfg(feature = "postgres-cdc")]
 use std::sync::Arc;
+#[cfg(feature = "postgres-cdc")]
+use std::time::Duration;
 
 #[cfg(feature = "postgres-cdc")]
 use arrow_array::{Array, RecordBatch};
 #[cfg(feature = "postgres-cdc")]
 use arrow_row::SortField;
 #[cfg(feature = "postgres-cdc")]
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 #[cfg(feature = "postgres-cdc")]
 use deadpool_postgres::Pool;
 #[cfg(feature = "postgres-cdc")]
@@ -36,6 +36,85 @@ use laminar_core::lookup::source::{
 };
 #[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::KeyAligner;
+
+#[cfg(feature = "postgres-cdc")]
+use super::await_owned_driver;
+
+#[cfg(feature = "postgres-cdc")]
+const MAX_LOOKUP_KEYS: usize = 4_096;
+#[cfg(feature = "postgres-cdc")]
+const MAX_LOOKUP_KEY_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "postgres-cdc")]
+const MAX_LOOKUP_RESULT_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(feature = "postgres-cdc")]
+const MAX_POOL_SIZE: usize = 64;
+#[cfg(feature = "postgres-cdc")]
+const POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "postgres-cdc")]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "postgres-cdc")]
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "postgres-cdc")]
+const UNIQUE_LOOKUP_KEY_QUERY: &str = r#"
+WITH target AS (
+    SELECT pg_catalog.to_regclass($1)::oid AS table_oid
+)
+SELECT
+    target.table_oid,
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_index AS idx
+        JOIN pg_catalog.pg_attribute AS attr
+          ON attr.attrelid = idx.indrelid
+         AND attr.attnum = idx.indkey[0]
+        WHERE idx.indrelid = target.table_oid
+          AND idx.indisunique
+          AND idx.indisvalid
+          AND idx.indisready
+          AND idx.indislive
+          AND idx.indnkeyatts = 1
+          AND idx.indpred IS NULL
+          AND idx.indexprs IS NULL
+          AND attr.attname = $2
+          AND attr.attnum > 0
+          AND NOT attr.attisdropped
+    ) AS has_unique_key
+FROM target
+"#;
+
+#[cfg(feature = "postgres-cdc")]
+async fn await_lookup_driver<T>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = Result<T, LookupError>> + Send + 'static,
+) -> Result<T, LookupError>
+where
+    T: Send + 'static,
+{
+    await_owned_driver(future, move |error| {
+        LookupError::Internal(format!("postgres {operation} task failed: {error}"))
+    })
+    .await
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn validate_unique_lookup_key(
+    table: &str,
+    key: &str,
+    table_oid: Option<u32>,
+    has_unique_key: bool,
+) -> Result<u32, LookupError> {
+    let table_oid = table_oid.ok_or_else(|| {
+        LookupError::Internal(format!(
+            "postgres lookup table {table} could not be resolved with to_regclass"
+        ))
+    })?;
+    if !has_unique_key {
+        return Err(LookupError::Internal(format!(
+            "postgres lookup requires a valid, ready, non-partial unique index whose sole key column is '{key}' on {table}"
+        )));
+    }
+    Ok(table_oid)
+}
 
 /// Configuration for [`PostgresLookupSource`].
 #[cfg(feature = "postgres-cdc")]
@@ -57,24 +136,31 @@ pub struct PostgresLookupSourceConfig {
 pub struct PostgresLookupSource {
     pool: Pool,
     select_sql: String,
-    /// Quoted table name and key column, kept to build a projected `SELECT`
-    /// when a query pushes down a column projection.
+    select_expressions: Vec<String>,
+    /// Quoted table name, kept to build a projected `SELECT`.
     table: String,
     pk_column: String,
+    quoted_pk_column: String,
     schema: SchemaRef,
     aligner: KeyAligner,
 }
 
 #[cfg(feature = "postgres-cdc")]
-fn quote_identifier(name: &str) -> String {
-    if name.contains('.') {
-        name.split('.')
-            .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(".")
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
+fn quote_identifier(name: &str) -> Result<String, LookupError> {
+    if name.is_empty() || name.contains('\0') {
+        return Err(LookupError::Internal(
+            "postgres identifiers must be non-empty and cannot contain NUL".into(),
+        ));
     }
+    Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn quote_qualified_identifier(name: &str) -> Result<String, LookupError> {
+    name.split('.')
+        .map(quote_identifier)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("."))
 }
 
 #[cfg(feature = "postgres-cdc")]
@@ -92,27 +178,63 @@ impl PostgresLookupSource {
                 config.primary_key_columns.len()
             )));
         }
+        if config.pool_size == 0 || config.pool_size > MAX_POOL_SIZE {
+            return Err(LookupError::Connection(format!(
+                "postgres lookup pool_size must be between 1 and {MAX_POOL_SIZE}, got {}",
+                config.pool_size
+            )));
+        }
         let pk_column = config.primary_key_columns[0].clone();
+        let table = quote_qualified_identifier(&config.table)?;
+        let quoted_pk_column = quote_identifier(&pk_column)?;
 
         let pool = build_pool(&config.properties, config.pool_size)?;
-        let select_sql = format!(
-            "SELECT * FROM {} WHERE {} = ANY($1)",
-            quote_identifier(&config.table),
-            quote_identifier(&pk_column)
-        );
 
-        // Read column metadata via a prepared zero-row statement.
-        let client = pool
-            .get()
+        // Keep the checked-out client in the owned task until prepare is terminal. If the
+        // startup waiter is cancelled, the task continues and cannot return an in-flight client.
+        let probe_pool = pool.clone();
+        let schema_probe = format!("SELECT * FROM {table} LIMIT 0");
+        let probe_table = table.clone();
+        let probe_key = pk_column.clone();
+        let stmt = await_lookup_driver("schema probe", async move {
+            let client = probe_pool
+                .get()
+                .await
+                .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
+            let identity = match tokio::time::timeout(
+                QUERY_TIMEOUT,
+                client.query_one(
+                    UNIQUE_LOOKUP_KEY_QUERY,
+                    &[&probe_table.as_str(), &probe_key.as_str()],
+                ),
+            )
             .await
-            .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
-        let stmt = client
-            .prepare(&format!(
-                "SELECT * FROM {} LIMIT 0",
-                quote_identifier(&config.table)
-            ))
-            .await
-            .map_err(|e| LookupError::Connection(format!("prepare schema probe: {e}")))?;
+            {
+                Ok(result) => result.map_err(|e| {
+                    LookupError::Connection(format!("inspect postgres lookup key index: {e}"))
+                })?,
+                Err(_) => {
+                    discard_pool_client(client);
+                    return Err(LookupError::Timeout(QUERY_TIMEOUT));
+                }
+            };
+            let table_oid = identity
+                .try_get::<_, Option<u32>>("table_oid")
+                .map_err(|e| LookupError::Connection(format!("decode lookup table OID: {e}")))?;
+            let has_unique_key = identity
+                .try_get::<_, bool>("has_unique_key")
+                .map_err(|e| LookupError::Connection(format!("decode lookup index check: {e}")))?;
+            validate_unique_lookup_key(&probe_table, &probe_key, table_oid, has_unique_key)?;
+            match tokio::time::timeout(QUERY_TIMEOUT, client.prepare(&schema_probe)).await {
+                Ok(result) => result
+                    .map_err(|e| LookupError::Connection(format!("prepare schema probe: {e}"))),
+                Err(_) => {
+                    discard_pool_client(client);
+                    Err(LookupError::Timeout(QUERY_TIMEOUT))
+                }
+            }
+        })
+        .await?;
         let fields: Vec<Field> = stmt
             .columns()
             .iter()
@@ -123,14 +245,32 @@ impl PostgresLookupSource {
         let pk_idx = schema.index_of(&pk_column).map_err(|_| {
             LookupError::Internal(format!("pk column not found in table: {pk_column}"))
         })?;
+        let pk_pg_type = stmt.columns()[pk_idx].type_();
+        if !supports_any_parameter(pk_pg_type) {
+            return Err(LookupError::Internal(format!(
+                "postgres lookup primary key column '{pk_column}' has unsupported type {pk_pg_type}"
+            )));
+        }
+        let select_expressions = stmt
+            .columns()
+            .iter()
+            .map(select_expression)
+            .collect::<Result<Vec<_>, _>>()?;
+        let select_sql = format!(
+            "SELECT {} FROM {table} WHERE {quoted_pk_column} = ANY($1) LIMIT {}",
+            select_expressions.join(", "),
+            MAX_LOOKUP_KEYS + 1
+        );
         let pk_sort_fields = vec![SortField::new(schema.field(pk_idx).data_type().clone())];
         let aligner = KeyAligner::new(pk_sort_fields, config.primary_key_columns)?;
 
         Ok(Self {
             pool,
             select_sql,
-            table: config.table,
+            select_expressions,
+            table,
             pk_column,
+            quoted_pk_column,
             schema,
             aligner,
         })
@@ -202,6 +342,42 @@ impl PostgresLookupSource {
 }
 
 #[cfg(feature = "postgres-cdc")]
+fn validate_lookup_keys(keys: &[&[u8]]) -> Result<(), LookupError> {
+    if keys.len() > MAX_LOOKUP_KEYS {
+        return Err(LookupError::Query(format!(
+            "postgres lookup received {} keys, exceeding the fixed {MAX_LOOKUP_KEYS}-key batch limit",
+            keys.len()
+        )));
+    }
+    let bytes = keys.iter().try_fold(0_usize, |total, key| {
+        total
+            .checked_add(key.len())
+            .ok_or_else(|| LookupError::Query("postgres lookup key byte count overflow".into()))
+    })?;
+    if bytes > MAX_LOOKUP_KEY_BYTES {
+        return Err(LookupError::Query(format!(
+            "postgres lookup received {bytes} key bytes, exceeding the fixed {MAX_LOOKUP_KEY_BYTES}-byte batch limit"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn enforce_lookup_result_bytes(batch: &RecordBatch) -> Result<(), LookupError> {
+    let bytes = batch.columns().iter().try_fold(0_usize, |total, column| {
+        total
+            .checked_add(column.get_array_memory_size())
+            .ok_or_else(|| LookupError::Query("postgres lookup result byte count overflow".into()))
+    })?;
+    if bytes > MAX_LOOKUP_RESULT_BYTES {
+        return Err(LookupError::Query(format!(
+            "postgres lookup result retains {bytes} bytes, exceeding the fixed {MAX_LOOKUP_RESULT_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "postgres-cdc")]
 impl LookupSource for PostgresLookupSource {
     async fn query(
         &self,
@@ -212,13 +388,32 @@ impl LookupSource for PostgresLookupSource {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-
+        validate_lookup_keys(keys)?;
         let pk_arrays = self.aligner.decode_keys(keys)?;
-        let param = Self::build_any_param(pk_arrays[0].as_ref())?;
+        let pk_array = pk_arrays
+            .first()
+            .ok_or_else(|| LookupError::Internal("postgres lookup decoded no key column".into()))?
+            .as_ref();
+        if pk_array.len() != keys.len() {
+            return Err(LookupError::Internal(format!(
+                "postgres lookup decoded {} keys from {} inputs",
+                pk_array.len(),
+                keys.len()
+            )));
+        }
+        let unique_key_count = keys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !pk_array.is_null(*index))
+            .map(|(_, key)| *key)
+            .collect::<rustc_hash::FxHashSet<_>>()
+            .len();
 
-        // Projection pushdown: SELECT only the requested columns (always incl.
-        // the key, so the row maps back); else the prebuilt `SELECT *`. The
-        // result schema follows so `rows_to_batch` reads the right columns.
+        let param = Self::build_any_param(pk_array)?;
+
+        // Projection pushdown selects only requested columns plus the key used
+        // for result alignment. Unsupported native result types use the text
+        // casts derived during the schema probe.
         let (sql, out_schema, project_needed) = if projection.is_empty() {
             (self.select_sql.clone(), Arc::clone(&self.schema), false)
         } else {
@@ -236,15 +431,25 @@ impl LookupSource for PostgresLookupSource {
                 project_needed = true;
             }
 
-            let cols = proj_names
+            let cols = idx
                 .iter()
-                .map(|n| quote_identifier(n))
-                .collect::<Vec<_>>()
+                .map(|&index| {
+                    self.select_expressions
+                        .get(index)
+                        .map(String::as_str)
+                        .ok_or_else(|| {
+                            LookupError::Internal(format!(
+                                "postgres projection column index {index} is out of bounds"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             let sql = format!(
-                "SELECT {cols} FROM {} WHERE {} = ANY($1)",
-                quote_identifier(&self.table),
-                quote_identifier(&self.pk_column)
+                "SELECT {cols} FROM {} WHERE {} = ANY($1) LIMIT {}",
+                self.table,
+                self.quoted_pk_column,
+                MAX_LOOKUP_KEYS + 1
             );
             let proj_schema = Arc::new(
                 self.schema
@@ -254,20 +459,36 @@ impl LookupSource for PostgresLookupSource {
             (sql, proj_schema, project_needed)
         };
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
-        let pg_rows = client
-            .query(&sql, &[&*param])
-            .await
-            .map_err(|e| LookupError::Query(format!("postgres lookup query: {e}")))?;
+        let query_pool = self.pool.clone();
+        let pg_rows = await_lookup_driver("lookup query", async move {
+            let client = query_pool
+                .get()
+                .await
+                .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
+            match tokio::time::timeout(QUERY_TIMEOUT, client.query(&sql, &[&*param])).await {
+                Ok(result) => {
+                    result.map_err(|e| LookupError::Query(format!("postgres lookup query: {e}")))
+                }
+                Err(_) => {
+                    discard_pool_client(client);
+                    Err(LookupError::Timeout(QUERY_TIMEOUT))
+                }
+            }
+        })
+        .await?;
+        if pg_rows.len() > unique_key_count {
+            return Err(LookupError::Query(format!(
+                "postgres lookup returned {} rows for {unique_key_count} distinct keys; the configured key column is not unique",
+                pg_rows.len()
+            )));
+        }
 
         let batches = if pg_rows.is_empty() {
             Vec::new()
         } else {
-            vec![rows_to_batch(&out_schema, &pg_rows)?]
+            let batch = rows_to_batch(&out_schema, &pg_rows)?;
+            enforce_lookup_result_bytes(&batch)?;
+            vec![batch]
         };
         let aligned = self.aligner.align(keys, &batches)?;
 
@@ -304,6 +525,7 @@ impl LookupSource for PostgresLookupSource {
         LookupSourceCapabilities {
             supports_batch_lookup: true,
             supports_projection_pushdown: true,
+            max_batch_size: MAX_LOOKUP_KEYS,
             ..LookupSourceCapabilities::none()
         }
     }
@@ -318,190 +540,220 @@ impl LookupSource for PostgresLookupSource {
     }
 
     async fn health_check(&self) -> Result<(), LookupError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| LookupError::Connection(format!("health check pool: {e}")))?;
-        client
-            .query_one("SELECT 1", &[])
-            .await
-            .map(|_| ())
-            .map_err(|e| LookupError::Connection(format!("health check: {e}")))
+        let health_pool = self.pool.clone();
+        await_lookup_driver("health check", async move {
+            let client = health_pool
+                .get()
+                .await
+                .map_err(|e| LookupError::Connection(format!("health check pool: {e}")))?;
+            match tokio::time::timeout(QUERY_TIMEOUT, client.query_one("SELECT 1", &[])).await {
+                Ok(result) => result
+                    .map(|_| ())
+                    .map_err(|e| LookupError::Connection(format!("health check: {e}"))),
+                Err(_) => {
+                    discard_pool_client(client);
+                    Err(LookupError::Timeout(QUERY_TIMEOUT))
+                }
+            }
+        })
+        .await
     }
 }
 
 #[cfg(feature = "postgres-cdc")]
-fn parse_conn_string_params(conn: &str) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    if conn.starts_with("postgresql://") || conn.starts_with("postgres://") {
-        if let Some(pos) = conn.find('?') {
-            let query = &conn[pos + 1..];
-            for pair in query.split('&') {
-                let mut parts = pair.splitn(2, '=');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    params.insert(k.to_string(), v.replace("%2F", "/").replace("%2f", "/"));
-                }
-            }
-        }
-    } else {
-        let mut chars = conn.chars().peekable();
-        while let Some(&c) = chars.peek() {
-            if c.is_whitespace() {
-                chars.next();
-                continue;
-            }
-            let mut key = String::new();
-            while let Some(&c) = chars.peek() {
-                if c == '=' {
-                    chars.next();
-                    break;
-                }
-                if c.is_whitespace() {
-                    break;
-                }
-                key.push(c);
-                chars.next();
-            }
-            if key.is_empty() {
-                break;
-            }
-            let mut val = String::new();
-            if chars.peek() == Some(&'\'') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c == '\'' {
-                        break;
-                    }
-                    val.push(c);
-                }
-            } else {
-                while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() {
-                        break;
-                    }
-                    val.push(c);
-                    chars.next();
-                }
-            }
-            params.insert(key, val);
-        }
-    }
-    params
+fn discard_pool_client(client: deadpool_postgres::Client) {
+    drop(deadpool_postgres::Client::take(client));
 }
 
 /// Build a `deadpool` pool from libpq-style properties (individual keys or a
 /// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
 #[cfg(feature = "postgres-cdc")]
-#[allow(clippy::match_wildcard_for_single_variants)]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
+    if pool_size == 0 || pool_size > MAX_POOL_SIZE {
+        return Err(LookupError::Connection(format!(
+            "postgres lookup pool_size must be between 1 and {MAX_POOL_SIZE}, got {pool_size}"
+        )));
+    }
     let mut cfg = deadpool_postgres::Config::new();
-    let mut merged_props = props.clone();
+    for (left, right) in [
+        ("connection", "connection_string"),
+        ("database", "dbname"),
+        ("user", "username"),
+    ] {
+        if props.contains_key(left) && props.contains_key(right) {
+            return Err(LookupError::Connection(format!(
+                "postgres lookup cannot configure both '{left}' and '{right}'"
+            )));
+        }
+    }
+    for key in ["host", "database", "dbname", "user", "username"] {
+        if props.get(key).is_some_and(|value| value.trim().is_empty()) {
+            return Err(LookupError::Connection(format!(
+                "postgres lookup '{key}' must not be empty"
+            )));
+        }
+    }
 
     if let Some(conn) = props
         .get("connection")
         .or_else(|| props.get("connection_string"))
     {
-        let conn_params = parse_conn_string_params(conn);
-        for (k, v) in conn_params {
-            merged_props.insert(k, v);
+        if conn.trim().is_empty() {
+            return Err(LookupError::Connection(
+                "postgres lookup connection string must not be empty".into(),
+            ));
         }
-
-        let pg: tokio_postgres::Config = conn
+        if let Some(conflict) = [
+            "host", "port", "database", "dbname", "user", "username", "password", "options",
+        ]
+        .into_iter()
+        .find(|key| props.contains_key(*key))
+        {
+            return Err(LookupError::Connection(format!(
+                "postgres lookup cannot combine a connection string with '{conflict}'"
+            )));
+        }
+        let parsed: tokio_postgres::Config = conn
             .parse()
             .map_err(|e| LookupError::Connection(format!("parse connection string: {e}")))?;
-        cfg.host = pg.get_hosts().iter().find_map(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        });
-        cfg.port = pg.get_ports().first().copied();
-        cfg.dbname = pg.get_dbname().map(str::to_string);
-        cfg.user = pg.get_user().map(str::to_string);
-        cfg.password = pg
-            .get_password()
-            .map(|p| String::from_utf8_lossy(p).into_owned());
+        if parsed.get_ports().contains(&0) {
+            return Err(LookupError::Connection(
+                "postgres lookup port must be greater than zero".into(),
+            ));
+        }
+        if parsed.get_user().is_none_or(str::is_empty) {
+            return Err(LookupError::Connection(
+                "postgres lookup connection string must specify a user".into(),
+            ));
+        }
+        if parsed.get_dbname().is_none_or(str::is_empty) {
+            return Err(LookupError::Connection(
+                "postgres lookup connection string must specify a database".into(),
+            ));
+        }
+        cfg.url = Some(conn.clone());
     } else {
         cfg.host = props.get("host").cloned();
-        cfg.port = props.get("port").and_then(|p| p.parse().ok());
+        cfg.port = props
+            .get("port")
+            .map(|port| {
+                let parsed = port.parse::<u16>().map_err(|error| {
+                    LookupError::Connection(format!(
+                        "invalid postgres lookup port '{port}': {error}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(LookupError::Connection(
+                        "postgres lookup port must be greater than zero".into(),
+                    ));
+                }
+                Ok(parsed)
+            })
+            .transpose()?;
         cfg.dbname = props
             .get("database")
             .or_else(|| props.get("dbname"))
             .cloned();
-        cfg.user = props.get("user").cloned();
+        cfg.user = props.get("user").or_else(|| props.get("username")).cloned();
+        if cfg.user.is_none() {
+            return Err(LookupError::Connection(
+                "postgres lookup requires 'user' or 'username'".into(),
+            ));
+        }
+        if cfg.dbname.is_none() {
+            return Err(LookupError::Connection(
+                "postgres lookup requires 'database' or 'dbname'".into(),
+            ));
+        }
         cfg.password = props.get("password").cloned();
+        if let Some(options) = props.get("options") {
+            if options.contains('\0') {
+                return Err(LookupError::Connection(
+                    "postgres lookup options cannot contain NUL".into(),
+                ));
+            }
+            cfg.options = Some(options.clone());
+        }
     }
 
-    cfg.pool = Some(deadpool_postgres::PoolConfig::new(pool_size.max(1)));
+    cfg.connect_timeout = Some(CONNECT_TIMEOUT);
+    let mut pool_config = deadpool_postgres::PoolConfig::new(pool_size);
+    pool_config.timeouts.wait = Some(POOL_WAIT_TIMEOUT);
+    pool_config.timeouts.create = Some(CONNECT_TIMEOUT);
+    pool_config.timeouts.recycle = Some(POOL_WAIT_TIMEOUT);
+    cfg.pool = Some(pool_config);
     let runtime = Some(deadpool_postgres::Runtime::Tokio1);
+    let ssl_mode = ssl_mode(props)?;
+    cfg.ssl_mode = Some(driver_ssl_mode(ssl_mode));
 
-    // `create_pool` is generic over the TLS connector but erases it into the
-    // same `Pool` type, so the two arms unify.
-    if tls_enabled(&merged_props)? {
-        let connector = build_rustls_connector(&merged_props)?;
-        cfg.create_pool(runtime, connector)
-            .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
-    } else {
-        cfg.create_pool(runtime, tokio_postgres::NoTls)
-            .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
+    match ssl_mode {
+        crate::connector::PostgresSslMode::VerifyFull => {
+            let connector = build_rustls_connector(props)?;
+            cfg.create_pool(runtime, connector)
+                .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
+        }
+        crate::connector::PostgresSslMode::Disable => cfg
+            .create_pool(runtime, tokio_postgres::NoTls)
+            .map_err(|e| LookupError::Connection(format!("create pool: {e}"))),
     }
 }
 
-/// Whether the configured `sslmode`/`ssl.mode` requests TLS. Absent or
-/// `disable` → no TLS (backward compatible); `require`/`verify-ca`/`verify-full`
-/// → verified TLS. `prefer` (opportunistic fallback) is rejected because a
-/// pooled static connector cannot implement its plaintext fallback.
 #[cfg(feature = "postgres-cdc")]
-fn tls_enabled(props: &HashMap<String, String>) -> Result<bool, LookupError> {
-    let Some(mode) = props.get("sslmode").or_else(|| props.get("ssl.mode")) else {
-        return Ok(false);
+fn driver_ssl_mode(mode: crate::connector::PostgresSslMode) -> deadpool_postgres::SslMode {
+    match mode {
+        crate::connector::PostgresSslMode::Disable => deadpool_postgres::SslMode::Disable,
+        crate::connector::PostgresSslMode::VerifyFull => deadpool_postgres::SslMode::Require,
+    }
+}
+
+/// Whether the configuration requests verified TLS. It is secure by default;
+/// plaintext requires an explicit opt-out.
+#[cfg(feature = "postgres-cdc")]
+fn ssl_mode(
+    props: &HashMap<String, String>,
+) -> Result<crate::connector::PostgresSslMode, LookupError> {
+    if props.contains_key("sslmode") {
+        return Err(LookupError::Connection(
+            "postgres lookup uses ssl.mode (disable or verify-full), not sslmode".into(),
+        ));
+    }
+    if props
+        .get("ssl.ca.cert.path")
+        .is_some_and(|path| path.trim().is_empty())
+    {
+        return Err(LookupError::Connection(
+            "postgres lookup ssl.ca.cert.path must not be empty".into(),
+        ));
+    }
+    let Some(mode) = props.get("ssl.mode") else {
+        return Ok(crate::connector::PostgresSslMode::VerifyFull);
     };
     match mode.to_ascii_lowercase().as_str() {
-        "disable" => Ok(false),
-        "require" | "verify-ca" | "verify-full" => Ok(true),
+        "disable" => {
+            if props.contains_key("ssl.ca.cert.path") {
+                return Err(LookupError::Connection(
+                    "postgres lookup ssl.ca.cert.path requires ssl.mode=verify-full".into(),
+                ));
+            }
+            Ok(crate::connector::PostgresSslMode::Disable)
+        }
+        "verify-full" => Ok(crate::connector::PostgresSslMode::VerifyFull),
         other => Err(LookupError::Connection(format!(
-            "unsupported sslmode '{other}' (use disable/require/verify-ca/verify-full)"
+            "unsupported ssl.mode '{other}' (use disable or verify-full)"
         ))),
     }
 }
 
-/// Build a server-auth rustls TLS connector. Roots come from `sslrootcert`
+/// Build a server-auth rustls TLS connector. Roots come from `ssl.ca.cert.path`
 /// (CA PEM) if set, otherwise the Mozilla webpki roots; the server certificate
 /// is always verified (no insecure skip-verify).
 #[cfg(feature = "postgres-cdc")]
 fn build_rustls_connector(
     props: &HashMap<String, String>,
 ) -> Result<tokio_postgres_rustls::MakeRustlsConnect, LookupError> {
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-
-    // Idempotent process-wide install; matches the rest of the workspace.
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    let mut roots = RootCertStore::empty();
-    if let Some(ca_path) = props.get("sslrootcert").or_else(|| props.get("ssl.ca")) {
-        let pem = std::fs::read(ca_path)
-            .map_err(|e| LookupError::Connection(format!("read sslrootcert '{ca_path}': {e}")))?;
-        let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| LookupError::Connection(format!("parse sslrootcert: {e}")))?;
-        if certs.is_empty() {
-            return Err(LookupError::Connection(
-                "sslrootcert contained no certificates".into(),
-            ));
-        }
-        for cert in certs {
-            roots
-                .add(cert)
-                .map_err(|e| LookupError::Connection(format!("add CA cert: {e}")))?;
-        }
-    } else {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
-    let client_cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg))
+    let ca_path = props.get("ssl.ca.cert.path").map(std::path::Path::new);
+    crate::postgres_tls::make_rustls_connector(ca_path)
+        .map_err(|error| LookupError::Connection(error.to_string()))
 }
 
 /// Convert `tokio_postgres` rows into one Arrow `RecordBatch` via the
@@ -512,7 +764,8 @@ fn rows_to_batch(
     rows: &[tokio_postgres::Row],
 ) -> Result<RecordBatch, LookupError> {
     use arrow_array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
+        BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, StringArray, TimestampMicrosecondArray,
     };
 
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
@@ -529,13 +782,58 @@ fn rows_to_batch(
             DataType::Int64 => Arc::new(Int64Array::from(collect_col::<i64>(rows, name)?)),
             DataType::Float32 => Arc::new(Float32Array::from(collect_col::<f32>(rows, name)?)),
             DataType::Float64 => Arc::new(Float64Array::from(collect_col::<f64>(rows, name)?)),
-            // Everything else (Decimal/Date/Timestamp/UUID/JSON) renders as text.
-            _ => {
-                let vals: Vec<Option<String>> = rows
-                    .iter()
-                    .map(|r| r.try_get::<_, Option<String>>(name).unwrap_or(None))
-                    .collect();
-                Arc::new(StringArray::from(vals))
+            DataType::Utf8 => {
+                let values = collect_col::<String>(rows, name)?;
+                Arc::new(StringArray::from(
+                    values.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                ))
+            }
+            DataType::Binary => {
+                let values = collect_col::<Vec<u8>>(rows, name)?;
+                Arc::new(BinaryArray::from(
+                    values.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                ))
+            }
+            DataType::Date32 => {
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
+                let values = collect_col::<chrono::NaiveDate>(rows, name)?
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .map(|date| {
+                                i32::try_from(date.signed_duration_since(epoch).num_days()).map_err(
+                                    |_| {
+                                        LookupError::Internal(format!(
+                                            "postgres column '{name}' contains a date outside the Arrow Date32 range"
+                                        ))
+                                    },
+                                )
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Arc::new(Date32Array::from(values))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                let values = collect_col::<chrono::NaiveDateTime>(rows, name)?
+                    .into_iter()
+                    .map(|value| value.map(|timestamp| timestamp.and_utc().timestamp_micros()))
+                    .collect::<Vec<_>>();
+                Arc::new(TimestampMicrosecondArray::from(values))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+                if timezone.as_ref() == "UTC" =>
+            {
+                let values = collect_col::<chrono::DateTime<chrono::Utc>>(rows, name)?
+                    .into_iter()
+                    .map(|value| value.map(|timestamp| timestamp.timestamp_micros()))
+                    .collect::<Vec<_>>();
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"))
+            }
+            unsupported => {
+                return Err(LookupError::Internal(format!(
+                    "unsupported PostgreSQL lookup result type {unsupported}"
+                )));
             }
         };
         columns.push(array);
@@ -561,18 +859,63 @@ where
         .collect()
 }
 
-/// Map a `tokio_postgres` type to an Arrow `DataType`. Native columnar types
-/// map directly; richer types fall back to text so they survive the round trip.
+/// Map a `tokio_postgres` type to an Arrow `DataType`. Types without a native
+/// mapping are explicitly projected as PostgreSQL text.
 #[cfg(feature = "postgres-cdc")]
 fn pg_type_to_arrow(pg_type: &Type) -> DataType {
+    native_pg_type_to_arrow(pg_type).unwrap_or(DataType::Utf8)
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn native_pg_type_to_arrow(pg_type: &Type) -> Option<DataType> {
     match *pg_type {
-        Type::BOOL => DataType::Boolean,
-        Type::INT2 => DataType::Int16,
-        Type::INT4 => DataType::Int32,
-        Type::INT8 => DataType::Int64,
-        Type::FLOAT4 => DataType::Float32,
-        Type::FLOAT8 => DataType::Float64,
-        _ => DataType::Utf8,
+        Type::BOOL => Some(DataType::Boolean),
+        Type::INT2 => Some(DataType::Int16),
+        Type::INT4 => Some(DataType::Int32),
+        Type::INT8 => Some(DataType::Int64),
+        Type::FLOAT4 => Some(DataType::Float32),
+        Type::FLOAT8 => Some(DataType::Float64),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(DataType::Utf8),
+        Type::BYTEA => Some(DataType::Binary),
+        Type::DATE => Some(DataType::Date32),
+        Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        Type::TIMESTAMPTZ => Some(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn supports_any_parameter(pg_type: &Type) -> bool {
+    matches!(
+        *pg_type,
+        Type::BOOL
+            | Type::INT2
+            | Type::INT4
+            | Type::INT8
+            | Type::FLOAT4
+            | Type::FLOAT8
+            | Type::TEXT
+            | Type::VARCHAR
+            | Type::BPCHAR
+            | Type::NAME
+    )
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn select_expression(column: &tokio_postgres::Column) -> Result<String, LookupError> {
+    select_expression_for(column.name(), column.type_())
+}
+
+#[cfg(feature = "postgres-cdc")]
+fn select_expression_for(name: &str, pg_type: &Type) -> Result<String, LookupError> {
+    let identifier = quote_identifier(name)?;
+    if native_pg_type_to_arrow(pg_type).is_some() {
+        Ok(identifier)
+    } else {
+        Ok(format!("CAST({identifier} AS TEXT) AS {identifier}"))
     }
 }
 
@@ -582,14 +925,58 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
 
     #[test]
-    fn pg_type_map_native_and_text_fallback() {
+    fn pg_type_map_native_and_explicit_text_projection() {
         assert_eq!(pg_type_to_arrow(&Type::INT8), DataType::Int64);
         assert_eq!(pg_type_to_arrow(&Type::FLOAT8), DataType::Float64);
         assert_eq!(pg_type_to_arrow(&Type::BOOL), DataType::Boolean);
-        // Rich types render as text.
-        assert_eq!(pg_type_to_arrow(&Type::TIMESTAMP), DataType::Utf8);
+        assert_eq!(
+            pg_type_to_arrow(&Type::TIMESTAMP),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
         assert_eq!(pg_type_to_arrow(&Type::NUMERIC), DataType::Utf8);
         assert_eq!(pg_type_to_arrow(&Type::UUID), DataType::Utf8);
+        assert_eq!(
+            select_expression_for("amount", &Type::NUMERIC).unwrap(),
+            "CAST(\"amount\" AS TEXT) AS \"amount\""
+        );
+        assert_eq!(
+            select_expression_for("created_at", &Type::TIMESTAMP).unwrap(),
+            "\"created_at\""
+        );
+        assert!(!supports_any_parameter(&Type::UUID));
+        assert!(supports_any_parameter(&Type::INT8));
+    }
+
+    #[test]
+    fn unique_key_catalog_probe_is_fail_closed_and_allows_include_columns() {
+        for required in [
+            "pg_catalog.to_regclass($1)",
+            "idx.indisunique",
+            "idx.indisvalid",
+            "idx.indisready",
+            "idx.indislive",
+            "idx.indnkeyatts = 1",
+            "idx.indpred IS NULL",
+            "idx.indexprs IS NULL",
+            "attr.attnum = idx.indkey[0]",
+            "attr.attname = $2",
+        ] {
+            assert!(
+                UNIQUE_LOOKUP_KEY_QUERY.contains(required),
+                "missing {required}"
+            );
+        }
+        assert!(
+            !UNIQUE_LOOKUP_KEY_QUERY.contains("indnatts = 1"),
+            "included columns must not invalidate a single-key unique index"
+        );
+
+        assert!(validate_unique_lookup_key("events", "id", None, false).is_err());
+        assert!(validate_unique_lookup_key("events", "id", Some(42), false).is_err());
+        assert_eq!(
+            validate_unique_lookup_key("events", "id", Some(42), true).unwrap(),
+            42
+        );
     }
 
     #[test]
@@ -619,11 +1006,96 @@ mod tests {
 
     #[test]
     fn tls_mode_parsing() {
-        assert!(!tls_enabled(&HashMap::new()).unwrap()); // absent → no TLS
-        assert!(!tls_enabled(&props(&[("sslmode", "disable")])).unwrap());
-        assert!(tls_enabled(&props(&[("sslmode", "require")])).unwrap());
-        assert!(tls_enabled(&props(&[("ssl.mode", "verify-full")])).unwrap());
-        assert!(tls_enabled(&props(&[("sslmode", "bogus")])).is_err());
+        assert_eq!(
+            ssl_mode(&HashMap::new()).unwrap(),
+            crate::connector::PostgresSslMode::VerifyFull
+        );
+        assert_eq!(
+            ssl_mode(&props(&[("ssl.mode", "disable")])).unwrap(),
+            crate::connector::PostgresSslMode::Disable
+        );
+        assert_eq!(
+            ssl_mode(&props(&[("ssl.mode", "verify-full")])).unwrap(),
+            crate::connector::PostgresSslMode::VerifyFull
+        );
+        assert_eq!(
+            driver_ssl_mode(crate::connector::PostgresSslMode::VerifyFull),
+            deadpool_postgres::SslMode::Require
+        );
+        assert_eq!(
+            driver_ssl_mode(crate::connector::PostgresSslMode::Disable),
+            deadpool_postgres::SslMode::Disable
+        );
+        for rejected in ["prefer", "require", "verify-ca", "bogus"] {
+            assert!(ssl_mode(&props(&[("ssl.mode", rejected)])).is_err());
+        }
+        assert!(ssl_mode(&props(&[("sslmode", "disable")])).is_err());
+        assert!(ssl_mode(&props(&[
+            ("ssl.mode", "disable"),
+            ("ssl.ca.cert.path", "/certs/ca.pem"),
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn lookup_key_admission_is_bounded() {
+        assert!(validate_lookup_keys(&[&b"a"[..], &b"bc"[..]]).is_ok());
+
+        let too_many = vec![&b""[..]; MAX_LOOKUP_KEYS + 1];
+        assert!(validate_lookup_keys(&too_many).is_err());
+
+        let oversized = vec![0_u8; MAX_LOOKUP_KEY_BYTES + 1];
+        assert!(validate_lookup_keys(&[oversized.as_slice()]).is_err());
+    }
+
+    #[test]
+    fn pool_configuration_rejects_invalid_values() {
+        let base = [
+            ("host", "localhost"),
+            ("database", "db"),
+            ("user", "user"),
+            ("ssl.mode", "disable"),
+        ];
+        assert!(build_pool(&props(&base), 0).is_err());
+        assert!(build_pool(&props(&base), MAX_POOL_SIZE + 1).is_err());
+
+        let mut invalid_port = props(&base);
+        invalid_port.insert("port".into(), "not-a-port".into());
+        assert!(build_pool(&invalid_port, 1).is_err());
+        invalid_port.insert("port".into(), "0".into());
+        assert!(build_pool(&invalid_port, 1).is_err());
+
+        let mut invalid_options = props(&base);
+        invalid_options.insert("options".into(), "bad\0option".into());
+        assert!(build_pool(&invalid_options, 1).is_err());
+
+        let mut empty_user = props(&base);
+        empty_user.insert("user".into(), " ".into());
+        assert!(build_pool(&empty_user, 1).is_err());
+
+        let conflict = props(&[
+            ("connection", "host=localhost dbname=db user=user"),
+            ("host", "other"),
+            ("ssl.mode", "disable"),
+        ]);
+        assert!(build_pool(&conflict, 1).is_err());
+
+        let zero_port = props(&[
+            ("connection", "host=localhost port=0 dbname=db user=user"),
+            ("ssl.mode", "disable"),
+        ]);
+        assert!(build_pool(&zero_port, 1).is_err());
+        assert!(build_pool(&props(&[("connection", ""), ("ssl.mode", "disable")]), 1).is_err());
+    }
+
+    #[test]
+    fn identifier_validation_rejects_unsafe_shapes() {
+        assert_eq!(
+            quote_qualified_identifier("public.events").unwrap(),
+            "\"public\".\"events\""
+        );
+        assert!(quote_qualified_identifier("public.").is_err());
+        assert!(quote_identifier("bad\0name").is_err());
     }
 
     #[test]
@@ -631,6 +1103,8 @@ mod tests {
         // Default webpki roots: builds without a CA file.
         assert!(build_rustls_connector(&HashMap::new()).is_ok());
         // An explicit but missing CA path is a clear error, not a panic.
-        assert!(build_rustls_connector(&props(&[("sslrootcert", "/no/such/ca.pem")])).is_err());
+        assert!(
+            build_rustls_connector(&props(&[("ssl.ca.cert.path", "/no/such/ca.pem")])).is_err()
+        );
     }
 }

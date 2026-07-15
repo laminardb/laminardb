@@ -298,13 +298,16 @@ while let Some(rows) = sub.poll() {
 
 When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
 
+Cluster mode currently rejects materialized-view creation with `[LDB-4007]`; this interface applies to embedded and single-node materialized views.
+
 ```sql
 SUBSCRIBE <name> [WHERE <predicate>] [AS OF EPOCH <n>]
 ```
 
-- `<name>` may be a materialized view, a source, or a named stream.
-- The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. It works on materialized views and sources; named streams reject `WHERE` because their output schema isn't introspectable.
+- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.
+- The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
 - The query stays open until the client disconnects; rows arrive as they're produced upstream.
+- `SUBSCRIBE` is currently supported in embedded and single-node runtimes. Cluster runtimes reject it until delivery is globally sequenced and checkpoint-aligned.
 
 #### Reconnect without gaps: `RETAIN HISTORY` + `AS OF EPOCH`
 
@@ -315,13 +318,15 @@ CREATE STREAM trades AS SELECT * FROM raw_trades
   WITH ('retain_history' = '64mb');
 ```
 
-The server keeps recent committed epochs in memory up to that budget. A client that crashed at epoch `42` can reconnect and resume from exactly where it left off:
+`RETAIN HISTORY` is currently rejected in cluster runtimes for the same ordering reason.
+
+The server keeps a bounded suffix of committed epochs in memory. WebSocket consumers receive ordered `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds `__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` columns; progress is a row in the same ordered result stream. Durably record the marker only after all preceding data is durable, then resume strictly after it:
 
 ```sql
 SUBSCRIBE trades AS OF EPOCH 42;
 ```
 
-If epoch `42` has already fallen out of the ring the server returns an error instead of silently skipping rows. Pick a larger budget if your clients can disconnect for longer.
+If epoch `42` was not committed or is no longer retained, the server returns an error instead of silently skipping rows.
 
 #### Cursored consumption: `DECLARE` / `FETCH` / `CLOSE`
 
@@ -507,7 +512,7 @@ Connector-produced schemas may use other `Timestamp(_)` precisions:
 | Column | Precision | Source |
 |--------|-----------|--------|
 | `_laminar_received_at` | `Timestamp(Nanosecond)` | OTel |
-| `_ts_ms` | `Timestamp(Millisecond)` | Postgres / MySQL CDC |
+| `_ts_ms` | `Timestamp(Millisecond)` | Postgres CDC |
 | `_timestamp` | `Timestamp(Millisecond)` | Kafka metadata |
 | `_wall_time_ms` | `Timestamp(Millisecond)` | MongoDB CDC |
 | `file_modification_time` | `Timestamp(Millisecond)` | Files connector |

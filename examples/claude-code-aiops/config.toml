@@ -5,7 +5,7 @@
 #     --config examples/claude-code-aiops/config.toml
 
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:8080"
 # OTLP ingress cannot be replayed after a crash, so this pipeline explicitly
 # chooses best effort. Delta still durably acknowledges each direct commit,

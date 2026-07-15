@@ -138,13 +138,13 @@ impl GraphOperator for AsofJoinOperator {
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let Some((&version, body)) = checkpoint.data.split_last() else {
-            return Err(DbError::Pipeline(format!(
+            return Err(DbError::Checkpoint(format!(
                 "ASOF join [{}]: checkpoint empty (missing version trailer)",
                 self.projection.op_name
             )));
         };
         if version != ASOF_CHECKPOINT_VERSION {
-            return Err(DbError::Pipeline(format!(
+            return Err(DbError::Checkpoint(format!(
                 "ASOF join [{}]: unsupported checkpoint version {version} (expected {ASOF_CHECKPOINT_VERSION})",
                 self.projection.op_name
             )));
@@ -152,20 +152,21 @@ impl GraphOperator for AsofJoinOperator {
 
         let cp: AsofBufferCheckpoint =
             rkyv::from_bytes::<AsofBufferCheckpoint, rkyv::rancor::Error>(body).map_err(|e| {
-                DbError::Pipeline(format!(
+                DbError::Checkpoint(format!(
                     "ASOF join [{}]: checkpoint deserialization: {e}",
                     self.projection.op_name
                 ))
             })?;
 
-        let (buffer, last_wm) = AsofRightBuffer::from_checkpoint(&cp)?;
+        let (buffer, last_wm) = AsofRightBuffer::from_checkpoint(&cp).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "ASOF join [{}]: checkpoint restore: {error}",
+                self.projection.op_name
+            ))
+        })?;
         self.right_buffer = buffer;
         self.last_evicted_watermark = last_wm;
         Ok(())
-    }
-
-    fn estimated_state_bytes(&self) -> usize {
-        self.right_buffer.estimated_size_bytes()
     }
 }
 
@@ -352,12 +353,5 @@ mod tests {
         let ctx = laminar_sql::create_session_context();
         let op = AsofJoinOperator::new("my_asof_query", test_config(), None, ctx);
         assert_eq!(&*op.projection.op_name, "my_asof_query");
-    }
-
-    #[test]
-    fn test_estimated_state_bytes_starts_zero() {
-        let ctx = laminar_sql::create_session_context();
-        let op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
-        assert_eq!(op.estimated_state_bytes(), 0);
     }
 }

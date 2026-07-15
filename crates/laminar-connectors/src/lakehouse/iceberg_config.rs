@@ -75,7 +75,26 @@ impl IcebergCatalogConfig {
 
         let catalog_uri = config.require("catalog.uri")?.to_string();
         let warehouse = config.require("warehouse")?.to_string();
-        let storage_type = config.get("storage.type").map(str::to_string);
+        let storage_type = config
+            .get("storage.type")
+            .map(str::trim)
+            .filter(|storage| !storage.is_empty())
+            .map(str::to_ascii_lowercase);
+        if let Some(storage) = storage_type.as_deref() {
+            if !matches!(storage, "s3" | "s3a" | "fs") {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unsupported Iceberg storage.type '{storage}'; expected s3 | s3a | fs"
+                )));
+            }
+        }
+        if let Some((scheme, _)) = warehouse.split_once("://") {
+            let scheme = scheme.to_ascii_lowercase();
+            if !matches!(scheme.as_str(), "s3" | "s3a" | "file") {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unsupported Iceberg warehouse scheme '{scheme}'; expected s3 | s3a | file"
+                )));
+            }
+        }
         let namespace = config.require("namespace")?.to_string();
         let table_name = config.require("table.name")?.to_string();
 
@@ -293,6 +312,21 @@ mod tests {
         let cfg = IcebergSinkConfig::from_config(&config).unwrap();
         assert_eq!(cfg.compression, "zstd");
         assert!(!cfg.auto_create);
+    }
+
+    #[test]
+    fn test_unwired_storage_backends_are_rejected() {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "http://localhost:8181");
+        config.set("warehouse", "demo");
+        config.set("storage.type", "gcs");
+        config.set("namespace", "prod");
+        config.set("table.name", "events");
+        assert!(IcebergSinkConfig::from_config(&config).is_err());
+
+        config.set("storage.type", "s3");
+        config.set("warehouse", "abfs://container/warehouse");
+        assert!(IcebergSinkConfig::from_config(&config).is_err());
     }
 
     // ── Schema validation tests ──

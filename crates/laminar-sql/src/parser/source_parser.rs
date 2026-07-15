@@ -20,7 +20,10 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use super::statements::{CreateSourceStatement, FormatSpec, WatermarkDef};
-use super::tokenizer::{expect_custom_keyword, parse_with_options, try_parse_custom_keyword};
+use super::tokenizer::{
+    expect_custom_keyword, expect_statement_end, insert_unique_option, parse_with_options,
+    try_parse_custom_keyword,
+};
 use super::ParseError;
 
 /// Parse a CREATE SOURCE statement from a sqlparser `Parser`.
@@ -92,6 +95,7 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
 
     // WITH options (optional) — contains watermark config like event_time, watermark_delay
     let with_options = parse_with_options(parser)?;
+    expect_statement_end(parser)?;
 
     Ok(CreateSourceStatement {
         name,
@@ -270,7 +274,7 @@ fn parse_from_connector(
                 .expect_token(&Token::Eq)
                 .map_err(ParseError::SqlParseError)?;
             let value = parse_connector_option_string(parser)?;
-            opts.insert(key, value);
+            insert_unique_option(&mut opts, key, value)?;
             if !parser.consume_token(&Token::Comma) {
                 parser
                     .expect_token(&Token::RParen)

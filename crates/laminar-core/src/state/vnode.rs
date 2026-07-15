@@ -21,6 +21,9 @@ use std::sync::Arc;
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::{CheckpointWatermark, CommittedSourceHandoff, SourceHandoffState};
+use crate::state::CheckpointAttempt;
+
 /// Unique identifier for a node. Also the owner id for vnodes; cluster
 /// membership and vnode ownership identify the same thing.
 #[derive(
@@ -82,19 +85,10 @@ impl VnodeLifecycleState {
     }
 }
 
-/// Source-instance → opaque connector offsets staged for a rotation handoff. Source namespacing
-/// prevents common keys such as `lsn` or `topic-partition` from colliding across connectors. A private alias keeps the single
-/// `disallowed_types` exception (cold path, mirrors the checkpoint map shape) in
-/// one place rather than blanket-allowing this perf-sensitive module.
-#[allow(clippy::disallowed_types)]
-type SourceResumeOffsets = std::collections::HashMap<String, String>;
-#[allow(clippy::disallowed_types)]
-type ResumeOffsets = std::collections::HashMap<String, SourceResumeOffsets>;
-
-#[derive(Clone)]
-enum ResumeHandoff {
-    NoCommittedCut,
-    Committed(Arc<ResumeOffsets>),
+enum SourceHandoffPublication {
+    Clear,
+    Replace(Arc<CommittedSourceHandoff>),
+    Carry,
 }
 
 /// One immutable publication of vnode ownership and the source cursors that
@@ -104,7 +98,8 @@ pub struct VnodeAssignmentSnapshot {
     version: u64,
     owners: Arc<[NodeId]>,
     owner_changed_versions: Arc<[u64]>,
-    resume_handoff: ResumeHandoff,
+    source_handoff: Option<Arc<CommittedSourceHandoff>>,
+    source_handoff_installed_version: Option<u64>,
 }
 
 impl VnodeAssignmentSnapshot {
@@ -129,17 +124,53 @@ impl VnodeAssignmentSnapshot {
     /// Whether this publication carries a durable decided checkpoint cut.
     #[must_use]
     pub const fn has_committed_handoff(&self) -> bool {
-        matches!(self.resume_handoff, ResumeHandoff::Committed(_))
+        self.source_handoff.is_some()
     }
 
-    /// Connector-defined handoff offsets for one source, bound to this version.
+    /// Validated committed state for one source, without cloning its checkpoint maps.
     #[must_use]
-    pub fn resume_offsets_for(&self, source: &str) -> Arc<SourceResumeOffsets> {
-        let offsets = match &self.resume_handoff {
-            ResumeHandoff::NoCommittedCut => None,
-            ResumeHandoff::Committed(offsets) => offsets.get(source),
-        };
-        Arc::new(offsets.cloned().unwrap_or_default())
+    pub fn source_handoff(&self, source: &str) -> Option<&SourceHandoffState> {
+        self.source_handoff
+            .as_deref()
+            .and_then(|handoff| handoff.source(source))
+    }
+
+    /// Complete committed source cut carried by this publication, if present.
+    #[must_use]
+    pub fn committed_source_handoff(&self) -> Option<&CommittedSourceHandoff> {
+        self.source_handoff.as_deref()
+    }
+
+    /// Assignment version that installed the current handoff. Carry-only
+    /// publications preserve the earlier version so runtimes do not restore
+    /// the same recovery cut for an unrelated roster update.
+    #[must_use]
+    pub const fn source_handoff_installed_version(&self) -> Option<u64> {
+        self.source_handoff_installed_version
+    }
+
+    /// Exact checkpoint attempt supplying the committed handoff, if present.
+    #[must_use]
+    pub fn source_handoff_attempt(&self) -> Option<CheckpointAttempt> {
+        self.source_handoff
+            .as_deref()
+            .map(CommittedSourceHandoff::attempt)
+    }
+
+    /// Assignment version sealed by the committed handoff, if present.
+    #[must_use]
+    pub fn source_handoff_assignment_version(&self) -> Option<u64> {
+        self.source_handoff
+            .as_deref()
+            .map(CommittedSourceHandoff::checkpoint_assignment_version)
+    }
+
+    /// Explicit cluster event-time status at the committed cut, if present.
+    #[must_use]
+    pub fn source_handoff_cluster_watermark(&self) -> Option<CheckpointWatermark> {
+        self.source_handoff
+            .as_deref()
+            .map(CommittedSourceHandoff::cluster_watermark)
     }
 }
 
@@ -160,13 +191,14 @@ fn changed_owner_versions(
     next_owners: &[NodeId],
     next_version: u64,
 ) -> Arc<[u64]> {
+    let skipped_generation = next_version > current.version.saturating_add(1);
     current
         .owners
         .iter()
         .zip(next_owners)
         .enumerate()
         .map(|(vnode, (current_owner, next_owner))| {
-            if current_owner == next_owner {
+            if current_owner == next_owner && !skipped_generation {
                 current.owner_changed_versions[vnode]
             } else {
                 next_version
@@ -232,7 +264,8 @@ impl VnodeRegistry {
                 owner_changed_versions: std::iter::repeat_n(1, vnode_count as usize)
                     .collect::<Vec<_>>()
                     .into(),
-                resume_handoff: ResumeHandoff::NoCommittedCut,
+                source_handoff: None,
+                source_handoff_installed_version: None,
             }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
@@ -280,7 +313,8 @@ impl VnodeRegistry {
                 owner_changed_versions: std::iter::repeat_n(1, vnode_count as usize)
                     .collect::<Vec<_>>()
                     .into(),
-                resume_handoff: ResumeHandoff::NoCommittedCut,
+                source_handoff: None,
+                source_handoff_installed_version: None,
             }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
@@ -352,7 +386,8 @@ impl VnodeRegistry {
             version,
             owners: new_assignment,
             owner_changed_versions,
-            resume_handoff: ResumeHandoff::NoCommittedCut,
+            source_handoff: None,
+            source_handoff_installed_version: None,
         };
         self.assignment_version
             .store(current.version, Ordering::Release);
@@ -366,7 +401,7 @@ impl VnodeRegistry {
     /// Panics on length mismatch, or if `version` is less than the
     /// current one (assignment versions are monotonic).
     pub fn set_assignment_and_version(&self, new_assignment: Arc<[NodeId]>, version: u64) {
-        self.publish_assignment(new_assignment, version, Some(ResumeHandoff::NoCommittedCut));
+        self.publish_assignment(new_assignment, version, SourceHandoffPublication::Clear);
     }
 
     /// Atomically publish ownership, its monotonic version, and the sealed
@@ -374,34 +409,34 @@ impl VnodeRegistry {
     ///
     /// # Panics
     /// Panics on length mismatch or version regression.
-    pub fn set_assignment_and_version_with_resume_offsets(
+    pub fn set_assignment_and_version_with_source_handoff(
         &self,
         new_assignment: Arc<[NodeId]>,
         version: u64,
-        resume_offsets: ResumeOffsets,
+        source_handoff: Arc<CommittedSourceHandoff>,
     ) {
         self.publish_assignment(
             new_assignment,
             version,
-            Some(ResumeHandoff::Committed(Arc::new(resume_offsets))),
+            SourceHandoffPublication::Replace(source_handoff),
         );
     }
 
     /// Publish a version that does not acquire local ownership while retaining
     /// the prior version-bound handoff until the source has reconciled it.
-    pub fn set_assignment_and_version_carrying_resume_offsets(
+    pub fn set_assignment_and_version_carrying_source_handoff(
         &self,
         new_assignment: Arc<[NodeId]>,
         version: u64,
     ) {
-        self.publish_assignment(new_assignment, version, None);
+        self.publish_assignment(new_assignment, version, SourceHandoffPublication::Carry);
     }
 
     fn publish_assignment(
         &self,
         new_assignment: Arc<[NodeId]>,
         version: u64,
-        resume_handoff: Option<ResumeHandoff>,
+        source_handoff: SourceHandoffPublication,
     ) {
         assert_eq!(
             new_assignment.len(),
@@ -417,12 +452,22 @@ impl VnodeRegistry {
             "assignment version must advance: got {version}, current {current}",
         );
         let owner_changed_versions = changed_owner_versions(&guard, &new_assignment, version);
-        let resume_handoff = resume_handoff.unwrap_or_else(|| guard.resume_handoff.clone());
+        let (source_handoff, source_handoff_installed_version) = match source_handoff {
+            SourceHandoffPublication::Clear => (None, None),
+            SourceHandoffPublication::Replace(source_handoff) => {
+                (Some(source_handoff), Some(version))
+            }
+            SourceHandoffPublication::Carry => (
+                guard.source_handoff.clone(),
+                guard.source_handoff_installed_version,
+            ),
+        };
         *guard = VnodeAssignmentSnapshot {
             version,
             owners: new_assignment,
             owner_changed_versions,
-            resume_handoff,
+            source_handoff,
+            source_handoff_installed_version,
         };
         self.assignment_version.store(version, Ordering::Release);
     }
@@ -701,6 +746,66 @@ pub fn peer_owners(registry: &VnodeRegistry, self_id: NodeId) -> Vec<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, ClusterRecoveryCapsule,
+        ConnectorCheckpoint, ParticipantRecoveryRef, PipelineIdentity,
+        CLUSTER_RECOVERY_CAPSULE_VERSION, PIPELINE_IDENTITY_VERSION,
+    };
+
+    fn digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn committed_handoff(
+        source: Option<(&str, ConnectorCheckpoint, Option<i64>)>,
+        cluster_watermark: CheckpointWatermark,
+    ) -> Arc<CommittedSourceHandoff> {
+        let mut source_offsets = BTreeMap::new();
+        let mut source_metadata = BTreeMap::new();
+        let mut source_watermarks = BTreeMap::new();
+        if let Some((source, checkpoint, watermark)) = source {
+            let ConnectorCheckpoint { offsets, metadata } = checkpoint;
+            source_offsets.insert(source.to_string(), offsets.into_iter().collect());
+            source_metadata.insert(source.to_string(), metadata.into_iter().collect());
+            if let Some(watermark) = watermark {
+                source_watermarks.insert(source.to_string(), watermark);
+            }
+        }
+
+        let participant = CheckpointParticipant {
+            node_id: 7,
+            boot_incarnation: uuid::Uuid::from_u128(77),
+        };
+        let capsule = ClusterRecoveryCapsule {
+            version: CLUSTER_RECOVERY_CAPSULE_VERSION,
+            attempt: CheckpointAttempt::new(5, 9),
+            deployment_id: uuid::Uuid::from_u128(99).to_string(),
+            pipeline_identity: PipelineIdentity {
+                canonical_version: PIPELINE_IDENTITY_VERSION,
+                sha256: digest(1),
+            },
+            assignment_fence: CheckpointAssignmentFence::from_owner_map(
+                17,
+                &[7],
+                vec![participant],
+            )
+            .unwrap(),
+            seal_inventory_sha256: digest(2),
+            participants: vec![ParticipantRecoveryRef {
+                participant_id: 7,
+                readiness_sha256: digest(3),
+                manifest_sha256: digest(4),
+                portable_state_sha256: digest(5),
+            }],
+            source_offsets,
+            source_metadata,
+            source_watermarks,
+            cluster_watermark,
+            recovery_watermark_frontier: cluster_watermark.active_value(),
+            portable_state_sha256: digest(5),
+        };
+        Arc::new(CommittedSourceHandoff::try_from(&capsule).unwrap())
+    }
 
     #[test]
     fn new_registry_is_unassigned() {
@@ -754,33 +859,84 @@ mod tests {
     }
 
     #[test]
-    fn empty_resume_cut_replaces_stale_handoff_offsets() {
+    fn committed_empty_source_is_distinct_from_a_missing_source() {
         let r = VnodeRegistry::new_unassigned(4);
         let owners = r.snapshot();
-        let mut offsets = ResumeOffsets::new();
-        offsets.insert(
-            "orders".into(),
-            SourceResumeOffsets::from([("orders:0".into(), "41".into())]),
+        let orders = ConnectorCheckpoint {
+            offsets: [("orders:0".into(), "41".into())].into_iter().collect(),
+            metadata: [("topic".into(), "orders".into())].into_iter().collect(),
+        };
+        let version_one_handoff = committed_handoff(
+            Some(("orders", orders, Some(700))),
+            CheckpointWatermark::Uninitialized,
         );
-        r.set_assignment_and_version_with_resume_offsets(Arc::clone(&owners), 1, offsets);
+        r.set_assignment_and_version_with_source_handoff(
+            Arc::clone(&owners),
+            1,
+            version_one_handoff,
+        );
         let version_one = r.versioned_snapshot();
         assert_eq!(version_one.version(), 1);
         assert!(version_one.has_committed_handoff());
         assert_eq!(
             version_one
-                .resume_offsets_for("orders")
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .offsets
                 .get("orders:0")
                 .map(String::as_str),
             Some("41")
         );
-
-        r.set_assignment_and_version_with_resume_offsets(owners, 2, ResumeOffsets::new());
-        let published = r.versioned_snapshot();
-        assert_eq!(published.version(), 2);
-        assert!(published.resume_offsets_for("orders").is_empty());
         assert_eq!(
             version_one
-                .resume_offsets_for("orders")
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .metadata
+                .get("topic")
+                .map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            version_one.source_handoff("orders").unwrap().watermark(),
+            Some(700)
+        );
+        assert_eq!(
+            version_one.source_handoff_cluster_watermark(),
+            Some(CheckpointWatermark::Uninitialized)
+        );
+        assert_eq!(
+            version_one.source_handoff_attempt(),
+            Some(CheckpointAttempt::new(5, 9))
+        );
+        assert_eq!(version_one.source_handoff_assignment_version(), Some(17));
+        assert_eq!(version_one.source_handoff_installed_version(), Some(1));
+
+        let committed_empty_source = committed_handoff(
+            Some(("orders", ConnectorCheckpoint::new(), None)),
+            CheckpointWatermark::Idle,
+        );
+        r.set_assignment_and_version_with_source_handoff(owners, 2, committed_empty_source);
+        let published = r.versioned_snapshot();
+        assert_eq!(published.version(), 2);
+        assert_eq!(published.source_handoff_installed_version(), Some(2));
+        assert!(published.has_committed_handoff());
+        let orders = published.source_handoff("orders").unwrap();
+        assert!(orders.checkpoint().offsets.is_empty());
+        assert!(orders.checkpoint().metadata.is_empty());
+        assert_eq!(orders.watermark(), None);
+        assert!(published.source_handoff("missing").is_none());
+        assert_eq!(
+            published.source_handoff_cluster_watermark(),
+            Some(CheckpointWatermark::Idle)
+        );
+        assert_eq!(
+            version_one
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .offsets
                 .get("orders:0")
                 .map(String::as_str),
             Some("41"),
@@ -793,23 +949,58 @@ mod tests {
         let r = VnodeRegistry::new_unassigned(1);
         let self_id = NodeId(7);
         let other = NodeId(8);
-        let offsets = ResumeOffsets::from([(
-            "events".to_string(),
-            SourceResumeOffsets::from([("events:0".to_string(), "41".to_string())]),
-        )]);
-        r.set_assignment_and_version_with_resume_offsets(vec![self_id].into(), 1, offsets);
-        r.set_assignment_and_version_carrying_resume_offsets(vec![other].into(), 2);
-        r.set_assignment_and_version_carrying_resume_offsets(vec![self_id].into(), 3);
+        let handoff = committed_handoff(
+            Some((
+                "events",
+                ConnectorCheckpoint::with_offsets(
+                    [("events:0".to_string(), "41".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                None,
+            )),
+            CheckpointWatermark::Idle,
+        );
+        r.set_assignment_and_version_with_source_handoff(
+            vec![self_id].into(),
+            1,
+            Arc::clone(&handoff),
+        );
+        r.set_assignment_and_version_carrying_source_handoff(vec![other].into(), 2);
+        r.set_assignment_and_version_carrying_source_handoff(vec![self_id].into(), 3);
 
         let published = r.versioned_snapshot();
         assert_eq!(published.owner_changed_version(0), Some(3));
         assert!(published.has_committed_handoff());
+        assert_eq!(published.source_handoff_installed_version(), Some(1));
+        assert!(std::ptr::eq(
+            published.committed_source_handoff().unwrap(),
+            handoff.as_ref()
+        ));
         assert_eq!(
             published
-                .resume_offsets_for("events")
+                .source_handoff("events")
+                .unwrap()
+                .checkpoint()
+                .offsets
                 .get("events:0")
                 .map(String::as_str),
             Some("41")
+        );
+    }
+
+    #[test]
+    fn skipped_assignment_generation_forces_owner_reconciliation() {
+        let r = VnodeRegistry::new_unassigned(1);
+        let self_id = NodeId(7);
+        r.set_assignment_and_version(vec![self_id].into(), 1);
+        assert_eq!(r.versioned_snapshot().owner_changed_version(0), Some(1));
+
+        r.set_assignment_and_version(vec![self_id].into(), 3);
+        assert_eq!(
+            r.versioned_snapshot().owner_changed_version(0),
+            Some(3),
+            "a missed intermediate generation may have transferred ownership"
         );
     }
 

@@ -176,7 +176,7 @@
       }
     },
     {
-      "title": "Congestion (Backpressured Cycles & Remote Subscription Drops)",
+      "title": "Congestion (Backpressured Cycles)",
       "type": "timeseries",
       "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
@@ -184,10 +184,6 @@
         {
           "expr": "sum(rate(laminardb_cycles_backpressured_total[1m])) by (instance)",
           "legendFormat": "Backpressured {{instance}}"
-        },
-        {
-          "expr": "sum(rate(laminardb_remote_subscription_batches_dropped_total[1m])) by (instance)",
-          "legendFormat": "Subscription Drops {{instance}}"
         }
       ],
       "fieldConfig": {

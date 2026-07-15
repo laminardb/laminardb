@@ -36,12 +36,36 @@ service BarrierSync {
   rpc Abort(AbortRequest) returns (Ack);
 }
 
+// One exact process in the canonical checkpoint participant roster. The
+// incarnation is the UUID's 16-byte canonical binary representation.
+message CheckpointParticipant {
+  uint64 node_id = 1;
+  bytes boot_incarnation = 2;
+}
+
+// Exact durable leader-lease grant authorizing reversible barrier work.
+// The UUID is its 16-byte canonical binary representation. Followers
+// validate the complete owner and fencing token; node identity alone is
+// never an authority boundary.
+message LeaderProof {
+  uint64 node_id = 1;
+  bytes boot_id = 2;
+  uint64 process_term = 3;
+  uint64 fencing_token = 4;
+}
+
 message PrepareRequest {
   uint64 epoch = 1;
   uint64 checkpoint_id = 2;
   // Reserved for unaligned / other barrier flags (mirrors
   // `BarrierAnnouncement.flags`).
   uint64 flags = 3;
+  uint64 assignment_version = 4;
+  repeated CheckpointParticipant assignment_participants = 5;
+  uint32 assignment_vnode_count = 6;
+  // SHA-256 of the vnode count and ordered vnode-to-owner map.
+  bytes assignment_map_digest = 7;
+  LeaderProof leader_proof = 20;
 }
 
 message AlignedRequest {
@@ -52,6 +76,11 @@ message AlignedRequest {
   // followers see cluster-wide event-time progress at resume rather
   // than waiting for the (upload-gated) Commit.
   optional int64 min_watermark_ms = 4;
+  uint64 assignment_version = 5;
+  repeated CheckpointParticipant assignment_participants = 6;
+  uint32 assignment_vnode_count = 7;
+  bytes assignment_map_digest = 8;
+  LeaderProof leader_proof = 20;
 }
 
 message CommitRequest {
@@ -62,12 +91,26 @@ message CommitRequest {
   // leader from the Prepare acks. Absent when no node has a watermark
   // yet (treated as +infinity).
   optional int64 min_watermark_ms = 4;
+  uint64 assignment_version = 5;
+  repeated CheckpointParticipant assignment_participants = 6;
+  uint32 assignment_vnode_count = 7;
+  bytes assignment_map_digest = 8;
+  // Informational only. Commit authority comes from the immutable durable
+  // checkpoint outcome, not from this notification or its leader proof.
+  LeaderProof leader_proof = 20;
 }
 
 message AbortRequest {
   uint64 epoch = 1;
   uint64 checkpoint_id = 2;
   uint64 flags = 3;
+  uint64 assignment_version = 4;
+  repeated CheckpointParticipant assignment_participants = 5;
+  uint32 assignment_vnode_count = 6;
+  bytes assignment_map_digest = 7;
+  // Informational only. Abort authority comes from the immutable durable
+  // checkpoint outcome, not from this notification or its leader proof.
+  LeaderProof leader_proof = 20;
 }
 
 // Follower reply to any phase. Mirrors `BarrierAck`.
@@ -77,7 +120,18 @@ message Ack {
   bool ok = 2;
   // Populated only when ok = false.
   optional string error = 3;
-  // The follower's local watermark at ack time; absent when unset
-  // (fresh boot, no source events yet).
+  // Present only when watermark_status is CHECKPOINT_WATERMARK_ACTIVE.
   optional int64 local_watermark_ms = 4;
+  uint64 checkpoint_id = 5;
+  // SHA-256 of the full assignment certificate (version, map identity,
+  // vnode count, and exact participant boot roster). Empty only when the
+  // corresponding announcement has no assignment fence.
+  bytes assignment_digest = 6;
+  CheckpointWatermarkStatus watermark_status = 7;
+}
+
+enum CheckpointWatermarkStatus {
+  CHECKPOINT_WATERMARK_UNINITIALIZED = 0;
+  CHECKPOINT_WATERMARK_IDLE = 1;
+  CHECKPOINT_WATERMARK_ACTIVE = 2;
 }

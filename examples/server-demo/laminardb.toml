@@ -1,4 +1,4 @@
-# LaminarDB Server Demo — Embedded Mode with Kafka
+# LaminarDB standalone single-node server demo with Kafka
 #
 # Runs 3 Kafka sources → 4 SQL pipelines → 4 Kafka sinks.
 # Pair with the demo producer for synthetic market data:
@@ -9,7 +9,7 @@
 #   cargo run -p laminar-server --features kafka -- --config examples/server-demo/laminardb.toml
 
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:9000"
 delivery = "at_least_once"
 metrics_bind = "127.0.0.1:9090"

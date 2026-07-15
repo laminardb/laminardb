@@ -1,255 +1,232 @@
-# Checkpoint Production Correctness — 2026 Order
+# Checkpoint and CDC production plan — 2026
 
-**Status:** corrective fault cycle active on `feat/checkpoint-correctness-2026`. Earlier embedded
-and coordinated leader/follower hard-kill legs passed; the rotating three-node leg exposed further
-source-reconciliation, restore-activation, retention, and decision-ambiguity faults. Corrective
-code is not certified until the current deterministic gates and the full fault matrix both pass.
-**Decision date:** 2026-07-12
+**Status:** corrective implementation is present but not production-certified. The current commit
+must pass deterministic, connector-integration, fault, soak, and latency gates before any guarantee
+is widened. Cluster exactly-once remains rejected by LDB-0013.
 
-This plan supersedes the older implementation order that treated connector phase-2 commits and
-per-sink status fields as the checkpoint commit point. LaminarDB now follows a decision-led
-protocol: an exact immutable state seal plus one exact durable decision commits the recovery cut;
-external publication is re-driven asynchronously from that decided inventory.
+LaminarDB uses a decision-led checkpoint protocol. An immutable, provenance-checked state seal and
+one durable decision commit the recovery cut. External sink publication is re-driven from that
+decision and is not part of the pipeline pause.
 
-The ordering follows the production model used by modern barrier-snapshot systems and the
-separation of fast alignment from durable completion described in the current
-[Apache Flink task lifecycle](https://nightlies.apache.org/flink/flink-docs-stable/docs/internals/task_lifecycle/),
-[Flink fault-tolerance model](https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/),
-and [Flink sink contract](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/sinks/).
-Flink's asynchronous snapshot model is the basis for keeping remote persistence off the pipeline
-pause. [CheckMate](https://arxiv.org/abs/2403.13629) supports coordinated checkpoints as the
-production baseline under uniform load while showing that protocol choice is workload-sensitive;
-it does not by itself justify a universal latency claim.
-The release gates treat guarantees as empirical contracts, following the 2025 PVLDB work on
-end-to-end processing-guarantee validation under injected process and network faults
-([PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf)); a clean unit-test model is not a
-substitute for recovery-output validation.
+## Current protocol invariants
 
-## Required implementation order
+1. Connector contracts and runtime durability are admitted before connector I/O. Unsupported
+   delivery, placement, state, or sink combinations fail closed.
+2. Every attempt has a never-reused pair of epoch and checkpoint ID, bound to deployment and
+   pipeline identity. Failed attempts are abandoned rather than reused.
+3. Barriers align source and shuffle input before capturing source cursors with operator state.
+   A source cursor never bisects its upstream replay unit; PostgreSQL emits a committed transaction
+   whole even when it exceeds the normal batch target.
+4. Every participant persists immutable vnode partials, commit descriptors, source handoff,
+   manifest, and a final readiness record under the exact attempt. Cluster artifacts bind the
+   assignment, writer process, leader proof, length, and digest.
+5. A canonical seal is created only after exact vnode, descriptor, and participant coverage is
+   verified. Zero-vnode and idle participants remain part of the certified roster.
+6. A valid Prepared manifest is the local write-ahead witness. Its epoch has one create-once
+   terminal key, so a delayed Commit and startup Abort race to one immutable winner without an
+   extra normal-path registry write. Startup validates provenance and settles every live Prepared
+   witness before inventory selection. Source acknowledgement follows the durable engine decision;
+   designated external publication follows asynchronously.
+7. Cluster commits require the implemented content-addressed recovery capsule. It binds the exact
+   assignment and process roster, seal, participant manifests, source union, watermarks, and
+   portable state. Its implementation still requires the final fault and soak matrix.
+8. Retention is bounded by durable decision and external-publication floors. A deployment-scoped
+   tombstone floor prevents stale recreation below the retained window. Shutdown retains issued
+   durable tasks until terminal completion and never detaches them behind released lifecycle
+   fences.
 
-1. **Admission and durability contracts.** Resolve source/sink consistency and topology before
-   connector I/O. Reject a delivery guarantee that the active runtime mode, state backend, or
-   connector cannot prove.
-2. **Exact attempt identity.** Durably reserve `(epoch, checkpoint_id)` and bind it to pipeline
-   identity plus a create-once deployment incarnation. Failed attempts are abandoned, never
-   retried under the same identity.
-3. **Aligned capture.** One streaming coordinator admits barriers, fences prior sink writes,
-   aligns source/shuffle input, and captures source offsets with operator state.
-4. **Immutable participant prepare.** Each capture participant persists its Prepared manifest,
-   source handoff, vnode partials, coordinated-sink marker, and one final readiness attestation
-   under the exact attempt. The readiness key is required even for a zero-vnode/idle participant.
-   Writer generation and payload digests make stale or conflicting artifacts unsealable.
-5. **Restorable seal.** Publish one canonical seal only after the complete vnode, descriptor, and
-   participant-readiness inventory decodes and validates against one assignment generation.
-   Presence without exact provenance or participant completeness is not sufficient.
-6. **Write-ahead decision intent, then durable decision.** After the seal, first CAS-create and
-   await an immutable intent containing the complete canonical decision. Only then CAS-create the
-   commit marker with the same bytes. An unmatched intent is explicitly in-doubt and blocks
-   ordinary inventory reads; startup idempotently completes that exact marker before recovery or
-   reconciliation rollback. This ordering makes a cancelled or timed-out commit-marker write
-   recoverably resolvable instead of invisible. A participant absent from the completed decision
-   must roll back its late prepare.
-7. **Completion and source acknowledgement.** Finalize the manifest and deliver the exact
-   completion. Sources acknowledge only that validated attempt. A successor-epoch failure is a
-   continuation fault, not a retroactive failure of the committed cut.
-8. **External publication.** A designated committer consumes decided sealed inventories in order,
-   validates the exact predecessor cursor, and commits Delta/Iceberg outside pipeline-stall
-   latency. It re-reads external cursors on every pass and fails closed on rollback or overlap.
-9. **Recovery.** Select the highest exact durable decision, require its bound manifest, seal,
-   participant set, assignment generation, and deployment identity, finalize a matching Prepared
-   manifest, and re-drive external publication. An undecided or excluded Prepared attempt is
-   force-rolled back. Until a canonical cluster recovery capsule exists, a replacement participant
-   may borrow only a metadata-only peer manifest; participant-local operators, tables, or
-   watermarks fail closed rather than being guessed from a donor.
-10. **Retention and shutdown.** Retention is one coalescing maintenance owner pinned by the
-    external-commit floor and newest decision. Before deleting any decision, manifest, or state
-    artifact, it audits every intent and publishes an immutable, deployment-scoped durable GC
-    floor. That floor embeds the full canonical decision immediately below the retained window as
-    its continuity anchor; readers treat every raw record below the floor as tombstoned even if a
-    stale writer recreates it. Shutdown retains ownership of every issued decision task and waits
-    for it to reach a terminal client-side state. A timeout leaves teardown retryable; it never
-    cancels or detaches the task and releases lifecycle fences behind it. Only after owned durable
-    tails settle does shutdown tear down sources/sinks and release deployment/control-plane
-    ownership.
+## Runtime and state policy
 
-## Configuration dimensions
-
-Research and the fault model do not justify independently tunable pre-commit, persist, commit,
-rollback, enqueue, actor, and acknowledgement budgets. Resetting those budgets makes the actual
-checkpoint bound unknowable. The production model is:
-
-- one end-to-end checkpoint-attempt deadline;
-- connector write timeout as a connector health limit, carried as one absolute enqueue-to-ack
-  deadline;
-- a private bounded cleanup budget after failure;
-- public resource bounds: in-flight epochs, staged bytes, and retention;
-- optional cluster delta-chain bounds; alignment derives from the one attempt deadline;
-- a private runtime-owned safety cap for externally uncommitted epochs.
-
-Polling intervals, sidecar thresholds, per-sink commit statuses, explicit writer IDs, store-local
-retention counts, and incremental-query emission policy are implementation details, obsolete
-dimensions, or belong outside checkpoint configuration. Event-time policy has one SQL surface,
-`WATERMARK FOR`; Kafka-specific event-time and out-of-orderness aliases are removed.
-
-## Runtime-mode policy
-
-| Runtime | Admitted semantics | Required durability/fencing |
+| Runtime | Admitted delivery | Required recovery authority |
 |---|---|---|
-| Embedded/local | Best effort, at least once, and connector-eligible coordinated exactly once | For exactly once: node-durable state plus the built-in local checkpoint/decision store under an exclusive OS deployment lock |
-| Single-node server | Same protocol as embedded/local | Same built-in local checkpoint/decision provenance and exclusive-ownership requirements |
-| Local exactly once with a configured checkpoint/object-store URL or injected decision store | **Rejected (`LDB-0014`)** | Provenance-erasing stores remain rejected until a deployment lease term fences decisions and external commits end to end |
-| Cluster | At least once only | Cluster-shared state/checkpoint storage, durable membership/lease during tail settlement |
-| Cluster exactly once | **Rejected (`LDB-0013`)** | Remains rejected until leader term is atomically consumed by both decision creation and external sink cursor commit |
+| Embedded library | Best effort, at least once, and the internal generator-to-Delta exact candidate | At-least-once requires node-durable checkpoint/decision storage; exactly-once also requires node-durable state, the built-in local decision store, an exact-certified source, and an exclusive deployment lock |
+| Single-node server | Same protocol and guarantees as embedded | Same node-durable local authority and ownership requirements |
+| Cluster | Contract-eligible at least once only | Cluster-shared checkpoint/state storage, exact assignment/process fencing, and durable recovery control |
+| Cluster exactly-once | Rejected by LDB-0013 | Requires a leader term consumed by both the durable engine decision and every external sink cursor commit |
+| Local exactly-once with an injected decision/object store | Rejected by LDB-0014 | Remains closed while the injected store erases the provenance of the built-in exclusive owner |
 
-These rejections are intentional correctness, not missing fallbacks. A renewable leader lease
-alone cannot prevent an expired leader from completing a separate object-store or catalog
-transaction, and an arbitrary local object-store or injected decision-store handle erases the
-provenance needed to prove that the built-in OS lock fences every decision writer.
+The current StateBackend stores checkpoint-attempt artifacts; it is not the hot keyed-state engine.
+Embedded and single-node execution should keep hot state in memory or local NVMe and recover from a
+node-durable checkpoint. Cluster recovery authority stays in shared object storage; local memory or
+NVMe may be a secondary cache, never the only copy. A local LSM working-state tier should be added
+only with state-size and latency evidence. A RisingWave-style object-store-primary LSM is a separate
+storage engine, not a label to apply to ordinary checkpoint blobs.
+Removing the experimental tier also removed its approximate live-state budget. Fixed group-count
+guards do not bound variable-width keys, emission state, or allocator retention. Cluster admission
+therefore rejects keyed aggregates and windows until the common keyed-state engine enforces a byte
+budget; embedded and single-node operation must not be described as byte-bounded yet.
 
-## Effective exactly-once scope and next order
+Cluster shuffle is bound to the exact assignment owner vector and boot-incarnation roster. Streams
+use assignment-scoped sequence domains, barriers carry high-water marks, and fan-out must cover the
+exact peer roster. Process loss triggers recovery and source replay; LaminarDB does not need a
+Spark-style external batch-shuffle service unless measurements prove recomputation cannot meet the
+recovery objective.
 
-The contract audit on 2026-07-12 found a narrower reachable matrix than the runtime table alone
-suggests:
+Gossip and static discovery provide membership, addresses, failure suspicion, and low-latency
+notification transport. They do not choose assignments, source cursors, checkpoint verdicts, or
+external commit terms. Both discovery modes must consume the same durable authority and pass the
+same fault matrix.
 
-- local Kafka sources use engine-owned assignment for guaranteed delivery. `earliest` captures the
-  full explicit topic inventory; specific offsets bind exactly the configured partition set. Both
-  persist numeric next-to-read baselines before the first record and fail recovery on inventory,
-  configuration, or retention drift. Patterns, broker group cursors, moving latest, and timestamp
-  starts remain rejected for guaranteed delivery;
-- the Kafka sink is intentionally `DurableAtLeastOnce`, never `CheckpointCommittable`:
-  idempotent production and `acks=all` do not make its output transaction recoverable from an
-  exact LaminarDB decision;
-- commit-coupled CDC sources cannot yet align a checkpoint at an external transaction boundary;
-- only coordinated append-mode Delta Lake and Iceberg are checkpoint-committable sinks; and
-- Iceberg has no direct at-least-once flush path, so it is also unreachable under the default
-  at-least-once setting.
+## Effective connector matrix
 
-Consequently, append-mode Delta Lake and Iceberg are implemented/admitted local exactly-once
-candidates, not production-certified paths. Even those candidates are admitted only with the
-built-in local checkpoint/decision store; a configured remote or `file://` checkpoint URL and an
-injected decision store fail closed with `[LDB-0014]`. Their current connector tests do not replace
-a full engine process-death/output-oracle matrix. A local Kafka-to-Delta/Iceberg path is reachable
-in the implementation but remains **uncertified** until its pre-first-record, process-death,
-restart, and partition-topology cases pass. Kafka-to-Kafka remains at-least-once because the Kafka
-sink is not `CheckpointCommittable`. Kafka append is multi-writer; compacted upsert is singleton
-until writer-generation ordering is fenced across handoff.
+| Connector path | Current contract | Embedded/single-node | Cluster |
+|---|---|---|---|
+| Deterministic generator source | Replayable, exact-certified singleton | At-least-once; the only source admitted for the local exact candidate | Rejected: singleton placement and cluster exact remain closed |
+| Kafka source | Replayable, splittable when engine-assigned | At-least-once for explicit engine-owned topic/partition baselines; exact delivery rejected by LDB-5037 pending certification; dynamic group ownership is best effort | At-least-once after exact assignment and drain certification |
+| Kafka sink | DurableAtLeastOnce with durable broker acknowledgement; weaker acknowledgements are ephemeral | At-least-once; never CheckpointCommittable | At-least-once |
+| PostgreSQL CDC source | CommitCoupled singleton | Fresh Initial startup is rejected before I/O; exact-checkpoint resume is read-only and binds the PostgreSQL cluster, exact WAL timeline/socket, database, publication definition, slot properties, and source filters; unsupported TRUNCATE publications fail admission; whole transactions are emitted atomically; exactly-once admission remains closed pending bootstrap and certification | Rejected until fenced singleton placement exists; timeline changes and failover remain rejected |
+| MongoDB CDC source | Replayable singleton | Versioned post-batch/resume/start-after replay binds the deployment and collection UUID; exact delivery is rejected by LDB-5037 pending certification; there is no initial collection snapshot or transaction-group guarantee | Rejected until fenced singleton placement exists |
+| Delta Lake source | Ephemeral singleton | Local best effort only | Rejected |
+| Iceberg source | Ephemeral singleton; REST catalog | Local best effort only | Rejected |
+| PostgreSQL/MongoDB append sink | DurableAtLeastOnce, multiwriter | At-least-once | At-least-once |
+| PostgreSQL/MongoDB mutable sink | DurableAtLeastOnce, singleton | At-least-once | Rejected until keyed or singleton writer handoff is fenced |
+| Delta Lake sink | DurableAtLeastOnce normally; coordinated append is CheckpointCommittable | Coordinated append is reachable for exact validation only with the certified generator and remains uncertified end to end | At-least-once for a shared append target; exactly-once rejected |
+| Iceberg sink | DurableAtLeastOnce REST-catalog append; never CheckpointCommittable | At-least-once | At-least-once only for a shared multiwriter warehouse |
+| MySQL CDC source | Not exposed | Bounded decoding, snapshot, and replay are prerequisites for re-entry | Not exposed |
 
-Kafka source group offsets are progress telemetry, not recovery authority. After a LaminarDB
-checkpoint commits, the source enqueues the corresponding broker offset asynchronously and records
-the eventual callback outcome as a metric. A broker-progress failure must not restart or invalidate
-the already-decided engine cut; recovery always uses the sealed source checkpoint. This follows the
-current Flink Kafka source contract, which likewise treats broker commits as monitoring progress
-rather than fault-tolerance state
-([Kafka source offset committing](https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/datastream/kafka/#consumer-offset-committing)).
+Kafka broker offsets are monitoring progress, not recovery authority. MongoDB replay tokens provide
+event-level replay and do not prove an upstream transaction boundary. PostgreSQL and MongoDB
+exactly-once sinks will require a short target transaction that applies deterministic operations
+and conditionally advances an exact predecessor cursor; ambiguous responses are resolved by
+reading that cursor.
 
-Do not restore the former inline Kafka transaction path. A process can die after the engine's
-durable decision but before `commit_transaction`; a new producer with the same transactional ID
-fences the old session and Kafka aborts its unresolved transaction, but LaminarDB has no durable
-committable from which to reproduce output that was aborted before publication. Kafka's
-transaction protocol requires stable transactional IDs and
-atomic commit markers ([KIP-98](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging)); moving partition ownership also
-requires group-generation fencing ([KIP-447](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/103093950/KIP-447%2BProducer%2Bscalability%2Bfor%2Bexactly%2Bonce%2Bsemantics)). Flink likewise makes
-Kafka transactions checkpoint-owned, requires a stable transactional-ID prefix, and documents
-checkpoint-bounded visibility and transaction-timeout constraints.
+## Public configuration
 
-Implement the remaining work in this order:
+Keep public choices to runtime mode, requested delivery, source scope/start policy, connection and
+security data, durable storage location and namespace, checkpoint cadence and end-to-end deadline,
+recovery objective, deterministic sink keys, and hard memory/local-cache budgets. State exposes at
+most one immutable deployment-level `key_groups` expert setting; runtime mode derives the physical
+in-memory, local-disk, cache, and shared-checkpoint policy. Do not expose placement, gossip
+consistency, compaction strategy, or separate backend-specific vnode-capacity matrices.
 
-1. **Certify the current corrective protocol.** Prove write-ahead decision ambiguity, follower
-   assignment-cut validation, fail-closed vnode rehydration, batch/cursor rotation fencing, and
-   latest-pointer corruption before another feature is admitted. Run process-death output oracles,
-   not only unit models.
-2. **Make the existing matrix truthful and useful.** Use the typed `Embedded | Cluster` server
-   boundary and remove the unused Raft coordination settings; embedded and standalone API hosting
-   share the local checkpoint protocol. Keep consistency, topology, and input mode derived from
-   connector contracts. Certify local Kafka initial, pre-first-record, restart, and topology-drift
-   behavior. Give Iceberg a real direct-append at-least-once path (or prove that its coordinated
-   protocol is safe under an at-least-once request).
-3. **Build the canonical cluster recovery capsule.** This is the first remaining availability
-   blocker because cluster at-least-once already admits stateful pipelines, while a replacement
-   participant cannot safely reconstruct participant-local operator, table, or watermark state.
-   Seal a decision-bound global recovery image, not an arbitrary participant's local manifest.
-   It must bind the assignment, every participant readiness digest, source-offset union,
-   cluster-min watermark, operator/table-state roots, and any materialized-view metadata needed
-   after ownership changes. Keep the current metadata-only peer bootstrap as a narrow
-   optimization; reject non-portable donor state until this capsule is implemented and
-   fault-tested.
-4. **Certify source transaction cuts.** Add a deadline-bounded async barrier-prepare hook for
-   commit-coupled CDC. PostgreSQL CDC must either drain through the current database transaction
-   before emitting its barrier or persist the transaction identifier, event ordinal, and in-flight
-   payload. Merely removing its admission rejection can replay a partially emitted transaction.
-5. **Add recoverable Kafka sink committables, local first.** Stage encoded record segments durably
-   before the seal and keep participant descriptors small and checksummed. After the exact engine
-   decision, a designated committer opens a fresh Kafka transaction, publishes the staged records
-   plus a namespaced exact cursor marker atomically, and resolves ambiguous commits by reading that
-   cursor with `read_committed`. Derive the transactional ID from pipeline identity, deployment,
-   sink, and participant; do not add a public writer-ID dimension. Reject a non-transactional DLQ
-   under exactly-once and validate transaction timeout against checkpoint plus recovery bounds.
-   Preserve the current direct producer path for low-latency at-least-once operation.
-6. **Build a linearizable cluster decision authority.** Complete AD-0 from
-   `cluster-production-readiness.md`: use the authoritative Postgres control store to insert the
-   seal-bound decision in a transaction conditioned on the current owner and fencing term. The
-   removed legacy `strategy = "raft"`/`raft_port` settings never constituted a Raft implementation
-   and cannot justify removing `LDB-0013`.
-7. **Fence and certify every external committer.** External cursors must carry the exact
-   predecessor, deployment namespace, and decision fence. Run stale-leader, network-partition,
-   rebalance, process-death-before/after-decision, ambiguous Kafka commit, mixed-sink, and
-   transaction-timeout matrices before admitting cluster exactly-once.
+Consistency, topology, and sink input mode remain typed internal connector contracts because they
+enforce independent admission proofs; they are not user options. Derive writer identity,
+transaction alignment, snapshot concurrency, batching, retry cadence, shuffle behavior, and
+publication ownership. State writer identity is private: local modes use a local audit identity and
+cluster mode derives it from the runtime node.
+Vnode count should be an immutable deployment-level expert setting at most.
 
-Keep consistency, topology, and input mode as derived connector contract dimensions rather than
-user options. The public delivery setting remains the requested end-to-end minimum; diagnostics
-and status APIs should also expose the effective source/state/sink guarantee so a narrower matrix
-cannot be mistaken for broad exactly-once support.
+Use one absolute checkpoint-attempt deadline, one connector health deadline carried from enqueue
+to acknowledgement, and a private bounded cleanup budget. Stage-specific timeout resets, writer
+IDs, per-sink checkpoint statuses, and independent polling thresholds do not belong in the public
+checkpoint surface.
 
-## Exit gates
+## Implementation order
 
-- All-target compilation for core, connectors, DB (local and `cluster`), and server.
-- Deterministic tests for decision ambiguity, exact seal inventory, cursor rollback/overlap,
-  successor-epoch failure, total attempt deadline, decision-floor monotonicity/continuity,
-  retention coalescing, and owned-task shutdown quiescence.
-- Fault-injection/soak runs for process death before/after seal, during decision creation, during
-  external commit, and during shutdown.
-- Latency verification separates pipeline stall, restorable-gate wait, durable completion, and
-  external-commit lag; retention work must never appear on the source-ack critical path.
-- Dead-code and configuration audit after every feature cycle.
+1. **Close durable authority races first.** Resolve delayed terminal-outcome and recovery-capsule
+   writes, term-fence every durable per-node recovery-control value, preserve the global recovery
+   generation across process terms, and fail unknown gossip lifecycle state closed. These are
+   recovery-cut prerequisites, not state-engine work.
+2. **Certify the corrective checkpoint core.** Complete compile and deterministic tests for seal
+   provenance and bounds, decision ambiguity, recovery capsules, assignment adoption, retention,
+   shutdown tails, and corruption. Run the finite local process-death output oracle and remove dead
+   code before another feature cycle.
+3. **Fail closed on mutable capture errors.** Operator and vnode capture can consume dirty sets or
+   drain accumulators before rebuilding them. Any capture error must fault the pipeline and recover
+   from the last committed cut before sources resume. Prove this with an injected drain/rebuild
+   failure in local and cluster execution; an in-memory retry is not safe.
+4. **Cancel superseded shuffle scope before rotation.** Bind every blocking connect, send, receive,
+   queue, byte permit, and stream slot to the exact assignment/recovery scope. Invalidation,
+   suspension, rewind, or replacement must cancel that scope before waiting for the rotation fence.
+   Once a newer durable assignment is audited, close old source and shuffle authority before any
+   handoff or state read, carry one absolute deadline, and remain fenced on failure.
+5. **Isolate shuffle delivery classes and harden routing.** Give checkpointed data/barriers and
+   ephemeral subscriptions separate bounded queues, byte reservations, and holdovers under one
+   node memory cap and separate connections. Preserve one FIFO domain for checkpointed data plus
+   barriers. Make routing
+   return errors for invalid owner/vnode inputs, prove row-count conservation, and reject reserved
+   protocol field/stage names at DDL admission.
+6. **Make durable configuration fail closed and remove false choices.** Replace the duplicated
+   state/checkpoint roots with one explicit storage URL and deployment namespace, derive physical
+   policy from runtime mode, and persist the immutable key-group count in that namespace. Local
+   guaranteed delivery must reject temporary or absent storage; cluster must reject node-local
+   storage. Remove the dead profile policy, ignored pipeline parallelism, public retention count,
+   and backend matrix before certifying deployment artifacts. Helm must render no guaranteed mode
+   onto `emptyDir`.
+7. **Certify the cluster at-least-once protocol on stateless and explicitly bounded small-state
+   graphs.** Test the exact shuffle roster, sequence/high-water loss detection, reconnect, process
+   replacement, rebalance, recovery Release, capsule restore, and authority retention under static
+   and gossip discovery. This is protocol evidence, not stateful cluster production certification,
+   and must not be reported as exactly-once evidence.
+8. **Make snapshot capture bounded and non-blocking.** Capture one concrete immutable checkpoint
+   image in the aligned section, then encode and upload it in one owned blocking job. Use a single
+   fallible byte reservation across graph, materialized views, tables, and vnodes; retain the charge
+   until a timed-out worker actually exits. Optimize dirty-only vnode capture in a separate ancestry
+   cycle. Validate event-loop and ingestion p99 plus RSS before lifting any cluster stateful gate.
+9. **Finish durable authority and generic singleton placement.** Keep the exclusive local
+   implementation for embedded/single. Use a linearizable cluster authority, with PostgreSQL as
+   the first implementation, for owner terms, assignments, decisions, recovery rounds, and source
+   handoff. Non-owners stay dormant; an old owner cannot acknowledge source progress or write a
+   mutable sink after handoff.
+10. **Benchmark, then implement common keyed working state without changing recovery truth.** Run a
+   working set larger than RAM on target Linux NVMe under sustained mixed reads, writes,
+   checkpointing, and compaction. Gate latency percentiles, throughput, CPU, RSS, write
+   amplification, crash reopen, and corruption in all three runtime modes before choosing the LSM.
+   Shared checkpoints remain primary in cluster and local recovery remains an optimization. Keep
+   compaction and remote persistence off the record path.
+11. **Complete PostgreSQL source correctness.** The current resume path binds the system, timeline,
+   database, publication, slot, and filter identity at admission, then revalidates the system,
+   timeline, database, slot cursor, and WAL upper bound on the exact replication socket. Timeline
+   changes and TRUNCATE publications fail closed. Next, create an exported-snapshot logical slot
+   while its replication session remains open, run internally bounded parallel snapshot readers,
+   then continue WAL from the same consistent point. Add continuous publication and slot drift
+   fencing before a durable decision, validate failover-slot ancestry and readiness, support
+   streamed transactions, and reject unsupported two-phase messages. Certify local at-least-once,
+   local exact, then clustered singleton failover.
+12. **Complete MongoDB source correctness.** Certify the current event-token and post-batch replay,
+   then add a bounded snapshot/change-stream repair protocol. Bind deployment, FCV, scope,
+   pipeline/options, and collection UUIDs; fail closed on history loss and unsupported invalidation
+   transitions. Do not advertise transaction-group atomicity.
+13. **Certify database sink throughput, then add exact cursors.** Preserve bounded PostgreSQL COPY
+   and MongoDB bulk paths for low-latency at-least-once. Add key-affine or fenced singleton
+   placement for mutable cluster writes. Implement target-transaction cursor protocols locally
+   before cluster fencing and ambiguous-commit tests.
+14. **Add remaining recoverable external publication.** Stage Kafka records durably and publish
+   them with an exact namespaced cursor in a fresh transaction after the engine decision. Certify
+   Delta first; Iceberg remains at-least-once until it has a real predecessor-cursor committer.
+   Remove LDB-0013 only for each concrete source/state/sink combination that passes the complete
+   stale-leader, partition, rebalance, process-death, and ambiguous-commit matrix—never globally.
 
-The previous local gate counts are intentionally not reused as certification evidence: the current
-cycle changes decision persistence, follower preparation, source rotation, and rehydration. Strict
-Clippy, all-feature compilation, complete local suites, public cluster adoption, and the full Linux
-fault matrix must be rerun on the final commit and recorded with that exact SHA.
-The first Linux fault matrix (`29169226798`) completed four embedded kill-9 rounds with aggregate
-state continuity, 908 demotions, and 31,025 cold-state fetches. Its cluster legs exposed an
-unaligned rkyv vnode payload returned from object storage after the first fault; object-store reads
-now normalize that buffer once and the decoder also protects custom backends. The deliberately
-misaligned regressions pass locally; the production matrix must pass on the corrective commit
-before release.
+## Validation gates
 
-Remaining deliberate gap: cluster exactly once requires a term-fenced decision/external-commit
-protocol. Until that exists, admitting it would be less correct than failing configuration.
+- Format, strict lint, and all relevant feature combinations for core, connectors, DB, and server.
+- Deterministic tests for every immutable record, bound, conflict, timeout, cancellation, retention,
+  and recovery invariant.
+- Docker integration tests for PostgreSQL logical slots/snapshot/failover, MongoDB replica-set and
+  sharded replay/history loss, Kafka, and object-store lakehouse commits.
+- Integration commands must assert the expected selected-test count and fail when Docker, Kafka,
+  MinIO, PostgreSQL, or MongoDB is unreachable; a zero-test or dependency-skip exit is not evidence.
+- Fault injection before and after capture, seal, Prepared publication, decision, source feedback, external cursor
+  commit, rebalance, and shutdown. Recovery assertions use exact checkpoint ID and epoch.
+- Local exactly-once soak uses the finite hard-kill source/state/output oracle, not a clean-close
+  recovery smoke test. Cluster
+  at-least-once soak checks no gaps or coherent state rollback while treating duplicates according
+  to its advertised contract.
+- Performance gates record rows and bytes per second, p50/p95/p99 source-to-output latency, batch
+  residence, checkpoint stall, durable completion, external-publication lag, spill, and recovery.
+- Remove superseded code and unused configuration after every feature cycle, then rerun the
+  proportional gates. The final Linux fault matrix and latency record must name the exact commit.
 
-The file source now checkpoints one exact, unbounded processed-file inventory plus a hash-verified
-partial-file row cursor; it never truncates correctness state or treats a probabilistic membership
-result as authoritative. In-memory inventory inserts are `O(log N)`, and immutable source-offset
-snapshots/clones are `O(1)` through a structurally shared serialized-fragment tree. The full
-`O(processed files)` string is built only when DB converts the source position into the durable
-checkpoint manifest (or during explicit compatibility/recovery access), without retaining a
-second materialized copy in the source snapshot. Durable storage is still a full payload, not an
-append log. A later cycle may introduce a checksummed durable inventory log and paged compaction
-whose exact root/cursor is sealed by the checkpoint manifest; it must not reintroduce eviction or
-false-positive data loss.
+## Primary research and implementation references
 
-The full durable source-offset map is materialized on a deadline-bounded blocking worker in the
-leader/follower durable tail, after the callback has released the pipeline and before the
-checkpoint coordinator mutex is acquired. Connector startup follows the same single-budget model:
-all sink opens in one stage and all source starts in one stage share the checkpoint-derived
-absolute deadline, while failed stages use one private shared cleanup deadline.
-
-MySQL CDC now advertises only behavior it executes: one fully qualified table, explicit unique
-`server.id`, strict GTID selection, and real buffer/backpressure controls. It remains an honest
-ephemeral/best-effort source until a certified snapshot plus replay/resume protocol is implemented;
-reader task or stream failure is terminal rather than silently appearing as an empty poll.
-
-NATS source behavior is likewise aligned with its ephemeral contract. JetStream messages are
-acknowledged asynchronously only after successful deserialization through an owned, bounded worker
-with capped concurrency and private I/O deadlines; no checkpoint-owned ack queue can grow forever
-when checkpointing is disabled. Queue saturation or ack failure leaves messages eligible for
-broker redelivery, and reader termination becomes a terminal source error after queued data drains.
+- Apache Flink 2.3 [fault tolerance](https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/),
+  [state backends](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/),
+  [experimental disaggregated state](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/disaggregated_state/),
+  and [network tuning](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/memory/network_mem_tuning/)
+- Apache Spark 4.1.2 [state and shuffle invariants](https://spark.apache.org/docs/latest/streaming/additional-information.html),
+  RisingWave [architecture](https://docs.risingwave.com/get-started/architecture), and Arroyo
+  [architecture](https://doc.arroyo.dev/architecture/)
+- PostgreSQL 18 [replication protocol](https://www.postgresql.org/docs/18/protocol-replication.html),
+  [logical decoding](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html), and
+  [logical replication failover](https://www.postgresql.org/docs/18/logical-replication-failover.html)
+- MongoDB [change streams](https://www.mongodb.com/docs/manual/changestreams/), current
+  [production guidance](https://www.mongodb.com/docs/manual/administration/change-streams-production-recommendations/),
+  and the accepted [driver specification](https://github.com/mongodb/specifications/blob/master/source/change-streams/change-streams.md)
+- Apache Flink CDC 3.6 [PostgreSQL](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.6/docs/connectors/flink-sources/postgres-cdc/)
+  and [MongoDB](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.6/docs/connectors/flink-sources/mongodb-cdc/)
+- [DBLog](https://arxiv.org/abs/2010.12597), its 2026
+  [certified virtual-cut formalization](https://arxiv.org/abs/2605.31475), and Moonlink's
+  [Arrow/NVMe design](https://github.com/Mooncake-Labs/moonlink)
+- [CheckMate](https://arxiv.org/abs/2403.13629) for workload-sensitive checkpoint protocol choice
+  and [PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf) for end-to-end guarantee validation
+  under injected process and network faults

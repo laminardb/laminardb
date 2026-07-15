@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
+use laminar_core::catalog::CatalogObjectKind;
 use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
@@ -36,9 +37,26 @@ pub(crate) enum DbState {
     Running = 2,
     ShuttingDown = 3,
     Stopped = 4,
-    /// Compute thread crashed (operator panic). Recoverable, unlike `Stopped`:
-    /// `start()` rebuilds from the catalog. Reason in `LaminarDB::last_fault`.
+    /// Runtime fault. Recoverable faults may restart from the catalog; terminal resource
+    /// exhaustion remains faulted for operator intervention. Reason in `LaminarDB::last_fault`.
     Faulted = 5,
+}
+
+/// Deployment scope fixed when the database is constructed.
+///
+/// Cluster support being compiled into the process does not select cluster semantics. The
+/// builder resolves this value once and separately verifies that cluster-only handles agree with
+/// it, so admission cannot change because a controller slot happens to be populated later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeMode {
+    Local,
+    Cluster,
+}
+
+impl RuntimeMode {
+    pub(crate) const fn is_cluster(self) -> bool {
+        matches!(self, Self::Cluster)
+    }
 }
 
 impl DbState {
@@ -81,14 +99,116 @@ impl DbState {
     }
 }
 
-fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
-    (mem.as_bytes() / 256).max(1024) as usize
+const DB_IO_WORKER_THREADS: usize = 2;
+
+struct DbControlRuntimeInner {
+    handle: tokio::runtime::Handle,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Lazily-created executor for connector I/O and lifecycle ownership.
+///
+/// The runtime itself lives on a detached owner thread, so dropping a DB from async code never
+/// blocks on Tokio shutdown. The fixed two-worker size keeps control and feedback traffic live
+/// while one connector future is temporarily busy without adding a public tuning dimension.
+pub(crate) struct DbControlRuntime {
+    inner: parking_lot::Mutex<Option<DbControlRuntimeInner>>,
+}
+
+impl DbControlRuntime {
+    fn new() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn handle(&self) -> Result<tokio::runtime::Handle, DbError> {
+        let mut owned = self.inner.lock();
+        if let Some(runtime) = owned.as_ref() {
+            return Ok(runtime.handle.clone());
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let owner = std::thread::Builder::new()
+            .name("laminar-io-owner".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(DB_IO_WORKER_THREADS)
+                    .thread_name("laminar-io")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(runtime.handle().clone())).is_err() {
+                    return;
+                }
+                runtime.block_on(async {
+                    let _ = shutdown_rx.await;
+                });
+                runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+            })
+            .map_err(|error| {
+                DbError::Pipeline(format!("failed to spawn LaminarDB I/O runtime: {error}"))
+            })?;
+        // The shutdown sender is the nonblocking owner. The OS thread terminates after it fires.
+        drop(owner);
+
+        let handle = ready_rx
+            .recv()
+            .map_err(|_| {
+                DbError::Pipeline("LaminarDB I/O runtime exited during initialization".into())
+            })?
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "failed to initialize LaminarDB I/O runtime: {error}"
+                ))
+            })?;
+        *owned = Some(DbControlRuntimeInner {
+            handle: handle.clone(),
+            shutdown: shutdown_tx,
+        });
+        Ok(handle)
+    }
+}
+
+impl Drop for DbControlRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.inner.get_mut().take() {
+            let _ = runtime.shutdown.send(());
+        }
+    }
+}
+
+pub(crate) fn canonical_object_name(name: &sqlparser::ast::ObjectName) -> Result<String, DbError> {
+    let [part] = name.0.as_slice() else {
+        return Err(DbError::InvalidOperation(format!(
+            "catalog identifiers must be unqualified: {name}"
+        )));
+    };
+    let ident = part.as_ident().ok_or_else(|| {
+        DbError::InvalidOperation(format!(
+            "dynamic catalog identifier is not supported: {name}"
+        ))
+    })?;
+    Ok(ident.value.clone())
+}
+
+pub(crate) fn exact_table_reference(name: &str) -> datafusion::common::TableReference {
+    // `Into<TableReference>` reparses `&str` and lowercases it independently of session config.
+    datafusion::common::TableReference::bare(name)
 }
 
 /// The main `LaminarDB` database handle.
 ///
 /// Unified interface for SQL execution, data ingestion, and result consumption.
 pub struct LaminarDB {
+    runtime_mode: RuntimeMode,
     pub(crate) catalog: Arc<SourceCatalog>,
     pub(crate) planner: parking_lot::Mutex<StreamingPlanner>,
     pub(crate) ctx: SessionContext,
@@ -102,9 +222,15 @@ pub struct LaminarDB {
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
-    /// Panic message when the compute thread exits unexpectedly (`Faulted`);
+    /// Last recoverable runtime fault, panic, or terminal resource-exhaustion reason;
     /// cleared on a clean start. Surfaced via `pipeline_status`/`/ready`.
     pub(crate) last_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Permanent per-instance fence set when catalog cleanup cannot prove that every backing
+    /// registration was removed. Unlike a normal runtime fault, this is never restartable.
+    pub(crate) catalog_cleanup_fenced: std::sync::atomic::AtomicBool,
+    /// Deterministic provider-deregistration failure used to exercise the terminal cleanup fence.
+    #[cfg(test)]
+    pub(crate) catalog_cleanup_deregister_fault: parking_lot::Mutex<Option<String>>,
     /// Self-ref set by `enable_supervision`; empty `Weak` (default) disables auto-restart.
     pub(crate) supervisor_self: Arc<parking_lot::Mutex<std::sync::Weak<LaminarDB>>>,
     /// Auto-restart timestamps within the sliding window; bounds restart storms.
@@ -113,18 +239,41 @@ pub struct LaminarDB {
     /// owner is currently joining only while this lock is held; another caller must never treat
     /// it as completed teardown.
     pub(crate) lifecycle_lock: tokio::sync::Mutex<()>,
+    pub(crate) control_runtime: DbControlRuntime,
+    pub(crate) startup_attempt:
+        parking_lot::Mutex<Option<Arc<crate::pipeline_lifecycle::StartupAttempt>>>,
+    /// Serializes topology DDL through manifest persistence; catalog reads take a shared guard so
+    /// they cannot observe a tentative create that may still roll back.
+    pub(crate) topology_ddl_lock: tokio::sync::RwLock<()>,
+    /// Typed ownership for every user-visible catalog identifier.
+    pub(crate) catalog_namespace: parking_lot::Mutex<HashMap<String, CatalogObjectKind>>,
+    #[cfg(test)]
+    pub(crate) topology_planning_gate:
+        parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    pub(crate) stop_after_claim_gate:
+        parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) catalog_seal_gate:
+        parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Set at pipeline start when a sink is exactly-once; gates the rotation drain.
     pub(crate) rotation_drain_required: Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Decoupled coordinated-commit committer task; aborted on shutdown.
-    pub(crate) committer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Kept inside an async mutex while joined. A cancelled stop future drops only the guard,
+    /// never the sole watcher handle, so a retry cannot publish a false terminal state.
+    pub(crate) runtime_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Decoupled coordinated-commit committer task. Awaited in place so cancellation cannot lose
+    /// the sole handle while an issued external commit is still completing.
+    pub(crate) committer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// OS-released exclusive lock for a local exactly-once checkpoint namespace. Deployment
     /// identity prevents reuse after reset; this lock prevents two live processes from writing
     /// divergent cuts into the same deployment.
     pub(crate) exact_deployment_lock: parking_lot::Mutex<Option<std::fs::File>>,
-    /// Sink tasks created during `start_inner`; retained until startup commits so
-    /// any later error can close them instead of detaching external connectors.
-    pub(crate) startup_sink_handles: parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>,
+    /// Every sink actor in the active generation, retained from spawn until terminal observation.
+    /// A replacement cannot start while any prior actor can still mutate an external system.
+    pub(crate) owned_sink_handles: Arc<parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>>,
+    /// Every source task in the active or draining generation. A replacement cannot start until
+    /// the stable supervisor has observed actual task exit, including after Tokio cancellation.
+    pub(crate) owned_source_tasks: crate::pipeline::streaming_coordinator::OwnedSourceTasks,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
@@ -149,17 +298,18 @@ pub struct LaminarDB {
     /// local latest (taken in `start_inner`).
     #[cfg(feature = "cluster")]
     pub(crate) recover_target_epoch: parking_lot::Mutex<Option<u64>>,
-    /// One-shot guard for the recovery-monitor spawn.
+    /// Database-owned recovery supervisor. It outlives restartable pipeline generations and is
+    /// aborted if the facade is dropped without a graceful terminal shutdown.
     #[cfg(feature = "cluster")]
-    pub(crate) recovery_monitor_started: std::sync::atomic::AtomicBool,
+    pub(crate) recovery_monitor: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Prevents a timed-out coordinated stop/start from overlapping a later lifecycle attempt.
+    /// Cleared by the owning lifecycle thread only after its future actually finishes.
+    #[cfg(feature = "cluster")]
+    pub(crate) coordinated_lifecycle_active: Arc<std::sync::atomic::AtomicBool>,
     /// Epoch the most recent start restored from (`None` = started fresh). A rejoin fault
     /// is reported only when prior local state existed — a fresh joiner lost no window.
     #[cfg(feature = "cluster")]
     pub(crate) last_recovery_epoch: parking_lot::Mutex<Option<u64>>,
-    /// Coordinated rounds applied by this process; a rejoin fault racing a round that
-    /// already restored this node must not trigger another.
-    #[cfg(feature = "cluster")]
-    pub(crate) coordinated_restores: std::sync::atomic::AtomicU64,
     /// Holds source intake closed during a coordinated round until every node has restarted
     /// and rebound its shuffle receiver (the restore quorum). Sources re-read + re-shuffle the
     /// replay window on restart; without this gate a node that restarts first shuffles into a
@@ -177,7 +327,6 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
-    /// `Arc`-wrapped so the subscription-router task can hold a weak handle.
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_receiver:
         Arc<parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>>,
@@ -187,10 +336,13 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) assignment_snapshot_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
-    /// Cluster-wide catalog manifest; persisted on checkpoint, replayed at boot.
+    /// Create-once cluster catalog inventory, sealed at bootstrap and replayed at boot.
     #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
+    /// Pre-built shared checkpoint namespace installed during cluster construction.
+    #[cfg(feature = "cluster")]
+    cluster_checkpoint_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Vnode state staged during rebalance adoption; operators drain it each cycle to resume
     /// from the last committed epoch. Shared with `OperatorGraph` via `ClusterShuffleConfig`.
     #[cfg(feature = "cluster")]
@@ -199,6 +351,18 @@ pub struct LaminarDB {
     /// in-memory state so a later re-acquire merges into empty state (no additive double-count).
     #[cfg(feature = "cluster")]
     pub(crate) pending_revoke_vnodes: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<u32>>>,
+    /// Process incarnation for which local vnode state has been restored or initialized.
+    #[cfg(feature = "cluster")]
+    local_state_incarnation: parking_lot::Mutex<Option<uuid::Uuid>>,
+    /// Serializes successor preparation with assignment-certificate publication. Remote state
+    /// reads do not hold the compute-cycle fence, but an old certificate must never be re-opened
+    /// while a newer audited assignment is being prepared.
+    #[cfg(feature = "cluster")]
+    pub(crate) assignment_adoption_lock: tokio::sync::Mutex<()>,
+    /// Changes whenever local assignment authority is suspended or invalidated. The snapshot
+    /// watcher uses it to reject a certificate computed from a head read before that closure.
+    #[cfg(feature = "cluster")]
+    pub(crate) assignment_authority_revision: std::sync::atomic::AtomicU64,
     /// Linearizes assignment publication with compute-cycle entry so staged
     /// revoke/rehydration state is applied before any row observes new ownership.
     #[cfg(feature = "cluster")]
@@ -207,10 +371,6 @@ pub struct LaminarDB {
     /// barrier admission. `None` means no running pipeline can produce a valid cut.
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// stream/MV name → subscribing node ids; refreshed from gossip by the router task.
-    #[cfg(feature = "cluster")]
-    pub(crate) active_subs:
-        Arc<parking_lot::RwLock<std::collections::HashMap<String, std::collections::HashSet<u64>>>>,
     /// Resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
@@ -218,6 +378,10 @@ pub struct LaminarDB {
 
 impl Drop for LaminarDB {
     fn drop(&mut self) {
+        #[cfg(feature = "cluster")]
+        if let Some(monitor) = self.recovery_monitor.get_mut().take() {
+            monitor.abort();
+        }
         if matches!(
             DbState::load(&self.state),
             DbState::Starting | DbState::Running | DbState::ShuttingDown | DbState::Faulted
@@ -239,10 +403,353 @@ impl Drop for LaminarDB {
 
 #[cfg(feature = "cluster")]
 fn checkpoint_participant_for_runtime(db: &LaminarDB) -> Option<u64> {
+    if !db.is_cluster_runtime() {
+        return None;
+    }
     db.cluster_controller
         .lock()
         .as_ref()
         .map(|controller| controller.instance_id().0)
+}
+
+#[cfg(feature = "cluster")]
+tokio::task_local! {
+    static CATALOG_MANIFEST_REPLAY: ();
+}
+
+#[cfg(feature = "cluster")]
+tokio::task_local! {
+    static CATALOG_BOOTSTRAP: ();
+}
+
+#[cfg(feature = "cluster")]
+struct CatalogBootstrapGuard<'a> {
+    db: &'a LaminarDB,
+    created: Vec<(String, CatalogObjectKind)>,
+    sealed: bool,
+}
+
+#[cfg(feature = "cluster")]
+impl CatalogBootstrapGuard<'_> {
+    fn record(&mut self, name: String, kind: CatalogObjectKind) {
+        self.created.push((name, kind));
+    }
+
+    fn sealed(mut self) {
+        self.sealed = true;
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for CatalogBootstrapGuard<'_> {
+    fn drop(&mut self) {
+        if !self.sealed {
+            for (name, kind) in self.created.iter().rev() {
+                self.db
+                    .rollback_catalog_create_or_fence(name, *kind, "catalog bootstrap rollback");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn catalog_manifest_replay_active() -> bool {
+    CATALOG_MANIFEST_REPLAY.try_with(|_| ()).is_ok()
+}
+
+#[cfg(feature = "cluster")]
+fn catalog_bootstrap_active() -> bool {
+    CATALOG_BOOTSTRAP.try_with(|_| ()).is_ok()
+}
+
+#[cfg(not(feature = "cluster"))]
+pub(crate) const fn catalog_manifest_replay_active() -> bool {
+    false
+}
+
+fn is_topology_ddl(statement: &StreamingStatement) -> bool {
+    match statement {
+        StreamingStatement::CreateSource(_)
+        | StreamingStatement::CreateSink(_)
+        | StreamingStatement::CreateContinuousQuery { .. }
+        | StreamingStatement::DropSource { .. }
+        | StreamingStatement::DropSink { .. }
+        | StreamingStatement::DropMaterializedView { .. }
+        | StreamingStatement::CreateMaterializedView { .. }
+        | StreamingStatement::CreateStream { .. }
+        | StreamingStatement::DropStream { .. }
+        | StreamingStatement::AlterSource { .. }
+        | StreamingStatement::CreateLookupTable(_)
+        | StreamingStatement::DropLookupTable { .. } => true,
+        StreamingStatement::Standard(statement) => matches!(
+            statement.as_ref(),
+            sqlparser::ast::Statement::CreateTable(_)
+                | sqlparser::ast::Statement::Drop {
+                    object_type: sqlparser::ast::ObjectType::Table,
+                    ..
+                }
+                | sqlparser::ast::Statement::AlterTable { .. }
+        ),
+        _ => false,
+    }
+}
+
+fn mutates_database(statement: &StreamingStatement) -> bool {
+    is_topology_ddl(statement)
+        || matches!(
+            statement,
+            StreamingStatement::InsertInto { .. }
+                | StreamingStatement::Checkpoint
+                | StreamingStatement::RestoreCheckpoint { .. }
+        )
+        || matches!(
+            statement,
+            StreamingStatement::Standard(statement)
+                if matches!(statement.as_ref(), sqlparser::ast::Statement::Set(_))
+        )
+}
+
+fn reads_catalog(statement: &StreamingStatement) -> bool {
+    matches!(
+        statement,
+        StreamingStatement::Standard(statement)
+            if matches!(statement.as_ref(), sqlparser::ast::Statement::Query(_))
+    ) || matches!(
+        statement,
+        StreamingStatement::InsertInto { .. }
+            | StreamingStatement::Show(_)
+            | StreamingStatement::Describe { .. }
+            | StreamingStatement::Explain { .. }
+    )
+}
+
+#[cfg(feature = "cluster")]
+fn catalog_create_identity(
+    statement: &StreamingStatement,
+) -> Result<Option<(String, CatalogObjectKind, &'static str)>, DbError> {
+    let identity = match statement {
+        StreamingStatement::CreateSource(create) => (
+            canonical_object_name(&create.name)?,
+            CatalogObjectKind::Source,
+            "CREATE SOURCE",
+        ),
+        StreamingStatement::CreateSink(create) => (
+            canonical_object_name(&create.name)?,
+            CatalogObjectKind::Sink,
+            "CREATE SINK",
+        ),
+        StreamingStatement::CreateMaterializedView { name, .. } => (
+            canonical_object_name(name)?,
+            CatalogObjectKind::MaterializedView,
+            "CREATE MATERIALIZED VIEW",
+        ),
+        StreamingStatement::CreateStream { name, .. } => (
+            canonical_object_name(name)?,
+            CatalogObjectKind::Stream,
+            "CREATE STREAM",
+        ),
+        StreamingStatement::CreateLookupTable(create) => (
+            canonical_object_name(&create.name)?,
+            CatalogObjectKind::LookupTable,
+            "CREATE LOOKUP TABLE",
+        ),
+        StreamingStatement::Standard(statement) => {
+            let sqlparser::ast::Statement::CreateTable(create) = statement.as_ref() else {
+                return Ok(None);
+            };
+            (
+                canonical_object_name(&create.name)?,
+                CatalogObjectKind::Table,
+                "CREATE TABLE",
+            )
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(identity))
+}
+
+#[cfg(feature = "cluster")]
+fn validate_cluster_catalog_create(
+    sql: &str,
+    statement: &StreamingStatement,
+) -> Result<(String, CatalogObjectKind, &'static str), DbError> {
+    if matches!(
+        statement,
+        StreamingStatement::CreateStream {
+            retention_bytes: Some(_),
+            ..
+        }
+    ) {
+        return Err(DbError::Unsupported(
+            "CREATE STREAM RETAIN HISTORY is not supported in cluster runtime until replay is globally ordered and checkpoint-aligned"
+                .into(),
+        ));
+    }
+    if catalog_ddl_contains_comment(sql)? {
+        return Err(DbError::InvalidOperation(
+            "cluster catalog DDL cannot persist SQL comments; submit one canonical typed definition"
+                .into(),
+        ));
+    }
+    if let Some(key) = sensitive_catalog_property(statement) {
+        return Err(DbError::InvalidOperation(format!(
+            "cluster catalog DDL cannot persist secret property '{key}'; use $${{ENV_VAR}} in server TOML or ${{ENV_VAR}} through the SQL API (without a default), or omit it for a connector environment fallback"
+        )));
+    }
+    if connector_source_requires_schema_discovery(statement) {
+        return Err(DbError::InvalidOperation(
+            "cluster connector sources require an explicit column schema; runtime schema discovery is not a durable catalog identity"
+                .into(),
+        ));
+    }
+    let identity = catalog_create_identity(statement)?.ok_or_else(|| {
+        DbError::InvalidOperation(
+            "cluster catalog bootstrap accepts only reversible typed CREATE statements".into(),
+        )
+    })?;
+    if matches!(
+        identity.1,
+        CatalogObjectKind::Table | CatalogObjectKind::LookupTable
+    ) {
+        return Err(DbError::InvalidOperation(format!(
+            "{} is not supported in cluster mode until reference-table rows and source positions are atomically replicated through distributed state",
+            identity.2
+        )));
+    }
+    Ok(identity)
+}
+
+#[cfg(feature = "cluster")]
+fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
+    if value.contains("://") {
+        return laminar_connectors::security::value_contains_uri_secret(value, allow_reference);
+    }
+    {
+        let lower = value.to_ascii_lowercase();
+        lower.split_whitespace().any(|part| {
+            part.strip_prefix("password=")
+                .or_else(|| part.strip_prefix("pwd="))
+                .is_some_and(|password| {
+                    let password = password.trim_matches(|ch| ch == '\'' || ch == '"');
+                    !password.is_empty()
+                        && !(allow_reference
+                            && laminar_connectors::security::is_env_reference(password))
+                })
+        })
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn catalog_property_contains_unsupported_secret(
+    key: &str,
+    value: &str,
+    allow_reference: bool,
+) -> bool {
+    let lower = key.to_ascii_lowercase();
+    let normalized = lower.replace(['.', '-'], "_");
+    let secret_key = laminar_connectors::security::is_secret_option_key(key)
+        || normalized == "sasl_oauthbearer_config";
+    if secret_key {
+        return !(allow_reference && laminar_connectors::security::is_env_reference(value));
+    }
+    if value.contains("://")
+        && laminar_connectors::security::value_contains_uri_secret(value, allow_reference)
+    {
+        return true;
+    }
+    (normalized.contains("connection")
+        || normalized == "uri"
+        || normalized.ends_with("_uri")
+        || normalized == "url"
+        || normalized.ends_with("_url")
+        || normalized == "dsn")
+        && uri_contains_unsupported_secret(value, allow_reference)
+}
+
+#[cfg(feature = "cluster")]
+fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+
+    let tokens = Tokenizer::new(&sqlparser::dialect::GenericDialect {}, sql)
+        .tokenize()
+        .map_err(|error| {
+            DbError::InvalidOperation(format!("catalog DDL tokenization failed: {error}"))
+        })?;
+    Ok(tokens.into_iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }))
+}
+
+#[cfg(feature = "cluster")]
+fn sensitive_catalog_property(statement: &StreamingStatement) -> Option<String> {
+    fn find<'a>(
+        options: impl IntoIterator<Item = (&'a String, &'a String)>,
+        allow_reference: bool,
+    ) -> Option<String> {
+        options
+            .into_iter()
+            .find(|(key, value)| {
+                catalog_property_contains_unsupported_secret(key, value, allow_reference)
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    match statement {
+        StreamingStatement::CreateSource(create) => find(create.with_options.iter(), true)
+            .or_else(|| find(create.connector_options.iter(), true))
+            .or_else(|| {
+                create
+                    .format
+                    .as_ref()
+                    .and_then(|format| find(format.options.iter(), true))
+            }),
+        StreamingStatement::CreateSink(create) => find(create.with_options.iter(), true)
+            .or_else(|| find(create.connector_options.iter(), true))
+            .or_else(|| find(create.output_options.iter(), true))
+            .or_else(|| {
+                create
+                    .format
+                    .as_ref()
+                    .and_then(|format| find(format.options.iter(), true))
+            }),
+        StreamingStatement::CreateLookupTable(create) => find(create.with_options.iter(), false),
+        StreamingStatement::Standard(statement) => {
+            let sqlparser::ast::Statement::CreateTable(create) = statement.as_ref() else {
+                return None;
+            };
+            let sqlparser::ast::CreateTableOptions::With(options) = &create.table_options else {
+                return None;
+            };
+            options.iter().find_map(|option| {
+                let sqlparser::ast::SqlOption::KeyValue { key, value } = option else {
+                    return None;
+                };
+                let key = key.to_string();
+                let value = value.to_string();
+                catalog_property_contains_unsupported_secret(&key, value.trim_matches('\''), false)
+                    .then_some(key)
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn connector_source_requires_schema_discovery(statement: &StreamingStatement) -> bool {
+    let StreamingStatement::CreateSource(create) = statement else {
+        return false;
+    };
+    let has_connector = create.connector_type.is_some()
+        || create
+            .with_options
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("connector"));
+    has_connector && (create.columns.is_empty() || create.has_wildcard)
 }
 
 #[cfg(not(feature = "cluster"))]
@@ -261,16 +768,6 @@ pub(crate) type ForceCheckpointRx =
     crossfire::AsyncRx<crossfire::mpsc::Array<ForceCheckpointReply>>;
 
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
-
-/// Subscription-router drain period; bounds cross-node SUBSCRIBE delivery latency.
-#[cfg(feature = "cluster")]
-const SUB_ROUTER_TICK: std::time::Duration = std::time::Duration::from_millis(10);
-/// Gossip interest refresh cadence (~500ms) while subscriptions are active.
-#[cfg(feature = "cluster")]
-const SUB_REFRESH_ACTIVE_TICKS: u64 = 50;
-/// Idle refresh cadence (~5s) when no subscriptions are active.
-#[cfg(feature = "cluster")]
-const SUB_REFRESH_IDLE_TICKS: u64 = 500;
 
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
@@ -321,6 +818,18 @@ pub struct SnapshotAdoption {
     pub rehydration_epoch: Option<u64>,
 }
 
+/// Result of publishing one locally serialized assignment-authority certificate.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssignmentAuthorityActivation {
+    /// The exact certificate was installed and published.
+    pub(crate) installed: bool,
+    /// Source intake was opened; recovery keeps it closed even after installation.
+    pub(crate) intake_open: bool,
+    /// Authority revision observed at the local publication point.
+    pub(crate) revision: u64,
+}
+
 #[cfg(feature = "cluster")]
 fn owned_vnode_indices(
     assignment: &[laminar_core::state::NodeId],
@@ -341,6 +850,15 @@ fn owned_vnode_indices(
 }
 
 impl LaminarDB {
+    pub(crate) const fn runtime_mode(&self) -> RuntimeMode {
+        self.runtime_mode
+    }
+
+    /// Whether this instance was constructed with distributed runtime semantics.
+    pub(crate) const fn is_cluster_runtime(&self) -> bool {
+        self.runtime_mode().is_cluster()
+    }
+
     /// Vnodes revoked by a rebalance and staged for operator-state drop on the next cycle; drained
     /// once the compute thread applies the revoke. Observability/test hook.
     #[cfg(feature = "cluster")]
@@ -355,7 +873,7 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns `DbError` if `DataFusion` context creation fails.
-    pub fn open() -> Result<Self, DbError> {
+    pub fn open() -> Result<Arc<Self>, DbError> {
         Self::open_with_config(LaminarConfig::default())
     }
 
@@ -364,8 +882,10 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns `DbError` if `DataFusion` context creation fails.
-    pub fn open_with_config(config: LaminarConfig) -> Result<Self, DbError> {
-        Self::open_with_config_and_vars(config, HashMap::new())
+    pub fn open_with_config(config: LaminarConfig) -> Result<Arc<Self>, DbError> {
+        let db = Self::open_with_config_and_vars(config, HashMap::new())?;
+        db.connector_registry.freeze();
+        Ok(Arc::new(db))
     }
 
     /// Create with custom configuration and config variables for SQL substitution.
@@ -378,7 +898,13 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
-        Self::open_with_config_and_vars_and_rules(config, config_vars, &[], None)
+        Self::open_with_config_and_vars_and_rules(
+            config,
+            config_vars,
+            &[],
+            None,
+            RuntimeMode::Local,
+        )
     }
 
     /// Same as [`Self::open_with_config_and_vars`] but also installs
@@ -392,6 +918,7 @@ impl LaminarDB {
             dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
         >],
         target_partitions: Option<usize>,
+        runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
         // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();
@@ -415,12 +942,6 @@ impl LaminarDB {
                 .with_config(session_config)
                 .with_default_features()
                 .with_query_planner(query_planner);
-            #[cfg(feature = "cluster")]
-            {
-                state_builder = state_builder.with_physical_optimizer_rule(Arc::new(
-                    laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
-                ));
-            }
             for rule in extra_optimizer_rules {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
             }
@@ -434,19 +955,11 @@ impl LaminarDB {
         ));
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
-        Self::register_builtin_connectors(&connector_registry);
-        #[cfg(feature = "cluster")]
-        let mut physical_rules = extra_optimizer_rules.to_vec();
-        #[cfg(feature = "cluster")]
-        {
-            physical_rules.push(Arc::new(
-                laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
-            ));
-        }
-        #[cfg(not(feature = "cluster"))]
+        Self::register_builtin_connectors(&connector_registry)?;
         let physical_rules = extra_optimizer_rules.to_vec();
 
         Ok(Self {
+            runtime_mode,
             catalog,
             planner: parking_lot::Mutex::new(StreamingPlanner::new()),
             ctx,
@@ -464,14 +977,28 @@ impl LaminarDB {
             )),
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
+            catalog_cleanup_fenced: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            catalog_cleanup_deregister_fault: parking_lot::Mutex::new(None),
             supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
             restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             lifecycle_lock: tokio::sync::Mutex::new(()),
+            control_runtime: DbControlRuntime::new(),
+            startup_attempt: parking_lot::Mutex::new(None),
+            topology_ddl_lock: tokio::sync::RwLock::new(()),
+            catalog_namespace: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            topology_planning_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            stop_after_claim_gate: parking_lot::Mutex::new(None),
+            #[cfg(all(test, feature = "cluster"))]
+            catalog_seal_gate: parking_lot::Mutex::new(None),
             rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            runtime_handle: parking_lot::Mutex::new(None),
-            committer_handle: parking_lot::Mutex::new(None),
+            runtime_handle: tokio::sync::Mutex::new(None),
+            committer_handle: tokio::sync::Mutex::new(None),
             exact_deployment_lock: parking_lot::Mutex::new(None),
-            startup_sink_handles: parking_lot::Mutex::new(Vec::new()),
+            owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             engine_metrics: parking_lot::Mutex::new(None),
             prometheus_registry: parking_lot::Mutex::new(None),
@@ -488,13 +1015,15 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             recover_target_epoch: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
-            recovery_monitor_started: std::sync::atomic::AtomicBool::new(false),
+            recovery_monitor: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            coordinated_lifecycle_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "cluster")]
             last_recovery_epoch: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
-            coordinated_restores: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(feature = "cluster")]
-            source_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_gate: Arc::new(std::sync::atomic::AtomicBool::new(
+                runtime_mode.is_cluster(),
+            )),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
@@ -510,17 +1039,23 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             catalog_manifest_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
+            cluster_checkpoint_object_store: None,
+            #[cfg(feature = "cluster")]
             rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             #[cfg(feature = "cluster")]
             pending_revoke_vnodes: Arc::new(parking_lot::Mutex::new(
                 rustc_hash::FxHashSet::default(),
             )),
             #[cfg(feature = "cluster")]
+            local_state_incarnation: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            assignment_adoption_lock: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "cluster")]
+            assignment_authority_revision: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cluster")]
             rotation_execution_fence: Arc::new(tokio::sync::RwLock::new(())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
-            #[cfg(feature = "cluster")]
-            active_subs: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
@@ -543,7 +1078,6 @@ impl LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
         *self.shuffle_sender.lock() = Some(sender);
-        self.update_sql_cluster_context();
     }
 
     #[cfg(feature = "cluster")]
@@ -552,7 +1086,271 @@ impl LaminarDB {
         receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     ) {
         *self.shuffle_receiver.lock() = Some(receiver);
-        self.update_sql_cluster_context();
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn invalidate_shuffle_assignment_fence(&self) {
+        self.assignment_authority_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(receiver) = self.shuffle_receiver.lock().as_ref() {
+            receiver.invalidate_assignment_fence();
+        }
+        if let Some(sender) = self.shuffle_sender.lock().as_ref() {
+            sender.invalidate_assignment_fence();
+        }
+    }
+
+    /// Close shuffle admission during a transient durable-assignment read failure without
+    /// destroying the retained certificate's delivery sequence domain.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn suspend_shuffle_assignment_fence(&self) {
+        self.assignment_authority_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(receiver) = self.shuffle_receiver.lock().as_ref() {
+            receiver.suspend_assignment_fence();
+        }
+        if let Some(sender) = self.shuffle_sender.lock().as_ref() {
+            sender.suspend_assignment_fence();
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_shuffle_assignment_fence(
+        &self,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<(), DbError> {
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("shuffle assignment install has no cluster controller".into())
+        })?;
+        let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("shuffle assignment install has no vnode registry".into())
+        })?;
+        let assignment = registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        // The caller installs under the assignment-adoption and execution write fences, then
+        // publishes this certificate through the controller. Requiring it to be visible first
+        // exposes authority before the transport has actually switched scopes.
+        if !fence.is_canonical()
+            || fence.assignment_version != assignment.version()
+            || fence.vnode_count != registry.vnode_count()
+            || !fence.matches_owner_map(&owners)
+            || fence.participant_incarnation(controller.instance_id().0)
+                != Some(controller.recovery_incarnation())
+        {
+            self.invalidate_shuffle_assignment_fence();
+            return Err(DbError::Checkpoint(format!(
+                "shuffle assignment certificate does not match local assignment {} and process {}",
+                assignment.version(),
+                controller.instance_id().0
+            )));
+        }
+
+        let receiver = self.shuffle_receiver.lock().clone();
+        let sender = self.shuffle_sender.lock().clone();
+        let expected_digest = fence.digest();
+        let receiver_exact = receiver.as_ref().is_none_or(|endpoint| {
+            endpoint.assignment_version() == fence.assignment_version
+                && endpoint.active_assignment_digest() == Some(expected_digest)
+        });
+        let sender_exact = sender.as_ref().is_none_or(|endpoint| {
+            endpoint.assignment_version() == fence.assignment_version
+                && endpoint.active_assignment_digest() == Some(expected_digest)
+        });
+        if receiver_exact && sender_exact {
+            return Ok(());
+        }
+        let endpoint_conflict = receiver.as_ref().is_some_and(|endpoint| {
+            endpoint.local_id() != controller.instance_id().0
+                || endpoint.incarnation() != controller.recovery_incarnation()
+                || endpoint.assignment_version() > fence.assignment_version
+                || (endpoint.assignment_version() == fence.assignment_version
+                    && endpoint.active_assignment_digest() != Some(expected_digest))
+        }) || sender.as_ref().is_some_and(|endpoint| {
+            endpoint.local_id() != controller.instance_id().0
+                || endpoint.incarnation() != controller.recovery_incarnation()
+                || endpoint.assignment_version() > fence.assignment_version
+                || (endpoint.assignment_version() == fence.assignment_version
+                    && endpoint.active_assignment_digest() != Some(expected_digest))
+        });
+        if endpoint_conflict {
+            self.invalidate_shuffle_assignment_fence();
+            return Err(DbError::Checkpoint(
+                "shuffle endpoint identity conflicts with the certified assignment".into(),
+            ));
+        }
+
+        // Background and operator shuffle paths hold the execution read fence. Activate inbound
+        // first, then make outbound admission the local transition's linearization point.
+        let result = (|| {
+            if let Some(receiver) = receiver.as_ref() {
+                receiver
+                    .install_assignment_fence(fence, &owners)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "failed to install receiver shuffle assignment certificate: {error}"
+                        ))
+                    })?;
+                if receiver.assignment_version() != fence.assignment_version
+                    || receiver.active_assignment_digest() != Some(expected_digest)
+                {
+                    return Err(DbError::Checkpoint(
+                        "receiver did not activate the exact shuffle assignment certificate".into(),
+                    ));
+                }
+            }
+            if let Some(sender) = sender.as_ref() {
+                sender
+                    .install_assignment_fence(fence, &owners)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "failed to install sender shuffle assignment certificate: {error}"
+                        ))
+                    })?;
+                if sender.assignment_version() != fence.assignment_version
+                    || sender.active_assignment_digest() != Some(expected_digest)
+                {
+                    return Err(DbError::Checkpoint(
+                        "sender did not activate the exact shuffle assignment certificate".into(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // Keep watcher caches coherent with a partial endpoint install. Direct endpoint
+            // invalidation would close transport authority without advancing the shared revision.
+            self.invalidate_shuffle_assignment_fence();
+        }
+        result
+    }
+
+    /// Install shuffle authority, publish its controller certificate, and conditionally open
+    /// source intake at one local assignment/execution boundary.
+    ///
+    /// `expected_revision` must have been captured before any durable reads used to derive
+    /// `fence`. A concurrent closure advances the revision and this method leaves that closure in
+    /// force. The controller certificate is deliberately published only after both endpoints are
+    /// installed.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn activate_assignment_authority(
+        &self,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        drain_transition: Option<laminar_core::checkpoint::AssignmentDrainTransition>,
+        expected_revision: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<AssignmentAuthorityActivation, DbError> {
+        if drain_transition
+            .as_ref()
+            .is_some_and(|transition| transition.predecessor != *fence)
+        {
+            return Err(DbError::Checkpoint(
+                "assignment drain transition does not bind the installed predecessor certificate"
+                    .into(),
+            ));
+        }
+        let _adoption = tokio::time::timeout_at(deadline, self.assignment_adoption_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("timed out serializing assignment authority activation".into())
+            })?;
+        let _execution = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.rotation_execution_fence).write_owned(),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("timed out draining the prior assignment execution scope".into())
+        })?;
+        let revision = self
+            .assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        if revision != expected_revision || tokio::time::Instant::now() >= deadline {
+            return Ok(AssignmentAuthorityActivation {
+                installed: false,
+                intake_open: false,
+                revision,
+            });
+        }
+
+        self.set_source_gate(true);
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("assignment activation has no cluster controller".into())
+        })?;
+        if let Err(error) = self.install_shuffle_assignment_fence(fence) {
+            controller.publish_checkpoint_drain_transition(None);
+            controller.publish_checkpoint_assignment_fence(None);
+            return Err(error);
+        }
+        if self
+            .assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_revision
+        {
+            controller.publish_checkpoint_drain_transition(None);
+            controller.publish_checkpoint_assignment_fence(None);
+            self.suspend_shuffle_assignment_fence();
+            return Ok(AssignmentAuthorityActivation {
+                installed: false,
+                intake_open: false,
+                revision: self
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            });
+        }
+
+        controller.publish_checkpoint_drain_transition(drain_transition);
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        if self
+            .assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_revision
+        {
+            controller.publish_checkpoint_drain_transition(None);
+            controller.publish_checkpoint_assignment_fence(None);
+            self.suspend_shuffle_assignment_fence();
+            return Ok(AssignmentAuthorityActivation {
+                installed: false,
+                intake_open: false,
+                revision: self
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            });
+        }
+
+        let mut intake_open = false;
+        if !controller.is_recovering() {
+            self.set_source_gate(false);
+            let unchanged = self
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                == expected_revision
+                && !controller.is_recovering()
+                && controller
+                    .checkpoint_assignment_fence(fence.assignment_version)
+                    .as_ref()
+                    == Some(fence);
+            if unchanged {
+                intake_open = true;
+            } else {
+                self.set_source_gate(true);
+                controller.publish_checkpoint_drain_transition(None);
+                controller.publish_checkpoint_assignment_fence(None);
+                self.suspend_shuffle_assignment_fence();
+                return Ok(AssignmentAuthorityActivation {
+                    installed: false,
+                    intake_open: false,
+                    revision: self
+                        .assignment_authority_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                });
+            }
+        }
+
+        Ok(AssignmentAuthorityActivation {
+            installed: true,
+            intake_open,
+            revision: expected_revision,
+        })
     }
 
     /// Drop buffered shuffle slices and stashed barriers before a rewind: their senders
@@ -571,29 +1369,6 @@ impl LaminarDB {
                 staged,
                 barriers,
                 "purged stale shuffle buffers before coordinated rewind"
-            );
-        }
-    }
-
-    #[cfg(feature = "cluster")]
-    fn update_sql_cluster_context(&self) {
-        if let (Some(registry), Some(sender), Some(receiver)) = (
-            self.vnode_registry.lock().as_ref(),
-            self.shuffle_sender.lock().as_ref(),
-            self.shuffle_receiver.lock().as_ref(),
-        ) {
-            let self_id = self
-                .cluster_controller
-                .lock()
-                .as_ref()
-                .map_or(laminar_core::state::NodeId(0), |c| {
-                    laminar_core::state::NodeId(c.instance_id().0)
-                });
-            laminar_sql::datafusion::cluster_repartition::set_cluster_context(
-                Arc::clone(registry),
-                Arc::clone(sender),
-                Arc::clone(receiver),
-                self_id,
             );
         }
     }
@@ -623,76 +1398,261 @@ impl LaminarDB {
         *self.catalog_manifest_store.lock() = Some(store);
     }
 
-    /// Publish this node's catalog DDL to `catalog/manifest.json`. Best-effort;
-    /// failures are logged and never propagated.
+    /// Install the shared checkpoint namespace before the database is published behind `Arc`.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn persist_catalog_manifest(&self) {
-        let Some(store) = self.catalog_manifest_store.lock().clone() else {
-            return;
+    pub(crate) fn set_cluster_checkpoint_object_store(
+        &mut self,
+        store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<(), DbError> {
+        if !self.is_cluster_runtime() || self.cluster_controller.lock().is_none() {
+            return Err(DbError::Config(
+                "cluster checkpoint object store requires a cluster controller".into(),
+            ));
+        }
+        self.cluster_checkpoint_object_store = Some(store);
+        Ok(())
+    }
+
+    /// Clone the immutable cluster checkpoint namespace selected at construction.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cluster_checkpoint_object_store(
+        &self,
+    ) -> Option<Arc<dyn object_store::ObjectStore>> {
+        self.cluster_checkpoint_object_store.clone()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn catalog_manifest_inventory(
+        &self,
+    ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
+        let ordered = self.connector_manager.lock().ordered_ddl();
+        let namespace = self.catalog_namespace.lock();
+        if ordered.len() != namespace.len() {
+            return Err(DbError::Pipeline(format!(
+                "typed catalog has {} objects but the durable DDL inventory has {}",
+                namespace.len(),
+                ordered.len()
+            )));
+        }
+        ordered
+            .into_iter()
+            .map(|(canonical_name, ddl)| {
+                let kind = namespace.get(&canonical_name).copied().ok_or_else(|| {
+                    DbError::Pipeline(format!(
+                        "DDL inventory entry '{canonical_name}' has no typed catalog owner"
+                    ))
+                })?;
+                Ok(laminar_core::cluster::control::CatalogManifestEntry {
+                    canonical_name,
+                    kind,
+                    ddl,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn exact_bootstrap_noop(
+        &self,
+        sql: &str,
+        statement: &StreamingStatement,
+    ) -> Result<Option<ExecuteResult>, DbError> {
+        let Some((name, kind, statement_type)) = catalog_create_identity(statement)? else {
+            return Ok(None);
         };
-        let entries: Vec<laminar_core::cluster::control::CatalogManifestEntry> = self
+        let local_ddl = self
             .connector_manager
             .lock()
-            .ordered_ddl()
-            .into_iter()
-            .map(|(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry { name, ddl })
-            .collect();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64);
-        let manifest = laminar_core::cluster::control::CatalogManifest {
-            // Wall-clock as a diagnostic version; the object is overwritten in place.
-            version: now_ms.unsigned_abs(),
-            updated_at_ms: now_ms,
-            entries,
-        };
-        if let Err(e) = store.save(&manifest).await {
-            tracing::warn!(error = %e, "catalog manifest persist failed");
+            .get_ddl(&name)
+            .map(str::to_owned);
+        let local_kind = self.catalog_namespace.lock().get(&name).copied();
+        if local_ddl.is_none() && local_kind.is_none() {
+            return Ok(None);
         }
+        if local_ddl.as_deref() != Some(sql) || local_kind != Some(kind) {
+            return Err(DbError::Pipeline(format!(
+                "cluster bootstrap definition for '{name}' differs from the durable typed catalog"
+            )));
+        }
+        Ok(Some(ExecuteResult::Ddl(DdlInfo {
+            statement_type: statement_type.to_string(),
+            object_name: name,
+            applied: false,
+        })))
     }
 
-    /// Replay catalog DDL from the shared manifest, recreating objects this node
-    /// lacks. Runs at boot; per-entry failures are logged and skipped.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn restore_catalog_from_manifest(&self) {
+    fn validate_catalog_seal_authority(
+        &self,
+        proof: Option<&laminar_core::cluster::control::LeaderProof>,
+    ) -> Result<(), DbError> {
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Pipeline(
+                "[LDB-6043] cluster catalog bootstrap requires a cluster controller".into(),
+            )
+        })?;
+        let Some(proof) = proof else {
+            return Err(DbError::Pipeline(
+                "[LDB-6043] cluster catalog bootstrap requires the active durable leader lease"
+                    .into(),
+            ));
+        };
+        if !controller.catalog_bootstrap_proof_is_live(proof) {
+            return Err(DbError::Pipeline(
+                "[LDB-6043] cluster catalog bootstrap lost its durable leader lease before sealing"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replay catalog DDL from the shared manifest before cluster startup.
+    ///
+    /// # Errors
+    /// Fails closed when the manifest cannot be loaded, a local definition conflicts with it, or
+    /// any entry cannot be recreated. A node must never start with a partial cluster topology.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn restore_catalog_from_manifest(
+        &self,
+    ) -> Result<Option<laminar_core::cluster::control::CatalogManifest>, DbError> {
+        self.connector_registry.freeze();
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
-            return;
+            return Ok(None);
         };
-        let manifest = match store.load().await {
-            Ok(Some(m)) => m,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::warn!(error = %e, "catalog manifest load failed — skipping replay");
-                return;
-            }
+        let Some(manifest) = store.load().await.map_err(|error| {
+            DbError::Pipeline(format!(
+                "[{}] catalog manifest load failed: {error}",
+                laminar_core::error_codes::RECOVERY_FAILED
+            ))
+        })?
+        else {
+            return Ok(None);
         };
-        // Detach during replay: execute() would re-persist a still-partial catalog
-        // after each DDL, potentially truncating the shared manifest on failure.
-        let detached = self.catalog_manifest_store.lock().take();
+
+        let mut replay_guard = CatalogBootstrapGuard {
+            db: self,
+            created: Vec::new(),
+            sealed: false,
+        };
         for entry in &manifest.entries {
-            if self.catalog_object_exists(&entry.name) {
+            if catalog_ddl_contains_comment(&entry.ddl)? {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' contains SQL comments rather than one canonical typed definition",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
+            }
+            let statements = parse_streaming_sql(&entry.ddl).map_err(|error| {
+                DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' is not valid topology DDL: {error}",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                ))
+            })?;
+            if statements.len() != 1 {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' must contain exactly one typed CREATE statement",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
+            }
+            let Some((name, kind, _)) = catalog_create_identity(&statements[0])? else {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' must contain exactly one typed CREATE statement",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
+            };
+            if name != entry.canonical_name || kind != entry.kind {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' does not match its typed DDL identity",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
+            }
+            if connector_source_requires_schema_discovery(&statements[0]) {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest source '{}' lacks an explicit durable schema",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
+            }
+            if let Some(key) = sensitive_catalog_property(&statements[0]) {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' contains secret property '{key}'",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
+            }
+        }
+
+        for entry in &manifest.entries {
+            let local_ddl = self
+                .connector_manager
+                .lock()
+                .get_ddl(&entry.canonical_name)
+                .map(str::to_owned);
+            if let Some(local_ddl) = local_ddl {
+                let local_kind = self
+                    .catalog_namespace
+                    .lock()
+                    .get(&entry.canonical_name)
+                    .copied();
+                if local_ddl != entry.ddl || local_kind != Some(entry.kind) {
+                    return Err(DbError::Pipeline(format!(
+                        "[{}] local catalog definition for '{}' conflicts with catalog manifest",
+                        laminar_core::error_codes::RECOVERY_FAILED,
+                        entry.canonical_name
+                    )));
+                }
                 continue;
             }
-            match self.execute(&entry.ddl).await {
-                Ok(_) => tracing::info!(name = %entry.name, "replayed catalog DDL from manifest"),
-                Err(e) => tracing::warn!(
-                    name = %entry.name, error = %e,
-                    "catalog manifest replay failed for object"
-                ),
+            CATALOG_MANIFEST_REPLAY
+                .scope((), self.execute_single_already_gated(&entry.ddl))
+                .await
+                .map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "[{}] catalog manifest replay failed for '{}': {error}",
+                        laminar_core::error_codes::RECOVERY_FAILED,
+                        entry.canonical_name
+                    ))
+                })?;
+            let replayed_ddl = self
+                .connector_manager
+                .lock()
+                .get_ddl(&entry.canonical_name)
+                .map(str::to_owned);
+            let replayed_kind = self
+                .catalog_namespace
+                .lock()
+                .get(&entry.canonical_name)
+                .copied();
+            if replayed_ddl.as_deref() != Some(entry.ddl.as_str())
+                || replayed_kind != Some(entry.kind)
+            {
+                return Err(DbError::Pipeline(format!(
+                    "[{}] catalog manifest entry '{}' completed without installing its exact \
+                     durable DDL identity",
+                    laminar_core::error_codes::RECOVERY_FAILED,
+                    entry.canonical_name
+                )));
             }
+            replay_guard.record(entry.canonical_name.clone(), entry.kind);
+            tracing::info!(name = %entry.canonical_name, "replayed catalog DDL from manifest");
         }
-        *self.catalog_manifest_store.lock() = detached;
-    }
 
-    /// Returns `true` if any catalog type (source/sink/stream/table) is registered under `name`.
-    #[cfg(feature = "cluster")]
-    fn catalog_object_exists(&self, name: &str) -> bool {
-        let mgr = self.connector_manager.lock();
-        mgr.sources().contains_key(name)
-            || mgr.sinks().contains_key(name)
-            || mgr.streams().contains_key(name)
-            || mgr.tables().contains_key(name)
+        let local_inventory = self.catalog_manifest_inventory()?;
+        if local_inventory.as_slice() != manifest.entries.as_slice() {
+            return Err(DbError::Pipeline(format!(
+                "[{}] local catalog DDL inventory does not match the ordered catalog manifest \
+                 (local entries: {}, manifest entries: {}); refusing cluster startup",
+                laminar_core::error_codes::RECOVERY_FAILED,
+                local_inventory.len(),
+                manifest.entries.len()
+            )));
+        }
+        replay_guard.sealed();
+        Ok(Some(manifest))
     }
 
     /// Atomically adopt a new vnode assignment across the registry, state-backend
@@ -703,17 +1663,72 @@ impl LaminarDB {
     /// object-store read can't stall the checkpoint cadence.
     ///
     /// # Errors
-    /// Returns a checkpoint error when source-offset handoff or vnode-state rehydration fails.
-    /// The assignment is not published in that case, so the same snapshot remains retryable.
+    /// Returns a checkpoint error when the end-to-end deadline expires or source-offset handoff
+    /// or vnode-state rehydration fails. The assignment is not published in that case, so the
+    /// same snapshot remains retryable.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // sequential rotation steps read better inline
     pub async fn adopt_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
+        deadline: tokio::time::Instant,
     ) -> Result<SnapshotAdoption, DbError> {
+        let version = snapshot.version;
+        tokio::time::timeout_at(deadline, async {
+            let _adoption = self.assignment_adoption_lock.lock().await;
+            self.adopt_assignment_snapshot_locked(snapshot, deadline)
+                .await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(DbError::Checkpoint(format!(
+                "assignment {version} adoption exceeded its end-to-end deadline"
+            )))
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // sequential rotation steps read better inline
+    async fn adopt_assignment_snapshot_locked(
+        &self,
+        snapshot: laminar_core::cluster::control::AssignmentSnapshot,
+        deadline: tokio::time::Instant,
+    ) -> Result<SnapshotAdoption, DbError> {
+        if snapshot.draining {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} is a draining generation and cannot publish ownership",
+                snapshot.version
+            )));
+        }
+        if !snapshot.has_canonical_participants() {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} has no canonical process roster",
+                snapshot.version
+            )));
+        }
         let Some(registry) = self.vnode_registry.lock().clone() else {
             return Ok(SnapshotAdoption::default());
         };
+        let vnode_count = registry.vnode_count();
+        let new_assignment: Arc<[laminar_core::state::NodeId]> = snapshot
+            .to_vnode_vec(vnode_count)
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?
+            .into();
+        let controller = self.cluster_controller.lock().clone();
+        let assignment_snapshot_store = self.assignment_snapshot_store.lock().clone();
+        if let Some(store) = assignment_snapshot_store.as_ref() {
+            crate::rebalance::audit_assignment_snapshot_authority(
+                store,
+                controller.as_deref(),
+                &snapshot,
+            )
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "assignment {} authority audit failed: {error}",
+                    snapshot.version
+                ))
+            })?;
+        }
         if snapshot.version <= registry.assignment_version() {
             return Ok(SnapshotAdoption {
                 adopted: false,
@@ -721,18 +1736,78 @@ impl LaminarDB {
                 ..SnapshotAdoption::default()
             });
         }
-        let vnode_count = registry.vnode_count();
-        let new_assignment: Arc<[laminar_core::state::NodeId]> =
-            snapshot.to_vnode_vec(vnode_count).into();
+        // The target is now durable-authority-audited and still newer. Close every predecessor
+        // admission path before reading its process roster, source handoff, or vnode state. Scope
+        // cancellation releases compute cycles blocked in shuffle so the final write fence can
+        // drain; any later error deliberately leaves this authority closed for a full retry.
+        self.set_source_gate(true);
+        if let Some(controller) = controller.as_ref() {
+            controller.publish_checkpoint_assignment_fence(None);
+        }
+        self.invalidate_shuffle_assignment_fence();
+        let predecessor_drain = Arc::clone(&self.rotation_execution_fence)
+            .write_owned()
+            .await;
+        drop(predecessor_drain);
 
-        let self_id = self
-            .cluster_controller
-            .lock()
+        let self_id = controller
             .as_ref()
-            .map_or(laminar_core::state::NodeId(0), |c| {
-                laminar_core::state::NodeId(c.instance_id().0)
+            .map_or(laminar_core::state::NodeId(0), |controller| {
+                laminar_core::state::NodeId(controller.instance_id().0)
             });
-
+        let observed_assignment = registry.versioned_snapshot();
+        let observed_version = observed_assignment.version();
+        let current_incarnation = controller
+            .as_ref()
+            .map(|controller| controller.recovery_incarnation());
+        let local_state_is_current = current_incarnation
+            .is_some_and(|incarnation| *self.local_state_incarnation.lock() == Some(incarnation));
+        let force_local_restore = if observed_version == 0 || local_state_is_current {
+            false
+        } else if let (Some(store), Some(incarnation)) =
+            (assignment_snapshot_store, current_incarnation)
+        {
+            let prior = store
+                .load_version(observed_version)
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "failed to load assignment {observed_version} process roster: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "assignment {observed_version} process roster is unavailable"
+                    ))
+                })?;
+            crate::rebalance::audit_assignment_snapshot_authority(
+                &store,
+                controller.as_deref(),
+                &prior,
+            )
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "assignment {observed_version} authority audit failed: {error}"
+                ))
+            })?;
+            prior
+                .to_vnode_vec(vnode_count)
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            prior
+                .participants
+                .binary_search_by_key(&self_id.0, |participant| participant.node_id)
+                .ok()
+                .and_then(|index| prior.participants.get(index))
+                .map(|participant| participant.boot_incarnation)
+                != Some(incarnation)
+        } else if current_incarnation.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "cannot verify local state incarnation for assignment {observed_version} without durable assignment history"
+            )));
+        } else {
+            false
+        };
         // Hold the coord mutex so registry + fence updates land between epochs.
         let guard = self.coordinator.lock().await;
         // Re-check under the lock: a concurrent adopt may have advanced the version,
@@ -747,20 +1822,33 @@ impl LaminarDB {
 
         let prepared_assignment = registry.versioned_snapshot();
         let prepared_from_version = prepared_assignment.version();
+        if prepared_from_version != observed_version {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] assignment base advanced from {observed_version} to {prepared_from_version} while preparing target {}",
+                snapshot.version
+            )));
+        }
         let old_owned = owned_vnode_indices(prepared_assignment.owners(), self_id)?;
         let old_set: std::collections::HashSet<u32> = old_owned.iter().copied().collect();
+        let new_owned = owned_vnode_indices(&new_assignment, self_id)?;
+        let skipped_assignment_generation =
+            snapshot.version > prepared_from_version.saturating_add(1);
         // Compute from the new assignment before publishing it, so the Restoring marks
         // below land before the ownership flip.
         let newly_acquired: Vec<u32> = (0..vnode_count)
             .filter(|&v| {
-                new_assignment.get(v as usize).copied() == Some(self_id) && !old_set.contains(&v)
+                new_assignment.get(v as usize).copied() == Some(self_id)
+                    && (force_local_restore
+                        || skipped_assignment_generation
+                        || !old_set.contains(&v))
             })
             .collect();
+        let source_handoff_required = !newly_acquired.is_empty();
 
         // Snapshot immutable recovery handles at the epoch boundary, then release the coordinator
         // mutex before decision-store, seal, readiness, and vnode reads. Remote object-store
         // latency must not stall checkpoint admission.
-        let handoff_reader = if newly_acquired.is_empty() {
+        let handoff_reader = if !source_handoff_required {
             None
         } else if let Some(coord) = guard.as_ref() {
             Some(coord.cluster_handoff_reader()?.ok_or_else(|| {
@@ -771,8 +1859,8 @@ impl LaminarDB {
             })?)
         } else {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6052] cannot acquire vnodes for assignment {} without a live checkpoint coordinator",
-                snapshot.version
+                "[LDB-6052] cannot acquire {} vnodes for assignment {} without a live checkpoint coordinator",
+                newly_acquired.len(), snapshot.version
             )));
         };
 
@@ -789,25 +1877,36 @@ impl LaminarDB {
         } else {
             None
         };
-        let prepared_decision = source_handoff
+        let prepared_outcome = source_handoff
             .as_ref()
-            .map(|(decision, _)| decision.clone());
-        if let Some(decision) = prepared_decision.as_ref() {
-            if decision.assignment_version > snapshot.version {
+            .map(|handoff| handoff.outcome.clone());
+        if let Some(outcome) = prepared_outcome.as_ref() {
+            let outcome_fence = outcome.assignment_fence.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6054] cluster source handoff Commit outcome has no assignment certificate"
+                        .into(),
+                )
+            })?;
+            if outcome_fence.assignment_version > snapshot.version {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6054] assignment {} is older than durable checkpoint fence {}; refresh the assignment snapshot before adoption",
-                    snapshot.version, decision.assignment_version
+                    snapshot.version, outcome_fence.assignment_version
                 )));
             }
         }
-        let mut rehydration = if let Some((decision, _)) = source_handoff.as_ref() {
+        let mut rehydration = if let Some(handoff) = source_handoff
+            .as_ref()
+            .filter(|_| !newly_acquired.is_empty())
+        {
             let backend = self.state_backend.lock().clone().ok_or_else(|| {
                 DbError::Checkpoint(
                     "[LDB-6050] cluster assignment adoption requires a state backend".into(),
                 )
             })?;
-            let attempt =
-                laminar_core::state::CheckpointAttempt::new(decision.epoch, decision.checkpoint_id);
+            let attempt = laminar_core::state::CheckpointAttempt::new(
+                handoff.outcome.epoch,
+                handoff.outcome.checkpoint_id,
+            );
             crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
                 .rehydrate_at(&newly_acquired, attempt)
                 .await?
@@ -815,8 +1914,8 @@ impl LaminarDB {
             crate::recovery_manager::VnodeRehydration::default()
         };
 
-        let observed_decision = if let Some(reader) = handoff_reader.as_ref() {
-            reader.highest_commit_decision().await?
+        let observed_outcome = if let Some(reader) = handoff_reader.as_ref() {
+            reader.highest_commit_outcome().await?
         } else {
             None
         };
@@ -827,6 +1926,12 @@ impl LaminarDB {
             .write_owned()
             .await;
         let mut guard = self.coordinator.lock().await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} adoption reached its deadline before publication",
+                snapshot.version
+            )));
+        }
         let current_version = registry.assignment_version();
         if snapshot.version <= current_version {
             return Ok(SnapshotAdoption {
@@ -841,7 +1946,7 @@ impl LaminarDB {
                 snapshot.version
             )));
         }
-        if !newly_acquired.is_empty() {
+        if source_handoff_required {
             let current_reader = guard
                 .as_ref()
                 .ok_or_else(|| {
@@ -869,14 +1974,54 @@ impl LaminarDB {
                     snapshot.version
                 )));
             }
-            if observed_decision != prepared_decision {
+            if observed_outcome != prepared_outcome {
                 return Err(DbError::Checkpoint(format!(
-                    "[LDB-6053] durable checkpoint decision advanced while preparing assignment {}; retrying the complete source/state handoff",
+                    "[LDB-6053] durable checkpoint Commit outcome advanced while preparing assignment {}; retrying the complete source/state handoff",
                     snapshot.version
                 )));
             }
         }
-        let new_owned = owned_vnode_indices(&new_assignment, self_id)?;
+        if let Some(handoff) = source_handoff.as_ref() {
+            let expected_attempt = laminar_core::state::CheckpointAttempt::new(
+                handoff.outcome.epoch,
+                handoff.outcome.checkpoint_id,
+            );
+            if handoff.sources.attempt() != expected_attempt {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6054] committed source handoff {:?} does not match durable outcome {expected_attempt:?}",
+                    handoff.sources.attempt()
+                )));
+            }
+            for (source_name, _) in handoff.sources.sources() {
+                if self.catalog.get_source(source_name).is_none() {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6054] committed source handoff names unknown catalog source '{source_name}'"
+                    )));
+                }
+            }
+            let controller = controller.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6054] committed source handoff has no live cluster controller".into(),
+                )
+            })?;
+            match (
+                controller.cluster_min_watermark(),
+                handoff.sources.recovery_watermark_frontier(),
+            ) {
+                (Some(current), Some(recovered)) if current > recovered => {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6054] live committed cluster watermark {current} is ahead of source handoff frontier {recovered}"
+                    )));
+                }
+                (Some(current), None) => {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6054] {:?} source handoff without a numeric frontier cannot replace committed cluster watermark {current}",
+                        handoff.sources.cluster_watermark()
+                    )));
+                }
+                _ => {}
+            }
+        }
         let new_set: std::collections::HashSet<u32> = new_owned.iter().copied().collect();
         let revoked: Vec<u32> = old_set.difference(&new_set).copied().collect();
         let rehydration_attempt = rehydration.attempt;
@@ -908,22 +2053,31 @@ impl LaminarDB {
             registry.mark_restoring(&newly_acquired);
         }
 
-        if newly_acquired.is_empty() {
-            registry.set_assignment_and_version_carrying_resume_offsets(
+        if let Some(watermark) = source_handoff
+            .as_ref()
+            .and_then(|handoff| handoff.sources.recovery_watermark_frontier())
+        {
+            controller
+                .as_ref()
+                .expect("validated source handoff has a cluster controller")
+                .publish_cluster_min_watermark(watermark);
+        }
+        if let Some(handoff) = source_handoff {
+            registry.set_assignment_and_version_with_source_handoff(
                 new_assignment,
                 snapshot.version,
+                handoff.sources,
             );
-        } else if let Some((_, resume_offsets)) = source_handoff {
-            registry.set_assignment_and_version_with_resume_offsets(
-                new_assignment,
-                snapshot.version,
-                resume_offsets,
-            );
-        } else {
-            // Genesis has no decided cut. Keep that distinct from a decided
+        } else if source_handoff_required {
+            // Genesis has no committed cut. Keep that distinct from a committed
             // empty cut so sources may use their start-captured numeric baseline.
             registry.set_assignment_and_version(new_assignment, snapshot.version);
             registry.mark_active(&newly_acquired);
+        } else {
+            registry.set_assignment_and_version_carrying_source_handoff(
+                new_assignment,
+                snapshot.version,
+            );
         }
         registry.clear_draining();
         if let Some(backend) = self.state_backend.lock().clone() {
@@ -933,6 +2087,9 @@ impl LaminarDB {
             coord.set_assignment_version(snapshot.version);
             coord.set_vnode_set(new_owned.clone());
             coord.set_gate_vnode_set((0..vnode_count).collect());
+        }
+        if let Some(incarnation) = current_incarnation {
+            *self.local_state_incarnation.lock() = Some(incarnation);
         }
         drop(staged_rehydration);
         drop(pending_revoke);
@@ -948,18 +2105,78 @@ impl LaminarDB {
         Ok(adoption)
     }
 
+    /// Wait for every local vnode-partitioned source to publish an exact FIFO drain receipt.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn prepare_local_source_drain(
+        &self,
+        transition: &laminar_core::checkpoint::AssignmentDrainTransition,
+        participant: laminar_core::checkpoint::CheckpointParticipant,
+        revoking_vnodes: &[u32],
+        deadline: tokio::time::Instant,
+    ) -> Result<laminar_core::checkpoint::NodeDrainReceiptAggregate, DbError> {
+        crate::pipeline::streaming_coordinator::prepare_owned_source_drain(
+            &self.owned_source_tasks,
+            transition,
+            participant,
+            Arc::from(revoking_vnodes.to_vec()),
+            deadline,
+        )
+        .await
+        .map_err(|error| DbError::Checkpoint(format!("source drain failed: {error}")))
+    }
+
+    /// Resolve the exact local source drain after target commit or abort.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn resolve_local_source_drain(
+        &self,
+        round: laminar_core::checkpoint::AssignmentDrainId,
+        outcome: laminar_connectors::connector::SourceDrainOutcome,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        crate::pipeline::streaming_coordinator::resolve_owned_source_drain(
+            &self.owned_source_tasks,
+            laminar_connectors::connector::SourceDrainResolution { round, outcome },
+            deadline,
+        )
+        .await
+        .map_err(|error| DbError::Checkpoint(format!("source drain resolution failed: {error}")))
+    }
+
     /// Mark the vnodes this node is about to lose as draining (source pauses their
     /// partitions for a clean checkpoint cut); does NOT change ownership. Returns
     /// them so the leader can wait on the drain. The committed snapshot rotates
     /// ownership later via [`adopt_assignment_snapshot`](Self::adopt_assignment_snapshot).
     #[cfg(feature = "cluster")]
-    pub fn adopt_draining_snapshot(
+    pub(crate) fn adopt_draining_snapshot(
         &self,
         snapshot: &laminar_core::cluster::control::AssignmentSnapshot,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, DbError> {
+        if !snapshot.draining {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} is not a draining generation",
+                snapshot.version
+            )));
+        }
+        if !snapshot.has_canonical_participants() {
+            return Err(DbError::Checkpoint(format!(
+                "draining assignment {} has no canonical process roster",
+                snapshot.version
+            )));
+        }
         let Some(registry) = self.vnode_registry.lock().clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
+        let expected_version = registry
+            .assignment_version()
+            .checked_add(1)
+            .ok_or_else(|| DbError::Checkpoint("assignment version overflow".into()))?;
+        if snapshot.version != expected_version {
+            return Err(DbError::Checkpoint(format!(
+                "draining assignment {} is not the exact successor of local assignment {}",
+                snapshot.version,
+                registry.assignment_version()
+            )));
+        }
         let vnode_count = registry.vnode_count();
         let self_id = self
             .cluster_controller
@@ -968,7 +2185,9 @@ impl LaminarDB {
             .map_or(laminar_core::state::NodeId(0), |c| {
                 laminar_core::state::NodeId(c.instance_id().0)
             });
-        let next = snapshot.to_vnode_vec(vnode_count);
+        let next = snapshot
+            .to_vnode_vec(vnode_count)
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
         let current = registry.snapshot();
         let revoking: Vec<u32> = (0..vnode_count)
             .filter(|&v| {
@@ -988,7 +2207,7 @@ impl LaminarDB {
             );
             registry.mark_draining(&revoking);
         }
-        revoking
+        Ok(revoking)
     }
 
     /// Whether vnode rotations run the pre-rotation source drain — true when a sink
@@ -1011,7 +2230,12 @@ impl LaminarDB {
     pub(crate) fn set_cluster_controller(
         &self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
-    ) {
+    ) -> Result<(), DbError> {
+        if !self.is_cluster_runtime() {
+            return Err(DbError::Config(
+                "cluster controller cannot be installed on a local runtime".into(),
+            ));
+        }
         // Weak store handles avoid a reference cycle with the DB.
         controller.register_query_handler(Arc::new(DbQueryHandler {
             mv_store: Arc::downgrade(&self.mv_store),
@@ -1020,112 +2244,8 @@ impl LaminarDB {
             // temp table visible, so it can't reference other registered tables.
             filter_ctx: SessionContext::new(),
         }));
-        self.spawn_subscription_router(&controller);
         *self.cluster_controller.lock() = Some(controller);
-        self.update_sql_cluster_context();
-    }
-
-    /// Refresh the gossip interest cache and drain remote `__sub::` batches.
-    /// Weak handles so the task exits when the `LaminarDB` is dropped.
-    #[cfg(feature = "cluster")]
-    fn spawn_subscription_router(
-        &self,
-        controller: &Arc<laminar_core::cluster::control::ClusterController>,
-    ) {
-        use std::collections::{HashMap, HashSet};
-
-        // Some unit tests install a controller without a runtime; server-mode only.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-
-        let kv = Arc::clone(controller.kv());
-
-        // Object-store backends have no subscription-interest discovery.
-        if !kv.supports_subscription_routing() {
-            tracing::info!(
-                "distributed SUBSCRIBE routing disabled: coordination backend has \
-                 no subscription-interest discovery"
-            );
-            return;
-        }
-
-        let active_subs = Arc::downgrade(&self.active_subs);
-        let subscription_registry = Arc::downgrade(&self.subscription_registry);
-        let shuffle_receiver = Arc::downgrade(&self.shuffle_receiver);
-
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(SUB_ROUTER_TICK);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut advertised: HashSet<String> = HashSet::new();
-            let mut until_refresh: u64 = 0;
-            loop {
-                tick.tick().await;
-
-                // Upgrade weak handles; bail once the DB has been dropped.
-                let (Some(active_subs), Some(registry), Some(receiver_slot)) = (
-                    active_subs.upgrade(),
-                    subscription_registry.upgrade(),
-                    shuffle_receiver.upgrade(),
-                ) else {
-                    break;
-                };
-
-                let local_names = registry.active_subscription_names();
-
-                if until_refresh == 0 {
-                    let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
-                    for (node_id, key, value) in kv.scan_prefix("sub:").await {
-                        if !value.is_empty() {
-                            if let Some(name) = key.strip_prefix("sub:") {
-                                map.entry(name.to_string()).or_default().insert(node_id.0);
-                            }
-                        }
-                    }
-                    let idle = map.is_empty() && local_names.is_empty();
-                    *active_subs.write() = map;
-                    until_refresh = if idle {
-                        SUB_REFRESH_IDLE_TICKS
-                    } else {
-                        SUB_REFRESH_ACTIVE_TICKS
-                    };
-                }
-                until_refresh = until_refresh.saturating_sub(1);
-
-                for name in &local_names {
-                    if advertised.insert(name.clone()) {
-                        kv.write(&format!("sub:{name}"), "active".to_string()).await;
-                    }
-                }
-                let removed: Vec<String> = advertised
-                    .iter()
-                    .filter(|n| !local_names.contains(*n))
-                    .cloned()
-                    .collect();
-                for name in removed {
-                    kv.write(&format!("sub:{name}"), String::new()).await;
-                    advertised.remove(&name);
-                }
-
-                // Drain every `__sub::` stage; dropped subs fall through send_batch as a no-op.
-                if !local_names.is_empty() {
-                    let receiver = receiver_slot.lock().clone();
-                    if let Some(receiver) = receiver {
-                        for (stage, batches) in receiver
-                            .drain_staged_with_prefix(crate::subscription::REMOTE_STAGE_PREFIX)
-                        {
-                            if let Some(name) =
-                                crate::subscription::stream_from_remote_stage(&stage)
-                            {
-                                for batch in batches {
-                                    registry.send_batch(name, batch);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        Ok(())
     }
 
     pub(crate) fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
@@ -1134,14 +2254,25 @@ impl LaminarDB {
 
     pub(crate) fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
         *self.vnode_registry.lock() = Some(registry);
-        #[cfg(feature = "cluster")]
-        self.update_sql_cluster_context();
     }
 
-    /// The underlying `DataFusion` session context.
-    #[must_use]
-    pub fn session_context(&self) -> &SessionContext {
-        &self.ctx
+    /// Collect this node's physical table slice without invoking distributed fan-out.
+    ///
+    /// This is intended for cluster diagnostics and placement validation. It deliberately returns
+    /// immutable batches rather than exposing the mutable `DataFusion` catalog.
+    #[cfg(feature = "cluster")]
+    pub async fn collect_local_table(&self, name: &str) -> Result<Vec<RecordBatch>, DbError> {
+        const LOCAL_SCAN_NAME: &str = "__laminar_local_table_scan";
+
+        let _catalog_guard = self.topology_ddl_lock.read().await;
+        let provider = self.ctx.table_provider(exact_table_reference(name)).await?;
+        let context = SessionContext::new();
+        context.register_table(exact_table_reference(LOCAL_SCAN_NAME), provider)?;
+        Ok(context
+            .sql(&format!("SELECT * FROM {LOCAL_SCAN_NAME}"))
+            .await?
+            .collect()
+            .await?)
     }
 
     /// Returns a fluent builder for constructing a [`LaminarDB`].
@@ -1151,59 +2282,58 @@ impl LaminarDB {
     }
 
     #[allow(unused_variables)]
-    fn register_builtin_connectors(registry: &laminar_connectors::registry::ConnectorRegistry) {
-        laminar_connectors::generator::register_generator_source(registry);
+    fn register_builtin_connectors(
+        registry: &laminar_connectors::registry::ConnectorRegistry,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        laminar_connectors::generator::register_generator_source(registry)?;
         #[cfg(feature = "kafka")]
         {
-            laminar_connectors::kafka::register_kafka_source(registry);
-            laminar_connectors::kafka::register_kafka_sink(registry);
+            laminar_connectors::kafka::register_kafka_source(registry)?;
+            laminar_connectors::kafka::register_kafka_sink(registry)?;
         }
         #[cfg(feature = "postgres-cdc")]
         {
-            laminar_connectors::cdc::postgres::register_postgres_cdc_source(registry);
+            laminar_connectors::cdc::postgres::register_postgres_cdc_source(registry)?;
         }
         #[cfg(feature = "postgres-sink")]
         {
-            laminar_connectors::postgres::register_postgres_sink(registry);
+            laminar_connectors::postgres::register_postgres_sink(registry)?;
         }
         #[cfg(feature = "delta-lake")]
         {
-            laminar_connectors::lakehouse::register_delta_lake_sink(registry);
-            laminar_connectors::lakehouse::register_delta_lake_source(registry);
+            laminar_connectors::lakehouse::register_delta_lake_sink(registry)?;
+            laminar_connectors::lakehouse::register_delta_lake_source(registry)?;
         }
         #[cfg(feature = "iceberg")]
         {
-            laminar_connectors::lakehouse::register_iceberg_sink(registry);
-            laminar_connectors::lakehouse::register_iceberg_source(registry);
+            laminar_connectors::lakehouse::register_iceberg_sink(registry)?;
+            laminar_connectors::lakehouse::register_iceberg_source(registry)?;
         }
         #[cfg(feature = "websocket")]
         {
-            laminar_connectors::websocket::register_websocket_source(registry);
-            laminar_connectors::websocket::register_websocket_sink(registry);
-        }
-        #[cfg(feature = "mysql-cdc")]
-        {
-            laminar_connectors::cdc::mysql::register_mysql_cdc_source(registry);
+            laminar_connectors::websocket::register_websocket_source(registry)?;
+            laminar_connectors::websocket::register_websocket_sink(registry)?;
         }
         #[cfg(feature = "mongodb-cdc")]
         {
-            laminar_connectors::mongodb::register_mongodb_cdc_source(registry);
-            laminar_connectors::mongodb::register_mongodb_sink(registry);
+            laminar_connectors::mongodb::register_mongodb_cdc_source(registry)?;
+            laminar_connectors::mongodb::register_mongodb_sink(registry)?;
         }
         #[cfg(feature = "files")]
         {
-            laminar_connectors::files::register_file_source(registry);
-            laminar_connectors::files::register_file_sink(registry);
+            laminar_connectors::files::register_file_source(registry)?;
+            laminar_connectors::files::register_file_sink(registry)?;
         }
         #[cfg(feature = "otel")]
         {
-            laminar_connectors::otel::register_otel_source(registry);
+            laminar_connectors::otel::register_otel_source(registry)?;
         }
         #[cfg(feature = "nats")]
         {
-            laminar_connectors::nats::register_nats_source(registry);
-            laminar_connectors::nats::register_nats_sink(registry);
+            laminar_connectors::nats::register_nats_source(registry)?;
+            laminar_connectors::nats::register_nats_sink(registry)?;
         }
+        Ok(())
     }
 
     fn handle_register_lookup_table(
@@ -1212,6 +2342,7 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         use laminar_sql::parser::lookup_table::ConnectorType;
 
+        self.preflight_lookup_connector(&info.properties)?;
         if info.primary_key.len() != 1 {
             return Err(DbError::InvalidOperation(
                 "Lookup table requires a single-column primary key".into(),
@@ -1219,25 +2350,12 @@ impl LaminarDB {
         }
         let pk = info.primary_key[0].clone();
 
-        let cache_mode = info.properties.cache_memory.map(|mem| {
-            let max_entries = cache_entries_from_memory(mem);
-            crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-        });
-        if let Some(cache) = cache_mode {
-            self.table_store.write().create_table_with_cache(
-                &info.name,
-                info.arrow_schema.clone(),
-                &pk,
-                cache,
-            )?;
-        } else {
-            self.table_store
-                .write()
-                .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
-        }
+        self.table_store
+            .write()
+            .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
 
         if !matches!(info.properties.connector, ConnectorType::Static) {
-            self.register_lookup_connector(&info, &pk)?;
+            self.register_lookup_connector(&info, &pk);
         }
 
         {
@@ -1246,15 +2364,30 @@ impl LaminarDB {
                 info.arrow_schema.clone(),
                 self.table_store.clone(),
             );
-            let _ = self.ctx.deregister_table(&info.name);
-            self.ctx
-                .register_table(&info.name, Arc::new(provider))
-                .map_err(|e| {
-                    DbError::InvalidOperation(format!("Failed to register lookup table: {e}"))
-                })?;
+            match self
+                .ctx
+                .register_table(exact_table_reference(&info.name), Arc::new(provider))
+            {
+                Ok(None) => {}
+                Ok(Some(previous)) => {
+                    let _ = self
+                        .ctx
+                        .register_table(exact_table_reference(&info.name), previous);
+                    return Err(DbError::InvalidOperation(format!(
+                        "cannot create lookup table '{}': its provider was claimed concurrently",
+                        info.name
+                    )));
+                }
+                Err(error) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "failed to register lookup table '{}': {error}",
+                        info.name
+                    )));
+                }
+            }
         }
 
-        if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
+        if let Some(batch) = self.table_store.read().to_record_batch(&info.name)? {
             self.lookup_registry.register(
                 &info.name,
                 laminar_sql::datafusion::LookupSnapshot { batch },
@@ -1266,46 +2399,74 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE LOOKUP TABLE".to_string(),
             object_name: info.name,
+            applied: true,
         }))
     }
 
-    #[allow(clippy::unnecessary_wraps)]
-    fn register_lookup_connector(
+    fn preflight_lookup_connector(
         &self,
-        info: &laminar_sql::planner::LookupTableInfo,
-        pk: &str,
+        properties: &laminar_sql::parser::lookup_table::LookupTableProperties,
     ) -> Result<(), DbError> {
+        use laminar_sql::parser::lookup_table::{ConnectorType, LookupStrategy};
+
+        if properties.strategy == LookupStrategy::OnDemand
+            && self.config.delivery_guarantee
+                == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+        {
+            return Err(DbError::InvalidOperation(
+                "on-demand LOOKUP TABLE is incompatible with exactly-once delivery because \
+                 external lookup results are not checkpointed"
+                    .into(),
+            ));
+        }
+        if matches!(properties.connector, ConnectorType::Static) {
+            if properties.strategy == LookupStrategy::OnDemand {
+                return Err(DbError::InvalidOperation(
+                    "static LOOKUP TABLE supports only the replicated strategy".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let connector =
+            crate::connector_manager::normalize_connector_type(&properties.connector.to_string());
+        let (available, capability) = match properties.strategy {
+            LookupStrategy::Replicated => (
+                self.connector_registry.has_table_source(&connector),
+                "snapshot-capable table source",
+            ),
+            LookupStrategy::OnDemand => (
+                self.connector_registry.has_lookup_source(&connector),
+                "on-demand lookup source",
+            ),
+        };
+        if !available {
+            return Err(DbError::InvalidOperation(format!(
+                "LOOKUP TABLE connector '{connector}' has no registered {capability} required \
+                 by strategy '{}'",
+                properties.strategy
+            )));
+        }
+        Ok(())
+    }
+
+    fn register_lookup_connector(&self, info: &laminar_sql::planner::LookupTableInfo, pk: &str) {
         use laminar_sql::parser::lookup_table::ConnectorType;
 
         let connector_type_str = match &info.properties.connector {
             ConnectorType::Postgres => "postgres",
-            ConnectorType::PostgresCdc => "postgres-cdc",
-            ConnectorType::MysqlCdc => "mysql-cdc",
             ConnectorType::Redis => "redis",
             ConnectorType::S3Parquet => "s3-parquet",
             ConnectorType::DeltaLake => "delta-lake",
             ConnectorType::Custom(s) => s.as_str(),
             ConnectorType::Static => unreachable!(),
         };
+        let connector_type_str =
+            crate::connector_manager::normalize_connector_type(connector_type_str);
 
         self.table_store
             .write()
-            .set_connector(&info.name, connector_type_str);
-
-        let refresh = match info.properties.strategy {
-            laminar_sql::parser::lookup_table::LookupStrategy::Replicated
-            | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
-                // Postgres has no CDC slot; snapshot-only is sufficient.
-                if matches!(info.properties.connector, ConnectorType::Postgres) {
-                    Some(laminar_connectors::reference::RefreshMode::SnapshotOnly)
-                } else {
-                    Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
-                }
-            }
-            laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
-                Some(laminar_connectors::reference::RefreshMode::Manual)
-            }
-        };
+            .set_connector(&info.name, &connector_type_str);
 
         // Keys consumed by LookupTableProperties are excluded; "format.*" keys
         // go to format_options with the prefix stripped.
@@ -1313,7 +2474,6 @@ impl LaminarDB {
             "connector",
             "strategy",
             "cache.memory",
-            "cache.disk",
             "cache.ttl",
             "pushdown",
             "format",
@@ -1348,20 +2508,21 @@ impl LaminarDB {
             .register_table(crate::connector_manager::TableRegistration {
                 name: info.name.clone(),
                 primary_key: pk.to_string(),
-                connector_type: Some(connector_type_str.to_string()),
+                connector_type: Some(connector_type_str),
                 connector_options,
                 format: info.raw_options.get("format").cloned(),
                 format_options,
-                refresh,
+                on_demand: matches!(
+                    info.properties.strategy,
+                    laminar_sql::parser::lookup_table::LookupStrategy::OnDemand
+                ),
                 cache_max_bytes,
                 cache_ttl,
             });
-
-        Ok(())
     }
 
     /// Rebuild the lookup optimizer rules for the current set of registered tables.
-    fn refresh_lookup_optimizer_rule(&self) {
+    pub(crate) fn refresh_lookup_optimizer_rule(&self) {
         use laminar_sql::planner::lookup_join::{LookupColumnPruningRule, LookupJoinRewriteRule};
         use laminar_sql::planner::predicate_split::{
             PlanPushdownMode, PlanSourceCapabilities, PredicateSplitterRule,
@@ -1406,7 +2567,8 @@ impl LaminarDB {
             .add_optimizer_rule(Arc::new(LookupColumnPruningRule));
     }
 
-    /// Returns the connector registry for registering custom connectors before `start()`.
+    /// Returns the frozen connector registry for factory lookup and deployment introspection.
+    /// Custom factories must be registered through [`LaminarDbBuilder::register_connector`].
     #[must_use]
     pub fn connector_registry(&self) -> &laminar_connectors::registry::ConnectorRegistry {
         &self.connector_registry
@@ -1434,6 +2596,15 @@ impl LaminarDB {
         table_uri: &str,
         storage_options: HashMap<String, String>,
     ) -> Result<(), DbError> {
+        self.ensure_catalog_cleanup_unfenced("Delta table registration")?;
+        let _topology = self.topology_ddl_lock.write().await;
+        self.ensure_catalog_cleanup_unfenced("Delta table registration")?;
+        if self.is_cluster_runtime() {
+            return Err(DbError::InvalidOperation(
+                "Delta table registration is not supported in cluster mode until it has a typed, durable catalog definition"
+                    .into(),
+            ));
+        }
         laminar_connectors::lakehouse::delta_table_provider::register_delta_table(
             &self.ctx,
             name,
@@ -1467,32 +2638,278 @@ impl LaminarDB {
         last_result.ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Apply and durably seal the complete startup catalog as one immutable batch.
+    /// Existing sealed catalogs accept exact replay/no-op definitions only.
+    ///
+    /// # Errors
+    /// Returns an error for a partial or divergent bootstrap, unsafe catalog mutation, lost leader
+    /// authority, or manifest sealing failure. Local creates are rolled back on every error.
+    #[cfg(feature = "cluster")]
+    pub async fn execute_cluster_bootstrap_batch(
+        &self,
+        sql: &[String],
+    ) -> Result<Vec<ExecuteResult>, DbError> {
+        self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
+        self.connector_registry.freeze();
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(DbError::Shutdown);
+        }
+        if DbState::load(&self.state) != DbState::Created {
+            return Err(DbError::InvalidOperation(
+                "cluster catalog bootstrap is only valid before pipeline startup".into(),
+            ));
+        }
+
+        let mut parsed = Vec::new();
+        for batch_entry in sql {
+            for stmt_sql in sql_utils::split_statements(batch_entry) {
+                let mut statements = parse_streaming_sql(stmt_sql)?;
+                if statements.len() != 1 {
+                    return Err(DbError::InvalidOperation(
+                        "cluster bootstrap entries must contain exactly one SQL statement".into(),
+                    ));
+                }
+                let statement = statements.pop().ok_or_else(|| {
+                    DbError::InvalidOperation(
+                        "cluster bootstrap entries must contain exactly one SQL statement".into(),
+                    )
+                })?;
+                let (name, kind, _) = validate_cluster_catalog_create(stmt_sql, &statement)?;
+                parsed.push((stmt_sql.to_owned(), statement, name, kind));
+            }
+        }
+        {
+            let mut names = std::collections::HashSet::with_capacity(parsed.len());
+            for (_, _, name, _) in &parsed {
+                if !names.insert(name.as_str()) {
+                    return Err(DbError::InvalidOperation(format!(
+                        "cluster bootstrap defines '{name}' more than once"
+                    )));
+                }
+            }
+        }
+
+        let _topology_ddl = self.topology_ddl_lock.write().await;
+        self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
+        if DbState::load(&self.state) != DbState::Created {
+            return Err(DbError::InvalidOperation(
+                "cluster catalog bootstrap is only valid before pipeline startup".into(),
+            ));
+        }
+
+        if let Some(manifest) = self.restore_catalog_from_manifest().await? {
+            let requested = parsed
+                .iter()
+                .map(|(ddl, _, canonical_name, kind)| {
+                    laminar_core::cluster::control::CatalogManifestEntry {
+                        canonical_name: canonical_name.clone(),
+                        kind: *kind,
+                        ddl: ddl.clone(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            if requested.as_slice() != manifest.entries.as_slice() {
+                return Err(DbError::Pipeline(format!(
+                    "configured cluster catalog must exactly match the complete ordered sealed inventory (configured entries: {}, sealed entries: {})",
+                    requested.len(),
+                    manifest.entries.len()
+                )));
+            }
+            let mut results = Vec::with_capacity(parsed.len());
+            for (stmt_sql, statement, name, _) in &parsed {
+                let result = self
+                    .exact_bootstrap_noop(stmt_sql, statement)?
+                    .ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "sealed cluster catalog rejects startup addition '{name}'"
+                        ))
+                    })?;
+                results.push(result);
+            }
+            return Ok(results);
+        }
+
+        if !self.catalog_manifest_inventory()?.is_empty() {
+            return Err(DbError::Pipeline(
+                "cannot seal a new cluster catalog over uncommitted local topology".into(),
+            ));
+        }
+        let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
+            DbError::Pipeline("cluster catalog manifest store is not configured".into())
+        })?;
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Pipeline(
+                "[LDB-6043] cluster catalog bootstrap requires a cluster controller".into(),
+            )
+        })?;
+        let leader_proof = controller
+            .capture_catalog_bootstrap_proof()
+            .ok_or_else(|| {
+                DbError::Pipeline(
+                    "[LDB-6043] cluster catalog bootstrap requires the active durable leader lease"
+                        .into(),
+                )
+            })?;
+        self.validate_catalog_seal_authority(Some(&leader_proof))?;
+
+        let mut bootstrap_guard = CatalogBootstrapGuard {
+            db: self,
+            created: Vec::with_capacity(parsed.len()),
+            sealed: false,
+        };
+        let mut results = Vec::with_capacity(parsed.len());
+        for (stmt_sql, statement, name, kind) in &parsed {
+            let result = CATALOG_BOOTSTRAP
+                .scope((), self.execute_parsed_single(stmt_sql, statement))
+                .await?;
+            let ExecuteResult::Ddl(info) = &result else {
+                return Err(DbError::Pipeline(format!(
+                    "cluster catalog create '{name}' returned a non-DDL result"
+                )));
+            };
+            if !info.applied || info.object_name != *name {
+                return Err(DbError::Pipeline(format!(
+                    "cluster catalog create '{name}' did not apply exactly once"
+                )));
+            }
+            bootstrap_guard.record(name.clone(), *kind);
+            results.push(result);
+        }
+
+        let manifest = laminar_core::cluster::control::CatalogManifest::new(
+            self.catalog_manifest_inventory()?,
+        )
+        .map_err(|error| {
+            DbError::Pipeline(format!("invalid cluster catalog inventory: {error}"))
+        })?;
+
+        #[cfg(test)]
+        let catalog_seal_gate = { self.catalog_seal_gate.lock().clone() };
+        #[cfg(test)]
+        if let Some((entered, release)) = catalog_seal_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.validate_catalog_seal_authority(Some(&leader_proof))?;
+        store
+            .seal(&manifest, &leader_proof)
+            .await
+            .map_err(|error| DbError::Pipeline(format!("catalog manifest seal failed: {error}")))?;
+        bootstrap_guard.sealed();
+        Ok(results)
+    }
+
+    /// Apply one startup catalog definition and seal it as the complete inventory.
+    /// Prefer [`Self::execute_cluster_bootstrap_batch`] for server configuration.
+    #[cfg(feature = "cluster")]
+    pub async fn execute_cluster_bootstrap(&self, sql: &str) -> Result<ExecuteResult, DbError> {
+        let entries = vec![sql.to_owned()];
+        self.execute_cluster_bootstrap_batch(&entries)
+            .await?
+            .into_iter()
+            .last()
+            .ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
+    }
+
     async fn execute_single(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         let statements = parse_streaming_sql(sql)?;
-
         if statements.is_empty() {
             return Err(DbError::InvalidOperation("Empty SQL statement".into()));
         }
-
         let statement = &statements[0];
+        if mutates_database(statement) {
+            self.ensure_catalog_cleanup_unfenced("database mutation")?;
+        }
+        if is_topology_ddl(statement) {
+            let _topology_ddl = self.topology_ddl_lock.write().await;
+            self.ensure_catalog_cleanup_unfenced("database mutation")?;
+            self.execute_parsed_single(sql, statement).await
+        } else if reads_catalog(statement) {
+            let _topology_read = self.topology_ddl_lock.read().await;
+            if mutates_database(statement) {
+                self.ensure_catalog_cleanup_unfenced("database mutation")?;
+            }
+            self.execute_parsed_single(sql, statement).await
+        } else {
+            if mutates_database(statement) {
+                self.ensure_catalog_cleanup_unfenced("database mutation")?;
+            }
+            self.execute_parsed_single(sql, statement).await
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn execute_single_already_gated(&self, sql: &str) -> Result<ExecuteResult, DbError> {
+        let statements = parse_streaming_sql(sql)?;
+        if statements.len() != 1 || !is_topology_ddl(&statements[0]) {
+            return Err(DbError::InvalidOperation(
+                "catalog manifest entries must contain exactly one topology DDL statement".into(),
+            ));
+        }
+        self.execute_parsed_single(sql, &statements[0]).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_parsed_single(
+        &self,
+        sql: &str,
+        statement: &StreamingStatement,
+    ) -> Result<ExecuteResult, DbError> {
+        if self.is_cluster_runtime()
+            && matches!(
+                statement,
+                StreamingStatement::CreateStream {
+                    retention_bytes: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(DbError::Unsupported(
+                "CREATE STREAM RETAIN HISTORY is not supported in cluster runtime until replay is globally ordered and checkpoint-aligned"
+                    .into(),
+            ));
+        }
+
+        #[cfg(feature = "cluster")]
+        if is_topology_ddl(statement) && !catalog_manifest_replay_active() {
+            let store_configured = self.catalog_manifest_store.lock().is_some();
+            let cluster_runtime = self.is_cluster_runtime();
+            if store_configured || cluster_runtime {
+                validate_cluster_catalog_create(sql, statement)?;
+                if !store_configured {
+                    return Err(DbError::Pipeline(
+                        "cluster topology DDL requires a catalog manifest store".into(),
+                    ));
+                }
+                if !catalog_bootstrap_active() {
+                    return Err(DbError::Pipeline(
+                        "[LDB-6043] configured cluster topology can change only through startup bootstrap/replay until a replicated topology-version barrier is implemented"
+                            .into(),
+                    ));
+                }
+            }
+        }
 
         let result = match statement {
             StreamingStatement::CreateSource(create) => {
                 let result = self.handle_create_source(create).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
-                    self.connector_manager
-                        .lock()
-                        .store_ddl(&info.object_name, sql);
+                    if info.applied {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
                 }
                 Ok(result)
             }
             StreamingStatement::CreateSink(create) => {
                 let result = self.handle_create_sink(create)?;
                 if let ExecuteResult::Ddl(ref info) = result {
-                    self.connector_manager
-                        .lock()
-                        .store_ddl(&info.object_name, sql);
+                    if info.applied {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
                 }
                 Ok(result)
             }
@@ -1500,50 +2917,102 @@ impl LaminarDB {
                 name,
                 query,
                 emit_clause,
+                if_not_exists,
                 query_sql,
                 retention_bytes,
                 ..
             } => {
                 let result = self
                     .handle_create_stream(
+                        sql,
                         name,
                         query,
                         emit_clause.as_ref(),
+                        *if_not_exists,
                         query_sql,
                         *retention_bytes,
                     )
                     .await?;
                 if let ExecuteResult::Ddl(ref info) = result {
-                    self.connector_manager
-                        .lock()
-                        .store_ddl(&info.object_name, sql);
+                    if info.applied {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
                 }
                 Ok(result)
             }
-            StreamingStatement::CreateContinuousQuery { .. }
-            | StreamingStatement::CreateLookupTable(_)
-            | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
+            StreamingStatement::CreateContinuousQuery { .. } => Err(DbError::InvalidOperation(
+                "CREATE CONTINUOUS QUERY has no typed catalog/drop lifecycle; use CREATE STREAM"
+                    .into(),
+            )),
+            StreamingStatement::DropLookupTable { name, if_exists } => {
+                self.handle_drop_lookup_table(name, *if_exists)
+            }
+            StreamingStatement::CreateLookupTable(create) => {
+                if create.or_replace {
+                    return Err(DbError::InvalidOperation(
+                        "CREATE OR REPLACE LOOKUP TABLE is not atomic; use DROP LOOKUP TABLE followed by CREATE LOOKUP TABLE"
+                            .into(),
+                    ));
+                }
+                let name = canonical_object_name(&create.name)?;
+                let Some(reservation) = self.reserve_catalog_name(
+                    &name,
+                    CatalogObjectKind::LookupTable,
+                    create.if_not_exists,
+                )?
+                else {
+                    return Ok(ExecuteResult::Ddl(DdlInfo {
+                        statement_type: "CREATE LOOKUP TABLE".into(),
+                        object_name: name,
+                        applied: false,
+                    }));
+                };
+                let result = self.handle_query(sql).await?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    if info.applied {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
+                }
+                reservation.commit();
+                Ok(result)
+            }
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
                     let result = self.handle_create_table(ct)?;
                     if let ExecuteResult::Ddl(ref info) = result {
-                        self.connector_manager
-                            .lock()
-                            .store_ddl(&info.object_name, sql);
+                        if info.applied {
+                            self.connector_manager
+                                .lock()
+                                .store_ddl(&info.object_name, sql);
+                        }
                     }
                     Ok(result)
                 } else if let sqlparser::ast::Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Table,
                     names,
                     if_exists,
+                    cascade,
                     ..
                 } = stmt.as_ref()
                 {
-                    self.handle_drop_table(names, *if_exists)
+                    self.handle_drop_table(names, *if_exists, *cascade)
                 } else if let sqlparser::ast::Statement::Set(set_stmt) = stmt.as_ref() {
                     self.handle_set(set_stmt)
-                } else {
+                } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::AlterTable { .. }) {
+                    Err(DbError::InvalidOperation(
+                        "ALTER TABLE is disabled until catalog/provider changes are transactional"
+                            .into(),
+                    ))
+                } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::Query(_)) {
                     self.handle_query(sql).await
+                } else {
+                    Err(DbError::InvalidOperation(format!(
+                        "unsupported standard SQL statement; catalog mutation is not typed or transactional: {stmt}"
+                    )))
                 }
             }
             StreamingStatement::InsertInto {
@@ -1565,12 +3034,15 @@ impl LaminarDB {
                 name,
                 if_exists,
                 cascade,
-            } => self.handle_drop_stream(name, *if_exists, *cascade),
+            } => self.handle_drop_stream(name, *if_exists, *cascade).await,
             StreamingStatement::DropMaterializedView {
                 name,
                 if_exists,
                 cascade,
-            } => self.handle_drop_materialized_view(name, *if_exists, *cascade),
+            } => {
+                self.handle_drop_materialized_view(name, *if_exists, *cascade)
+                    .await
+            }
             StreamingStatement::Show(cmd) => {
                 let batch = match cmd {
                     ShowCommand::Sources => self.build_show_sources(),
@@ -1581,10 +3053,10 @@ impl LaminarDB {
                     ShowCommand::Tables => self.build_show_tables(),
                     ShowCommand::CheckpointStatus => self.build_show_checkpoint_status().await?,
                     ShowCommand::CreateSource { name } => {
-                        self.build_show_create_source(&name.to_string())?
+                        self.build_show_create_source(&canonical_object_name(name)?)?
                     }
                     ShowCommand::CreateSink { name } => {
-                        self.build_show_create_sink(&name.to_string())?
+                        self.build_show_create_sink(&canonical_object_name(name)?)?
                     }
                 };
                 Ok(ExecuteResult::Metadata(batch))
@@ -1594,6 +3066,7 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "CHECKPOINT".to_string(),
                     object_name: format!("checkpoint_{}", result.checkpoint_id),
+                    applied: true,
                 }))
             }
             StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
@@ -1634,15 +3107,17 @@ impl LaminarDB {
                     )
                     .await?;
                 if let ExecuteResult::Ddl(ref info) = result {
-                    self.connector_manager
-                        .lock()
-                        .store_ddl(&info.object_name, sql);
+                    if info.applied {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
                 }
                 Ok(result)
             }
-            StreamingStatement::AlterSource { name, operation } => {
-                self.handle_alter_source(name, operation)
-            }
+            StreamingStatement::AlterSource { .. } => Err(DbError::InvalidOperation(
+                "ALTER SOURCE is disabled until catalog/provider changes are transactional".into(),
+            )),
             StreamingStatement::Subscribe(_) => Err(DbError::InvalidOperation(
                 "SUBSCRIBE requires the pgwire endpoint, not HTTP /api/v1/sql".into(),
             )),
@@ -1652,23 +3127,27 @@ impl LaminarDB {
             )),
         };
 
-        #[cfg(feature = "cluster")]
-        if let Ok(ExecuteResult::Ddl(ref info)) = &result {
-            if info.statement_type != "CHECKPOINT" {
-                self.persist_catalog_manifest().await;
-            }
-        }
-
         result
     }
 
     async fn handle_insert_into(
         &self,
         table_name: &sqlparser::ast::ObjectName,
-        _columns: &[sqlparser::ast::Ident],
+        columns: &[sqlparser::ast::Ident],
         values: &[Vec<sqlparser::ast::Expr>],
     ) -> Result<ExecuteResult, DbError> {
-        let name = table_name.to_string();
+        let name = canonical_object_name(table_name)?;
+        if !columns.is_empty() {
+            return Err(DbError::InvalidOperation(
+                "INSERT column lists are unsupported until projection and default-value semantics are implemented"
+                    .into(),
+            ));
+        }
+        if values.is_empty() {
+            return Err(DbError::InvalidOperation(
+                "INSERT requires at least one VALUES row".into(),
+            ));
+        }
 
         if let Some(entry) = self.catalog.get_source(&name) {
             let batch = sql_utils::sql_values_to_record_batch(&entry.schema, values)?;
@@ -1694,28 +3173,9 @@ impl LaminarDB {
             }
         }
 
-        let table = self
-            .ctx
-            .table_provider(&name)
-            .await
-            .map_err(|_| DbError::TableNotFound(name.clone()))?;
-
-        let schema = table.schema();
-        let batch = sql_utils::sql_values_to_record_batch(&schema, values)?;
-
-        self.ctx
-            .deregister_table(&name)
-            .map_err(|e| DbError::InsertError(format!("Failed to deregister table: {e}")))?;
-
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![batch]])
-                .map_err(|e| DbError::InsertError(format!("Failed to create table: {e}")))?;
-
-        self.ctx
-            .register_table(&name, Arc::new(mem_table))
-            .map_err(|e| DbError::InsertError(format!("Failed to register table: {e}")))?;
-
-        Ok(ExecuteResult::RowsAffected(values.len() as u64))
+        Err(DbError::InvalidOperation(format!(
+            "INSERT target '{name}' is not a typed mutable source or table"
+        )))
     }
 
     #[allow(clippy::unused_self)] // will use self when implemented
@@ -1754,124 +3214,111 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError::StreamNotFound` if the stream is not registered.
-    pub fn subscribe<T: crate::handle::FromBatch>(
+    /// Returns `DbError::StreamNotFound` if the object or its output schema is unresolved.
+    pub async fn subscribe<T: crate::handle::FromBatch>(
         &self,
         name: &str,
     ) -> Result<crate::handle::TypedSubscription<T>, DbError> {
-        let sub = self
-            .catalog
-            .get_stream_subscription(name)
-            .ok_or_else(|| DbError::StreamNotFound(name.to_string()))?;
-        Ok(crate::handle::TypedSubscription::from_raw(sub))
+        let portal = self
+            .open_subscription(name, None, crate::subscription::SubscribeStart::Tail)
+            .await?;
+        Ok(crate::handle::TypedSubscription::new(portal))
     }
 
-    /// Subscribe to a named stream's output.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DbError::StreamNotFound` if the stream doesn't exist.
-    #[cfg(feature = "api")]
-    pub fn subscribe_raw(
-        &self,
-        name: &str,
-    ) -> Result<laminar_core::streaming::Subscription<crate::catalog::ArrowRecord>, DbError> {
-        self.catalog
-            .get_stream_subscription(name)
-            .ok_or_else(|| DbError::StreamNotFound(name.to_string()))
+    fn ensure_subscription_runtime_supported(&self) -> Result<(), DbError> {
+        if self.is_cluster_runtime() {
+            return Err(DbError::Unsupported(
+                "SUBSCRIBE is not supported in cluster runtime until delivery is sequenced and checkpoint-aligned"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
-    /// Schema a `SUBSCRIBE` against `name` would emit, plus `filterable`.
-    ///
-    /// `filterable` is `false` only when the schema comes from a `StreamEntry`
-    /// sink placeholder — a `WHERE` clause can't compile against it.
-    /// Order: MV registry → resolved stream output → `StreamEntry` sink.
-    /// A bare source is not resolved (subscribing to it would block forever).
+    /// Schema a `SUBSCRIBE` against `name` would emit.
+    /// A stream is visible here only after its physical output schema has been
+    /// resolved. Bare sources and unresolved streams are not subscribable.
     #[must_use]
-    pub fn lookup_subscription_schema(
-        &self,
-        name: &str,
-    ) -> Option<(arrow_schema::SchemaRef, bool)> {
+    pub fn lookup_subscription_schema(&self, name: &str) -> Option<arrow_schema::SchemaRef> {
         if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
-            return Some((mv.schema, true));
+            return Some(mv.schema);
         }
         if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
-            return Some((schema, true));
-        }
-        if let Some(entry) = self.catalog.get_stream_entry(name) {
-            return Some((entry.sink.schema(), false));
+            return Some(schema);
         }
         None
     }
 
     /// Open a SUBSCRIBE portal against a named MV or resolved stream. A bare
     /// SOURCE is not subscribable (surfaced as `StreamNotFound`).
-    /// `filter_sql` is rejected on streams (their schema is opaque).
     ///
     /// # Errors
-    /// `StreamNotFound` for unknown `name`; `Pipeline` for subscriber-cap
+    /// `Unsupported` in cluster runtime; `StreamNotFound` for unknown `name`;
+    /// `Pipeline` for subscriber-cap
     /// or filter-compile failures; `InvalidOperation` when `AsOfEpoch(n)`
-    /// is requested but `n` is no longer retained.
+    /// is not committed or is no longer retained.
     pub async fn open_subscription(
         &self,
         name: &str,
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
+        self.ensure_subscription_runtime_supported()?;
+
+        // Serialize schema resolution, filter compilation, and cursor attachment
+        // with topology DDL. Otherwise DROP/recreate can leave a portal attached
+        // to an orphaned log with the previous object's schema.
+        let _topology = self.topology_ddl_lock.read().await;
+
         // SUBSCRIBE to an incremental MV delivers consolidated snapshots (plain rows), not the
         // raw `__weight` changelog.
 
-        let attached = self.subscription_registry.subscriber_count(name);
-        if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
-            return Err(DbError::Pipeline(format!(
-                "subscriber cap reached for '{name}' ({attached}/{})",
-                crate::subscription::MAX_SUBSCRIBERS_PER_MV
-            )));
-        }
-
-        let (schema, filterable) = self
+        let schema = self
             .lookup_subscription_schema(name)
             .ok_or_else(|| DbError::StreamNotFound(name.to_string()))?;
 
         let filter = match filter_sql {
             None => None,
-            Some(_) if !filterable => {
-                return Err(DbError::Pipeline(format!(
-                    "WHERE on '{name}' is not supported: stream output schema \
-                     was not resolved (likely a planner failure at start())"
-                )));
-            }
             Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
         };
 
-        let (mut replay, rx) = self
-            .subscription_registry
-            .subscribe(name, start)
-            .map_err(|e| {
-                let requested = match start {
-                    crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
-                    crate::subscription::SubscribeStart::Tail => 0,
-                };
-                DbError::InvalidOperation(format!(
-                    "epoch {requested} for stream '{name}' is no longer retained \
-                     (earliest retained is {})",
-                    e.earliest_retained
-                ))
-            })?;
+        let reader =
+            self.subscription_registry
+                .subscribe(name, start)
+                .map_err(|error| match error {
+                    crate::subscription::SubscriptionOpenError::ReplayPruned {
+                        earliest_retained,
+                    } => {
+                        let requested = match start {
+                            crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
+                            crate::subscription::SubscribeStart::Tail => 0,
+                        };
+                        DbError::SubscriptionReplayPruned {
+                            name: name.to_string(),
+                            requested,
+                            earliest_retained,
+                        }
+                    }
+                    crate::subscription::SubscriptionOpenError::EpochNotCommitted {
+                        requested,
+                        latest_committed,
+                    } => DbError::SubscriptionEpochNotCommitted {
+                        name: name.to_string(),
+                        requested,
+                        latest_committed,
+                    },
+                    crate::subscription::SubscriptionOpenError::Capacity { attached, limit } => {
+                        DbError::Pipeline(format!(
+                            "subscriber cap reached for '{name}' ({attached}/{limit})"
+                        ))
+                    }
+                })?;
 
-        // Seed a Tail subscriber with the current snapshot so it sees present state at once.
-        if matches!(start, crate::subscription::SubscribeStart::Tail) {
-            if let Some(snap) = self.mv_store.read().to_record_batch(name)? {
-                if snap.num_rows() > 0 {
-                    replay.insert(0, crate::subscription::MvUpdate::Batch(snap));
-                }
-            }
-        }
         Ok(match filter {
             Some(phys) => crate::subscription::SubscriptionPortal::open_with_filter(
-                name, schema, replay, rx, phys,
+                name, schema, reader, phys,
             ),
-            None => crate::subscription::SubscriptionPortal::open(name, schema, replay, rx),
+            None => crate::subscription::SubscriptionPortal::open(name, schema, reader),
         })
     }
 
@@ -2051,6 +3498,29 @@ impl LaminarDB {
             if statements.is_empty() {
                 return Err(DbError::InvalidOperation("Empty SQL statement".into()));
             }
+            match &statements[0] {
+                StreamingStatement::CreateContinuousQuery { .. } => {
+                    return Err(DbError::InvalidOperation(
+                        "CREATE CONTINUOUS QUERY has no typed catalog/drop lifecycle; use CREATE STREAM"
+                            .into(),
+                    ));
+                }
+                StreamingStatement::CreateLookupTable(statement) => {
+                    self.ensure_offline_topology_ddl_allowed("CREATE LOOKUP TABLE")?;
+                    let name = canonical_object_name(&statement.name)?;
+                    if self.catalog_namespace.lock().get(&name)
+                        != Some(&CatalogObjectKind::LookupTable)
+                    {
+                        return Err(DbError::InvalidOperation(
+                            "CREATE LOOKUP TABLE must pass typed namespace admission".into(),
+                        ));
+                    }
+                }
+                StreamingStatement::DropLookupTable { name, if_exists } => {
+                    return self.handle_drop_lookup_table(name, *if_exists);
+                }
+                _ => {}
+            }
             let mut planner = self.planner.lock();
             planner
                 .plan(&statements[0])
@@ -2062,12 +3532,14 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DDL".to_string(),
                     object_name: info.name,
+                    applied: true,
                 }))
             }
             laminar_sql::planner::StreamingPlan::RegisterSink(info) => {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DDL".to_string(),
                     object_name: info.name,
+                    applied: true,
                 }))
             }
             laminar_sql::planner::StreamingPlan::Query(query_plan) => {
@@ -2092,17 +3564,9 @@ impl LaminarDB {
             laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
                 self.handle_register_lookup_table(info)
             }
-            laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
-                self.table_store.write().drop_table(&name);
-                self.connector_manager.lock().unregister_table(&name);
-                let _ = self.ctx.deregister_table(&name);
-                self.lookup_registry.unregister(&name);
-                self.refresh_lookup_optimizer_rule();
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "DROP LOOKUP TABLE".to_string(),
-                    object_name: name,
-                }))
-            }
+            laminar_sql::planner::StreamingPlan::DropLookupTable { .. } => Err(
+                DbError::InvalidOperation("lookup drop bypassed typed catalog admission".into()),
+            ),
         }
     }
 
@@ -2219,9 +3683,11 @@ impl LaminarDB {
             datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![result_batch]])
                 .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
-        let _ = self.ctx.deregister_table("__asof_result");
+        let _ = self
+            .ctx
+            .deregister_table(exact_table_reference("__asof_result"));
         self.ctx
-            .register_table("__asof_result", Arc::new(mem_table))
+            .register_table(exact_table_reference("__asof_result"), Arc::new(mem_table))
             .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let df = self
@@ -2234,7 +3700,9 @@ impl LaminarDB {
             .await
             .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
-        let _ = self.ctx.deregister_table("__asof_result");
+        let _ = self
+            .ctx
+            .deregister_table(exact_table_reference("__asof_result"));
 
         Ok(self.bridge_query_stream(original_sql, stream))
     }
@@ -2481,6 +3949,7 @@ impl LaminarDB {
     pub async fn checkpoint(
         &self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        self.ensure_catalog_cleanup_unfenced("manual checkpoint")?;
         if self.config.checkpoint.is_none() {
             return Err(DbError::Checkpoint(
                 "checkpointing is not enabled".to_string(),
@@ -2494,15 +3963,15 @@ impl LaminarDB {
         }
 
         #[cfg(feature = "cluster")]
-        {
+        if self.is_cluster_runtime() {
             let leader_rpc: Result<Option<String>, DbError> = {
                 let cc_guard = self.cluster_controller.lock();
-                match cc_guard.as_ref() {
-                    // Embedded and single-node runtimes do not install a cluster
-                    // controller, so their manual checkpoint remains local.
-                    None => Ok(None),
-                    Some(cc) if cc.is_leader() => Ok(None),
-                    Some(cc) => {
+                let cc = cc_guard.as_ref().ok_or_else(|| {
+                    DbError::Checkpoint("cluster runtime has no cluster controller".into())
+                })?;
+                match cc {
+                    cc if cc.is_leader() => Ok(None),
+                    cc => {
                         let leader_id = cc.current_leader().ok_or_else(|| {
                             DbError::Checkpoint(
                                 "cannot route checkpoint: cluster leader is unresolved".into(),
@@ -2551,11 +4020,6 @@ impl LaminarDB {
             DbError::Checkpoint("manual checkpoint ended without a terminal reply".into())
         })?;
 
-        #[cfg(feature = "cluster")]
-        if matches!(&result, Ok(r) if r.success) {
-            self.persist_catalog_manifest().await;
-        }
-
         result
     }
 
@@ -2571,6 +4035,8 @@ impl LaminarDB {
             epoch: u64,
             duration_ms: u64,
             error: Option<String>,
+            failure_disposition:
+                Option<crate::checkpoint_coordinator::CheckpointFailureDisposition>,
         }
 
         let mut req = reqwest::Client::new()
@@ -2600,6 +4066,7 @@ impl LaminarDB {
                 epoch: response.epoch,
                 duration: std::time::Duration::from_millis(response.duration_ms),
                 error: response.error,
+                failure_disposition: response.failure_disposition,
             }),
             Err(_) => Err(DbError::Checkpoint(format!(
                 "leader rejected checkpoint ({status}): {body}"
@@ -2619,6 +4086,7 @@ impl LaminarDB {
 impl std::fmt::Debug for LaminarDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaminarDB")
+            .field("runtime_mode", &self.runtime_mode)
             .field("sources", &self.catalog.list_sources().len())
             .field("sinks", &self.catalog.list_sinks().len())
             .field("materialized_views", &self.mv_registry.lock().len())
@@ -2688,10 +4156,16 @@ impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
         let batch = if let Some(b) = from_mv {
             b
         } else {
-            self.table_store
+            let store = self
+                .table_store
                 .upgrade()
-                .and_then(|s| s.read().to_record_batch(table_name))
-                .ok_or_else(|| format!("table '{table_name}' not found"))?
+                .ok_or_else(|| "table store is unavailable".to_string())?;
+            let batch = store
+                .read()
+                .to_record_batch(table_name)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("table '{table_name}' not found"))?;
+            batch
         };
 
         // Apply before projecting (predicate may reference dropped columns);

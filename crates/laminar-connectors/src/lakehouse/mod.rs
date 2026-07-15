@@ -1,7 +1,7 @@
 //! Lakehouse connectors (Delta Lake, Apache Iceberg).
 
-// Shared versioned envelope for coordinated-commit descriptors.
-#[cfg(any(feature = "iceberg", feature = "delta-lake"))]
+// Versioned envelope for Delta coordinated-commit descriptors.
+#[cfg(feature = "delta-lake")]
 mod commit_descriptor;
 
 // Delta Lake modules
@@ -52,7 +52,13 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the Delta Lake sink connector with the given registry.
-pub fn register_delta_lake_sink(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns the registry error when a name is already registered or the registry is frozen.
+pub fn register_delta_lake_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "delta-lake".to_string(),
         display_name: "Delta Lake Sink".to_string(),
@@ -71,11 +77,17 @@ pub fn register_delta_lake_sink(registry: &ConnectorRegistry) {
                 registry,
             )))
         }),
-    );
+    )
 }
 
 /// Registers the Delta Lake source connector with the given registry.
-pub fn register_delta_lake_source(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns the registry error when a name is already registered or the registry is frozen.
+pub fn register_delta_lake_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "delta-lake".to_string(),
         display_name: "Delta Lake Source".to_string(),
@@ -91,26 +103,28 @@ pub fn register_delta_lake_source(registry: &ConnectorRegistry) {
         Arc::new(|registry: Option<&prometheus::Registry>| {
             Box::new(DeltaSource::new(DeltaSourceConfig::default(), registry))
         }),
-    );
+    )?;
 
-    // Also register as a table source so CREATE LOOKUP TABLE ... WITH
-    // (connector = 'delta-lake') can use Delta tables as reference data.
+    // Register finite startup snapshots for replicated reference tables.
     #[cfg(feature = "delta-lake")]
     registry.register_table_source(
         "delta-lake",
-        info,
-        Arc::new(|config| {
+        info.clone(),
+        Arc::new(|config, declared_schema| {
             Ok(Box::new(
                 crate::lookup::delta_reference::DeltaReferenceTableSource::from_connector_config(
                     config,
+                    declared_schema,
                 )?,
             ))
         }),
-    );
+    )?;
 
     // Register lookup source factory for on-demand/partial cache mode.
     #[cfg(feature = "delta-lake")]
-    registry.register_lookup_source("delta-lake", Arc::new(DeltaLookupFactory));
+    registry.register_lookup_source("delta-lake", info, Arc::new(DeltaLookupFactory))?;
+
+    Ok(())
 }
 
 #[cfg(feature = "delta-lake")]
@@ -169,7 +183,13 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
 }
 
 /// Registers the Iceberg sink connector with the given registry.
-pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns the registry error when a name is already registered or the registry is frozen.
+pub fn register_iceberg_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "iceberg".to_string(),
         display_name: "Apache Iceberg Sink".to_string(),
@@ -188,11 +208,17 @@ pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
                 registry,
             )))
         }),
-    );
+    )
 }
 
 /// Registers the Iceberg source connector with the given registry.
-pub fn register_iceberg_source(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns the registry error when a name is already registered or the registry is frozen.
+pub fn register_iceberg_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "iceberg".to_string(),
         display_name: "Apache Iceberg Source".to_string(),
@@ -224,23 +250,25 @@ pub fn register_iceberg_source(registry: &ConnectorRegistry) {
                 registry,
             ))
         }),
-    );
+    )?;
 
-    // Register as table source for CREATE LOOKUP TABLE ... WITH (connector = 'iceberg').
+    // Register finite startup snapshots for replicated reference tables.
     #[cfg(feature = "iceberg")]
     registry.register_table_source(
         "iceberg",
-        info,
-        Arc::new(|config| {
+        info.clone(),
+        Arc::new(|config, declared_schema| {
             Ok(Box::new(
-                IcebergReferenceTableSource::from_connector_config(config)?,
+                IcebergReferenceTableSource::from_connector_config(config, declared_schema)?,
             ))
         }),
-    );
+    )?;
 
     // Register lookup source factory for on-demand/partial cache mode.
     #[cfg(feature = "iceberg")]
-    registry.register_lookup_source("iceberg", Arc::new(IcebergLookupFactory));
+    registry.register_lookup_source("iceberg", info, Arc::new(IcebergLookupFactory))?;
+
+    Ok(())
 }
 
 #[cfg(feature = "iceberg")]
@@ -284,15 +312,27 @@ impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
 }
 
 /// Registers all lakehouse sink connectors (Delta Lake, Iceberg).
-pub fn register_lakehouse_sinks(registry: &ConnectorRegistry) {
-    register_delta_lake_sink(registry);
-    register_iceberg_sink(registry);
+///
+/// # Errors
+///
+/// Returns the first registry error.
+pub fn register_lakehouse_sinks(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
+    register_delta_lake_sink(registry)?;
+    register_iceberg_sink(registry)
 }
 
 /// Registers all lakehouse source connectors.
-pub fn register_lakehouse_sources(registry: &ConnectorRegistry) {
-    register_delta_lake_source(registry);
-    register_iceberg_source(registry);
+///
+/// # Errors
+///
+/// Returns the first registry error.
+pub fn register_lakehouse_sources(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
+    register_delta_lake_source(registry)?;
+    register_iceberg_source(registry)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -633,7 +673,7 @@ mod tests {
     #[test]
     fn test_register_delta_lake_sink() {
         let registry = ConnectorRegistry::new();
-        register_delta_lake_sink(&registry);
+        register_delta_lake_sink(&registry).unwrap();
 
         let info = registry.sink_info("delta-lake");
         assert!(info.is_some());
@@ -699,7 +739,7 @@ mod tests {
     #[test]
     fn test_factory_creates_sink() {
         let registry = ConnectorRegistry::new();
-        register_delta_lake_sink(&registry);
+        register_delta_lake_sink(&registry).unwrap();
 
         let mut config = crate::config::ConnectorConfig::new("delta-lake");
         config.set("table.path", "/tmp/laminardb-factory-test");
@@ -712,7 +752,7 @@ mod tests {
     #[test]
     fn test_register_delta_lake_source() {
         let registry = ConnectorRegistry::new();
-        register_delta_lake_source(&registry);
+        register_delta_lake_source(&registry).unwrap();
 
         let info = registry.source_info("delta-lake");
         assert!(info.is_some());
@@ -749,7 +789,7 @@ mod tests {
     #[test]
     fn test_factory_creates_source() {
         let registry = ConnectorRegistry::new();
-        register_delta_lake_source(&registry);
+        register_delta_lake_source(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("delta-lake");
         let source = registry.create_source(&config, None);
@@ -759,7 +799,7 @@ mod tests {
     #[test]
     fn test_register_lakehouse_sinks() {
         let registry = ConnectorRegistry::new();
-        register_lakehouse_sinks(&registry);
+        register_lakehouse_sinks(&registry).unwrap();
 
         assert!(registry.sink_info("delta-lake").is_some());
         assert!(registry.sink_info("iceberg").is_some());
@@ -770,7 +810,7 @@ mod tests {
     #[test]
     fn test_register_iceberg_sink() {
         let registry = ConnectorRegistry::new();
-        register_iceberg_sink(&registry);
+        register_iceberg_sink(&registry).unwrap();
 
         let info = registry.sink_info("iceberg");
         assert!(info.is_some());
@@ -784,7 +824,7 @@ mod tests {
     #[test]
     fn test_register_iceberg_source() {
         let registry = ConnectorRegistry::new();
-        register_iceberg_source(&registry);
+        register_iceberg_source(&registry).unwrap();
 
         let info = registry.source_info("iceberg");
         assert!(info.is_some());
@@ -827,7 +867,7 @@ mod tests {
     #[test]
     fn test_factory_creates_iceberg_sink() {
         let registry = ConnectorRegistry::new();
-        register_iceberg_sink(&registry);
+        register_iceberg_sink(&registry).unwrap();
 
         let mut config = crate::config::ConnectorConfig::new("iceberg");
         config.set("catalog.uri", "http://localhost:8181");
@@ -841,7 +881,7 @@ mod tests {
     #[test]
     fn test_factory_creates_iceberg_source() {
         let registry = ConnectorRegistry::new();
-        register_iceberg_source(&registry);
+        register_iceberg_source(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("iceberg");
         let source = registry.create_source(&config, None);

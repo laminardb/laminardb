@@ -37,6 +37,12 @@ mod macros;
 /// Connector configuration types.
 pub mod config;
 
+/// Secret classification and durable connector-identity sanitization.
+pub mod security;
+
+/// Connector-owned semantic identity for durable source recovery.
+pub mod recovery_identity;
+
 /// Core connector traits (`SourceConnector`, `SinkConnector`).
 pub mod connector;
 pub mod generator;
@@ -82,6 +88,9 @@ pub mod cdc;
 #[cfg(feature = "postgres-sink")]
 pub mod postgres;
 
+#[cfg(any(feature = "postgres-cdc", feature = "postgres-sink"))]
+mod postgres_tls;
+
 /// Lookup table support for enrichment joins.
 pub mod lookup;
 
@@ -96,7 +105,7 @@ pub mod changelog;
 /// Cloud storage infrastructure (credential resolution, validation, secret masking).
 pub mod storage;
 
-/// Reference table source trait and refresh modes.
+/// Finite startup snapshot sources for reference tables.
 pub mod reference;
 
 /// WebSocket source and sink connectors.

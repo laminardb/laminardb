@@ -12,12 +12,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::config::BackpressurePolicy;
+use crate::db::exact_table_reference;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
+#[cfg(feature = "cluster")]
+use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
-    apply_topk_filter, detect_asof_query, detect_processtime_join, detect_stream_join_query,
-    detect_temporal_probe_query, detect_temporal_query, extract_table_references,
-    StreamJoinDetection,
+    apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
+    detect_temporal_query, detect_unbounded_join_steps, extract_table_references, has_join_clause,
+    join_clause_count, StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -34,10 +37,10 @@ pub(crate) trait GraphOperator: Send {
     ) -> Result<Vec<RecordBatch>, DbError>;
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
-    fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError>;
-
-    fn estimated_state_bytes(&self) -> usize {
-        0
+    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Err(DbError::Checkpoint(
+            "operator does not accept checkpoint state".into(),
+        ))
     }
 
     /// Output watermark ceiling. Holds the watermark at `min(input_wm, hold)` so
@@ -47,30 +50,37 @@ pub(crate) trait GraphOperator: Send {
         None
     }
 
+    /// Safe output watermark reconstructed from retained checkpoint work. Restore uses this seed
+    /// before any cycle runs; returning a value asserts that the durable cut had reached it.
+    #[cfg(feature = "cluster")]
+    fn restored_output_watermark(&self) -> Option<i64> {
+        None
+    }
+
     /// Whether the operator can accept new input this cycle. When `false`, input
     /// stays buffered and the operator is still stepped with empty input to drain.
     fn wants_input(&self) -> bool {
         true
     }
 
-    /// Fold a peer-shipped shuffle batch into state outside the normal `process`
-    /// path so barrier-aligned rows enter the snapshot.
+    /// Retain a peer-shipped shuffle batch as channel state outside the normal `process` path so
+    /// the barrier-aligned row and its pending downstream emission enter the snapshot together.
     #[cfg(feature = "cluster")]
-    async fn ingest_shuffle(
+    fn stage_checkpointed_shuffle(
         &mut self,
-        _stage: &str,
-        _batch: RecordBatch,
+        stage: &str,
+        _batch: RetainedBatch,
         _watermark: i64,
     ) -> Result<(), DbError> {
-        Ok(())
+        Err(DbError::Pipeline(format!(
+            "operator does not accept checkpointed shuffle stage '{stage}'"
+        )))
     }
 
     /// Per-vnode state snapshot for cross-node rehydration. `None` for operators
     /// that don't key state by vnode (they recover from the whole-node manifest).
-    /// A cold-tier vnode stages [`StagedSlice::Cold`] rather than bytes so it
-    /// isn't treated as emptied by recovery.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    #[allow(clippy::disallowed_types)] // checkpoint path; vnode-keyed map
     fn checkpoint_by_vnode(
         &mut self,
         _vnode_count: u32,
@@ -79,20 +89,6 @@ pub(crate) trait GraphOperator: Send {
         DbError,
     > {
         Ok(None)
-    }
-
-    /// Drop one vnode's in-memory state after the cold-tier write is confirmed.
-    /// Returns `false` if the vnode was modified since the last capture.
-    #[cfg(feature = "state-tier")]
-    fn demote_vnode(&mut self, _vnode: u32, _vnode_count: u32) -> bool {
-        false
-    }
-
-    /// Whether [`demote_vnode`](Self::demote_vnode) would succeed right now.
-    /// Checked before any tier I/O so dirty vnodes are skipped cheaply.
-    #[cfg(feature = "state-tier")]
-    fn can_demote(&self, _vnode: u32, _vnode_count: u32) -> bool {
-        false
     }
 
     /// Merge one vnode's rehydrated state slice into this operator.
@@ -107,61 +103,22 @@ pub(crate) trait GraphOperator: Send {
         &mut self,
         _vnode: u32,
         _base: &[u8],
-        _deltas: &[(&[u8], &[u8])],
+        _deltas: &[&[u8]],
     ) -> Result<(), DbError> {
         Ok(())
     }
 
-    /// Drop in-memory state for vnodes this node lost on a rebalance, before any later re-acquire
-    /// merges rehydrated state on top of it (the agg merge is additive → double-count). Default
-    /// no-op; only vnode-sharded aggregates act on it.
+    /// Drop in-memory state for vnodes this node lost on a rebalance, before a later authoritative
+    /// vnode image is installed. Default no-op; only vnode-sharded aggregates act on it.
     #[cfg(feature = "cluster")]
-    fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) {}
+    fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+        Ok(())
+    }
 
     /// Force the next delta capture to re-base FULL after a failed epoch (destructive capture
     /// cleared the dirty sets before durability). Default no-op; only delta aggregates act.
     #[cfg(feature = "cluster")]
     fn force_full_rebase(&mut self) {}
-
-    /// Wire the cold-tier channel for vnode promotion. Only vnode-sharded
-    /// aggregates use it; others ignore it.
-    #[cfg(feature = "state-tier")]
-    fn attach_state_tier(&mut self, _tier: crate::state_tier::TierTx) {}
-
-    /// Enable agg delta dirty-tracking for single-node group demotion (no delta chain). Only
-    /// aggregate operators act on it.
-    #[cfg(feature = "state-tier")]
-    fn enable_group_delta_tracking(&mut self) {}
-
-    /// Demote idle resident groups to the cold tier until `target_bytes` is freed; encodes,
-    /// tier-writes and drops each off the compute path. Returns `(groups_demoted, bytes_freed)`.
-    #[cfg(feature = "state-tier")]
-    async fn demote_cold_groups(
-        &mut self,
-        _target_bytes: usize,
-        _vnode_count: u32,
-    ) -> (usize, usize) {
-        (0, 0)
-    }
-
-    /// Vnodes this operator had demoted at the restored checkpoint; must be
-    /// replayed from durable partials since the cold tier is wiped on restart.
-    #[cfg(feature = "state-tier")]
-    fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
-        Vec::new()
-    }
-
-    /// Promotion work pending (fetched cold groups/vnodes awaiting apply, or batches deferred until
-    /// a fetch resolves) that needs a cycle to drain even with no new input. Default `false`.
-    #[cfg(feature = "state-tier")]
-    fn has_pending_promotion(&self) -> bool {
-        false
-    }
-
-    /// Release tier drops queued during promotion; called only with no checkpoint in flight so a
-    /// drop can't race a staged cold-group fetch. Default no-op.
-    #[cfg(feature = "state-tier")]
-    fn release_tier_drops(&mut self) {}
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -174,14 +131,20 @@ enum GateDecision {
     Fail,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphExecutionMode {
+    Normal,
+    CheckpointDrain,
+}
+
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
-// std HashMap: rkyv supports HashMap<K,V> natively but not FxHashMap; cold checkpoint path only.
+// std HashMap: rkyv supports HashMap<K,V> natively but not FxHashMap; checkpoint path only.
 #[allow(clippy::disallowed_types)]
 pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
 
 /// Persisted operator-graph state ABI.
-pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 1;
+pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct GraphCheckpoint {
@@ -217,10 +180,6 @@ impl GraphOperator for SourcePassthrough {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None)
     }
-
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        Ok(())
-    }
 }
 
 struct TombstonedOperator;
@@ -237,10 +196,6 @@ impl GraphOperator for TombstonedOperator {
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None)
-    }
-
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        Ok(())
     }
 }
 
@@ -302,10 +257,6 @@ impl GraphOperator for SqlFilterOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None)
     }
-
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        Ok(())
-    }
 }
 
 /// Enriches an incremental MV's changelog with a static dimension, preserving `__weight`. Re-creates
@@ -343,9 +294,9 @@ impl GraphOperator for ChangelogEnrichOperator {
             let provider = LiveSourceProvider::new(batches[0].schema());
             self.handle = Some(provider.handle());
             let tmp = crate::sql_analysis::CHANGELOG_ENRICH_TMP;
-            let _ = self.ctx.deregister_table(tmp);
+            let _ = self.ctx.deregister_table(exact_table_reference(tmp));
             self.ctx
-                .register_table(tmp, Arc::new(provider))
+                .register_table(exact_table_reference(tmp), Arc::new(provider))
                 .map_err(|e| DbError::Pipeline(format!("changelog-enrich register temp: {e}")))?;
             let logical = self
                 .ctx
@@ -372,15 +323,14 @@ impl GraphOperator for ChangelogEnrichOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None)
     }
-
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        Ok(())
-    }
 }
 
 #[allow(clippy::struct_excessive_bools)] // distinct independent flags, not a state enum
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
+    // Node indices are embedded in edges and parallel buffers. Live DDL runs at
+    // the coordinator safe point, where a fully detached tombstone can be reused.
+    free_node_ids: Vec<usize>,
     edges: Vec<GraphEdge>,
     topo_order: Vec<usize>,
     topo_dirty: bool,
@@ -396,6 +346,10 @@ pub(crate) struct OperatorGraph {
     // Local source names whose domain faulted this cycle; drained by `take_cycle_failures`.
     cycle_failed_sources: FxHashSet<Arc<str>>,
     cycle_any_failed: bool,
+    // Local sources whose graph work remains buffered for replay. `cycle_any_deferred` also
+    // covers remote-only cluster work, where there is no local source cursor to retain.
+    cycle_deferred_sources: FxHashSet<Arc<str>>,
+    cycle_any_deferred: bool,
     source_map: FxHashMap<Arc<str>, usize>,
     source_list: Vec<(Arc<str>, usize)>,
     source_node_ids: FxHashSet<usize>,
@@ -412,12 +366,11 @@ pub(crate) struct OperatorGraph {
     query_budget_ns: u64,
     deferred_scan_offset: usize,
     stats_tick: u64,
-    max_state_bytes: Option<usize>,
     ctx: SessionContext,
     prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
     source_schemas: FxHashMap<String, SchemaRef>,
-    temporal_configs: Vec<TemporalJoinTranslatorConfig>,
+    temporal_configs: Vec<(String, TemporalJoinTranslatorConfig)>,
     depends_on_stream: FxHashSet<usize>,
     order_configs: FxHashMap<usize, OrderOperatorConfig>,
     // Covers source tables and intermediates (lazily created on first operator output).
@@ -435,17 +388,21 @@ pub(crate) struct OperatorGraph {
     reference_tables: FxHashSet<String>,
     // Plan-time errors from add_query (returns ()); surfaced by take_build_errors at start.
     build_errors: Vec<DbError>,
+    // Whole-graph restore is a one-shot startup transition and closes before the first cycle.
+    whole_restore_open: bool,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
-    // `Some(chain_max)` enables incremental delta checkpoints on aggregate operators; the delta
+    #[cfg(feature = "cluster")]
+    last_execution_assignment_version: Option<u64>,
+    // `Some(chain_bound)` enables incremental delta checkpoints on aggregate operators; the delta
     // chain then becomes the PRIMARY agg checkpoint (skip the whole-node manifest, recover from the chain).
     #[cfg(feature = "cluster")]
-    delta_chain_max: Option<u32>,
+    delta_chain_bound: Option<u32>,
     // Per-vnode partials are the authoritative agg checkpoint (cluster + durable backend);
     // whole-node capture into the per-node-incomplete manifest is skipped.
     #[cfg(feature = "cluster")]
     vnode_partials_authoritative: bool,
-    // Set from the shuffle registry in cluster mode, or directly on a single-node tier path.
+    // Set from the shuffle registry in cluster mode.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
     // Staged per-vnode rehydration map; drained at the top of each cycle.
@@ -458,19 +415,13 @@ pub(crate) struct OperatorGraph {
     pending_revoke_vnodes: Option<Arc<parking_lot::Mutex<FxHashSet<u32>>>>,
     #[cfg(feature = "cluster")]
     rotation_execution_fence: Option<Arc<tokio::sync::RwLock<()>>>,
-    // Stored so DDL-added operators also receive the tier channel.
-    #[cfg(feature = "state-tier")]
-    state_tier: Option<crate::state_tier::TierTx>,
-    // Single-node group demotion: enable the agg delta dirty-tracking (no delta chain) so idle
-    // groups are demotable; the coordinator writes demoted groups to cold-only durable partials.
-    #[cfg(feature = "state-tier")]
-    group_delta_tracking: bool,
 }
 
 impl OperatorGraph {
     pub fn new(ctx: SessionContext) -> Self {
         Self {
             nodes: Vec::new(),
+            free_node_ids: Vec::new(),
             edges: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
@@ -480,6 +431,8 @@ impl OperatorGraph {
             max_replay_buffer_bytes: usize::MAX,
             cycle_failed_sources: FxHashSet::default(),
             cycle_any_failed: false,
+            cycle_deferred_sources: FxHashSet::default(),
+            cycle_any_deferred: false,
             source_map: FxHashMap::default(),
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
@@ -495,11 +448,12 @@ impl OperatorGraph {
             query_budget_ns: 8_000_000,
             deferred_scan_offset: 0,
             stats_tick: 0,
-            max_state_bytes: None,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
-            delta_chain_max: None,
+            last_execution_assignment_version: None,
+            #[cfg(feature = "cluster")]
+            delta_chain_bound: None,
             #[cfg(feature = "cluster")]
             vnode_partials_authoritative: false,
             #[cfg(feature = "cluster")]
@@ -510,10 +464,6 @@ impl OperatorGraph {
             pending_revoke_vnodes: None,
             #[cfg(feature = "cluster")]
             rotation_execution_fence: None,
-            #[cfg(feature = "state-tier")]
-            state_tier: None,
-            #[cfg(feature = "state-tier")]
-            group_delta_tracking: false,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -528,6 +478,7 @@ impl OperatorGraph {
             incremental_tables: FxHashSet::default(),
             reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
+            whole_restore_open: true,
         }
     }
 
@@ -574,10 +525,6 @@ impl OperatorGraph {
             Some(e) => Err(e),
             None => Ok(()),
         }
-    }
-
-    pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
-        self.max_state_bytes = limit;
     }
 
     pub fn set_shared_source_isolation(&mut self, on: bool, max_replay_buffer_bytes: usize) {
@@ -644,20 +591,53 @@ impl OperatorGraph {
         })
     }
 
-    /// Any operator has promotion work pending — the coordinator must keep cycling to drain it even
-    /// when no input is arriving (single-node; cluster already cycles every idle tick).
-    #[cfg(feature = "state-tier")]
-    pub fn has_pending_promotion(&self) -> bool {
-        self.nodes
+    /// Logical bytes queued on every live input port. Uses the maintained per-port byte counters
+    /// rather than walking Arrow batches, so checkpoint drain polling is independent of the number
+    /// of buffered batches.
+    pub(crate) fn checkpoint_pending_input_bytes(&self) -> usize {
+        self.input_buf_bytes
             .iter()
-            .any(|n| !n.removed && n.operator.has_pending_promotion())
+            .enumerate()
+            .filter(|(node_id, _)| !self.nodes[*node_id].removed)
+            .flat_map(|(_, port_bytes)| port_bytes.iter().copied())
+            .fold(0usize, usize::saturating_add)
     }
 
-    /// Estimated state bytes per operator; cheap (operators maintain a counter).
-    pub(crate) fn state_bytes_per_operator(&self) -> impl Iterator<Item = (&Arc<str>, usize)> {
+    /// Whether an aligned checkpoint can snapshot without leaving queued graph input outside the
+    /// cut. Buffer presence is checked separately from bytes because Arrow permits positive-row
+    /// record batches whose arrays occupy zero bytes.
+    pub(crate) fn checkpoint_is_quiescent(&self) -> bool {
         self.nodes
             .iter()
-            .map(|n| (&n.name, n.operator.estimated_state_bytes()))
+            .enumerate()
+            .filter(|(_, node)| !node.removed)
+            .all(|(node_id, _)| !self.node_has_checkpoint_pending_work(node_id))
+    }
+
+    fn node_has_checkpoint_pending_work(&self, node_id: usize) -> bool {
+        if self.input_bufs[node_id].iter().any(|port| !port.is_empty()) {
+            return true;
+        }
+        false
+    }
+
+    fn checkpoint_drain_nodes(&self) -> FxHashSet<usize> {
+        let mut drain = FxHashSet::default();
+        let mut pending = VecDeque::new();
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            if !node.removed && self.node_has_checkpoint_pending_work(node_id) {
+                drain.insert(node_id);
+                pending.push_back(node_id);
+            }
+        }
+        while let Some(node_id) = pending.pop_front() {
+            for &(target, _) in &self.nodes[node_id].output_routes {
+                if !self.nodes[target].removed && drain.insert(target) {
+                    pending.push_back(target);
+                }
+            }
+        }
+        drain
     }
 
     pub fn set_lookup_registry(
@@ -677,10 +657,10 @@ impl OperatorGraph {
         self.cluster_shuffle = Some(config);
     }
 
-    /// Enable incremental delta checkpoints on aggregate operators with `chain_max` as the bound.
+    /// Enable incremental delta checkpoints on aggregate operators with the given re-base bound.
     #[cfg(feature = "cluster")]
-    pub fn set_delta_chain_max(&mut self, chain_max: u32) {
-        self.delta_chain_max = Some(chain_max);
+    pub fn set_delta_chain_bound(&mut self, chain_bound: u32) {
+        self.delta_chain_bound = Some(chain_bound);
     }
 
     /// Per-vnode partials are the authoritative agg checkpoint; skip the whole-node manifest copy.
@@ -689,44 +669,18 @@ impl OperatorGraph {
         self.vnode_partials_authoritative = true;
     }
 
-    /// Set the vnode count for the single-node tier path (no shuffle config).
-    /// Must stay stable across restarts; demoted partials are keyed by vnode.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
-        self.vnode_count = Some(vnode_count);
-    }
-
-    /// Vnode count for per-vnode capture/demotion, if set.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn vnode_count(&self) -> Option<u32> {
-        self.vnode_count
-    }
-
-    /// Wire the cold-tier channel to all current operators (and future DDL-added ones).
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn set_state_tier(&mut self, tier: crate::state_tier::TierTx) {
-        for node in &mut self.nodes {
-            node.operator.attach_state_tier(tier.clone());
-        }
-        self.state_tier = Some(tier);
-    }
-
-    /// Single-node group demotion: enable agg delta dirty-tracking on built operators and
-    /// remember it so operators built later (DDL hot-add) pick it up. No `delta_chain_max`.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn enable_group_delta_tracking(&mut self) {
-        self.group_delta_tracking = true;
-        for node in &mut self.nodes {
-            node.operator.enable_group_delta_tracking();
-        }
-    }
-
     /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
     #[cfg(feature = "cluster")]
     pub(crate) fn cluster_shuffle_config(
         &self,
     ) -> Option<&crate::operator::sql_query::ClusterShuffleConfig> {
         self.cluster_shuffle.as_ref()
+    }
+
+    #[cfg(feature = "cluster")]
+    #[cfg(test)]
+    pub(crate) const fn last_execution_assignment_version(&self) -> Option<u64> {
+        self.last_execution_assignment_version
     }
 
     /// Share the staged per-vnode rehydration map; drained at the top of each cycle.
@@ -754,23 +708,30 @@ impl OperatorGraph {
     /// merges any re-acquired ones — so a lose-then-reacquire merges into empty state. Disjoint from
     /// the rehydrated set per rotation; the ordering is defensive against rapid cross-rotation churn.
     #[cfg(feature = "cluster")]
-    fn apply_revoked_vnodes(&mut self) {
-        let Some(handle) = self.pending_revoke_vnodes.as_ref() else {
-            return;
+    fn apply_revoked_vnodes(&mut self) -> Result<(), DbError> {
+        let Some(handle) = self.pending_revoke_vnodes.as_ref().map(Arc::clone) else {
+            return Ok(());
         };
         let revoked: FxHashSet<u32> = {
-            let mut guard = handle.lock();
+            let guard = handle.lock();
             if guard.is_empty() {
-                return;
+                return Ok(());
             }
-            std::mem::take(&mut *guard)
+            guard.clone()
         };
         for node in &mut self.nodes {
             if node.removed {
                 continue;
             }
-            node.operator.drop_owned_vnodes(&revoked);
+            node.operator.drop_owned_vnodes(&revoked).map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6051] failed to revoke vnode state for operator '{}': {error}",
+                    node.name
+                ))
+            })?;
         }
+        handle.lock().retain(|vnode| !revoked.contains(vnode));
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]
@@ -1002,8 +963,11 @@ impl OperatorGraph {
         }
         let provider = LiveSourceProvider::new(schema.clone());
         let handle = provider.handle();
-        let _ = self.ctx.deregister_table(name);
-        if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
+        let _ = self.ctx.deregister_table(exact_table_reference(name));
+        if let Err(e) = self
+            .ctx
+            .register_table(exact_table_reference(name), Arc::new(provider))
+        {
             // Table was just deregistered, so re-registration should always succeed.
             tracing::error!(
                 table = %name,
@@ -1016,7 +980,10 @@ impl OperatorGraph {
     }
 
     pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
-        self.temporal_configs.clone()
+        self.temporal_configs
+            .iter()
+            .map(|(_, config)| config.clone())
+            .collect()
     }
 
     fn find_node(&self, name: &str) -> Option<usize> {
@@ -1025,41 +992,59 @@ impl OperatorGraph {
             .position(|n| &*n.name == name && !n.removed)
     }
 
+    fn allocate_node(&mut self, node: GraphNode) -> usize {
+        let input_port_count = node.input_port_count;
+        if let Some(id) = self.free_node_ids.pop() {
+            debug_assert!(self.nodes[id].removed);
+            self.nodes[id] = node;
+            self.input_bufs[id] = vec![Vec::new(); input_port_count];
+            self.input_buf_bytes[id] = vec![0; input_port_count];
+            self.input_sources[id] = vec![usize::MAX; input_port_count];
+            self.output_watermarks[id] = i64::MIN;
+            if let Some(domain) = self.node_domain.get_mut(id) {
+                *domain = 0;
+            }
+            self.output_node_ids.remove(&id);
+            self.source_node_ids.remove(&id);
+            self.depends_on_stream.remove(&id);
+            self.order_configs.remove(&id);
+            id
+        } else {
+            let id = self.nodes.len();
+            self.nodes.push(node);
+            self.input_bufs.push(vec![Vec::new(); input_port_count]);
+            self.input_buf_bytes.push(vec![0; input_port_count]);
+            self.input_sources.push(vec![usize::MAX; input_port_count]);
+            self.output_watermarks.push(i64::MIN);
+            id
+        }
+    }
+
     fn ensure_source_node(&mut self, table_name: &str) -> usize {
         if let Some(&id) = self.source_map.get(table_name) {
             return id;
         }
-        let node_id = self.nodes.len();
         let name: Arc<str> = Arc::from(table_name);
-        self.nodes.push(GraphNode {
+        let node_id = self.allocate_node(GraphNode {
             name: Arc::clone(&name),
             operator: Box::new(SourcePassthrough),
             input_port_count: 1,
             output_routes: Vec::new(),
             removed: false,
         });
-        self.input_bufs.push(vec![Vec::new()]);
-        self.input_buf_bytes.push(vec![0]);
-        self.input_sources.push(vec![usize::MAX]); // no upstream
-        self.output_watermarks.push(i64::MIN);
         self.source_map.insert(name, node_id);
         self.source_node_ids.insert(node_id);
         node_id
     }
 
     fn insert_filter_node(&mut self, name: &str, filter_sql: String, source_id: usize) -> usize {
-        let node_id = self.nodes.len();
-        self.nodes.push(GraphNode {
+        let node_id = self.allocate_node(GraphNode {
             name: Arc::from(name),
             operator: Box::new(SqlFilterOperator::new(filter_sql, self.ctx.clone(), name)),
             input_port_count: 1,
             output_routes: Vec::new(),
             removed: false,
         });
-        self.input_bufs.push(vec![Vec::new()]);
-        self.input_buf_bytes.push(vec![0]);
-        self.input_sources.push(vec![usize::MAX]);
-        self.output_watermarks.push(i64::MIN);
         self.add_edge(source_id, node_id, 0);
         self.topo_dirty = true;
         node_id
@@ -1218,16 +1203,16 @@ impl OperatorGraph {
         emit_clause: Option<EmitClause>,
         window_config: Option<WindowOperatorConfig>,
         order_config: Option<OrderOperatorConfig>,
-        idle_ttl_ms: Option<u64>,
         join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
         incremental: bool,
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
 
-        // Record changelog producers so a later `changelog ⋈ static dim` consumer routes to the
-        // ChangelogEnrich operator.
-        if incremental {
-            self.incremental_tables.insert(name.clone());
+        if join_clause_count(&sql) > 1 {
+            self.build_errors.push(DbError::InvalidOperation(
+                "multi-way streaming joins require explicitly named two-way stages".to_string(),
+            ));
+            return;
         }
 
         let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
@@ -1254,7 +1239,9 @@ impl OperatorGraph {
         }
 
         if let Some(plan) = crate::sql_analysis::plan_frame_query(&sql) {
-            self.build_frame_operator_node(&name, &plan);
+            if let Err(error) = self.build_frame_operator_node(&name, &plan) {
+                self.build_errors.push(error);
+            }
             return;
         }
 
@@ -1311,12 +1298,22 @@ impl OperatorGraph {
             (None, None)
         };
         let stream_join_detection = if specialized {
-            // Interval join first; falls back to processing-time equi-join.
-            detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
+            detect_stream_join_query(&sql)
         } else {
             None
         };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
+        if let Some(config) = &stream_join_config {
+            if config.join_type != laminar_sql::translator::StreamJoinType::Inner
+                || config.time_bound.is_zero()
+                || i64::try_from(config.time_bound.as_millis()).is_err()
+            {
+                self.build_errors.push(DbError::InvalidOperation(format!(
+                    "streaming interval join '{name}' requires an INNER join with a positive finite time bound"
+                )));
+                return;
+            }
+        }
         let stream_join_projection_sql = stream_join_detection
             .as_ref()
             .map(|d| d.projection_sql.clone());
@@ -1339,22 +1336,51 @@ impl OperatorGraph {
             (None, None)
         };
 
+        let unbounded_lookup_join = if !enrich && !inc_join {
+            if let Some(steps) = detect_unbounded_join_steps(&sql) {
+                let lookup_only = steps.iter().all(|(_, right)| {
+                    self.reference_tables.contains(right)
+                        || self.partial_lookup_tables.contains_key(right)
+                });
+                if !lookup_only {
+                    let relations = steps
+                        .iter()
+                        .map(|(left, right)| format!("'{left}' and '{right}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.build_errors.push(DbError::InvalidOperation(format!(
+                        "unbounded join between streaming relations {relations}; add a temporal predicate or use a lookup table"
+                    )));
+                    return;
+                }
+                lookup_only
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let projection_sql = projection_sql
             .or(temporal_probe_projection_sql)
             .or(temporal_projection_sql)
             .or(stream_join_projection_sql)
             .or(lookup_projection_sql);
 
-        if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
-            let sql_upper = sql.to_uppercase();
-            if sql_upper.contains("JOIN") && sql_upper.contains("BETWEEN") {
-                tracing::warn!(
-                    query = %name,
-                    "Query contains JOIN with BETWEEN but was not detected as an interval join. \
-                     It will execute as a batch join (matches within one cycle only). \
-                     Ensure time columns in the BETWEEN clause are simple column references."
-                );
-            }
+        let unrecognized_join = has_join_clause(&sql)
+            && !enrich
+            && !inc_join
+            && temporal_probe_config.is_none()
+            && asof_config.is_none()
+            && temporal_config.is_none()
+            && stream_join_config.is_none()
+            && lookup_enrich_config.is_none()
+            && !unbounded_lookup_join;
+        if unrecognized_join {
+            self.build_errors.push(DbError::InvalidOperation(format!(
+                "stream join '{name}' could not be planned as a supported bounded interval or lookup join"
+            )));
+            return;
         }
 
         let mut table_refs = extract_table_references(&sql);
@@ -1368,10 +1394,6 @@ impl OperatorGraph {
             table_refs.retain(|t| t == &cfg.changelog_table);
         }
 
-        if let Some(ref tc) = temporal_config {
-            self.temporal_configs.push(tc.clone());
-        }
-
         let operator: Box<dyn GraphOperator> = self.create_operator(
             &name,
             &sql,
@@ -1383,12 +1405,10 @@ impl OperatorGraph {
             temporal_probe_config.as_ref(),
             lookup_enrich_config,
             projection_sql.as_deref(),
-            idle_ttl_ms,
             incremental,
             changelog_enrich_config,
             incremental_join_config.clone(),
         );
-
         let input_port_count = if asof_config.is_some()
             || stream_join_config.is_some()
             || temporal_probe_config.is_some()
@@ -1406,7 +1426,7 @@ impl OperatorGraph {
             temporal_config.as_ref(),
             &table_refs,
         );
-        let node_id = self.place_operator_node(name.as_str(), operator, input_port_count);
+        let node_id = self.place_prepared_operator_node(name.as_str(), operator, input_port_count);
         let depends = self.wire_query_edges(
             node_id,
             temporal_probe_config.as_ref(),
@@ -1424,12 +1444,29 @@ impl OperatorGraph {
             self.order_configs.insert(node_id, oc);
         }
         self.output_map.insert(Arc::from(name.as_str()), node_id);
+        if incremental {
+            self.incremental_tables.insert(name.clone());
+        }
+        if let Some(ref tc) = temporal_config {
+            self.temporal_configs.push((name.clone(), tc.clone()));
+        }
         self.topo_dirty = true;
     }
 
     // Replace a SourcePassthrough placeholder in place (preserving its id and outbound edges),
     // or append a fresh node. Callers must ensure source nodes before and wire edges after.
+    #[cfg(test)]
     fn place_operator_node(
+        &mut self,
+        name: &str,
+        operator: Box<dyn GraphOperator>,
+        input_port_count: usize,
+    ) -> Result<usize, DbError> {
+        Ok(self.place_prepared_operator_node(name, operator, input_port_count))
+    }
+
+    // The caller has completed validation before making any graph mutation.
+    fn place_prepared_operator_node(
         &mut self,
         name: &str,
         operator: Box<dyn GraphOperator>,
@@ -1449,19 +1486,13 @@ impl OperatorGraph {
             }
             id
         } else {
-            let id = self.nodes.len();
-            self.nodes.push(GraphNode {
+            self.allocate_node(GraphNode {
                 name: Arc::from(name),
                 operator,
                 input_port_count,
                 output_routes: Vec::new(),
                 removed: false,
-            });
-            self.input_bufs.push(vec![Vec::new(); input_port_count]);
-            self.input_buf_bytes.push(vec![0; input_port_count]);
-            self.input_sources.push(vec![usize::MAX; input_port_count]);
-            self.output_watermarks.push(i64::MIN);
-            id
+            })
         }
     }
 
@@ -1538,7 +1569,7 @@ impl OperatorGraph {
         };
 
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
-        let node_id = self.place_operator_node(name, operator, 1);
+        let node_id = self.place_prepared_operator_node(name, operator, 1);
         let depends =
             self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
         if depends {
@@ -1553,7 +1584,7 @@ impl OperatorGraph {
         &mut self,
         name: &str,
         plan: &crate::sql_analysis::FrameQueryPlan,
-    ) {
+    ) -> Result<(), DbError> {
         let operator: Box<dyn GraphOperator> =
             Box::new(crate::operator::window_frame::WindowFrameOperator::new(
                 name,
@@ -1570,7 +1601,7 @@ impl OperatorGraph {
         let mut table_refs = FxHashSet::default();
         table_refs.insert(plan.source_table.clone());
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
-        let node_id = self.place_operator_node(name, operator, 1);
+        let node_id = self.place_prepared_operator_node(name, operator, 1);
         let depends =
             self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
         if depends {
@@ -1578,6 +1609,7 @@ impl OperatorGraph {
         }
         self.output_map.insert(Arc::from(name), node_id);
         self.topo_dirty = true;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1593,7 +1625,6 @@ impl OperatorGraph {
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         lookup_enrich_config: Option<crate::operator::lookup_enrich::LookupEnrichConfig>,
         projection_sql: Option<&str>,
-        idle_ttl_ms: Option<u64>,
         incremental: bool,
         changelog_enrich_config: Option<crate::sql_analysis::ChangelogEnrichConfig>,
         incremental_join_config: Option<crate::sql_analysis::IncrementalJoinConfig>,
@@ -1603,20 +1634,9 @@ impl OperatorGraph {
         // `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join emitting a joined
         // changelog into the join MV's `Multiset` store.
         if let Some(cfg) = incremental_join_config {
-            #[cfg_attr(not(feature = "state-tier"), allow(unused_mut))]
-            let mut op = operator::incremental_join::IncrementalJoinOperator::new(cfg);
-            #[cfg(feature = "state-tier")]
-            if let Some(tier) = self.state_tier.clone() {
-                op.set_op_name(name);
-                op.attach_state_tier(tier);
-                if let Some(vnode_count) = self.vnode_count {
-                    op.set_vnode_count(vnode_count);
-                }
-                if self.group_delta_tracking {
-                    op.enable_delta_tracking();
-                }
-            }
-            return Box::new(op);
+            return Box::new(operator::incremental_join::IncrementalJoinOperator::new(
+                cfg,
+            ));
         }
 
         // `changelog ⋈ static dim` — consume the changelog, join against the dimension (in the
@@ -1631,8 +1651,7 @@ impl OperatorGraph {
         // Falls through to the DataFusion lookup path if the registry/handle is absent.
         if let Some(cfg) = lookup_enrich_config {
             if let (Some(reg), Some(handle)) = (&self.lookup_registry, &self.main_runtime_handle) {
-                #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
-                let mut op = operator::lookup_enrich::LookupEnrichOperator::new(
+                let op = operator::lookup_enrich::LookupEnrichOperator::new(
                     name,
                     cfg,
                     projection_sql.map(Arc::from),
@@ -1641,11 +1660,6 @@ impl OperatorGraph {
                     handle.clone(),
                     self.prom.clone(),
                 );
-                // Key-shard the probe side for cache affinity.
-                #[cfg(feature = "cluster")]
-                if let Some(ref sc) = self.cluster_shuffle {
-                    op.attach_cluster_shuffle(sc.clone());
-                }
                 return Box::new(op);
             }
         }
@@ -1681,32 +1695,12 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = stream_join_config {
-            // No time columns → per-cycle batch join; with time columns → interval join.
-            if cfg.left_time_column.is_empty() && cfg.right_time_column.is_empty() {
-                #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
-                let mut op = operator::process_time_join::ProcessTimeJoinOperator::new(
-                    name,
-                    cfg.clone(),
-                    projection_sql.map(Arc::from),
-                    self.ctx.clone(),
-                );
-                #[cfg(feature = "cluster")]
-                if let Some(ref sc) = self.cluster_shuffle {
-                    op.attach_cluster_shuffle(sc.clone());
-                }
-                return Box::new(op);
-            }
-            #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
-            let mut op = operator::interval_join::IntervalJoinOperator::new(
+            let op = operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
                 self.ctx.clone(),
             );
-            #[cfg(feature = "cluster")]
-            if let Some(ref sc) = self.cluster_shuffle {
-                op.attach_cluster_shuffle(sc.clone());
-            }
             return Box::new(op);
         }
 
@@ -1764,51 +1758,36 @@ impl OperatorGraph {
         let emit_changelog =
             incremental || emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        #[cfg_attr(
-            not(any(feature = "cluster", feature = "state-tier")),
-            allow(unused_mut)
-        )]
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
         let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.prom.clone(),
             emit_changelog,
-            idle_ttl_ms,
         );
         #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
             // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
             // Enabling delta also makes the chain the primary agg checkpoint.
-            if let Some(chain_max) = self.delta_chain_max {
-                op.enable_delta_checkpoints(chain_max);
+            if let Some(chain_bound) = self.delta_chain_bound {
+                op.enable_delta_checkpoints(chain_bound);
             }
             if self.vnode_partials_authoritative {
                 op.set_vnode_partials_authoritative();
-            }
-        }
-        #[cfg(feature = "state-tier")]
-        if let Some(tier) = self.state_tier.clone() {
-            op.attach_state_tier(tier);
-            // Single-node path has no shuffle config to read the count from.
-            if let Some(vnode_count) = self.vnode_count {
-                op.set_vnode_count(vnode_count);
-            }
-            if self.group_delta_tracking {
-                op.enable_delta_tracking();
             }
         }
         Box::new(op)
     }
 
     pub fn remove_query(&mut self, name: &str) {
-        let Some(node_id) = self.find_node(name) else {
-            return;
-        };
-
         let prefix = format!("{name}::");
-        let ids_to_remove: smallvec::SmallVec<[usize; 3]> = std::iter::once(node_id)
+        let ids_to_remove: smallvec::SmallVec<[usize; 3]> = self
+            .output_map
+            .get(name)
+            .copied()
+            .into_iter()
             .chain(
                 self.nodes
                     .iter()
@@ -1831,6 +1810,9 @@ impl OperatorGraph {
             self.order_configs.remove(&id);
             self.depends_on_stream.remove(&id);
             self.edges.retain(|e| e.source != id && e.target != id);
+            self.input_sources[id].fill(usize::MAX);
+            self.output_watermarks[id] = i64::MIN;
+            self.free_node_ids.push(id);
         }
 
         for node in &mut self.nodes {
@@ -1839,7 +1821,23 @@ impl OperatorGraph {
         }
 
         self.output_map.remove(name);
-        self.topo_dirty = true;
+        self.incremental_tables.remove(name);
+        self.temporal_configs
+            .retain(|(query_name, _)| query_name != name);
+        self.live_handles.remove(name);
+        if !ids_to_remove.is_empty() {
+            self.topo_dirty = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_query(&self, name: &str) -> bool {
+        self.output_map.contains_key(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     fn compute_topo_order(&mut self) {
@@ -2040,12 +2038,6 @@ impl OperatorGraph {
             )
             .await;
 
-        // Advancing the output watermark is only valid if `process` actually consumed the input.
-        // Snapshot the prior value so a deferral (below) — which preserves the input for replay —
-        // can pin it back, or downstream windows close past the buffered-but-unemitted rows (EX-2).
-        let prev_output_watermark = self.output_watermarks[node_id];
-        self.propagate_operator_watermark(node_id, &watermarks, current_watermark);
-
         let batches = match output_result {
             Ok(b) => {
                 // Reuse the Vecs (clear preserves capacity); when !accept, leave buffers intact.
@@ -2056,27 +2048,27 @@ impl OperatorGraph {
                     input_bytes.fill(0);
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
+                    // A watermark may cross this operator only after the corresponding input was
+                    // consumed. Operators return `wants_input == false` while graph-owned rows
+                    // remain buffered, so advancing here would close downstream windows past data
+                    // that has not run yet.
+                    self.propagate_operator_watermark(node_id, &watermarks, current_watermark);
                 }
                 b
             }
             Err(e) => {
+                if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
+                    return Err(e);
+                }
                 // Defer (preserve input, keep the cycle alive) when the upstream
                 // isn't ready, OR when a cross-node shuffle target isn't reachable
                 // yet (cluster formation): aborting the whole cycle would also drop
                 // co-located streams (e.g. a pass-through exactly-once sink) whose
                 // source rows the generator has already advanced past — an EO gap.
-                // A must-not-replay error (a partial shuffle send) must NOT take the defer branch
-                // even for a `depends_on_stream` node — replaying re-sends to peers that already
-                // folded this cycle's rows (double-count). Let it fall through to fault/drop (CL-1).
-                if accept
-                    && !e.must_not_replay()
-                    && (self.depends_on_stream.contains(&node_id) || e.is_shuffle_not_ready())
+                if accept && (self.depends_on_stream.contains(&node_id) || e.is_shuffle_not_ready())
                 {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
-                    // Input is held for replay, so its rows haven't been emitted — freeze the
-                    // output watermark instead of leaving it advanced (EX-2).
-                    self.output_watermarks[node_id] = prev_output_watermark;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
@@ -2089,17 +2081,11 @@ impl OperatorGraph {
                 }
                 // Under shared-source isolation, keep the faulted operator's input so the next cycle
                 // replays it with new arrivals; returns Err to isolate the domain. Bounded by `max_replay_buffer_bytes`.
-                // A must-not-replay error (a partial shuffle send) is excluded: replaying it would
-                // re-send to peers that already folded this cycle's rows → double-count. Let it fall
-                // through to clear the input so the domain drops the cycle instead (CL-1).
                 if self.shared_source_isolation
-                    && !e.must_not_replay()
                     && input_bytes.iter().sum::<usize>() <= self.max_replay_buffer_bytes
                 {
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
-                    // Preserved for replay → the advanced watermark is not yet valid (EX-2).
-                    self.output_watermarks[node_id] = prev_output_watermark;
                     return Err(e);
                 }
                 for v in &mut inputs {
@@ -2111,8 +2097,6 @@ impl OperatorGraph {
                 return Err(e);
             }
         };
-
-        self.enforce_state_limit(node_id)?;
 
         let batches = if let Some(oc) = self.order_configs.get(&node_id) {
             match oc {
@@ -2153,28 +2137,6 @@ impl OperatorGraph {
                 .with_label_values(&[&self.nodes[node_id].name])
                 .set(wm);
         }
-    }
-
-    fn enforce_state_limit(&self, node_id: usize) -> Result<(), DbError> {
-        let Some(limit) = self.max_state_bytes else {
-            return Ok(());
-        };
-        let size = self.nodes[node_id].operator.estimated_state_bytes();
-        if size >= limit {
-            return Err(DbError::Pipeline(format!(
-                "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
-                self.nodes[node_id].name
-            )));
-        }
-        if size >= limit * 4 / 5 {
-            tracing::warn!(
-                query = %self.nodes[node_id].name,
-                size_bytes = size,
-                limit_bytes = limit,
-                "state size at 80% of limit"
-            );
-        }
-        Ok(())
     }
 
     fn route_output(
@@ -2227,6 +2189,41 @@ impl OperatorGraph {
         current_watermark: i64,
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        self.execute_cycle_with_mode(
+            source_batches,
+            current_watermark,
+            source_watermarks,
+            GraphExecutionMode::Normal,
+        )
+        .await
+    }
+
+    /// Execute one aligned-checkpoint drain pass. This shares the normal cycle path but does not
+    /// defer operators because the interactive query budget elapsed; backpressure gates and all
+    /// operator error, watermark, state-limit, and routing behavior remain unchanged.
+    pub(crate) async fn execute_checkpoint_drain_cycle(
+        &mut self,
+        current_watermark: i64,
+        frozen_source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        let source_batches = FxHashMap::default();
+        self.execute_cycle_with_mode(
+            &source_batches,
+            current_watermark,
+            frozen_source_watermarks,
+            GraphExecutionMode::CheckpointDrain,
+        )
+        .await
+    }
+
+    async fn execute_cycle_with_mode(
+        &mut self,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        current_watermark: i64,
+        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+        mode: GraphExecutionMode,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        self.whole_restore_open = false;
         #[cfg(feature = "cluster")]
         let _rotation_guard = match self.rotation_execution_fence.as_ref() {
             Some(fence) => Some(Arc::clone(fence).read_owned().await),
@@ -2235,8 +2232,23 @@ impl OperatorGraph {
 
         #[cfg(feature = "cluster")]
         {
-            self.apply_revoked_vnodes();
+            self.last_execution_assignment_version = None;
+            let execution_assignment_version = if let Some(cfg) = &self.cluster_shuffle {
+                let version = cfg.registry.versioned_snapshot().version();
+                if cfg.sender.assignment_version() != version
+                    || cfg.receiver.assignment_version() != version
+                {
+                    return Err(DbError::ShuffleNotReady(format!(
+                        "shuffle transport assignment does not match execution assignment {version}"
+                    )));
+                }
+                Some(version)
+            } else {
+                None
+            };
+            self.apply_revoked_vnodes()?;
             self.apply_rehydrated_vnodes()?;
+            self.last_execution_assignment_version = execution_assignment_version;
         }
 
         if self.topo_dirty {
@@ -2246,12 +2258,20 @@ impl OperatorGraph {
         self.register_source_tables(source_batches);
         self.prime_sources(source_batches, current_watermark, source_watermarks);
 
+        let checkpoint_drain_nodes = if mode == GraphExecutionMode::CheckpointDrain {
+            Some(self.checkpoint_drain_nodes())
+        } else {
+            None
+        };
+
         let mut results = FxHashMap::default();
         let cycle_start = std::time::Instant::now();
         let topo_len = self.topo_order.len();
 
         self.cycle_failed_sources.clear();
         self.cycle_any_failed = false;
+        self.cycle_deferred_sources.clear();
+        self.cycle_any_deferred = false;
         let mut failed_domains: FxHashSet<usize> = FxHashSet::default();
         let mut first_error: Option<DbError> = None;
 
@@ -2259,6 +2279,12 @@ impl OperatorGraph {
             let node_id = self.topo_order[i];
 
             if self.nodes[node_id].removed {
+                continue;
+            }
+            if checkpoint_drain_nodes
+                .as_ref()
+                .is_some_and(|drain| !drain.contains(&node_id))
+            {
                 continue;
             }
 
@@ -2279,7 +2305,7 @@ impl OperatorGraph {
                 }
             }
 
-            if i > 0 {
+            if mode == GraphExecutionMode::Normal && i > 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
                 if elapsed_ns > self.query_budget_ns {
@@ -2312,6 +2338,10 @@ impl OperatorGraph {
                 .execute_single_operator(node_id, current_watermark, &mut results)
                 .await
             {
+                if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
+                    self.finish_cycle();
+                    return Err(e);
+                }
                 let domain = self.node_domain[node_id];
                 tracing::warn!(
                     query = %self.nodes[node_id].name,
@@ -2326,6 +2356,7 @@ impl OperatorGraph {
             }
         }
 
+        self.record_cycle_deferrals();
         self.complete_cycle(&failed_domains, first_error)?;
 
         Ok(results)
@@ -2369,6 +2400,46 @@ impl OperatorGraph {
             self.cycle_any_failed,
             std::mem::take(&mut self.cycle_failed_sources),
         )
+    }
+
+    /// `(any retained graph work, local source names whose cursor must be withheld)` from the
+    /// last cycle. A remote-only cluster deferral has an empty source set but still returns true.
+    pub fn take_cycle_deferrals(&mut self) -> (bool, FxHashSet<Arc<str>>) {
+        (
+            self.cycle_any_deferred,
+            std::mem::take(&mut self.cycle_deferred_sources),
+        )
+    }
+
+    fn record_cycle_deferrals(&mut self) {
+        let deferred_nodes: FxHashSet<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(node_id, node)| {
+                !node.removed && self.node_has_checkpoint_pending_work(*node_id)
+            })
+            .map(|(node_id, _)| node_id)
+            .collect();
+        if deferred_nodes.is_empty() {
+            return;
+        }
+        self.cycle_any_deferred = true;
+        let deferred_domains: FxHashSet<usize> = deferred_nodes
+            .iter()
+            .filter(|node_id| !self.source_node_ids.contains(node_id))
+            .map(|node_id| self.node_domain[*node_id])
+            .collect();
+        let deferred_sources: Vec<Arc<str>> = self
+            .source_list
+            .iter()
+            .filter(|(_, node_id)| {
+                deferred_nodes.contains(node_id)
+                    || self.source_feeds_failed_domain(*node_id, &deferred_domains)
+            })
+            .map(|(name, _)| Arc::clone(name))
+            .collect();
+        self.cycle_deferred_sources.extend(deferred_sources);
     }
 
     fn prime_sources(
@@ -2438,6 +2509,9 @@ impl OperatorGraph {
                 .execute_single_operator(deferred_id, current_watermark, results)
                 .await
             {
+                if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
+                    return Err(e);
+                }
                 let domain = self.node_domain[deferred_id];
                 tracing::warn!(
                     query = %self.nodes[deferred_id].name,
@@ -2474,178 +2548,461 @@ impl OperatorGraph {
         }
     }
 
-    // Unknown stage (no live operator for it) is silently dropped.
     #[cfg(feature = "cluster")]
-    async fn ingest_to_stage(
+    fn stage_checkpointed_shuffle(
         &mut self,
         stage: &str,
-        batch: RecordBatch,
+        batch: RetainedBatch,
         watermark: i64,
     ) -> Result<(), DbError> {
         let node_name = stage
             .strip_suffix("::left")
             .or_else(|| stage.strip_suffix("::right"))
             .unwrap_or(stage);
-        if let Some(idx) = self.find_node(node_name) {
-            self.nodes[idx]
-                .operator
-                .ingest_shuffle(stage, batch, watermark)
-                .await?;
+        let idx = self.find_node(node_name).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "shuffle frame targets unknown or removed stage '{stage}'"
+            ))
+        })?;
+        let result = self.nodes[idx]
+            .operator
+            .stage_checkpointed_shuffle(stage, batch, watermark);
+        if result.is_ok() {
+            self.output_watermarks[idx] = self.output_watermarks[idx].min(watermark);
+        }
+        result
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_shuffle_attempt_scope(
+        cfg: &crate::operator::sql_query::ClusterShuffleConfig,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        recovery_gen: u64,
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+    ) -> Result<(), DbError> {
+        if !assignment_fence.is_canonical() || !assignment_fence.contains(cfg.self_id.0) {
+            return Err(DbError::Pipeline(
+                "shuffle alignment has a non-canonical or incomplete assignment certificate".into(),
+            ));
+        }
+        let assignment = cfg.registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        let local_incarnation = assignment_fence.participant_incarnation(cfg.self_id.0);
+        if assignment.version() != assignment_fence.assignment_version
+            || !assignment_fence.matches_owner_map(&owners)
+            || cfg.sender.assignment_version() != assignment_fence.assignment_version
+            || cfg.receiver.assignment_version() != assignment_fence.assignment_version
+            || local_incarnation != Some(cfg.sender.incarnation())
+            || local_incarnation != Some(cfg.receiver.incarnation())
+        {
+            return Err(DbError::Pipeline(format!(
+                "shuffle assignment differs from admitted certificate version {}",
+                assignment_fence.assignment_version
+            )));
+        }
+        if cfg.sender.recovery_gen() != recovery_gen || cfg.receiver.recovery_gen() != recovery_gen
+        {
+            return Err(DbError::Pipeline(format!(
+                "shuffle recovery generation changed during alignment from {recovery_gen}"
+            )));
+        }
+        if let Some(controller) = controller {
+            let current = controller
+                .checkpoint_assignment_fence(assignment_fence.assignment_version)
+                .ok_or_else(|| {
+                    DbError::Pipeline(format!(
+                        "shuffle assignment {} is no longer checkpoint-ready",
+                        assignment_fence.assignment_version
+                    ))
+                })?;
+            if current != *assignment_fence {
+                return Err(DbError::Pipeline(format!(
+                    "shuffle assignment certificate changed at version {}",
+                    assignment_fence.assignment_version
+                )));
+            }
         }
         Ok(())
     }
 
-    /// Chandy–Lamport shuffle alignment: fan out a barrier to peers, drain rows,
-    /// and wait until every peer's barrier is observed before snapshotting.
-    ///
-    /// Requires full-membership commit — no peer resumes the next epoch until all
-    /// have aligned, so no next-epoch frame can arrive mid-alignment.
+    #[cfg(feature = "cluster")]
+    fn validate_received_shuffle_scope(
+        received: &laminar_core::shuffle::ReceivedShuffle,
+        self_id: u64,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        let peer = received.peer();
+        let expected_sender = assignment_fence.participant_incarnation(peer);
+        let expected_receiver = assignment_fence.participant_incarnation(self_id);
+        if peer == self_id
+            || !assignment_fence.contains(peer)
+            || expected_sender != Some(received.sender_incarnation())
+            || expected_receiver != Some(received.receiver_incarnation())
+            || received.stream_id().is_nil()
+            || received.assignment_version() != assignment_fence.assignment_version
+            || received.recovery_gen() != recovery_gen
+        {
+            return Err(DbError::Pipeline(format!(
+                "shuffle frame from peer {peer} has the wrong assignment, recovery, or stream scope"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_received_batch_scope(
+        received: &laminar_core::shuffle::ReceivedBatch,
+        self_id: u64,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        let peer = received.peer();
+        let expected_sender = assignment_fence.participant_incarnation(peer);
+        let expected_receiver = assignment_fence.participant_incarnation(self_id);
+        if peer == self_id
+            || !assignment_fence.contains(peer)
+            || expected_sender != Some(received.sender_incarnation())
+            || expected_receiver != Some(received.receiver_incarnation())
+            || received.stream_id().is_nil()
+            || received.assignment_version() != assignment_fence.assignment_version
+            || received.recovery_gen() != recovery_gen
+        {
+            return Err(DbError::Pipeline(format!(
+                "shuffle batch from peer {peer} has the wrong assignment, recovery, or stream scope"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn compare_shuffle_attempts(
+        expected: laminar_core::state::CheckpointAttempt,
+        observed: laminar_core::state::CheckpointAttempt,
+    ) -> Result<std::cmp::Ordering, DbError> {
+        match observed.relation_to(expected) {
+            laminar_core::state::CheckpointAttemptRelation::Exact => Ok(std::cmp::Ordering::Equal),
+            laminar_core::state::CheckpointAttemptRelation::Newer => {
+                Ok(std::cmp::Ordering::Greater)
+            }
+            laminar_core::state::CheckpointAttemptRelation::Older => Ok(std::cmp::Ordering::Less),
+            laminar_core::state::CheckpointAttemptRelation::Conflict => {
+                Err(DbError::Pipeline(format!(
+                "shuffle barrier attempt mismatch: expected {expected:?}, received {observed:?}"
+            )))
+            }
+        }
+    }
+
+    /// Aligned shuffle checkpointing: fan out an in-band barrier, retain each peer's pre-barrier
+    /// rows as channel state, and wait until every peer's barrier is observed before snapshotting.
+    /// A barrier closes that peer's current-attempt channel: data from an already aligned peer while
+    /// other peers are outstanding is a protocol violation and requires recovery.
     ///
     /// # Errors
-    /// Fails the checkpoint on timeout or closed receiver so the caller can retry.
+    /// Every admitted-attempt failure requires coordinated recovery: alignment may already have
+    /// dequeued channel data, so retrying only the checkpoint could lose or double-apply it.
     #[cfg(feature = "cluster")]
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn align_shuffle_barriers(
         &mut self,
-        checkpoint_id: u64,
+        attempt: laminar_core::state::CheckpointAttempt,
         watermark: i64,
-        live: &[u64],
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
         controller: Option<&laminar_core::cluster::control::ClusterController>,
     ) -> Result<(), DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
         use laminar_core::cluster::control::Phase;
         use laminar_core::shuffle::ShuffleMessage;
-        use rustc_hash::FxHashSet;
+        use rustc_hash::{FxHashMap, FxHashSet};
 
-        // Safety cap only — the membership self-heal below normally finishes alignment
-        // well before this by dropping any peer that leaves membership mid-align.
-        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
         const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
         };
-        // Fan-out and wait set both come from the same `live` membership so they stay
-        // mutually consistent across nodes (a vnode-ownership fan-out could target a
-        // stale/dead owner a live peer is still waiting on). Barriers are cheap.
-        let peers: Vec<u64> = live
-            .iter()
-            .copied()
-            .filter(|&id| id != cfg.self_id.0)
-            .collect();
-        if peers.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-staged rows arrived before the barrier; fold them in first.
-        for (stage, batch) in cfg.receiver.drain_all_staged() {
-            self.ingest_to_stage(&stage, batch, watermark).await?;
-        }
-
-        let barrier = CheckpointBarrier::new(checkpoint_id, 0);
-        cfg.sender
-            .fan_out_barrier(&peers, barrier)
-            .await
-            .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
-
-        // Self-healing wait set: done when every peer's barrier is seen OR the peer has
-        // left membership (re-checked each tick) — a peer that dies can't wedge the epoch.
-        let mut remaining: FxHashSet<u64> = peers.iter().copied().collect();
-        tracing::debug!(checkpoint_id, self_id = cfg.self_id.0, peers = ?peers, "shuffle align: start");
-
-        // Barriers stashed before we began aligning. A later-checkpoint barrier (a faster
-        // peer that moved on) is re-stashed, not dropped, so we still see it at that epoch.
-        for (from, b) in cfg.receiver.drain_staged_barriers() {
-            if b.checkpoint_id == checkpoint_id {
-                remaining.remove(&from);
-            } else if b.checkpoint_id > checkpoint_id {
-                cfg.receiver.stash_barrier(from, b);
+        let alignment = tokio::time::timeout_at(deadline, async {
+            let recovery_gen = cfg.receiver.recovery_gen();
+            Self::validate_shuffle_attempt_scope(
+                &cfg,
+                assignment_fence,
+                recovery_gen,
+                controller,
+            )?;
+            let ensure_no_delivery_loss = || {
+                if cfg.receiver.has_unrecovered_delivery_loss() {
+                    Err(DbError::Pipeline(
+                        "shuffle delivery-domain or transit loss requires recovery".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            ensure_no_delivery_loss()?;
+            let peers: Vec<u64> = assignment_fence
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .filter(|peer| *peer != cfg.self_id.0)
+                .collect();
+            if peers.is_empty() {
+                return Ok(());
             }
-        }
-        if remaining.is_empty() {
-            return Ok(());
-        }
 
-        let alignment_timeout = tokio::time::sleep(ALIGN_TIMEOUT);
-        tokio::pin!(alignment_timeout);
-        let mut check_interval = tokio::time::interval(RECHECK);
-        loop {
-            tokio::select! {
-                res = cfg.receiver.recv() => {
-                    match res {
-                        None => {
-                            return Err(DbError::Pipeline(
-                                "shuffle receiver closed during barrier alignment".into(),
-                            ));
-                        }
-                        Some((from, ShuffleMessage::Barrier(b))) => {
-                            if b.checkpoint_id == checkpoint_id {
-                                if remaining.remove(&from) && remaining.is_empty() {
-                                    break;
-                                }
-                            } else if b.checkpoint_id > checkpoint_id {
-                                cfg.receiver.stash_barrier(from, b); // for a later epoch; keep it
-                            }
-                        }
-                        Some((_, ShuffleMessage::VnodeData(stage, _vnode, batch))) => {
-                            self.ingest_to_stage(&stage, batch, watermark).await?;
-                        }
-                        Some(_) => {}
-                    }
-                }
-                _ = check_interval.tick() => {
-                    if let Some(ctrl) = controller {
-                        // Stop waiting on peers that left membership (a dead peer never
-                        // sends its barrier); Active-but-slow peers stay in the wait set.
-                        let live_now: FxHashSet<u64> =
-                            ctrl.live_instances().iter().map(|n| n.0).collect();
-                        remaining.retain(|p| live_now.contains(p));
-                        if remaining.is_empty() {
-                            break;
-                        }
-                        if let Ok(Some(ann)) = ctrl.observe_barrier().await {
-                            if ann.checkpoint_id == checkpoint_id && ann.phase == Phase::Abort {
-                                return Err(DbError::Pipeline(format!(
-                                    "checkpoint {checkpoint_id} was aborted by leader"
-                                )));
-                            }
-                            // A newer announcement means the leader moved on; our barriers will
-                            // never arrive, and without this check a rejoining node livelocks.
-                            if ann.checkpoint_id > checkpoint_id {
-                                return Err(DbError::Pipeline(format!(
-                                    "checkpoint {checkpoint_id} superseded by {} — alignment abandoned",
-                                    ann.checkpoint_id
-                                )));
-                            }
-                        }
-                    }
-                }
-                () = &mut alignment_timeout => {
+            // Take only previously staged data. Consuming the live queue here would split its
+            // data/barrier order into separate holdovers before alignment can inspect the cut.
+            let staged_batches = cfg.receiver.drain_checkpointed_holdover();
+            ensure_no_delivery_loss()?;
+
+            let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
+            cfg.sender
+                .fan_out_barrier(&peers, barrier, assignment_fence)
+                .await
+                .map_err(|error| {
+                    DbError::Pipeline(format!("shuffle barrier fan-out: {error}"))
+                })?;
+
+            let mut remaining: FxHashSet<u64> = peers.iter().copied().collect();
+            let mut barrier_cuts: FxHashMap<u64, u64> = FxHashMap::default();
+            tracing::debug!(
+                checkpoint_id = attempt.checkpoint_id,
+                epoch = attempt.epoch,
+                self_id = cfg.self_id.0,
+                peers = ?peers,
+                "shuffle align: start"
+            );
+
+            for received in cfg.receiver.drain_staged_barriers() {
+                Self::validate_received_shuffle_scope(
+                    &received,
+                    cfg.self_id.0,
+                    assignment_fence,
+                    recovery_gen,
+                )?;
+                if received.assignment_digest() != Some(assignment_fence.digest()) {
                     return Err(DbError::Pipeline(format!(
-                        "shuffle barrier alignment timed out for checkpoint {checkpoint_id} \
-                         (waiting on {remaining:?})"
+                        "shuffle barrier from peer {} has the wrong assignment certificate",
+                        received.peer()
                     )));
                 }
+                let ShuffleMessage::Barrier(barrier) = received.message() else {
+                    return Err(DbError::Pipeline(
+                        "non-barrier frame entered shuffle barrier holdover".into(),
+                    ));
+                };
+                let observed = laminar_core::state::CheckpointAttempt::new(
+                    barrier.epoch,
+                    barrier.checkpoint_id,
+                );
+                match Self::compare_shuffle_attempts(attempt, observed)? {
+                    std::cmp::Ordering::Equal => {
+                        let peer = received.peer();
+                        let cut = received.checkpoint_sequence();
+                        if let Some(previous) = barrier_cuts.insert(peer, cut) {
+                            if previous != cut {
+                                return Err(DbError::Pipeline(format!(
+                                    "shuffle peer {peer} repeated checkpoint barrier with conflicting high-water sequences {previous} and {cut}"
+                                )));
+                            }
+                        }
+                        remaining.remove(&peer);
+                    }
+                    std::cmp::Ordering::Greater => cfg.receiver.stash_barrier(received),
+                    std::cmp::Ordering::Less => {}
+                }
             }
-        }
-        tracing::debug!(checkpoint_id, "shuffle align: complete");
-        Ok(())
+
+            // A normal execution cycle may already have bucketed data and a later barrier into
+            // separate holdovers. The transport sequence reconstructs their per-peer order: data
+            // below the barrier's exclusive high-water belongs to this cut; data at/above it does
+            // not and cannot be sealed into the current snapshot.
+            for (stage, received) in staged_batches {
+                Self::validate_received_batch_scope(
+                    &received,
+                    cfg.self_id.0,
+                    assignment_fence,
+                    recovery_gen,
+                )?;
+                let peer = received.peer();
+                let sequence = received.checkpoint_sequence();
+                if let Some(cut) = barrier_cuts.get(&peer) {
+                    if sequence >= *cut {
+                        return Err(DbError::Pipeline(format!(
+                            "shuffle data sequence {sequence} from peer {peer} is at or after its checkpoint barrier high-water {cut}"
+                        )));
+                    }
+                }
+                self.stage_checkpointed_shuffle(
+                    &stage,
+                    RetainedBatch::from_received(received),
+                    watermark,
+                )?;
+            }
+            ensure_no_delivery_loss()?;
+            if remaining.is_empty() {
+                Self::validate_shuffle_attempt_scope(
+                    &cfg,
+                    assignment_fence,
+                    recovery_gen,
+                    controller,
+                )?;
+                ensure_no_delivery_loss()?;
+                return Ok(());
+            }
+
+            let mut check_interval = tokio::time::interval(RECHECK);
+            loop {
+                tokio::select! {
+                    res = cfg.receiver.recv() => {
+                        let received = res.ok_or_else(|| DbError::Pipeline(
+                            "shuffle receiver closed during barrier alignment".into(),
+                        ))?;
+                        Self::validate_received_shuffle_scope(
+                            &received,
+                            cfg.self_id.0,
+                            assignment_fence,
+                            recovery_gen,
+                        )?;
+                        if matches!(received.message(), ShuffleMessage::Data { .. }) {
+                            let peer = received.peer();
+                            let sequence = received.checkpoint_sequence();
+                            if let Some(cut) = barrier_cuts.get(&peer) {
+                                return Err(DbError::Pipeline(format!(
+                                    "shuffle data sequence {sequence} from peer {peer} arrived after its checkpoint barrier high-water {cut} while peers {remaining:?} were still outstanding"
+                                )));
+                            }
+                            let assignment_version = received.assignment_version();
+                            let (message, admission) = received.into_parts();
+                            let ShuffleMessage::Data {
+                                stage,
+                                batch,
+                                ..
+                            } = message
+                            else {
+                                unreachable!("matched data above");
+                            };
+                            self.stage_checkpointed_shuffle(
+                                &stage,
+                                RetainedBatch::admitted(batch, admission, assignment_version),
+                                watermark,
+                            )?;
+                            continue;
+                        }
+
+                        let ShuffleMessage::Barrier(barrier) = received.message() else {
+                            unreachable!("shuffle message variants are exhaustive");
+                        };
+                        if received.assignment_digest() != Some(assignment_fence.digest()) {
+                            return Err(DbError::Pipeline(format!(
+                                "shuffle barrier from peer {} has the wrong assignment certificate",
+                                received.peer()
+                            )));
+                        }
+                        let observed = laminar_core::state::CheckpointAttempt::new(
+                            barrier.epoch,
+                            barrier.checkpoint_id,
+                        );
+                        match Self::compare_shuffle_attempts(attempt, observed)? {
+                            std::cmp::Ordering::Equal => {
+                                let peer = received.peer();
+                                let cut = received.checkpoint_sequence();
+                                if let Some(previous) = barrier_cuts.insert(peer, cut) {
+                                    if previous != cut {
+                                        return Err(DbError::Pipeline(format!(
+                                            "shuffle peer {peer} repeated checkpoint barrier with conflicting high-water sequences {previous} and {cut}"
+                                        )));
+                                    }
+                                }
+                                let first_observation = remaining.remove(&peer);
+                                if first_observation && remaining.is_empty() {
+                                    break;
+                                }
+                            }
+                            std::cmp::Ordering::Greater => {
+                                cfg.receiver.stash_barrier(received);
+                            }
+                            std::cmp::Ordering::Less => {}
+                        }
+                    }
+                    _ = check_interval.tick() => {
+                        Self::validate_shuffle_attempt_scope(
+                            &cfg,
+                            assignment_fence,
+                            recovery_gen,
+                            controller,
+                        )?;
+                        ensure_no_delivery_loss()?;
+                        if let Some(ctrl) = controller {
+                            if let Ok(Some(announcement)) = ctrl.observe_barrier().await {
+                                let announced = laminar_core::state::CheckpointAttempt::new(
+                                    announcement.epoch,
+                                    announcement.checkpoint_id,
+                                );
+                                match Self::compare_shuffle_attempts(attempt, announced)? {
+                                    std::cmp::Ordering::Equal if announcement.phase == Phase::Abort => {
+                                        return Err(DbError::Pipeline(format!(
+                                            "checkpoint {} epoch {} was aborted by leader",
+                                            attempt.checkpoint_id, attempt.epoch
+                                        )));
+                                    }
+                                    std::cmp::Ordering::Greater => {
+                                        return Err(DbError::Pipeline(format!(
+                                            "checkpoint {} epoch {} was superseded by {announced:?}",
+                                            attempt.checkpoint_id, attempt.epoch
+                                        )));
+                                    }
+                                    std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Self::validate_shuffle_attempt_scope(
+                &cfg,
+                assignment_fence,
+                recovery_gen,
+                controller,
+            )?;
+            ensure_no_delivery_loss()?;
+            tracing::debug!(
+                checkpoint_id = attempt.checkpoint_id,
+                epoch = attempt.epoch,
+                "shuffle align: complete"
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "shuffle barrier alignment exhausted the absolute deadline for checkpoint {} epoch {}",
+                attempt.checkpoint_id, attempt.epoch
+            ))
+        })?;
+        alignment.map_err(|error| {
+            DbError::Checkpoint(format!(
+                "shuffle barrier alignment for checkpoint {} epoch {} requires recovery: {error}",
+                attempt.checkpoint_id, attempt.epoch
+            ))
+        })
     }
 
-    #[cfg(all(test, feature = "cluster"))]
+    #[cfg(test)]
     pub(crate) fn push_test_node(&mut self, name: &str, operator: Box<dyn GraphOperator>) {
-        self.nodes.push(GraphNode {
+        self.allocate_node(GraphNode {
             name: Arc::from(name),
             operator,
             input_port_count: 1,
             output_routes: Vec::new(),
             removed: false,
         });
-        self.input_bufs.push(vec![Vec::new()]);
-        self.input_buf_bytes.push(vec![0]);
-        self.input_sources.push(vec![usize::MAX]);
-        self.output_watermarks.push(i64::MIN);
         self.topo_dirty = true;
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn set_test_vnode_count(&mut self, vnode_count: u32) {
+        self.vnode_count = Some(vnode_count);
     }
 
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
@@ -2704,151 +3061,90 @@ impl OperatorGraph {
         }
     }
 
-    /// Drop one vnode's state after its cold-tier write is confirmed.
-    /// Returns `false` if the operator refuses (vnode modified since last capture).
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn demote_vnode(&mut self, operator: &str, vnode: u32) -> bool {
-        let Some(vnode_count) = self.vnode_count else {
-            return false;
-        };
-        let demoted = self
-            .nodes
-            .iter_mut()
-            .find(|n| !n.removed && &*n.name == operator)
-            .is_some_and(|n| n.operator.demote_vnode(vnode, vnode_count));
-        if demoted {
-            if let Some(ref prom) = self.prom {
-                prom.state_tier_demote_total.inc();
-            }
+    /// Restore a newly built graph. The graph is consumed so any late operator failure drops the
+    /// partially restored image instead of returning it to the caller.
+    pub fn restore_state(mut self, checkpoint: &GraphCheckpoint) -> Result<(Self, usize), DbError> {
+        if !self.whole_restore_open {
+            return Err(DbError::Checkpoint(
+                "[LDB-6029] operator graph restore is only valid before the first execution cycle"
+                    .into(),
+            ));
         }
-        demoted
-    }
-
-    /// Demote idle resident groups across all operators until `target_bytes` is freed. Each operator
-    /// encodes, tier-writes and drops its own idle groups off the compute path; returns the count demoted.
-    #[cfg(feature = "state-tier")]
-    pub(crate) async fn demote_cold_groups(&mut self, target_bytes: usize) -> u64 {
-        let Some(vnode_count) = self.vnode_count else {
-            return 0;
-        };
-        let mut total = 0u64;
-        // Hold the budget across operators: each gets only what's left, so the total freed never
-        // exceeds target_bytes. Iteration order sets demotion priority (earlier operators first).
-        let mut remaining = target_bytes;
-        for node in &mut self.nodes {
-            if node.removed {
-                continue;
-            }
-            if remaining == 0 {
-                break;
-            }
-            let (n, freed) = node
-                .operator
-                .demote_cold_groups(remaining, vnode_count)
-                .await;
-            total += n as u64;
-            remaining = remaining.saturating_sub(freed);
-        }
-        if total > 0 {
-            if let Some(ref prom) = self.prom {
-                prom.state_tier_demote_total.inc_by(total);
-            }
-        }
-        total
-    }
-
-    /// Release every operator's queued tier drops; called only with no checkpoint in flight so a
-    /// drop can't race a staged cold-group fetch.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn release_tier_drops(&mut self) {
-        for node in &mut self.nodes {
-            if !node.removed {
-                node.operator.release_tier_drops();
-            }
-        }
-    }
-
-    /// Whether the named operator could demote `vnode` right now (no tier I/O performed).
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn can_demote(&self, operator: &str, vnode: u32) -> bool {
-        let Some(vnode_count) = self.vnode_count else {
-            return false;
-        };
-        self.nodes
-            .iter()
-            .find(|n| !n.removed && &*n.name == operator)
-            .is_some_and(|n| n.operator.can_demote(vnode, vnode_count))
-    }
-
-    /// Vnodes each operator had demoted at the last checkpoint; absent from the manifest
-    /// and must be replayed from durable partials. Returns `(operator_name, vnodes)`.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn take_tier_cold_vnodes(&mut self) -> Vec<(String, Vec<u32>)> {
-        let mut out = Vec::new();
-        for node in &mut self.nodes {
-            if node.removed {
-                continue;
-            }
-            let cold = node.operator.take_tier_cold_vnodes();
-            if !cold.is_empty() {
-                out.push((node.name.to_string(), cold));
-            }
-        }
-        out
-    }
-
-    /// Replay one operator's recovery chain (FULL base + ordered deltas) for a vnode (cold-vnode
-    /// rehydration on restart). Targets a single operator to avoid double-applying manifest slices.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn apply_vnode_chain(
-        &mut self,
-        operator: &str,
-        vnode: u32,
-        base: &[u8],
-        deltas: &[(&[u8], &[u8])],
-    ) -> Result<(), DbError> {
-        match self
-            .nodes
-            .iter_mut()
-            .find(|n| !n.removed && &*n.name == operator)
-        {
-            Some(node) => node.operator.apply_vnode_chain(vnode, base, deltas),
-            None => Ok(()),
-        }
-    }
-
-    pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {
         if checkpoint.version != GRAPH_CHECKPOINT_VERSION {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6043] unsupported operator graph checkpoint version {}; expected {}",
                 checkpoint.version, GRAPH_CHECKPOINT_VERSION
             )));
         }
+        let mut missing: Vec<&str> = checkpoint
+            .operators
+            .keys()
+            .map(String::as_str)
+            .filter(|operator| {
+                !self
+                    .nodes
+                    .iter()
+                    .any(|node| !node.removed && &*node.name == *operator)
+            })
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6029] operator graph checkpoint requires missing operator(s): {}",
+                missing.join(", ")
+            )));
+        }
         let mut restored = 0;
-        for node in &mut self.nodes {
+        for node_id in 0..self.nodes.len() {
+            let node = &mut self.nodes[node_id];
             if node.removed {
                 continue;
             }
             if let Some(bytes) = checkpoint.operators.get(&*node.name) {
-                node.operator.restore(OperatorCheckpoint {
-                    data: bytes.clone(),
-                })?;
+                node.operator
+                    .restore(OperatorCheckpoint {
+                        data: bytes.clone(),
+                    })
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6029] operator '{}' restore failed: {error}",
+                            node.name
+                        ))
+                    })?;
+                #[cfg(feature = "cluster")]
+                if let Some(watermark) = node.operator.restored_output_watermark() {
+                    self.output_watermarks[node_id] = watermark;
+                }
                 restored += 1;
             }
         }
-        Ok(restored)
+        self.whole_restore_open = false;
+        Ok((self, restored))
     }
 
-    pub fn serialize_checkpoint(cp: &GraphCheckpoint) -> Result<Vec<u8>, DbError> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(cp)
-            .map(|v| v.to_vec())
-            .map_err(|e| DbError::Pipeline(format!("operator graph checkpoint serialization: {e}")))
+    pub fn serialize_checkpoint_bounded(
+        cp: &GraphCheckpoint,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, DbError> {
+        let max_bytes = usize::try_from(max_bytes).map_err(|_| {
+            DbError::Checkpoint("operator graph checkpoint budget does not fit usize".into())
+        })?;
+        let writer = rkyv::ser::writer::IoWriter::new(
+            laminar_core::serialization::BoundedBytesWriter::new(max_bytes),
+        );
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(cp, writer)
+            .map(|writer| writer.into_inner().into_vec())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "operator graph checkpoint serialization exceeded its {max_bytes}-byte budget: {error}"
+                ))
+            })
     }
 
-    pub fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
+    pub fn restore_from_bytes(self, bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let checkpoint: GraphCheckpoint =
             rkyv::from_bytes::<GraphCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
-                DbError::Pipeline(format!("operator graph checkpoint deserialization: {e}"))
+                DbError::Checkpoint(format!("operator graph checkpoint deserialization: {e}"))
             })?;
         self.restore_state(&checkpoint)
     }
@@ -2895,9 +3191,357 @@ mod tests {
         .unwrap()
     }
 
-    /// Records the batches handed to `ingest_shuffle`.
     #[cfg(feature = "cluster")]
-    struct RecordingOperator(Arc<parking_lot::Mutex<Vec<RecordBatch>>>);
+    #[test]
+    fn default_operator_rejects_checkpointed_shuffle() {
+        let mut operator = SourcePassthrough;
+
+        let error = operator
+            .stage_checkpointed_shuffle(
+                "unadmitted-join-stage",
+                RetainedBatch::local(test_batch()),
+                0,
+            )
+            .expect_err("operators without an admitted shuffle path must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("does not accept checkpointed shuffle stage"));
+    }
+
+    struct RestoreProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl GraphOperator for RestoreProbe {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RestoreFailureProbe {
+        restores: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    impl Drop for RestoreFailureProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl GraphOperator for RestoreFailureProbe {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            self.restores
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                Err(DbError::Pipeline("injected late restore failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    struct RestoredReplayWatermarkProbe {
+        replay_watermark: Option<i64>,
+        processed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "cluster")]
+    #[async_trait]
+    impl GraphOperator for RestoredReplayWatermarkProbe {
+        async fn process(
+            &mut self,
+            inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            if self.replay_watermark.is_none() {
+                return Ok(Vec::new());
+            }
+            assert!(inputs.is_empty(), "replay-only cycle accepted new input");
+            self.replay_watermark = None;
+            self.processed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![test_batch()])
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(self.replay_watermark.map(|watermark| OperatorCheckpoint {
+                data: watermark.to_le_bytes().to_vec(),
+            }))
+        }
+
+        fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            let encoded: [u8; 8] = checkpoint.data.try_into().map_err(|_| {
+                DbError::Checkpoint("invalid replay-watermark probe checkpoint".into())
+            })?;
+            self.replay_watermark = Some(i64::from_le_bytes(encoded));
+            Ok(())
+        }
+
+        fn watermark_hold(&self) -> Option<i64> {
+            self.replay_watermark
+        }
+
+        fn restored_output_watermark(&self) -> Option<i64> {
+            self.replay_watermark
+        }
+
+        fn wants_input(&self) -> bool {
+            self.replay_watermark.is_none()
+        }
+    }
+
+    #[test]
+    fn whole_graph_restore_rejects_old_abi_before_mutation() {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.allocate_node(GraphNode {
+            name: Arc::from("present"),
+            operator: Box::new(RestoreProbe(Arc::clone(&restores))),
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        let mut operators = OperatorStateMap::new();
+        operators.insert("present".into(), vec![1]);
+
+        let error = graph
+            .restore_state(&GraphCheckpoint {
+                version: GRAPH_CHECKPOINT_VERSION - 1,
+                operators,
+            })
+            .err()
+            .expect("old graph ABI must fail");
+
+        assert!(error.to_string().contains("[LDB-6043]"), "{error}");
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn whole_graph_checkpoint_serialization_enforces_its_byte_budget() {
+        let mut operators = OperatorStateMap::new();
+        operators.insert("stateful".into(), vec![42; 4_096]);
+        let checkpoint = GraphCheckpoint {
+            version: GRAPH_CHECKPOINT_VERSION,
+            operators,
+        };
+        let encoded = OperatorGraph::serialize_checkpoint_bounded(&checkpoint, u64::MAX).unwrap();
+        let restored = rkyv::from_bytes::<GraphCheckpoint, rkyv::rancor::Error>(&encoded).unwrap();
+        assert_eq!(restored.version, GRAPH_CHECKPOINT_VERSION);
+        assert_eq!(restored.operators["stateful"], vec![42; 4_096]);
+
+        let error = OperatorGraph::serialize_checkpoint_bounded(
+            &checkpoint,
+            u64::try_from(encoded.len() - 1).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("byte budget"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn restored_replay_seeds_and_holds_output_watermark_through_final_emission() {
+        let donor_processed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut donor = OperatorGraph::new(laminar_sql::create_session_context());
+        donor.push_test_node(
+            "replay",
+            Box::new(RestoredReplayWatermarkProbe {
+                replay_watermark: Some(42),
+                processed: donor_processed,
+            }),
+        );
+        let checkpoint = donor.snapshot_state().unwrap().unwrap();
+        let encoded = OperatorGraph::serialize_checkpoint_bounded(&checkpoint, u64::MAX).unwrap();
+
+        let processed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut target = OperatorGraph::new(laminar_sql::create_session_context());
+        target.push_test_node(
+            "replay",
+            Box::new(RestoredReplayWatermarkProbe {
+                replay_watermark: None,
+                processed: Arc::clone(&processed),
+            }),
+        );
+        let (mut restored, count) = target.restore_from_bytes(&encoded).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(restored.output_watermarks[0], 42);
+
+        let mut results = FxHashMap::default();
+        restored
+            .execute_single_operator(0, 100, &mut results)
+            .await
+            .unwrap();
+        assert!(processed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            restored.output_watermarks[0], 42,
+            "the replay-only emission cycle must not advance past its restored watermark"
+        );
+
+        restored
+            .execute_single_operator(0, 100, &mut results)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.output_watermarks[0], 100,
+            "the next input-accepting cycle may advance after replay drains"
+        );
+    }
+
+    #[test]
+    fn whole_graph_restore_rejects_missing_operator_before_mutation() {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.allocate_node(GraphNode {
+            name: Arc::from("present"),
+            operator: Box::new(RestoreProbe(Arc::clone(&restores))),
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        let mut operators = OperatorStateMap::new();
+        operators.insert("present".into(), vec![1]);
+        operators.insert("missing".into(), vec![2]);
+
+        let error = graph
+            .restore_state(&GraphCheckpoint {
+                version: GRAPH_CHECKPOINT_VERSION,
+                operators,
+            })
+            .err()
+            .expect("missing operator must fail");
+
+        assert!(error.to_string().contains("missing operator(s): missing"));
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn whole_graph_restore_closes_before_first_execution_cycle() {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.allocate_node(GraphNode {
+            name: Arc::from("present"),
+            operator: Box::new(RestoreProbe(Arc::clone(&restores))),
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        graph
+            .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+            .await
+            .unwrap();
+        let operators = [("present".to_string(), vec![1])].into_iter().collect();
+
+        let error = graph
+            .restore_state(&GraphCheckpoint {
+                version: GRAPH_CHECKPOINT_VERSION,
+                operators,
+            })
+            .err()
+            .expect("restore after execution must fail");
+
+        assert!(error
+            .to_string()
+            .contains("before the first execution cycle"));
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn late_restore_failure_consumes_and_drops_partial_graph() {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        for (name, fail) in [("first", false), ("second", true)] {
+            graph.allocate_node(GraphNode {
+                name: Arc::from(name),
+                operator: Box::new(RestoreFailureProbe {
+                    restores: Arc::clone(&restores),
+                    drops: Arc::clone(&drops),
+                    fail,
+                }),
+                input_port_count: 1,
+                output_routes: Vec::new(),
+                removed: false,
+            });
+        }
+        let operators = [
+            ("first".to_string(), vec![1]),
+            ("second".to_string(), vec![2]),
+        ]
+        .into_iter()
+        .collect();
+
+        let error = graph
+            .restore_state(&GraphCheckpoint {
+                version: GRAPH_CHECKPOINT_VERSION,
+                operators,
+            })
+            .err()
+            .expect("late restore fault must fail the graph");
+
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.requires_pipeline_recovery());
+        assert!(error.to_string().contains("second"), "{error}");
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stateless_operator_rejects_unexpected_checkpoint_state() {
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.allocate_node(GraphNode {
+            name: Arc::from("source"),
+            operator: Box::new(SourcePassthrough),
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        let operators = [("source".to_string(), vec![1])].into_iter().collect();
+
+        let error = graph
+            .restore_state(&GraphCheckpoint {
+                version: GRAPH_CHECKPOINT_VERSION,
+                operators,
+            })
+            .err()
+            .expect("stateless operator state must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("does not accept checkpoint state"));
+        assert!(error.requires_pipeline_recovery());
+    }
+
+    /// Records the batches handed to `stage_checkpointed_shuffle`.
+    #[cfg(feature = "cluster")]
+    struct RecordingOperator(Arc<parking_lot::Mutex<Vec<RetainedBatch>>>);
 
     #[cfg(feature = "cluster")]
     #[async_trait]
@@ -2915,10 +3559,10 @@ mod tests {
         fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
             Ok(())
         }
-        async fn ingest_shuffle(
+        fn stage_checkpointed_shuffle(
             &mut self,
             _stage: &str,
-            batch: RecordBatch,
+            batch: RetainedBatch,
             _watermark: i64,
         ) -> Result<(), DbError> {
             self.0.lock().push(batch);
@@ -2955,7 +3599,7 @@ mod tests {
             &mut self,
             vnode: u32,
             _base: &[u8],
-            _deltas: &[(&[u8], &[u8])],
+            _deltas: &[&[u8]],
         ) -> Result<(), DbError> {
             if let Some(message) = self.failure {
                 return Err(DbError::Pipeline(message.into()));
@@ -2981,15 +3625,31 @@ mod tests {
         let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
         registry.mark_restoring(&[0]);
         let receiver = Arc::new(
-            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(1))
                 .await
                 .expect("bind test shuffle receiver"),
         );
+        let sender = Arc::new(ShuffleSender::new(1, uuid::Uuid::from_u128(1)));
+        let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+            registry.assignment_version(),
+            &[self_id.0],
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap();
+        receiver
+            .install_assignment_fence(&fence, &[self_id.0])
+            .unwrap();
+        sender
+            .install_assignment_fence(&fence, &[self_id.0])
+            .unwrap();
 
         let mut graph = test_graph();
         graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
             registry: Arc::clone(&registry),
-            sender: Arc::new(ShuffleSender::new(1)),
+            sender,
             receiver,
             self_id,
         });
@@ -3001,76 +3661,512 @@ mod tests {
         (graph, registry)
     }
 
-    /// A peer ships a row + its barrier; alignment folds the row into the target
-    /// operator (so it would enter the snapshot) and completes once the peer's
-    /// barrier is observed.
     #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn align_shuffle_barriers_folds_peer_rows_then_aligns() {
-        use laminar_core::checkpoint::barrier::CheckpointBarrier;
-        use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
+    struct AlignmentHarness {
+        graph: OperatorGraph,
+        local_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        remote_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        remote_sender: laminar_core::shuffle::ShuffleSender,
+        fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+        recorded: Arc<parking_lot::Mutex<Vec<RetainedBatch>>>,
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn alignment_harness() -> AlignmentHarness {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
         use laminar_core::state::{NodeId, VnodeRegistry};
 
-        // 2 vnodes: node 1 owns vnode 0, node 2 owns vnode 1 (so node 1's peer = {2}).
         let registry = Arc::new(VnodeRegistry::new(2));
         registry.set_assignment(vec![NodeId(1), NodeId(2)].into());
-
-        let recv1 = Arc::new(
-            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+        let assignment_version = registry.assignment_version();
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            assignment_version,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(1),
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+            ],
+        )
+        .unwrap();
+        let local_receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(1))
                 .await
                 .unwrap(),
         );
-        let recv2 = Arc::new(
-            ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap())
+        let remote_receiver = Arc::new(
+            ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(2))
                 .await
                 .unwrap(),
         );
-        let send1 = ShuffleSender::new(1);
-        send1.register_peer(2, recv2.local_addr()).await;
-        let send2 = ShuffleSender::new(2);
-        send2.register_peer(1, recv1.local_addr()).await;
+        let local_sender = ShuffleSender::new(1, uuid::Uuid::from_u128(1));
+        local_sender
+            .register_peer(2, remote_receiver.local_addr())
+            .await;
+        let remote_sender = ShuffleSender::new(2, uuid::Uuid::from_u128(2));
+        remote_sender
+            .register_peer(1, local_receiver.local_addr())
+            .await;
+        local_receiver
+            .install_assignment_fence(&fence, &[1, 2])
+            .unwrap();
+        remote_receiver
+            .install_assignment_fence(&fence, &[1, 2])
+            .unwrap();
+        local_sender
+            .install_assignment_fence(&fence, &[1, 2])
+            .unwrap();
+        remote_sender
+            .install_assignment_fence(&fence, &[1, 2])
+            .unwrap();
 
         let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
         graph.push_test_node("out", Box::new(RecordingOperator(Arc::clone(&recorded))));
         graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
             registry,
-            sender: Arc::new(send1),
-            receiver: Arc::clone(&recv1),
+            sender: Arc::new(local_sender),
+            receiver: Arc::clone(&local_receiver),
             self_id: NodeId(1),
         });
+        AlignmentHarness {
+            graph,
+            local_receiver,
+            remote_receiver,
+            remote_sender,
+            fence,
+            recorded,
+        }
+    }
 
-        // Peer (node 2) ships a row for stage "out", then its barrier for cp 7.
+    /// A peer ships a row + its exact-attempt barrier; alignment retains the row as channel state
+    /// before completing the certified distributed cut.
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::shuffle::ShuffleMessage;
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = alignment_harness().await;
+        let attempt = CheckpointAttempt::new(7, 70);
+
         let batch = test_batch();
-        send2
+        harness
+            .remote_sender
             .send_to(
                 1,
-                &ShuffleMessage::VnodeData("out".into(), 0, batch.clone()),
+                &ShuffleMessage::checkpointed("out".into(), 0, batch.clone()),
             )
             .await
             .unwrap();
-        send2
-            .send_to(1, &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 0)))
+        harness
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &harness.fence,
+            )
             .await
             .unwrap();
 
-        graph
-            .align_shuffle_barriers(7, 0, &[1, 2], None)
+        harness
+            .graph
+            .align_shuffle_barriers(
+                attempt,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
             .await
             .unwrap();
 
-        // Node 1 must have fanned its own barrier out to node 2.
-        let (from, msg) = recv2.recv().await.unwrap();
-        assert_eq!(from, 1);
-        assert!(matches!(msg, ShuffleMessage::Barrier(b) if b.checkpoint_id == 7));
+        let received = harness.remote_receiver.recv().await.unwrap();
+        assert_eq!(received.peer(), 1);
+        assert_eq!(received.assignment_digest(), Some(harness.fence.digest()));
+        assert!(matches!(
+            received.message(),
+            ShuffleMessage::Barrier(barrier)
+                if barrier.epoch == attempt.epoch
+                    && barrier.checkpoint_id == attempt.checkpoint_id
+        ));
 
-        let got = recorded.lock();
+        let got = harness.recorded.lock();
         assert_eq!(
             got.len(),
             1,
-            "peer's pre-barrier row folded into the operator"
+            "peer's pre-barrier row retained by the operator"
         );
         assert_eq!(got[0].num_rows(), batch.num_rows());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_rejects_staged_data_barrier_data_sequence() {
+        use laminar_core::checkpoint::{
+            CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant,
+        };
+        use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{CheckpointAttempt, NodeId, VnodeRegistry};
+
+        let registry = Arc::new(VnodeRegistry::new(3));
+        registry.set_assignment(vec![NodeId(1), NodeId(2), NodeId(3)].into());
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            registry.assignment_version(),
+            &[1, 2, 3],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(1),
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+                CheckpointParticipant {
+                    node_id: 3,
+                    boot_incarnation: uuid::Uuid::from_u128(3),
+                },
+            ],
+        )
+        .unwrap();
+        let local_receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(1))
+                .await
+                .unwrap(),
+        );
+        let peer_two_receiver = Arc::new(
+            ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(2))
+                .await
+                .unwrap(),
+        );
+        let waiting_peer_receiver = Arc::new(
+            ShuffleReceiver::bind(3, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(3))
+                .await
+                .unwrap(),
+        );
+        for receiver in [&local_receiver, &peer_two_receiver, &waiting_peer_receiver] {
+            receiver
+                .install_assignment_fence(&fence, &[1, 2, 3])
+                .unwrap();
+        }
+
+        let local_sender = ShuffleSender::new(1, uuid::Uuid::from_u128(1));
+        local_sender
+            .register_peer(2, peer_two_receiver.local_addr())
+            .await;
+        local_sender
+            .register_peer(3, waiting_peer_receiver.local_addr())
+            .await;
+        local_sender
+            .install_assignment_fence(&fence, &[1, 2, 3])
+            .unwrap();
+        let peer_two_sender = ShuffleSender::new(2, uuid::Uuid::from_u128(2));
+        peer_two_sender
+            .register_peer(1, local_receiver.local_addr())
+            .await;
+        peer_two_sender
+            .register_peer(3, waiting_peer_receiver.local_addr())
+            .await;
+        peer_two_sender
+            .install_assignment_fence(&fence, &[1, 2, 3])
+            .unwrap();
+
+        let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.push_test_node("out", Box::new(RecordingOperator(Arc::clone(&recorded))));
+        graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+            registry,
+            sender: Arc::new(local_sender),
+            receiver: Arc::clone(&local_receiver),
+            self_id: NodeId(1),
+        });
+
+        let attempt = CheckpointAttempt::new(7, 70);
+        let before_barrier = test_batch();
+        peer_two_sender
+            .send_to(
+                1,
+                &ShuffleMessage::checkpointed("out".into(), 0, before_barrier.clone()),
+            )
+            .await
+            .unwrap();
+        peer_two_sender
+            .fan_out_barrier(
+                &[1, 3],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &fence,
+            )
+            .await
+            .unwrap();
+        peer_two_sender
+            .send_to(
+                1,
+                &ShuffleMessage::checkpointed("out".into(), 0, test_batch()),
+            )
+            .await
+            .unwrap();
+
+        // Force the normal per-stage drainer to split the queued data/barrier stream into its two
+        // holdovers before alignment starts. The sequence metadata must still distinguish the
+        // pre-barrier batch from the post-barrier batch.
+        let stage_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let _ = local_receiver.drain_checkpointed_data_for("__alignment_probe");
+            let barriers = local_receiver.drain_staged_barriers();
+            if !barriers.is_empty() {
+                for barrier in barriers {
+                    local_receiver.stash_barrier(barrier);
+                }
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < stage_deadline,
+                "remote barrier did not reach the staged holdover"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let error = graph
+            .align_shuffle_barriers(
+                attempt,
+                0,
+                &fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect_err("data behind an observed peer barrier must fail the checkpoint");
+        assert!(error.to_string().contains("checkpoint barrier"), "{error}");
+        assert!(
+            error.requires_pipeline_recovery(),
+            "destructive alignment failure must rewind the pipeline"
+        );
+        let retained = recorded.lock();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].num_rows(), before_barrier.num_rows());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_rejects_wrong_epoch_for_same_checkpoint_id() {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = alignment_harness().await;
+        let expected = CheckpointAttempt::new(7, 70);
+        harness
+            .remote_sender
+            .fan_out_barrier(&[1], CheckpointBarrier::new(70, 8), &harness.fence)
+            .await
+            .unwrap();
+        let error = harness
+            .graph
+            .align_shuffle_barriers(
+                expected,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("attempt mismatch"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn shuffle_attempt_comparison_rejects_all_conflicting_orders() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let expected = CheckpointAttempt::new(7, 70);
+        for observed in [
+            CheckpointAttempt::new(6, 71),
+            CheckpointAttempt::new(8, 69),
+            CheckpointAttempt::new(7, 69),
+            CheckpointAttempt::new(7, 71),
+            CheckpointAttempt::new(6, 70),
+            CheckpointAttempt::new(8, 70),
+        ] {
+            assert!(
+                OperatorGraph::compare_shuffle_attempts(expected, observed).is_err(),
+                "mixed attempt order must fail: {observed:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_rejects_wrong_assignment_digest() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
+        use laminar_core::state::CheckpointAttempt;
+
+        let harness = alignment_harness().await;
+        let wrong_fence = CheckpointAssignmentFence::from_owner_map(
+            harness.fence.assignment_version,
+            &[2, 1],
+            harness.fence.participants.clone(),
+        )
+        .unwrap();
+        let attempt = CheckpointAttempt::new(7, 70);
+        let error = harness
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &wrong_fence,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("assignment roster"), "{error}");
+        assert!(harness.recorded.lock().is_empty());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_rejects_changed_local_assignment_scope() {
+        use laminar_core::checkpoint::CheckpointAssignmentFence;
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = alignment_harness().await;
+        let next = CheckpointAssignmentFence::from_owner_map(
+            harness.fence.assignment_version + 1,
+            &[1, 2],
+            harness.fence.participants.clone(),
+        )
+        .unwrap();
+        let cfg = harness.graph.cluster_shuffle_config().unwrap();
+        cfg.sender.install_assignment_fence(&next, &[1, 2]).unwrap();
+        cfg.receiver
+            .install_assignment_fence(&next, &[1, 2])
+            .unwrap();
+        let error = harness
+            .graph
+            .align_shuffle_barriers(
+                CheckpointAttempt::new(7, 70),
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("assignment differs"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_transition_discards_staged_pre_recovery_barrier() {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::state::CheckpointAttempt;
+
+        let harness = alignment_harness().await;
+        let attempt = CheckpointAttempt::new(7, 70);
+        harness
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+        let old = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            harness.local_receiver.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        harness.local_receiver.stash_barrier(old);
+        harness.local_receiver.set_recovery_gen(1);
+        harness.remote_receiver.set_recovery_gen(1);
+        harness
+            .graph
+            .cluster_shuffle_config()
+            .unwrap()
+            .sender
+            .set_recovery_gen(1);
+
+        assert!(harness.local_receiver.drain_staged_barriers().is_empty());
+        assert!(harness.remote_receiver.drain_staged_barriers().is_empty());
+        assert!(harness.recorded.lock().is_empty());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_fails_closed_on_unknown_stage() {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::shuffle::ShuffleMessage;
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = alignment_harness().await;
+        let attempt = CheckpointAttempt::new(7, 70);
+        harness
+            .remote_sender
+            .send_to(
+                1,
+                &ShuffleMessage::checkpointed("missing".into(), 0, test_batch()),
+            )
+            .await
+            .unwrap();
+        harness
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+        let error = harness
+            .graph
+            .align_shuffle_barriers(
+                attempt,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown or removed stage"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_uses_supplied_absolute_deadline() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = alignment_harness().await;
+        let started = std::time::Instant::now();
+        let error = harness
+            .graph
+            .align_shuffle_barriers(
+                CheckpointAttempt::new(7, 70),
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(30),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("absolute deadline"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "alignment ignored its supplied deadline"
+        );
     }
 
     #[test]
@@ -3099,7 +4195,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
@@ -3121,13 +4216,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "q2".to_string(),
             "SELECT symbol FROM q1 WHERE price > 100".to_string(),
-            None,
             None,
             None,
             None,
@@ -3155,13 +4248,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "q1".to_string(),
             "SELECT * FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -3200,14 +4291,189 @@ mod tests {
             None,
             None,
             None,
-            None,
-            false,
+            true,
         );
         assert!(graph.output_map.contains_key("q1"));
+        let original_node = graph.output_map["q1"];
+        graph.ensure_live_provider("q1", &test_schema());
+        let temporal_config = TemporalJoinTranslatorConfig {
+            stream_table: "trades".to_string(),
+            table_name: "versions".to_string(),
+            stream_key_column: "symbol".to_string(),
+            table_key_column: "symbol".to_string(),
+            stream_time_column: "ts".to_string(),
+            table_version_column: "valid_from".to_string(),
+            semantics: "event_time".to_string(),
+            join_type: "inner".to_string(),
+        };
+        graph
+            .temporal_configs
+            .push(("q1".to_string(), temporal_config.clone()));
 
         graph.remove_query("q1");
         assert!(!graph.output_map.contains_key("q1"));
         assert!(graph.nodes[1].removed); // node 0 = source, node 1 = q1
+        assert!(!graph.incremental_tables.contains("q1"));
+        assert!(graph.temporal_configs.is_empty());
+        assert!(!graph.live_handles.contains_key("q1"));
+
+        graph.add_query(
+            "q1".to_string(),
+            "SELECT * FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let replacement_node = graph.output_map["q1"];
+        assert_eq!(replacement_node, original_node);
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| !node.removed && &*node.name == "q1")
+                .count(),
+            1
+        );
+        assert!(!graph.incremental_tables.contains("q1"));
+        graph.ensure_live_provider("q1", &test_schema());
+        assert!(graph.live_handles.contains_key("q1"));
+
+        graph.incremental_tables.insert("metadata_only".to_string());
+        graph
+            .temporal_configs
+            .push(("metadata_only".to_string(), temporal_config));
+        graph.ensure_live_provider("metadata_only", &test_schema());
+        assert!(!graph.output_map.contains_key("metadata_only"));
+        graph.remove_query("metadata_only");
+        assert!(!graph.incremental_tables.contains("metadata_only"));
+        assert!(graph
+            .temporal_configs
+            .iter()
+            .all(|(query_name, _)| query_name != "metadata_only"));
+        assert!(!graph.live_handles.contains_key("metadata_only"));
+    }
+
+    #[test]
+    fn rejected_control_add_removes_all_query_artifacts() {
+        let ctx = laminar_sql::create_session_context();
+        let mut graph = OperatorGraph::new(ctx);
+        graph
+            .build_errors
+            .push(DbError::Pipeline("forced admission rejection".into()));
+
+        let mutation = Arc::new(crate::pipeline::ControlMutation::new());
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        let message = crate::pipeline::ControlMsg::add_stream(
+            "rejected".to_string(),
+            "SELECT * FROM events".to_string(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            reply,
+            Arc::clone(&mutation),
+        );
+        crate::pipeline_callback::apply_control_to_graph(&mut graph, message);
+        let error = result
+            .try_recv()
+            .expect("control result must be sent synchronously")
+            .unwrap_err();
+
+        assert_eq!(
+            mutation.state(),
+            crate::pipeline::ControlMutationState::Cancelled
+        );
+        assert!(matches!(error, DbError::Pipeline(_)));
+        assert!(!graph.output_map.contains_key("rejected"));
+        assert!(!graph.incremental_tables.contains("rejected"));
+        assert!(!graph.live_handles.contains_key("rejected"));
+        assert!(graph
+            .temporal_configs
+            .iter()
+            .all(|(query_name, _)| query_name != "rejected"));
+        let rejected_nodes: FxHashSet<_> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| &*node.name == "rejected")
+            .map(|(id, node)| {
+                assert!(node.removed);
+                id
+            })
+            .collect();
+        assert!(!rejected_nodes.is_empty());
+        assert!(graph
+            .edges
+            .iter()
+            .all(|edge| !rejected_nodes.contains(&edge.source)
+                && !rejected_nodes.contains(&edge.target)));
+        assert!(graph.nodes.iter().all(|node| node
+            .output_routes
+            .iter()
+            .all(|(target, _)| !rejected_nodes.contains(target))));
+    }
+
+    #[test]
+    fn repeated_live_control_create_drop_reuses_graph_slots() {
+        let ctx = laminar_sql::create_session_context();
+        let mut graph = OperatorGraph::new(ctx);
+
+        for _ in 0..128 {
+            let create_mutation = Arc::new(crate::pipeline::ControlMutation::new());
+            let (create_reply, mut create_result) = tokio::sync::oneshot::channel();
+            crate::pipeline_callback::apply_control_to_graph(
+                &mut graph,
+                crate::pipeline::ControlMsg::add_stream(
+                    "churn".to_string(),
+                    "SELECT * FROM events".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    create_reply,
+                    Arc::clone(&create_mutation),
+                ),
+            );
+            create_result
+                .try_recv()
+                .expect("CREATE acknowledgement must be synchronous")
+                .unwrap();
+            assert_eq!(
+                create_mutation.state(),
+                crate::pipeline::ControlMutationState::Applied
+            );
+
+            let drop_mutation = Arc::new(crate::pipeline::ControlMutation::new());
+            let (drop_reply, mut drop_result) = tokio::sync::oneshot::channel();
+            crate::pipeline_callback::apply_control_to_graph(
+                &mut graph,
+                crate::pipeline::ControlMsg::drop_streams(
+                    vec!["churn".to_string()],
+                    drop_reply,
+                    Arc::clone(&drop_mutation),
+                ),
+            );
+            drop_result
+                .try_recv()
+                .expect("DROP acknowledgement must be synchronous")
+                .unwrap();
+            assert_eq!(
+                drop_mutation.state(),
+                crate::pipeline::ControlMutationState::Applied
+            );
+        }
+
+        assert_eq!(
+            graph.nodes.len(),
+            2,
+            "one source slot plus one reusable query slot"
+        );
+        assert_eq!(graph.free_node_ids.len(), 1);
+        assert!(graph.edges.is_empty());
     }
 
     #[tokio::test]
@@ -3219,7 +4485,6 @@ mod tests {
         graph.add_query(
             "filtered".to_string(),
             "SELECT symbol, price FROM trades WHERE price > 200".to_string(),
-            None,
             None,
             None,
             None,
@@ -3325,7 +4590,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph
@@ -3366,7 +4630,6 @@ mod tests {
             "bad".to_string(),
             "SELECT ai_classify(text, model => 'ghost', labels => ARRAY['a']) AS label FROM docs"
                 .to_string(),
-            None,
             None,
             None,
             None,
@@ -3444,7 +4707,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph
@@ -3491,7 +4753,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
@@ -3520,13 +4781,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "q2".to_string(),
             "SELECT symbol FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -3557,7 +4816,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         // No state yet → None
@@ -3578,7 +4836,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let mut src = FxHashMap::default();
@@ -3589,7 +4846,7 @@ mod tests {
 
         // Snapshot + restore through the real GraphCheckpoint/rkyv path.
         let cp = g1.snapshot_state().unwrap().expect("buffered state");
-        let bytes = OperatorGraph::serialize_checkpoint(&cp).unwrap();
+        let bytes = OperatorGraph::serialize_checkpoint_bounded(&cp, u64::MAX).unwrap();
         let mut g2 = test_graph();
         g2.add_query(
             "recent".into(),
@@ -3598,10 +4855,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
-        assert_eq!(g2.restore_from_bytes(&bytes).unwrap(), 1);
+        let (restored_graph, restored) = g2.restore_from_bytes(&bytes).unwrap();
+        let mut g2 = restored_graph;
+        assert_eq!(restored, 1);
 
         // Advancing to 11000ms ages out AAPL@1000 (exit 11000, strict `>`)
         // but not GOOG@2000 (exit 12000): exactly one -1, nothing lost.
@@ -3635,6 +4893,28 @@ mod tests {
         assert_eq!(total_rows(&r, "recent"), 0);
     }
 
+    struct DelayOperator;
+
+    #[async_trait]
+    impl GraphOperator for DelayOperator {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
     /// Helper: total row count from result batches.
     fn total_rows(results: &FxHashMap<Arc<str>, Vec<RecordBatch>>, key: &str) -> usize {
         results
@@ -3652,6 +4932,69 @@ mod tests {
         graph
     }
 
+    struct AlwaysFailOperator;
+
+    #[async_trait]
+    impl GraphOperator for AlwaysFailOperator {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Err(DbError::Pipeline("injected operator failure".into()))
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    struct TerminalShuffleOperator;
+
+    #[async_trait]
+    impl GraphOperator for TerminalShuffleOperator {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Err(DbError::ShuffleTerminal(
+                "injected permanent routing failure".into(),
+            ))
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    fn terminal_shuffle_graph(query_budget_ns: u64) -> OperatorGraph {
+        let mut graph = test_graph();
+        graph.set_query_budget_ns(query_budget_ns);
+        graph.set_shared_source_isolation(true, usize::MAX);
+        let source = graph.ensure_source_node("trades");
+        let terminal = graph
+            .place_operator_node("terminal", Box::new(TerminalShuffleOperator), 1)
+            .unwrap();
+        let healthy = graph
+            .place_operator_node("healthy", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(source, terminal, 0);
+        graph.add_edge(source, healthy, 0);
+        graph.output_map.insert(Arc::from("terminal"), terminal);
+        graph.output_map.insert(Arc::from("healthy"), healthy);
+        graph.topo_dirty = true;
+        graph
+    }
+
     #[cfg(feature = "cluster")]
     #[test]
     fn apply_revoked_vnodes_drains_handle() {
@@ -3660,10 +5003,54 @@ mod tests {
             [1u32, 2, 3].into_iter().collect::<FxHashSet<u32>>(),
         ));
         graph.set_revoke_handle(Arc::clone(&handle));
-        graph.apply_revoked_vnodes();
+        graph.apply_revoked_vnodes().unwrap();
         assert!(
             handle.lock().is_empty(),
             "the revoke handle is drained after apply_revoked_vnodes",
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn vnode_revoke_failure_faults_and_retains_pending_work() {
+        struct RevokeFailureOperator;
+
+        #[async_trait]
+        impl GraphOperator for RevokeFailureOperator {
+            async fn process(
+                &mut self,
+                _inputs: &[Vec<RecordBatch>],
+                _watermarks: &[i64],
+            ) -> Result<Vec<RecordBatch>, DbError> {
+                Ok(Vec::new())
+            }
+
+            fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+                Ok(None)
+            }
+
+            fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+                Ok(())
+            }
+
+            fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+                Err(DbError::Pipeline("injected vnode revoke failure".into()))
+            }
+        }
+
+        let mut graph = test_graph();
+        graph.push_test_node("revoke-failure", Box::new(RevokeFailureOperator));
+        let handle = Arc::new(parking_lot::Mutex::new(
+            [7u32].into_iter().collect::<FxHashSet<u32>>(),
+        ));
+        graph.set_revoke_handle(Arc::clone(&handle));
+
+        let error = graph.apply_revoked_vnodes().unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("revoke-failure"));
+        assert_eq!(
+            *handle.lock(),
+            [7u32].into_iter().collect::<FxHashSet<u32>>()
         );
     }
 
@@ -3685,6 +5072,22 @@ mod tests {
             registry.is_restoring(0),
             "a corrupt chain must not activate the vnode"
         );
+        assert_eq!(graph.last_execution_assignment_version(), None);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn execution_assignment_is_not_published_when_transport_scope_is_stale() {
+        let (mut graph, registry) = rehydration_test_graph(Vec::new()).await;
+        registry.set_assignment(vec![laminar_core::state::NodeId(1)].into());
+
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .expect_err("stale shuffle transport scope must reject the cycle");
+
+        assert!(matches!(error, DbError::ShuffleNotReady(_)));
+        assert_eq!(graph.last_execution_assignment_version(), None);
     }
 
     #[cfg(feature = "cluster")]
@@ -3693,13 +5096,7 @@ mod tests {
         let partial = crate::vnode_partial::VnodePartial {
             operators: Vec::new(),
             base: Some(laminar_core::state::CheckpointAttempt::new(1, 1)),
-            deltas: vec![(
-                "agg".to_string(),
-                crate::vnode_partial::OpDelta {
-                    changed: vec![1],
-                    tombstones_ipc: Vec::new(),
-                },
-            )],
+            deltas: vec![("agg".to_string(), vec![1])],
         };
         let (mut graph, registry) =
             rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
@@ -3849,6 +5246,10 @@ mod tests {
             !registry.is_restoring(0),
             "the vnode activates only after every operator applies"
         );
+        assert_eq!(
+            graph.last_execution_assignment_version(),
+            Some(registry.assignment_version())
+        );
     }
 
     #[test]
@@ -3863,13 +5264,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "qb".to_string(),
             "SELECT symbol FROM trades_b".to_string(),
-            None,
             None,
             None,
             None,
@@ -3898,13 +5297,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "qb".to_string(),
             "SELECT price FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -3931,13 +5328,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "qb".to_string(),
             "SELECT price FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -3963,32 +5358,49 @@ mod tests {
 
     // A fault in one query sharing a source must not sink a sibling reading the same source: the
     // healthy query still emits, and the shared source is held back because it feeds the faulted domain.
+
+    #[tokio::test]
+    async fn terminal_shuffle_bypasses_main_failure_domain_isolation() {
+        let mut graph = terminal_shuffle_graph(u64::MAX);
+
+        let error = graph
+            .execute_cycle(&trades_source(), i64::MAX, None)
+            .await
+            .expect_err("terminal routing must abort before isolating one domain");
+
+        assert!(matches!(error, DbError::ShuffleTerminal(_)));
+        assert!(!graph.take_cycle_failures().0);
+    }
+
+    #[tokio::test]
+    async fn terminal_shuffle_bypasses_deferred_failure_domain_isolation() {
+        let mut graph = terminal_shuffle_graph(0);
+
+        let error = graph
+            .execute_cycle(&trades_source(), i64::MAX, None)
+            .await
+            .expect_err("a deferred terminal routing failure must abort the cycle");
+
+        assert!(matches!(error, DbError::ShuffleTerminal(_)));
+        assert!(!graph.take_cycle_failures().0);
+    }
+
     #[tokio::test]
     async fn test_execute_cycle_isolates_shared_source_sibling() {
         let mut graph = test_graph();
         graph.set_shared_source_isolation(true, usize::MAX);
-        graph.set_max_state_bytes(Some(1));
-        graph.register_source_schema("trades".to_string(), test_schema());
-        graph.add_query(
-            "agg".to_string(),
-            "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
-        graph.add_query(
-            "healthy".to_string(),
-            "SELECT symbol, price FROM trades".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
+        let source_node = graph.ensure_source_node("trades");
+        let failing = graph
+            .place_operator_node("failing", Box::new(AlwaysFailOperator), 1)
+            .unwrap();
+        let healthy = graph
+            .place_operator_node("healthy", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(source_node, failing, 0);
+        graph.add_edge(source_node, healthy, 0);
+        graph.output_map.insert(Arc::from("failing"), failing);
+        graph.output_map.insert(Arc::from("healthy"), healthy);
+        graph.topo_dirty = true;
 
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
@@ -4004,7 +5416,7 @@ mod tests {
             "healthy sibling emitted despite sharing the faulted source"
         );
         assert_eq!(
-            total_rows(&results, "agg"),
+            total_rows(&results, "failing"),
             0,
             "faulted domain emitted nothing"
         );
@@ -4049,24 +5461,28 @@ mod tests {
         let mut graph = test_graph();
         graph.set_shared_source_isolation(true, usize::MAX);
         let src = graph.ensure_source_node("trades");
-        let a = graph.place_operator_node(
-            "a",
-            Box::new(ReplayTestOp {
-                fail_once: true,
-                has_failed: false,
-            }),
-            1,
-        );
+        let a = graph
+            .place_operator_node(
+                "a",
+                Box::new(ReplayTestOp {
+                    fail_once: true,
+                    has_failed: false,
+                }),
+                1,
+            )
+            .unwrap();
         graph.add_edge(src, a, 0);
         graph.output_map.insert(Arc::from("a"), a);
-        let b = graph.place_operator_node(
-            "b",
-            Box::new(ReplayTestOp {
-                fail_once: false,
-                has_failed: false,
-            }),
-            1,
-        );
+        let b = graph
+            .place_operator_node(
+                "b",
+                Box::new(ReplayTestOp {
+                    fail_once: false,
+                    has_failed: false,
+                }),
+                1,
+            )
+            .unwrap();
         graph.add_edge(src, b, 0);
         graph.output_map.insert(Arc::from("b"), b);
         graph.topo_dirty = true;
@@ -4106,35 +5522,24 @@ mod tests {
         assert!(!any_failed2, "no fault on the replay cycle");
     }
 
-    // A fatal error in one disjoint query (the aggregate trips the state-size limit) must not
-    // sink the sibling query: the healthy domain still produces output, and only the faulted
-    // domain's source is held back from committing.
+    // A fatal error in one disjoint query must not sink the sibling query: the healthy domain
+    // still produces output, and only the faulted domain's source is held back from committing.
     #[tokio::test]
     async fn test_execute_cycle_isolates_failed_domain() {
         let mut graph = test_graph();
-        graph.set_max_state_bytes(Some(1));
-        graph.register_source_schema("trades_a".to_string(), test_schema());
-        graph.register_source_schema("trades_b".to_string(), test_schema());
-        graph.add_query(
-            "agg".to_string(),
-            "SELECT symbol, SUM(price) AS total FROM trades_a GROUP BY symbol".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
-        graph.add_query(
-            "filtered".to_string(),
-            "SELECT symbol, price FROM trades_b WHERE price > 100".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
+        let source_a = graph.ensure_source_node("trades_a");
+        let source_b = graph.ensure_source_node("trades_b");
+        let failing = graph
+            .place_operator_node("failing", Box::new(AlwaysFailOperator), 1)
+            .unwrap();
+        let healthy = graph
+            .place_operator_node("filtered", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(source_a, failing, 0);
+        graph.add_edge(source_b, healthy, 0);
+        graph.output_map.insert(Arc::from("failing"), failing);
+        graph.output_map.insert(Arc::from("filtered"), healthy);
+        graph.topo_dirty = true;
 
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades_a"), vec![test_batch()]);
@@ -4151,7 +5556,7 @@ mod tests {
             "healthy domain emitted"
         );
         assert_eq!(
-            total_rows(&results, "agg"),
+            total_rows(&results, "failing"),
             0,
             "faulted domain emitted nothing"
         );
@@ -4169,7 +5574,6 @@ mod tests {
         graph.add_query(
             "projected".to_string(),
             "SELECT symbol, price FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -4202,7 +5606,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
@@ -4220,7 +5623,6 @@ mod tests {
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
-            None,
             None,
             None,
             None,
@@ -4273,13 +5675,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "step2".to_string(),
             "SELECT symbol, doubled FROM step1 WHERE doubled > 400".to_string(),
-            None,
             None,
             None,
             None,
@@ -4297,14 +5697,12 @@ mod tests {
         assert_eq!(total_rows(&r, "step2"), 1);
     }
 
-    #[tokio::test]
-    async fn test_og_diamond_dag() {
-        // source → A, source → B, A+B → C  (diamond fan-out/fan-in)
+    #[test]
+    fn test_og_rejects_unbounded_diamond_fanin() {
         let mut graph = test_graph();
         graph.add_query(
             "high".to_string(),
             "SELECT symbol, price FROM trades WHERE price > 200".to_string(),
-            None,
             None,
             None,
             None,
@@ -4318,10 +5716,8 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
-        // C selects from both A and B — this will use cached plan (multi-source)
         graph.add_query(
             "combined".to_string(),
             "SELECT h.symbol, h.price FROM high h INNER JOIN low l ON h.symbol = l.symbol"
@@ -4330,18 +5726,29 @@ mod tests {
             None,
             None,
             None,
+            false,
+        );
+        let error = graph.take_build_errors().unwrap_err();
+        assert!(error.to_string().contains("unbounded join"));
+        assert!(!graph.has_query("combined"));
+    }
+
+    #[test]
+    fn test_og_rejects_generic_cross_join_fallback() {
+        let mut graph = test_graph();
+        graph.add_query(
+            "crossed".to_string(),
+            "SELECT l.symbol FROM trades l CROSS JOIN trades r".to_string(),
+            None,
+            None,
+            None,
             None,
             false,
         );
 
-        let mut source = FxHashMap::default();
-        source.insert(Arc::from("trades"), vec![test_batch()]);
-
-        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
-        assert_eq!(total_rows(&r, "high"), 1); // GOOG
-        assert_eq!(total_rows(&r, "low"), 1); // AAPL
-                                              // combined: inner join on symbol — no shared symbols, so empty
-        assert_eq!(total_rows(&r, "combined"), 0);
+        let error = graph.take_build_errors().unwrap_err();
+        assert!(error.to_string().contains("could not be planned"));
+        assert!(!graph.has_query("crossed"));
     }
 
     #[tokio::test]
@@ -4357,13 +5764,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "q2".to_string(),
             "SELECT * FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -4401,7 +5806,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 false,
             );
         }
@@ -4427,11 +5831,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_og_state_size_limit() {
-        // Set a very low state size limit — aggregate state should exceed it
+    async fn checkpoint_drain_bypasses_query_budget_and_emits_each_row_once() {
         let mut graph = test_graph();
-        graph.set_max_state_bytes(Some(1)); // 1 byte limit
+        // This root runs before the source and makes the near-zero budget deterministic.
+        graph
+            .place_operator_node("delay", Box::new(DelayOperator), 1)
+            .unwrap();
+        let source = graph.ensure_source_node("trades");
+        let middle = graph
+            .place_operator_node("middle", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        let output = graph
+            .place_operator_node("output", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(source, middle, 0);
+        graph.add_edge(middle, output, 0);
+        graph.output_map.insert(Arc::from("output"), output);
+        graph.topo_dirty = true;
+        graph.set_query_budget_ns(1);
 
+        let batch = test_batch();
+        let expected_edge_bytes = batch.get_array_memory_size();
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("trades"), vec![batch]);
+
+        let normal = graph.execute_cycle(&sources, i64::MAX, None).await.unwrap();
+        assert_eq!(total_rows(&normal, "output"), 0);
+        let (any_deferred, deferred_sources) = graph.take_cycle_deferrals();
+        assert!(any_deferred);
+        assert!(deferred_sources.contains(&Arc::from("trades")));
+        assert_eq!(
+            graph.checkpoint_pending_input_bytes(),
+            expected_edge_bytes,
+            "normal budget deferral leaves the source row batch on the middle edge"
+        );
+
+        let mut emitted_symbols = Vec::new();
+        for _ in 0..3 {
+            let mut drained = graph
+                .execute_checkpoint_drain_cycle(i64::MAX, None)
+                .await
+                .unwrap();
+            for output_batch in drained.remove("output").unwrap_or_default() {
+                let symbols = output_batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                emitted_symbols
+                    .extend((0..output_batch.num_rows()).map(|row| symbols.value(row).to_string()));
+            }
+            if graph.checkpoint_is_quiescent() {
+                break;
+            }
+        }
+
+        assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
+        assert!(graph.checkpoint_is_quiescent());
+        assert_eq!(emitted_symbols, ["AAPL", "GOOG"]);
+
+        let after_quiescence = graph
+            .execute_checkpoint_drain_cycle(i64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            total_rows(&after_quiescence, "output"),
+            0,
+            "a drained edge is not replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_drain_accounting_includes_deferred_source_ports() {
+        let mut graph = test_graph();
+        graph
+            .place_operator_node("delay", Box::new(DelayOperator), 1)
+            .unwrap();
+        let source_a = graph.ensure_source_node("source_a");
+        let source_b = graph.ensure_source_node("source_b");
+        let output_a = graph
+            .place_operator_node("output_a", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        let output_b = graph
+            .place_operator_node("output_b", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(source_a, output_a, 0);
+        graph.add_edge(source_b, output_b, 0);
+        graph.output_map.insert(Arc::from("output_a"), output_a);
+        graph.output_map.insert(Arc::from("output_b"), output_b);
+        graph.topo_dirty = true;
+        graph.set_query_budget_ns(1);
+
+        let batch = test_batch();
+        let batch_bytes = batch.get_array_memory_size();
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("source_a"), vec![batch.clone()]);
+        sources.insert(Arc::from("source_b"), vec![batch]);
+
+        let normal = graph.execute_cycle(&sources, 10, None).await.unwrap();
+        assert!(normal.is_empty());
+        assert_eq!(graph.input_bufs[source_b][0].len(), 1);
+        assert_eq!(
+            graph.checkpoint_pending_input_bytes(),
+            batch_bytes.saturating_mul(2),
+            "one routed edge and one budget-deferred source port are both accounted"
+        );
+        assert!(!graph.checkpoint_is_quiescent());
+
+        let drained = graph
+            .execute_checkpoint_drain_cycle(10, None)
+            .await
+            .unwrap();
+        assert_eq!(total_rows(&drained, "output_a"), 2);
+        assert_eq!(total_rows(&drained, "output_b"), 2);
+        assert!(graph.checkpoint_is_quiescent());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_drain_quiescence_detects_zero_byte_row_batch() {
+        let mut graph = test_graph();
+        let source = graph.ensure_source_node("empty_schema_source");
+        let output = graph
+            .place_operator_node("output", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(source, output, 0);
+        graph.output_map.insert(Arc::from("output"), output);
+        graph.topo_dirty = true;
+
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(3));
+        let zero_byte_rows =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options)
+                .unwrap();
+        assert_eq!(zero_byte_rows.num_rows(), 3);
+        assert_eq!(zero_byte_rows.get_array_memory_size(), 0);
+        prefill_port(&mut graph, output, 0, vec![zero_byte_rows]);
+
+        assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
+        assert!(!graph.checkpoint_is_quiescent());
+
+        let drained = graph
+            .execute_checkpoint_drain_cycle(10, None)
+            .await
+            .unwrap();
+        assert_eq!(total_rows(&drained, "output"), 3);
+        assert!(graph.checkpoint_is_quiescent());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_drain_does_not_poll_unrelated_aggregate_branch() {
+        let mut graph = test_graph();
+        graph.register_source_schema("trades".to_string(), test_schema());
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
@@ -4439,20 +5988,111 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
-        let mut source = FxHashMap::default();
-        source.insert(Arc::from("trades"), vec![test_batch()]);
+        let mut trades = FxHashMap::default();
+        trades.insert(Arc::from("trades"), vec![test_batch()]);
+        let initial = graph.execute_cycle(&trades, 10, None).await.unwrap();
+        assert_eq!(total_rows(&initial, "agg"), 2);
+        assert!(graph.checkpoint_is_quiescent());
 
-        let result = graph.execute_cycle(&source, i64::MAX, None).await;
-        assert!(result.is_err(), "state size limit should be exceeded");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("state size limit exceeded"),
-            "unexpected error: {err_msg}"
+        let other_source = graph.ensure_source_node("other");
+        let other_output = graph
+            .place_operator_node("other_output", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(other_source, other_output, 0);
+        graph
+            .output_map
+            .insert(Arc::from("other_output"), other_output);
+        graph.topo_dirty = true;
+        prefill_port(&mut graph, other_source, 0, vec![test_batch()]);
+
+        let drained = graph
+            .execute_checkpoint_drain_cycle(10, None)
+            .await
+            .unwrap();
+        assert_eq!(total_rows(&drained, "other_output"), 2);
+        assert_eq!(
+            total_rows(&drained, "agg"),
+            0,
+            "the unchanged aggregate branch must not re-emit during another branch's drain"
         );
+        assert!(graph.checkpoint_is_quiescent());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
+        struct PausedOperator;
+
+        #[async_trait]
+        impl GraphOperator for PausedOperator {
+            async fn process(
+                &mut self,
+                inputs: &[Vec<RecordBatch>],
+                _watermarks: &[i64],
+            ) -> Result<Vec<RecordBatch>, DbError> {
+                assert!(inputs.is_empty(), "paused operator must not accept input");
+                Ok(Vec::new())
+            }
+
+            fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+                Ok(None)
+            }
+
+            fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+                Ok(())
+            }
+
+            fn wants_input(&self) -> bool {
+                false
+            }
+        }
+
+        let mut graph = test_graph();
+        let source = graph.ensure_source_node("trades");
+        let middle = graph
+            .place_operator_node("middle", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        let paused = graph
+            .place_operator_node("paused", Box::new(PausedOperator), 1)
+            .unwrap();
+        graph.add_edge(source, middle, 0);
+        graph.add_edge(middle, paused, 0);
+        graph.topo_dirty = true;
+        prefill_port(&mut graph, middle, 0, vec![test_batch()]);
+        prefill_port(&mut graph, paused, 0, vec![test_batch()]);
+        graph.set_max_input_buf_batches(1);
+
+        let pending_before = graph.checkpoint_pending_input_bytes();
+        assert_eq!(pending_before, 2 * test_batch().get_array_memory_size());
+        assert!(!graph.checkpoint_is_quiescent());
+
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
+        let error = graph
+            .execute_checkpoint_drain_cycle(i64::MAX, None)
+            .await
+            .expect_err("the checkpoint drain must preserve Fail backpressure semantics");
+        assert!(matches!(error, DbError::BackpressureFail(_)));
+        assert_eq!(graph.checkpoint_pending_input_bytes(), pending_before);
+        assert!(!graph.checkpoint_is_quiescent());
+
+        graph.set_backpressure_policy(BackpressurePolicy::Backpressure);
+        graph
+            .execute_checkpoint_drain_cycle(i64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            graph.checkpoint_pending_input_bytes(),
+            pending_before,
+            "a gated/paused drain cycle must not clear pending edge buffers"
+        );
+        assert_eq!(
+            graph.output_watermarks[paused],
+            i64::MIN,
+            "an operator that declined buffered input must not advance its output watermark"
+        );
+        assert!(!graph.checkpoint_is_quiescent());
     }
 
     #[tokio::test]
@@ -4462,7 +6102,6 @@ mod tests {
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
-            None,
             None,
             None,
             None,
@@ -4481,7 +6120,7 @@ mod tests {
             .snapshot_state()
             .unwrap()
             .expect("aggregate should have state");
-        let bytes = OperatorGraph::serialize_checkpoint(&cp).unwrap();
+        let bytes = OperatorGraph::serialize_checkpoint_bounded(&cp, u64::MAX).unwrap();
 
         // Create a new graph with same query and restore
         let mut graph2 = test_graph();
@@ -4492,17 +6131,14 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
-        // Need one cycle to lazy-init state before restore will take effect
-        let _ = graph2.execute_cycle(&source, i64::MAX, None).await.unwrap();
-        let restored = graph2.restore_from_bytes(&bytes).unwrap();
+        let (restored_graph, restored) = graph2.restore_from_bytes(&bytes).unwrap();
+        let mut graph2 = restored_graph;
         assert!(restored > 0, "should restore at least one operator");
 
-        // Next cycle should show accumulated state from both the initial
-        // cycle in graph2 plus the restored state from graph1
+        // New input is applied on top of the authoritative restored image.
         let r = graph2.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "agg"), 2);
     }
@@ -4515,7 +6151,6 @@ mod tests {
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
-            None,
             None,
             None,
             None,
@@ -4553,13 +6188,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "q1".to_string(),
             "SELECT symbol, price FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -4610,7 +6243,6 @@ mod tests {
              TEMPORAL PROBE JOIN market_data m ON (symbol) \
              TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p"
                 .to_string(),
-            None,
             None,
             None,
             None,
@@ -4668,7 +6300,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         // Push some data into the source buffer
@@ -4689,7 +6320,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         // Fill source buffer to 50% of cap
@@ -4706,7 +6336,6 @@ mod tests {
         graph.add_query(
             "q1".to_string(),
             "SELECT * FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -4741,13 +6370,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "downstream".to_string(),
             "SELECT symbol FROM proj".to_string(),
-            None,
             None,
             None,
             None,
@@ -4797,7 +6424,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
@@ -4805,7 +6431,6 @@ mod tests {
         graph.add_query(
             "derived".to_string(),
             "SELECT symbol, price FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -4828,7 +6453,6 @@ mod tests {
         graph.add_query(
             "sink".to_string(),
             "SELECT symbol FROM trades".to_string(),
-            None,
             None,
             None,
             None,
@@ -4909,13 +6533,13 @@ mod tests {
 
         let mut graph = OperatorGraph::new(ctx);
         graph.register_source_schema("trades".to_string(), test_schema());
+        graph.set_reference_tables(["instruments".to_string()].into_iter().collect());
 
         graph.add_query(
             "enriched".to_string(),
             "SELECT t.symbol, t.price, i.company_name \
              FROM trades t LEFT JOIN instruments i ON t.symbol = i.symbol"
                 .to_string(),
-            None,
             None,
             None,
             None,
@@ -4975,7 +6599,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
 
@@ -5002,12 +6625,13 @@ mod tests {
         source.insert(Arc::from("events"), vec![batch.clone()]);
 
         // First cycle seeds the join buffers; second cycle produces matches
-        // when buffered left (type=A) rows see right (type=B) rows.
-        let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        // when buffered left (type=A) rows see right (type=B) rows. Keep the
+        // watermark below the rows so the first cycle does not close their interval.
+        let _ = graph.execute_cycle(&source, 0, None).await.unwrap();
 
         source.clear();
         source.insert(Arc::from("events"), vec![batch]);
-        let results = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        let results = graph.execute_cycle(&source, 0, None).await.unwrap();
 
         let total_rows: usize = results
             .get("joined")
@@ -5041,13 +6665,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "consumer".to_string(),
             "SELECT symbol FROM producer".to_string(),
-            None,
             None,
             None,
             None,
@@ -5125,13 +6747,11 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         graph.add_query(
             "consumer".to_string(),
             "SELECT symbol FROM producer".to_string(),
-            None,
             None,
             None,
             None,

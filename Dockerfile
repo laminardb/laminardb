@@ -120,7 +120,7 @@ COPY <<'EOF' /etc/laminardb/laminardb.toml
 # See https://github.com/laminardb/laminardb for documentation.
 
 [server]
-mode = "embedded"
+mode = "single"
 bind = "0.0.0.0:8080"
 workers = 0
 log_level = "info"

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crossfire::{mpsc, AsyncRx, MAsyncTx, TryRecvError};
 use futures_util::StreamExt;
-use tokio::sync::{mpsc as tokio_mpsc, Notify};
+use tokio::sync::{mpsc as tokio_mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
@@ -41,16 +41,39 @@ struct Incoming {
 }
 
 struct AckRuntime {
-    tx: tokio_mpsc::Sender<jetstream::Message>,
+    tx: Option<tokio_mpsc::Sender<jetstream::Message>>,
     handle: JoinHandle<()>,
 }
 
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
-    rx: AsyncRx<mpsc::Array<Incoming>>,
-    shutdown: Arc<Notify>,
+    rx: Option<AsyncRx<mpsc::Array<Incoming>>>,
+    shutdown: watch::Sender<bool>,
     handle: JoinHandle<()>,
     ack_runtime: Option<AckRuntime>,
+}
+
+impl Drop for AckRuntime {
+    fn drop(&mut self) {
+        self.tx.take();
+        self.handle.abort();
+    }
+}
+
+impl Running {
+    fn request_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // Drop is the final backstop for a cancelled startup/close future. The watch update is
+        // observable even if the reader has not entered `changed()` yet; abort guarantees that a
+        // misbehaving transport future cannot become a detached loop.
+        self.request_shutdown();
+        self.handle.abort();
+    }
 }
 
 impl AckRuntime {
@@ -58,7 +81,10 @@ impl AckRuntime {
         let (backlog, concurrency) = ack_runtime_limits(cfg);
         let (tx, rx) = tokio_mpsc::channel(backlog);
         let handle = tokio::spawn(run_ack_worker(rx, concurrency, metrics));
-        Self { tx, handle }
+        Self {
+            tx: Some(tx),
+            handle,
+        }
     }
 }
 
@@ -124,14 +150,14 @@ impl NatsSource {
             .map_err(|e| classify_create_consumer_error(&e, consumer_name))?;
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let requires_ack = cfg.ack_policy == AckPolicy::Explicit;
         let ack_runtime = requires_ack.then(|| AckRuntime::spawn(cfg, self.metrics.clone()));
 
         let reader = JsReader {
             consumer,
             tx,
-            shutdown: Arc::clone(&shutdown),
+            shutdown: shutdown_rx,
             consecutive_errors: Arc::new(AtomicU32::new(0)),
             data_ready: Arc::clone(&self.data_ready),
             metrics: self.metrics.clone(),
@@ -144,7 +170,7 @@ impl NatsSource {
 
         self.running = Some(Running {
             deserializer,
-            rx,
+            rx: Some(rx),
             shutdown,
             handle,
             ack_runtime,
@@ -175,19 +201,19 @@ impl NatsSource {
         };
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
 
         let reader = CoreReader {
             subscriber,
             tx,
-            shutdown: Arc::clone(&shutdown),
+            shutdown: shutdown_rx,
             data_ready: Arc::clone(&self.data_ready),
         };
         let handle = tokio::spawn(reader.run());
 
         self.running = Some(Running {
             deserializer,
-            rx,
+            rx: Some(rx),
             shutdown,
             handle,
             ack_runtime: None,
@@ -248,7 +274,12 @@ impl SourceConnector for NatsSource {
         let mut reader_disconnected = false;
 
         while payloads.len() < max_records {
-            let incoming = match running.rx.try_recv() {
+            let incoming = match running
+                .rx
+                .as_mut()
+                .expect("running NATS source owns its receiver")
+                .try_recv()
+            {
                 Ok(m) => m,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -307,34 +338,27 @@ impl SourceConnector for NatsSource {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        let Some(running) = self.running.take() else {
+        let Some(mut running) = self.running.take() else {
             return Ok(());
         };
-        let Running {
-            deserializer: _,
-            rx,
-            shutdown,
-            mut handle,
-            ack_runtime,
-        } = running;
         let close_deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
-        shutdown.notify_one();
-        match tokio::time::timeout_at(close_deadline, &mut handle).await {
+        running.request_shutdown();
+        match tokio::time::timeout_at(close_deadline, &mut running.handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => warn!(%error, "NATS reader task failed while closing"),
             Err(_) => {
                 warn!("NATS reader did not stop before close deadline; aborting task");
-                handle.abort();
-                let _ = handle.await;
+                running.handle.abort();
+                let _ = (&mut running.handle).await;
             }
         }
         // Drop unread messages only after the reader has stopped. Their unacked JetStream
         // handles remain eligible for broker redelivery.
-        drop(rx);
+        running.rx.take();
 
-        if let Some(AckRuntime { tx, mut handle }) = ack_runtime {
-            drop(tx);
-            match tokio::time::timeout_at(close_deadline, &mut handle).await {
+        if let Some(mut ack_runtime) = running.ack_runtime.take() {
+            ack_runtime.tx.take();
+            match tokio::time::timeout_at(close_deadline, &mut ack_runtime.handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     warn!(%error, "NATS ack worker failed while closing");
@@ -342,8 +366,8 @@ impl SourceConnector for NatsSource {
                 }
                 Err(_) => {
                     warn!("NATS ack worker did not drain before close deadline; aborting task");
-                    handle.abort();
-                    let _ = handle.await;
+                    ack_runtime.handle.abort();
+                    let _ = (&mut ack_runtime.handle).await;
                     self.metrics.record_abandoned_acks();
                 }
             }
@@ -393,7 +417,11 @@ fn enqueue_acks(
     for message in messages {
         // Increment before publication: a fast worker may complete immediately after try_send.
         metrics.record_ack_enqueued();
-        if runtime.tx.try_send(message).is_err() {
+        if runtime
+            .tx
+            .as_ref()
+            .is_none_or(|tx| tx.try_send(message).is_err())
+        {
             metrics.record_ack_error();
             rejected += 1;
         }
@@ -585,10 +613,14 @@ fn entropy_now() -> u64 {
         .as_nanos() as u64
 }
 
+fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
 struct JsReader {
     consumer: jetstream::consumer::Consumer<pull::Config>,
     tx: MAsyncTx<mpsc::Array<Incoming>>,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
     consecutive_errors: Arc<AtomicU32>,
     data_ready: Arc<Notify>,
     metrics: NatsSourceMetrics,
@@ -604,7 +636,7 @@ impl JsReader {
         let Self {
             mut consumer,
             tx,
-            shutdown,
+            mut shutdown,
             consecutive_errors,
             data_ready,
             metrics,
@@ -618,9 +650,12 @@ impl JsReader {
         let lag_poll_enabled = !lag_poll_interval.is_zero();
 
         loop {
+            if shutdown_requested(&shutdown) {
+                break;
+            }
             let fetch_result = tokio::select! {
                 biased;
-                () = shutdown.notified() => break,
+                _ = shutdown.changed() => break,
                 r = consumer.fetch().max_messages(batch_size).expires(max_wait).messages() => r,
             };
 
@@ -637,7 +672,7 @@ impl JsReader {
                     let backoff = fetch_backoff(errs, entropy_now());
                     tokio::select! {
                         biased;
-                        () = shutdown.notified() => break,
+                        _ = shutdown.changed() => break,
                         () = tokio::time::sleep(backoff) => {}
                     }
                     continue;
@@ -649,7 +684,7 @@ impl JsReader {
             loop {
                 let msg_result = tokio::select! {
                     biased;
-                    () = shutdown.notified() => return,
+                    _ = shutdown.changed() => return,
                     r = stream.next() => match r {
                         Some(r) => r,
                         None => break,
@@ -673,7 +708,12 @@ impl JsReader {
                     stream_seq,
                     ack: requires_ack.then_some(msg),
                 };
-                if tx.send(incoming).await.is_err() {
+                let send_result = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => return,
+                    result = tx.send(incoming) => result,
+                };
+                if send_result.is_err() {
                     debug!("nats reader: downstream channel closed");
                     return;
                 }
@@ -690,7 +730,7 @@ impl JsReader {
                 let backoff = fetch_backoff(errs, entropy_now());
                 tokio::select! {
                     biased;
-                    () = shutdown.notified() => break,
+                    _ = shutdown.changed() => break,
                     () = tokio::time::sleep(backoff) => {}
                 }
             }
@@ -709,7 +749,7 @@ impl JsReader {
 struct CoreReader {
     subscriber: async_nats::Subscriber,
     tx: MAsyncTx<mpsc::Array<Incoming>>,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
     data_ready: Arc<Notify>,
 }
 
@@ -718,14 +758,17 @@ impl CoreReader {
         let Self {
             mut subscriber,
             tx,
-            shutdown,
+            mut shutdown,
             data_ready,
         } = self;
 
         loop {
+            if shutdown_requested(&shutdown) {
+                break;
+            }
             let msg = tokio::select! {
                 biased;
-                () = shutdown.notified() => break,
+                _ = shutdown.changed() => break,
                 m = subscriber.next() => match m {
                     Some(m) => m,
                     None => break,
@@ -737,8 +780,13 @@ impl CoreReader {
                 stream_seq: None,
                 ack: None,
             };
-            if tx.send(incoming).await.is_err() {
-                return;
+            let send_result = tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                result = tx.send(incoming) => result,
+            };
+            if send_result.is_err() {
+                break;
             }
             data_ready.notify_one();
         }
@@ -752,6 +800,27 @@ impl CoreReader {
 mod tests {
     use super::*;
     use arrow_schema::Schema;
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn pending_task(
+        started: tokio::sync::oneshot::Sender<()>,
+        dropped: tokio::sync::oneshot::Sender<()>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped));
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        })
+    }
 
     #[test]
     fn source_contract_is_ephemeral_even_for_jetstream_config() {
@@ -782,10 +851,11 @@ mod tests {
             })
             .is_ok());
         drop(tx);
+        let (shutdown, _) = watch::channel(false);
         src.running = Some(Running {
             deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
-            rx,
-            shutdown: Arc::new(Notify::new()),
+            rx: Some(rx),
+            shutdown,
             handle: tokio::spawn(async {}),
             ack_runtime: None,
         });
@@ -796,6 +866,79 @@ mod tests {
         let error = src.poll_batch(10).await.unwrap_err();
         assert!(matches!(error, ConnectorError::ReadError(_)));
         assert!(error.to_string().contains("reader task terminated"));
+    }
+
+    #[tokio::test]
+    async fn dropping_source_signals_and_aborts_the_owned_reader() {
+        let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        source.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            handle: pending_task(started_tx, dropped_tx),
+            ack_runtime: None,
+        });
+        started_rx.await.expect("reader task started");
+
+        drop(source);
+
+        assert!(*shutdown_rx.borrow(), "drop must publish shutdown");
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("reader must be aborted on drop")
+            .expect("reader drop signal");
+    }
+
+    #[tokio::test]
+    async fn cancelling_close_does_not_detach_reader_or_ack_tasks() {
+        let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+        let (shutdown, _) = watch::channel(false);
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (reader_dropped_tx, reader_dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_handle = pending_task(reader_started_tx, reader_dropped_tx);
+
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<jetstream::Message>(1);
+        let (ack_started_tx, ack_started_rx) = tokio::sync::oneshot::channel();
+        let (ack_dropped_tx, ack_dropped_rx) = tokio::sync::oneshot::channel();
+        let ack_handle = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(ack_dropped_tx));
+            let _ack_rx = ack_rx;
+            let _ = ack_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        source.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            handle: reader_handle,
+            ack_runtime: Some(AckRuntime {
+                tx: Some(ack_tx),
+                handle: ack_handle,
+            }),
+        });
+        reader_started_rx.await.expect("reader task started");
+        ack_started_rx.await.expect("ack task started");
+
+        let close = tokio::spawn(async move { source.close().await });
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished(), "close must be waiting for the reader");
+        close.abort();
+        assert!(close
+            .await
+            .expect_err("close waiter cancelled")
+            .is_cancelled());
+
+        for (name, dropped) in [("reader", reader_dropped_rx), ("ack", ack_dropped_rx)] {
+            tokio::time::timeout(Duration::from_secs(1), dropped)
+                .await
+                .unwrap_or_else(|_| panic!("{name} task remained detached"))
+                .unwrap_or_else(|_| panic!("{name} drop signal closed"));
+        }
     }
 
     #[test]

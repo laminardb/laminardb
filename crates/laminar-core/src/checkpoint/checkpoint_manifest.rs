@@ -22,7 +22,7 @@ pub const DEFAULT_VNODE_COUNT: u16 = 256;
 pub const CHECKPOINT_MANIFEST_VERSION: u32 = 4;
 
 /// Canonical pipeline-identity payload version.
-pub const PIPELINE_IDENTITY_VERSION: u16 = 1;
+pub const PIPELINE_IDENTITY_VERSION: u16 = 2;
 
 /// SHA-256 identity of the logical pipeline and recovery-state ABI.
 ///
@@ -301,7 +301,6 @@ impl CheckpointManifest {
 /// Uses string key-value pairs to support all connector types:
 /// - **Kafka**: `{"events:0": "1234", "events:1": "5678"}`
 /// - **`PostgreSQL` CDC**: `{"lsn": "0/1234ABCD"}`
-/// - **`MySQL` CDC**: `{"gtid_set": "uuid:1-5", "binlog_file": "mysql-bin.000003"}`
 /// - **Delta Lake**: `{"version": "42"}`
 ///
 /// The containing [`CheckpointManifest`] supplies the exact attempt identity;

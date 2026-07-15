@@ -35,9 +35,8 @@ laminar-db
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
 | `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC source (also enables Postgres lookup) |
+| `postgres-cdc` | PostgreSQL CDC source (also builds the standalone `postgres` lookup connector) |
 | `postgres-sink` | PostgreSQL sink |
-| `mysql-cdc` | MySQL CDC source via binlog |
 | `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake sink and source |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
@@ -46,7 +45,7 @@ laminar-db
 | `iceberg` | Apache Iceberg source and sink |
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source (AutoLoader) and sink (rolling files) |
-| `parquet-lookup` | Parquet lookup source for reference tables |
+| `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `otel` | OpenTelemetry OTLP/gRPC source |
 | `cluster` | Pre-production distributed mode (gRPC control plane and gossip/static discovery; at-least-once only). |
 | `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-core) |

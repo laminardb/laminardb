@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use laminar_core::state::{StateBackendConfig, StateBackendDurability};
+use laminar_core::state::{StateBackendConfig, StateBackendDurability, MAX_VNODE_CAPACITY};
 use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
@@ -42,9 +42,12 @@ pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
 }
 
 /// Substitute `${VAR}` and `${VAR:-default}` patterns with environment values.
+/// `$${VAR}` escapes substitution and becomes the literal `${VAR}` used by cluster DDL.
 fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
+    const ESCAPED_OPEN: &str = "\0LAMINAR_ENV_OPEN\0";
+    let escaped = input.replace("$${", ESCAPED_OPEN);
     let mut errors = Vec::new();
-    let result = ENV_VAR_RE.replace_all(input, |caps: &regex::Captures| {
+    let result = ENV_VAR_RE.replace_all(&escaped, |caps: &regex::Captures| {
         let var_name = &caps[1];
         match std::env::var(var_name) {
             Ok(val) => val,
@@ -63,7 +66,7 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
         return Err(ConfigError::MissingEnvVars { vars: errors });
     }
 
-    Ok(result.into_owned())
+    Ok(result.replace(ESCAPED_OPEN, "${"))
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
@@ -115,8 +118,15 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         ));
     }
     if let Some(addr) = &config.server.pgwire_bind {
-        if addr.parse::<std::net::SocketAddr>().is_err() {
-            errors.push(format!("invalid server pgwire_bind address: '{}'", addr));
+        match addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) if !addr.ip().is_loopback() && config.server.pgwire_tls_cert.is_none() => {
+                errors.push(
+                    "non-loopback pgwire_bind requires pgwire_tls_cert + pgwire_tls_key"
+                        .to_string(),
+                );
+            }
+            Ok(_) => {}
+            Err(_) => errors.push(format!("invalid server pgwire_bind address: '{}'", addr)),
         }
     }
     for (user, password) in &config.server.pgwire_users {
@@ -202,6 +212,13 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
+    let vnode_capacity = config.state.vnode_capacity();
+    if !(1..=MAX_VNODE_CAPACITY).contains(&vnode_capacity) {
+        errors.push(format!(
+            "state.vnode_capacity must be between 1 and {MAX_VNODE_CAPACITY}, got {vnode_capacity}"
+        ));
+    }
+
     if config.server.mode == ServerMode::Cluster {
         match config.server.delivery {
             DeliveryGuarantee::BestEffort => errors.push(
@@ -211,8 +228,9 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             ),
             DeliveryGuarantee::AtLeastOnce => {}
             DeliveryGuarantee::ExactlyOnce => errors.push(
-                "[LDB-0013] cluster exactly-once is not admitted: the durable leader lease is \
-                 not atomically bound to checkpoint decisions or sink commits. Use cluster \
+                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
+                 term-fenced, but supported connectors do not yet provide a certified \
+                 term-fenced source handoff and external sink cursor commit. Use cluster \
                  at_least_once, or exactly_once in embedded/single-node mode"
                     .to_string(),
             ),
@@ -292,23 +310,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     if config.checkpoint.max_retained == 0 {
         errors.push("checkpoint.max_retained must be > 0".to_string());
     }
-    if config.checkpoint.max_in_flight_epochs == Some(0) {
-        errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
-    }
-    if let Some(chain_max) = config.checkpoint.delta_chain_max {
-        if config.server.mode != ServerMode::Cluster {
-            errors.push("checkpoint.delta_chain_max is supported only in cluster mode".to_string());
-        }
-        if chain_max == 0
-            || config.checkpoint.max_retained < 2
-            || chain_max as usize >= config.checkpoint.max_retained
-        {
-            errors.push(format!(
-                "checkpoint.delta_chain_max must be > 0 and < max_retained ({})",
-                config.checkpoint.max_retained
-            ));
-        }
-    }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
         errors.push("supervision.window_secs must be > 0".to_string());
@@ -316,60 +317,11 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 
     validate_ai(config, &mut errors);
     validate_cluster_tls(config, &mut errors);
-    validate_state_tier(config, &mut errors);
-
     if !errors.is_empty() {
         return Err(ConfigError::ValidationErrors { errors });
     }
 
     Ok(())
-}
-
-/// Validate the `state_tier_dir` contract once, shared by embedded and cluster startup.
-fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
-    // Group demotion needs the cold tier; enabling it without a tier dir demotes nothing.
-    if config.server.state_tier_group_demotion == Some(true)
-        && config.server.state_tier_dir.is_none()
-    {
-        errors.push(
-            "state_tier_group_demotion is set but state_tier_dir is not — group demotion needs a \
-             cold tier to shed groups to, so without state_tier_dir it does nothing; set \
-             state_tier_dir (with state_memory_budget_bytes) or remove state_tier_group_demotion"
-                .to_string(),
-        );
-    }
-    if config.server.state_tier_dir.is_none() {
-        return;
-    }
-    #[cfg(feature = "state-tier")]
-    {
-        // Cold tier needs a durable backend (survives restart) and a memory budget (drives demotion).
-        if !config
-            .state
-            .durability_scope()
-            .satisfies(StateBackendDurability::NodeDurable)
-        {
-            errors.push(
-                "state_tier_dir requires a durable [state] backend (a local path or \
-                 object store); an in-process backend would lose demoted state on restart"
-                    .to_string(),
-            );
-        }
-        if config.server.state_memory_budget_bytes.is_none() {
-            errors.push(
-                "state_tier_dir requires state_memory_budget_bytes — demotion to the cold \
-                 tier is triggered by the memory budget, so a tier dir without a budget \
-                 would never demote"
-                    .to_string(),
-            );
-        }
-    }
-    #[cfg(not(feature = "state-tier"))]
-    errors.push(
-        "state_tier_dir is set but this binary was built without the 'state-tier' \
-         feature; rebuild with --features state-tier or remove state_tier_dir"
-            .to_string(),
-    );
 }
 
 /// Top-level server configuration deserialized from `laminardb.toml`.
@@ -410,15 +362,16 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerMode {
-    /// Embedded library or standalone single-node hosting.
+    /// Standalone single-node server.
     #[default]
-    Embedded,
+    Single,
     /// Multi-node runtime with discovery, durable leases, and shared state.
     Cluster,
 }
 
 /// `[server]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSection {
     #[serde(default)]
     pub mode: ServerMode,
@@ -436,7 +389,7 @@ pub struct ServerSection {
     /// MD5 auth users. Empty → trust auth (loopback only).
     #[serde(default)]
     pub pgwire_users: std::collections::HashMap<String, Secret>,
-    /// Required true to bind pgwire on a non-loopback address.
+    /// Required true to bind pgwire on a non-loopback address; remote binds also require TLS.
     #[serde(default)]
     pub pgwire_allow_remote: bool,
     /// PEM cert; pair with `pgwire_tls_key` to enable TLS.
@@ -463,17 +416,6 @@ pub struct ServerSection {
     /// CORS allow-list of console origins; `None` falls back to a permissive policy (dev only).
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
-    /// Cap on in-memory operator state (bytes); crossing it backpressures intake. `None` = unlimited.
-    #[serde(default)]
-    pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier; state near the memory budget demotes here
-    /// instead of backpressuring. Requires a `state-tier` build. `None` = no tier.
-    #[serde(default)]
-    pub state_tier_dir: Option<std::path::PathBuf>,
-    /// Demote at GROUP (not vnode) granularity. Requires the cold tier. Unset defaults ON;
-    /// `Some(false)` forces the coarser vnode-granular path. Inert without `state_tier_dir`.
-    #[serde(default)]
-    pub state_tier_group_demotion: Option<bool>,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -486,15 +428,6 @@ fn default_pgwire_max_auth_failures_per_min() -> u32 {
 
 fn default_pgwire_tls_min_version() -> String {
     "1.2".to_string()
-}
-
-impl ServerSection {
-    /// Effective group-demotion setting; unset defaults ON for every topology since the cluster
-    /// group path is kill-9 soaked. Explicit config wins.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn group_demotion(&self) -> bool {
-        self.state_tier_group_demotion.unwrap_or(true)
-    }
 }
 
 impl Default for ServerSection {
@@ -515,9 +448,6 @@ impl Default for ServerSection {
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
             console_cors_allowed_origins: None,
-            state_memory_budget_bytes: None,
-            state_tier_dir: None,
-            state_tier_group_demotion: None,
         }
     }
 }
@@ -596,18 +526,10 @@ pub struct CheckpointSection {
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
-    /// Max epochs between capture and restorable (the upload backlog).
-    /// Default 4; exactly-once pipelines are capped at 1 regardless.
-    #[serde(default)]
-    pub max_in_flight_epochs: Option<u64>,
     /// Cap on captured-state bytes held by in-flight epochs awaiting
     /// upload; admission pauses at the cap. Default 512 MiB.
     #[serde(default)]
     pub max_staged_bytes: Option<u64>,
-    /// Enable incremental delta checkpoints (cluster-only) with this re-base chain bound.
-    /// Default off; must be `< max_retained` so a chain base never ages out of the prune window.
-    #[serde(default)]
-    pub delta_chain_max: Option<u32>,
 }
 
 impl Default for CheckpointSection {
@@ -618,9 +540,7 @@ impl Default for CheckpointSection {
             timeout: default_checkpoint_timeout(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
-            max_in_flight_epochs: None,
             max_staged_bytes: None,
-            delta_chain_max: None,
         }
     }
 }
@@ -641,7 +561,6 @@ impl std::fmt::Debug for CheckpointSection {
                     .map(|k| (k, "[REDACTED]"))
                     .collect::<Vec<_>>(),
             )
-            .field("max_in_flight_epochs", &self.max_in_flight_epochs)
             .field("max_staged_bytes", &self.max_staged_bytes)
             .finish()
     }
@@ -830,7 +749,7 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
-    /// Connector type: "kafka", "postgres_cdc", "mysql_cdc", "generator".
+    /// Connector type: "kafka", "postgres_cdc", "mongodb-cdc", "generator".
     pub connector: String,
     #[serde(default = "default_format")]
     pub format: String,
@@ -863,7 +782,7 @@ pub struct WatermarkConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LookupConfig {
     pub name: String,
-    /// Connector type: "postgres", "mysql", "redis", "csv".
+    /// Connector type: "postgres", "redis", "csv".
     pub connector: String,
     #[serde(default = "default_lookup_strategy")]
     pub strategy: String,
@@ -1021,25 +940,6 @@ fn default_gossip_port() -> u16 {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "state-tier")]
-    #[test]
-    fn group_demotion_defaults_on_with_explicit_opt_out() {
-        let mut s = ServerSection::default();
-        assert_eq!(s.state_tier_group_demotion, None, "unset by default");
-        assert!(
-            s.group_demotion(),
-            "unset defaults ON for every topology (cluster path is kill-9 soaked)"
-        );
-
-        s.state_tier_group_demotion = Some(false);
-        assert!(
-            !s.group_demotion(),
-            "explicit OFF falls back to vnode-granular"
-        );
-        s.state_tier_group_demotion = Some(true);
-        assert!(s.group_demotion(), "explicit ON stays ON");
-    }
-
     const AI_TOML: &str = r#"
 [server]
 
@@ -1162,7 +1062,7 @@ task = "classify"
     fn test_parse_minimal_config() {
         let toml = "[server]\n";
         let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.mode, ServerMode::Embedded);
+        assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(config.server.incremental_emit);
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
@@ -1174,11 +1074,24 @@ task = "classify"
     #[test]
     fn test_server_mode_rejects_unknown_values() {
         let error = toml::from_str::<ServerConfig>("[server]\nmode = \"cluser\"\n")
-            .expect_err("a mistyped runtime mode must not fall back to embedded");
+            .expect_err("a mistyped runtime mode must not fall back to single-node mode");
         let message = error.to_string();
         assert!(message.contains("unknown variant"), "{message}");
         assert!(
-            message.contains("embedded") && message.contains("cluster"),
+            message.contains("single") && message.contains("cluster"),
+            "{message}"
+        );
+        assert!(!message.contains("embedded"), "{message}");
+    }
+
+    #[test]
+    fn test_server_mode_rejects_retired_embedded_value() {
+        let error = toml::from_str::<ServerConfig>("[server]\nmode = \"embedded\"\n")
+            .expect_err("the standalone server mode is named single");
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(
+            message.contains("single") && message.contains("cluster"),
             "{message}"
         );
     }
@@ -1194,10 +1107,10 @@ task = "classify"
     }
 
     #[test]
-    fn test_parse_full_embedded_config() {
+    fn test_parse_full_single_config() {
         let toml = r#"
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:8080"
 
 [state]
@@ -1264,7 +1177,6 @@ delivery = "at_least_once"
 [state]
 backend = "object_store"
 url = "s3://bucket/state"
-instance_id = "star-1"
 vnode_capacity = 256
 
 [checkpoint]
@@ -1371,7 +1283,6 @@ delivery = "exactly_once"
 [state]
 backend = "object_store"
 url = "s3://bucket/state"
-instance_id = "node-1"
 
 [discovery]
 strategy = "static"
@@ -1400,7 +1311,6 @@ delivery = "best_effort"
 [state]
 backend = "object_store"
 url = "s3://bucket/state"
-instance_id = "node-1"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1463,28 +1373,17 @@ url = "s3://bucket/checkpoints"
     }
 
     #[test]
-    fn test_state_memory_budget_parses_and_defaults_off() {
-        let toml = r#"
-[server]
-mode = "embedded"
-state_memory_budget_bytes = 1073741824
-"#;
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.state_memory_budget_bytes, Some(1_073_741_824));
-
-        let config: ServerConfig = toml::from_str("[server]\nmode = \"embedded\"\n").unwrap();
-        assert_eq!(config.server.state_memory_budget_bytes, None);
-        assert_eq!(config.server.state_tier_dir, None);
-    }
-
-    #[test]
-    fn test_state_tier_dir_parses() {
-        let toml = "[server]\nmode = \"embedded\"\nstate_tier_dir = \"/data/tier\"\n";
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(
-            config.server.state_tier_dir,
-            Some(std::path::PathBuf::from("/data/tier"))
-        );
+    fn removed_managed_state_options_are_rejected() {
+        for option in [
+            "state_memory_budget_bytes = 1073741824",
+            "state_tier_dir = \"/data/tier\"",
+            "state_tier_group_demotion = true",
+        ] {
+            let input = format!("[server]\nmode = \"single\"\n{option}\n");
+            let error = toml::from_str::<ServerConfig>(&input)
+                .expect_err("removed managed-state options must not be ignored");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]
@@ -1502,6 +1401,14 @@ state_memory_budget_bytes = 1073741824
         let input = "brokers = \"${LAMINAR_TEST_UNSET_VAR:-localhost:9092}\"";
         let result = substitute_env_vars(input).unwrap();
         assert_eq!(result, "brokers = \"localhost:9092\"");
+    }
+
+    #[test]
+    fn escaped_env_var_is_preserved_for_per_node_connector_resolution() {
+        std::env::remove_var("LAMINAR_TEST_CONNECTOR_PASSWORD");
+        let input = "password = \"$${LAMINAR_TEST_CONNECTOR_PASSWORD}\"";
+        let result = substitute_env_vars(input).unwrap();
+        assert_eq!(result, "password = \"${LAMINAR_TEST_CONNECTOR_PASSWORD}\"");
     }
 
     #[test]
@@ -1650,6 +1557,29 @@ pgwire_max_connections = 0
             ConfigError::ValidationErrors { errors } => {
                 assert!(
                     errors.iter().any(|e| e.contains("must be > 0")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_remote_pgwire_requires_tls() {
+        let toml = r#"
+[server]
+pgwire_bind = "0.0.0.0:5432"
+pgwire_allow_remote = true
+pgwire_users = { alice = "wonderland-key" }
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("non-loopback pgwire_bind requires")),
                     "errors: {errors:?}"
                 );
             }
@@ -1874,11 +1804,30 @@ alice = "wonderland-key"
             models: Default::default(),
         };
 
-        assert_eq!(config.server.mode, ServerMode::Embedded);
+        assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
         assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_validate_vnode_capacity_persisted_range() {
+        for vnode_capacity in [0, MAX_VNODE_CAPACITY + 1] {
+            let toml =
+                format!("[state]\nbackend = \"in_process\"\nvnode_capacity = {vnode_capacity}\n");
+            let config: ServerConfig = toml::from_str(&toml).unwrap();
+            let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err()
+            else {
+                panic!("expected vnode capacity validation error");
+            };
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("state.vnode_capacity must be between")),
+                "errors: {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -1922,14 +1871,20 @@ incremental_emit = false
 
     #[test]
     fn checkpoint_rejects_removed_mechanism_knobs() {
-        let error = toml::from_str::<ServerConfig>(
-            r#"
+        for option in [
+            r#"snapshot_strategy = "incremental""#,
+            "delta_chain_max = 2",
+        ] {
+            let input = format!(
+                r#"
 [checkpoint]
-snapshot_strategy = "incremental"
+{option}
 "#,
-        )
-        .expect_err("removed checkpoint knobs must not be silently ignored");
-        assert!(error.to_string().contains("unknown field"), "{error}");
+            );
+            let error = toml::from_str::<ServerConfig>(&input)
+                .expect_err("removed checkpoint knobs must not be silently ignored");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]

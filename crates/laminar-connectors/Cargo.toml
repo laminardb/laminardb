@@ -23,15 +23,11 @@ tokio-postgres = { version = "0.7", optional = true, features = ["with-chrono-0_
 postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_4"] }
 pgpq = { version = "0.11", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-pgwire-replication = { version = "0.2", optional = true }
-# Client-side TLS for the pooled Postgres lookup source (server-auth; CA via
-# sslrootcert, else webpki roots). aws-lc-rs provider is already in the tree.
+pgwire-replication = { version = "=0.3.2", optional = true }
+# Client-side verified TLS for PostgreSQL CDC, sink, and lookup connections.
 tokio-postgres-rustls = { version = "0.13", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs", "tls12"] }
-rustls-pemfile = { version = "2", optional = true }
-webpki-roots = { version = "0.26", optional = true }
-# MySQL async driver with rustls (no OpenSSL required)
-mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
+webpki-roots = { version = "1", optional = true }
 # MongoDB driver (optional, for mongodb-cdc feature)
 mongodb = { version = "3", optional = true }
 tokio-stream = { workspace = true, optional = true }
@@ -116,7 +112,6 @@ default = [
     "kafka",
     "postgres-cdc",
     "postgres-sink",
-    "mysql-cdc",
     "mongodb-cdc",
     "nats",
     "delta-lake",
@@ -132,10 +127,8 @@ default = [
 ]
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest", "changelog-collapse"]
-postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
-postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util", "changelog-collapse"]
-# mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
-mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
+postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "changelog-collapse"]
 # MongoDB CDC source and sink
 mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow-row", "changelog-collapse"]
 # Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pure Arrow, just
@@ -151,7 +144,7 @@ delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
 # Apache Iceberg
 iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet", "dep:arrow-row"]
-# Parquet file lookup source
+# Parquet schema and codec helpers (not a standalone connector)
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # WebSocket source and sink
 websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
@@ -164,13 +157,7 @@ nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-criterion = { workspace = true }
 wiremock = "0.6"
-
-[[bench]]
-name = "mongodb_throughput"
-harness = false
-required-features = ["mongodb-cdc"]

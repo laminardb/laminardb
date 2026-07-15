@@ -10,8 +10,81 @@ use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{SourceConnector, SourceContract, SourcePosition};
-use laminar_core::state::CheckpointAttempt;
+use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
+use laminar_core::cluster::control::CheckpointAssignmentFence;
+use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Retained source-task command for an exact barrier attempt.
+///
+/// A release is identity-bound so an old checkpoint cannot resume a source held at a newer cut.
+/// `Stop` lets shutdown terminate a held source without briefly reopening data intake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceBarrierSignal {
+    Release(CheckpointAttempt),
+    Stop,
+}
+
+/// Coordinator/callback control for one source's exact barrier command and hold.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SourceBarrierControl {
+    injector: CheckpointBarrierInjector,
+    release_tx: tokio::sync::watch::Sender<Option<SourceBarrierSignal>>,
+}
+
+impl SourceBarrierControl {
+    pub(crate) fn new(
+        injector: CheckpointBarrierInjector,
+        release_tx: tokio::sync::watch::Sender<Option<SourceBarrierSignal>>,
+    ) -> Self {
+        Self {
+            injector,
+            release_tx,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn can_trigger(&self) -> bool {
+        self.injector.can_trigger()
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn trigger(&self, barrier: CheckpointBarrier) -> bool {
+        self.injector.trigger(barrier)
+    }
+
+    /// Remove this exact command if it has not been claimed by the source yet.
+    pub(crate) fn cancel_exact(&self, barrier: CheckpointBarrier) -> bool {
+        self.injector.cancel_exact(barrier)
+    }
+
+    /// Release a source that has already emitted this exact attempt's barrier.
+    pub(crate) fn release_exact(&self, attempt: CheckpointAttempt) {
+        self.release_tx.send_if_modified(|signal| match *signal {
+            Some(SourceBarrierSignal::Stop) => false,
+            Some(SourceBarrierSignal::Release(released)) => match released.relation_to(attempt) {
+                CheckpointAttemptRelation::Older => {
+                    *signal = Some(SourceBarrierSignal::Release(attempt));
+                    true
+                }
+                // Preserve exact/newer releases. Conflicting dimensions are equivocation and
+                // deliberately cannot overwrite or authorize either exact hold.
+                CheckpointAttemptRelation::Exact
+                | CheckpointAttemptRelation::Newer
+                | CheckpointAttemptRelation::Conflict => false,
+            },
+            None => {
+                *signal = Some(SourceBarrierSignal::Release(attempt));
+                true
+            }
+        });
+    }
+
+    pub(crate) fn stop_hold(&self) {
+        let _ = self.release_tx.send(Some(SourceBarrierSignal::Stop));
+    }
+}
 
 /// Why a barrier checkpoint was deliberately skipped, as opposed to
 /// attempted-and-failed.
@@ -73,6 +146,27 @@ pub(crate) enum CheckpointCompletion {
     },
 }
 
+/// Result of servicing authoritative cluster checkpoint control on a follower.
+///
+/// Exact attempt identity lets the coordinator adopt a leader-started checkpoint for state
+/// pressure without mistaking a stale completion for the current baseline.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointControlOutcome {
+    /// No new authoritative checkpoint command was observed.
+    Idle,
+    /// The exact leader-prepared attempt was admitted locally.
+    Started {
+        attempt: CheckpointAttempt,
+        captured: bool,
+    },
+    /// The exact leader-prepared attempt was rejected before it could remain in flight.
+    Failed {
+        attempt: CheckpointAttempt,
+        error: String,
+    },
+}
+
 impl CheckpointCompletion {
     /// Create a completion for a path whose exact attempt is already authoritative.
     #[cfg(any(feature = "cluster", test))]
@@ -89,6 +183,7 @@ impl CheckpointCompletion {
                 epoch: attempt.epoch,
                 duration: std::time::Duration::ZERO,
                 error: None,
+                failure_disposition: None,
             },
             source_checkpoints,
         }
@@ -138,6 +233,9 @@ pub enum CycleError {
     /// Non-deferrable error: `ExactlyOnce` recovers from checkpoint, `AtLeastOnce` drops it.
     #[error("{0}")]
     Fatal(String),
+    /// Shared runtime infrastructure failed; all delivery modes recover from a durable cut.
+    #[error("{0}")]
+    Recovery(String),
     /// `backpressure_policy=Fail` (shutdown already signaled); stop, don't recover.
     #[error("{0}")]
     Halt(String),
@@ -153,6 +251,12 @@ pub struct CycleOutcome {
     pub any_failed: bool,
     /// Names of sources whose domain faulted; the coordinator must not commit their offsets.
     pub failed_sources: FxHashSet<Arc<str>>,
+    /// At least one operator retained work for an exact local retry. This may be set with
+    /// `deferred_sources` empty on a cluster worker processing remote shuffle input.
+    pub any_deferred: bool,
+    /// Names of local sources whose input is retained in the graph. Their staged cursors must
+    /// remain uncommitted until a later cycle consumes all retained work.
+    pub deferred_sources: FxHashSet<Arc<str>>,
 }
 
 impl CycleOutcome {
@@ -163,6 +267,8 @@ impl CycleOutcome {
             results,
             any_failed: false,
             failed_sources: FxHashSet::default(),
+            any_deferred: false,
+            deferred_sources: FxHashSet::default(),
         }
     }
 }
@@ -185,6 +291,13 @@ pub struct SourceRegistration {
 /// Trait exists for test seam; production impl is `ConnectorPipelineCallback`.
 #[trait_variant::make(Send)]
 pub trait PipelineCallback: Send + 'static {
+    /// Install any newly published recovery cut before the coordinator removes
+    /// another source message from its FIFO. The default is a no-op outside a
+    /// clustered source-handoff runtime.
+    fn prepare_source_intake(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Execute a SQL cycle over the accumulated source batches. `Err` is a whole-cycle
     /// failure (all domains, or a backpressure halt); per-domain faults surface in
     /// [`CycleOutcome`] so healthy domains still commit.
@@ -194,12 +307,32 @@ pub trait PipelineCallback: Send + 'static {
         watermark: i64,
     ) -> Result<CycleOutcome, CycleError>;
 
+    /// Drain every graph input that belongs to the frozen checkpoint cut.
+    ///
+    /// Implementations must deliver each drain pass's outputs before returning and must not
+    /// cancel an in-progress graph pass: operators may temporarily own their input buffers across
+    /// an await. The absolute deadline is checked between complete passes.
+    async fn drain_checkpoint_edges_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), CycleError>;
+
     /// Push cycle results to stream subscriptions.
-    fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
+    fn push_to_streams(
+        &self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<(), CycleError> {
+        let _ = results;
+        Ok(())
+    }
 
     /// Update materialized view stores with cycle results.
-    fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+    fn update_mv_stores(
+        &self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<(), CycleError> {
         let _ = results;
+        Ok(())
     }
 
     /// Write cycle results to sinks.
@@ -231,16 +364,19 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
-    /// Take a pending exactly-once sink failure, if any. A poisoned sink epoch aborts its
-    /// transaction; escalating to a pipeline fault (like a cycle error) is the only path that
-    /// replays the dropped rows, so the coordinator polls this and faults for recovery (CP-4).
-    fn take_sink_fault(&mut self) -> Option<String> {
+    /// Take a pending consistency fault from checkpointing or a poisoned sink epoch. The
+    /// coordinator stops intake so recovery can replay from the last committed cut.
+    fn take_pipeline_fault(&mut self) -> Option<String> {
         None
     }
 
     /// Record a checkpoint failure observed by the coordinator. Exactly-once implementations
     /// fault for recovery; weaker guarantees may retain retry-on-next-interval behaviour.
     fn record_checkpoint_failure(&mut self, _checkpoint_id: u64, _reason: &str) {}
+
+    /// Record an invariant failure after the checkpoint itself became durable.
+    fn record_checkpoint_continuation_fault(&mut self, _attempt: CheckpointAttempt, _reason: &str) {
+    }
 
     /// Record a failure before an exact checkpoint attempt could be reserved.
     fn record_checkpoint_admission_failure(&mut self, _reason: &str) {}
@@ -268,24 +404,43 @@ pub trait PipelineCallback: Send + 'static {
         ))
     }
 
+    /// Publish the certified cluster `Prepare` for an exact reserved attempt before any source or
+    /// shuffle barrier is injected. Local runtimes have no cluster control record.
+    fn publish_checkpoint_prepare(
+        &mut self,
+        _attempt: CheckpointAttempt,
+        _attempt_started: std::time::Instant,
+        _assignment_fence: Option<CheckpointAssignmentFence>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        std::future::ready(Ok(()))
+    }
+
     /// Abandon a reserved attempt that cannot reach the durable checkpoint tail.
     /// Transactional sinks must roll back that epoch before the next attempt begins.
     fn abandon_checkpoint_attempt(
         &mut self,
         _attempt: CheckpointAttempt,
         _reason: &str,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        std::future::ready(())
-    }
+        _assignment_fence: Option<CheckpointAssignmentFence>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
-    /// `true` when the cluster is converged enough for the leader to checkpoint; the
-    /// cluster impl reads a locally-published verdict, no gossip. Default `true`
-    /// (single-node). `impl Future` (not `async fn`) preserves the `trait_variant`
-    /// default; `&mut self` keeps the future `Send`.
-    fn assignment_ready_for_checkpoint(
+    /// Cancel an exact follower source-barrier attempt before capture.
+    ///
+    /// Local and leader runtimes use `abandon_checkpoint_attempt`; a follower instead releases
+    /// its exact local reservation and publishes a negative barrier acknowledgement.
+    fn cancel_source_barrier_attempt(
         &mut self,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(true)
+        _attempt: CheckpointAttempt,
+        _reason: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// Capture the exact assignment certificate for a new attempt. `Ok(None)` is a local runtime,
+    /// `Ok(Some(_))` is a certified clustered cut, and `Err` closes admission with a reason.
+    fn checkpoint_assignment_for_admission(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<CheckpointAssignmentFence>, String>> + Send
+    {
+        std::future::ready(Ok(None))
     }
 
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
@@ -293,12 +448,12 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Service a cluster follower announcement observed from the leader.
     ///
-    /// Periodic, connector-request, manual, and shutdown admission belongs exclusively to the
-    /// streaming coordinator. This control seam must never originate a local checkpoint.
+    /// Periodic, manual, and shutdown admission belongs exclusively to the streaming coordinator.
+    /// This control seam must never originate a local checkpoint.
     async fn service_checkpoint_control(
         &mut self,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
-    ) -> Option<u64>;
+    ) -> CheckpointControlOutcome;
 
     /// Called when all sources have aligned on a barrier.
     async fn checkpoint_with_barrier(
@@ -306,6 +461,7 @@ pub trait PipelineCallback: Send + 'static {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
         attempt: CheckpointAttempt,
         attempt_started: std::time::Instant,
+        assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> BarrierOutcome;
 
     /// Record cycle metrics.
@@ -313,9 +469,6 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Count a fatal cycle error that was dropped-and-continued (at-least-once only).
     fn note_cycle_error(&self) {}
-
-    /// Poll table sources for incremental CDC changes.
-    async fn poll_tables(&mut self);
 
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
@@ -325,20 +478,11 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
-    /// `true` while total operator state exceeds the configured memory budget.
-    ///
-    /// When over budget, the coordinator throttles intake to one message per cycle
-    /// and skips idle-watermark ticking so a paused source is not treated as idle.
-    fn state_over_budget(&mut self) -> bool {
+    /// `true` while the runtime must not fold source or shuffle input into operator state.
+    /// Cluster startup and coordinated recovery use this stronger fence; ordinary backpressure
+    /// only pauses source polling.
+    fn intake_paused(&self) -> bool {
         false
-    }
-
-    /// Shed idle vnode slices to the cold tier when state approaches the memory budget.
-    ///
-    /// Runs in the maintenance phase; no-op without a tier or budget. `ready` (not
-    /// `async {}`) preserves the `trait_variant` `impl Future` rewrite.
-    fn maybe_demote_state(&mut self) -> impl std::future::Future<Output = ()> + Send {
-        std::future::ready(())
     }
 
     /// `true` when deferred operators have pending input to drain.
@@ -346,10 +490,21 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
-    /// Forward a committed epoch to external SUBSCRIBE consumers.
-    fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
-        let _ = (epoch, checkpoint_id);
+    /// Reserve each subscription log's cursor at the aligned checkpoint cut.
+    fn reserve_subscription_cut(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
+        Ok(())
     }
+
+    /// Discard an unresolved subscription cut after checkpoint failure.
+    fn abort_subscription_cut(&self, _attempt: CheckpointAttempt) {}
+
+    /// Resolve the exact cut for external SUBSCRIBE consumers after durable commit.
+    fn publish_barrier(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Terminate provisional subscription delivery before shutdown or recovery replay.
+    fn invalidate_subscriptions(&self, _reason: &str) {}
 
     /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
     /// re-initialises cleanly. Every sink must be attempted; the result aggregates failures.
@@ -358,13 +513,7 @@ pub trait PipelineCallback: Send + 'static {
     }
 
     /// Register the local source barrier injectors.
-    fn set_barrier_injectors(
-        &mut self,
-        injectors: Vec<(
-            Arc<str>,
-            laminar_core::checkpoint::CheckpointBarrierInjector,
-        )>,
-    ) {
+    fn set_barrier_injectors(&mut self, injectors: Vec<SourceBarrierControl>) {
         let _ = injectors;
     }
 }

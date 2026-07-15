@@ -110,16 +110,33 @@ pub struct SourceContract {
     pub consistency: SourceConsistency,
     /// Valid runtime placement model.
     pub topology: SourceTopology,
+    exact_delivery_certified: bool,
 }
 
 impl SourceContract {
-    /// Construct a source contract from its two explicit dimensions.
+    /// Construct a source contract from its recovery and placement dimensions.
+    /// Exactly-once certification defaults to fail-closed.
     #[must_use]
     pub const fn new(consistency: SourceConsistency, topology: SourceTopology) -> Self {
         Self {
             consistency,
             topology,
+            exact_delivery_certified: false,
         }
+    }
+
+    /// Mark a built-in connector whose exact-delivery suite is an engine release gate.
+    #[must_use]
+    pub(crate) const fn with_exact_delivery_certification(mut self) -> Self {
+        self.exact_delivery_certified = true;
+        self
+    }
+
+    /// Whether this source is certified for exactly-once delivery.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_exact_delivery_certified(self) -> bool {
+        self.exact_delivery_certified
     }
 
     /// Whether a persisted source position can be replayed after recovery.
@@ -226,22 +243,16 @@ impl SinkContract {
     }
 }
 
-/// SSL connection mode for `PostgreSQL`-compatible connectors.
+/// Connection security for `PostgreSQL` connectors.
 ///
-/// Shared by the `PostgreSQL` sink and `PostgreSQL` CDC source. Variant names
-/// follow the `libpq` `sslmode` parameter.
+/// Production connections either verify both the certificate chain and server
+/// hostname, or explicitly opt into plaintext for trusted test networks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PostgresSslMode {
-    /// No SSL.
+    /// Disable TLS explicitly.
     Disable,
-    /// Try SSL, fall back to unencrypted.
+    /// Require TLS with certificate-chain and hostname verification.
     #[default]
-    Prefer,
-    /// Require SSL.
-    Require,
-    /// Require SSL and verify CA certificate.
-    VerifyCa,
-    /// Require SSL, verify certificate and hostname.
     VerifyFull,
 }
 
@@ -249,9 +260,6 @@ impl std::fmt::Display for PostgresSslMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Disable => write!(f, "disable"),
-            Self::Prefer => write!(f, "prefer"),
-            Self::Require => write!(f, "require"),
-            Self::VerifyCa => write!(f, "verify-ca"),
             Self::VerifyFull => write!(f, "verify-full"),
         }
     }
@@ -261,12 +269,9 @@ impl FromStr for PostgresSslMode {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('-', "_").as_str() {
-            "disable" | "off" => Ok(Self::Disable),
-            "prefer" => Ok(Self::Prefer),
-            "require" => Ok(Self::Require),
-            "verify_ca" | "verifyca" => Ok(Self::VerifyCa),
-            "verify_full" | "verifyfull" => Ok(Self::VerifyFull),
+        match s.to_ascii_lowercase().as_str() {
+            "disable" => Ok(Self::Disable),
+            "verify-full" => Ok(Self::VerifyFull),
             other => Err(format!("unknown SSL mode: '{other}'")),
         }
     }
@@ -356,6 +361,19 @@ impl WriteResult {
     }
 }
 
+/// How the runtime may enforce a deadline around a started connector operation.
+///
+/// This is an internal connector/driver capability, not a deployment option.
+/// Drivers that can become inconsistent when their futures are dropped must
+/// finish the exact started future before the actor processes later work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorCancellationPolicy {
+    /// Dropping an in-flight future leaves the connector valid for recovery or reuse.
+    CancelSafe,
+    /// Once polled, the future must be polled to completion even after its deadline.
+    CompleteStarted,
+}
+
 /// Atomic startup position for a source connector.
 ///
 /// A resume request carries both the durable checkpoint attempt and the
@@ -388,6 +406,96 @@ pub struct SourceStart {
     pub delivery: DeliveryGuarantee,
 }
 
+/// Exact cluster transition and local vnode subset a partitioned source must drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDrainRequest {
+    /// Compact predecessor/target/leader identity.
+    pub round: laminar_core::checkpoint::AssignmentDrainId,
+    /// Strictly ascending local vnodes whose input ownership is being revoked.
+    pub revoking_vnodes: Arc<[u32]>,
+}
+
+impl SourceDrainRequest {
+    /// Construct a canonical source drain request.
+    ///
+    /// # Errors
+    /// Returns an error when the round or vnode set is not canonical.
+    pub fn new(
+        round: laminar_core::checkpoint::AssignmentDrainId,
+        revoking_vnodes: Arc<[u32]>,
+    ) -> Result<Self, ConnectorError> {
+        if !round.is_canonical() {
+            return Err(ConnectorError::ConfigurationError(
+                "source drain round is not canonical".into(),
+            ));
+        }
+        laminar_core::checkpoint::source_drain_vnode_digest(&revoking_vnodes)
+            .map_err(ConnectorError::ConfigurationError)?;
+        Ok(Self {
+            round,
+            revoking_vnodes,
+        })
+    }
+}
+
+/// Connector-owned proof of the concrete external-input cut behind a source receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectorDrainCut {
+    /// Number of concrete external inputs paused by the connector.
+    pub revoked_input_count: u32,
+    /// Canonical digest of those connector-specific input identities.
+    pub revoked_input_digest: [u8; 32],
+    /// Canonical digest of their next-to-read positions at the cut.
+    pub cut_cursor_digest: [u8; 32],
+}
+
+impl ConnectorDrainCut {
+    /// Canonical empty cut used when no external input maps to the revoking vnode set.
+    #[must_use]
+    pub fn empty() -> Self {
+        let empty_inputs = Sha256::digest(b"laminardb-source-drain-inputs-v1\0\0\0\0\0\0\0\0");
+        let empty_cursor = Sha256::digest(b"laminardb-source-drain-cursor-v1\0\0\0\0\0\0\0\0");
+        Self {
+            revoked_input_count: 0,
+            revoked_input_digest: empty_inputs.into(),
+            cut_cursor_digest: empty_cursor.into(),
+        }
+    }
+
+    /// Whether the cut has non-empty canonical digests.
+    #[must_use]
+    pub fn is_canonical(self) -> bool {
+        self.revoked_input_digest != [0; 32] && self.cut_cursor_digest != [0; 32]
+    }
+}
+
+/// Result of starting a non-blocking connector drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDrainStart {
+    /// The connector reader is pausing inputs and will later publish a FIFO cut.
+    Pending,
+    /// No asynchronous reader work is required for this request.
+    Ready(ConnectorDrainCut),
+}
+
+/// Terminal resolution of one exact source drain round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDrainOutcome {
+    /// The target assignment committed; revoked inputs must be unassigned before release.
+    Commit,
+    /// The transition aborted; revoked inputs must rewind to the cut before release.
+    Abort,
+}
+
+/// Exact round resolution delivered to a partitioned source connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceDrainResolution {
+    /// Round being resolved.
+    pub round: laminar_core::checkpoint::AssignmentDrainId,
+    /// Durable transition outcome.
+    pub outcome: SourceDrainOutcome,
+}
+
 /// Trait for source connectors that read data from external systems.
 ///
 /// Source connectors operate in Ring 1 and push data into Ring 0 via
@@ -401,6 +509,14 @@ pub struct SourceStart {
 /// 4. `close()` — clean shutdown
 #[async_trait]
 pub trait SourceConnector: Send {
+    /// Deadline behavior required by the underlying client implementation.
+    ///
+    /// Completion is the conservative default: a new connector must not be
+    /// cancellation-enabled until every lifecycle future has been audited.
+    fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+        ConnectorCancellationPolicy::CompleteStarted
+    }
+
     /// Opens the source and establishes its initial or resumed position as one
     /// indivisible lifecycle transition.
     ///
@@ -409,15 +525,17 @@ pub trait SourceConnector: Send {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError>;
 
     /// `Ok(None)` = no data currently available; runtime retries after a delay.
-    /// A returned batch must contain at most `max_records` rows.
+    /// `max_records` is the normal batching target. A source may exceed it only
+    /// when one upstream atomic replay unit cannot be split without making its
+    /// checkpoint cursor invalid. Such sources must enforce independent hard
+    /// record and byte limits and fail before retained data can grow unbounded.
     ///
-    /// The runtime may cancel this future to service shutdown or control-plane
-    /// work (including an epoch-commit notification in runtimes that multiplex
-    /// it with polling). Implementations must not advance external or
-    /// checkpoint-visible position across an `.await` unless dropping the
-    /// future at that point preserves replay of every not-yet-returned record.
-    /// Stage work privately, then advance the cursor and return without another
-    /// cancellation point.
+    /// The runtime cancels this future only when the connector explicitly
+    /// declares [`ConnectorCancellationPolicy::CancelSafe`]. Such
+    /// implementations must not advance external or checkpoint-visible
+    /// position across an `.await` unless dropping the future at that point
+    /// preserves replay of every not-yet-returned record. Stage work privately,
+    /// then advance the cursor and return without another cancellation point.
     async fn poll_batch(
         &mut self,
         max_records: usize,
@@ -473,6 +591,52 @@ pub trait SourceConnector: Send {
     /// polling and barriers are fenced.
     fn drive_control_plane(&mut self) {}
 
+    /// Whether this concrete source instance has engine vnode ownership installed.
+    ///
+    /// The runtime uses this internal seam to allocate drain controls only for clustered,
+    /// partitioned instances. Embedded and single-node sources retain the allocation-free path.
+    fn vnode_drain_enabled(&self) -> bool {
+        false
+    }
+
+    /// Start an exact partition drain without waiting for the reader FIFO to empty.
+    ///
+    /// Implementations return [`SourceDrainStart::Pending`] and later expose the cut through
+    /// [`Self::take_drain_cut`]. The default accepts only an empty vnode set.
+    fn begin_drain(
+        &mut self,
+        request: &SourceDrainRequest,
+    ) -> Result<SourceDrainStart, ConnectorError> {
+        if request.revoking_vnodes.is_empty() {
+            Ok(SourceDrainStart::Ready(ConnectorDrainCut::empty()))
+        } else {
+            Err(ConnectorError::ConfigurationError(
+                "partitioned source does not implement vnode drain".into(),
+            ))
+        }
+    }
+
+    /// Take the exact external-input cut after its FIFO boundary has been consumed.
+    ///
+    /// Returns `None` while the reader is still pausing or while pre-boundary payloads remain.
+    fn take_drain_cut(
+        &mut self,
+        _round: laminar_core::checkpoint::AssignmentDrainId,
+    ) -> Result<Option<ConnectorDrainCut>, ConnectorError> {
+        Ok(None)
+    }
+
+    /// Resolve an exact drain after target commit or abort.
+    ///
+    /// An abort must rewind any client-delivered but engine-unaccepted records before resuming;
+    /// a commit must unassign revoked inputs before clearing its post-cut filter.
+    async fn finish_drain(
+        &mut self,
+        _resolution: SourceDrainResolution,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
     /// Install the cluster vnode assignment so a partitioned source can bind
     /// its input partitions to vnodes (`partition % vnode_count`) and consume
     /// only those it owns, re-binding when the assignment rotates. Called by
@@ -526,19 +690,6 @@ pub trait SourceConnector: Send {
         Ok(SourceContract::default())
     }
 
-    /// Returns a shared flag that the source sets to `true` when it
-    /// requests an immediate checkpoint.
-    ///
-    /// This is used by sources that detect external state changes requiring
-    /// a checkpoint before proceeding — for example, Kafka consumer group
-    /// rebalance (partition revocation). The pipeline coordinator polls
-    /// this flag each cycle and clears it after triggering the checkpoint.
-    ///
-    /// The default returns `None` (no source-initiated checkpoints).
-    fn checkpoint_requested(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        None
-    }
-
     /// Acknowledge that `epoch` has been durably committed.
     ///
     /// Called after the manifest and exact engine commit decision are durable. Coordinated
@@ -583,6 +734,14 @@ pub trait SourceConnector: Send {
 /// proven pre-decision failure).
 #[async_trait]
 pub trait SinkConnector: Send {
+    /// Deadline behavior required by the underlying client implementation.
+    ///
+    /// Completion is the conservative default: a new connector must not be
+    /// cancellation-enabled until every lifecycle future has been audited.
+    fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+        ConnectorCancellationPolicy::CompleteStarted
+    }
+
     /// Declare durability, placement, and input semantics for this exact
     /// configuration without opening files, sockets, clients, or transactions.
     ///
@@ -600,11 +759,10 @@ pub trait SinkConnector: Send {
     /// Open the connection and prepare to accept writes.
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
 
-    /// Must be cancellation-safe: the runtime wraps this in
-    /// `tokio::time::timeout`. Don't split a `&mut self` mutation
-    /// across an `.await`. In-flight transactional state may remain open
-    /// after cancellation; for checkpoint-committable sinks the caller will
-    /// `rollback_epoch` it after proving no durable commit decision exists.
+    /// Implementations using [`ConnectorCancellationPolicy::CancelSafe`] must
+    /// remain valid when this future is dropped at a deadline. For
+    /// [`ConnectorCancellationPolicy::CompleteStarted`], the runtime keeps
+    /// polling the exact future to completion before processing later work.
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError>;
 
     /// Expected Arrow schema of input batches.
@@ -648,6 +806,13 @@ pub trait SinkConnector: Send {
     /// the `sink.write.timeout.ms` connector property.
     fn suggested_write_timeout(&self) -> std::time::Duration;
 
+    /// Maximum residence time for a non-empty sink buffer before the runtime
+    /// invokes [`flush`](Self::flush). Checkpoint-committable sinks ignore the
+    /// periodic timer and flush only through their checkpoint protocol.
+    fn flush_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+
     /// Must be internally bounded — the sink task's periodic timer
     /// calls this on every tick. Thorough drains belong in `pre_commit`
     /// / coordinated commit / `close`, not here.
@@ -670,6 +835,19 @@ pub trait SinkConnector: Send {
         None
     }
 }
+
+/// Fixed control-plane bound for one connector's coordinated-commit payload.
+///
+/// Connectors must keep prepared metadata at or below this limit before
+/// returning it to the checkpoint runtime. Bulk records belong in the sink's
+/// data plane, referenced by the bounded payload.
+pub const MAX_COORDINATED_COMMIT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fixed aggregate control-plane bound for one designated commit call.
+pub const MAX_COORDINATED_COMMIT_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Fixed participant-marker bound for one designated commit call.
+pub const MAX_COORDINATED_COMMIT_BATCH_ENTRIES: usize = 4_096;
 
 /// Stable external commit namespace for one deployment incarnation of a logical pipeline sink.
 ///
@@ -744,8 +922,17 @@ impl CoordinatedCommitNamespace {
         digest.update([0]);
         digest.update(self.sink_id.as_bytes());
         let digest = digest.finalize();
-        format!("ldb-c2-{digest:x}")
+        format!("ldb-c3-{digest:x}")
     }
+}
+
+/// Exact external commit position and the authority that published it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CoordinatedCommitCursor {
+    /// Highest globally unique checkpoint id atomically reflected by the sink.
+    pub checkpoint_id: u64,
+    /// Monotonic authority token that fenced earlier designated committers.
+    pub fencing_token: u64,
 }
 
 /// One participant's validated prepared marker for one exact attempt.
@@ -764,16 +951,177 @@ pub struct CoordinatedCommitPayload {
 pub struct CoordinatedCommitBatch {
     /// External cursor namespace.
     pub namespace: CoordinatedCommitNamespace,
-    /// Exact external cursor that must precede this batch. A freshly observed
-    /// cursor below this value proves target rollback and must fail closed.
-    pub expected_predecessor: u64,
+    /// Exact external cursor that must precede this batch. The zero cursor names
+    /// an empty target. A different authority at the predecessor checkpoint is
+    /// a conflicting history and must fail closed.
+    pub expected_predecessor: CoordinatedCommitCursor,
+    /// Non-zero authority token that the external commit must persist atomically.
+    pub fencing_token: u64,
     /// Highest exact attempt atomically covered by this commit.
     pub target: laminar_core::state::CheckpointAttempt,
     /// Every sealed participant marker through `target`, including empty ones.
     pub entries: Vec<CoordinatedCommitPayload>,
 }
 
+/// Runtime-owned deadline for one designated external publication.
+///
+/// The deadline is created before the command enters the sink actor, so a
+/// connector sees the actual budget left after queueing rather than a second,
+/// connector-local timeout window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatedCommitContext {
+    deadline: tokio::time::Instant,
+}
+
+impl CoordinatedCommitContext {
+    /// Create a context from the sink actor's absolute end-to-end deadline.
+    #[must_use]
+    pub const fn new(deadline: tokio::time::Instant) -> Self {
+        Self { deadline }
+    }
+
+    /// Absolute monotonic publication deadline.
+    #[must_use]
+    pub const fn deadline(self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// Budget still available at the point the connector starts publication.
+    #[must_use]
+    pub fn remaining(self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+}
+
 impl CoordinatedCommitBatch {
+    /// Collision-resistant identity for one exact ordered publication cut.
+    /// Every variable-length field is length framed so distinct batches cannot
+    /// share an input byte stream before hashing.
+    #[must_use]
+    pub(crate) fn exact_fingerprint(&self) -> [u8; 32] {
+        fn update_length(hasher: &mut Sha256, length: usize) {
+            let source = length.to_be_bytes();
+            let mut encoded = [0_u8; 16];
+            let start = encoded.len() - source.len();
+            encoded[start..].copy_from_slice(&source);
+            hasher.update(encoded);
+        }
+
+        fn update_framed(hasher: &mut Sha256, bytes: &[u8]) {
+            update_length(hasher, bytes.len());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        update_framed(&mut hasher, b"laminardb/coordinated-commit-batch/v1");
+        update_framed(&mut hasher, self.namespace.external_key().as_bytes());
+        hasher.update(self.expected_predecessor.checkpoint_id.to_be_bytes());
+        hasher.update(self.expected_predecessor.fencing_token.to_be_bytes());
+        hasher.update(self.fencing_token.to_be_bytes());
+        hasher.update(self.target.epoch.to_be_bytes());
+        hasher.update(self.target.checkpoint_id.to_be_bytes());
+        update_length(&mut hasher, self.entries.len());
+        for entry in &self.entries {
+            hasher.update(entry.attempt.epoch.to_be_bytes());
+            hasher.update(entry.attempt.checkpoint_id.to_be_bytes());
+            hasher.update(entry.participant_id.to_be_bytes());
+            match &entry.payload {
+                Some(payload) => {
+                    hasher.update([1]);
+                    update_framed(&mut hasher, payload);
+                }
+                None => hasher.update([0]),
+            }
+        }
+        hasher.finalize().into()
+    }
+
+    /// Validate canonical attempt/participant order and all fixed control-plane bounds.
+    /// This check is independent of external state and must run before connector I/O.
+    ///
+    /// # Errors
+    /// Returns a diagnostic when the batch is malformed or exceeds a fixed bound.
+    pub fn validate_shape(&self) -> Result<(), String> {
+        use laminar_core::state::CheckpointAttemptRelation;
+
+        if self.expected_predecessor.checkpoint_id >= self.target.checkpoint_id {
+            return Err(format!(
+                "invalid coordinated batch predecessor {} for target {}",
+                self.expected_predecessor.checkpoint_id, self.target.checkpoint_id
+            ));
+        }
+        if (self.expected_predecessor.checkpoint_id == 0)
+            != (self.expected_predecessor.fencing_token == 0)
+        {
+            return Err(
+                "coordinated batch predecessor must be either an exact non-zero cursor or the zero cursor"
+                    .into(),
+            );
+        }
+        if self.fencing_token == 0 {
+            return Err("coordinated batch fencing token must be non-zero".into());
+        }
+        if self.entries.is_empty() || self.entries.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
+            return Err(format!(
+                "coordinated batch entry count must be in 1..={MAX_COORDINATED_COMMIT_BATCH_ENTRIES}"
+            ));
+        }
+
+        let mut total_payload_bytes = 0usize;
+        let mut previous: Option<&CoordinatedCommitPayload> = None;
+        for entry in &self.entries {
+            if entry.attempt.checkpoint_id <= self.expected_predecessor.checkpoint_id
+                || entry.attempt.checkpoint_id > self.target.checkpoint_id
+            {
+                return Err(
+                    "coordinated batch entries do not cover the predecessor-to-target interval"
+                        .into(),
+                );
+            }
+            if let Some(payload) = &entry.payload {
+                if payload.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+                    return Err(format!(
+                        "coordinated participant payload exceeds the fixed {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} byte limit"
+                    ));
+                }
+                total_payload_bytes = total_payload_bytes
+                    .checked_add(payload.len())
+                    .ok_or_else(|| "coordinated batch payload byte count overflow".to_owned())?;
+                if total_payload_bytes > MAX_COORDINATED_COMMIT_BATCH_BYTES {
+                    return Err(format!(
+                        "coordinated batch payloads exceed the fixed {MAX_COORDINATED_COMMIT_BATCH_BYTES} byte limit"
+                    ));
+                }
+            }
+
+            if let Some(previous) = previous {
+                match entry.attempt.relation_to(previous.attempt) {
+                    CheckpointAttemptRelation::Exact
+                        if entry.participant_id > previous.participant_id => {}
+                    CheckpointAttemptRelation::Newer => {}
+                    CheckpointAttemptRelation::Exact => {
+                        return Err(
+                            "coordinated batch contains a duplicate or out-of-order attempt/participant key"
+                                .into(),
+                        );
+                    }
+                    CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
+                        return Err(
+                            "coordinated batch attempts are not in coherent epoch/checkpoint order"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            previous = Some(entry);
+        }
+        if previous.map(|entry| entry.attempt) != Some(self.target) {
+            return Err("coordinated batch target is not its final exact attempt".into());
+        }
+        Ok(())
+    }
+
     /// Validate a cursor freshly read from the external target against this
     /// exact batch. Advancing overlap is safe only at an attempt named by the
     /// batch; rollback or an unproven gap would skip output.
@@ -782,43 +1130,76 @@ impl CoordinatedCommitBatch {
     ///
     /// Returns a diagnostic when the batch is malformed, the observed cursor
     /// proves rollback, or an overlap cannot be tied to an exact batch entry.
-    pub fn validate_observed_cursor(&self, observed: u64) -> Result<(), String> {
-        if self.expected_predecessor >= self.target.checkpoint_id {
+    pub fn validate_observed_cursor(
+        &self,
+        observed: Option<CoordinatedCommitCursor>,
+    ) -> Result<(), String> {
+        self.validate_shape()?;
+        let Some(observed) = observed else {
+            return if self.expected_predecessor.checkpoint_id == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "external cursor is absent below expected predecessor {}",
+                    self.expected_predecessor.checkpoint_id
+                ))
+            };
+        };
+        if observed.fencing_token == 0 {
+            return Err("external cursor contains a zero fencing token".into());
+        }
+        if observed.fencing_token > self.fencing_token {
             return Err(format!(
-                "invalid coordinated batch predecessor {} for target {}",
-                self.expected_predecessor, self.target.checkpoint_id
+                "external fencing token {} is newer than designated committer token {}",
+                observed.fencing_token, self.fencing_token
             ));
         }
-        if self.entries.is_empty()
-            || !self
-                .entries
-                .iter()
-                .any(|entry| entry.attempt == self.target)
-            || self.entries.iter().any(|entry| {
-                entry.attempt.checkpoint_id <= self.expected_predecessor
-                    || entry.attempt.checkpoint_id > self.target.checkpoint_id
-            })
+        if observed.checkpoint_id >= self.target.checkpoint_id
+            && observed.fencing_token != self.fencing_token
         {
-            return Err(
-                "coordinated batch entries do not cover the predecessor-to-target interval".into(),
-            );
-        }
-        if observed < self.expected_predecessor {
             return Err(format!(
-                "external cursor rolled back from expected predecessor {} to {observed}",
-                self.expected_predecessor
+                "external cursor at or above target {} has fencing token {}, expected {}",
+                self.target.checkpoint_id, observed.fencing_token, self.fencing_token
             ));
         }
-        if observed < self.target.checkpoint_id
+        if observed.checkpoint_id < self.expected_predecessor.checkpoint_id {
+            return Err(format!(
+                "external cursor rolled back from expected predecessor {} to {}",
+                self.expected_predecessor.checkpoint_id, observed.checkpoint_id
+            ));
+        }
+        if observed.checkpoint_id == self.expected_predecessor.checkpoint_id
             && observed != self.expected_predecessor
+        {
+            return Err(format!(
+                "external cursor checkpoint {} has fencing token {}, expected predecessor token {}",
+                observed.checkpoint_id,
+                observed.fencing_token,
+                self.expected_predecessor.fencing_token
+            ));
+        }
+        if observed.checkpoint_id > self.expected_predecessor.checkpoint_id
+            && observed.fencing_token < self.expected_predecessor.fencing_token
+        {
+            return Err(format!(
+                "external cursor advanced past predecessor {} while fencing token regressed from {} to {}",
+                self.expected_predecessor.checkpoint_id,
+                self.expected_predecessor.fencing_token,
+                observed.fencing_token
+            ));
+        }
+        if observed.checkpoint_id < self.target.checkpoint_id
+            && observed.checkpoint_id != self.expected_predecessor.checkpoint_id
             && !self
                 .entries
                 .iter()
-                .any(|entry| entry.attempt.checkpoint_id == observed)
+                .any(|entry| entry.attempt.checkpoint_id == observed.checkpoint_id)
         {
             return Err(format!(
-                "external cursor {observed} is not an exact attempt in batch {}..={}",
-                self.expected_predecessor, self.target.checkpoint_id
+                "external cursor {} is not an exact attempt in batch {}..={}",
+                observed.checkpoint_id,
+                self.expected_predecessor.checkpoint_id,
+                self.target.checkpoint_id
             ));
         }
         Ok(())
@@ -836,15 +1217,19 @@ pub trait CoordinatedCommitter: Send + Sync {
     /// Atomically commit the validated participant markers and advance the
     /// namespaced external cursor to the batch's exact target. Empty markers
     /// still advance the cursor.
-    async fn commit_aggregated(&self, batch: CoordinatedCommitBatch) -> Result<(), ConnectorError>;
+    async fn commit_aggregated(
+        &self,
+        batch: CoordinatedCommitBatch,
+        context: CoordinatedCommitContext,
+    ) -> Result<(), ConnectorError>;
 
-    /// Highest globally unique checkpoint id already committed in `namespace`.
+    /// Highest checkpoint and fencing authority committed in `namespace`.
     /// A metadata read error must be returned, never converted to an absent
     /// cursor, because that could duplicate a previously committed batch.
-    async fn committed_checkpoint_id(
+    async fn committed_cursor(
         &self,
         namespace: &CoordinatedCommitNamespace,
-    ) -> Result<Option<u64>, ConnectorError>;
+    ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError>;
 }
 
 #[cfg(test)]
@@ -895,12 +1280,26 @@ mod tests {
     }
 
     #[test]
+    fn source_drain_request_requires_sorted_unique_vnodes() {
+        let round = laminar_core::checkpoint::AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        };
+        assert!(SourceDrainRequest::new(round, Arc::from([1_u32, 4, 9])).is_ok());
+        assert!(SourceDrainRequest::new(round, Arc::from([4_u32, 1])).is_err());
+        assert!(SourceDrainRequest::new(round, Arc::from([1_u32, 1])).is_err());
+        assert!(ConnectorDrainCut::empty().is_canonical());
+    }
+
+    #[test]
     fn source_contract_defaults_fail_closed() {
         let contract = SourceContract::default();
         assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
         assert_eq!(contract.topology, SourceTopology::Singleton);
         assert!(!contract.supports_replay());
         assert!(!contract.requires_checkpointing());
+        assert!(!contract.is_exact_delivery_certified());
     }
 
     #[test]
@@ -946,7 +1345,7 @@ mod tests {
         assert_eq!(first.external_key(), same.external_key());
         assert_ne!(first.external_key(), other.external_key());
         assert_ne!(first.external_key(), other_deployment.external_key());
-        assert_eq!(first.external_key().len(), "ldb-c2-".len() + 64);
+        assert_eq!(first.external_key().len(), "ldb-c3-".len() + 64);
         assert!(first
             .external_key()
             .bytes()
@@ -977,6 +1376,68 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_batch_fingerprint_covers_the_exact_ordered_cut() {
+        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+        let namespace = CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+        )
+        .unwrap();
+        let attempt = CheckpointAttempt::new(8, 108);
+        let batch = CoordinatedCommitBatch {
+            namespace,
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 107,
+                fencing_token: 3,
+            },
+            fencing_token: 4,
+            target: attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt,
+                participant_id: 7,
+                payload: None,
+            }],
+        };
+        let expected = batch.exact_fingerprint();
+        assert_eq!(expected, batch.clone().exact_fingerprint());
+
+        let mut variants = Vec::new();
+        let mut variant = batch.clone();
+        variant.namespace = CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "018f0000-0000-7000-8000-000000000001",
+            "audit",
+        )
+        .unwrap();
+        variants.push(variant);
+        let mut variant = batch.clone();
+        variant.expected_predecessor.checkpoint_id -= 1;
+        variants.push(variant);
+        let mut variant = batch.clone();
+        variant.fencing_token += 1;
+        variants.push(variant);
+        let mut variant = batch.clone();
+        variant.target.epoch += 1;
+        variants.push(variant);
+        let mut variant = batch.clone();
+        variant.entries[0].attempt.checkpoint_id += 1;
+        variants.push(variant);
+        let mut variant = batch.clone();
+        variant.entries[0].participant_id += 1;
+        variants.push(variant);
+        let mut variant = batch;
+        variant.entries[0].payload = Some(Vec::new());
+        variants.push(variant);
+
+        assert!(variants
+            .into_iter()
+            .all(|variant| variant.exact_fingerprint() != expected));
+    }
+
+    #[test]
     fn coordinated_batch_rejects_cursor_rollback_and_unproven_overlap() {
         use laminar_core::state::CheckpointAttempt;
         use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
@@ -990,7 +1451,11 @@ mod tests {
                 "orders",
             )
             .unwrap(),
-            expected_predecessor: 107,
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 107,
+                fencing_token: 3,
+            },
+            fencing_token: 4,
             target,
             entries: vec![
                 CoordinatedCommitPayload {
@@ -1006,11 +1471,110 @@ mod tests {
             ],
         };
 
-        assert!(batch.validate_observed_cursor(106).is_err());
-        assert!(batch.validate_observed_cursor(109).is_err());
-        assert!(batch.validate_observed_cursor(107).is_ok());
-        assert!(batch.validate_observed_cursor(108).is_ok());
-        assert!(batch.validate_observed_cursor(110).is_ok());
+        let cursor = |checkpoint_id, fencing_token| {
+            Some(CoordinatedCommitCursor {
+                checkpoint_id,
+                fencing_token,
+            })
+        };
+        assert!(batch.validate_observed_cursor(cursor(106, 3)).is_err());
+        assert!(batch.validate_observed_cursor(cursor(109, 3)).is_err());
+        assert!(batch.validate_observed_cursor(cursor(107, 2)).is_err());
+        assert!(batch.validate_observed_cursor(cursor(107, 3)).is_ok());
+        assert!(batch.validate_observed_cursor(cursor(108, 3)).is_ok());
+        assert!(batch.validate_observed_cursor(cursor(110, 4)).is_ok());
+        assert!(batch.validate_observed_cursor(cursor(110, 3)).is_err());
+        assert!(batch.validate_observed_cursor(cursor(108, 5)).is_err());
+    }
+
+    #[test]
+    fn coordinated_batch_requires_unique_canonical_attempt_participants() {
+        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+        let namespace = CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+        )
+        .unwrap();
+        let target = CheckpointAttempt::new(2, 102);
+        let batch = |entries| CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 100,
+                fencing_token: 1,
+            },
+            fencing_token: 2,
+            target,
+            entries,
+        };
+        let payload = |attempt, participant_id| CoordinatedCommitPayload {
+            attempt,
+            participant_id,
+            payload: None,
+        };
+
+        let duplicate = batch(vec![payload(target, 0), payload(target, 0)]);
+        assert!(duplicate
+            .validate_shape()
+            .unwrap_err()
+            .contains("duplicate"));
+
+        let out_of_order = batch(vec![payload(target, 1), payload(target, 0)]);
+        assert!(out_of_order
+            .validate_shape()
+            .unwrap_err()
+            .contains("out-of-order"));
+
+        let conflicting = batch(vec![
+            payload(CheckpointAttempt::new(3, 101), 0),
+            payload(target, 0),
+        ]);
+        assert!(conflicting
+            .validate_shape()
+            .unwrap_err()
+            .contains("coherent"));
+    }
+
+    #[test]
+    fn coordinated_batch_entry_limit_accepts_max_and_rejects_max_plus_one() {
+        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+        let namespace = CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+        )
+        .unwrap();
+        let target = CheckpointAttempt::new(1, 101);
+        let make_batch = |count: usize| CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            fencing_token: 1,
+            target,
+            entries: (0..count)
+                .map(|participant_id| CoordinatedCommitPayload {
+                    attempt: target,
+                    participant_id: participant_id as u64,
+                    payload: None,
+                })
+                .collect(),
+        };
+
+        assert!(make_batch(MAX_COORDINATED_COMMIT_BATCH_ENTRIES - 1)
+            .validate_shape()
+            .is_ok());
+        assert!(make_batch(MAX_COORDINATED_COMMIT_BATCH_ENTRIES)
+            .validate_shape()
+            .is_ok());
+        assert!(make_batch(MAX_COORDINATED_COMMIT_BATCH_ENTRIES + 1)
+            .validate_shape()
+            .is_err());
     }
 
     struct DefaultPreCommitSink {
@@ -1048,14 +1612,15 @@ mod tests {
         async fn commit_aggregated(
             &self,
             _batch: CoordinatedCommitBatch,
+            _context: CoordinatedCommitContext,
         ) -> Result<(), ConnectorError> {
             Ok(())
         }
 
-        async fn committed_checkpoint_id(
+        async fn committed_cursor(
             &self,
             _namespace: &CoordinatedCommitNamespace,
-        ) -> Result<Option<u64>, ConnectorError> {
+        ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
             Ok(None)
         }
     }

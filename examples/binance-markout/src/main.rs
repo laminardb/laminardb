@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.execute(include_str!("../pipeline.sql")).await?;
     db.start().await?;
 
-    let mut markouts_sub: TypedSubscription<MarkoutProbe> = db.subscribe("markouts_long")?;
+    let mut markouts_sub: TypedSubscription<MarkoutProbe> = db.subscribe("markouts_long").await?;
 
     println!("binance-markout running — connecting to Binance USDT-M futures");
     println!("  trades: wss://fstream.binance.com/ws/btcusdt@trade");
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = ticker.tick() => {
                 // Drain the direct Rust subscription to count markouts_long rows.
-                while let Some(rows) = markouts_sub.poll() {
+                while let Some(rows) = markouts_sub.poll()? {
                     markouts_seen += rows.len() as u64;
                 }
                 let m = db.metrics();

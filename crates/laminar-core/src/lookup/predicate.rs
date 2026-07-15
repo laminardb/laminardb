@@ -212,7 +212,7 @@ pub fn split_predicates(
 
 /// Convert a predicate to a SQL WHERE clause fragment.
 ///
-/// This is used by SQL-based lookup sources (Postgres/MySQL) to
+/// This is used by SQL-based lookup sources such as PostgreSQL to
 /// construct parameterized queries.
 ///
 /// # Returns

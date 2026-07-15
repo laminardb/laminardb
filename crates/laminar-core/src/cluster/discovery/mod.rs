@@ -111,8 +111,6 @@ pub struct NodeMetadata {
     pub failure_domain: Option<String>,
     /// Arbitrary key-value tags.
     pub tags: HashMap<String, String>,
-    /// Partitions currently owned by this node.
-    pub owned_partitions: Vec<u32>,
     /// `LaminarDB` version string.
     pub version: String,
 }
@@ -124,7 +122,6 @@ impl Default for NodeMetadata {
             memory_bytes: 0,
             failure_domain: None,
             tags: HashMap::new(),
-            owned_partitions: Vec::new(),
             version: String::new(),
         }
     }
@@ -316,7 +313,6 @@ mod tests {
         assert_eq!(meta.memory_bytes, 0);
         assert!(meta.failure_domain.is_none());
         assert!(meta.tags.is_empty());
-        assert!(meta.owned_partitions.is_empty());
     }
 
     #[test]

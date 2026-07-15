@@ -5,6 +5,8 @@
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
 
+/// Feature-neutral catalog identity types.
+pub mod catalog;
 /// Z-set changelog `__weight` column name, shared between the MV producer and
 /// upsert-sink consumers.
 pub mod changelog;
@@ -29,8 +31,8 @@ pub mod state;
 pub mod streaming;
 pub mod time;
 
-/// Distributed cluster coordination. Unstable: gated behind `cluster`.
-#[cfg(feature = "cluster")]
+/// Distributed cluster coordination. Runtime services are gated behind `cluster`; the control
+/// namespace retains feature-neutral checkpoint value types in every build.
 pub mod cluster;
 
 /// Per-epoch checkpoint commit marker store. Used by the checkpoint

@@ -193,8 +193,7 @@
       "targets": [
         { "expr": "rate(laminardb_sink_write_failures_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "write failures/s" },
         { "expr": "rate(laminardb_sink_write_timeouts_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "write timeouts/s" },
-        { "expr": "rate(laminardb_sink_task_channel_closed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "channel closed/s" },
-        { "expr": "rate(laminardb_remote_subscription_batches_dropped_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "remote sub queue drops/s" }
+        { "expr": "rate(laminardb_sink_task_channel_closed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "channel closed/s" }
       ],
       "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
     },
@@ -341,34 +340,6 @@
             { "expr": "laminardb_delta_sink_compaction_files_removed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "files removed" }
           ],
           "fieldConfig": { "defaults": { "unit": "short" } }
-        }
-      ]
-    },
-    {
-      "title": "MySQL CDC",
-      "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
-      "collapsed": true,
-      "panels": [
-        {
-          "title": "Binlog Position",
-          "type": "stat",
-          "datasource": "${DS_PROMETHEUS}",
-          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 37 },
-          "targets": [{ "expr": "laminardb_mysql_cdc_binlog_position{instance=~\"$instance\",pipeline=~\"$pipeline\"}" }],
-          "fieldConfig": { "defaults": { "unit": "short" } }
-        },
-        {
-          "title": "CDC Events/sec by Type",
-          "type": "timeseries",
-          "datasource": "${DS_PROMETHEUS}",
-          "gridPos": { "h": 8, "w": 18, "x": 6, "y": 37 },
-          "targets": [
-            { "expr": "rate(laminardb_mysql_cdc_inserts_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "inserts/s" },
-            { "expr": "rate(laminardb_mysql_cdc_updates_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "updates/s" },
-            { "expr": "rate(laminardb_mysql_cdc_deletes_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "deletes/s" }
-          ],
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
         }
       ]
     },

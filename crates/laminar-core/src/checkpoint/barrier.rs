@@ -230,6 +230,47 @@ impl CheckpointBarrierInjector {
         self.state.store(STATE_PENDING, Ordering::Release);
         true
     }
+
+    /// Cancel the pending barrier with this exact checkpoint identity.
+    ///
+    /// Returns `true` only when this call claims and cancels a pending command
+    /// whose checkpoint ID and epoch both match. A stale identity, an idle
+    /// injector, or a barrier already claimed by a poller returns `false`.
+    /// Mismatched pending commands remain available to pollers unchanged.
+    #[must_use = "a false result means the exact pending barrier was not cancelled"]
+    pub fn cancel_exact(&self, barrier: CheckpointBarrier) -> bool {
+        if barrier.checkpoint_id == 0
+            || barrier.epoch == 0
+            || self.state.load(Ordering::Acquire) != STATE_PENDING
+            || self.checkpoint_id.load(Ordering::Relaxed) != barrier.checkpoint_id
+            || self.epoch.load(Ordering::Relaxed) != barrier.epoch
+        {
+            return false;
+        }
+
+        if self
+            .state
+            .compare_exchange(
+                STATE_PENDING,
+                STATE_CONSUMING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        // Revalidate under exclusive ownership: a poll and a subsequent
+        // trigger may have changed the payload after the optimistic check.
+        let matches = self.checkpoint_id.load(Ordering::Relaxed) == barrier.checkpoint_id
+            && self.epoch.load(Ordering::Relaxed) == barrier.epoch;
+        self.state.store(
+            if matches { STATE_IDLE } else { STATE_PENDING },
+            Ordering::Release,
+        );
+        matches
+    }
 }
 
 impl Default for CheckpointBarrierInjector {
@@ -447,6 +488,82 @@ mod tests {
 
         assert_eq!(handle.poll(), Some(first));
         assert!(injector.trigger(second));
+    }
+
+    #[test]
+    fn test_cancel_exact_removes_matching_pending_barrier() {
+        let injector = CheckpointBarrierInjector::new();
+        let handle = injector.handle();
+        let pending = CheckpointBarrier::full_snapshot(41, 17);
+
+        assert!(injector.trigger(pending));
+        assert!(injector.cancel_exact(pending));
+        assert!(handle.poll().is_none());
+        assert!(injector.can_trigger());
+    }
+
+    #[test]
+    fn test_cancel_exact_preserves_mismatched_pending_barrier() {
+        let injector = CheckpointBarrierInjector::new();
+        let handle = injector.handle();
+        let pending = CheckpointBarrier::full_snapshot(41, 17);
+
+        assert!(injector.trigger(pending));
+        assert!(!injector.cancel_exact(CheckpointBarrier {
+            epoch: pending.epoch + 1,
+            ..pending
+        }));
+        assert!(!injector.cancel_exact(CheckpointBarrier {
+            checkpoint_id: pending.checkpoint_id + 1,
+            ..pending
+        }));
+        assert_eq!(handle.poll(), Some(pending));
+    }
+
+    #[test]
+    fn test_cancel_exact_after_poll_does_not_claim_completed_barrier() {
+        let injector = CheckpointBarrierInjector::new();
+        let handle = injector.handle();
+        let pending = CheckpointBarrier::new(41, 17);
+
+        assert!(injector.trigger(pending));
+        assert_eq!(handle.poll(), Some(pending));
+        assert!(!injector.cancel_exact(pending));
+        assert!(injector.can_trigger());
+    }
+
+    #[test]
+    fn test_cancel_exact_and_poll_have_exactly_one_winner() {
+        let injector = Arc::new(CheckpointBarrierInjector::new());
+        let handle = injector.handle();
+        let pending = CheckpointBarrier::new(41, 17);
+        assert!(injector.trigger(pending));
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let cancel_thread = {
+            let injector = Arc::clone(&injector);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                injector.cancel_exact(pending)
+            })
+        };
+        let poll_thread = {
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                handle.poll()
+            })
+        };
+
+        start.wait();
+        let cancelled = cancel_thread.join().unwrap();
+        let polled = poll_thread.join().unwrap();
+        assert_eq!(cancelled, polled.is_none());
+        if !cancelled {
+            assert_eq!(polled, Some(pending));
+        }
+        assert!(injector.can_trigger());
     }
 
     #[test]

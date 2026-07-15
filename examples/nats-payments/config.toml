@@ -6,7 +6,7 @@
 # design fixture until the sources move to a certified replayable protocol.
 #
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:8080"
 
 [state]

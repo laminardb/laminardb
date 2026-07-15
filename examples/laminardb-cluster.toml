@@ -18,7 +18,6 @@ workers = 8
 [state]
 backend = "object_store"
 url = "s3://laminardb-checkpoints/prod-state"
-instance_id = "star-1"
 vnode_capacity = 256
 
 [checkpoint]

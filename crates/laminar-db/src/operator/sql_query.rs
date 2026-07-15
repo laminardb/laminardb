@@ -8,6 +8,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "cluster")]
+use std::collections::VecDeque;
+
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::TaskContext;
@@ -18,22 +21,15 @@ use laminar_core::shuffle::ShuffleMessage;
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
 };
+#[cfg(feature = "cluster")]
+use crate::aggregate_state::{merge_serialized_agg_cps, validate_agg_checkpoint_slice};
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
-#[cfg(feature = "state-tier")]
+#[cfg(feature = "cluster")]
 use bytes::Bytes;
-#[cfg(feature = "state-tier")]
-use rustc_hash::{FxHashMap, FxHashSet};
-#[cfg(feature = "state-tier")]
-use std::collections::VecDeque;
-// Reply receivers are stored across cycles in `AggPromotion.inflight`, so they
-// must be `Sync` (this operator's `process` future holds `&self` across an
-// await); crossfire's `RxOneshot` is `!Sync`, so replies use tokio oneshot.
-#[cfg(feature = "state-tier")]
-use tokio::sync::oneshot;
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -65,253 +61,15 @@ impl std::fmt::Debug for ClusterShuffleConfig {
     }
 }
 
-/// Async-decoupled promotion of cold-tier aggregate state.
-///
-/// Rows touching a demoted vnode are deferred at their ingest watermark and
-/// replayed once the fetch resolves. The watermark hold prevents late-data drops.
-#[cfg(feature = "state-tier")]
-struct AggPromotion {
-    op_name: Arc<str>,
-    tier: crate::state_tier::TierTx,
-    deferred: VecDeque<(i64, RecordBatch)>,
-    inflight: FxHashMap<u32, oneshot::Receiver<Result<Option<Bytes>, DbError>>>,
-    // In-flight per-group fetches keyed by the group's row key, carrying the tier coordinates
-    // `(vnode, group_key_bytes)` so a miss can be re-issued.
-    #[allow(clippy::type_complexity)]
-    inflight_groups: FxHashMap<
-        arrow::row::OwnedRow,
-        (
-            u32,
-            Vec<u8>,
-            oneshot::Receiver<Result<Option<Bytes>, DbError>>,
-        ),
-    >,
-    // Consecutive `Ok(None)` fetch replies per key — a demoted slice/group the tier cannot produce
-    // (corruption / out-of-order drop). Without a bound the touching batch re-issues forever and the
-    // operator wedges silently behind its watermark hold; past `MAX_PROMOTION_FETCH_MISSES` we fail
-    // loud instead. Reset on a successful promote.
-    vnode_fetch_misses: FxHashMap<u32, u32>,
-    group_fetch_misses: FxHashMap<arrow::row::OwnedRow, u32>,
-    max_deferred_rows: usize,
-    // `Closed`/disconnected reply = the tier worker died; escalate at once rather than wedge
-    // (a miss just re-fetches).
-    worker_dead: bool,
-    // Drops of just-promoted slices/groups, deferred until no checkpoint is in flight (a drop
-    // mid-tail would race a staged cold-group fetch).
-    pending_slice_drops: Vec<u32>,
-    pending_group_drops: Vec<(u32, Vec<u8>)>,
-}
-
-#[cfg(feature = "state-tier")]
-const MAX_DEFERRED_PROMOTION_ROWS: usize = 8192;
-
-/// A demoted slice/group genuinely absent from the tier stays deferred and re-fetched each cycle.
-/// After this many consecutive misses for one key, escalate to a hard error rather than wedge.
-#[cfg(feature = "state-tier")]
-const MAX_PROMOTION_FETCH_MISSES: u32 = 32;
-
-#[cfg(feature = "state-tier")]
-impl AggPromotion {
-    fn new(op_name: Arc<str>, tier: crate::state_tier::TierTx) -> Self {
-        Self {
-            op_name,
-            tier,
-            deferred: VecDeque::new(),
-            inflight: FxHashMap::default(),
-            inflight_groups: FxHashMap::default(),
-            vnode_fetch_misses: FxHashMap::default(),
-            group_fetch_misses: FxHashMap::default(),
-            max_deferred_rows: MAX_DEFERRED_PROMOTION_ROWS,
-            worker_dead: false,
-            pending_slice_drops: Vec::new(),
-            pending_group_drops: Vec::new(),
-        }
-    }
-
-    fn worker_dead(&self) -> bool {
-        self.worker_dead
-    }
-
-    /// Issue the queued promotion drops; called only with no checkpoint in flight so a drop can't
-    /// race a staged cold-group fetch.
-    fn release_drops(&mut self) {
-        for vnode in std::mem::take(&mut self.pending_slice_drops) {
-            self.drop_slice(vnode);
-        }
-        for (vnode, group) in std::mem::take(&mut self.pending_group_drops) {
-            self.drop_group(vnode, group);
-        }
-    }
-
-    /// Record a `None` fetch reply for `vnode`; returns the new consecutive-miss streak.
-    fn note_vnode_miss(&mut self, vnode: u32) -> u32 {
-        let c = self.vnode_fetch_misses.entry(vnode).or_insert(0);
-        *c += 1;
-        *c
-    }
-
-    fn clear_vnode_miss(&mut self, vnode: u32) {
-        self.vnode_fetch_misses.remove(&vnode);
-    }
-
-    /// Record a `None` fetch reply for a group; returns the new consecutive-miss streak.
-    fn note_group_miss(&mut self, key: &arrow::row::OwnedRow) -> u32 {
-        let c = self.group_fetch_misses.entry(key.clone()).or_insert(0);
-        *c += 1;
-        *c
-    }
-
-    fn clear_group_miss(&mut self, key: &arrow::row::OwnedRow) {
-        self.group_fetch_misses.remove(key);
-    }
-
-    fn drain_ready(&mut self) -> Vec<(u32, Option<Bytes>)> {
-        let mut ready = Vec::new();
-        let mut still: FxHashMap<u32, oneshot::Receiver<Result<Option<Bytes>, DbError>>> =
-            FxHashMap::default();
-        for (vnode, mut rx) in self.inflight.drain() {
-            match rx.try_recv() {
-                Ok(Ok(slice)) => ready.push((vnode, slice)),
-                Ok(Err(e)) => tracing::warn!(
-                    operator = %self.op_name, vnode, error = %e,
-                    "cold-tier promotion fetch failed — will retry"
-                ),
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    still.insert(vnode, rx);
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    tracing::warn!(
-                        operator = %self.op_name, vnode,
-                        "cold-tier worker dropped a promotion fetch"
-                    );
-                    self.worker_dead = true;
-                }
-            }
-        }
-        self.inflight = still;
-        ready
-    }
-
-    fn issue_fetch(&mut self, vnode: u32) {
-        if self.inflight.contains_key(&vnode) {
-            return;
-        }
-        let (reply, rx) = oneshot::channel();
-        let req = crate::state_tier::TierRequest::Fetch {
-            operator: Arc::clone(&self.op_name),
-            vnode,
-            reply,
-        };
-        match self.tier.try_send(req) {
-            Ok(()) => {
-                self.inflight.insert(vnode, rx);
-            }
-            // Disconnected = worker gone (Full just retries); flag it so promotion escalates. A
-            // worker that dies with nothing in flight is otherwise never seen by `drain_ready`.
-            Err(crossfire::TrySendError::Disconnected(_)) => self.worker_dead = true,
-            Err(crossfire::TrySendError::Full(_)) => {}
-        }
-    }
-
-    // Fire-and-forget: a full channel just leaves the slice for the next demotion to overwrite.
-    fn drop_slice(&self, vnode: u32) {
-        let (reply, _rx) = oneshot::channel();
-        let req = crate::state_tier::TierRequest::Drop {
-            operator: Arc::clone(&self.op_name),
-            vnode,
-            reply,
-        };
-        let _ = self.tier.try_send(req);
-    }
-
-    fn drain_ready_groups(&mut self) -> Vec<(arrow::row::OwnedRow, u32, Vec<u8>, Option<Bytes>)> {
-        let mut ready = Vec::new();
-        let mut still = FxHashMap::default();
-        for (key, (vnode, group, mut rx)) in self.inflight_groups.drain() {
-            match rx.try_recv() {
-                Ok(Ok(slice)) => ready.push((key, vnode, group, slice)),
-                Ok(Err(e)) => tracing::warn!(
-                    operator = %self.op_name, vnode, error = %e,
-                    "cold-tier group promotion fetch failed — will retry"
-                ),
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    still.insert(key, (vnode, group, rx));
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    tracing::warn!(
-                        operator = %self.op_name, vnode,
-                        "cold-tier worker dropped a group promotion fetch"
-                    );
-                    self.worker_dead = true;
-                }
-            }
-        }
-        self.inflight_groups = still;
-        ready
-    }
-
-    fn issue_fetch_group(&mut self, key: arrow::row::OwnedRow, vnode: u32, group: Vec<u8>) {
-        if self.inflight_groups.contains_key(&key) {
-            return;
-        }
-        let (reply, rx) = oneshot::channel();
-        let req = crate::state_tier::TierRequest::FetchGroup {
-            operator: Arc::clone(&self.op_name),
-            vnode,
-            group: group.clone(),
-            reply,
-        };
-        match self.tier.try_send(req) {
-            Ok(()) => {
-                self.inflight_groups.insert(key, (vnode, group, rx));
-            }
-            Err(crossfire::TrySendError::Disconnected(_)) => self.worker_dead = true,
-            Err(crossfire::TrySendError::Full(_)) => {}
-        }
-    }
-
-    fn drop_group(&self, vnode: u32, group: Vec<u8>) {
-        let (reply, _rx) = oneshot::channel();
-        let req = crate::state_tier::TierRequest::DropGroup {
-            operator: Arc::clone(&self.op_name),
-            vnode,
-            group,
-            reply,
-        };
-        let _ = self.tier.try_send(req);
-    }
-
-    fn defer(&mut self, watermark: i64, batch: RecordBatch) {
-        self.deferred.push_back((watermark, batch));
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.inflight.is_empty() || !self.deferred.is_empty() || !self.inflight_groups.is_empty()
-    }
-
-    fn take_deferred(&mut self) -> Vec<(i64, RecordBatch)> {
-        self.deferred.drain(..).collect()
-    }
-
-    fn deferred_rows(&self) -> usize {
-        self.deferred.iter().map(|(_, b)| b.num_rows()).sum()
-    }
-
-    fn min_deferred_watermark(&self) -> Option<i64> {
-        self.deferred.iter().map(|(wm, _)| *wm).min()
-    }
-}
-
-// Wraps the agg group state + any promotion-deferred batches + demoted-vnode list.
-// A checkpoint taken mid-promotion must carry deferred rows; the source counts them consumed.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct AggOpCheckpoint {
     agg: Option<AggStateCheckpoint>,
-    deferred: Vec<(i64, Vec<u8>)>, // (ingest watermark, IPC-serialized pre-agg batch)
-    cold_vnodes: Vec<u32>,         // absent from `agg`; replayed from durable partials on restart
     // Per-vnode `-1`-weight retraction batches stashed at revoke but not yet emitted; persisted so a
     // crash between revoke and the next emit still retracts the moved groups from the MV.
     revoke_retractions: Vec<(u32, Vec<u8>)>,
+    // Pre-barrier remote rows are channel state. They must be replayed after the cut rather than
+    // folded into aggregate state before its corresponding output is emitted.
+    aligned_replay: Vec<(u64, i64, Vec<u8>)>,
 }
 
 /// Serialize a per-vnode aggregate checkpoint slice (full or a delta's changed-groups) to bytes.
@@ -336,20 +94,26 @@ pub(crate) struct SqlQueryOperator {
     state: QueryState,
     prom: Option<Arc<EngineMetrics>>,
     pending_restore: Option<AggStateCheckpoint>,
-    tier_logged: bool,
+    // Validated vnode bases retained in their original serialized form while the SQL aggregate is
+    // still uninitialized. Lazy initialization merges the entire set once, avoiding a whole-state
+    // clone and IPC rewrite for every recovered vnode.
+    #[cfg(feature = "cluster")]
+    pending_restore_slices: Vec<Bytes>,
+    #[cfg(feature = "cluster")]
+    pending_restore_slice_fingerprint: Option<u64>,
+    execution_path_logged: bool,
     having_cache: Option<super::HavingSqlCache>,
     emit_changelog: bool,
-    idle_ttl_ms: Option<u64>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
     // Vnodes owned at the last capture; the diff vs the current owned-set yields the vnodes acquired
     // since, whose delta chains must re-base FULL (`IncrementalAggState::reset_acquired_vnodes`).
     #[cfg(feature = "cluster")]
     prev_owned: rustc_hash::FxHashSet<u32>,
-    // `Some(chain_max)` enables incremental delta checkpoints with that re-base bound. When set, the
+    // `Some(chain_bound)` enables incremental delta checkpoints with that re-base bound. When set, the
     // delta chain is the PRIMARY agg checkpoint; whole-node capture is skipped, partials recover.
     #[cfg(feature = "cluster")]
-    delta_chain_max: Option<u32>,
+    delta_chain_bound: Option<u32>,
     // Per-vnode partials are the authoritative agg checkpoint; the whole-node manifest copy is
     // skipped (one node's slices — recovery from another writer's manifest loses groups).
     #[cfg(feature = "cluster")]
@@ -362,8 +126,8 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     pending_restore_reemit: rustc_hash::FxHashSet<u32>,
     // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
-    // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore, so a
-    // later re-acquire still merges into empty state (no double-count).
+    // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore so
+    // ownership loss is reflected before any output or later re-acquire.
     #[cfg(feature = "cluster")]
     deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
     // Per-vnode `-1`-weight retraction batches captured when a vnode is revoked, keyed by vnode.
@@ -371,24 +135,8 @@ pub(crate) struct SqlQueryOperator {
     // moved groups; cancelled per-vnode on a same-cycle reacquire.
     #[cfg(feature = "cluster")]
     pending_revoke_retractions: rustc_hash::FxHashMap<u32, RecordBatch>,
-    #[cfg(feature = "state-tier")]
-    promotion: Option<AggPromotion>,
-    // Held until `lazy_init` builds the aggregate state, then moved into `promotion`.
-    #[cfg(feature = "state-tier")]
-    tier_sender: Option<crate::state_tier::TierTx>,
-    // Deferred batches from a restored checkpoint, queued until `lazy_init` builds the buffer.
-    #[cfg(feature = "state-tier")]
-    pending_deferred: Vec<(i64, RecordBatch)>,
-    // Demoted vnodes from a restored checkpoint; drained by `take_tier_cold_vnodes`.
-    #[cfg(feature = "state-tier")]
-    pending_cold_rehydrate: Vec<u32>,
-    // Set from the vnode registry; threaded separately since single-node has no shuffle config.
-    #[cfg(feature = "state-tier")]
-    vnode_count: u32,
-    // Single-node group demotion: turns on the agg's delta DIRTY-tracking (so `demotable_groups`
-    // has candidates) WITHOUT `delta_chain_max` — the whole-node manifest stays authoritative.
-    #[cfg(feature = "state-tier")]
-    group_delta_tracking: bool,
+    #[cfg(feature = "cluster")]
+    aligned_replay: VecDeque<(u64, i64, crate::operator::RetainedBatch)>,
 }
 
 impl SqlQueryOperator {
@@ -398,7 +146,6 @@ impl SqlQueryOperator {
         ctx: SessionContext,
         prom: Option<Arc<EngineMetrics>>,
         emit_changelog: bool,
-        idle_ttl_ms: Option<u64>,
     ) -> Self {
         let task_ctx = ctx.task_ctx();
         Self {
@@ -409,16 +156,19 @@ impl SqlQueryOperator {
             state: QueryState::Uninit,
             prom,
             pending_restore: None,
-            tier_logged: false,
+            #[cfg(feature = "cluster")]
+            pending_restore_slices: Vec::new(),
+            #[cfg(feature = "cluster")]
+            pending_restore_slice_fingerprint: None,
+            execution_path_logged: false,
             having_cache: None,
             emit_changelog,
-            idle_ttl_ms,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             prev_owned: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
-            delta_chain_max: None,
+            delta_chain_bound: None,
             #[cfg(feature = "cluster")]
             vnode_partials_authoritative: false,
             #[cfg(feature = "cluster")]
@@ -429,40 +179,15 @@ impl SqlQueryOperator {
             deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
             pending_revoke_retractions: rustc_hash::FxHashMap::default(),
-            #[cfg(feature = "state-tier")]
-            promotion: None,
-            #[cfg(feature = "state-tier")]
-            tier_sender: None,
-            #[cfg(feature = "state-tier")]
-            pending_deferred: Vec::new(),
-            #[cfg(feature = "state-tier")]
-            pending_cold_rehydrate: Vec::new(),
-            #[cfg(feature = "state-tier")]
-            vnode_count: 1,
-            #[cfg(feature = "state-tier")]
-            group_delta_tracking: false,
+            #[cfg(feature = "cluster")]
+            aligned_replay: VecDeque::new(),
         }
     }
 
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn set_vnode_count(&mut self, vnode_count: u32) {
-        self.vnode_count = vnode_count;
-    }
-
-    /// Single-node group demotion: enable the agg's delta DIRTY-tracking so idle groups become
-    /// demotable, WITHOUT making the delta chain the primary checkpoint (no `delta_chain_max`).
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn enable_delta_tracking(&mut self) {
-        self.group_delta_tracking = true;
-        if let QueryState::Agg(ref mut agg) = self.state {
-            agg.set_delta_enabled(true);
-        }
-    }
-
-    /// Enable incremental delta checkpoints with `chain_max` as the re-base bound.
+    /// Enable incremental delta checkpoints with `chain_bound` as the re-base bound.
     #[cfg(feature = "cluster")]
-    pub fn enable_delta_checkpoints(&mut self, chain_max: u32) {
-        self.delta_chain_max = Some(chain_max);
+    pub fn enable_delta_checkpoints(&mut self, chain_bound: u32) {
+        self.delta_chain_bound = Some(chain_bound);
         if let QueryState::Agg(ref mut agg) = self.state {
             agg.set_delta_enabled(true);
         }
@@ -479,7 +204,7 @@ impl SqlQueryOperator {
     /// or authoritative per-vnode partials make the chain the primary agg checkpoint.
     #[cfg(feature = "cluster")]
     fn skip_whole_node_agg(&self) -> bool {
-        self.delta_chain_max.is_some() || self.vnode_partials_authoritative
+        self.delta_chain_bound.is_some() || self.vnode_partials_authoritative
     }
     #[cfg(not(feature = "cluster"))]
     #[allow(clippy::unused_self)] // mirrors the cluster variant's `&self` signature
@@ -489,10 +214,6 @@ impl SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
-        #[cfg(feature = "state-tier")]
-        {
-            self.vnode_count = config.registry.vnode_count();
-        }
         self.cluster_shuffle = Some(config);
     }
 
@@ -512,139 +233,157 @@ impl SqlQueryOperator {
         newly
     }
 
+    fn staged_pending_restore(&self) -> Result<Option<AggStateCheckpoint>, DbError> {
+        #[cfg(feature = "cluster")]
+        {
+            if self.pending_restore_slices.is_empty() {
+                return Ok(self.pending_restore.clone());
+            }
+            let mut slices = Vec::with_capacity(
+                self.pending_restore_slices
+                    .len()
+                    .saturating_add(if self.pending_restore.is_some() { 1 } else { 0 }),
+            );
+            if let Some(checkpoint) = &self.pending_restore {
+                slices.push(Bytes::from(serialize_agg_cp(checkpoint, &self.op_name)?));
+            }
+            slices.extend(self.pending_restore_slices.iter().cloned());
+            let merged = merge_serialized_agg_cps(&slices).map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' vnode baseline merge failed: {error}",
+                    self.op_name
+                ))
+            })?;
+            return rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&merged)
+                .map(Some)
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' merged vnode baseline decode failed: {error}",
+                        self.op_name
+                    ))
+                });
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            Ok(self.pending_restore.clone())
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
         match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
-                #[cfg(feature = "cluster")]
-                let mut base_restored = true;
-                if let Some(ref cp) = self.pending_restore {
-                    match agg_state.restore_groups(cp) {
-                        Ok(restored) => {
-                            tracing::info!(
-                                query = %self.op_name,
-                                groups = restored,
-                                "lazy_init fold: restored pending aggregate baseline"
-                            );
-                        }
-                        Err(e) => {
-                            #[cfg(feature = "cluster")]
-                            {
-                                base_restored = false;
-                            }
-                            tracing::warn!(
-                                query = %self.op_name,
-                                error = %e,
-                                "Failed to restore aggregate checkpoint (schema evolution?)"
-                            );
-                        }
-                    }
-                }
-                self.pending_restore = None;
-                // Replay stashed restart deltas only if the base restored — deltas carry just the
-                // changed groups, so replaying onto an empty base would drop every unchanged group.
-                #[cfg(feature = "cluster")]
-                if base_restored {
-                    for delta in self.pending_restore_deltas.drain(..) {
-                        if let Err(e) = agg_state.apply_delta(&delta) {
-                            tracing::warn!(
-                                query = %self.op_name, error = %e,
-                                "failed to replay restart delta — vnode may be stale"
-                            );
-                        }
-                    }
-                } else if !self.pending_restore_deltas.is_empty() {
-                    tracing::warn!(
-                        query = %self.op_name, count = self.pending_restore_deltas.len(),
-                        "skipping restart delta replay — base restore failed; discarding stale deltas"
+                let staged_pending_restore = self.staged_pending_restore()?;
+                if let Some(ref cp) = staged_pending_restore {
+                    let restored = agg_state.restore_groups(cp).map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "aggregate '{}' baseline restore failed: {error}",
+                            self.op_name
+                        ))
+                    })?;
+                    tracing::info!(
+                        query = %self.op_name,
+                        groups = restored,
+                        "lazy_init fold: restored pending aggregate baseline"
                     );
-                    self.pending_restore_deltas.clear();
+                }
+                #[cfg(feature = "cluster")]
+                for delta in &self.pending_restore_deltas {
+                    agg_state.apply_delta(delta).map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "aggregate '{}' delta restore failed: {error}",
+                            self.op_name
+                        ))
+                    })?;
                 }
                 // Chains folded while Uninit re-emit here, or the restored `last_emitted` leaves
                 // their MV rows stale until new input. Skip deferred-revoke vnodes: the drop
                 // below needs their `last_emitted` intact to build retractions.
                 #[cfg(feature = "cluster")]
                 {
-                    let reemit = std::mem::take(&mut self.pending_restore_reemit);
-                    if base_restored && !reemit.is_empty() {
-                        if let Some(vc) = self
+                    if !self.pending_restore_reemit.is_empty() {
+                        let vc = self
                             .cluster_shuffle
                             .as_ref()
                             .map(|c| c.registry.vnode_count())
-                        {
-                            let mut skipped = 0usize;
-                            let total = reemit.len();
-                            for v in reemit {
-                                if self.deferred_revoke_vnodes.contains(&v) {
-                                    skipped += 1;
-                                } else {
-                                    agg_state.force_reemit_acquired_vnode(v, vc);
-                                }
-                            }
-                            // `reemit_skipped` > 0 = a re-acquired vnode about to be dropped by a
-                            // stale deferred revoke — the flap signature a soak should grep for.
-                            if skipped > 0 {
-                                tracing::warn!(
-                                    query = %self.op_name,
-                                    reemit_vnodes = total,
-                                    reemit_skipped = skipped,
-                                    "lazy_init fold: deferred revoke intersects re-acquired vnodes"
-                                );
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "aggregate '{}' cannot re-emit restored vnodes without cluster ownership",
+                                    self.op_name
+                                ))
+                            })?;
+                        let mut skipped = 0usize;
+                        let total = self.pending_restore_reemit.len();
+                        for &v in &self.pending_restore_reemit {
+                            if self.deferred_revoke_vnodes.contains(&v) {
+                                skipped += 1;
                             } else {
-                                tracing::info!(
-                                    query = %self.op_name,
-                                    reemit_vnodes = total,
-                                    "lazy_init fold: force-emitting restored vnodes"
-                                );
+                                agg_state.force_reemit_acquired_vnode(v, vc);
                             }
+                        }
+                        if skipped > 0 {
+                            tracing::warn!(
+                                query = %self.op_name,
+                                reemit_vnodes = total,
+                                reemit_skipped = skipped,
+                                "lazy_init fold: deferred revoke intersects re-acquired vnodes"
+                            );
+                        } else {
+                            tracing::info!(
+                                query = %self.op_name,
+                                reemit_vnodes = total,
+                                "lazy_init fold: force-emitting restored vnodes"
+                            );
                         }
                     }
                 }
                 // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
-                // so a later re-acquire merges into empty state instead of double-counting.
+                // before any output or later re-acquire can expose state this node no longer owns.
                 #[cfg(feature = "cluster")]
-                if !self.deferred_revoke_vnodes.is_empty() {
-                    if let Some(vc) = self
+                let staged_retractions = if self.deferred_revoke_vnodes.is_empty() {
+                    ahash::AHashMap::new()
+                } else {
+                    let vc = self
                         .cluster_shuffle
                         .as_ref()
                         .map(|c| c.registry.vnode_count())
-                    {
-                        let revoked = std::mem::take(&mut self.deferred_revoke_vnodes);
-                        tracing::info!(
-                            query = %self.op_name,
-                            vnodes = revoked.len(),
-                            "lazy_init fold: dropping deferred-revoked vnodes"
-                        );
-                        match agg_state.drop_vnodes(&revoked, vc) {
-                            Ok(r) => self.pending_revoke_retractions.extend(r),
-                            Err(e) => tracing::warn!(
-                                query = %self.op_name, error = %e,
-                                "deferred revoke retraction build failed; MV rows may be stale"
-                            ),
-                        }
-                    }
-                }
-                if let Some(ttl) = self.idle_ttl_ms {
-                    agg_state.idle_ttl_ms = Some(ttl);
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "aggregate '{}' cannot apply deferred vnode revocation without cluster ownership",
+                                self.op_name
+                            ))
+                        })?;
+                    tracing::info!(
+                        query = %self.op_name,
+                        vnodes = self.deferred_revoke_vnodes.len(),
+                        "lazy_init fold: dropping deferred-revoked vnodes"
+                    );
+                    agg_state
+                        .drop_vnodes(&self.deferred_revoke_vnodes, vc)
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "aggregate '{}' deferred vnode revocation failed: {error}",
+                                self.op_name
+                            ))
+                        })?
+                };
+
+                self.pending_restore = None;
+                #[cfg(feature = "cluster")]
+                {
+                    self.pending_restore_slices.clear();
+                    self.pending_restore_slice_fingerprint = None;
+                    self.pending_restore_deltas.clear();
+                    self.pending_restore_reemit.clear();
+                    self.deferred_revoke_vnodes.clear();
+                    self.pending_revoke_retractions.extend(staged_retractions);
                 }
                 #[cfg(feature = "cluster")]
-                if self.delta_chain_max.is_some() {
+                if self.delta_chain_bound.is_some() {
                     agg_state.set_delta_enabled(true);
                 }
-                #[cfg(feature = "state-tier")]
-                if self.group_delta_tracking {
-                    agg_state.set_delta_enabled(true);
-                }
-                self.log_tier(agg_state.compiled_projection().is_some());
+                self.log_execution_path(agg_state.compiled_projection().is_some());
                 self.state = QueryState::Agg(Box::new(agg_state));
-                #[cfg(feature = "state-tier")]
-                if let Some(tier) = self.tier_sender.take() {
-                    let mut promo = AggPromotion::new(Arc::clone(&self.op_name), tier);
-                    for (wm, batch) in self.pending_deferred.drain(..) {
-                        promo.defer(wm, batch);
-                    }
-                    self.promotion = Some(promo);
-                }
                 return Ok(());
             }
             Ok(None) => {}
@@ -664,13 +403,23 @@ impl SqlQueryOperator {
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
         let plan = df.logical_plan().clone();
 
+        #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_some() && crate::aggregate_state::find_aggregate(&plan).is_some()
+        {
+            return Err(DbError::Pipeline(format!(
+                "[{}] query '{}': cluster aggregate cannot use a node-local DataFusion fallback; the exact incremental execution path was not constructed",
+                laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                self.op_name
+            )));
+        }
+
         if single_source_table(&self.sql).is_some() {
             if let Some(proj) = self.try_build_compiled_projection(&plan) {
                 tracing::debug!(
                     query = %self.op_name,
                     "Non-aggregate single-source query compiled to PhysicalExpr"
                 );
-                self.log_tier(true);
+                self.log_execution_path(true);
                 self.state = QueryState::Compiled(proj);
                 return Ok(());
             }
@@ -680,7 +429,7 @@ impl SqlQueryOperator {
                 .create_physical_plan(&plan)
                 .await
                 .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-            self.log_tier(false);
+            self.log_execution_path(false);
             self.state = QueryState::CachedPlan(physical);
         } else {
             let physical = self
@@ -689,17 +438,17 @@ impl SqlQueryOperator {
                 .create_physical_plan(&plan)
                 .await
                 .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-            self.log_tier(false);
+            self.log_execution_path(false);
             self.state = QueryState::CachedPhysical(physical);
         }
         Ok(())
     }
 
-    fn log_tier(&mut self, compiled: bool) {
-        if self.tier_logged {
+    fn log_execution_path(&mut self, compiled: bool) {
+        if self.execution_path_logged {
             return;
         }
-        self.tier_logged = true;
+        self.execution_path_logged = true;
         if let Some(ref m) = self.prom {
             if compiled {
                 m.queries_compiled.inc();
@@ -807,6 +556,10 @@ impl SqlQueryOperator {
         inputs: &[RecordBatch],
         watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        #[cfg(feature = "cluster")]
+        if !self.aligned_replay.is_empty() {
+            return self.execute_aligned_replay().await;
+        }
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: execute_agg called on non-agg state".into(),
@@ -846,12 +599,11 @@ impl SqlQueryOperator {
             )));
         };
 
-        let QueryState::Agg(ref mut agg_state) = self.state else {
-            unreachable!();
-        };
-
         #[cfg(feature = "cluster")]
-        let pre_agg_batches = {
+        let (pre_agg_batches, _shuffle_admission) = {
+            let QueryState::Agg(ref agg_state) = self.state else {
+                unreachable!();
+            };
             let num_group_cols = agg_state.num_group_cols();
             shuffle_pre_agg_batches(
                 self.cluster_shuffle.as_ref(),
@@ -862,197 +614,76 @@ impl SqlQueryOperator {
             .await?
         };
 
-        #[cfg(feature = "state-tier")]
-        if self.promotion.is_some() {
-            return self
-                .process_with_promotion(pre_agg_batches, watermark)
-                .await;
-        }
-        for batch in &pre_agg_batches {
-            agg_state.process_batch(batch, watermark)?;
-        }
-
-        self.emit_agg_output(watermark).await
+        let QueryState::Agg(ref mut aggregate) = self.state else {
+            unreachable!();
+        };
+        pre_agg_batches
+            .iter()
+            .try_for_each(|batch| aggregate.process_batch(batch, watermark))?;
+        self.emit_agg_output().await
     }
 
-    #[cfg(feature = "state-tier")]
-    #[allow(clippy::too_many_lines)] // one coherent promotion → defer → process → emit cycle
-    async fn process_with_promotion(
-        &mut self,
-        pre_agg_batches: Vec<RecordBatch>,
-        watermark: i64,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let ready = self
-            .promotion
-            .as_mut()
-            .map(AggPromotion::drain_ready)
-            .unwrap_or_default();
-        for (vnode, slice) in ready {
-            match slice {
-                Some(bytes) => {
-                    self.apply_vnode_state(vnode, &bytes)?;
-                    if let Some(p) = self.promotion.as_mut() {
-                        p.clear_vnode_miss(vnode);
-                        p.pending_slice_drops.push(vnode);
-                    }
-                }
-                None => {
-                    if let Some(p) = self.promotion.as_mut() {
-                        let misses = p.note_vnode_miss(vnode);
-                        if misses > MAX_PROMOTION_FETCH_MISSES {
-                            return Err(DbError::Checkpoint(format!(
-                                "[state-tier] demoted vnode {vnode} absent from the cold tier after \
-                                 {misses} promotion fetches (operator={}) — failing rather than \
-                                 wedging the operator behind its watermark hold",
-                                p.op_name
-                            )));
-                        }
-                        p.issue_fetch(vnode);
-                    }
-                }
-            }
-        }
-
-        // Rehydrate any cold groups whose fetch resolved.
-        let ready_groups = self
-            .promotion
-            .as_mut()
-            .map(AggPromotion::drain_ready_groups)
-            .unwrap_or_default();
-        for (key, vnode, group, slice) in ready_groups {
-            match slice {
-                Some(bytes) => {
-                    self.apply_group_state(&key, &bytes)?;
-                    if let Some(p) = self.promotion.as_mut() {
-                        p.clear_group_miss(&key);
-                        p.pending_group_drops.push((vnode, group));
-                    }
-                }
-                None => {
-                    if let Some(p) = self.promotion.as_mut() {
-                        let misses = p.note_group_miss(&key);
-                        if misses > MAX_PROMOTION_FETCH_MISSES {
-                            return Err(DbError::Checkpoint(format!(
-                                "[state-tier] demoted group (vnode {vnode}) absent from the cold \
-                                 tier after {misses} promotion fetches (operator={}) — failing \
-                                 rather than wedging the operator behind its watermark hold",
-                                p.op_name
-                            )));
-                        }
-                        p.issue_fetch_group(key, vnode, group);
-                    }
-                }
-            }
-        }
-
-        // A dead worker can't resolve the deferred fetches; escalate rather than pin the watermark.
-        if self
-            .promotion
-            .as_ref()
-            .is_some_and(AggPromotion::worker_dead)
+    #[cfg(feature = "cluster")]
+    async fn execute_aligned_replay(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        let Some(config) = self.cluster_shuffle.as_ref() else {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' has aligned shuffle replay without an active cluster scope",
+                self.op_name
+            )));
+        };
+        let active_version = config.registry.versioned_snapshot().version();
+        if config.sender.assignment_version() != active_version
+            || config.receiver.assignment_version() != active_version
+            || self
+                .aligned_replay
+                .iter()
+                .any(|(version, _, _)| *version != active_version)
         {
             return Err(DbError::Checkpoint(format!(
-                "[state-tier] cold-tier worker died (operator={}) — failing rather than wedging \
-                 promotion behind the watermark hold",
+                "aggregate '{}' aligned shuffle replay crossed its assignment boundary",
                 self.op_name
             )));
         }
 
-        // Promote-then-retract cold groups that aged past the idle TTL while demoted: `evict_idle`
-        // scans only resident groups, so without this their changelog row leaks past the TTL and the
-        // tier entry is never reclaimed. Once fetched + promoted, the normal `evict_idle` pass below
-        // retracts them. Idempotent — `issue_fetch_group` dedupes in-flight keys.
-        {
-            let past_ttl = if let QueryState::Agg(ref agg) = self.state {
-                agg.cold_groups_past_idle_ttl(watermark, self.vnode_count)
-            } else {
-                Vec::new()
-            };
-            if let Some(p) = self.promotion.as_mut() {
-                for (key, vnode, group) in past_ttl {
-                    p.issue_fetch_group(key, vnode, group);
-                }
-            }
-        }
-
-        let mut candidates = self
-            .promotion
-            .as_mut()
-            .map(AggPromotion::take_deferred)
-            .unwrap_or_default();
-        for batch in pre_agg_batches {
-            candidates.push((watermark, batch));
-        }
-
-        let num_group_cols = match self.state {
-            QueryState::Agg(ref agg) => agg.num_group_cols(),
-            _ => unreachable!("process_with_promotion on non-agg state"),
+        // Apply one transport-bounded logical batch per execution cycle. Keep the authoritative
+        // queue entry until output emission succeeds. Any failure after aggregate mutation forces
+        // coordinated recovery, which restores both state and replay from the last committed cut
+        // instead of retrying a partially applied batch in memory.
+        let (_, replay_watermark, batch) = self
+            .aligned_replay
+            .front()
+            .cloned()
+            .ok_or_else(|| DbError::Checkpoint("aligned replay queue became empty".into()))?;
+        let QueryState::Agg(ref mut aggregate) = self.state else {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' aligned shuffle replay targeted non-aggregate state",
+                self.op_name
+            )));
         };
-        let vnode_count = self.vnode_count;
-        let cold: FxHashSet<u32> = match self.state {
-            QueryState::Agg(ref agg) => agg.cold_vnodes().clone(),
-            _ => FxHashSet::default(),
-        };
-
-        let mut to_process: Vec<(i64, RecordBatch)> = Vec::new();
-        for (wm, batch) in candidates {
-            let touched = cold_vnodes_touched(&batch, num_group_cols, vnode_count, &cold);
-            let touched_groups = if let QueryState::Agg(ref agg) = self.state {
-                agg.cold_groups_touched(&batch, vnode_count)?
-            } else {
-                Vec::new()
-            };
-            if touched.is_empty() && touched_groups.is_empty() {
-                to_process.push((wm, batch));
-            } else if let Some(p) = self.promotion.as_mut() {
-                for v in touched {
-                    p.issue_fetch(v);
-                }
-                for (key, vnode, group) in touched_groups {
-                    p.issue_fetch_group(key, vnode, group);
-                }
-                p.defer(wm, batch);
-            }
-        }
-
-        {
-            let QueryState::Agg(ref mut agg_state) = self.state else {
-                unreachable!();
-            };
-            for (wm, batch) in &to_process {
-                agg_state.process_batch(batch, *wm)?;
-            }
-        }
-
-        self.emit_agg_output(watermark).await
-    }
-
-    /// Rehydrate one demoted group from its tier bytes back into live aggregate state.
-    #[cfg(feature = "state-tier")]
-    fn apply_group_state(
-        &mut self,
-        key: &arrow::row::OwnedRow,
-        bytes: &[u8],
-    ) -> Result<(), DbError> {
-        let cp: AggStateCheckpoint =
-            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
-                DbError::Pipeline(format!(
-                    "cold-group state deserialization for '{}': {e}",
+        aggregate
+            .process_batch(batch.batch(), replay_watermark)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' aligned shuffle replay failed and requires recovery: {error}",
                     self.op_name
                 ))
             })?;
-        if let QueryState::Agg(ref mut agg) = self.state {
-            agg.promote_group(key, cp)?;
-        } else {
-            tracing::warn!(
-                query = %self.op_name,
-                "ignoring rehydrated group state for non-aggregate query"
-            );
-        }
-        Ok(())
+        let output = self.emit_agg_output().await.map_err(|error| {
+            DbError::Checkpoint(format!(
+                "aggregate '{}' aligned shuffle replay emission failed and requires recovery: {error}",
+                self.op_name
+            ))
+        })?;
+        let Some(_completed) = self.aligned_replay.pop_front() else {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' aligned shuffle replay disappeared after emission and requires recovery",
+                self.op_name
+            )));
+        };
+        Ok(output)
     }
 
-    async fn emit_agg_output(&mut self, watermark: i64) -> Result<Vec<RecordBatch>, DbError> {
+    async fn emit_agg_output(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: emit_agg_output on non-agg".into(),
@@ -1061,12 +692,6 @@ impl SqlQueryOperator {
 
         #[cfg(feature = "cluster")]
         let num_group_cols = agg_state.num_group_cols();
-
-        let mut eviction = if self.emit_changelog {
-            agg_state.evict_idle(watermark)?
-        } else {
-            Vec::new()
-        };
 
         let mut batches = agg_state.emit()?;
 
@@ -1082,31 +707,24 @@ impl SqlQueryOperator {
             }
         }
 
-        let result = if eviction.is_empty() {
-            batches
-        } else {
-            eviction.extend(batches);
-            eviction
-        };
-
         // Retract-before-insert: moved-away groups' `-1` batches lead the emit so a distributed read
         // never double-counts a rebalanced group.
         #[cfg(feature = "cluster")]
         let result = if self.pending_revoke_retractions.is_empty() {
-            result
+            batches
         } else {
             let mut prefixed: Vec<RecordBatch> =
                 std::mem::take(&mut self.pending_revoke_retractions)
                     .into_values()
                     .collect();
-            prefixed.extend(result);
+            prefixed.extend(batches);
             prefixed
         };
 
         #[cfg(feature = "cluster")]
         return self.suppress_restoring_output(result, num_group_cols);
         #[cfg(not(feature = "cluster"))]
-        Ok(result)
+        Ok(batches)
     }
 
     // Drops rows for vnodes still restoring so downstream never sees a partial aggregate.
@@ -1132,7 +750,12 @@ impl SqlQueryOperator {
                 vec![0; batch.num_rows()]
             } else {
                 let cols: Vec<usize> = (0..num_group_cols).collect();
-                laminar_core::shuffle::row_vnodes(&batch, &cols, vnode_count)
+                laminar_core::shuffle::row_vnodes(&batch, &cols, vnode_count).map_err(|error| {
+                    crate::operator::shuffle_routing_error(
+                        &format!("aggregate [{}] restore filter", self.op_name),
+                        error,
+                    )
+                })?
             };
             let keep: Vec<bool> = vnodes
                 .iter()
@@ -1192,114 +815,113 @@ async fn shuffle_pre_agg_batches(
     op_name: &str,
     num_group_cols: usize,
     batches: Vec<RecordBatch>,
-) -> Result<Vec<RecordBatch>, DbError> {
+) -> Result<(Vec<RecordBatch>, Vec<laminar_core::shuffle::ReceivedBatch>), DbError> {
     let Some(cfg) = config else {
-        return Ok(batches);
+        return Ok((batches, Vec::new()));
     };
 
     let vnode_count = cfg.registry.vnode_count();
+    let assignment = cfg.registry.versioned_snapshot();
     let mut local: Vec<RecordBatch> = Vec::new();
 
-    // Phase 1: slice every batch and STAGE all outbound frames without sending. A vnode that is
-    // unassigned defers the whole cycle here, before any peer received data — so a retry cannot
-    // double-fold on peers that already got their slice (all-or-nothing staging, CL-1).
+    // Build the complete plan before any transport admission. Unassigned ownership can then defer
+    // safely, while permanent structural failures halt rather than loop through recovery.
     let mut outbound: Vec<(u64, ShuffleMessage)> = Vec::new();
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
-        let assignment = cfg.registry.snapshot();
-        for &v in &row_vn {
-            let owner = usize::try_from(v)
-                .ok()
-                .and_then(|vnode| assignment.get(vnode))
-                .copied()
-                .unwrap_or(laminar_core::state::NodeId::UNASSIGNED);
-            if owner.is_unassigned() {
-                // Formation/rebalance transient — defer (recoverable), don't drop. Nothing sent yet.
-                return Err(DbError::ShuffleNotReady(format!(
-                    "[{op_name}] row-shuffle: vnode {v} is unassigned"
-                )));
-            }
-        }
-
-        let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
+        let context = format!("aggregate [{op_name}] routing");
+        let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count)
+            .map_err(|error| crate::operator::shuffle_routing_error(&context, error))?;
+        let plan = laminar_core::shuffle::route_checkpointed_batch(
             &batch,
             &row_vn,
-            &cfg.registry,
+            &assignment,
             cfg.self_id,
-        );
+        )
+        .map_err(|error| crate::operator::shuffle_routing_error(&context, error))?;
 
-        for (_v, slice) in local_slices {
-            local.push(slice);
+        for route in plan.local {
+            local.push(route.batch);
         }
-        for (owner, slice) in remote_slices {
+        for route in plan.remote {
             outbound.push((
-                owner.0,
-                ShuffleMessage::VnodeData(op_name.to_string(), 0, slice),
+                route.owner.0,
+                ShuffleMessage::checkpointed_routed(
+                    op_name.to_string(),
+                    route.routed_vnodes,
+                    route.batch,
+                ),
             ));
         }
     }
 
-    // Phase 2: send the staged frames. Before the first send lands, a failure is a formation
-    // transient → defer (retry is safe, nothing sent). AFTER a send lands, a failure is a partial
-    // send: deferring would re-send to peers that already folded, so fault instead — a Pipeline
-    // error trips `fault_on_cycle_error` → coordinated recovery rewinds every node and replays
-    // (CL-1/CL-2). ALO without coordinated recovery drops the cycle rather than double-counting.
-    let mut sent_any = false;
-    for (peer, msg) in outbound {
-        match cfg.sender.send_to(peer, &msg).await {
-            Ok(()) => sent_any = true,
-            Err(e) if !sent_any => {
-                return Err(DbError::ShuffleNotReady(format!(
-                    "[{op_name}] row-shuffle send_to peer {peer}: {e}"
-                )));
-            }
-            Err(e) => {
-                return Err(DbError::ShufflePartialSend(format!(
-                    "[{op_name}] row-shuffle to peer {peer} after prior sends landed; \
-                     faulting for domain replay: {e}"
-                )));
-            }
+    // Once any frame is admitted, a later failure requires coordinated recovery because the frame
+    // may still reach its peer. A failure before admission may defer only when it is transient.
+    crate::operator::send_shuffle_plan(
+        &cfg.sender,
+        assignment.version(),
+        outbound,
+        &format!("aggregate [{op_name}] shuffle"),
+    )
+    .await?;
+
+    let admitted = cfg.receiver.drain_checkpointed_data_for(op_name);
+    for received in &admitted {
+        if received.batch().num_rows() > 0 {
+            local.push(received.batch().clone());
         }
     }
 
-    for batch in cfg.receiver.drain_vnode_data_for(op_name) {
-        if batch.num_rows() > 0 {
-            local.push(batch);
-        }
-    }
-
-    Ok(local)
+    Ok((local, admitted))
 }
 
 #[cfg(feature = "cluster")]
-fn hash_rows_to_vnodes(batch: &RecordBatch, num_group_cols: usize, vnode_count: u32) -> Vec<u32> {
+fn hash_rows_to_vnodes(
+    batch: &RecordBatch,
+    num_group_cols: usize,
+    vnode_count: u32,
+) -> Result<Vec<u32>, laminar_core::shuffle::ShuffleRoutingError> {
     if num_group_cols == 0 || batch.num_rows() == 0 {
-        return vec![0; batch.num_rows()];
+        return Ok(vec![0; batch.num_rows()]);
     }
     let columns: Vec<usize> = (0..num_group_cols).collect();
     laminar_core::shuffle::row_vnodes(batch, &columns, vnode_count)
 }
 
-#[cfg(feature = "state-tier")]
-fn cold_vnodes_touched(
-    batch: &RecordBatch,
-    num_group_cols: usize,
-    vnode_count: u32,
-    cold: &FxHashSet<u32>,
-) -> Vec<u32> {
-    if cold.is_empty() || batch.num_rows() == 0 {
-        return Vec::new();
-    }
-    let mut touched: FxHashSet<u32> = FxHashSet::default();
-    for v in hash_rows_to_vnodes(batch, num_group_cols, vnode_count) {
-        if cold.contains(&v) {
-            touched.insert(v);
+#[cfg(feature = "cluster")]
+impl SqlQueryOperator {
+    fn stage_uninit_vnode_slice(
+        &mut self,
+        vnode: u32,
+        checkpoint: &AggStateCheckpoint,
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        validate_agg_checkpoint_slice(checkpoint).map_err(|error| {
+            DbError::Pipeline(format!(
+                "per-vnode state validation for '{}' vnode {vnode}: {error}",
+                self.op_name
+            ))
+        })?;
+        let expected = self
+            .pending_restore
+            .as_ref()
+            .map(|pending| pending.fingerprint)
+            .or(self.pending_restore_slice_fingerprint);
+        if expected.is_some_and(|fingerprint| fingerprint != checkpoint.fingerprint) {
+            return Err(DbError::Pipeline(format!(
+                "per-vnode state fingerprint mismatch for '{}' vnode {vnode}: pending={}, incoming={}",
+                self.op_name,
+                expected.expect("checked Some"),
+                checkpoint.fingerprint
+            )));
         }
+        self.pending_restore_slice_fingerprint = Some(checkpoint.fingerprint);
+        self.pending_restore_slices
+            .push(Bytes::copy_from_slice(bytes));
+        Ok(())
     }
-    touched.into_iter().collect()
 }
 
 #[async_trait]
@@ -1312,6 +934,13 @@ impl GraphOperator for SqlQueryOperator {
         if matches!(self.state, QueryState::Uninit) {
             self.lazy_init().await?;
         }
+        #[cfg(feature = "cluster")]
+        if !self.aligned_replay.is_empty() && !matches!(self.state, QueryState::Agg(_)) {
+            return Err(DbError::Checkpoint(format!(
+                "non-aggregate SQL operator '{}' restored checkpointed shuffle replay",
+                self.op_name
+            )));
+        }
 
         let watermark = watermarks.first().copied().unwrap_or(i64::MIN);
 
@@ -1319,20 +948,7 @@ impl GraphOperator for SqlQueryOperator {
 
         if input_batches.is_empty() || input_batches.iter().all(|b| b.num_rows() == 0) {
             if matches!(self.state, QueryState::Agg(_)) {
-                // In cluster mode, drain the shuffle receiver even on empty local input.
-                #[cfg(feature = "cluster")]
-                if self.cluster_shuffle.is_some() {
-                    return self.execute_agg(input_batches, watermark).await;
-                }
-                #[cfg(feature = "state-tier")]
-                if self
-                    .promotion
-                    .as_ref()
-                    .is_some_and(AggPromotion::has_pending)
-                {
-                    return self.execute_agg(input_batches, watermark).await;
-                }
-                return self.emit_agg_output(watermark).await;
+                return self.execute_agg(input_batches, watermark).await;
             }
             return Ok(Vec::new());
         }
@@ -1387,49 +1003,13 @@ impl GraphOperator for SqlQueryOperator {
             None
         } else {
             match self.state {
-                QueryState::Uninit => self.pending_restore.clone(),
+                QueryState::Uninit => self.staged_pending_restore()?,
                 QueryState::Agg(ref mut agg_state) => Some(agg_state.checkpoint_groups()?),
                 QueryState::Compiled(_)
                 | QueryState::CachedPlan(_)
                 | QueryState::CachedPhysical(_) => None,
             }
         };
-        #[cfg(feature = "state-tier")]
-        let deferred: Vec<(i64, Vec<u8>)> = {
-            let mut out = Vec::new();
-            let batches = self
-                .promotion
-                .as_ref()
-                .map(|p| p.deferred.iter())
-                .into_iter()
-                .flatten()
-                .chain(self.pending_deferred.iter());
-            for (wm, batch) in batches {
-                let blob = laminar_core::serialization::serialize_batch_stream(batch)
-                    .map_err(|e| DbError::Pipeline(format!("promotion checkpoint: {e}")))?;
-                out.push((*wm, blob));
-            }
-            out
-        };
-        #[cfg(not(feature = "state-tier"))]
-        let deferred: Vec<(i64, Vec<u8>)> = Vec::new();
-
-        // Vnodes whose state must be rehydrated from durable partials on restart: whole demoted
-        // vnodes, AND partially-demoted vnodes (their cold groups ride a cold-only partial that the
-        // additive `rehydrate` merges on top of the manifest's resident groups).
-        #[cfg(feature = "state-tier")]
-        let cold_vnodes: Vec<u32> = match self.state {
-            QueryState::Agg(ref agg_state) => {
-                let mut v: rustc_hash::FxHashSet<u32> =
-                    agg_state.cold_vnodes().iter().copied().collect();
-                v.extend(agg_state.cold_groups_by_vnode(self.vnode_count).into_keys());
-                v.into_iter().collect()
-            }
-            _ => Vec::new(),
-        };
-        #[cfg(not(feature = "state-tier"))]
-        let cold_vnodes: Vec<u32> = Vec::new();
-
         #[cfg(feature = "cluster")]
         let revoke_retractions: Vec<(u32, Vec<u8>)> = self
             .pending_revoke_retractions
@@ -1442,19 +1022,31 @@ impl GraphOperator for SqlQueryOperator {
             .collect::<Result<_, DbError>>()?;
         #[cfg(not(feature = "cluster"))]
         let revoke_retractions: Vec<(u32, Vec<u8>)> = Vec::new();
+        #[cfg(feature = "cluster")]
+        let aligned_replay = self
+            .aligned_replay
+            .iter()
+            .map(|(assignment_version, watermark, batch)| {
+                laminar_core::serialization::serialize_batch_stream(batch.batch())
+                    .map(|blob| (*assignment_version, *watermark, blob))
+                    .map_err(|error| {
+                        DbError::Pipeline(format!(
+                            "aligned aggregate replay checkpoint for '{}': {error}",
+                            self.op_name
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        #[cfg(not(feature = "cluster"))]
+        let aligned_replay = Vec::new();
 
-        if agg.is_none()
-            && deferred.is_empty()
-            && cold_vnodes.is_empty()
-            && revoke_retractions.is_empty()
-        {
+        if agg.is_none() && revoke_retractions.is_empty() && aligned_replay.is_empty() {
             return Ok(None);
         }
         let cp = AggOpCheckpoint {
             agg,
-            deferred,
-            cold_vnodes,
             revoke_retractions,
+            aligned_replay,
         };
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
             .map(|v| v.to_vec())
@@ -1472,138 +1064,197 @@ impl GraphOperator for SqlQueryOperator {
             &checkpoint.data,
         )
         .map_err(|e| {
-            DbError::Pipeline(format!(
+            DbError::Checkpoint(format!(
                 "checkpoint deserialization for '{}': {e}",
                 self.op_name
             ))
         })?;
 
-        #[cfg(feature = "state-tier")]
-        for (wm, blob) in cp.deferred {
-            let batch = laminar_core::serialization::deserialize_batch_stream(&blob)
-                .map_err(|e| DbError::Pipeline(format!("promotion restore: {e}")))?;
-            match self.promotion.as_mut() {
-                Some(p) => p.defer(wm, batch),
-                None => self.pending_deferred.push((wm, batch)),
-            }
-        }
-        #[cfg(not(feature = "state-tier"))]
-        if !cp.deferred.is_empty() {
-            tracing::warn!(
-                query = %self.op_name,
-                count = cp.deferred.len(),
-                "dropping checkpointed promotion-deferred batches — \
-                 this binary has no state-tier support"
-            );
+        #[cfg(not(feature = "cluster"))]
+        if !cp.revoke_retractions.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' checkpoint requires cluster support ({} pending vnode retractions)",
+                self.op_name,
+                cp.revoke_retractions.len()
+            )));
         }
 
-        #[cfg(feature = "state-tier")]
-        if !cp.cold_vnodes.is_empty() {
-            self.pending_cold_rehydrate = cp.cold_vnodes;
+        let AggOpCheckpoint {
+            agg,
+            revoke_retractions,
+            aligned_replay,
+        } = cp;
+
+        #[cfg(not(feature = "cluster"))]
+        if !aligned_replay.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' checkpoint contains cluster shuffle replay without cluster support",
+                self.op_name
+            )));
         }
 
         #[cfg(feature = "cluster")]
-        for (v, blob) in cp.revoke_retractions {
-            let batch = laminar_core::serialization::deserialize_batch_stream(&blob)
-                .map_err(|e| DbError::Pipeline(format!("revoke retraction restore: {e}")))?;
-            self.pending_revoke_retractions.insert(v, batch);
-        }
+        let decoded_aligned_replay = aligned_replay
+            .into_iter()
+            .map(|(assignment_version, watermark, blob)| {
+                laminar_core::serialization::deserialize_batch_stream(&blob)
+                    .map(|batch| {
+                        (
+                            assignment_version,
+                            watermark,
+                            crate::operator::RetainedBatch::local(batch),
+                        )
+                    })
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "aligned aggregate replay restore for '{}': {error}",
+                            self.op_name
+                        ))
+                    })
+            })
+            .collect::<Result<VecDeque<_>, DbError>>()?;
         #[cfg(not(feature = "cluster"))]
-        if !cp.revoke_retractions.is_empty() {
-            tracing::warn!(
-                query = %self.op_name, count = cp.revoke_retractions.len(),
-                "dropping checkpointed revoke retractions — this binary has no cluster support"
-            );
+        let _ = aligned_replay;
+
+        #[cfg(feature = "cluster")]
+        let decoded_retractions = {
+            let mut decoded = rustc_hash::FxHashMap::default();
+            for (vnode, blob) in revoke_retractions {
+                let batch = laminar_core::serialization::deserialize_batch_stream(&blob).map_err(
+                    |error| DbError::Checkpoint(format!("revoke retraction restore: {error}")),
+                )?;
+                if decoded.insert(vnode, batch).is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "aggregate '{}' checkpoint contains duplicate revoke state for vnode {vnode}",
+                        self.op_name
+                    )));
+                }
+            }
+            decoded
+        };
+        #[cfg(not(feature = "cluster"))]
+        let _ = revoke_retractions;
+
+        #[cfg(feature = "cluster")]
+        if decoded_retractions
+            .keys()
+            .any(|vnode| self.pending_revoke_retractions.contains_key(vnode))
+        {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' checkpoint revoke state was applied more than once",
+                self.op_name
+            )));
+        }
+        #[cfg(feature = "cluster")]
+        if !self.aligned_replay.is_empty() && !decoded_aligned_replay.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' aligned shuffle replay was applied more than once",
+                self.op_name
+            )));
         }
 
-        let Some(agg_cp) = cp.agg else {
-            return Ok(());
-        };
-        match self.state {
-            QueryState::Agg(ref mut agg_state) => {
-                agg_state.restore_groups(&agg_cp)?;
+        match &mut self.state {
+            QueryState::Agg(agg_state) => {
+                if let Some(ref agg_checkpoint) = agg {
+                    agg_state.restore_groups(agg_checkpoint).map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "aggregate '{}' checkpoint restore failed: {error}",
+                            self.op_name
+                        ))
+                    })?;
+                }
             }
             QueryState::Uninit => {
-                self.pending_restore = Some(agg_cp);
+                if self.pending_restore.is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "aggregate '{}' checkpoint restore was applied more than once",
+                        self.op_name
+                    )));
+                }
+                #[cfg(feature = "cluster")]
+                if let (Some(checkpoint), Some(fingerprint)) =
+                    (agg.as_ref(), self.pending_restore_slice_fingerprint)
+                {
+                    if checkpoint.fingerprint != fingerprint {
+                        return Err(DbError::Checkpoint(format!(
+                            "aggregate '{}' whole-node/vnode restore fingerprint mismatch: manifest={}, vnode={fingerprint}",
+                            self.op_name, checkpoint.fingerprint
+                        )));
+                    }
+                }
+                self.pending_restore = agg;
             }
             QueryState::Compiled(_) | QueryState::CachedPlan(_) | QueryState::CachedPhysical(_) => {
-                tracing::warn!(
-                    query = %self.op_name,
-                    "Ignoring aggregate checkpoint for non-aggregate query (schema evolution?)"
-                );
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate checkpoint cannot be restored into non-aggregate query '{}'",
+                    self.op_name
+                )));
             }
         }
+
+        #[cfg(feature = "cluster")]
+        self.pending_revoke_retractions.extend(decoded_retractions);
+        #[cfg(feature = "cluster")]
+        self.aligned_replay.extend(decoded_aligned_replay);
         Ok(())
     }
 
-    fn estimated_state_bytes(&self) -> usize {
-        match &self.state {
-            QueryState::Agg(ref agg_state) => agg_state.estimated_size_bytes(),
-            _ => 0,
-        }
-    }
-
-    #[cfg(feature = "state-tier")]
+    #[cfg(feature = "cluster")]
     fn watermark_hold(&self) -> Option<i64> {
-        self.promotion
-            .as_ref()
-            .and_then(AggPromotion::min_deferred_watermark)
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn wants_input(&self) -> bool {
-        self.promotion
-            .as_ref()
-            .is_none_or(|p| p.deferred_rows() < p.max_deferred_rows)
+        self.aligned_replay
+            .iter()
+            .map(|(_, watermark, _)| *watermark)
+            .min()
     }
 
     #[cfg(feature = "cluster")]
-    async fn ingest_shuffle(
+    fn restored_output_watermark(&self) -> Option<i64> {
+        self.aligned_replay
+            .iter()
+            .map(|(_, watermark, _)| *watermark)
+            .min()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn wants_input(&self) -> bool {
+        self.aligned_replay.is_empty()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle(
         &mut self,
-        _stage: &str,
-        batch: RecordBatch,
+        stage: &str,
+        batch: crate::operator::RetainedBatch,
         watermark: i64,
     ) -> Result<(), DbError> {
-        if matches!(self.state, QueryState::Uninit) {
-            self.lazy_init().await?;
+        if self.cluster_shuffle.is_none() || stage != self.op_name.as_ref() {
+            return Err(DbError::Pipeline(format!(
+                "SQL operator '{}' rejected checkpointed shuffle stage '{stage}' outside its active scope",
+                self.op_name
+            )));
         }
-        // Peer rows arriving during checkpoint barrier alignment (or pre-staged before it) must NOT
-        // fold a demoted vnode/group straight back in: `process_batch` would rebuild a fresh zeroed
-        // accumulator while the authoritative state sits in the cold tier, corrupting the aggregate.
-        // Mirror the steady-state path — defer any batch touching cold state for fetch-on-access.
-        #[cfg(feature = "state-tier")]
-        if self.promotion.is_some() {
-            let (num_group_cols, cold) = match self.state {
-                QueryState::Agg(ref agg) => (agg.num_group_cols(), agg.cold_vnodes().clone()),
-                _ => (0, FxHashSet::default()),
-            };
-            let touched = cold_vnodes_touched(&batch, num_group_cols, self.vnode_count, &cold);
-            let touched_groups = if let QueryState::Agg(ref agg) = self.state {
-                agg.cold_groups_touched(&batch, self.vnode_count)?
-            } else {
-                Vec::new()
-            };
-            if !touched.is_empty() || !touched_groups.is_empty() {
-                if let Some(p) = self.promotion.as_mut() {
-                    for v in touched {
-                        p.issue_fetch(v);
-                    }
-                    for (key, vnode, group) in touched_groups {
-                        p.issue_fetch_group(key, vnode, group);
-                    }
-                    p.defer(watermark, batch);
-                }
-                return Ok(());
-            }
+        if !matches!(self.state, QueryState::Uninit | QueryState::Agg(_)) {
+            return Err(DbError::Pipeline(format!(
+                "non-aggregate SQL operator '{}' cannot accept checkpointed shuffle data",
+                self.op_name
+            )));
         }
-        if let QueryState::Agg(ref mut agg) = self.state {
-            agg.process_batch(&batch, watermark)?;
-        }
+        // A peer's pre-barrier row is checkpointed channel state. Applying it here would let the
+        // aggregate snapshot include the row while its downstream output remains absent forever.
+        // The normal post-checkpoint cycle drains this queue before processing new source input.
+        let assignment_version = batch.assignment_version().ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "aggregate '{}' received checkpointed shuffle data without an assignment scope",
+                self.op_name
+            ))
+        })?;
+        self.aligned_replay
+            .push_back((assignment_version, watermark, batch));
         Ok(())
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    #[allow(clippy::disallowed_types)] // checkpoint path; vnode-keyed map
     #[allow(clippy::too_many_lines)]
     fn checkpoint_by_vnode(
         &mut self,
@@ -1613,39 +1264,19 @@ impl GraphOperator for SqlQueryOperator {
         DbError,
     > {
         use crate::checkpoint_coordinator::StagedSlice;
-        // Hoisted before the `agg_state` borrow: with authoritative per-vnode partials the
-        // manifest carries no resident, so cold-bearing vnodes must stage self-contained slices.
-        #[cfg(feature = "state-tier")]
-        let self_contained = self.skip_whole_node_agg();
         // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
         // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
         let newly_acquired = self.take_newly_acquired();
-        // Cloned so the overlap counter can be bumped while `agg_state` is borrowed below.
-        #[cfg(feature = "state-tier")]
-        let prom = self.prom.clone();
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Ok(None);
         };
         agg_state.reset_acquired_vnodes(&newly_acquired);
 
-        // Keep resident and cold group sets disjoint before capture (both capture paths); an overlap
-        // would double-count on recovery.
-        #[cfg(feature = "state-tier")]
-        {
-            let overlaps = agg_state.heal_resident_cold_overlap();
-            if overlaps > 0 {
-                if let Some(ref p) = prom {
-                    p.state_tier_overlap_total.inc_by(overlaps);
-                }
-                tracing::warn!(overlaps, query = %self.op_name, "healed resident∩cold overlap before capture");
-            }
-        }
-
         // Incremental delta capture: each touched vnode emits a FULL re-base or a DELTA.
-        if let Some(chain_max) = self.delta_chain_max {
+        if let Some(chain_bound) = self.delta_chain_bound {
             if agg_state.delta_enabled() {
                 use crate::aggregate_state::VnodeCapture;
-                let captures = agg_state.checkpoint_delta_by_vnode(vnode_count, chain_max)?;
+                let captures = agg_state.checkpoint_delta_by_vnode(vnode_count, chain_bound)?;
                 if captures.is_empty() {
                     return Ok(None);
                 }
@@ -1655,24 +1286,9 @@ impl GraphOperator for SqlQueryOperator {
                         VnodeCapture::Full(cp) => StagedSlice::Bytes(bytes::Bytes::from(
                             serialize_agg_cp(&cp, &self.op_name)?,
                         )),
-                        VnodeCapture::Delta(d) => StagedSlice::Delta {
-                            changed: bytes::Bytes::from(serialize_agg_cp(
-                                &d.changed,
-                                &self.op_name,
-                            )?),
-                            tombstones: bytes::Bytes::from(d.tombstones_ipc),
-                        },
-                        #[cfg(feature = "state-tier")]
-                        VnodeCapture::FullWithColdGroups { full, group_keys } => {
-                            StagedSlice::FullWithColdGroups {
-                                resident: bytes::Bytes::from(serialize_agg_cp(
-                                    &full,
-                                    &self.op_name,
-                                )?),
-                                group_keys,
-                                codec: crate::checkpoint_coordinator::StateCodec::Agg,
-                            }
-                        }
+                        VnodeCapture::Delta(d) => StagedSlice::Delta(bytes::Bytes::from(
+                            serialize_agg_cp(&d.changed, &self.op_name)?,
+                        )),
                     };
                     out.insert(vnode, slice);
                 }
@@ -1681,176 +1297,17 @@ impl GraphOperator for SqlQueryOperator {
         }
 
         let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
-        #[cfg(feature = "state-tier")]
-        let cold: Vec<u32> = agg_state.cold_vnodes().iter().copied().collect();
-        #[cfg(not(feature = "state-tier"))]
-        let cold: Vec<u32> = Vec::new();
-        #[cfg(feature = "state-tier")]
-        let mut cold_groups = agg_state.cold_groups_by_vnode(vnode_count);
-        #[cfg(not(feature = "state-tier"))]
-        let cold_groups: std::collections::HashMap<u32, Vec<Vec<u8>>> =
-            std::collections::HashMap::new();
-        if per_vnode.is_empty() && cold.is_empty() && cold_groups.is_empty() {
+        if per_vnode.is_empty() {
             return Ok(None);
         }
-        let mut out = std::collections::HashMap::with_capacity(
-            per_vnode.len() + cold.len() + cold_groups.len(),
-        );
+        let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
         for (vnode, cp) in per_vnode {
-            let resident = bytes::Bytes::from(serialize_agg_cp(&cp, &self.op_name)?);
-            // A cold-bearing vnode's durable partial must be self-contained when the per-vnode
-            // chain is the primary agg checkpoint: the manifest carries no resident there, the
-            // tier is node-local and wiped on restart, and the cluster fold never promotes — a
-            // resident- or cold-dropping partial is unrecoverable data loss after a kill. The
-            // coordinator force-fetches the cold bytes and folds them in at upload. Embedded
-            // (manifest-primary) keeps the cold-only partial so resident isn't double-applied.
-            #[cfg(feature = "state-tier")]
-            if let Some(group_keys) = cold_groups.remove(&vnode) {
-                if self_contained {
-                    out.insert(
-                        vnode,
-                        StagedSlice::FullWithColdGroups {
-                            resident,
-                            group_keys,
-                            codec: crate::checkpoint_coordinator::StateCodec::Agg,
-                        },
-                    );
-                } else {
-                    out.insert(
-                        vnode,
-                        StagedSlice::ColdGroups {
-                            group_keys,
-                            codec: crate::checkpoint_coordinator::StateCodec::Agg,
-                        },
-                    );
-                }
-                continue;
-            }
-            out.insert(vnode, StagedSlice::Bytes(resident));
-        }
-        // Fully-cold vnodes (no resident groups left): cold-only is already self-contained.
-        #[cfg(feature = "state-tier")]
-        for (vnode, group_keys) in cold_groups {
             out.insert(
                 vnode,
-                StagedSlice::ColdGroups {
-                    group_keys,
-                    codec: crate::checkpoint_coordinator::StateCodec::Agg,
-                },
+                StagedSlice::Bytes(bytes::Bytes::from(serialize_agg_cp(&cp, &self.op_name)?)),
             );
         }
-        // Cold markers let the coordinator fetch the slice instead of treating the vnode as empty.
-        for vnode in cold {
-            out.insert(vnode, StagedSlice::Cold);
-        }
         Ok(Some(out))
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn demote_vnode(&mut self, vnode: u32, vnode_count: u32) -> bool {
-        match self.state {
-            QueryState::Agg(ref mut agg_state) => agg_state.demote_vnode(vnode, vnode_count),
-            _ => false,
-        }
-    }
-
-    #[cfg(feature = "state-tier")]
-    async fn demote_cold_groups(
-        &mut self,
-        target_bytes: usize,
-        vnode_count: u32,
-    ) -> (usize, usize) {
-        let Some(tier) = self.promotion.as_ref().map(|p| p.tier.clone()) else {
-            return (0, 0);
-        };
-        let candidates = match self.state {
-            QueryState::Agg(ref agg) => agg.demotable_groups(vnode_count, 256),
-            _ => return (0, 0),
-        };
-        let mut freed = 0usize;
-        let mut count = 0usize;
-        for (key, vnode, group) in candidates {
-            if freed >= target_bytes {
-                break;
-            }
-            // Encode the clean group, write it to the tier (off-compute, awaited), then drop —
-            // write-before-drop, so a failed write leaves the group resident.
-            let QueryState::Agg(ref mut agg) = self.state else {
-                break;
-            };
-            let cp = match agg.encode_group(&key) {
-                Ok(cp) => cp,
-                Err(e) => {
-                    tracing::warn!(query = %self.op_name, error = %e, "encode_group failed; skipping");
-                    continue;
-                }
-            };
-            let Ok(bytes) = serialize_agg_cp(&cp, &self.op_name) else {
-                continue;
-            };
-            let blen = bytes.len();
-            let (reply, rx) = oneshot::channel();
-            let req = crate::state_tier::TierRequest::DemoteGroup {
-                operator: Arc::clone(&self.op_name),
-                vnode,
-                group,
-                bytes: Bytes::from(bytes),
-                reply,
-            };
-            if tier.send(req).await.is_err() {
-                break;
-            }
-            if !matches!(rx.await, Ok(Ok(()))) {
-                continue;
-            }
-            if let QueryState::Agg(ref mut agg) = self.state {
-                agg.drop_demoted_group(&key);
-            }
-            freed += blen;
-            count += 1;
-        }
-        (count, freed)
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn can_demote(&self, vnode: u32, vnode_count: u32) -> bool {
-        match self.state {
-            QueryState::Agg(ref agg_state) => agg_state.can_demote(vnode, vnode_count),
-            _ => false,
-        }
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn attach_state_tier(&mut self, tier: crate::state_tier::TierTx) {
-        if matches!(self.state, QueryState::Agg(_)) {
-            self.promotion = Some(AggPromotion::new(Arc::clone(&self.op_name), tier));
-        } else {
-            self.tier_sender = Some(tier);
-        }
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn enable_group_delta_tracking(&mut self) {
-        self.enable_delta_tracking();
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn take_tier_cold_vnodes(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.pending_cold_rehydrate)
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn has_pending_promotion(&self) -> bool {
-        self.promotion
-            .as_ref()
-            .is_some_and(AggPromotion::has_pending)
-    }
-
-    #[cfg(feature = "state-tier")]
-    fn release_tier_drops(&mut self) {
-        if let Some(p) = self.promotion.as_mut() {
-            p.release_drops();
-        }
     }
 
     #[cfg(feature = "cluster")]
@@ -1865,42 +1322,20 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.merge_groups(&cp)?;
-                // NOTE: this method serves BOTH state-tier promotion (`drain_ready` → here) and the
-                // rebalance rehydration path (via `apply_vnode_chain`). It must NOT force-emit or
-                // cancel a revoke retraction — a promotion needs its restored `last_emitted` intact
-                // (demotion emitted no retraction). Those steps run only for genuine rebalance
-                // gainers, in `force_reemit_if_gainer` called from `apply_vnode_chain` (CL-4).
-                //
-                // `mark_vnode_hot` clears the cold flag (promotion); `mark_vnode_dirty` then blocks
-                // re-demotion until the next capture — else a rebalance-acquired vnode (never cold)
-                // could be demoted against stale tier bytes.
-                #[cfg(feature = "state-tier")]
-                {
-                    agg_state.mark_vnode_hot(vnode);
-                    agg_state.mark_vnode_dirty(vnode);
-                }
                 tracing::debug!(
                     query = %self.op_name, vnode, groups = merged,
                     "applied rehydrated vnode aggregate state"
                 );
             }
             QueryState::Uninit => {
-                // Fold into the pending restore; vnodes are disjoint so concatenating groups is safe.
-                match self.pending_restore {
-                    Some(ref mut existing) if existing.fingerprint == cp.fingerprint => {
-                        existing.append_disjoint(cp)?;
-                    }
-                    Some(_) => tracing::warn!(
-                        query = %self.op_name, vnode,
-                        "pending restore fingerprint mismatch — dropping rehydrated slice"
-                    ),
-                    None => self.pending_restore = Some(cp),
-                }
+                self.stage_uninit_vnode_slice(vnode, &cp, bytes)?;
             }
-            _ => tracing::warn!(
-                query = %self.op_name, vnode,
-                "ignoring rehydrated vnode state for non-aggregate query"
-            ),
+            _ => {
+                return Err(DbError::Pipeline(format!(
+                    "per-vnode aggregate state for '{}' vnode {vnode} targeted a non-aggregate query",
+                    self.op_name
+                )));
+            }
         }
         Ok(())
     }
@@ -1910,15 +1345,13 @@ impl GraphOperator for SqlQueryOperator {
         &mut self,
         vnode: u32,
         base: &[u8],
-        deltas: &[(&[u8], &[u8])],
+        deltas: &[&[u8]],
     ) -> Result<(), DbError> {
         // No deltas → the base alone is the recovered state (full / reference / simple acquire).
         if deltas.is_empty() {
             self.apply_vnode_state(vnode, base)?;
-            // Rebalance gainer force-emit (this path is reached ONLY by rebalance rehydration, never
-            // by state-tier promotion, which calls apply_vnode_state directly): a same-cycle reacquire
-            // keeps its restored last_emitted (cancel the retraction), a genuine gainer force-emits the
-            // merged groups so they don't vanish from the MV (CL-4).
+            // A same-cycle reacquire keeps its restored last_emitted (cancel the retraction), while a genuine gainer force-emits the
+            // restored groups so they don't vanish from the MV (CL-4).
             if self.pending_revoke_retractions.remove(&vnode).is_none() {
                 if let Some(vc) = self
                     .cluster_shuffle
@@ -1950,7 +1383,7 @@ impl GraphOperator for SqlQueryOperator {
             })?;
         let delta_objs: Vec<crate::aggregate_state::AggVnodeDelta> = deltas
             .iter()
-            .map(|(changed, tombstones)| {
+            .map(|changed| {
                 let cp: AggStateCheckpoint =
                     rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(changed).map_err(
                         |e| {
@@ -1960,10 +1393,7 @@ impl GraphOperator for SqlQueryOperator {
                             ))
                         },
                     )?;
-                Ok(crate::aggregate_state::AggVnodeDelta {
-                    changed: cp,
-                    tombstones_ipc: tombstones.to_vec(),
-                })
+                Ok(crate::aggregate_state::AggVnodeDelta { changed: cp })
             })
             .collect::<Result<_, DbError>>()?;
 
@@ -1971,7 +1401,7 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
                 // Same-cycle reacquire keeps the restored `last_emitted` and cancels its retraction;
-                // a genuine gainer (no pending retraction) force-emits the merged groups instead, or
+                // a genuine gainer (no pending retraction) force-emits the restored groups instead, or
                 // the restored `last_emitted` suppresses its first emit and the group vanishes (CL-4).
                 if self.pending_revoke_retractions.remove(&vnode).is_none() {
                     if let Some(vc) = self
@@ -1982,11 +1412,6 @@ impl GraphOperator for SqlQueryOperator {
                         agg_state.force_reemit_acquired_vnode(vnode, vc);
                     }
                 }
-                #[cfg(feature = "state-tier")]
-                {
-                    agg_state.mark_vnode_hot(vnode);
-                    agg_state.mark_vnode_dirty(vnode);
-                }
                 // Info so a soak can compare the merged baseline against expectations per vnode.
                 tracing::info!(
                     query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
@@ -1994,49 +1419,26 @@ impl GraphOperator for SqlQueryOperator {
                 );
             }
             QueryState::Uninit => {
-                // Restart before the agg is built: fold the base into the pending restore and stash
-                // the deltas; `lazy_init` replays them after `restore_groups`.
-                let accepted = match self.pending_restore {
-                    Some(ref mut existing) if existing.fingerprint == base_cp.fingerprint => {
-                        existing.append_disjoint(base_cp)?;
-                        true
-                    }
-                    Some(_) => {
-                        tracing::warn!(
-                            query = %self.op_name, vnode,
-                            "pending restore fingerprint mismatch — dropping rehydrated chain base and its deltas"
-                        );
-                        false
-                    }
-                    None => {
-                        self.pending_restore = Some(base_cp);
-                        true
-                    }
-                };
-                // Only stash deltas whose base was accepted; deltas without their base would rebuild
-                // partial state.
-                if accepted {
-                    self.pending_restore_deltas.extend(delta_objs);
-                    self.pending_restore_reemit.insert(vnode);
-                }
+                // Keep each base in its original serialized form; lazy_init validates disjointness
+                // and performs one columnar merge across the complete recovered set.
+                self.stage_uninit_vnode_slice(vnode, &base_cp, base)?;
+                self.pending_restore_deltas.extend(delta_objs);
+                self.pending_restore_reemit.insert(vnode);
             }
-            _ => tracing::warn!(
-                query = %self.op_name, vnode,
-                "ignoring rehydrated vnode chain for non-aggregate query"
-            ),
+            _ => {
+                return Err(DbError::Pipeline(format!(
+                    "per-vnode aggregate chain for '{}' vnode {vnode} targeted a non-aggregate query",
+                    self.op_name
+                )));
+            }
         }
         Ok(())
     }
 
     #[cfg(feature = "cluster")]
-    fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) {
+    fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) -> Result<(), DbError> {
         if revoked.is_empty() {
-            return;
-        }
-        // A revoked vnode must stop counting as previously-owned, else a later re-acquire would not
-        // register in `take_newly_acquired` and would skip the FULL re-base.
-        for v in revoked {
-            self.prev_owned.remove(v);
+            return Ok(());
         }
         let vnode_count = self
             .cluster_shuffle
@@ -2044,20 +1446,29 @@ impl GraphOperator for SqlQueryOperator {
             .map(|c| c.registry.vnode_count());
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
-                if let Some(vc) = vnode_count {
-                    match agg_state.drop_vnodes(revoked, vc) {
-                        Ok(r) => self.pending_revoke_retractions.extend(r),
-                        Err(e) => tracing::warn!(
-                            query = %self.op_name, error = %e,
-                            "revoke retraction build failed; MV rows may be stale"
-                        ),
-                    }
-                }
+                let vc = vnode_count.ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' cannot revoke vnode state without cluster ownership",
+                        self.op_name
+                    ))
+                })?;
+                let retractions = agg_state.drop_vnodes(revoked, vc).map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' vnode revocation failed: {error}",
+                        self.op_name
+                    ))
+                })?;
+                self.pending_revoke_retractions.extend(retractions);
             }
             // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until
-            // `lazy_init` folds them in, else they'd survive to a later re-acquire and double-count.
+            // `lazy_init` folds them in, else this node could expose state it no longer owns.
             _ => self.deferred_revoke_vnodes.extend(revoked.iter().copied()),
         }
+        // A later re-acquire must register in `take_newly_acquired` and force a FULL re-base.
+        for vnode in revoked {
+            self.prev_owned.remove(vnode);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]
@@ -2068,12 +1479,506 @@ impl GraphOperator for SqlQueryOperator {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    pub(super) fn context_and_batch() -> (SessionContext, RecordBatch) {
+        let context = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["seed"])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                .unwrap();
+        context.register_table("events", Arc::new(table)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        (context, batch)
+    }
+
+    #[tokio::test]
+    async fn aggregate_restore_mismatch_faults_during_lazy_init() {
+        let (context, batch) = context_and_batch();
+        let mut donor = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+        );
+        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        let checkpoint = donor.checkpoint().unwrap().unwrap();
+
+        let mut restored = SqlQueryOperator::new(
+            "count",
+            "SELECT key, COUNT(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        restored.restore(checkpoint).unwrap();
+        let error = restored.lazy_init().await.unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("fingerprint mismatch"));
+        assert!(matches!(restored.state, QueryState::Uninit));
+        assert!(restored.pending_restore.is_some());
+    }
+
+    #[tokio::test]
+    async fn aggregate_checkpoint_cannot_target_initialized_non_aggregate() {
+        let (context, batch) = context_and_batch();
+        let mut donor = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+        );
+        donor
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+        let checkpoint = donor.checkpoint().unwrap().unwrap();
+
+        let mut projection = SqlQueryOperator::new(
+            "projection",
+            "SELECT key, value FROM events",
+            context,
+            None,
+            false,
+        );
+        projection
+            .process(&[vec![batch]], &[i64::MIN])
+            .await
+            .unwrap();
+        let error = projection.restore(checkpoint).unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("non-aggregate"));
+    }
+
+    #[tokio::test]
+    async fn local_derived_aggregate_retains_datafusion_fallback() {
+        let (context, _) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "ratio",
+            "SELECT SUM(value) / COUNT(value) AS ratio FROM events",
+            context,
+            None,
+            false,
+        );
+
+        operator.lazy_init().await.unwrap();
+        assert!(matches!(operator.state, QueryState::CachedPlan(_)));
+    }
+
+    #[test]
+    fn corrupt_aggregate_checkpoint_is_a_recovery_fault() {
+        let (context, _) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        let error = operator
+            .restore(OperatorCheckpoint {
+                data: b"not-rkyv".to_vec(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.requires_pipeline_recovery());
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[test]
+    fn cluster_aggregate_checkpoint_is_rejected_without_support() {
+        let (context, _) = context_and_batch();
+        let checkpoint = AggOpCheckpoint {
+            agg: None,
+            revoke_retractions: vec![(3, Vec::new())],
+            aligned_replay: Vec::new(),
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+            .unwrap()
+            .to_vec();
+        let mut operator = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        let error = operator.restore(OperatorCheckpoint { data }).unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("cluster support"));
+    }
+}
+
 #[cfg(all(test, feature = "cluster"))]
 mod delta_primary_tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use laminar_core::state::{NodeId, VnodeRegistry};
+
+    async fn single_owner_shuffle() -> (ClusterShuffleConfig, u64) {
+        let self_id = NodeId(1);
+        let incarnation = uuid::Uuid::from_u128(1);
+        let registry = Arc::new(VnodeRegistry::single_owner(8, self_id));
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                self_id.0,
+                "127.0.0.1:0".parse().unwrap(),
+                incarnation,
+            )
+            .await
+            .unwrap(),
+        );
+        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
+            self_id.0,
+            incarnation,
+        ));
+        let version = registry.assignment_version();
+        let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+            version,
+            &[self_id.0; 8],
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: incarnation,
+            }],
+        )
+        .unwrap();
+        sender
+            .install_assignment_fence(&fence, &[self_id.0; 8])
+            .unwrap();
+        receiver
+            .install_assignment_fence(&fence, &[self_id.0; 8])
+            .unwrap();
+        (
+            ClusterShuffleConfig {
+                registry,
+                sender,
+                receiver,
+                self_id,
+            },
+            version,
+        )
+    }
+
+    #[tokio::test]
+    async fn cluster_aggregate_never_falls_back_to_node_local_execution() {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "ratio",
+            "SELECT SUM(value) / COUNT(value) AS ratio FROM events",
+            context,
+            None,
+            false,
+        );
+        let (shuffle, _) = single_owner_shuffle().await;
+        operator.attach_cluster_shuffle(shuffle);
+
+        let error = operator
+            .process(&[vec![batch]], &[i64::MIN])
+            .await
+            .expect_err("a derived aggregate must not execute against node-local input");
+        assert!(error.to_string().contains("LDB-4007"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("exact incremental execution path"),
+            "{error}"
+        );
+        assert!(matches!(operator.state, QueryState::Uninit));
+    }
+
+    async fn aggregate_state_checkpoint() -> (SessionContext, AggStateCheckpoint) {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+        );
+        operator.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        let QueryState::Agg(ref mut aggregate) = operator.state else {
+            panic!("expected aggregate state");
+        };
+        (context, aggregate.checkpoint_groups().unwrap())
+    }
+
+    #[tokio::test]
+    async fn checkpointed_aligned_replay_emits_once_after_restore() {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let (donor_shuffle, version) = single_owner_shuffle().await;
+        let mut donor = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            true,
+        );
+        donor.attach_cluster_shuffle(donor_shuffle);
+        donor.lazy_init().await.unwrap();
+        donor
+            .aligned_replay
+            .push_back((version, 42, crate::operator::RetainedBatch::local(batch)));
+        let checkpoint = donor.checkpoint().unwrap().unwrap();
+
+        let (restored_shuffle, restored_version) = single_owner_shuffle().await;
+        assert_eq!(restored_version, version);
+        let mut restored = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            true,
+        );
+        restored.attach_cluster_shuffle(restored_shuffle);
+        restored.restore(checkpoint).unwrap();
+        assert!(!restored.wants_input());
+        assert_eq!(restored.watermark_hold(), Some(42));
+        assert_eq!(restored.restored_output_watermark(), Some(42));
+
+        let output = restored.process(&[Vec::new()], &[100]).await.unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert!(restored.aligned_replay.is_empty());
+        assert!(restored.wants_input());
+        assert_eq!(restored.watermark_hold(), None);
+
+        let second = restored.process(&[Vec::new()], &[100]).await.unwrap();
+        assert!(
+            second.is_empty(),
+            "aligned replay must not be applied twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn aligned_replay_processes_one_logical_batch_per_cycle() {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let (shuffle, version) = single_owner_shuffle().await;
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            true,
+        );
+        operator.attach_cluster_shuffle(shuffle);
+        operator.lazy_init().await.unwrap();
+        operator.aligned_replay.push_back((
+            version,
+            41,
+            crate::operator::RetainedBatch::local(batch.clone()),
+        ));
+        operator.aligned_replay.push_back((
+            version,
+            42,
+            crate::operator::RetainedBatch::local(batch),
+        ));
+
+        let first = operator.process(&[Vec::new()], &[100]).await.unwrap();
+        assert_eq!(first.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(operator.aligned_replay.len(), 1);
+        assert_eq!(operator.watermark_hold(), Some(42));
+        assert!(!operator.wants_input());
+
+        let second = operator.process(&[Vec::new()], &[100]).await.unwrap();
+        assert!(!second.is_empty());
+        assert!(operator.aligned_replay.is_empty());
+        assert!(operator.wants_input());
+
+        let after_drain = operator.process(&[Vec::new()], &[100]).await.unwrap();
+        assert!(after_drain.is_empty(), "drained replay must not run again");
+    }
+
+    #[tokio::test]
+    async fn failed_aligned_replay_remains_queued_for_checkpoint_recovery() {
+        let (context, _) = super::checkpoint_tests::context_and_batch();
+        let (shuffle, version) = single_owner_shuffle().await;
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            true,
+        );
+        operator.attach_cluster_shuffle(shuffle);
+        operator.lazy_init().await.unwrap();
+        let invalid = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        operator.aligned_replay.push_back((
+            version,
+            41,
+            crate::operator::RetainedBatch::local(invalid),
+        ));
+
+        let error = operator
+            .process(&[Vec::new()], &[100])
+            .await
+            .expect_err("schema-incompatible replay must fail closed");
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(operator.aligned_replay.len(), 1);
+        assert!(!operator.wants_input());
+    }
+
+    #[tokio::test]
+    async fn lazy_delta_restore_failure_requires_checkpoint_recovery() {
+        let (context, base) = aggregate_state_checkpoint().await;
+        let mut invalid_delta = base.clone();
+        invalid_delta.fingerprint ^= 1;
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        operator.pending_restore = Some(base);
+        operator
+            .pending_restore_deltas
+            .push(crate::aggregate_state::AggVnodeDelta {
+                changed: invalid_delta,
+            });
+
+        let error = operator.lazy_init().await.unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("delta fingerprint mismatch"));
+        assert!(error.requires_pipeline_recovery());
+        assert!(matches!(operator.state, QueryState::Uninit));
+        assert!(
+            operator.pending_restore.is_some(),
+            "a rejected delta must retain the baseline it depends on"
+        );
+        assert_eq!(operator.pending_restore_deltas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rehydrated_vnode_fingerprint_mismatch_is_not_dropped() {
+        let (context, checkpoint) = aggregate_state_checkpoint().await;
+        let first = serialize_agg_cp(&checkpoint, "totals").unwrap();
+        let mut mismatched = checkpoint;
+        mismatched.fingerprint ^= 1;
+        let second = serialize_agg_cp(&mismatched, "totals").unwrap();
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+
+        operator.apply_vnode_state(1, &first).unwrap();
+        let error = operator.apply_vnode_state(2, &second).unwrap_err();
+        assert!(matches!(error, DbError::Pipeline(_)));
+        assert!(error.to_string().contains("fingerprint mismatch"));
+        assert_eq!(operator.pending_restore_slices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn uninit_vnode_bases_are_retained_raw_and_bulk_merged_once() {
+        let (context, _) = super::checkpoint_tests::context_and_batch();
+        let sql = "SELECT key, SUM(value) AS total FROM events GROUP BY key";
+        let names = (0..128)
+            .map(|index| format!("key-{index}"))
+            .collect::<Vec<_>>();
+        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Utf8, false),
+                arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(Int64Array::from(vec![1_i64; 128])),
+            ],
+        )
+        .unwrap();
+        let mut donor = SqlQueryOperator::new("totals", sql, context.clone(), None, false);
+        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        let QueryState::Agg(ref mut aggregate) = donor.state else {
+            panic!("expected aggregate state");
+        };
+        let slices = aggregate.checkpoint_groups_by_vnode(64).unwrap();
+        assert!(
+            slices.len() > 16,
+            "test needs many independently recovered vnodes"
+        );
+
+        let mut restored = SqlQueryOperator::new("totals", sql, context, None, false);
+        for (vnode, checkpoint) in &slices {
+            let bytes = serialize_agg_cp(checkpoint, "totals").unwrap();
+            restored.apply_vnode_state(*vnode, &bytes).unwrap();
+        }
+        assert!(restored.pending_restore.is_none());
+        assert_eq!(restored.pending_restore_slices.len(), slices.len());
+
+        restored.lazy_init().await.unwrap();
+        assert!(restored.pending_restore_slices.is_empty());
+        let QueryState::Agg(ref mut aggregate) = restored.state else {
+            panic!("expected restored aggregate state");
+        };
+        assert_eq!(
+            aggregate.checkpoint_groups().unwrap().last_updated_ms.len(),
+            128
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_vnode_revoke_without_ownership_faults_restore() {
+        let (context, base) = aggregate_state_checkpoint().await;
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        operator.pending_restore = Some(base);
+        operator.deferred_revoke_vnodes.insert(3);
+        operator.pending_restore_reemit.insert(2);
+
+        let error = operator.lazy_init().await.unwrap_err();
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("without cluster ownership"));
+        assert!(operator.pending_restore.is_some());
+        assert!(operator.deferred_revoke_vnodes.contains(&3));
+        assert!(
+            operator.pending_restore_reemit.contains(&2),
+            "a late revoke failure must not consume earlier staged re-emission work"
+        );
+        assert!(matches!(operator.state, QueryState::Uninit));
+    }
 
     // A sharded aggregate with the delta chain as primary must NOT capture its groups into the
     // whole-node manifest blob (state lives in per-vnode partials); delta-off captures whole-node.
@@ -2108,19 +2013,25 @@ mod delta_primary_tests {
             ctx,
             None,
             false,
-            None,
         );
 
         let registry = Arc::new(VnodeRegistry::new(8));
         registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
         let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap(),
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                1,
+                "127.0.0.1:0".parse().unwrap(),
+                uuid::Uuid::from_u128(1),
+            )
+            .await
+            .unwrap(),
         );
         op.attach_cluster_shuffle(ClusterShuffleConfig {
             registry,
-            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                1,
+                uuid::Uuid::from_u128(1),
+            )),
             receiver,
             self_id: NodeId(1),
         });
@@ -2173,18 +2084,24 @@ mod delta_primary_tests {
             ctx,
             None,
             false,
-            None,
         );
         let registry = Arc::new(VnodeRegistry::new(8));
         registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
         let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap(),
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                1,
+                "127.0.0.1:0".parse().unwrap(),
+                uuid::Uuid::from_u128(1),
+            )
+            .await
+            .unwrap(),
         );
         op.attach_cluster_shuffle(ClusterShuffleConfig {
             registry,
-            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                1,
+                uuid::Uuid::from_u128(1),
+            )),
             receiver,
             self_id: NodeId(1),
         });
@@ -2198,12 +2115,11 @@ mod delta_primary_tests {
         );
     }
 
-    // Lose-then-reacquire: rehydrating a vnode's durable slice must merge into EMPTY state, not on
-    // top of the stale leftover. `drop_owned_vnodes` (revocation) clears the leftover so the
-    // additive `merge_groups` reproduces the original value; without the drop it double-counts.
+    // A FULL vnode image is authoritative and repeat delivery is idempotent. Revocation still has
+    // to remove the vnode immediately so this node does not expose state it no longer owns.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn reacquire_after_revoke_does_not_double_count() {
+    async fn full_vnode_replay_is_idempotent_and_reacquire_restores_revoked_state() {
         async fn populated_op() -> SqlQueryOperator {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, false),
@@ -2228,18 +2144,24 @@ mod delta_primary_tests {
                 ctx,
                 None,
                 false,
-                None,
             );
             let registry = Arc::new(VnodeRegistry::new(8));
             registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
             let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                    .await
-                    .unwrap(),
+                laminar_core::shuffle::ShuffleReceiver::bind(
+                    1,
+                    "127.0.0.1:0".parse().unwrap(),
+                    uuid::Uuid::from_u128(1),
+                )
+                .await
+                .unwrap(),
             );
             op.attach_cluster_shuffle(ClusterShuffleConfig {
                 registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                    1,
+                    uuid::Uuid::from_u128(1),
+                )),
                 receiver,
                 self_id: NodeId(1),
             });
@@ -2298,40 +2220,39 @@ mod delta_primary_tests {
             })
             .expect("at least one full vnode slice");
 
-        // Control: re-apply v's slice WITHOUT dropping → its groups double-count.
+        // Replaying an already-applied FULL slice, including retry after a lost ack, is idempotent.
         let mut control = populated_op().await;
         control
             .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
             .await
             .unwrap();
         control.apply_vnode_state(v, &slice_bytes).unwrap();
-        assert!(
-            total_sum(&mut control) > 3,
-            "without the revoke-drop, re-applying a vnode slice double-counts (additive merge)"
-        );
+        control.apply_vnode_state(v, &slice_bytes).unwrap();
+        assert_eq!(total_sum(&mut control), 3);
 
-        // Fixed: drop v on revocation, THEN re-apply → merges into empty, original value restored.
+        // Revocation removes the vnode immediately; a later authoritative FULL restores it.
         let mut fixed = populated_op().await;
         fixed
             .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
             .await
             .unwrap();
         let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
-        fixed.drop_owned_vnodes(&revoked);
+        fixed.drop_owned_vnodes(&revoked).unwrap();
+        assert!(total_sum(&mut fixed) < 3);
         fixed.apply_vnode_state(v, &slice_bytes).unwrap();
         assert_eq!(
             total_sum(&mut fixed),
             3,
-            "after revoke-drop, re-acquiring the vnode reproduces the exact aggregate (no doubling)"
+            "re-acquiring the vnode restores the committed aggregate"
         );
     }
 
     // A revoke that lands while the operator is still Uninit (restart + rebalance before the first
-    // process) must be deferred and applied after `lazy_init` folds `pending_restore`; otherwise the
-    // restored groups for the lost vnode survive and double-count on a later re-acquire.
+    // process) must be deferred and applied after `lazy_init` folds `pending_restore`; otherwise
+    // this node can expose restored groups it no longer owns.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn uninit_revoke_defers_drop_no_double_count() {
+    async fn uninit_revoke_is_applied_before_reacquire() {
         async fn populated_op() -> SqlQueryOperator {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, false),
@@ -2356,18 +2277,24 @@ mod delta_primary_tests {
                 ctx,
                 None,
                 false,
-                None,
             );
             let registry = Arc::new(VnodeRegistry::new(8));
             registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
             let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                    .await
-                    .unwrap(),
+                laminar_core::shuffle::ShuffleReceiver::bind(
+                    1,
+                    "127.0.0.1:0".parse().unwrap(),
+                    uuid::Uuid::from_u128(1),
+                )
+                .await
+                .unwrap(),
             );
             op.attach_cluster_shuffle(ClusterShuffleConfig {
                 registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                    1,
+                    uuid::Uuid::from_u128(1),
+                )),
                 receiver,
                 self_id: NodeId(1),
             });
@@ -2422,31 +2349,21 @@ mod delta_primary_tests {
             .expect("whole-node checkpoint")
             .data;
 
-        // Control: restore, init (folds {a:1,b:2}) WITHOUT dropping v, then re-acquire v → doubles.
-        let mut control = populated_op().await;
-        control
-            .restore(OperatorCheckpoint {
-                data: whole.clone(),
-            })
-            .unwrap();
-        control.process(&[], &[i64::MIN]).await.unwrap();
-        control.apply_vnode_state(v, &slice_bytes).unwrap();
-        assert!(
-            total_sum(&mut control) > 3,
-            "restoring then re-acquiring without the deferred drop double-counts"
-        );
-
-        // Fixed: revoke v WHILE Uninit (deferred), init folds then drops v, re-acquire merges clean.
+        // Revoke v while Uninit; lazy initialization folds the restore and then applies the drop.
         let mut fixed = populated_op().await;
         fixed.restore(OperatorCheckpoint { data: whole }).unwrap();
         let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
-        fixed.drop_owned_vnodes(&revoked); // Uninit → deferred
+        fixed.drop_owned_vnodes(&revoked).unwrap(); // Uninit → deferred
         fixed.process(&[], &[i64::MIN]).await.unwrap(); // lazy_init folds restore, then drops v
+        assert!(
+            total_sum(&mut fixed) < 3,
+            "deferred revocation must remove the lost vnode before output"
+        );
         fixed.apply_vnode_state(v, &slice_bytes).unwrap();
         assert_eq!(
             total_sum(&mut fixed),
             3,
-            "a revoke deferred from the Uninit window still prevents the re-acquire double-count"
+            "re-acquiring the vnode restores the committed aggregate"
         );
     }
 
@@ -2478,18 +2395,24 @@ mod delta_primary_tests {
                 ctx,
                 None,
                 true, // changelog: emission is dirty-gated + last_emitted-deduped
-                None,
             );
             let registry = Arc::new(VnodeRegistry::new(8));
             registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
             let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                    .await
-                    .unwrap(),
+                laminar_core::shuffle::ShuffleReceiver::bind(
+                    1,
+                    "127.0.0.1:0".parse().unwrap(),
+                    uuid::Uuid::from_u128(1),
+                )
+                .await
+                .unwrap(),
             );
             op.attach_cluster_shuffle(ClusterShuffleConfig {
                 registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                    1,
+                    uuid::Uuid::from_u128(1),
+                )),
                 receiver,
                 self_id: NodeId(1),
             });
@@ -2572,18 +2495,24 @@ mod delta_primary_tests {
                 ctx,
                 None,
                 true,
-                None,
             );
             let registry = Arc::new(VnodeRegistry::new(8));
             registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
             let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                    .await
-                    .unwrap(),
+                laminar_core::shuffle::ShuffleReceiver::bind(
+                    1,
+                    "127.0.0.1:0".parse().unwrap(),
+                    uuid::Uuid::from_u128(1),
+                )
+                .await
+                .unwrap(),
             );
             op.attach_cluster_shuffle(ClusterShuffleConfig {
                 registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(1)),
+                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                    1,
+                    uuid::Uuid::from_u128(1),
+                )),
                 receiver,
                 self_id: NodeId(1),
             });
@@ -2646,573 +2575,5 @@ mod delta_primary_tests {
             "the Uninit fold must restore and force-emit EVERY donor group across all vnodes; \
              a partial fold is the soak's one-burst loss"
         );
-    }
-}
-
-#[cfg(all(test, feature = "state-tier"))]
-mod promotion_tests {
-    use super::*;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use laminar_core::state::{NodeId, VnodeRegistry};
-    use rustc_hash::FxHashMap;
-    use std::time::Duration;
-
-    const VNODES: u32 = 8;
-
-    fn events_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]))
-    }
-
-    fn events_batch(keys: &[&str], vals: &[i64]) -> RecordBatch {
-        RecordBatch::try_new(
-            events_schema(),
-            vec![
-                Arc::new(StringArray::from(keys.to_vec())),
-                Arc::new(Int64Array::from(vals.to_vec())),
-            ],
-        )
-        .unwrap()
-    }
-
-    /// `key -> total` for the changelog inserts (weight > 0) in the output.
-    fn inserts(batches: &[RecordBatch]) -> FxHashMap<String, i64> {
-        let mut out = FxHashMap::default();
-        for b in batches {
-            if b.num_rows() == 0 {
-                continue;
-            }
-            let key = b
-                .column(b.schema().index_of("key").unwrap())
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let total = b
-                .column(b.schema().index_of("total").unwrap())
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            // The Z-set weight is the trailing column in changelog output.
-            let weight = b
-                .column(b.num_columns() - 1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            for i in 0..b.num_rows() {
-                if weight.value(i) > 0 {
-                    out.insert(key.value(i).to_string(), total.value(i));
-                }
-            }
-        }
-        out
-    }
-
-    async fn single_node_shuffle() -> ClusterShuffleConfig {
-        let registry = Arc::new(VnodeRegistry::new(VNODES));
-        let assignment: Arc<[NodeId]> = (0..VNODES).map(|_| NodeId(1)).collect::<Vec<_>>().into();
-        registry.set_assignment(assignment);
-        let sender = laminar_core::shuffle::ShuffleSender::new(1);
-        let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap(),
-        );
-        ClusterShuffleConfig {
-            registry,
-            sender: Arc::new(sender),
-            receiver,
-            self_id: NodeId(1),
-        }
-    }
-
-    async fn build_op(tier: crate::state_tier::TierTx) -> SqlQueryOperator {
-        let ctx = laminar_sql::create_session_context();
-        let mem = datafusion::datasource::MemTable::try_new(
-            events_schema(),
-            vec![vec![events_batch(&["seed"], &[0])]],
-        )
-        .unwrap();
-        ctx.register_table("events", Arc::new(mem)).unwrap();
-        let mut op = SqlQueryOperator::new(
-            "out",
-            "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-            ctx,
-            None,
-            true, // emit_changelog — required for demotion
-            None,
-        );
-        op.attach_cluster_shuffle(single_node_shuffle().await);
-        op.attach_state_tier(tier);
-        op
-    }
-
-    /// Establish groups, demote every vnode to the tier, then feed a new row
-    /// for an existing key: it must defer (hold the watermark), promote its
-    /// vnode off-thread, and replay so the aggregate reflects both the
-    /// restored and the new contribution.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn promotes_demoted_vnode_on_incoming_row() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx).await;
-
-        // Cycle 1: a=1, b=2, c=3.
-        let out1 = op
-            .process(&[vec![events_batch(&["a", "b", "c"], &[1, 2, 3])]], &[10])
-            .await
-            .unwrap();
-        assert_eq!(inserts(&out1).get("a"), Some(&1));
-
-        // Capture the clean baseline, persist every vnode's slice, demote all.
-        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
-        for (v, slice) in &staged {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice {
-                store.put("out", *v, bytes.as_ref()).unwrap();
-            }
-        }
-        for &v in staged.keys() {
-            assert!(op.demote_vnode(v, VNODES), "clean vnode must demote");
-        }
-        assert_eq!(op.estimated_state_bytes(), 0, "all groups demoted");
-
-        // Cycle 2: a new row for 'a' hits a cold vnode → deferred, not emitted.
-        let out2 = op
-            .process(&[vec![events_batch(&["a"], &[5])]], &[20])
-            .await
-            .unwrap();
-        assert!(
-            !inserts(&out2).contains_key("a"),
-            "a row for a demoted vnode must defer, not emit a partial aggregate"
-        );
-        assert_eq!(
-            op.watermark_hold(),
-            Some(20),
-            "the deferred row must hold the output watermark"
-        );
-
-        // Idle cycles drive the promotion fetch + replay to completion.
-        let mut final_a = None;
-        for _ in 0..200 {
-            let out = op.process(&[vec![]], &[30]).await.unwrap();
-            if let Some(&t) = inserts(&out).get("a") {
-                final_a = Some(t);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        assert_eq!(
-            final_a,
-            Some(6),
-            "promoted slice merged: original 1 + new 5"
-        );
-        assert_eq!(
-            op.watermark_hold(),
-            None,
-            "nothing deferred after promotion"
-        );
-    }
-
-    /// A demoted vnode the tier genuinely cannot produce (here: marked cold but its bytes were
-    /// never written) must ESCALATE to a hard error after a bounded number of promotion fetches —
-    /// not retry forever, holding the watermark and backpressuring the source with no signal.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn promotion_fetch_miss_escalates_instead_of_wedging() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx).await;
-
-        // Establish 'a', capture the clean baseline, then mark every vnode cold WITHOUT writing its
-        // slice to the tier — so a promotion fetch returns Ok(None) (the genuine-miss case).
-        op.process(&[vec![events_batch(&["a"], &[1])]], &[10])
-            .await
-            .unwrap();
-        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
-        for &v in staged.keys() {
-            assert!(op.demote_vnode(v, VNODES), "clean vnode must demote");
-        }
-
-        // A row for 'a' defers; its vnode's fetch can never resolve.
-        op.process(&[vec![events_batch(&["a"], &[5])]], &[20])
-            .await
-            .unwrap();
-        assert_eq!(op.watermark_hold(), Some(20), "the missing-tier row defers");
-
-        // Idle cycles drive the fetch→miss loop; it must error within the bound, not spin forever.
-        let mut escalation: Option<String> = None;
-        for _ in 0..(MAX_PROMOTION_FETCH_MISSES + 50) {
-            match op.process(&[vec![]], &[30]).await {
-                Ok(_) => tokio::time::sleep(Duration::from_millis(2)).await,
-                Err(e) => {
-                    escalation = Some(e.to_string());
-                    break;
-                }
-            }
-        }
-        let msg = escalation.expect("a genuinely-absent demoted vnode must escalate, not wedge");
-        assert!(
-            msg.contains("absent from the cold tier"),
-            "unexpected error: {msg}",
-        );
-    }
-
-    /// A peer batch arriving via `ingest_shuffle` (the checkpoint barrier-alignment
-    /// drain) for a DEMOTED vnode must DEFER for fetch-on-access promotion — exactly like the
-    /// steady-state `process` path — not fold straight into `process_batch`, which would rebuild a
-    /// fresh zeroed accumulator while the authoritative state sits in the tier (a silent lost-update
-    /// or, at the next capture, a double-count). The same branch covers demoted groups
-    /// (`cold_groups_touched`).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingest_shuffle_defers_row_for_demoted_vnode() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx).await;
-
-        // Establish a=1, b=2, c=3, then capture the clean baseline + demote every vnode to the tier.
-        op.process(&[vec![events_batch(&["a", "b", "c"], &[1, 2, 3])]], &[10])
-            .await
-            .unwrap();
-        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
-        for (v, slice) in &staged {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice {
-                store.put("out", *v, bytes.as_ref()).unwrap();
-            }
-        }
-        for &v in staged.keys() {
-            assert!(op.demote_vnode(v, VNODES), "clean vnode must demote");
-        }
-        assert_eq!(op.estimated_state_bytes(), 0, "all groups demoted");
-
-        // A peer row for 'a' arrives via ingest_shuffle (as it would mid barrier-alignment). With the
-        // fix it DEFERS (holds the watermark); the buggy path would fold it in and emit immediately.
-        op.ingest_shuffle("out", events_batch(&["a"], &[5]), 20)
-            .await
-            .unwrap();
-        assert_eq!(
-            op.watermark_hold(),
-            Some(20),
-            "ingest_shuffle must defer a row touching a demoted vnode, not fold it into a fresh acc",
-        );
-
-        // Idle cycles drive the promotion fetch + replay: 'a' must reflect restored 1 + new 5 = 6.
-        // A recreated-from-scratch 'a' would read 5; a double-count would read 7.
-        let mut final_a = None;
-        for _ in 0..200 {
-            let out = op.process(&[vec![]], &[30]).await.unwrap();
-            if let Some(&t) = inserts(&out).get("a") {
-                final_a = Some(t);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        assert_eq!(
-            final_a,
-            Some(6),
-            "ingest_shuffle deferred row replayed onto the promoted slice: 1 + 5",
-        );
-        assert_eq!(
-            op.watermark_hold(),
-            None,
-            "nothing deferred after promotion"
-        );
-    }
-
-    /// A checkpoint taken while a row is deferred for promotion must carry
-    /// that row across operator restore (the source counts it consumed).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deferred_row_survives_checkpoint_restore() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx.clone()).await;
-
-        op.process(&[vec![events_batch(&["a"], &[1])]], &[10])
-            .await
-            .unwrap();
-        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
-        for (v, slice) in &staged {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice {
-                store.put("out", *v, bytes.as_ref()).unwrap();
-            }
-        }
-        for &v in staged.keys() {
-            assert!(op.demote_vnode(v, VNODES));
-        }
-
-        // Defer a row, then checkpoint mid-promotion.
-        op.process(&[vec![events_batch(&["a"], &[5])]], &[20])
-            .await
-            .unwrap();
-        assert_eq!(op.watermark_hold(), Some(20));
-        let cp = op
-            .checkpoint()
-            .unwrap()
-            .expect("deferred row → non-empty checkpoint");
-
-        // The blob must carry the deferred row at its ingest watermark.
-        let decoded: AggOpCheckpoint =
-            rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&cp.data).unwrap();
-        assert_eq!(
-            decoded.deferred.len(),
-            1,
-            "deferred row must be checkpointed"
-        );
-        assert_eq!(decoded.deferred[0].0, 20, "carried at its ingest watermark");
-
-        // Restoring into a fresh operator replays the row rather than dropping it. The demoted
-        // slice's prior contribution returns only via restart rehydration; the row stands alone.
-        let mut op2 = build_op(tier_tx).await;
-        op2.restore(cp).unwrap();
-        let mut final_a = None;
-        for _ in 0..200 {
-            let out = op2.process(&[vec![]], &[30]).await.unwrap();
-            if let Some(&t) = inserts(&out).get("a") {
-                final_a = Some(t);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        assert_eq!(
-            final_a,
-            Some(5),
-            "the restored deferred row replays, not dropped"
-        );
-    }
-
-    /// Simulates a restart: a tier operator demotes every vnode, checkpoints
-    /// (the manifest blob then holds no groups, only the cold-vnode list),
-    /// and a fresh operator restores from it and rehydrates each demoted
-    /// vnode from its saved partial slice — exactly what the restart path
-    /// does with `VnodeRehydrator`. Recovered state must be complete: a new
-    /// row sees the rehydrated prior contribution.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restart_rehydrates_demoted_vnodes_from_partials() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx.clone()).await;
-
-        op.process(&[vec![events_batch(&["a", "b", "c"], &[1, 2, 3])]], &[10])
-            .await
-            .unwrap();
-
-        // Capture every vnode's slice (the bytes a partial would carry), then
-        // demote every vnode.
-        let staged = op.checkpoint_by_vnode(VNODES).unwrap().unwrap();
-        let mut saved: FxHashMap<u32, bytes::Bytes> = FxHashMap::default();
-        for (v, slice) in &staged {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice {
-                saved.insert(*v, bytes.clone());
-            }
-        }
-        for &v in staged.keys() {
-            assert!(op.demote_vnode(v, VNODES));
-        }
-
-        // The manifest blob now omits the demoted groups but lists them.
-        let manifest = op.checkpoint().unwrap().expect("non-empty manifest");
-        let decoded: AggOpCheckpoint =
-            rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&manifest.data).unwrap();
-        let agg = decoded.agg.as_ref().expect("agg payload present");
-        assert!(
-            agg.last_updated_ms.is_empty()
-                && agg.keys_ipc.is_empty()
-                && agg.acc_state_ipc.iter().all(Vec::is_empty)
-                && agg.last_emitted.is_empty(),
-            "all vnodes demoted → manifest carries no group-bearing payload"
-        );
-        let mut cold_listed: Vec<u32> = decoded.cold_vnodes.clone();
-        cold_listed.sort_unstable();
-        let mut cold_expected: Vec<u32> = staged.keys().copied().collect();
-        cold_expected.sort_unstable();
-        assert_eq!(
-            cold_listed, cold_expected,
-            "manifest lists the demoted vnodes"
-        );
-
-        // Fresh operator restores from the manifest, then the restart path
-        // replays each demoted vnode from its partial slice.
-        let mut op2 = build_op(tier_tx).await;
-        op2.restore(manifest).unwrap();
-        let cold = op2.take_tier_cold_vnodes();
-        assert_eq!(cold.len(), cold_expected.len());
-        for v in cold {
-            let slice = saved
-                .get(&v)
-                .expect("a slice was saved for every demoted vnode");
-            op2.apply_vnode_state(v, slice).unwrap();
-        }
-
-        // A new row for 'a' must reflect the rehydrated prior value (1 + 5),
-        // proving the demoted state survived the simulated restart.
-        let out = op2
-            .process(&[vec![events_batch(&["a"], &[5])]], &[30])
-            .await
-            .unwrap();
-        assert_eq!(
-            inserts(&out).get("a"),
-            Some(&6),
-            "rehydrated demoted state: original 1 + new 5"
-        );
-    }
-
-    /// Group demote→promote must not inflate the changelog: feed one row per round for a
-    /// slow-cycling key, checkpoint, demote it, then re-touch it next round to promote it back. The
-    /// emitted `total` must track the number of rows fed, never exceed it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cluster_group_demotion_never_double_counts_changelog() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx).await;
-        // Cluster group-demotion path: the per-vnode delta chain is the primary checkpoint
-        // (chain_max=2, so re-bases with cold groups happen), plus group dirty-tracking.
-        op.enable_delta_checkpoints(2);
-        op.enable_delta_tracking();
-
-        let rounds: i64 = 8;
-        let mut wm = 0i64;
-        let mut demoted_total = 0u64;
-        let mut max_emitted = 0i64;
-        let record = |out: &[RecordBatch], max: &mut i64| {
-            if let Some(&t) = inserts(out).get("a") {
-                *max = (*max).max(t);
-            }
-        };
-
-        for _ in 1..=rounds {
-            wm += 10;
-            // Feed one row for "a"; if "a" was demoted last round this defers + triggers promotion.
-            let out = op
-                .process(&[vec![events_batch(&["a"], &[1])]], &[wm])
-                .await
-                .unwrap();
-            record(&out, &mut max_emitted);
-            // Drain idle cycles until the promotion (if any) resolves and "a" re-emits.
-            for _ in 0..200 {
-                if op.watermark_hold().is_none() && !op.has_pending_promotion() {
-                    break;
-                }
-                wm += 1;
-                let out = op.process(&[vec![]], &[wm]).await.unwrap();
-                record(&out, &mut max_emitted);
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            // Mark the group clean (delta baseline), then demote it to the cold tier.
-            op.checkpoint_by_vnode(VNODES).unwrap();
-            let (n, _) = op.demote_cold_groups(usize::MAX, VNODES).await;
-            demoted_total += n as u64;
-        }
-
-        assert!(
-            demoted_total > 0,
-            "group demotion never fired — the test would be vacuous"
-        );
-        assert_eq!(
-            max_emitted, rounds,
-            "cluster group demotion emitted a changelog total ({max_emitted}) different from the \
-             true running count ({rounds}) — a value > {rounds} is the soak's double-count",
-        );
-    }
-
-    /// A cold-bearing vnode's non-delta authoritative capture must be self-contained
-    /// (resident + cold keys): in cluster the manifest carries no resident and the tier is
-    /// node-local + wiped on restart, so a cold-only partial silently drops the vnode's
-    /// resident groups from durable state — unrecoverable after a kill.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn authoritative_capture_stages_resident_with_cold_groups() {
-        use crate::checkpoint_coordinator::StagedSlice;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::state_tier::StateTierStore::open(tmp.path().join("tier"), None).unwrap(),
-        );
-        let tier_tx = crate::state_tier::spawn_worker(
-            &tokio::runtime::Handle::current(),
-            Arc::clone(&store),
-            64,
-        );
-        let mut op = build_op(tier_tx).await;
-        // Group dirty-tracking without delta-primary captures — the non-delta capture path.
-        op.enable_delta_tracking();
-
-        // vnode_count=1 puts both keys in one vnode: "a" goes cold, "b" stays resident.
-        op.process(&[vec![events_batch(&["a", "b"], &[1, 2])]], &[10])
-            .await
-            .unwrap();
-        op.checkpoint_by_vnode(1).unwrap();
-        op.process(&[vec![events_batch(&["b"], &[3])]], &[20])
-            .await
-            .unwrap();
-        let (n, _) = op.demote_cold_groups(usize::MAX, 1).await;
-        assert_eq!(n, 1, "exactly the clean group demotes");
-
-        // Embedded (manifest-primary): cold-only — resident rides the whole-node manifest.
-        let slices = op.checkpoint_by_vnode(1).unwrap().expect("capture");
-        assert!(
-            matches!(slices.get(&0), Some(StagedSlice::ColdGroups { .. })),
-            "manifest-primary capture stages a cold-only slice"
-        );
-
-        // Authoritative (cluster): the same vnode must stage resident + cold keys together.
-        op.set_vnode_partials_authoritative();
-        op.process(&[vec![events_batch(&["b"], &[4])]], &[30])
-            .await
-            .unwrap();
-        let slices = op.checkpoint_by_vnode(1).unwrap().expect("capture");
-        match slices.get(&0) {
-            Some(StagedSlice::FullWithColdGroups {
-                resident,
-                group_keys,
-                ..
-            }) => {
-                assert!(!resident.is_empty(), "resident bytes present");
-                assert_eq!(group_keys.len(), 1, "the demoted group's key is listed");
-            }
-            Some(StagedSlice::ColdGroups { .. }) => {
-                panic!("cold-only slice under authoritative partials drops resident groups")
-            }
-            _ => panic!("expected FullWithColdGroups for the mixed vnode"),
-        }
     }
 }

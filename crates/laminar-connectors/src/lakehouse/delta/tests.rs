@@ -230,40 +230,27 @@ fn test_should_flush_empty() {
 }
 
 #[tokio::test]
-async fn test_exactly_once_buffer_backpressure() {
-    // Exactly-once mode rejects writes once the cumulative pending
-    // buffer exceeds the hard cap (4× max_buffer_records). A single
-    // incoming batch that by itself exceeds the cap is admitted (we
-    // cannot split it without breaking exactly-once), but subsequent
-    // batches hit backpressure.
+async fn test_at_least_once_failed_flush_backpressure() {
+    // A failed at-least-once flush retains its staged rows. The next write
+    // must be rejected before it grows that in-memory retry backlog.
     let mut config = test_config();
-    config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+    config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     config.max_buffer_records = 10;
     let mut sink = DeltaLakeSink::new(config, None);
     sink.state = ConnectorState::Running;
+    sink.staged_rows = 50;
 
-    // First batch of 50 rows exceeds 4× cap (40) but we admit it —
-    // rejecting would wedge the pipeline with no way to split.
-    let first = test_batch(50);
-    sink.write_batch(&first)
-        .await
-        .expect("single oversized batch must be admitted");
-    assert_eq!(sink.buffered_rows(), 50);
-
-    // A second normal batch must now be rejected: cumulative pending
-    // (50 + 5 = 55) exceeds the effective cap (max(40, 5) = 40).
-    let second = test_batch(5);
+    let batch = test_batch(5);
     let err = sink
-        .write_batch(&second)
+        .write_batch(&batch)
         .await
-        .expect_err("should reject once cumulative buffer exceeds cap");
+        .expect_err("retained at-least-once backlog must remain bounded");
     let msg = err.to_string();
     assert!(
         msg.contains("buffer full"),
         "expected backpressure error, got: {msg}"
     );
-    // Rejected batch must NOT have been buffered.
-    assert_eq!(sink.buffered_rows(), 50);
+    assert_eq!(sink.buffered_rows(), 0);
 }
 
 // ── Batch buffering tests ──
@@ -403,28 +390,6 @@ async fn test_staged_data_preserved_until_commit_or_rollback() {
     assert!(sink.staged_batches.is_empty());
     assert_eq!(sink.staged_rows, 0);
     assert_eq!(sink.staged_bytes, 0);
-}
-
-// ── Flush tests ──
-// Note: These tests bypass open() and test business logic only.
-
-#[tokio::test]
-async fn test_flush_coalesces_buffer() {
-    let mut config = test_config();
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    config.writer_id = "test-writer".to_string();
-    let mut sink = DeltaLakeSink::new(config, None);
-    sink.state = ConnectorState::Running;
-
-    let batch = test_batch(10);
-    sink.write_batch(&batch).await.unwrap();
-    sink.write_batch(&batch).await.unwrap();
-    assert_eq!(sink.buffer.len(), 2);
-
-    // flush() coalesces batches but does not write to Delta.
-    sink.flush().await.unwrap();
-    assert_eq!(sink.buffer.len(), 1);
-    assert_eq!(sink.buffered_rows(), 20);
 }
 
 // ── Open and close tests ──
@@ -783,6 +748,13 @@ fn coordinated_config(path: &str) -> DeltaLakeSinkConfig {
 }
 
 #[cfg(feature = "delta-lake")]
+fn coordinated_commit_context() -> crate::connector::CoordinatedCommitContext {
+    crate::connector::CoordinatedCommitContext::new(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+}
+
+#[cfg(feature = "delta-lake")]
 async fn coordinated_row_count(path: &str) -> usize {
     let ctx = datafusion::prelude::SessionContext::new();
     crate::lakehouse::delta_table_provider::register_delta_table(
@@ -824,14 +796,119 @@ fn exactly_once_is_coordinated_append_only() {
     assert!(sink.contract(&ConnectorConfig::new("delta-lake")).is_err());
 }
 
+/// An exact epoch larger than the former 4x in-memory cap is staged across
+/// uniquely named, log-invisible Parquet files and published by one checkpoint
+/// without replay.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
+    use std::collections::HashSet;
+
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_large_epoch");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    let mut config = coordinated_config(&path);
+    config.max_buffer_records = 2;
+    config.compaction.enabled = false;
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    sink.begin_epoch(1).await.unwrap();
+
+    // Twelve rows exceed the removed 4 x 2 row cap. Every three-row write
+    // crosses the staging threshold and must succeed without replay.
+    for _ in 0..4 {
+        sink.write_batch(&test_batch(3)).await.unwrap();
+    }
+    assert!(sink.buffer.is_empty());
+    assert!(sink.staged_batches.is_empty());
+    assert_eq!(sink.coordinated_adds.len(), 4);
+    assert_eq!(
+        coordinated_row_count(&path).await,
+        0,
+        "staged files must remain invisible before their Delta Add commit"
+    );
+
+    let descriptor = sink
+        .pre_commit(1)
+        .await
+        .unwrap()
+        .expect("non-empty exact epoch returns one descriptor");
+    assert!(descriptor.len() <= crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
+    assert!(sink.coordinated_adds.is_empty());
+    assert_eq!(sink.coordinated_descriptor_bytes, 0);
+
+    let adds = super::super::delta_io::decode_commit_descriptors(&[descriptor.clone()])
+        .unwrap()
+        .unwrap()
+        .adds;
+    assert_eq!(adds.len(), 4);
+    assert_eq!(
+        adds.iter()
+            .map(|add| add.path.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        adds.len(),
+        "each incremental stage must use an attempt-unique object path"
+    );
+    assert_eq!(coordinated_row_count(&path).await, 0);
+
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let attempt = CheckpointAttempt::new(1, 101);
+    sink.commit_aggregated(
+        CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            fencing_token: 1,
+            target: attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt,
+                participant_id: 0,
+                payload: Some(descriptor),
+            }],
+        },
+        coordinated_commit_context(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(coordinated_row_count(&path).await, 12);
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 1,
+        })
+    );
+    sink.close().await.unwrap();
+}
+
 /// The designated cursor is scoped by pipeline + sink and stores the globally
 /// unique checkpoint id, independently of the writer-local epoch field.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
 async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
     use crate::connector::{
-        CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
-        CoordinatedCommitter,
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
     };
     use laminar_core::state::CheckpointAttempt;
     use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
@@ -866,16 +943,23 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
             .expect("coordinated pre_commit returns a descriptor");
         let attempt = CheckpointAttempt::new(epoch, 100 + epoch);
         writer
-            .commit_aggregated(CoordinatedCommitBatch {
-                namespace: namespace.clone(),
-                expected_predecessor: if epoch == 1 { 0 } else { 100 + epoch - 1 },
-                target: attempt,
-                entries: vec![CoordinatedCommitPayload {
-                    attempt,
-                    participant_id: 0,
-                    payload: Some(descriptor),
-                }],
-            })
+            .commit_aggregated(
+                CoordinatedCommitBatch {
+                    namespace: namespace.clone(),
+                    expected_predecessor: CoordinatedCommitCursor {
+                        checkpoint_id: if epoch == 1 { 0 } else { 100 + epoch - 1 },
+                        fencing_token: if epoch == 1 { 0 } else { 1 },
+                    },
+                    fencing_token: 1,
+                    target: attempt,
+                    entries: vec![CoordinatedCommitPayload {
+                        attempt,
+                        participant_id: 0,
+                        payload: Some(descriptor),
+                    }],
+                },
+                coordinated_commit_context(),
+            )
             .await
             .unwrap();
     }
@@ -889,8 +973,11 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
         .await
         .unwrap();
     assert_eq!(
-        recovered.committed_checkpoint_id(&namespace).await.unwrap(),
-        Some(102)
+        recovered.committed_cursor(&namespace).await.unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 1,
+        })
     );
     recovered.close().await.unwrap();
 }
@@ -903,8 +990,8 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
 #[tokio::test]
 async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
     use crate::connector::{
-        CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
-        CoordinatedCommitter,
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
     };
     use laminar_core::state::CheckpointAttempt;
     use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
@@ -936,22 +1023,32 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
         .unwrap()
         .expect("first coordinated descriptor");
     writer
-        .commit_aggregated(CoordinatedCommitBatch {
-            namespace: namespace.clone(),
-            expected_predecessor: 0,
-            target: first_attempt,
-            entries: vec![CoordinatedCommitPayload {
-                attempt: first_attempt,
-                participant_id: 0,
-                payload: Some(first_descriptor.clone()),
-            }],
-        })
+        .commit_aggregated(
+            CoordinatedCommitBatch {
+                namespace: namespace.clone(),
+                expected_predecessor: CoordinatedCommitCursor {
+                    checkpoint_id: 0,
+                    fencing_token: 0,
+                },
+                fencing_token: 1,
+                target: first_attempt,
+                entries: vec![CoordinatedCommitPayload {
+                    attempt: first_attempt,
+                    participant_id: 0,
+                    payload: Some(first_descriptor.clone()),
+                }],
+            },
+            coordinated_commit_context(),
+        )
         .await
         .unwrap();
     assert_eq!(coordinated_row_count(&path).await, 3);
     assert_eq!(
-        writer.committed_checkpoint_id(&namespace).await.unwrap(),
-        Some(101)
+        writer.committed_cursor(&namespace).await.unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 1,
+        })
     );
 
     writer.begin_epoch(2).await.unwrap();
@@ -965,23 +1062,30 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
     // Simulate leadership overlap: the replacement leader assembled this
     // batch before learning that checkpoint 101 had just committed.
     writer
-        .commit_aggregated(CoordinatedCommitBatch {
-            namespace: namespace.clone(),
-            expected_predecessor: 0,
-            target: second_attempt,
-            entries: vec![
-                CoordinatedCommitPayload {
-                    attempt: first_attempt,
-                    participant_id: 0,
-                    payload: Some(first_descriptor),
+        .commit_aggregated(
+            CoordinatedCommitBatch {
+                namespace: namespace.clone(),
+                expected_predecessor: CoordinatedCommitCursor {
+                    checkpoint_id: 0,
+                    fencing_token: 0,
                 },
-                CoordinatedCommitPayload {
-                    attempt: second_attempt,
-                    participant_id: 0,
-                    payload: Some(second_descriptor),
-                },
-            ],
-        })
+                fencing_token: 2,
+                target: second_attempt,
+                entries: vec![
+                    CoordinatedCommitPayload {
+                        attempt: first_attempt,
+                        participant_id: 0,
+                        payload: Some(first_descriptor),
+                    },
+                    CoordinatedCommitPayload {
+                        attempt: second_attempt,
+                        participant_id: 0,
+                        payload: Some(second_descriptor),
+                    },
+                ],
+            },
+            coordinated_commit_context(),
+        )
         .await
         .unwrap();
 
@@ -991,8 +1095,11 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
         "the already-committed three-row descriptor must not be appended twice"
     );
     assert_eq!(
-        writer.committed_checkpoint_id(&namespace).await.unwrap(),
-        Some(102),
+        writer.committed_cursor(&namespace).await.unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 2,
+        }),
         "the overlapping batch must still advance the external cursor"
     );
     writer.close().await.unwrap();
@@ -1034,15 +1141,245 @@ async fn coordinated_open_caches_configured_writer_properties() {
     sink.close().await.unwrap();
 }
 
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_reconcile");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+    let mut sink = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let attempt = CheckpointAttempt::new(1, 101);
+    let committed = CoordinatedCommitCursor {
+        checkpoint_id: 101,
+        fencing_token: 1,
+    };
+    sink.commit_aggregated(
+        CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            fencing_token: 1,
+            target: attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt,
+                participant_id: 0,
+                payload: None,
+            }],
+        },
+        coordinated_commit_context(),
+    )
+    .await
+    .unwrap();
+
+    let second = CheckpointAttempt::new(2, 102);
+    let third = CheckpointAttempt::new(3, 103);
+    let second_batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: committed,
+        fencing_token: 1,
+        target: second,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: second,
+            participant_id: 0,
+            payload: None,
+        }],
+    };
+    *sink.coordinated_unresolved_publication.lock() = Some(UnresolvedDeltaPublication {
+        external_key: namespace.external_key(),
+        target: CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 1,
+        },
+        exact_batch_fingerprint: second_batch.exact_fingerprint(),
+    });
+
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(committed)
+    );
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+    assert!(sink.begin_epoch(2).await.is_err());
+
+    let higher_batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: committed,
+        fencing_token: 1,
+        target: third,
+        entries: vec![
+            CoordinatedCommitPayload {
+                attempt: second,
+                participant_id: 0,
+                payload: None,
+            },
+            CoordinatedCommitPayload {
+                attempt: third,
+                participant_id: 0,
+                payload: None,
+            },
+        ],
+    };
+    assert!(sink
+        .commit_aggregated(higher_batch, coordinated_commit_context())
+        .await
+        .is_err());
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+
+    sink.commit_aggregated(second_batch, coordinated_commit_context())
+        .await
+        .unwrap();
+    assert!(sink.coordinated_unresolved_publication.lock().is_none());
+    let second_cursor = CoordinatedCommitCursor {
+        checkpoint_id: 102,
+        fencing_token: 1,
+    };
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(second_cursor)
+    );
+
+    sink.commit_aggregated(
+        CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: second_cursor,
+            fencing_token: 1,
+            target: third,
+            entries: vec![CoordinatedCommitPayload {
+                attempt: third,
+                participant_id: 0,
+                payload: None,
+            }],
+        },
+        coordinated_commit_context(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 103,
+            fencing_token: 1,
+        })
+    );
+    sink.begin_epoch(4).await.unwrap();
+    sink.close().await.unwrap();
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test(start_paused = true)]
+async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_commit_timeout");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+    let mut sink = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_timeout",
+    )
+    .unwrap();
+    let attempt = CheckpointAttempt::new(1, 101);
+    let batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 1,
+        target: attempt,
+        entries: vec![CoordinatedCommitPayload {
+            attempt,
+            participant_id: 0,
+            payload: None,
+        }],
+    };
+    let delayed_commit = super::super::delta_io::DelayedCoordinatedCatalogCommit {
+        started: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let error = super::super::delta_io::DELAY_COORDINATED_CATALOG_COMMIT
+        .scope(
+            delayed_commit.clone(),
+            sink.commit_aggregated(
+                batch,
+                crate::connector::CoordinatedCommitContext::new(deadline),
+            ),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("catalog commit exceeded"), "got: {error}");
+    delayed_commit.started.notified().await;
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+    assert!(sink.begin_epoch(2).await.is_err());
+
+    assert_eq!(sink.committed_cursor(&namespace).await.unwrap(), None);
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+    assert!(sink.begin_epoch(2).await.is_err());
+
+    delayed_commit.release.notify_one();
+    let target = CoordinatedCommitCursor {
+        checkpoint_id: 101,
+        fencing_token: 1,
+    };
+    let mut observed = None;
+    for _ in 0..100 {
+        observed = sink.committed_cursor(&namespace).await.unwrap();
+        if observed == Some(target) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(observed, Some(target));
+    assert!(sink.coordinated_unresolved_publication.lock().is_none());
+    sink.begin_epoch(2).await.unwrap();
+    sink.close().await.unwrap();
+}
+
 /// Coordinated preparation times out without discarding the staged checkpoint cut.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
 async fn coordinated_pre_commit_timeout_preserves_staged_data_until_rollback() {
-    let mut config = coordinated_config("unused-by-stalled-test");
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_prepare_timeout");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let mut config = coordinated_config(&table_dir.to_string_lossy());
     config.write_timeout = Duration::from_millis(10);
 
     let mut sink = DeltaLakeSink::with_schema(config, test_schema());
-    sink.state = ConnectorState::Running;
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
     sink.stall_descriptor_write = true;
     sink.begin_epoch(7).await.unwrap();
     sink.write_batch(&test_batch(3)).await.unwrap();
@@ -1066,4 +1403,5 @@ async fn coordinated_pre_commit_timeout_preserves_staged_data_until_rollback() {
     assert_eq!(sink.staged_rows, 0);
     assert_eq!(sink.staged_bytes, 0);
     assert!(sink.staged_batches.is_empty());
+    sink.close().await.unwrap();
 }

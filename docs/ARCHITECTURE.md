@@ -9,7 +9,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 1. **Embedded First** -- Single binary, no external dependencies
 2. **Sub-Microsecond Latency** -- Minimal allocations on hot path
 3. **SQL Native** -- Full SQL support via Apache DataFusion
-4. **Explicit Delivery Contracts** -- Best-effort, at-least-once, or certified single-node exactly-once, validated before connector I/O
+4. **Explicit Delivery Contracts** -- Best-effort, at-least-once, or a certification-gated single-node exact candidate, validated before connector I/O
 5. **Arrow-Native** -- Apache Arrow RecordBatch at every boundary
 
 ## Architecture Overview
@@ -19,8 +19,8 @@ The system has a coordinator layer (SQL execution, compiled projections), a back
 ```text
 +------------------------------------------------------------------+
 |                     SOURCE CONNECTORS                             |
-|  Kafka, Postgres CDC, MySQL CDC, MongoDB CDC, WebSocket,          |
-|  OpenTelemetry OTLP/gRPC, Files (AutoLoader), Delta Lake,         |
+|  Kafka, Postgres CDC, MongoDB CDC, WebSocket, OpenTelemetry,      |
+|  OTLP/gRPC, Files (AutoLoader), Delta Lake,                       |
 |  Iceberg                                                          |
 |  (tokio tasks on the main runtime, push RecordBatches via         |
 |   tokio::sync::mpsc to the compute thread)                        |
@@ -60,7 +60,7 @@ runtime (the `laminar-compute` thread, spawned with
 processing from I/O tasks on the main work-stealing runtime. Source tokio
 tasks deliver batches to the coordinator over `tokio::sync::mpsc` channels,
 and the coordinator executes SQL cycles via `PipelineCallback::execute_cycle()`
-and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
+and injects/aligns in-band checkpoint barriers.
 
 **Components:**
 - **StreamExecutor** -- Drives DataFusion SQL execution per cycle. Optimization tiers: `CompiledProjection` (single-source non-aggregate queries compiled to `PhysicalExpr`), `IncrementalAggState` (incremental GROUP BY with per-group accumulators), and `CoreWindowState` (tumbling/hopping/session windows via optimized `CoreWindowAssigner`). Queries that don't match these tiers fall back to full DataFusion execution.
@@ -81,7 +81,7 @@ and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
 Durability and I/O, runs on the main tokio async runtime (not the compute thread).
 
 **Components:**
-- **Checkpoint Coordinator** -- Orchestrates exact checkpoint attempts, durable manifests/decisions, source positions, and coordinated external commits for certified exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`crates/laminar-core/src/checkpoint/checkpoint_store.rs`).
+- **Checkpoint Coordinator** -- Orchestrates exact checkpoint attempts, durable manifests/decisions, source positions, and coordinated external commits for checkpoint-committable sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`crates/laminar-core/src/checkpoint/checkpoint_store.rs`).
 - **Recovery Manager** -- Loads the latest checkpoint manifest and restores operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
 - **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, Iceberg, WebSocket, OTEL, Files) run as tokio tasks on the main runtime.
 
@@ -118,12 +118,12 @@ How an event moves through the system:
     +------------- Offset Tracking --------------------+
 ```
 
-1. **Source ingestion**: Data arrives as Arrow RecordBatches via `SourceHandle::push()` or from external connectors (Kafka, PostgreSQL CDC, MySQL CDC, WebSocket).
+1. **Source ingestion**: Data arrives as Arrow RecordBatches via `SourceHandle::push()` or from external connectors (Kafka, PostgreSQL CDC, MongoDB CDC, WebSocket).
 2. **Watermark tracking**: Each source maintains an `EventTimeExtractor` + `BoundedOutOfOrdernessGenerator` for watermark computation. Late rows are filtered. Watermarks can be per-partition, per-key, or aligned across sources.
 3. **Operator processing**: The coordinator runs batches through SQL execution cycles (windows, joins, aggregations, filters). State is held in per-group accumulators and window buffers.
 4. **Emit**: Results are published to named streams. Subscribers receive RecordBatches via typed `TypedSubscription<T>` or callback subscriptions.
 5. **Durability**: Operator state and connector positions are captured under an exact attempt, sealed with a participant-complete inventory, then referenced by a prepared/finalized manifest and durable decision.
-6. **Sink output**: Each sink advertises durability, topology, and input-mode contracts. Kafka/PostgreSQL/file sinks provide durable at-least-once writes; append-mode Delta Lake and Iceberg provide coordinated exact commits when the whole single-node pipeline is configured and admitted for exactly-once.
+6. **Sink output**: Each sink advertises durability, topology, and input-mode contracts. Kafka, PostgreSQL, MongoDB, file, and Iceberg sinks provide at-least-once writes; only append-mode Delta Lake implements coordinated external publication for an admitted single-node exactly-once pipeline.
 
 ## Crate Map
 
@@ -140,7 +140,7 @@ laminar-sql           SQL parser (streaming extensions), query planner,
                       streaming physical optimizer, cooperative scheduling,
                       PROCTIME() UDF, temporal probe join translator
                       |
-laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
+laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink,
                       MongoDB CDC source/sink, WebSocket source/sink,
                       OpenTelemetry OTLP/gRPC source, file source/sink,
                       Delta Lake source/sink, Iceberg source/sink,
@@ -219,9 +219,8 @@ let db = LaminarDB::builder()
 
 The production SQL execution path (`StreamExecutor`) holds state in internal FxHashMaps (per-group accumulators, window buffers) and checkpoints via JSON serialization. Each stateful operator (`SqlQuery`, `EowcQuery`, `CoreWindowState`, `IncrementalAggState`) implements its own `checkpoint()`/`restore()` methods.
 
-#### Tiered operator state (cold tier)
-
-Most streaming state is structurally bounded (windowed aggregates and tolerance-bounded joins evict below the watermark), but unbounded keyed aggregates can outgrow RAM. Behind the `state-tier` feature, a node-level memory budget (`state_memory_budget_bytes`) backpressures source intake as state grows, and an optional fjall-backed cold tier (`state_tier_dir`) demotes idle state to local disk, fetching it back on access. The tier is capacity-not-durability — wiped on restart; the durable truth stays in the object-store checkpoint partials, which recovery replays. Demotion happens at `(operator, vnode)`-slice granularity (v1) or per-group granularity (v2, `state_tier_group_demotion`). See ADR-005.
+Unbounded keyed aggregates can outgrow RAM. They remain memory-resident until a production-ready
+spill path is implemented and validated; deployments must size or bound those queries accordingly.
 
 ### Streaming Channels
 
@@ -229,17 +228,16 @@ Source and Sink objects in the public streaming API (`laminar_core::streaming`) 
 
 ### Connector SDK
 
-Custom connectors implement `SourceConnector` and `SinkConnector`:
+Custom connectors implement `SourceConnector` and `SinkConnector`. Core lifecycle methods are shown below; optional hooks are omitted:
 
 ```rust
 #[async_trait]
 pub trait SourceConnector: Send {
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError>;
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError>;
     async fn poll_batch(&mut self, max_records: usize) -> Result<Option<SourceBatch>, ConnectorError>;
     fn schema(&self) -> SchemaRef;
     fn checkpoint(&self) -> SourceCheckpoint;
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
     async fn close(&mut self) -> Result<(), ConnectorError>;
 }
 
@@ -275,7 +273,7 @@ Enrichment joins via `CREATE LOOKUP TABLE` DDL with hash-probe physical executio
 
 - **Hash-indexed snapshot** -- lookup data pre-indexed at query planning time via Arrow `RowConverter`
 - **Predicate pushdown** -- `PredicateSplitterRule` splits WHERE predicates; pushdown predicates filter the snapshot before index build
-- **CDC refresh** -- `CdcTableSource` adapter wraps any `SourceConnector` (Postgres CDC, MySQL CDC) as a `ReferenceTableSource` for snapshot + incremental updates
+- **Refresh admission** -- only sources with an explicit snapshot-completion boundary can hydrate a reference table; an empty CDC poll is not a snapshot boundary
 - **Partial cache with Xor filter** -- probabilistic membership test to avoid full scans
 - **Lookup sources** -- `PostgresLookupSource`, `ParquetLookupSource` for direct queries
 
@@ -309,7 +307,7 @@ SQL parsing goes through sqlparser-rs with these streaming extensions:
 | Late data | `ALLOW LATENESS INTERVAL` / `LATE DATA TO <sink>` | Grace periods, side outputs |
 | EMIT clause | `EMIT ON WINDOW CLOSE` | Output control |
 | ASOF JOIN | `ASOF JOIN ... ON ... AND ts >= ts` | Point-in-time lookups |
-| Lookup tables | `CREATE LOOKUP TABLE ... FROM POSTGRES(...)` | Reference data |
+| Lookup tables | `CREATE LOOKUP TABLE ... (...) WITH ('connector' = 'postgres', ...)` | Reference data |
 | LAG/LEAD | `LAG(col, offset) OVER (...)` | Sliding analytics |
 | Ranking | `ROW_NUMBER() OVER (...)` | Ranking functions |
 | Window frames | `ROWS BETWEEN ... AND ...` | Custom frame bounds |
@@ -364,7 +362,7 @@ Exactly-once admission is currently limited to embedded/single-node mode and wor
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
 2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured
 3. **Checkpoints** -- Immutable attempts bind operator-state seals, source positions, watermarks, participant markers, parent links, pipeline identity, and deployment incarnation before finalization
-4. **Coordinated external commit** -- Participant-complete prepared markers are sealed before a designated committer publishes a namespaced checkpoint cut to append-mode Delta Lake or Iceberg
+4. **Coordinated external commit** -- Participant-complete prepared markers are sealed before a designated committer publishes a namespaced checkpoint cut to append-mode Delta Lake
 5. **Recovery** -- `RecoveryManager` accepts an identity-matching Finalized manifest or an exact
    decided Prepared manifest (which it finalizes), restores state/source positions, and resumes
    external commits from their exact cursor
@@ -375,21 +373,27 @@ Exactly-once admission is currently limited to embedded/single-node mode and wor
    Teardown never cancels or detaches it before releasing deployment or recovery fences.
 
 Startup additionally requires node-durable state, the built-in local
-checkpoint/decision store held by an exclusive OS deployment lock, replayable
-sources, and a `CheckpointCommittable` sink. Any configured checkpoint/object-
-store URL (including `file://`) or injected decision store fails closed with
-`[LDB-0014]` because it erases the provenance needed to prove that the local
-lock fences every writer. Incompatible connectors fail before external I/O;
+checkpoint/decision store held by an exclusive OS deployment lock, an exact-delivery-certified
+source, and a `CheckpointCommittable` sink. In the standalone server, a
+`file://` checkpoint URL selects that built-in store. Shared object-store URLs
+and library-injected object or decision stores fail closed with `[LDB-0014]`
+because their provenance cannot yet prove that the local lock fences every
+writer. Incompatible connectors fail before external I/O;
 there is no per-connector delivery override or public writer ID.
 
-The reachable external matrix is narrow and not yet production-certified.
-Append-mode Delta Lake and Iceberg are the only implemented/admitted local
-`CheckpointCommittable` sinks, and still require process-death output-oracle
-certification. Local Kafka sources now use engine-owned assignment in supported
-guaranteed modes, but the Kafka sink is `DurableAtLeastOnce`, never
-`CheckpointCommittable`. Kafka transactions must not be advertised as exact
-until a crash after the engine decision can be recovered and committed from
-durable staged output.
+The only admitted local exact candidate is the certified deterministic generator with append-mode
+Delta Lake, and it is not yet production-certified end to end. Iceberg is
+`DurableAtLeastOnce` and never `CheckpointCommittable`. Local Kafka sources use engine-owned assignment in supported guaranteed modes;
+dynamic consumer-group ownership is `BestEffort` and its revoke callback does not claim a later
+asynchronous checkpoint can retain the partition. The default/`acks=all` Kafka sink is
+`DurableAtLeastOnce`, never
+`CheckpointCommittable`; weaker acknowledgement modes are `Ephemeral` and fail at-least-once
+admission. This Kafka sink does not implement transactional checkpoint commit.
+
+PostgreSQL CDC is resume-only: fresh `Initial` startup is rejected before I/O. Kafka and MongoDB
+CDC remain at-least-once-only pending exact-delivery certification; MongoDB has event-level resume
+but no initial snapshot or transaction-group guarantee. Delta Lake and Iceberg sources are ephemeral singletons, so they are local
+`BestEffort`-only sources and are unavailable in cluster mode.
 
 ## Cluster Architecture (Distributed Mode)
 
@@ -404,6 +408,6 @@ With the `cluster` feature enabled, multi-node operation provides:
 
 **Delivery boundary**: cluster mode currently admits only `at_least_once` and
 requires cluster-shared S3/GCS/Azure state. Cluster `exactly_once` fails closed
-with `[LDB-0013]`: the leader lease token is not yet an atomic precondition of
-both checkpoint-decision writes and external sink commits, so end-to-end term
-fencing cannot yet be proven.
+with `[LDB-0013]`: checkpoint decisions are term-fenced, but supported connectors
+do not yet provide certified term-fenced source handoff and external sink cursor
+commits, so end-to-end term fencing cannot yet be proven.

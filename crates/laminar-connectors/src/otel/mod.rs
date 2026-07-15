@@ -33,7 +33,9 @@ use self::schema::traces_schema;
 ///
 /// After registration, the runtime can instantiate `OtelSource` by
 /// name when processing `CREATE SOURCE ... FROM OTEL (...)`.
-pub fn register_otel_source(registry: &ConnectorRegistry) {
+pub fn register_otel_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "otel".to_string(),
         display_name: "OpenTelemetry OTLP/gRPC Source".to_string(),
@@ -49,5 +51,5 @@ pub fn register_otel_source(registry: &ConnectorRegistry) {
         Arc::new(|registry: Option<&prometheus::Registry>| {
             Box::new(OtelSource::new(traces_schema(), registry))
         }),
-    );
+    )
 }

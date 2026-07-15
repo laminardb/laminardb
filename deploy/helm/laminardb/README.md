@@ -4,7 +4,7 @@ A Helm chart for deploying [LaminarDB](https://laminardb.dev) (Embedded Streamin
 
 ## 🚀 Quick Start (Standalone / Standalone-Durable)
 
-By default, the chart runs in `embedded` (single-node) mode.
+By default, the chart runs in `single` (standalone) mode.
 
 ```bash
 helm repo add laminardb https://laminardb.io/charts
@@ -22,7 +22,7 @@ helm install my-laminardb deploy/helm/laminardb
 
 ## 🌐 Durable Clustered Setup (`cluster` mode)
 
-LaminarDB supports distributed execution where query processing and subscription routing are coordinated across multiple nodes.
+LaminarDB supports distributed query execution across multiple nodes.
 
 Cluster mode is still pre-production while the open security and operability work is completed. To run a durable 3-node cluster configuration for evaluation:
 
@@ -156,7 +156,7 @@ prometheusRule:
 |--------|-------------|---------|
 | `replicaCount` | Number of pods to run | `1` |
 | `podManagementPolicy` | StatefulSet pod launch ordering: `Parallel` or `OrderedReady` (immutable after creation) | `Parallel` |
-| `laminardb.mode` | Server mode: `embedded` or `cluster` | `embedded` |
+| `laminardb.mode` | Server mode: `single` or `cluster` | `single` |
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
 | `laminardb.workers` | Number of worker threads (0 = auto) | `0` |

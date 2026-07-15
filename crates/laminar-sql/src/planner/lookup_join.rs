@@ -263,8 +263,6 @@ impl fmt::Display for crate::parser::lookup_table::ConnectorType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Postgres => write!(f, "postgres"),
-            Self::PostgresCdc => write!(f, "postgres-cdc"),
-            Self::MysqlCdc => write!(f, "mysql-cdc"),
             Self::Redis => write!(f, "redis"),
             Self::S3Parquet => write!(f, "s3-parquet"),
             Self::DeltaLake => write!(f, "delta-lake"),
@@ -278,7 +276,6 @@ impl fmt::Display for crate::parser::lookup_table::LookupStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Replicated => write!(f, "replicated"),
-            Self::Partitioned => write!(f, "partitioned"),
             Self::OnDemand => write!(f, "on-demand"),
         }
     }
@@ -299,7 +296,7 @@ mod tests {
     use super::*;
     use crate::datafusion::create_session_context;
     use crate::parser::lookup_table::{
-        ByteSize, ConnectorType, LookupStrategy, LookupTableProperties, PushdownMode,
+        ConnectorType, LookupStrategy, LookupTableProperties, PushdownMode,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
@@ -319,11 +316,10 @@ mod tests {
             ],
             primary_key: vec!["id".to_string()],
             properties: LookupTableProperties {
-                connector: ConnectorType::PostgresCdc,
+                connector: ConnectorType::Postgres,
                 connection: Some("postgresql://localhost/db".to_string()),
                 strategy: LookupStrategy::Replicated,
-                cache_memory: Some(ByteSize(512 * 1024 * 1024)),
-                cache_disk: None,
+                cache_memory: None,
                 cache_ttl: None,
                 pushdown_mode: PushdownMode::Auto,
             },
@@ -440,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_fmt_display_connector_type() {
-        assert_eq!(ConnectorType::PostgresCdc.to_string(), "postgres-cdc");
+        assert_eq!(ConnectorType::Postgres.to_string(), "postgres");
         assert_eq!(ConnectorType::Redis.to_string(), "redis");
         assert_eq!(
             ConnectorType::Custom("my-conn".into()).to_string(),

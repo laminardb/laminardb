@@ -4,20 +4,66 @@
 //! [`MongoDbSinkConfig`] for the write sink. Both support construction
 //! from a generic [`ConnectorConfig`] key-value map and programmatic builders.
 //!
-//! # Pipeline Validation
-//!
-//! The source config validates that user-supplied aggregation pipeline stages
-//! do not modify the `_id` field. `MongoDB` 8.x throws a server-side error if
-//! `_id` is projected away; validating at construction prevents runtime failures.
+//! User-supplied change-stream pipelines are limited to `$match` stages so they
+//! cannot alter MongoDB's resume token.
 
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
-use super::resume_token::ResumeTokenStoreConfig;
 use super::timeseries::{CollectionKind, TimeSeriesConfig, TimeSeriesGranularity};
 use super::write_model::WriteMode;
+
+const REMOVED_SOURCE_CONFIG_KEYS: &[&str] = &[
+    "batch.size",
+    "max.buffered.events",
+    "max.await.time.ms",
+    "resume.token.store",
+    "split.large.events",
+    "max.poll.records",
+];
+
+const SOURCE_CONFIG_KEYS: &[&str] = &[
+    "connection.uri",
+    "database",
+    "collection",
+    "full.document.mode",
+    "pipeline",
+    "max.buffered.bytes",
+    "laminar.source.name",
+    "_arrow_schema",
+    "_primary_key_columns",
+];
+
+pub(super) const DEFAULT_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PIPELINE_STAGES: usize = 64;
+pub(super) const MAX_PIPELINE_JSON_BYTES: usize = 256 * 1024;
+const MIN_BUFFERED_BYTES: usize = 1024 * 1024;
+const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const ESTIMATED_BUFFERED_ITEM_BYTES: usize = 64 * 1024;
+const MAX_READER_CHANNEL_ITEMS: usize = 4096;
+const MAX_CURSOR_BATCH_ITEMS: u32 = 1000;
+
+const SINK_CONFIG_KEYS: &[&str] = &[
+    "connection.uri",
+    "database",
+    "collection",
+    "flush.interval.ms",
+    "write.mode",
+    "write.mode.key_fields",
+    "timeseries.time_field",
+    "timeseries.meta_field",
+    "timeseries.granularity",
+    "timeseries.bucket_max_span_seconds",
+    "timeseries.bucket_rounding_seconds",
+    "timeseries.expire_after_seconds",
+    "delivery.guarantee",
+    "sink.write.timeout.ms",
+    "_arrow_schema",
+];
+
+const REMOVED_SINK_CONFIG_KEYS: &[&str] = &["batch.size", "write_concern.timeout_ms"];
 
 /// Mode for requesting full documents on update events.
 ///
@@ -31,34 +77,21 @@ pub enum FullDocumentMode {
     #[default]
     Delta,
 
-    /// `fullDocument: "updateLookup"` — fetches the current document from
-    /// the collection on update events.
-    ///
-    /// **Warning**: Dangerous on high-churn collections with `$match` filters.
-    /// If the matched document is quickly deleted, the lookup returns `null`
-    /// and can cause "Resume Token Not Found" errors. Prefer `WhenAvailable`
-    /// for high-churn patterns.
-    UpdateLookup,
-
     /// `fullDocument: "required"` — the collection must have
-    /// `changeStreamPreAndPostImages` enabled. Returns
-    /// `SourceError::PostImageNotEnabled` if not configured.
+    /// `changeStreamPreAndPostImages` enabled. Admission fails before the
+    /// change stream opens when the option is disabled.
+    #[serde(rename = "required")]
     RequirePostImage,
-
-    /// `fullDocument: "whenAvailable"` — safest option for high-churn
-    /// collections. Returns the post-image when available, `null` otherwise.
-    WhenAvailable,
 }
 
 str_enum!(FullDocumentMode, lowercase, ConnectorError, "unknown full document mode",
     Delta => "delta";
-    UpdateLookup => "updatelookup", "update_lookup";
-    RequirePostImage => "requirepostimage", "require_post_image", "required";
-    WhenAvailable => "whenavailable", "when_available"
+    RequirePostImage => "required"
 );
 
 /// Configuration for the `MongoDB` CDC source connector.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MongoDbSourceConfig {
     /// `MongoDB` connection URI (e.g., `mongodb://host:27017`).
     pub connection_uri: String,
@@ -66,53 +99,23 @@ pub struct MongoDbSourceConfig {
     /// Database name.
     pub database: String,
 
-    /// Collection name, or `"*"` to watch all collections in the database.
+    /// Fixed collection name.
     pub collection: String,
 
     /// Full document retrieval mode for update events.
     pub full_document_mode: FullDocumentMode,
 
-    /// Additional aggregation pipeline stages injected before the change
-    /// stream opens. Callers can inject `$match`, `$project`, etc.
-    ///
-    /// **Constraint**: Pipeline stages must not modify the `_id` field.
-    /// This is validated at construction.
+    /// Additional `$match` stages applied when the change stream opens.
     #[serde(default)]
     pub pipeline: Vec<serde_json::Value>,
 
-    /// Whether to enable `$changeStreamSplitLargeEvent` (`MongoDB` ≥ 6.0.9).
-    #[serde(default)]
-    pub split_large_events: bool,
-
-    /// Resume token persistence configuration.
-    #[serde(default)]
-    pub resume_token_store: ResumeTokenStoreConfig,
-
-    /// `getMore` await timeout in milliseconds.
-    pub max_await_time_ms: Option<u64>,
-
-    /// Cursor batch size hint.
-    pub batch_size: Option<u32>,
-
-    /// For fresh starts with no persisted token, start at this operation time.
-    /// Encoded as `{ t: <seconds>, i: <increment> }`.
-    pub start_at_operation_time: Option<(u32, u32)>,
-
-    /// Maximum events to buffer before applying backpressure.
-    #[serde(default = "default_max_buffered_events")]
-    pub max_buffered_events: usize,
-
-    /// Maximum records to return per `poll_batch` call.
-    #[serde(default = "default_max_poll_records")]
-    pub max_poll_records: usize,
+    /// Maximum retained decoded bytes across the reader channel and poll buffer.
+    #[serde(default = "default_max_buffered_bytes")]
+    pub max_buffered_bytes: usize,
 }
 
-fn default_max_buffered_events() -> usize {
-    100_000
-}
-
-fn default_max_poll_records() -> usize {
-    1000
+fn default_max_buffered_bytes() -> usize {
+    DEFAULT_MAX_BUFFERED_BYTES
 }
 
 impl Default for MongoDbSourceConfig {
@@ -123,13 +126,7 @@ impl Default for MongoDbSourceConfig {
             collection: String::new(),
             full_document_mode: FullDocumentMode::default(),
             pipeline: Vec::new(),
-            split_large_events: false,
-            resume_token_store: ResumeTokenStoreConfig::default(),
-            max_await_time_ms: Some(1000),
-            batch_size: Some(1000),
-            start_at_operation_time: None,
-            max_buffered_events: default_max_buffered_events(),
-            max_poll_records: default_max_poll_records(),
+            max_buffered_bytes: default_max_buffered_bytes(),
         }
     }
 }
@@ -146,10 +143,16 @@ impl MongoDbSourceConfig {
         }
     }
 
-    /// Returns `true` if the source is configured to watch all collections.
-    #[must_use]
-    pub fn is_database_watch(&self) -> bool {
-        self.collection == "*"
+    /// Private queue capacity derived from the one public ownership budget.
+    pub(crate) fn reader_channel_capacity(&self) -> usize {
+        (self.max_buffered_bytes / ESTIMATED_BUFFERED_ITEM_BYTES).clamp(1, MAX_READER_CHANNEL_ITEMS)
+    }
+
+    /// Cursor batch hint derived from the one public ownership budget.
+    pub(crate) fn cursor_batch_size(&self) -> u32 {
+        u32::try_from(self.reader_channel_capacity())
+            .unwrap_or(MAX_CURSOR_BATCH_ITEMS)
+            .min(MAX_CURSOR_BATCH_ITEMS)
     }
 
     /// Validates the configuration.
@@ -161,30 +164,22 @@ impl MongoDbSourceConfig {
         crate::config::require_non_empty(&self.connection_uri, "connection_uri")?;
         crate::config::require_non_empty(&self.database, "database")?;
         crate::config::require_non_empty(&self.collection, "collection")?;
-
-        if self.max_poll_records == 0 {
+        if self.collection == "*" {
             return Err(ConnectorError::ConfigurationError(
-                "max_poll_records must be > 0".to_string(),
-            ));
-        }
-        if self.max_buffered_events == 0 {
-            return Err(ConnectorError::ConfigurationError(
-                "max_buffered_events must be > 0".to_string(),
+                "MongoDB CDC collection must name one fixed collection; database-wide wildcard \
+                 streams cannot be bound to an immutable collection UUID"
+                    .into(),
             ));
         }
 
-        // split_large_events requires raw change stream access not available
-        // in the mongodb v3 driver (ChangeStreamEvent drops unknown fields).
-        if self.split_large_events {
-            return Err(ConnectorError::ConfigurationError(
-                "split_large_events requires raw change stream access not supported \
-                 by the mongodb v3 driver; set split_large_events = false"
-                    .to_string(),
-            ));
+        if !(MIN_BUFFERED_BYTES..=MAX_BUFFERED_BYTES).contains(&self.max_buffered_bytes) {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.buffered.bytes must be between {MIN_BUFFERED_BYTES} and \
+                     {MAX_BUFFERED_BYTES}"
+            )));
         }
 
-        // Validate pipeline does not modify the _id field.
-        validate_pipeline_no_id_modification(&self.pipeline)?;
+        validate_pipeline(&self.pipeline)?;
 
         Ok(())
     }
@@ -195,6 +190,22 @@ impl MongoDbSourceConfig {
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        if let Some(key) = REMOVED_SOURCE_CONFIG_KEYS
+            .iter()
+            .find(|key| config.get(key).is_some())
+        {
+            let reason = if *key == "max.buffered.events" {
+                "retained ownership is bounded by max.buffered.bytes instead"
+            } else {
+                "the connector did not execute it"
+            };
+            return Err(ConnectorError::ConfigurationError(format!(
+                "MongoDB CDC property '{key}' is not supported: {reason}"
+            )));
+        }
+
+        config.reject_unknown_properties(SOURCE_CONFIG_KEYS, "MongoDB CDC")?;
+
         let mut cfg = Self {
             connection_uri: config.require("connection.uri")?.to_string(),
             database: config.require("database")?.to_string(),
@@ -205,20 +216,11 @@ impl MongoDbSourceConfig {
         if let Some(mode) = config.get_parsed::<FullDocumentMode>("full.document.mode")? {
             cfg.full_document_mode = mode;
         }
-        if let Some(split) = config.get_parsed::<bool>("split.large.events")? {
-            cfg.split_large_events = split;
+        if let Some(pipeline) = config.get("pipeline") {
+            cfg.pipeline = parse_pipeline_property(pipeline)?;
         }
-        if let Some(timeout) = config.get_parsed::<u64>("max.await.time.ms")? {
-            cfg.max_await_time_ms = Some(timeout);
-        }
-        if let Some(batch) = config.get_parsed::<u32>("batch.size")? {
-            cfg.batch_size = Some(batch);
-        }
-        if let Some(max) = config.get_parsed::<usize>("max.poll.records")? {
-            cfg.max_poll_records = max;
-        }
-        if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
-            cfg.max_buffered_events = max;
+        if let Some(max) = config.get_parsed::<usize>("max.buffered.bytes")? {
+            cfg.max_buffered_bytes = max;
         }
 
         cfg.validate()?;
@@ -226,106 +228,121 @@ impl MongoDbSourceConfig {
     }
 }
 
-/// Validates that a pipeline does not modify the `_id` field.
-///
-/// `MongoDB` 8.x throws a server error if `_id` is projected away or
-/// modified in change stream pipeline stages. We fail fast at config
-/// time instead.
-fn validate_pipeline_no_id_modification(
-    pipeline: &[serde_json::Value],
-) -> Result<(), ConnectorError> {
-    for (i, stage) in pipeline.iter().enumerate() {
-        if let Some(obj) = stage.as_object() {
-            // Check $project stages.
-            if let Some(proj) = obj.get("$project") {
-                if let Some(proj_obj) = proj.as_object() {
-                    if let Some(id_val) = proj_obj.get("_id") {
-                        // _id: 0 or _id: false means exclusion.
-                        if id_val == &serde_json::Value::from(0)
-                            || id_val == &serde_json::Value::from(false)
-                        {
-                            return Err(ConnectorError::ConfigurationError(format!(
-                                "pipeline stage {i}: $project must not exclude _id field — \
-                                 MongoDB change streams require _id for resume tokens"
-                            )));
-                        }
-                    }
-                }
-            }
-
-            // Check $unset stages.
-            if let Some(unset) = obj.get("$unset") {
-                let fields: Vec<&str> = match unset {
-                    serde_json::Value::String(s) => vec![s.as_str()],
-                    serde_json::Value::Array(arr) => {
-                        arr.iter().filter_map(serde_json::Value::as_str).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                if fields.contains(&"_id") {
-                    return Err(ConnectorError::ConfigurationError(format!(
-                        "pipeline stage {i}: $unset must not remove _id field"
-                    )));
-                }
-            }
-
-            // Check $addFields / $set that overwrite _id.
-            for op in &["$addFields", "$set"] {
-                if let Some(fields) = obj.get(*op) {
-                    if let Some(fields_obj) = fields.as_object() {
-                        if fields_obj.contains_key("_id") {
-                            return Err(ConnectorError::ConfigurationError(format!(
-                                "pipeline stage {i}: {op} must not modify _id field"
-                            )));
-                        }
-                    }
-                }
-            }
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
         }
+        serde_json::Value::Object(object) => {
+            let mut fields: Vec<_> = object.into_iter().collect();
+            fields.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json(value)))
+                    .collect(),
+            )
+        }
+        scalar => scalar,
     }
-    Ok(())
 }
 
-/// Write concern level for `MongoDB` write operations.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteConcernLevel {
-    /// Write acknowledged by the majority of replica set members.
-    #[default]
-    Majority,
-    /// Write acknowledged by the specified number of nodes.
-    Nodes(u32),
+pub(crate) fn canonical_pipeline_json(pipeline: &[serde_json::Value]) -> String {
+    let canonical = canonicalize_json(serde_json::Value::Array(pipeline.to_vec()));
+    serde_json::to_string(&canonical).expect("serde_json::Value serialization cannot fail")
 }
 
-/// Write concern configuration for `MongoDB` operations.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WriteConcernConfig {
-    /// The write concern level.
-    #[serde(default)]
-    pub w: WriteConcernLevel,
-    /// Whether to wait for journal commit.
-    #[serde(default = "default_journal")]
-    pub journal: bool,
-    /// Write concern timeout in milliseconds.
-    pub timeout_ms: Option<u64>,
-}
+fn normalized_pipeline(
+    pipeline: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, ConnectorError> {
+    if pipeline.len() > MAX_PIPELINE_STAGES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC pipeline has {} stages; the maximum is {MAX_PIPELINE_STAGES}",
+            pipeline.len()
+        )));
+    }
 
-fn default_journal() -> bool {
-    true
-}
+    let encoded = serde_json::to_vec(pipeline).map_err(|error| {
+        ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC pipeline cannot be encoded as JSON: {error}"
+        ))
+    })?;
+    if encoded.len() > MAX_PIPELINE_JSON_BYTES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC pipeline is {} bytes; the maximum is {MAX_PIPELINE_JSON_BYTES}",
+            encoded.len()
+        )));
+    }
 
-impl Default for WriteConcernConfig {
-    fn default() -> Self {
-        Self {
-            w: WriteConcernLevel::default(),
-            journal: true,
-            timeout_ms: None,
+    let canonical: Vec<_> = pipeline.iter().cloned().map(canonicalize_json).collect();
+    for (i, stage) in canonical.iter().enumerate() {
+        let obj = stage.as_object().ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!("pipeline stage {i} must be a JSON object"))
+        })?;
+        if obj.len() != 1 || !obj.contains_key("$match") {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "pipeline stage {i} is unsafe: MongoDB CDC only supports $match stages because \
+                 projection/replacement stages can alter the resume token"
+            )));
         }
+        if !obj["$match"].is_object() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "pipeline stage {i} must contain a JSON object as $match"
+            )));
+        }
+        mongodb::bson::to_document(stage).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "pipeline stage {i} cannot be represented as BSON: {error}"
+            ))
+        })?;
+    }
+
+    let canonical_bytes = canonical_pipeline_json(&canonical).len();
+    if canonical_bytes > MAX_PIPELINE_JSON_BYTES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "canonical MongoDB CDC pipeline is {canonical_bytes} bytes; the maximum is \
+             {MAX_PIPELINE_JSON_BYTES}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn parse_pipeline_property(raw: &str) -> Result<Vec<serde_json::Value>, ConnectorError> {
+    if raw.len() > MAX_PIPELINE_JSON_BYTES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC pipeline property is {} bytes; the maximum is \
+             {MAX_PIPELINE_JSON_BYTES}",
+            raw.len()
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC pipeline must be valid JSON: {error}"
+        ))
+    })?;
+    let serde_json::Value::Array(pipeline) = value else {
+        return Err(ConnectorError::ConfigurationError(
+            "MongoDB CDC pipeline must be a JSON array".into(),
+        ));
+    };
+    normalized_pipeline(&pipeline)
+}
+
+/// Restrict change-stream pipelines to bounded `$match` stages.
+fn validate_pipeline(pipeline: &[serde_json::Value]) -> Result<(), ConnectorError> {
+    normalized_pipeline(pipeline).map(|_| ())
+}
+
+impl MongoDbSourceConfig {
+    pub(crate) fn normalize_pipeline(&mut self) -> Result<(), ConnectorError> {
+        self.pipeline = normalized_pipeline(&self.pipeline)?;
+        Ok(())
     }
 }
 
 /// Configuration for the `MongoDB` sink connector.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MongoDbSinkConfig {
     /// `MongoDB` connection URI.
     pub connection_uri: String,
@@ -344,38 +361,13 @@ pub struct MongoDbSinkConfig {
     #[serde(default)]
     pub write_mode: WriteMode,
 
-    /// Maximum documents per batch flush.
-    #[serde(default = "default_sink_batch_size")]
-    pub batch_size: usize,
-
     /// Maximum time between flushes in milliseconds.
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
-
-    /// `true` = ordered bulk write (fail-fast); `false` = unordered
-    /// (higher throughput).
-    ///
-    /// Ordered writes stop on the first error, preserving operation order.
-    /// Unordered writes attempt all operations and report all failures,
-    /// achieving higher throughput at the cost of non-deterministic ordering.
-    #[serde(default = "default_ordered")]
-    pub ordered: bool,
-
-    /// Write concern configuration.
-    #[serde(default)]
-    pub write_concern: WriteConcernConfig,
-}
-
-fn default_sink_batch_size() -> usize {
-    500
 }
 
 fn default_flush_interval_ms() -> u64 {
-    1000
-}
-
-fn default_ordered() -> bool {
-    true
+    250
 }
 
 impl Default for MongoDbSinkConfig {
@@ -386,10 +378,7 @@ impl Default for MongoDbSinkConfig {
             collection: String::new(),
             collection_kind: CollectionKind::default(),
             write_mode: WriteMode::default(),
-            batch_size: default_sink_batch_size(),
             flush_interval_ms: default_flush_interval_ms(),
-            ordered: default_ordered(),
-            write_concern: WriteConcernConfig::default(),
         }
     }
 }
@@ -421,15 +410,51 @@ impl MongoDbSinkConfig {
         crate::config::require_non_empty(&self.connection_uri, "connection_uri")?;
         crate::config::require_non_empty(&self.database, "database")?;
         crate::config::require_non_empty(&self.collection, "collection")?;
-
-        if self.batch_size == 0 {
+        if self.collection == "*" {
             return Err(ConnectorError::ConfigurationError(
-                "batch_size must be > 0".to_string(),
+                "MongoDB sink collection must name one fixed destination".into(),
             ));
         }
 
+        if self.flush_interval_ms == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "flush_interval_ms must be > 0".to_string(),
+            ));
+        }
+        if let WriteMode::Upsert { key_fields } = &self.write_mode {
+            let mut unique = std::collections::HashSet::with_capacity(key_fields.len());
+            for key in key_fields {
+                if key.trim().is_empty() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "write.mode.key_fields must not contain empty fields".to_string(),
+                    ));
+                }
+                if matches!(key.as_str(), "_op" | "__weight") {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "write.mode.key_fields cannot use engine metadata field '{key}'"
+                    )));
+                }
+                if key.starts_with('$') || key.contains('.') {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "write.mode.key_fields entry '{key}' must be a top-level MongoDB field and cannot start with '$' or contain '.'"
+                    )));
+                }
+                if !unique.insert(key.as_str()) {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "write.mode.key_fields contains duplicate field '{key}'"
+                    )));
+                }
+            }
+            if unique.is_empty() {
+                return Err(ConnectorError::ConfigurationError(
+                    "write.mode.key_fields must contain at least one field".to_string(),
+                ));
+            }
+        }
+
         // Time series collections only support Insert mode.
-        if let CollectionKind::TimeSeries(_) = &self.collection_kind {
+        if let CollectionKind::TimeSeries(time_series) = &self.collection_kind {
+            time_series.validate()?;
             super::write_model::validate_timeseries_write_mode(&self.write_mode)?;
         }
 
@@ -442,6 +467,23 @@ impl MongoDbSinkConfig {
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        if let Some(key) = REMOVED_SINK_CONFIG_KEYS
+            .iter()
+            .find(|key| config.get(key).is_some())
+        {
+            let replacement = match *key {
+                "batch.size" => "fixed memory and MongoDB wire limits govern batching",
+                "write_concern.timeout_ms" => {
+                    "sink.write.timeout.ms governs the complete write deadline"
+                }
+                _ => unreachable!("removed sink key must have a migration message"),
+            };
+            return Err(ConnectorError::ConfigurationError(format!(
+                "MongoDB sink property '{key}' is not supported; {replacement}"
+            )));
+        }
+        config.reject_unknown_properties(SINK_CONFIG_KEYS, "MongoDB sink")?;
+
         let mut cfg = Self {
             connection_uri: config.require("connection.uri")?.to_string(),
             database: config.require("database")?.to_string(),
@@ -449,14 +491,8 @@ impl MongoDbSinkConfig {
             ..Self::default()
         };
 
-        if let Some(batch) = config.get_parsed::<usize>("batch.size")? {
-            cfg.batch_size = batch;
-        }
         if let Some(interval) = config.get_parsed::<u64>("flush.interval.ms")? {
             cfg.flush_interval_ms = interval;
-        }
-        if let Some(ordered) = config.get_parsed::<bool>("ordered")? {
-            cfg.ordered = ordered;
         }
         if let Some(mode) = config.get("write.mode") {
             cfg.write_mode = match mode {
@@ -470,11 +506,6 @@ impl MongoDbSinkConfig {
                         .collect();
                     WriteMode::Upsert { key_fields: keys }
                 }
-                "replace" => WriteMode::Replace {
-                    upsert_on_missing: config
-                        .get_parsed::<bool>("write.mode.upsert_on_missing")?
-                        .unwrap_or(false),
-                },
                 other => {
                     return Err(ConnectorError::ConfigurationError(format!(
                         "unknown write.mode: {other}"
@@ -482,20 +513,26 @@ impl MongoDbSinkConfig {
                 }
             };
         }
-        if let Some(journal) = config.get_parsed::<bool>("write_concern.journal")? {
-            cfg.write_concern.journal = journal;
-        }
-        if let Some(timeout) = config.get_parsed::<u64>("write_concern.timeout_ms")? {
-            cfg.write_concern.timeout_ms = Some(timeout);
-        }
 
+        if config.get("write.mode.key_fields").is_some()
+            && !matches!(&cfg.write_mode, WriteMode::Upsert { .. })
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "MongoDB sink property 'write.mode.key_fields' is only valid for write.mode=upsert"
+                    .to_string(),
+            ));
+        }
         if let Some(time_field) = config.get("timeseries.time_field") {
             if time_field.trim().is_empty() {
                 return Err(ConnectorError::ConfigurationError(
                     "timeseries.time_field must not be empty".to_string(),
                 ));
             }
-            let meta_field = config.get("timeseries.meta_field").map(String::from);
+            let meta_field = config
+                .get("timeseries.meta_field")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(String::from);
             let granularity = if let Some(gran_str) = config.get("timeseries.granularity") {
                 match gran_str.to_lowercase().as_str() {
                     "seconds" => TimeSeriesGranularity::Seconds,
@@ -527,6 +564,39 @@ impl MongoDbSinkConfig {
                 granularity,
                 expire_after_seconds,
             });
+        } else if let Some(key) = [
+            "timeseries.meta_field",
+            "timeseries.granularity",
+            "timeseries.bucket_max_span_seconds",
+            "timeseries.bucket_rounding_seconds",
+            "timeseries.expire_after_seconds",
+        ]
+        .into_iter()
+        .find(|key| config.get(key).is_some())
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "MongoDB sink property '{key}' requires 'timeseries.time_field'"
+            )));
+        }
+
+        if !matches!(
+            &cfg.collection_kind,
+            CollectionKind::TimeSeries(TimeSeriesConfig {
+                granularity: TimeSeriesGranularity::Custom { .. },
+                ..
+            })
+        ) {
+            if let Some(key) = [
+                "timeseries.bucket_max_span_seconds",
+                "timeseries.bucket_rounding_seconds",
+            ]
+            .into_iter()
+            .find(|key| config.get(key).is_some())
+            {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "MongoDB sink property '{key}' is only valid for timeseries.granularity=custom"
+                )));
+            }
         }
 
         cfg.validate()?;
@@ -545,8 +615,7 @@ mod tests {
         let cfg = MongoDbSourceConfig::default();
         assert_eq!(cfg.connection_uri, "mongodb://localhost:27017");
         assert_eq!(cfg.full_document_mode, FullDocumentMode::Delta);
-        assert!(!cfg.split_large_events);
-        assert_eq!(cfg.max_poll_records, 1000);
+        assert_eq!(cfg.max_buffered_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -558,17 +627,8 @@ mod tests {
     }
 
     #[test]
-    fn test_source_config_database_watch() {
-        let cfg = MongoDbSourceConfig::new("mongodb://db:27017", "mydb", "*");
-        assert!(cfg.is_database_watch());
-
-        let cfg = MongoDbSourceConfig::new("mongodb://db:27017", "mydb", "users");
-        assert!(!cfg.is_database_watch());
-    }
-
-    #[test]
     fn test_source_config_validate_empty_uri() {
-        let mut cfg = MongoDbSourceConfig::new("", "db", "coll");
+        let cfg = MongoDbSourceConfig::new("", "db", "coll");
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("connection_uri"));
     }
@@ -581,19 +641,38 @@ mod tests {
     }
 
     #[test]
-    fn test_source_config_validate_zero_max_poll() {
-        let mut cfg = MongoDbSourceConfig::new("mongodb://db:27017", "db", "coll");
-        cfg.max_poll_records = 0;
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("max_poll_records"));
+    fn source_config_rejects_database_wildcard_watch() {
+        let cfg = MongoDbSourceConfig::new("mongodb://db:27017", "db", "*");
+        let error = cfg.validate().unwrap_err();
+        assert!(error.to_string().contains("fixed collection"), "{error}");
+        assert!(error.to_string().contains("UUID"), "{error}");
     }
 
     #[test]
-    fn test_source_config_split_large_events_rejected() {
+    fn source_buffer_byte_bound_has_a_finite_operational_range() {
         let mut cfg = MongoDbSourceConfig::new("mongodb://db:27017", "db", "coll");
-        cfg.split_large_events = true;
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("split_large_events"));
+        for invalid in [MIN_BUFFERED_BYTES - 1, MAX_BUFFERED_BYTES + 1] {
+            cfg.max_buffered_bytes = invalid;
+            let error = cfg.validate().unwrap_err();
+            assert!(error.to_string().contains("max.buffered.bytes"), "{error}");
+        }
+        for valid in [MIN_BUFFERED_BYTES, MAX_BUFFERED_BYTES] {
+            cfg.max_buffered_bytes = valid;
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn removed_source_properties_are_rejected_explicitly() {
+        for key in REMOVED_SOURCE_CONFIG_KEYS {
+            let mut config = ConnectorConfig::new("mongodb-cdc");
+            config.set("connection.uri", "mongodb://host:27017");
+            config.set("database", "testdb");
+            config.set("collection", "events");
+            config.set(*key, "removed-value");
+            let error = MongoDbSourceConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains(key));
+        }
     }
 
     #[test]
@@ -602,21 +681,59 @@ mod tests {
         config.set("connection.uri", "mongodb://host:27017");
         config.set("database", "testdb");
         config.set("collection", "events");
-        config.set("full.document.mode", "update_lookup");
-        config.set("max.poll.records", "500");
+        config.set("full.document.mode", "required");
+        config.set(
+            "pipeline",
+            r#"[{"$match":{"z":1,"operationType":"insert"}}]"#,
+        );
+        config.set("max.buffered.bytes", "33554432");
 
         let cfg = MongoDbSourceConfig::from_config(&config).unwrap();
         assert_eq!(cfg.connection_uri, "mongodb://host:27017");
         assert_eq!(cfg.database, "testdb");
         assert_eq!(cfg.collection, "events");
-        assert_eq!(cfg.full_document_mode, FullDocumentMode::UpdateLookup);
-        assert_eq!(cfg.max_poll_records, 500);
+        assert_eq!(cfg.full_document_mode, FullDocumentMode::RequirePostImage);
+        assert_eq!(
+            canonical_pipeline_json(&cfg.pipeline),
+            r#"[{"$match":{"operationType":"insert","z":1}}]"#
+        );
+        assert_eq!(cfg.max_buffered_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.reader_channel_capacity(), 512);
+        assert_eq!(cfg.cursor_batch_size(), 512);
+    }
+
+    #[test]
+    fn cursor_batch_hint_is_derived_from_buffer_budget() {
+        let mut cfg = MongoDbSourceConfig::new("mongodb://db:27017", "db", "coll");
+        cfg.max_buffered_bytes = MIN_BUFFERED_BYTES;
+        assert_eq!(cfg.reader_channel_capacity(), 16);
+        assert_eq!(cfg.cursor_batch_size(), 16);
+
+        cfg.max_buffered_bytes = DEFAULT_MAX_BUFFERED_BYTES;
+        assert_eq!(cfg.reader_channel_capacity(), 1024);
+        assert_eq!(cfg.cursor_batch_size(), 1000);
+
+        cfg.max_buffered_bytes = usize::MAX;
+        assert_eq!(cfg.reader_channel_capacity(), MAX_READER_CHANNEL_ITEMS);
+        assert_eq!(cfg.cursor_batch_size(), 1000);
     }
 
     #[test]
     fn test_source_config_from_config_missing_required() {
         let config = ConnectorConfig::new("mongodb-cdc");
         assert!(MongoDbSourceConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn source_config_rejects_unknown_property() {
+        let mut config = ConnectorConfig::new("mongodb-cdc");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "events");
+        config.set("max.await.time.mss", "25");
+
+        let error = MongoDbSourceConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("max.await.time.mss"));
     }
 
     // ── Pipeline validation tests ──
@@ -626,65 +743,77 @@ mod tests {
         let pipeline = vec![serde_json::json!({
             "$match": { "operationType": "insert" }
         })];
-        validate_pipeline_no_id_modification(&pipeline).unwrap();
+        validate_pipeline(&pipeline).unwrap();
     }
 
     #[test]
-    fn test_pipeline_id_excluded_in_project() {
+    fn pipeline_stage_must_be_a_document() {
+        let error = validate_pipeline(&[serde_json::json!("$match")]).unwrap_err();
+        assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn pipeline_stage_must_be_bson_representable() {
         let pipeline = vec![serde_json::json!({
-            "$project": { "_id": 0 }
+            "$match": { "value": u64::MAX }
         })];
-        let err = validate_pipeline_no_id_modification(&pipeline).unwrap_err();
-        assert!(err.to_string().contains("_id"));
+        let error = validate_pipeline(&pipeline).unwrap_err();
+        assert!(error.to_string().contains("cannot be represented as BSON"));
     }
 
     #[test]
-    fn test_pipeline_id_excluded_false() {
-        let pipeline = vec![serde_json::json!({
-            "$project": { "_id": false }
-        })];
-        let err = validate_pipeline_no_id_modification(&pipeline).unwrap_err();
-        assert!(err.to_string().contains("_id"));
+    fn pipeline_only_accepts_match_stages() {
+        for stage in [
+            serde_json::json!({ "$project": { "_id": 1, "name": 1 } }),
+            serde_json::json!({ "$unset": "_id" }),
+            serde_json::json!({ "$set": { "_id": "overwritten" } }),
+            serde_json::json!({ "$replaceRoot": { "newRoot": "$fullDocument" } }),
+            serde_json::json!({ "$match": {}, "$project": { "_id": 1 } }),
+        ] {
+            let error = validate_pipeline(&[stage]).unwrap_err();
+            assert!(error.to_string().contains("unsafe"), "{error}");
+        }
     }
 
     #[test]
-    fn test_pipeline_id_unset() {
-        let pipeline = vec![serde_json::json!({ "$unset": "_id" })];
-        let err = validate_pipeline_no_id_modification(&pipeline).unwrap_err();
-        assert!(err.to_string().contains("_id"));
+    fn pipeline_property_requires_a_bounded_json_array() {
+        let mut config = ConnectorConfig::new("mongodb-cdc");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "events");
+
+        config.set("pipeline", r#"{"$match":{}}"#);
+        let error = MongoDbSourceConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("JSON array"), "{error}");
+
+        let stages = vec![serde_json::json!({ "$match": {} }); MAX_PIPELINE_STAGES + 1];
+        config.set("pipeline", serde_json::to_string(&stages).unwrap());
+        let error = MongoDbSourceConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("maximum"), "{error}");
+
+        let oversized = format!(
+            r#"[{{"$match":{{"payload":"{}"}}}}]"#,
+            "x".repeat(MAX_PIPELINE_JSON_BYTES)
+        );
+        config.set("pipeline", oversized);
+        let error = MongoDbSourceConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("maximum"), "{error}");
     }
 
     #[test]
-    fn test_pipeline_id_unset_array() {
-        let pipeline = vec![serde_json::json!({ "$unset": ["_id", "other"] })];
-        let err = validate_pipeline_no_id_modification(&pipeline).unwrap_err();
-        assert!(err.to_string().contains("_id"));
+    fn pipeline_is_recursively_canonicalized() {
+        let pipeline =
+            parse_pipeline_property(r#"[{"$match":{"z":1,"a":{"y":2,"b":3}}}]"#).unwrap();
+        assert_eq!(
+            canonical_pipeline_json(&pipeline),
+            r#"[{"$match":{"a":{"b":3,"y":2},"z":1}}]"#
+        );
     }
 
     #[test]
-    fn test_pipeline_id_addfields() {
-        let pipeline = vec![serde_json::json!({
-            "$addFields": { "_id": "overwritten" }
-        })];
-        let err = validate_pipeline_no_id_modification(&pipeline).unwrap_err();
-        assert!(err.to_string().contains("_id"));
-    }
-
-    #[test]
-    fn test_pipeline_id_set() {
-        let pipeline = vec![serde_json::json!({
-            "$set": { "_id": "overwritten" }
-        })];
-        let err = validate_pipeline_no_id_modification(&pipeline).unwrap_err();
-        assert!(err.to_string().contains("_id"));
-    }
-
-    #[test]
-    fn test_pipeline_valid_project_includes_id() {
-        let pipeline = vec![serde_json::json!({
-            "$project": { "_id": 1, "name": 1 }
-        })];
-        validate_pipeline_no_id_modification(&pipeline).unwrap();
+    fn pipeline_match_expression_must_be_a_document() {
+        let error = validate_pipeline(&[serde_json::json!({ "$match": "insert" })]).unwrap_err();
+        assert!(error.to_string().contains("as $match"), "{error}");
     }
 
     // ── Full document mode tests ──
@@ -696,28 +825,18 @@ mod tests {
             FullDocumentMode::Delta
         );
         assert_eq!(
-            "update_lookup".parse::<FullDocumentMode>().unwrap(),
-            FullDocumentMode::UpdateLookup
-        );
-        assert_eq!(
-            "updatelookup".parse::<FullDocumentMode>().unwrap(),
-            FullDocumentMode::UpdateLookup
-        );
-        assert_eq!(
             "required".parse::<FullDocumentMode>().unwrap(),
             FullDocumentMode::RequirePostImage
         );
-        assert_eq!(
-            "when_available".parse::<FullDocumentMode>().unwrap(),
-            FullDocumentMode::WhenAvailable
-        );
+        assert!("update_lookup".parse::<FullDocumentMode>().is_err());
+        assert!("when_available".parse::<FullDocumentMode>().is_err());
         assert!("bad".parse::<FullDocumentMode>().is_err());
     }
 
     #[test]
     fn test_full_document_mode_display() {
         assert_eq!(FullDocumentMode::Delta.to_string(), "delta");
-        assert_eq!(FullDocumentMode::UpdateLookup.to_string(), "updatelookup");
+        assert_eq!(FullDocumentMode::RequirePostImage.to_string(), "required");
     }
 
     // ── Sink config tests ──
@@ -725,9 +844,7 @@ mod tests {
     #[test]
     fn test_sink_config_default() {
         let cfg = MongoDbSinkConfig::default();
-        assert_eq!(cfg.batch_size, 500);
-        assert_eq!(cfg.flush_interval_ms, 1000);
-        assert!(cfg.ordered);
+        assert_eq!(cfg.flush_interval_ms, 250);
         assert!(matches!(cfg.collection_kind, CollectionKind::Standard));
     }
 
@@ -747,11 +864,18 @@ mod tests {
     }
 
     #[test]
-    fn test_sink_config_validate_zero_batch_size() {
+    fn test_sink_config_validate_zero_flush_interval() {
         let mut cfg = MongoDbSinkConfig::new("mongodb://db:27017", "db", "coll");
-        cfg.batch_size = 0;
+        cfg.flush_interval_ms = 0;
         let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("batch_size"));
+        assert!(err.to_string().contains("flush_interval_ms"));
+    }
+
+    #[test]
+    fn sink_requires_a_fixed_destination_collection() {
+        let cfg = MongoDbSinkConfig::new("mongodb://db:27017", "db", "*");
+        let error = cfg.validate().unwrap_err();
+        assert!(error.to_string().contains("fixed destination"));
     }
 
     #[test]
@@ -774,7 +898,7 @@ mod tests {
     #[test]
     fn test_sink_config_flush_interval() {
         let cfg = MongoDbSinkConfig::default();
-        assert_eq!(cfg.flush_interval(), Duration::from_secs(1));
+        assert_eq!(cfg.flush_interval(), Duration::from_millis(250));
     }
 
     #[test]
@@ -783,12 +907,116 @@ mod tests {
         config.set("connection.uri", "mongodb://host:27017");
         config.set("database", "testdb");
         config.set("collection", "out");
-        config.set("batch.size", "1000");
-        config.set("ordered", "false");
+        config.set("write.mode", "upsert");
+        config.set("write.mode.key_fields", "id");
 
         let cfg = MongoDbSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.batch_size, 1000);
-        assert!(!cfg.ordered);
+        assert!(matches!(cfg.write_mode, WriteMode::Upsert { .. }));
+    }
+
+    #[test]
+    fn removed_sink_properties_are_rejected() {
+        for key in REMOVED_SINK_CONFIG_KEYS {
+            let mut config = ConnectorConfig::new("mongodb-sink");
+            config.set("connection.uri", "mongodb://host:27017");
+            config.set("database", "testdb");
+            config.set("collection", "out");
+            config.set(*key, "1000");
+
+            let error = MongoDbSinkConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains(key));
+        }
+    }
+
+    #[test]
+    fn sink_upsert_keys_must_be_non_empty_and_unique() {
+        for keys in [
+            vec![],
+            vec!["".to_string()],
+            vec!["id".to_string(), "id".to_string()],
+            vec!["_op".to_string()],
+            vec!["$expr".to_string()],
+            vec!["customer.id".to_string()],
+        ] {
+            let mut config = MongoDbSinkConfig::new("mongodb://host:27017", "db", "out");
+            config.write_mode = WriteMode::Upsert { key_fields: keys };
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn sink_config_rejects_mode_irrelevant_properties() {
+        let cases = [
+            ("insert", "write.mode.key_fields", "id"),
+            ("insert", "ordered", "false"),
+            ("insert", "write.mode.upsert_on_missing", "true"),
+            ("insert", "write_concern.journal", "false"),
+        ];
+
+        for (mode, key, value) in cases {
+            let mut config = ConnectorConfig::new("mongodb-sink");
+            config.set("connection.uri", "mongodb://host:27017");
+            config.set("database", "testdb");
+            config.set("collection", "out");
+            config.set("write.mode", mode);
+            config.set(key, value);
+
+            let error = MongoDbSinkConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains(key), "{error}");
+        }
+
+        let mut config = ConnectorConfig::new("mongodb-sink");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "out");
+        config.set("write.mode", "replace");
+        let error = MongoDbSinkConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("replace"), "{error}");
+    }
+
+    #[test]
+    fn sink_config_rejects_irrelevant_timeseries_properties() {
+        for key in [
+            "timeseries.meta_field",
+            "timeseries.granularity",
+            "timeseries.bucket_max_span_seconds",
+            "timeseries.bucket_rounding_seconds",
+            "timeseries.expire_after_seconds",
+        ] {
+            let mut config = ConnectorConfig::new("mongodb-sink");
+            config.set("connection.uri", "mongodb://host:27017");
+            config.set("database", "testdb");
+            config.set("collection", "out");
+            config.set(key, "60");
+
+            let error = MongoDbSinkConfig::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains(key), "{error}");
+        }
+
+        let mut config = ConnectorConfig::new("mongodb-sink");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "out");
+        config.set("timeseries.time_field", "timestamp");
+        config.set("timeseries.granularity", "seconds");
+        config.set("timeseries.bucket_max_span_seconds", "60");
+
+        let error = MongoDbSinkConfig::from_config(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timeseries.bucket_max_span_seconds"));
+    }
+
+    #[test]
+    fn sink_config_rejects_unknown_property() {
+        let mut config = ConnectorConfig::new("mongodb-sink");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "out");
+        config.set("flush.intervall.ms", "10");
+
+        let error = MongoDbSinkConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("flush.intervall.ms"));
     }
 
     #[test]
@@ -847,13 +1075,5 @@ mod tests {
         config.set("timeseries.time_field", "  ");
         let err = MongoDbSinkConfig::from_config(&config).unwrap_err();
         assert!(err.to_string().contains("time_field"));
-    }
-
-    #[test]
-    fn test_write_concern_default() {
-        let wc = WriteConcernConfig::default();
-        assert!(matches!(wc.w, WriteConcernLevel::Majority));
-        assert!(wc.journal);
-        assert!(wc.timeout_ms.is_none());
     }
 }

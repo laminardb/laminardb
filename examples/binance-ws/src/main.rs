@@ -46,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vwap_subs: Vec<TypedSubscription<Vwap>> = Vec::new();
     let mut signal_subs: Vec<TypedSubscription<Signal>> = Vec::new();
     for sym in SYMBOLS {
-        vwap_subs.push(db.subscribe::<Vwap>(&format!("vwap_{sym}"))?);
-        signal_subs.push(db.subscribe::<Signal>(&format!("signals_{sym}"))?);
+        vwap_subs.push(db.subscribe::<Vwap>(&format!("vwap_{sym}")).await?);
+        signal_subs.push(db.subscribe::<Signal>(&format!("signals_{sym}")).await?);
     }
 
     // ── Step 5: Run dashboard ────────────────────────────────────
@@ -88,8 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        drain_subs(&mut vwap_subs, &mut state.vwap, |r| r.symbol.clone());
-        drain_subs(&mut signal_subs, &mut state.signals, |r| r.symbol.clone());
+        drain_subs(&mut vwap_subs, &mut state.vwap, |r| r.symbol.clone())?;
+        drain_subs(&mut signal_subs, &mut state.signals, |r| r.symbol.clone())?;
 
         let m = db.metrics();
         state.total_events = m.total_events_ingested;
@@ -117,10 +117,10 @@ fn drain_subs<T: Clone + FromBatch>(
     subs: &mut [TypedSubscription<T>],
     map: &mut HashMap<String, T>,
     key_fn: fn(&T) -> String,
-) {
+) -> Result<(), laminar_db::SubscriptionError> {
     for sub in subs.iter_mut() {
         for _ in 0..64 {
-            match sub.poll() {
+            match sub.poll()? {
                 Some(rows) => {
                     for r in rows {
                         map.insert(key_fn(&r), r);
@@ -130,4 +130,5 @@ fn drain_subs<T: Clone + FromBatch>(
             }
         }
     }
+    Ok(())
 }

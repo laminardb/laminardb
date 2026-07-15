@@ -38,6 +38,8 @@ mod changelog_filter;
 /// Unified checkpoint coordination.
 #[doc(hidden)]
 pub mod checkpoint_coordinator;
+#[cfg(feature = "cluster")]
+mod cluster_recovery_capsule;
 mod config;
 mod connector_manager;
 mod coordinated_committer;
@@ -89,14 +91,9 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
-/// Disk cold tier for demoted operator state.
-#[cfg(feature = "state-tier")]
-mod state_tier;
-/// External `SUBSCRIBE` substrate: per-name broadcast channel and the
-/// per-portal pump task.
+/// External named-subscription substrate: byte-bounded shared logs and cursor portals.
 pub mod subscription;
 mod table_backend;
-mod table_cache_mode;
 mod table_provider;
 mod table_store;
 mod temporal_probe;
@@ -121,7 +118,9 @@ pub mod ffi;
 
 pub use builder::LaminarDbBuilder;
 pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
-pub use checkpoint_coordinator::{CheckpointPhase, CheckpointResult, CheckpointStats};
+pub use checkpoint_coordinator::{
+    CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
+};
 pub use config::{BackpressurePolicy, LaminarConfig, RestartPolicy};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
@@ -129,11 +128,9 @@ pub use error::DbError;
 pub use handle::{
     DdlInfo, ExecuteResult, FromBatch, MaterializedViewInfo, PipelineEdge, PipelineNode,
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
-    StreamInfo, TypedSubscription, UntypedSourceHandle,
+    StreamInfo, SubscriptionError, TypedSubscription, TypedSubscriptionFrame, UntypedSourceHandle,
 };
 pub use laminar_connectors::connector::DeliveryGuarantee;
-#[cfg(feature = "state-tier")]
-pub use metrics::TierMetrics;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};

@@ -98,10 +98,10 @@ impl Default for GeneratorSource {
 #[async_trait]
 impl SourceConnector for GeneratorSource {
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(SourceContract::new(
-            SourceConsistency::Replayable,
-            SourceTopology::Singleton,
-        ))
+        Ok(
+            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton)
+                .with_exact_delivery_certification(),
+        )
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -191,7 +191,11 @@ impl SourceConnector for GeneratorSource {
 
 /// Registers the generator source so
 /// `CREATE SOURCE ... WITH (connector = 'generator')` resolves.
-pub fn register_generator_source(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns the registry error when the name is already registered or the registry is frozen.
+pub fn register_generator_source(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
     let info = ConnectorInfo {
         name: "generator".to_string(),
         display_name: "Synthetic Data Generator".to_string(),
@@ -212,7 +216,7 @@ pub fn register_generator_source(registry: &ConnectorRegistry) {
         "generator",
         info,
         Arc::new(|_registry: Option<&prometheus::Registry>| Box::new(GeneratorSource::default())),
-    );
+    )
 }
 
 #[cfg(test)]
@@ -237,6 +241,7 @@ mod tests {
             .expect("static generator contract");
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert!(contract.is_exact_delivery_certified());
     }
 
     #[tokio::test]

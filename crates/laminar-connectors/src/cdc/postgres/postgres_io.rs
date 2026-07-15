@@ -1,701 +1,595 @@
-//! `PostgreSQL` logical replication I/O.
+//! `PostgreSQL` logical replication connections and slot administration.
 
+#[cfg(not(test))]
 use super::lsn::Lsn;
 use crate::error::ConnectorError;
+use sha2::{Digest, Sha256};
 
-// ── Wire format types (always available) ──
+pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A message received from the `PostgreSQL` replication stream.
-///
-/// These are the two message types sent by the server over the
-/// streaming replication protocol (inside `CopyData` messages).
+const MINIMUM_SERVER_VERSION_NUM: u32 = 170_000;
+
+/// Database-side identity that makes an engine checkpoint safe to resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReplicationMessage {
-    /// WAL data payload (tag `w`).
-    ///
-    /// Contains the raw pgoutput bytes that should be decoded by the
-    /// pgoutput decoder.
-    XLogData {
-        /// WAL start position of this message.
-        wal_start: Lsn,
-        /// WAL end position (server's current write position).
-        wal_end: Lsn,
-        /// Server timestamp in microseconds since 2000-01-01.
-        server_time_us: i64,
-        /// Raw pgoutput payload bytes.
-        data: Vec<u8>,
-    },
-
-    /// Primary keepalive message (tag `k`).
-    ///
-    /// Sent periodically by the server, and whenever the server needs
-    /// a status update from the client.
-    PrimaryKeepalive {
-        /// Server's current WAL end position.
-        wal_end: Lsn,
-        /// Server timestamp in microseconds since 2000-01-01.
-        server_time_us: i64,
-        /// If `true`, the client must reply immediately with a standby
-        /// status update, otherwise the server may disconnect.
-        reply_requested: bool,
-    },
+pub(super) struct PostgresCheckpointBinding {
+    pub system_identifier: u64,
+    pub timeline_id: u32,
+    pub database_oid: u32,
+    pub publication_oid: u32,
+    pub publication_definition_sha256: String,
+    pub source_config_sha256: String,
+    pub slot_plugin: String,
+    pub slot_two_phase: bool,
+    pub slot_failover: bool,
 }
 
-/// Parses a raw replication message from byte data.
-///
-/// The input should be the payload of a `CopyData` message (after
-/// stripping the `CopyData` framing).
-///
-/// # Wire Format
-///
-/// - `w` (0x77): `XLogData` — 1 + 8 + 8 + 8 bytes header + variable payload
-/// - `k` (0x6B): `PrimaryKeepalive` — 1 + 8 + 8 + 1 = 18 bytes
-///
-/// # Errors
-///
-/// Returns `ConnectorError::ReadError` if the message is empty,
-/// has an unknown tag, or is truncated.
-#[allow(clippy::missing_panics_doc)] // slice indexing is bounds-checked above
-pub fn parse_replication_message(data: &[u8]) -> Result<ReplicationMessage, ConnectorError> {
-    if data.is_empty() {
-        return Err(ConnectorError::ReadError(
-            "empty replication message".to_string(),
-        ));
-    }
-
-    match data[0] {
-        b'w' => {
-            // XLogData: tag(1) + wal_start(8) + wal_end(8) + server_time(8) + data(N)
-            const HEADER_LEN: usize = 1 + 8 + 8 + 8; // 25 bytes
-            if data.len() < HEADER_LEN {
-                return Err(ConnectorError::ReadError(format!(
-                    "truncated XLogData: {} bytes (need at least {HEADER_LEN})",
-                    data.len()
-                )));
-            }
-
-            // SAFETY: length checked by `data.len() < HEADER_LEN` guard above
-            let wal_start = Lsn::new(u64::from_be_bytes(data[1..9].try_into().unwrap()));
-            let wal_end = Lsn::new(u64::from_be_bytes(data[9..17].try_into().unwrap()));
-            let server_time_us = i64::from_be_bytes(data[17..25].try_into().unwrap());
-            let payload = data[HEADER_LEN..].to_vec();
-
-            Ok(ReplicationMessage::XLogData {
-                wal_start,
-                wal_end,
-                server_time_us,
-                data: payload,
-            })
-        }
-        b'k' => {
-            // PrimaryKeepalive: tag(1) + wal_end(8) + server_time(8) + reply(1) = 18
-            const KEEPALIVE_LEN: usize = 1 + 8 + 8 + 1; // 18 bytes
-            if data.len() < KEEPALIVE_LEN {
-                return Err(ConnectorError::ReadError(format!(
-                    "truncated PrimaryKeepalive: {} bytes (need {KEEPALIVE_LEN})",
-                    data.len()
-                )));
-            }
-
-            // SAFETY: length checked by `data.len() < KEEPALIVE_LEN` guard above
-            let wal_end = Lsn::new(u64::from_be_bytes(data[1..9].try_into().unwrap()));
-            let server_time_us = i64::from_be_bytes(data[9..17].try_into().unwrap());
-            let reply_requested = data[17] != 0;
-
-            Ok(ReplicationMessage::PrimaryKeepalive {
-                wal_end,
-                server_time_us,
-                reply_requested,
-            })
-        }
-        tag => Err(ConnectorError::ReadError(format!(
-            "unknown replication message tag: 0x{tag:02X}"
-        ))),
-    }
+/// Read-only projection of the recovery fields on an existing slot.
+#[cfg(not(test))]
+pub(super) struct InspectedReplicationSlot {
+    pub confirmed_flush_lsn: Option<Lsn>,
+    pub binding: PostgresCheckpointBinding,
 }
 
-/// Encodes a standby status update message.
-///
-/// Returns the 34-byte message suitable for sending via `CopyData`.
-///
-/// # Wire Format
-///
-/// ```text
-/// Byte  0:       'r' (0x72) — StandbyStatusUpdate tag
-/// Bytes 1-8:     write LSN (last WAL position received)
-/// Bytes 9-16:    flush LSN (last WAL position flushed to disk)
-/// Bytes 17-24:   apply LSN (last WAL position applied)
-/// Bytes 25-32:   client timestamp (microseconds since 2000-01-01)
-/// Byte  33:      reply requested (always 0 from client)
-/// ```
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+/// Hashes only settings that change which logical changes Laminar emits.
+/// Connection endpoints and buffering limits deliberately remain restartable.
 #[must_use]
-pub fn encode_standby_status(write_lsn: Lsn, flush_lsn: Lsn, apply_lsn: Lsn) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34);
-    buf.push(b'r');
-    buf.extend_from_slice(&write_lsn.as_u64().to_be_bytes());
-    buf.extend_from_slice(&flush_lsn.as_u64().to_be_bytes());
-    buf.extend_from_slice(&apply_lsn.as_u64().to_be_bytes());
-    // Client timestamp: 0 (server doesn't require it)
-    buf.extend_from_slice(&0_i64.to_be_bytes());
-    // Reply requested: always 0 from client
-    buf.push(0);
-    buf
+pub(super) fn source_config_digest(config: &super::config::PostgresCdcConfig) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"laminardb-postgres-cdc-source-v1\0");
+    digest_field(&mut digest, b"pgoutput");
+    digest_field(&mut digest, b"proto_version=1");
+    digest_field(&mut digest, b"messages=false");
+
+    for tables in [&config.table_include, &config.table_exclude] {
+        let mut canonical: Vec<&str> = tables.iter().map(String::as_str).collect();
+        canonical.sort_unstable();
+        canonical.dedup();
+        digest.update(
+            u64::try_from(canonical.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for table in canonical {
+            digest_field(&mut digest, table.as_bytes());
+        }
+    }
+
+    format!("{:x}", digest.finalize())
 }
 
-/// Validates that a string is a safe `PostgreSQL` identifier (alphanumeric + underscore).
-fn validate_pg_identifier(value: &str, field: &str) -> Result<(), ConnectorError> {
-    if value.is_empty() {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "{field} must not be empty"
-        )));
-    }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "{field} contains unsafe characters (only [a-zA-Z0-9_] allowed): {value:?}"
-        )));
-    }
-    Ok(())
+/// Cancellation-safe control-plane connection and driver task.
+#[cfg(not(test))]
+pub(super) struct ControlConnection {
+    client: tokio_postgres::Client,
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Builds the `START_REPLICATION` SQL command.
-///
-/// Returns the query string to be sent via the `CopyBoth` protocol.
+#[cfg(not(test))]
+impl ControlConnection {
+    #[must_use]
+    pub(super) fn client(&self) -> &tokio_postgres::Client {
+        &self.client
+    }
+
+    pub(super) async fn close(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for ControlConnection {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Opens the regular connection used for version and recovery-identity checks.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ConfigurationError` if `slot_name` or
-/// `publication` contain characters outside `[a-zA-Z0-9_]`.
-pub fn build_start_replication_query(
-    slot_name: &str,
-    start_lsn: Lsn,
-    publication: &str,
-) -> Result<String, ConnectorError> {
-    validate_pg_identifier(slot_name, "slot_name")?;
-    validate_pg_identifier(publication, "publication")?;
-    Ok(format!(
-        "START_REPLICATION SLOT {slot_name} LOGICAL {start_lsn} \
-         (proto_version '1', publication_names '{publication}')"
-    ))
-}
-
-// ── Feature-gated I/O functions ──
-
-/// Connects to `PostgreSQL` as a regular (control-plane) connection.
-///
-/// This connection is used for slot management and metadata queries.
-/// WAL streaming uses a separate `pgwire-replication` client (see
-/// `build_replication_config()`).
-///
-/// Spawns a background task to drive the connection. The caller must
-/// keep the returned `JoinHandle` alive; dropping it will close the
-/// connection.
-///
-/// # TLS
-///
-/// Currently only supports `NoTls`. Non-`Disable` SSL modes will log
-/// a warning and fall back to `NoTls`. TLS is not supported.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::ConnectionFailed` if the connection fails.
-#[cfg(feature = "postgres-cdc")]
-pub async fn connect(
+/// Returns an error when TLS configuration is invalid or the connection cannot be opened.
+#[cfg(not(test))]
+pub(super) async fn connect(
     config: &super::config::PostgresCdcConfig,
-) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), ConnectorError> {
+) -> Result<ControlConnection, ConnectorError> {
     use super::config::SslMode;
 
-    let conn_str = config.connection_string();
-
-    // Control-plane connection has no TLS support yet (replication
-    // stream does — see `build_replication_config`). Refuse anything
-    // other than `Disable` rather than silently downgrading. `Prefer`
-    // in particular MUST NOT silently fall back to NoTls on a
-    // connector that documents TLS support for replication; that
-    // produces a confusing posture where one channel is encrypted
-    // and the other isn't. Operators who need TLS for control-plane
-    // need to wait until it lands; until then they have to opt out
-    // explicitly with `ssl.mode=disable`.
+    let pg_config = config.control_connection_config()?;
     match config.ssl_mode {
-        SslMode::Disable => {}
-        mode => {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "ssl.mode={mode}: TLS for the postgres-cdc control-plane \
-                 connection is not implemented; only ssl.mode=disable is \
-                 currently supported. The replication stream still \
-                 honours ssl.mode."
-            )));
+        SslMode::Disable => {
+            let (client, connection) =
+                tokio::time::timeout(CONNECT_TIMEOUT, pg_config.connect(tokio_postgres::NoTls))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::ConnectionFailed(
+                            "PostgreSQL connect timed out after 10 seconds".into(),
+                        )
+                    })?
+                    .map_err(|error| {
+                        ConnectorError::ConnectionFailed(format!("PostgreSQL connect: {error}"))
+                    })?;
+            let handle = tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!(%error, "PostgreSQL control-plane connection error");
+                }
+            });
+            Ok(ControlConnection {
+                client,
+                handle: Some(handle),
+            })
+        }
+        SslMode::VerifyFull => {
+            let tls =
+                crate::postgres_tls::make_rustls_connector(config.ssl_ca_cert_path.as_deref())?;
+            let (client, connection) =
+                tokio::time::timeout(CONNECT_TIMEOUT, pg_config.connect(tls))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::ConnectionFailed(
+                            "PostgreSQL TLS connect timed out after 10 seconds".into(),
+                        )
+                    })?
+                    .map_err(|error| {
+                        ConnectorError::ConnectionFailed(format!("PostgreSQL TLS connect: {error}"))
+                    })?;
+            let handle = tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!(%error, "PostgreSQL control-plane TLS connection error");
+                }
+            });
+            Ok(ControlConnection {
+                client,
+                handle: Some(handle),
+            })
         }
     }
-
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
-        .await
-        .map_err(|e| ConnectorError::ConnectionFailed(format!("PostgreSQL connect: {e}")))?;
-
-    let handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::error!(error = %e, "PostgreSQL control-plane connection error");
-        }
-    });
-
-    Ok((client, handle))
 }
 
-/// Ensures the replication slot exists, creating it if necessary.
+/// Inspects an existing logical replication slot and returns its durable cursor.
 ///
-/// Returns the slot's `confirmed_flush_lsn` if the slot already exists
-/// (useful for resuming replication from the last acknowledged position).
-///
-/// Uses a regular (non-replication) connection. Slot creation uses the
-/// `pg_create_logical_replication_slot()` SQL function which works on
-/// standard connections.
+/// This operation never creates, replaces, advances, or drops a slot. Recovery
+/// owns an exact engine checkpoint and must fail closed when the corresponding
+/// PostgreSQL slot is absent.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError` if the slot query or creation fails.
-#[cfg(feature = "postgres-cdc")]
-pub async fn ensure_replication_slot(
+/// Returns an error when slot lookup, identity validation, or LSN parsing fails.
+#[allow(clippy::too_many_lines)]
+#[cfg(not(test))]
+pub(super) async fn inspect_replication_slot(
     client: &tokio_postgres::Client,
     slot_name: &str,
     plugin: &str,
-) -> Result<Option<Lsn>, ConnectorError> {
-    // Check if slot already exists (parameterized to prevent SQL injection)
-    let rows = client
-        .query(
-            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
-            &[&slot_name],
+    database: &str,
+    publication: &str,
+    source_config_sha256: String,
+) -> Result<Option<InspectedReplicationSlot>, ConnectorError> {
+    let version_row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_one("SELECT current_setting('server_version_num')", &[]),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::ConnectionFailed(
+            "query PostgreSQL server version timed out after 10 seconds".into(),
         )
-        .await
-        .map_err(|e| ConnectorError::ConnectionFailed(format!("query replication slots: {e}")))?;
+    })?
+    .map_err(|error| {
+        ConnectorError::ConnectionFailed(format!("query PostgreSQL server version: {error}"))
+    })?;
+    let version_text: &str = version_row.get(0);
+    let version_num = version_text.parse::<u32>().map_err(|error| {
+        ConnectorError::ReadError(format!(
+            "invalid PostgreSQL server_version_num '{version_text}': {error}"
+        ))
+    })?;
+    validate_server_version_num(version_num)?;
 
-    if let Some(row) = rows.first() {
-        let lsn_str: Option<&str> = row.get(0);
-        if let Some(lsn_str) = lsn_str {
-            let lsn: Lsn = lsn_str.parse().map_err(|e| {
-                ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {e}"))
-            })?;
-            tracing::info!(slot = slot_name, lsn = %lsn, "replication slot exists");
-            return Ok(Some(lsn));
-        }
-        // Row exists but LSN column is NULL
-        tracing::info!(slot = slot_name, "replication slot exists (no flush LSN)");
+    let control_row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_one(
+            "SELECT control_system.system_identifier::text, control_checkpoint.timeline_id::text \
+             FROM pg_catalog.pg_control_system() AS control_system \
+             CROSS JOIN pg_catalog.pg_control_checkpoint() AS control_checkpoint",
+            &[],
+        ),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::ConnectionFailed(
+            "query PostgreSQL system identifier and timeline timed out after 10 seconds".into(),
+        )
+    })?
+    .map_err(map_control_system_query_error)?;
+    let system_identifier = parse_decimal_identity::<u64>(control_row.get(0), "system identifier")?;
+    let timeline_id = parse_decimal_identity::<u32>(control_row.get(1), "timeline ID")?;
+
+    // Keep the database, publication, and slot projection in one statement so
+    // its catalog rows come from one PostgreSQL snapshot. The JSONB rendering
+    // is deterministic and automatically includes new publication properties.
+    let row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_opt(
+            "WITH publication_identity AS ( \
+                 SELECT p.oid::text AS publication_oid, p.pubtruncate, \
+                        jsonb_build_object( \
+                            'properties', to_jsonb(p) - ARRAY['oid', 'pubname', 'pubowner']::text[], \
+                            'tables', COALESCE( \
+                                (SELECT jsonb_agg( \
+                                     jsonb_build_array( \
+                                         c.oid::text, pt.schemaname, pt.tablename, \
+                                         pt.attnames, pt.rowfilter \
+                                     ) \
+                                     ORDER BY pt.schemaname, pt.tablename, c.oid \
+                                 ) \
+                                 FROM pg_catalog.pg_publication_tables AS pt \
+                                 LEFT JOIN pg_catalog.pg_namespace AS n \
+                                        ON n.nspname = pt.schemaname \
+                                 LEFT JOIN pg_catalog.pg_class AS c \
+                                        ON c.relnamespace = n.oid AND c.relname = pt.tablename \
+                                 WHERE pt.pubname = p.pubname), \
+                                '[]'::jsonb \
+                            ) \
+                        )::text AS definition \
+                 FROM pg_catalog.pg_publication AS p \
+                 WHERE p.pubname = $2 \
+             ) \
+             SELECT s.confirmed_flush_lsn::text, s.plugin, s.slot_type, \
+                    s.database::text, s.temporary, s.two_phase, s.failover, \
+                    s.invalidation_reason, db.oid::text, publication_identity.publication_oid, \
+                    publication_identity.definition, publication_identity.pubtruncate \
+             FROM pg_catalog.pg_replication_slots AS s \
+             CROSS JOIN pg_catalog.pg_database AS db \
+             LEFT JOIN publication_identity ON TRUE \
+             WHERE s.slot_name = $1 AND db.datname = current_database()",
+            &[&slot_name, &publication],
+        ),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::ConnectionFailed("query replication slot timed out after 10 seconds".into())
+    })?
+    .map_err(|error| {
+        ConnectorError::ConnectionFailed(format!(
+            "query PostgreSQL replication identity: {error}"
+        ))
+    })?;
+
+    let Some(row) = row else {
         return Ok(None);
+    };
+    let configured_plugin: Option<&str> = row.get(1);
+    let slot_type: &str = row.get(2);
+    let configured_database: Option<&str> = row.get(3);
+    let temporary: bool = row.get(4);
+    let two_phase: bool = row.get(5);
+    let failover: bool = row.get(6);
+    let invalidation_reason: Option<&str> = row.get(7);
+    validate_replication_slot(
+        slot_name,
+        plugin,
+        database,
+        configured_plugin,
+        slot_type,
+        configured_database,
+        temporary,
+        invalidation_reason,
+    )?;
+    let database_oid = parse_decimal_identity::<u32>(row.get(8), "database OID")?;
+    let publication_oid_text: Option<&str> = row.get(9);
+    let publication_oid = publication_oid_text
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "PostgreSQL publication '{publication}' does not exist"
+            ))
+        })
+        .and_then(|value| parse_decimal_identity::<u32>(value, "publication OID"))?;
+    let publication_definition: Option<&str> = row.get(10);
+    let publication_definition = publication_definition.ok_or_else(|| {
+        ConnectorError::ConfigurationError(format!(
+            "PostgreSQL publication '{publication}' has no readable definition"
+        ))
+    })?;
+    let publication_truncates: Option<bool> = row.get(11);
+    if publication_truncates != Some(false) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL publication '{publication}' publishes TRUNCATE, which this CDC source cannot represent; recreate or alter it with publish='insert,update,delete'"
+        )));
     }
-
-    // Slot doesn't exist — create it via SQL function (parameterized)
-    client
-        .execute(
-            "SELECT pg_create_logical_replication_slot($1, $2)",
-            &[&slot_name, &plugin],
-        )
-        .await
-        .map_err(|e| ConnectorError::ConnectionFailed(format!("create replication slot: {e}")))?;
-
+    let mut publication_digest = Sha256::new();
+    publication_digest.update(b"laminardb-postgres-publication-v1\0");
+    digest_field(&mut publication_digest, publication_definition.as_bytes());
     tracing::info!(
         slot = slot_name,
-        plugin = plugin,
-        "created replication slot"
+        two_phase,
+        failover,
+        "using logical replication slot"
     );
-    Ok(None)
+
+    let lsn: Option<&str> = row.get(0);
+    let confirmed_flush_lsn = lsn
+        .map(|value| {
+            value.parse().map_err(|error| {
+                ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {error}"))
+            })
+        })
+        .transpose()?;
+    Ok(Some(InspectedReplicationSlot {
+        confirmed_flush_lsn,
+        binding: PostgresCheckpointBinding {
+            system_identifier,
+            timeline_id,
+            database_oid,
+            publication_oid,
+            publication_definition_sha256: format!("{:x}", publication_digest.finalize()),
+            source_config_sha256,
+            slot_plugin: configured_plugin.unwrap_or_default().to_string(),
+            slot_two_phase: two_phase,
+            slot_failover: failover,
+        },
+    }))
 }
 
-/// Drop a `PostgreSQL` logical replication slot.
-///
-/// Use this for administrative cleanup when a pipeline is permanently
-/// deleted and the slot is no longer needed.  Do NOT call this on normal
-/// shutdown — the slot must survive restarts for resume-from-checkpoint.
-///
-/// An unconsumed slot holds WAL on the server until it is either consumed
-/// or dropped.  Monitor `pg_replication_slots` for stale slots.
-///
-/// # Errors
-///
-/// Returns `ConnectorError` if the DROP fails (e.g., slot does not exist,
-/// or it is still active).
-#[cfg(feature = "postgres-cdc")]
-pub async fn drop_replication_slot(
-    client: &tokio_postgres::Client,
-    slot_name: &str,
-) -> Result<(), ConnectorError> {
-    client
-        .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
-        .await
-        .map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("drop replication slot '{slot_name}': {e}"))
-        })?;
-    tracing::info!(slot = slot_name, "dropped replication slot");
+fn validate_server_version_num(version_num: u32) -> Result<(), ConnectorError> {
+    if version_num < MINIMUM_SERVER_VERSION_NUM {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL CDC requires PostgreSQL 17 or newer; server_version_num is {version_num}"
+        )));
+    }
     Ok(())
 }
 
-/// Builds a [`pgwire_replication::ReplicationConfig`] from a
-/// [`PostgresCdcConfig`](super::config::PostgresCdcConfig).
-///
-/// Maps connection parameters, replication slot, publication, start LSN,
-/// keepalive interval, and TLS settings.
-///
-/// # TLS Mapping
-///
-/// | `SslMode`    | `TlsConfig` method                     |
-/// |--------------|----------------------------------------|
-/// | `Disable`    | `disabled()`                           |
-/// | `Prefer`     | `require()` (no prefer in upstream)    |
-/// | `Require`    | `require()`                            |
-/// | `VerifyCa`   | `verify_ca(ca_path)`                   |
-/// | `VerifyFull` | `verify_full(ca_path)`                 |
-///
-/// Optional SNI hostname and mTLS client cert/key are chained as
-/// builder steps when their config fields are set.
-///
-/// # Note
-///
-/// `pgwire-replication` manages slot creation externally — use
-/// `ensure_replication_slot()` before calling this.
-#[cfg(feature = "postgres-cdc")]
-pub fn build_replication_config(
+#[cfg(not(test))]
+fn parse_decimal_identity<T>(value: &str, label: &str) -> Result<T, ConnectorError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value.parse::<T>().map_err(|error| {
+        ConnectorError::ReadError(format!("invalid PostgreSQL {label} '{value}': {error}"))
+    })
+}
+
+#[cfg(not(test))]
+fn map_control_system_query_error(error: tokio_postgres::Error) -> ConnectorError {
+    if error.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) {
+        return ConnectorError::ConfigurationError(
+            "PostgreSQL CDC must call pg_catalog.pg_control_system() and pg_catalog.pg_control_checkpoint() to bind checkpoints to a physical cluster and WAL timeline; grant the replication role pg_monitor or EXECUTE on both functions"
+                .into(),
+        );
+    }
+    ConnectorError::ConnectionFailed(format!(
+        "query PostgreSQL system identifier and timeline: {error}"
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_replication_slot(
+    slot_name: &str,
+    expected_plugin: &str,
+    expected_database: &str,
+    configured_plugin: Option<&str>,
+    slot_type: &str,
+    configured_database: Option<&str>,
+    temporary: bool,
+    invalidation_reason: Option<&str>,
+) -> Result<(), ConnectorError> {
+    if slot_type != "logical" || configured_plugin != Some(expected_plugin) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL replication slot '{slot_name}' is not a logical {expected_plugin} slot"
+        )));
+    }
+    if configured_database != Some(expected_database) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL replication slot '{slot_name}' belongs to database '{}', not configured database '{expected_database}'",
+            configured_database.unwrap_or("<none>")
+        )));
+    }
+    if temporary {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL replication slot '{slot_name}' is temporary and cannot provide durable recovery"
+        )));
+    }
+    if let Some(reason) = invalidation_reason {
+        return Err(ConnectorError::ReadError(format!(
+            "PostgreSQL replication slot '{slot_name}' is invalidated: {reason}"
+        )));
+    }
+    Ok(())
+}
+
+/// Builds the replication client configuration from the validated source config.
+#[must_use]
+pub(super) fn build_replication_config(
     config: &super::config::PostgresCdcConfig,
 ) -> pgwire_replication::ReplicationConfig {
-    use std::path::PathBuf;
-
-    use super::config::SslMode;
-
-    let ca_path = config.ca_cert_path.as_ref().map(PathBuf::from);
-
-    let tls = match config.ssl_mode {
-        SslMode::Disable => pgwire_replication::TlsConfig::disabled(),
-        SslMode::Prefer | SslMode::Require => pgwire_replication::TlsConfig::require(),
-        SslMode::VerifyCa => pgwire_replication::TlsConfig::verify_ca(ca_path),
-        SslMode::VerifyFull => pgwire_replication::TlsConfig::verify_full(ca_path),
-    };
-
-    // Apply optional SNI hostname
-    let tls = if let Some(ref hostname) = config.sni_hostname {
-        tls.with_sni_hostname(hostname)
-    } else {
-        tls
-    };
-
-    // Apply optional mTLS client certificate
-    let tls = match (&config.client_cert_path, &config.client_key_path) {
-        (Some(cert), Some(key)) => tls.with_client_cert(PathBuf::from(cert), PathBuf::from(key)),
-        _ => tls,
-    };
-
-    let start_lsn = config
-        .start_lsn
-        .map_or(pgwire_replication::Lsn::ZERO, |lsn| {
-            pgwire_replication::Lsn::from_u64(lsn.as_u64())
-        });
-
     pgwire_replication::ReplicationConfig {
         host: config.host.clone(),
         port: config.port,
         user: config.username.clone(),
         password: config.password.clone().unwrap_or_default(),
         database: config.database.clone(),
-        tls,
+        tls: match config.ssl_mode {
+            super::config::SslMode::Disable => pgwire_replication::TlsConfig::disabled(),
+            super::config::SslMode::VerifyFull => {
+                pgwire_replication::TlsConfig::verify_full(config.ssl_ca_cert_path.clone())
+            }
+        },
         slot: config.slot_name.clone(),
         publication: config.publication.clone(),
-        start_lsn,
+        // The exact slot/checkpoint cursor is installed by `PostgresCdcSource::start` after it
+        // validates the durable slot. A user-supplied cursor is never accepted as configuration.
+        start_lsn: pgwire_replication::Lsn::ZERO,
+        expected_recovery_identity: None,
         stop_at_lsn: None,
-        status_interval: config.keepalive_interval,
-        idle_wakeup_interval: config.poll_timeout,
+        status_interval: std::time::Duration::from_secs(1),
+        idle_wakeup_interval: std::time::Duration::from_secs(1),
         buffer_events: 8192,
+        max_message_bytes: config.raw_wal_bytes(),
+        max_in_flight_bytes: config.raw_wal_bytes(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // ── XLogData parsing ──
+    use super::{
+        build_replication_config, source_config_digest, validate_replication_slot,
+        validate_server_version_num,
+    };
+    use crate::cdc::postgres::config::{PostgresCdcConfig, SslMode};
 
     #[test]
-    fn test_parse_xlog_data() {
-        let mut msg = vec![b'w'];
-        msg.extend_from_slice(&0x0000_0001_0000_0100_u64.to_be_bytes());
-        msg.extend_from_slice(&0x0000_0001_0000_0200_u64.to_be_bytes());
-        msg.extend_from_slice(&1_234_567_890_i64.to_be_bytes());
-        msg.extend_from_slice(b"hello pgoutput");
-
-        let parsed = parse_replication_message(&msg).unwrap();
-        match parsed {
-            ReplicationMessage::XLogData {
-                wal_start,
-                wal_end,
-                server_time_us,
-                data,
-            } => {
-                assert_eq!(wal_start, Lsn::new(0x0000_0001_0000_0100));
-                assert_eq!(wal_end, Lsn::new(0x0000_0001_0000_0200));
-                assert_eq!(server_time_us, 1_234_567_890);
-                assert_eq!(data, b"hello pgoutput");
-            }
-            ReplicationMessage::PrimaryKeepalive { .. } => panic!("expected XLogData"),
-        }
+    fn replication_config_disables_tls() {
+        let mut config = PostgresCdcConfig::default();
+        config.ssl_mode = SslMode::Disable;
+        let replication = build_replication_config(&config);
+        assert_eq!(replication.tls.mode, pgwire_replication::SslMode::Disable);
     }
 
     #[test]
-    fn test_parse_xlog_data_empty_payload() {
-        let mut msg = vec![b'w'];
-        msg.extend_from_slice(&0_u64.to_be_bytes());
-        msg.extend_from_slice(&0_u64.to_be_bytes());
-        msg.extend_from_slice(&0_i64.to_be_bytes());
+    fn replication_config_maps_verified_tls_and_custom_ca() {
+        let mut config = PostgresCdcConfig::default();
+        config.ssl_mode = SslMode::VerifyFull;
+        config.ssl_ca_cert_path = Some("/certs/ca.pem".into());
 
-        let parsed = parse_replication_message(&msg).unwrap();
-        match parsed {
-            ReplicationMessage::XLogData { data, .. } => {
-                assert!(data.is_empty());
-            }
-            ReplicationMessage::PrimaryKeepalive { .. } => panic!("expected XLogData"),
-        }
-    }
-
-    // ── PrimaryKeepalive parsing ──
-
-    #[test]
-    fn test_parse_keepalive_reply_requested() {
-        let mut msg = vec![b'k'];
-        msg.extend_from_slice(&0x0000_0002_0000_0500_u64.to_be_bytes());
-        msg.extend_from_slice(&9_876_543_210_i64.to_be_bytes());
-        msg.push(1);
-
-        let parsed = parse_replication_message(&msg).unwrap();
-        match parsed {
-            ReplicationMessage::PrimaryKeepalive {
-                wal_end,
-                server_time_us,
-                reply_requested,
-            } => {
-                assert_eq!(wal_end, Lsn::new(0x0000_0002_0000_0500));
-                assert_eq!(server_time_us, 9_876_543_210);
-                assert!(reply_requested);
-            }
-            ReplicationMessage::XLogData { .. } => panic!("expected PrimaryKeepalive"),
-        }
-    }
-
-    #[test]
-    fn test_parse_keepalive_no_reply() {
-        let mut msg = vec![b'k'];
-        msg.extend_from_slice(&0x100_u64.to_be_bytes());
-        msg.extend_from_slice(&0_i64.to_be_bytes());
-        msg.push(0);
-
-        let parsed = parse_replication_message(&msg).unwrap();
-        match parsed {
-            ReplicationMessage::PrimaryKeepalive {
-                reply_requested, ..
-            } => {
-                assert!(!reply_requested);
-            }
-            ReplicationMessage::XLogData { .. } => panic!("expected PrimaryKeepalive"),
-        }
-    }
-
-    // ── Error cases ──
-
-    #[test]
-    fn test_parse_empty_message() {
-        let err = parse_replication_message(&[]).unwrap_err();
-        assert!(err.to_string().contains("empty"));
-    }
-
-    #[test]
-    fn test_parse_unknown_tag() {
-        let err = parse_replication_message(&[0xFF]).unwrap_err();
-        assert!(err.to_string().contains("unknown"));
-        assert!(err.to_string().contains("0xFF"));
-    }
-
-    #[test]
-    fn test_parse_truncated_xlog_data() {
-        let msg = vec![b'w', 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let err = parse_replication_message(&msg).unwrap_err();
-        assert!(err.to_string().contains("truncated"));
-    }
-
-    #[test]
-    fn test_parse_truncated_keepalive() {
-        let msg = vec![b'k', 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let err = parse_replication_message(&msg).unwrap_err();
-        assert!(err.to_string().contains("truncated"));
-    }
-
-    // ── Standby status encoding ──
-
-    #[test]
-    fn test_encode_standby_status_layout() {
-        let write_lsn = Lsn::new(0x0000_0001_0000_0100);
-        let flush_lsn = Lsn::new(0x0000_0001_0000_0080);
-        let apply_lsn = Lsn::new(0x0000_0001_0000_0080);
-
-        let buf = encode_standby_status(write_lsn, flush_lsn, apply_lsn);
-
-        assert_eq!(buf.len(), 34, "standby status must be exactly 34 bytes");
-        assert_eq!(buf[0], b'r', "tag must be 'r'");
-
-        // write LSN at bytes 1-8
-        let w = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-        assert_eq!(w, 0x0000_0001_0000_0100);
-
-        // flush LSN at bytes 9-16
-        let f = u64::from_be_bytes(buf[9..17].try_into().unwrap());
-        assert_eq!(f, 0x0000_0001_0000_0080);
-
-        // apply LSN at bytes 17-24
-        let a = u64::from_be_bytes(buf[17..25].try_into().unwrap());
-        assert_eq!(a, 0x0000_0001_0000_0080);
-
-        // client timestamp at bytes 25-32 (we send 0)
-        let ts = i64::from_be_bytes(buf[25..33].try_into().unwrap());
-        assert_eq!(ts, 0);
-
-        // reply requested at byte 33
-        assert_eq!(buf[33], 0);
-    }
-
-    // ── START_REPLICATION query builder ──
-
-    #[test]
-    fn test_build_start_replication_query() {
-        let query =
-            build_start_replication_query("my_slot", "0/1234ABCD".parse().unwrap(), "my_pub")
-                .unwrap();
-        assert!(query.contains("START_REPLICATION SLOT my_slot LOGICAL 0/1234ABCD"));
-        assert!(query.contains("proto_version '1'"));
-        assert!(query.contains("publication_names 'my_pub'"));
-    }
-
-    #[test]
-    fn test_build_start_replication_query_rejects_injection() {
-        let result = build_start_replication_query(
-            "slot'; DROP TABLE users; --",
-            "0/0".parse().unwrap(),
-            "pub",
+        let replication = build_replication_config(&config);
+        assert_eq!(
+            replication.tls.mode,
+            pgwire_replication::SslMode::VerifyFull
         );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsafe characters"));
+        assert_eq!(replication.tls.ca_pem_path, Some("/certs/ca.pem".into()));
+        assert_eq!(
+            replication.status_interval,
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            replication.idle_wakeup_interval,
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(replication.max_message_bytes, config.raw_wal_bytes());
+        assert_eq!(replication.max_in_flight_bytes, config.raw_wal_bytes());
     }
 
     #[test]
-    fn test_build_start_replication_query_rejects_empty() {
-        let result = build_start_replication_query("", "0/0".parse().unwrap(), "pub");
-        assert!(result.is_err());
+    fn replication_config_maps_connection_identity() {
+        let mut config = PostgresCdcConfig::new("pg.example.com", "mydb", "my_slot", "my_pub");
+        config.ssl_mode = SslMode::Disable;
+        config.port = 5433;
+        config.username = "replicator".to_string();
+        config.password = Some("secret".to_string());
+
+        let replication = build_replication_config(&config);
+        assert_eq!(replication.host, "pg.example.com");
+        assert_eq!(replication.port, 5433);
+        assert_eq!(replication.user, "replicator");
+        assert_eq!(replication.password, "secret");
+        assert_eq!(replication.database, "mydb");
+        assert_eq!(replication.slot, "my_slot");
+        assert_eq!(replication.publication, "my_pub");
     }
 
     #[test]
-    fn test_validate_pg_identifier_accepts_valid() {
-        assert!(validate_pg_identifier("my_slot_123", "test").is_ok());
+    fn existing_slot_must_match_the_durable_logical_identity() {
+        validate_replication_slot(
+            "slot",
+            "pgoutput",
+            "app",
+            Some("pgoutput"),
+            "logical",
+            Some("app"),
+            false,
+            None,
+        )
+        .unwrap();
+
+        for error in [
+            validate_replication_slot(
+                "slot",
+                "pgoutput",
+                "app",
+                Some("test_decoding"),
+                "logical",
+                Some("app"),
+                false,
+                None,
+            )
+            .unwrap_err(),
+            validate_replication_slot(
+                "slot",
+                "pgoutput",
+                "app",
+                Some("pgoutput"),
+                "logical",
+                Some("other"),
+                false,
+                None,
+            )
+            .unwrap_err(),
+            validate_replication_slot(
+                "slot",
+                "pgoutput",
+                "app",
+                Some("pgoutput"),
+                "logical",
+                Some("app"),
+                true,
+                None,
+            )
+            .unwrap_err(),
+            validate_replication_slot(
+                "slot",
+                "pgoutput",
+                "app",
+                Some("pgoutput"),
+                "logical",
+                Some("app"),
+                false,
+                Some("wal_removed"),
+            )
+            .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("slot"));
+        }
     }
 
-    // ── build_replication_config TLS mapping ──
+    #[test]
+    fn source_config_digest_is_canonical_but_semantic() {
+        let mut first = PostgresCdcConfig::default();
+        first.table_include = vec!["public.b".into(), "public.a".into(), "public.a".into()];
+        first.table_exclude = vec!["public.audit".into()];
 
-    #[cfg(feature = "postgres-cdc")]
-    mod tls_mapping_tests {
-        use super::super::build_replication_config;
-        use crate::cdc::postgres::config::{PostgresCdcConfig, SslMode};
+        let mut reordered = first.clone();
+        reordered.table_include = vec!["public.a".into(), "public.b".into()];
+        reordered.host = "replacement-primary".into();
+        reordered.max_buffered_bytes = 64 * 1024 * 1024;
+        assert_eq!(
+            source_config_digest(&first),
+            source_config_digest(&reordered),
+            "endpoint, capacity, order, and duplicates do not change filtering semantics"
+        );
 
-        #[test]
-        fn test_disable_maps_to_disabled() {
-            let mut cfg = PostgresCdcConfig::default();
-            cfg.ssl_mode = SslMode::Disable;
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.tls.mode, pgwire_replication::SslMode::Disable);
-        }
+        reordered.table_exclude.push("public.private".into());
+        assert_ne!(
+            source_config_digest(&first),
+            source_config_digest(&reordered)
+        );
+    }
 
-        #[test]
-        fn test_prefer_maps_to_require() {
-            let cfg = PostgresCdcConfig::default(); // default is Prefer
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.tls.mode, pgwire_replication::SslMode::Require);
-        }
-
-        #[test]
-        fn test_require_maps_to_require() {
-            let mut cfg = PostgresCdcConfig::default();
-            cfg.ssl_mode = SslMode::Require;
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.tls.mode, pgwire_replication::SslMode::Require);
-        }
-
-        #[test]
-        fn test_verify_ca_maps_with_ca_path() {
-            let mut cfg = PostgresCdcConfig::default();
-            cfg.ssl_mode = SslMode::VerifyCa;
-            cfg.ca_cert_path = Some("/certs/ca.pem".to_string());
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.tls.mode, pgwire_replication::SslMode::VerifyCa);
-            assert_eq!(
-                repl.tls.ca_pem_path.as_deref(),
-                Some(std::path::Path::new("/certs/ca.pem"))
-            );
-        }
-
-        #[test]
-        fn test_verify_full_maps_with_ca_path() {
-            let mut cfg = PostgresCdcConfig::default();
-            cfg.ssl_mode = SslMode::VerifyFull;
-            cfg.ca_cert_path = Some("/certs/ca.pem".to_string());
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.tls.mode, pgwire_replication::SslMode::VerifyFull);
-            assert_eq!(
-                repl.tls.ca_pem_path.as_deref(),
-                Some(std::path::Path::new("/certs/ca.pem"))
-            );
-        }
-
-        #[test]
-        fn test_sni_hostname_applied() {
-            let mut cfg = PostgresCdcConfig::default();
-            cfg.sni_hostname = Some("db.example.com".to_string());
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.tls.sni_hostname.as_deref(), Some("db.example.com"));
-        }
-
-        #[test]
-        fn test_mtls_client_cert_applied() {
-            let mut cfg = PostgresCdcConfig::default();
-            cfg.ssl_mode = SslMode::Require;
-            cfg.client_cert_path = Some("/certs/client.pem".to_string());
-            cfg.client_key_path = Some("/certs/client-key.pem".to_string());
-            let repl = build_replication_config(&cfg);
-            assert_eq!(
-                repl.tls.client_cert_pem_path.as_deref(),
-                Some(std::path::Path::new("/certs/client.pem"))
-            );
-            assert_eq!(
-                repl.tls.client_key_pem_path.as_deref(),
-                Some(std::path::Path::new("/certs/client-key.pem"))
-            );
-        }
-
-        #[test]
-        fn test_no_client_cert_when_not_set() {
-            let cfg = PostgresCdcConfig::default();
-            let repl = build_replication_config(&cfg);
-            assert!(repl.tls.client_cert_pem_path.is_none());
-            assert!(repl.tls.client_key_pem_path.is_none());
-        }
-
-        #[test]
-        fn test_connection_fields_mapped() {
-            let mut cfg = PostgresCdcConfig::new("pg.example.com", "mydb", "my_slot", "my_pub");
-            cfg.port = 5433;
-            cfg.username = "replicator".to_string();
-            cfg.password = Some("secret".to_string());
-            let repl = build_replication_config(&cfg);
-            assert_eq!(repl.host, "pg.example.com");
-            assert_eq!(repl.port, 5433);
-            assert_eq!(repl.user, "replicator");
-            assert_eq!(repl.password, "secret");
-            assert_eq!(repl.database, "mydb");
-            assert_eq!(repl.slot, "my_slot");
-            assert_eq!(repl.publication, "my_pub");
-        }
+    #[test]
+    fn server_version_is_admitted_before_pg17_slot_columns_are_used() {
+        let error = validate_server_version_num(160_012).unwrap_err();
+        assert!(error.to_string().contains("PostgreSQL 17"), "{error}");
+        validate_server_version_num(170_000).unwrap();
+        validate_server_version_num(180_001).unwrap();
     }
 }

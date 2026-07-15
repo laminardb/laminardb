@@ -1,11 +1,11 @@
 //! Durable vnode→instance assignment snapshots. One object per
-//! version at `control/assignment-snapshots/v{N:016}.json`. Chitchat
+//! version at `control/assignment-snapshots/v{N:020}.json`. Chitchat
 //! carries the ephemeral copy; these files survive full-cluster
 //! restart.
 //!
-//! Rotation uses `PutMode::Create` on a per-version path so the CAS
-//! works on every backend (`LocalFileSystem` included, which doesn't
-//! yet implement `PutMode::Update`).
+//! Rotation and drain finalization use `PutMode::Create` on separate per-version paths. The
+//! append-only winner works on every backend, including `LocalFileSystem`, without relying on
+//! conditional overwrite support.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,13 +16,37 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload}
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
+use crate::checkpoint::{
+    AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+    MAX_CHECKPOINT_PARTICIPANTS,
+};
 use crate::cluster::discovery::NodeId;
 
 const SNAPSHOT_PREFIX: &str = "control/assignment-snapshots/";
+const DRAIN_FINALIZATION_PREFIX: &str = "control/assignment-drain-finalizations/";
+const SNAPSHOT_VERSION_WIDTH: usize = 20;
+const DRAIN_FINALIZATION_VERSION: u16 = 1;
 
 fn snapshot_path(version: u64) -> OsPath {
     // Fixed-width so lexicographic list order matches numeric order.
-    OsPath::from(format!("{SNAPSHOT_PREFIX}v{version:016}.json"))
+    OsPath::from(format!(
+        "{SNAPSHOT_PREFIX}v{version:0width$}.json",
+        width = SNAPSHOT_VERSION_WIDTH
+    ))
+}
+
+fn drain_finalization_path(version: u64) -> OsPath {
+    OsPath::from(format!(
+        "{DRAIN_FINALIZATION_PREFIX}v{version:0width$}.json",
+        width = SNAPSHOT_VERSION_WIDTH
+    ))
+}
+
+fn current_time_millis() -> i64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
 }
 
 /// Durable vnode-to-instance assignment snapshot.
@@ -34,6 +58,9 @@ pub struct AssignmentSnapshot {
     /// with different `vnode_count` are still deserializable — sparse
     /// indices surface as missing keys the caller can diagnose.
     pub vnodes: BTreeMap<u32, NodeId>,
+    /// Exact process roster certified for this assignment generation. A stable node restart
+    /// changes this roster and therefore requires a new version even when vnode owners do not.
+    pub participants: Vec<CheckpointParticipant>,
     /// Wall-clock timestamp of the last update, millis since epoch.
     pub updated_at_ms: i64,
     /// Pre-rotation drain phase: when set, this snapshot carries the *intended*
@@ -43,6 +70,72 @@ pub struct AssignmentSnapshot {
     /// assignment with `draining = false` to commit the rotation.
     #[serde(default)]
     pub draining: bool,
+    /// Exact predecessor, successor, and durable leader term for a draining generation.
+    /// Present if and only if `draining` is true.
+    #[serde(default)]
+    pub drain_transition: Option<AssignmentDrainTransition>,
+}
+
+/// Immutable winner that settles one draining snapshot without changing its certified target
+/// version. The original transition remains append-only at the snapshot path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainFinalization {
+    protocol_version: u16,
+    transition_digest: [u8; 32],
+    proposal: AssignmentSnapshot,
+}
+
+impl DrainFinalization {
+    fn new(
+        draining: &AssignmentSnapshot,
+        proposal: AssignmentSnapshot,
+    ) -> Result<Self, SnapshotError> {
+        let transition = draining.drain_transition.as_ref().ok_or_else(|| {
+            SnapshotError::Invalid("drain finalization requires a draining transition".into())
+        })?;
+        let finalization = Self {
+            protocol_version: DRAIN_FINALIZATION_VERSION,
+            transition_digest: transition.digest(),
+            proposal,
+        };
+        finalization.validate_against(draining)?;
+        Ok(finalization)
+    }
+
+    fn validate_against(&self, draining: &AssignmentSnapshot) -> Result<(), SnapshotError> {
+        draining.validate()?;
+        self.proposal.validate()?;
+        let transition = draining.drain_transition.as_ref().ok_or_else(|| {
+            SnapshotError::Invalid("drain finalization requires a draining transition".into())
+        })?;
+        if self.protocol_version != DRAIN_FINALIZATION_VERSION
+            || self.transition_digest != transition.digest()
+            || !draining.draining
+            || self.proposal.draining
+            || self.proposal.version != draining.version
+            || self.proposal.drain_transition.is_some()
+        {
+            return Err(SnapshotError::Invalid(
+                "drain finalization does not preserve the exact transition identity".into(),
+            ));
+        }
+        let proposed_fence = self.proposal.assignment_fence()?;
+        let predecessor = &transition.predecessor;
+        let commits_target = proposed_fence == transition.target;
+        let aborts_to_predecessor = proposed_fence.assignment_version
+            == transition.target.assignment_version
+            && proposed_fence.vnode_count == predecessor.vnode_count
+            && proposed_fence.assignment_digest == predecessor.assignment_digest
+            && proposed_fence.participants == predecessor.participants;
+        if !commits_target && !aborts_to_predecessor {
+            return Err(SnapshotError::Invalid(
+                "drain finalization is neither the certified target nor exact predecessor rollback"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl AssignmentSnapshot {
@@ -52,24 +145,181 @@ impl AssignmentSnapshot {
         Self {
             version: 0,
             vnodes: BTreeMap::new(),
+            participants: Vec::new(),
             updated_at_ms: 0,
             draining: false,
+            drain_transition: None,
         }
     }
 
     /// Next snapshot with bumped version and current wall-clock time.
     #[must_use]
-    pub fn next(&self, vnodes: BTreeMap<u32, NodeId>) -> Self {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64);
-        Self {
-            version: self.version + 1,
+    pub fn next(&self, vnodes: BTreeMap<u32, NodeId>) -> Result<Self, SnapshotError> {
+        self.next_for_participants(vnodes, self.participants.clone())
+    }
+
+    /// Next snapshot bound to the supplied canonical process roster.
+    pub fn next_for_participants(
+        &self,
+        vnodes: BTreeMap<u32, NodeId>,
+        participants: Vec<CheckpointParticipant>,
+    ) -> Result<Self, SnapshotError> {
+        let version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| SnapshotError::Invalid("assignment snapshot version overflow".into()))?;
+        let next = Self {
+            version,
             vnodes,
-            updated_at_ms: now_ms,
+            participants,
+            updated_at_ms: current_time_millis(),
             draining: false,
+            drain_transition: None,
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
+    fn validate_assignment(&self) -> Result<(), SnapshotError> {
+        if self.participants.len() > MAX_CHECKPOINT_PARTICIPANTS {
+            return Err(SnapshotError::Invalid(format!(
+                "assignment snapshot has {} participants; maximum is {MAX_CHECKPOINT_PARTICIPANTS}",
+                self.participants.len()
+            )));
         }
+        let dense = !self.vnodes.is_empty()
+            && self
+                .vnodes
+                .keys()
+                .copied()
+                .zip(0_u32..)
+                .all(|(actual, expected)| actual == expected);
+        let canonical_participants = !self.participants.is_empty()
+            && self
+                .participants
+                .windows(2)
+                .all(|pair| pair[0].node_id < pair[1].node_id)
+            && self.participants.iter().all(|participant| {
+                participant.node_id != 0 && !participant.boot_incarnation.is_nil()
+            })
+            && self.vnodes.values().all(|owner| {
+                self.participants
+                    .binary_search_by_key(&owner.0, |participant| participant.node_id)
+                    .is_ok()
+            });
+        if self.version == 0 || !dense || !canonical_participants {
+            return Err(SnapshotError::Invalid(
+                "assignment snapshot is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the durable owner map, process roster, and optional drain transition.
+    pub fn validate(&self) -> Result<(), SnapshotError> {
+        self.validate_assignment()?;
+        match (self.draining, self.drain_transition.as_ref()) {
+            (false, None) => Ok(()),
+            (true, Some(transition)) => {
+                let target = self.assignment_fence_unchecked()?;
+                if !transition.is_canonical() || transition.target != target {
+                    return Err(SnapshotError::Invalid(
+                        "draining snapshot does not match its exact target transition".into(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(SnapshotError::Invalid(
+                "assignment drain flag and transition disagree".into(),
+            )),
+        }
+    }
+
+    fn assignment_fence_unchecked(&self) -> Result<CheckpointAssignmentFence, SnapshotError> {
+        let owners: Vec<u64> = self.vnodes.values().map(|owner| owner.0).collect();
+        CheckpointAssignmentFence::from_owner_map(self.version, &owners, self.participants.clone())
+            .map_err(SnapshotError::Invalid)
+    }
+
+    /// Exact checkpoint certificate represented by this snapshot.
+    pub fn assignment_fence(&self) -> Result<CheckpointAssignmentFence, SnapshotError> {
+        self.validate_assignment()?;
+        self.assignment_fence_unchecked()
+    }
+
+    /// Create the exact successor as a leader-fenced draining generation.
+    ///
+    /// # Errors
+    /// Rejects a non-committed predecessor, invalid successor, or leader proof outside both
+    /// certified rosters.
+    pub fn next_draining(
+        &self,
+        vnodes: BTreeMap<u32, NodeId>,
+        participants: Vec<CheckpointParticipant>,
+        leader: LeaderProof,
+    ) -> Result<Self, SnapshotError> {
+        self.validate()?;
+        if self.draining {
+            return Err(SnapshotError::Invalid(
+                "cannot start a drain from a draining assignment".into(),
+            ));
+        }
+        let predecessor = self.assignment_fence()?;
+        let mut target = self.next_for_participants(vnodes, participants)?;
+        let target_fence = target.assignment_fence()?;
+        target.drain_transition = Some(
+            AssignmentDrainTransition::new(predecessor, target_fence, leader)
+                .map_err(SnapshotError::Invalid)?,
+        );
+        target.draining = true;
+        target.validate()?;
+        Ok(target)
+    }
+
+    /// Convert a draining generation into its committed target without changing identity.
+    pub fn committed_target(&self) -> Result<Self, SnapshotError> {
+        self.validate()?;
+        if !self.draining {
+            return Err(SnapshotError::Invalid(
+                "only a draining assignment has a target to commit".into(),
+            ));
+        }
+        let mut committed = self.clone();
+        committed.draining = false;
+        committed.drain_transition = None;
+        committed.updated_at_ms = current_time_millis();
+        committed.validate()?;
+        Ok(committed)
+    }
+
+    /// Convert a draining generation into a committed rollback of its predecessor map.
+    pub fn aborted_target(&self, predecessor: &Self) -> Result<Self, SnapshotError> {
+        self.validate()?;
+        predecessor.validate()?;
+        let transition = self.drain_transition.as_ref().ok_or_else(|| {
+            SnapshotError::Invalid("draining assignment has no transition".into())
+        })?;
+        if predecessor.draining
+            || predecessor.assignment_fence()? != transition.predecessor
+            || self.version != predecessor.version.saturating_add(1)
+        {
+            return Err(SnapshotError::Invalid(
+                "drain rollback does not match the exact predecessor".into(),
+            ));
+        }
+        let mut aborted = predecessor.clone();
+        aborted.version = self.version;
+        aborted.updated_at_ms = current_time_millis();
+        aborted.draining = false;
+        aborted.drain_transition = None;
+        aborted.validate()?;
+        Ok(aborted)
+    }
+
+    /// Whether the durable process roster is canonical and covers every vnode owner.
+    #[must_use]
+    pub fn has_canonical_participants(&self) -> bool {
+        self.validate().is_ok()
     }
 
     /// Convert a `Vec<NodeId>` (one entry per vnode id, dense) into the
@@ -85,13 +335,25 @@ impl AssignmentSnapshot {
             .collect()
     }
 
-    /// Dense `Vec<NodeId>` of length `vnode_count`. Missing entries (a
-    /// stale snapshot from a smaller vnode topology) are filled with
-    /// `NodeId::UNASSIGNED` so callers can detect the mismatch.
-    #[must_use]
-    pub fn to_vnode_vec(&self, vnode_count: u32) -> Vec<NodeId> {
+    /// Convert the canonical owner map to a dense vector of exactly `vnode_count` entries.
+    pub fn to_vnode_vec(&self, vnode_count: u32) -> Result<Vec<NodeId>, SnapshotError> {
+        self.validate()?;
+        if usize::try_from(vnode_count).ok() != Some(self.vnodes.len()) {
+            return Err(SnapshotError::Invalid(format!(
+                "assignment {} vnode cardinality {} does not match runtime cardinality {vnode_count}",
+                self.version,
+                self.vnodes.len()
+            )));
+        }
         (0..vnode_count)
-            .map(|v| self.vnodes.get(&v).copied().unwrap_or(NodeId::UNASSIGNED))
+            .map(|v| {
+                self.vnodes.get(&v).copied().ok_or_else(|| {
+                    SnapshotError::Invalid(format!(
+                        "assignment {} is missing vnode {v}",
+                        self.version
+                    ))
+                })
+            })
             .collect()
     }
 }
@@ -117,6 +379,9 @@ pub enum SnapshotError {
     /// JSON de/serialization failure.
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
+    /// Snapshot metadata, owner map, or process roster is non-canonical.
+    #[error("invalid snapshot: {0}")]
+    Invalid(String),
 }
 
 impl AssignmentSnapshotStore {
@@ -136,19 +401,82 @@ impl AssignmentSnapshotStore {
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| SnapshotError::Io(e.to_string()))?;
             let loc = entry.location.as_ref();
-            // Accept only `v{N:016}.json` entries so unrelated
-            // siblings in the bucket can't shift the CAS token.
+            // Accept only canonical fixed-width snapshot names. Unrelated siblings are ignored,
+            // but a snapshot-like name with another shape is a split-history risk and fails load.
             let Some(rest) = loc.strip_prefix(SNAPSHOT_PREFIX) else {
                 continue;
             };
             let Some(num) = rest.strip_prefix('v').and_then(|s| s.strip_suffix(".json")) else {
                 continue;
             };
-            if let Ok(v) = num.parse::<u64>() {
-                versions.push(v);
+            if num.len() != SNAPSHOT_VERSION_WIDTH || !num.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(SnapshotError::Invalid(format!(
+                    "non-canonical assignment snapshot filename {rest}"
+                )));
             }
+            let v = num.parse::<u64>().map_err(|error| {
+                SnapshotError::Invalid(format!("invalid snapshot filename {rest}: {error}"))
+            })?;
+            if v == 0 {
+                return Err(SnapshotError::Invalid(
+                    "assignment snapshot version zero is not durable".into(),
+                ));
+            }
+            versions.push(v);
         }
         versions.sort_unstable();
+        if versions.windows(2).any(|pair| {
+            pair[0]
+                .checked_add(1)
+                .is_none_or(|expected| expected != pair[1])
+        }) {
+            return Err(SnapshotError::Invalid(
+                "assignment snapshot versions are not contiguous".into(),
+            ));
+        }
+        Ok(versions)
+    }
+
+    async fn list_drain_finalization_versions(&self) -> Result<Vec<u64>, SnapshotError> {
+        let prefix = OsPath::from(DRAIN_FINALIZATION_PREFIX);
+        let mut entries = self.store.list(Some(&prefix));
+        let mut versions = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|error| SnapshotError::Io(error.to_string()))?;
+            let location = entry.location.as_ref();
+            let Some(rest) = location.strip_prefix(DRAIN_FINALIZATION_PREFIX) else {
+                continue;
+            };
+            let Some(number) = rest
+                .strip_prefix('v')
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                return Err(SnapshotError::Invalid(format!(
+                    "non-canonical drain finalization filename {rest}"
+                )));
+            };
+            if number.len() != SNAPSHOT_VERSION_WIDTH
+                || !number.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(SnapshotError::Invalid(format!(
+                    "non-canonical drain finalization filename {rest}"
+                )));
+            }
+            let version = number.parse::<u64>().map_err(|error| {
+                SnapshotError::Invalid(format!(
+                    "invalid drain finalization filename {rest}: {error}"
+                ))
+            })?;
+            if version == 0 {
+                return Err(SnapshotError::Invalid(
+                    "assignment drain finalization version zero is not durable".into(),
+                ));
+            }
+            versions.push(version);
+        }
+        versions.sort_unstable();
+        versions.dedup();
         Ok(versions)
     }
 
@@ -174,6 +502,43 @@ impl AssignmentSnapshotStore {
         &self,
         version: u64,
     ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
+        let Some(snapshot) = self.load_snapshot_object(version).await? else {
+            return Ok(None);
+        };
+        if !snapshot.draining {
+            return Ok(Some(snapshot));
+        }
+        match self.load_drain_finalization(version).await? {
+            Some(finalization) => {
+                finalization.validate_against(&snapshot)?;
+                Ok(Some(finalization.proposal))
+            }
+            None => Ok(Some(snapshot)),
+        }
+    }
+
+    /// Load the immutable drain transition underlying a materialized assignment version.
+    ///
+    /// A terminal `load_version` result intentionally contains only the installed assignment.
+    /// Cluster readers use this accessor to bind that materialized result back to the shared
+    /// authority decision before adoption. Ordinary assignment versions return `None`.
+    ///
+    /// # Errors
+    /// Object-store I/O, JSON decode failure, or a malformed base snapshot.
+    pub async fn load_drain_transition(
+        &self,
+        version: u64,
+    ) -> Result<Option<AssignmentDrainTransition>, SnapshotError> {
+        Ok(self
+            .load_snapshot_object(version)
+            .await?
+            .and_then(|snapshot| snapshot.drain_transition))
+    }
+
+    async fn load_snapshot_object(
+        &self,
+        version: u64,
+    ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
         let path = snapshot_path(version);
         match self.store.get(&path).await {
             Ok(res) => {
@@ -181,7 +546,14 @@ impl AssignmentSnapshotStore {
                     .bytes()
                     .await
                     .map_err(|e| SnapshotError::Io(e.to_string()))?;
-                let snap = serde_json::from_slice(&bytes)?;
+                let snap: AssignmentSnapshot = serde_json::from_slice(&bytes)?;
+                if snap.version != version {
+                    return Err(SnapshotError::Invalid(format!(
+                        "snapshot path version {version} contains payload version {}",
+                        snap.version
+                    )));
+                }
+                snap.validate()?;
                 Ok(Some(snap))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -189,16 +561,36 @@ impl AssignmentSnapshotStore {
         }
     }
 
-    /// CAS-create the object for `snapshot.version`. `Ok(None)` means
-    /// another writer landed there first. Used for both the initial
-    /// seed and for rotations (via [`Self::save_if_version`]).
-    ///
-    /// # Errors
-    /// Object-store I/O or JSON encode failure.
-    pub async fn save_if_absent(
+    async fn load_drain_finalization(
+        &self,
+        version: u64,
+    ) -> Result<Option<DrainFinalization>, SnapshotError> {
+        let path = drain_finalization_path(version);
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|error| SnapshotError::Io(error.to_string()))?;
+                let finalization: DrainFinalization = serde_json::from_slice(&bytes)?;
+                if finalization.proposal.version != version {
+                    return Err(SnapshotError::Invalid(format!(
+                        "drain finalization path version {version} contains payload version {}",
+                        finalization.proposal.version
+                    )));
+                }
+                Ok(Some(finalization))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(SnapshotError::Io(error.to_string())),
+        }
+    }
+
+    async fn create_if_absent(
         &self,
         snapshot: &AssignmentSnapshot,
     ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
+        snapshot.validate()?;
         let path = snapshot_path(snapshot.version);
         let bytes = serde_json::to_vec_pretty(snapshot)?;
         let opts = PutOptions {
@@ -216,6 +608,34 @@ impl AssignmentSnapshotStore {
         }
     }
 
+    /// CAS-create the version-one seed. `Ok(None)` means another initial writer won.
+    ///
+    /// # Errors
+    /// Object-store I/O or JSON encode failure.
+    pub async fn save_if_absent(
+        &self,
+        snapshot: &AssignmentSnapshot,
+    ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
+        if snapshot.version != 1 {
+            return Err(SnapshotError::Invalid(format!(
+                "save_if_absent only accepts the version-one seed, got {}",
+                snapshot.version
+            )));
+        }
+        if let Some(head) = self
+            .list_versions()
+            .await?
+            .last()
+            .copied()
+            .filter(|head| *head != 1)
+        {
+            return Err(SnapshotError::Invalid(format!(
+                "cannot seed assignment history with durable head {head}"
+            )));
+        }
+        self.create_if_absent(snapshot).await
+    }
+
     /// Rotate to `snapshot` assuming the current durable version is
     /// `prior_version`. Returns [`RotateOutcome::Conflict`] carrying
     /// the winner's snapshot if a racer produced `prior_version + 1`
@@ -229,20 +649,94 @@ impl AssignmentSnapshotStore {
         snapshot: &AssignmentSnapshot,
         prior_version: u64,
     ) -> Result<RotateOutcome, SnapshotError> {
-        if snapshot.version != prior_version + 1 {
-            return Err(SnapshotError::Io(format!(
+        snapshot.validate()?;
+        let expected = prior_version
+            .checked_add(1)
+            .ok_or_else(|| SnapshotError::Invalid("assignment snapshot version overflow".into()))?;
+        if snapshot.version != expected {
+            return Err(SnapshotError::Invalid(format!(
                 "save_if_version requires monotonic +1 bump: prior={prior_version}, \
                  proposed={}",
                 snapshot.version,
             )));
         }
-        if self.save_if_absent(snapshot).await?.is_some() {
+        let head = self.list_versions().await?.last().copied();
+        if head == Some(expected) {
+            let winner = self.load_version(expected).await?.ok_or_else(|| {
+                SnapshotError::Io("durable head disappeared while loading CAS winner".into())
+            })?;
+            return Ok(RotateOutcome::Conflict(winner));
+        }
+        if head != Some(prior_version) {
+            return Err(SnapshotError::Invalid(format!(
+                "save_if_version requires durable head {prior_version}, observed {head:?}"
+            )));
+        }
+        if self.create_if_absent(snapshot).await?.is_some() {
             return Ok(RotateOutcome::Rotated);
         }
         let winner = self.load_version(snapshot.version).await?.ok_or_else(|| {
             SnapshotError::Io("CAS conflict but load of winner returned None".into())
         })?;
         Ok(RotateOutcome::Conflict(winner))
+    }
+
+    /// Append exactly one immutable winner for a draining object: its target or a rollback.
+    ///
+    /// The object version is intentionally unchanged: source receipts certify the target
+    /// assignment version, so committing the map under another version would discard the very
+    /// identity they proved. `PutMode::Create` makes commit versus abort a store-level race with
+    /// one winner on local and cloud backends; the original transition remains auditable.
+    /// Cluster callers must first serialize the verdict through `LeaderLeaseStore`; this method
+    /// only materializes that already-authoritative verdict.
+    ///
+    /// # Errors
+    /// Rejects a stale/non-draining expected value, an unrelated proposal, or a non-head object.
+    pub async fn finalize_drain(
+        &self,
+        draining: &AssignmentSnapshot,
+        proposal: &AssignmentSnapshot,
+    ) -> Result<RotateOutcome, SnapshotError> {
+        let finalization = DrainFinalization::new(draining, proposal.clone())?;
+        if self.list_versions().await?.last().copied() != Some(draining.version) {
+            return Err(SnapshotError::Invalid(format!(
+                "draining assignment {} is no longer the durable head",
+                draining.version
+            )));
+        }
+
+        let current = self
+            .load_snapshot_object(draining.version)
+            .await?
+            .ok_or_else(|| SnapshotError::Io("draining assignment disappeared".into()))?;
+        if current != *draining {
+            let winner = self
+                .load_version(draining.version)
+                .await?
+                .ok_or_else(|| SnapshotError::Io("drain conflict winner disappeared".into()))?;
+            return Ok(RotateOutcome::Conflict(winner));
+        }
+        if let Some(winner) = self.load_drain_finalization(draining.version).await? {
+            winner.validate_against(draining)?;
+            return Ok(RotateOutcome::Conflict(winner.proposal));
+        }
+
+        let path = drain_finalization_path(draining.version);
+        let payload = PutPayload::from(Bytes::from(serde_json::to_vec_pretty(&finalization)?));
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self.store.put_opts(&path, payload, options).await {
+            Ok(_) => Ok(RotateOutcome::Rotated),
+            Err(error) => match self.load_drain_finalization(draining.version).await {
+                Ok(Some(winner)) => {
+                    winner.validate_against(draining)?;
+                    Ok(RotateOutcome::Conflict(winner.proposal))
+                }
+                Ok(None) | Err(_) => Err(SnapshotError::Io(error.to_string())),
+            },
+        }
     }
 
     /// Delete every snapshot object with `version < before`.
@@ -262,9 +756,19 @@ impl AssignmentSnapshotStore {
             let path = snapshot_path(v);
             match self.store.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    tracing::warn!(version = v, error = %e, "snapshot prune: delete failed");
-                }
+                Err(e) => return Err(SnapshotError::Io(e.to_string())),
+            }
+        }
+        // Finalization records are in a separate append-only namespace. Scan it independently so
+        // a prior failure after deleting the snapshot can be repaired without leaking orphans.
+        for version in self.list_drain_finalization_versions().await? {
+            if version >= before {
+                break;
+            }
+            let path = drain_finalization_path(version);
+            match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(SnapshotError::Io(error.to_string())),
             }
         }
         Ok(())
@@ -285,12 +789,51 @@ pub enum RotateOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::LeaderProofOwner;
     use object_store::local::LocalFileSystem;
     use tempfile::tempdir;
+    use uuid::Uuid;
+
+    fn participant(node_id: u64, boot: u128) -> CheckpointParticipant {
+        CheckpointParticipant {
+            node_id,
+            boot_incarnation: Uuid::from_u128(boot),
+        }
+    }
+
+    fn leader(node_id: u64, boot: u128, token: u64) -> LeaderProof {
+        LeaderProof {
+            owner: LeaderProofOwner {
+                node_id,
+                boot_id: Uuid::from_u128(boot),
+                process_term: 1,
+            },
+            fencing_token: token,
+        }
+    }
+
+    fn snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
+        let participants = [1, 2, 3, 10, 20, 99]
+            .into_iter()
+            .map(|node| participant(node, u128::from(node)))
+            .collect();
+        AssignmentSnapshot::empty()
+            .next_for_participants(vnodes, participants)
+            .unwrap()
+    }
 
     fn store_in(dir: &std::path::Path) -> AssignmentSnapshotStore {
         let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
         AssignmentSnapshotStore::new(fs)
+    }
+
+    async fn put_raw(store: &AssignmentSnapshotStore, path: OsPath, snapshot: &AssignmentSnapshot) {
+        let bytes = serde_json::to_vec(snapshot).unwrap();
+        store
+            .store
+            .put(&path, PutPayload::from(Bytes::from(bytes)))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -298,6 +841,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let s = store_in(dir.path());
         assert!(s.load().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn assignment_generation_persists_exact_process_roster() {
+        let vnodes = BTreeMap::from([(0, NodeId(1)), (1, NodeId(2))]);
+        let first = AssignmentSnapshot::empty()
+            .next_for_participants(vnodes.clone(), vec![participant(1, 11), participant(2, 22)])
+            .unwrap();
+        assert!(first.has_canonical_participants());
+
+        let restarted = first
+            .next_for_participants(vnodes, vec![participant(1, 11), participant(2, 222)])
+            .unwrap();
+        assert_eq!(restarted.version, first.version + 1);
+        assert_eq!(restarted.vnodes, first.vnodes);
+        assert_ne!(restarted.participants, first.participants);
+        assert!(restarted.has_canonical_participants());
     }
 
     #[tokio::test]
@@ -308,11 +868,163 @@ mod tests {
         let mut vnodes = BTreeMap::new();
         vnodes.insert(0, NodeId(1));
         vnodes.insert(1, NodeId(2));
-        let snap = AssignmentSnapshot::empty().next(vnodes);
+        let snap = snapshot(vnodes);
 
         assert_eq!(s.save_if_absent(&snap).await.unwrap().as_ref(), Some(&snap),);
         let loaded = s.load().await.unwrap().unwrap();
         assert_eq!(loaded, snap);
+    }
+
+    #[test]
+    fn snapshot_path_is_canonical_across_the_u64_range() {
+        assert_eq!(
+            snapshot_path(1).as_ref(),
+            "control/assignment-snapshots/v00000000000000000001.json"
+        );
+        assert_eq!(
+            snapshot_path(u64::MAX).as_ref(),
+            "control/assignment-snapshots/v18446744073709551615.json"
+        );
+    }
+
+    #[test]
+    fn next_rejects_generation_overflow() {
+        let mut current = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        current.version = u64::MAX;
+        assert!(matches!(
+            current.next(current.vnodes.clone()),
+            Err(SnapshotError::Invalid(message)) if message.contains("overflow")
+        ));
+    }
+
+    #[tokio::test]
+    async fn seed_write_rejects_non_seed_generation() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let first = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        let second = first.next(first.vnodes.clone()).unwrap();
+
+        assert!(matches!(
+            store.save_if_absent(&second).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("version-one seed")
+        ));
+        assert!(store.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn seed_write_rejects_retained_nonempty_history() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let first = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&first).await.unwrap();
+        let second = first.next(first.vnodes.clone()).unwrap();
+        store.save_if_version(&second, first.version).await.unwrap();
+        let third = second.next(second.vnodes.clone()).unwrap();
+        store.save_if_version(&third, second.version).await.unwrap();
+        store.prune_before(3).await.unwrap();
+
+        assert!(matches!(
+            store.save_if_absent(&first).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("durable head 3")
+        ));
+        assert_eq!(store.list_versions().await.unwrap(), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_noncanonical_owner_map_and_roster() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let canonical = snapshot(BTreeMap::from([(0, NodeId(1))]));
+
+        let mut sparse = canonical.clone();
+        sparse.vnodes = BTreeMap::from([(1, NodeId(1))]);
+        assert!(matches!(
+            store.save_if_absent(&sparse).await,
+            Err(SnapshotError::Invalid(_))
+        ));
+
+        let mut uncovered = canonical;
+        uncovered.participants.clear();
+        assert!(matches!(
+            store.save_if_absent(&uncovered).await,
+            Err(SnapshotError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_assignment_rejects_oversized_participant_roster() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let maximum = u64::try_from(MAX_CHECKPOINT_PARTICIPANTS).unwrap();
+        let participants = (1..=maximum + 1)
+            .map(|node_id| participant(node_id, u128::from(node_id)))
+            .collect();
+        let oversized = AssignmentSnapshot {
+            version: 1,
+            vnodes: BTreeMap::from([(0, NodeId(1))]),
+            participants,
+            updated_at_ms: 1,
+            draining: false,
+            drain_transition: None,
+        };
+
+        assert!(matches!(
+            store.save_if_absent(&oversized).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("maximum is 129")
+        ));
+
+        put_raw(&store, snapshot_path(1), &oversized).await;
+        assert!(matches!(
+            store.load().await,
+            Err(SnapshotError::Invalid(message)) if message.contains("maximum is 129")
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_path_payload_version_mismatch() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let first = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        put_raw(&store, snapshot_path(2), &first).await;
+
+        assert!(matches!(
+            store.load_version(2).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("payload version")
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_generation_gap() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let first = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        let second = first.next(first.vnodes.clone()).unwrap();
+        let third = second.next(second.vnodes.clone()).unwrap();
+        put_raw(&store, snapshot_path(1), &first).await;
+        put_raw(&store, snapshot_path(3), &third).await;
+
+        assert!(matches!(
+            store.load().await,
+            Err(SnapshotError::Invalid(message)) if message.contains("not contiguous")
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_noncanonical_snapshot_filename() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let first = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        put_raw(
+            &store,
+            OsPath::from("control/assignment-snapshots/v1.json"),
+            &first,
+        )
+        .await;
+
+        assert!(matches!(
+            store.load().await,
+            Err(SnapshotError::Invalid(message)) if message.contains("filename")
+        ));
     }
 
     #[tokio::test]
@@ -322,12 +1034,12 @@ mod tests {
 
         let mut v1_map = BTreeMap::new();
         v1_map.insert(0, NodeId(1));
-        let v1 = AssignmentSnapshot::empty().next(v1_map);
+        let v1 = snapshot(v1_map);
         s.save_if_absent(&v1).await.unwrap();
 
         let mut v2_map = BTreeMap::new();
         v2_map.insert(0, NodeId(2));
-        let v2 = v1.next(v2_map);
+        let v2 = v1.next(v2_map).unwrap();
         // Rotate via save_if_version — the canonical post-boot path.
         assert!(matches!(
             s.save_if_version(&v2, v1.version).await.unwrap(),
@@ -351,7 +1063,7 @@ mod tests {
         let mut first_map = BTreeMap::new();
         first_map.insert(0, NodeId(1));
         first_map.insert(1, NodeId(2));
-        let first = AssignmentSnapshot::empty().next(first_map);
+        let first = snapshot(first_map);
 
         let winner = s.save_if_absent(&first).await.unwrap();
         assert_eq!(winner.as_ref(), Some(&first), "first writer must win");
@@ -360,7 +1072,7 @@ mod tests {
         // rejected without mutating the store.
         let mut second_map = BTreeMap::new();
         second_map.insert(0, NodeId(99));
-        let second = AssignmentSnapshot::empty().next(second_map);
+        let second = snapshot(second_map);
         let rejected = s.save_if_absent(&second).await.unwrap();
         assert!(rejected.is_none(), "second writer must lose the CAS");
 
@@ -375,7 +1087,7 @@ mod tests {
 
         let mut m = BTreeMap::new();
         m.insert(0, NodeId(1));
-        let v1 = AssignmentSnapshot::empty().next(m);
+        let v1 = snapshot(m);
         s.save_if_absent(&v1).await.unwrap();
 
         // Caller builds v3 but claims prior=1 — enforcing monotonic +1
@@ -383,15 +1095,37 @@ mod tests {
         // durable storage.
         let mut m2 = BTreeMap::new();
         m2.insert(0, NodeId(2));
-        let v2 = v1.next(m2);
+        let v2 = v1.next(m2).unwrap();
         let mut m3 = BTreeMap::new();
         m3.insert(0, NodeId(3));
-        let v3 = v2.next(m3);
+        let v3 = v2.next(m3).unwrap();
         let err = s.save_if_version(&v3, 1).await.unwrap_err();
         assert!(
-            matches!(err, SnapshotError::Io(msg) if msg.contains("monotonic")),
+            matches!(err, SnapshotError::Invalid(msg) if msg.contains("monotonic")),
             "non-monotonic bump must surface a clear error",
         );
+    }
+
+    #[tokio::test]
+    async fn save_if_version_rejects_future_prior_without_punching_a_gap() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let first = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&first).await.unwrap();
+        let second = first.next(first.vnodes.clone()).unwrap();
+        store.save_if_version(&second, first.version).await.unwrap();
+        let third = second.next(second.vnodes.clone()).unwrap();
+        store.save_if_version(&third, second.version).await.unwrap();
+        let fourth = third.next(third.vnodes.clone()).unwrap();
+        let fifth = fourth.next(fourth.vnodes.clone()).unwrap();
+        let sixth = fifth.next(fifth.vnodes.clone()).unwrap();
+
+        assert!(matches!(
+            store.save_if_version(&sixth, fifth.version).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("durable head 5")
+        ));
+        assert_eq!(store.list_versions().await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(store.load().await.unwrap().unwrap(), third);
     }
 
     #[tokio::test]
@@ -401,12 +1135,12 @@ mod tests {
 
         let mut v1_map = BTreeMap::new();
         v1_map.insert(0, NodeId(1));
-        let first = AssignmentSnapshot::empty().next(v1_map);
+        let first = snapshot(v1_map);
         s.save_if_absent(&first).await.unwrap();
 
         let mut v2_map = BTreeMap::new();
         v2_map.insert(0, NodeId(2));
-        let second = first.next(v2_map);
+        let second = first.next(v2_map).unwrap();
         let outcome = s.save_if_version(&second, first.version).await.unwrap();
         assert!(matches!(outcome, RotateOutcome::Rotated));
 
@@ -424,12 +1158,12 @@ mod tests {
 
         let mut seed = BTreeMap::new();
         seed.insert(0, NodeId(1));
-        let v1 = AssignmentSnapshot::empty().next(seed);
+        let v1 = snapshot(seed);
         s.save_if_absent(&v1).await.unwrap();
 
         let mut winner_map = BTreeMap::new();
         winner_map.insert(0, NodeId(10));
-        let winner = v1.next(winner_map);
+        let winner = v1.next(winner_map).unwrap();
         assert!(matches!(
             s.save_if_version(&winner, v1.version).await.unwrap(),
             RotateOutcome::Rotated,
@@ -437,7 +1171,7 @@ mod tests {
 
         let mut loser_map = BTreeMap::new();
         loser_map.insert(0, NodeId(20));
-        let loser = v1.next(loser_map);
+        let loser = v1.next(loser_map).unwrap();
         match s.save_if_version(&loser, v1.version).await.unwrap() {
             RotateOutcome::Conflict(current) => {
                 assert_eq!(
@@ -462,10 +1196,10 @@ mod tests {
         // Seed v1..=v4 by repeatedly rotating.
         let mut m = BTreeMap::new();
         m.insert(0, NodeId(1));
-        let mut current = AssignmentSnapshot::empty().next(m);
+        let mut current = snapshot(m);
         s.save_if_absent(&current).await.unwrap();
         for _ in 0..3 {
-            let next = current.next(current.vnodes.clone());
+            let next = current.next(current.vnodes.clone()).unwrap();
             s.save_if_version(&next, current.version).await.unwrap();
             current = next;
         }
@@ -480,6 +1214,32 @@ mod tests {
         assert_eq!(s.load().await.unwrap().unwrap().version, 4);
     }
 
+    #[tokio::test]
+    async fn prune_stops_at_first_delete_failure_without_punching_a_gap() {
+        use crate::cluster::testing::{FaultyObjectStore, ObjectStoreFault};
+        use object_store::memory::InMemory;
+
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let faulty = Arc::new(FaultyObjectStore::new(inner));
+        let wrapped: Arc<dyn ObjectStore> = faulty.clone();
+        let store = AssignmentSnapshotStore::new(wrapped);
+        let mut current = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&current).await.unwrap();
+        for _ in 0..2 {
+            let next = current.next(current.vnodes.clone()).unwrap();
+            store.save_if_version(&next, current.version).await.unwrap();
+            current = next;
+        }
+
+        faulty.set_fault(ObjectStoreFault::FailWrites);
+        assert!(matches!(
+            store.prune_before(3).await,
+            Err(SnapshotError::Io(_))
+        ));
+        faulty.set_fault(ObjectStoreFault::None);
+        assert_eq!(store.list_versions().await.unwrap(), vec![1, 2, 3]);
+    }
+
     #[test]
     fn empty_starts_at_version_zero() {
         let s = AssignmentSnapshot::empty();
@@ -491,7 +1251,7 @@ mod tests {
     fn next_bumps_version() {
         let mut vnodes = BTreeMap::new();
         vnodes.insert(0, NodeId(1));
-        let s = AssignmentSnapshot::empty().next(vnodes);
+        let s = snapshot(vnodes);
         assert_eq!(s.version, 1);
     }
 
@@ -499,30 +1259,127 @@ mod tests {
     fn roundtrip_vec_conversions() {
         let assignment = vec![NodeId(1), NodeId(2), NodeId(1), NodeId(2)];
         let map = AssignmentSnapshot::vnodes_from_vec(&assignment);
-        let snap = AssignmentSnapshot::empty().next(map);
-        let back = snap.to_vnode_vec(u32::try_from(assignment.len()).expect("test len fits u32"));
+        let snap = snapshot(map);
+        let back = snap
+            .to_vnode_vec(u32::try_from(assignment.len()).expect("test len fits u32"))
+            .unwrap();
         assert_eq!(back, assignment);
     }
 
     #[test]
-    fn draining_defaults_false_and_survives_roundtrip() {
-        // `next` produces a committed (non-draining) snapshot.
-        let mut vnodes = BTreeMap::new();
-        vnodes.insert(0, NodeId(1));
-        let committed = AssignmentSnapshot::empty().next(vnodes);
+    fn dense_conversion_rejects_smaller_and_larger_runtime_cardinality() {
+        let snap = snapshot(BTreeMap::from([(0, NodeId(1)), (1, NodeId(1))]));
+        for count in [1, 3] {
+            assert!(matches!(
+                snap.to_vnode_vec(count),
+                Err(SnapshotError::Invalid(message)) if message.contains("vnode cardinality")
+            ));
+        }
+    }
+
+    #[test]
+    fn draining_survives_roundtrip() {
+        let committed = AssignmentSnapshot::empty()
+            .next_for_participants(BTreeMap::from([(0, NodeId(1))]), vec![participant(1, 1)])
+            .unwrap();
         assert!(!committed.draining);
 
-        // The draining flag round-trips through JSON.
-        let mut drain = committed.clone();
-        drain.draining = true;
+        let drain = committed
+            .next_draining(
+                BTreeMap::from([(0, NodeId(2))]),
+                vec![participant(2, 2)],
+                leader(1, 1, 7),
+            )
+            .unwrap();
         let json = serde_json::to_vec(&drain).unwrap();
         let back: AssignmentSnapshot = serde_json::from_slice(&json).unwrap();
+        back.validate().unwrap();
         assert!(back.draining);
+        assert_eq!(back.drain_transition, drain.drain_transition);
         assert_eq!(back.version, drain.version);
+    }
 
-        // An older snapshot JSON without the field deserializes as not draining.
-        let legacy = r#"{"version":3,"vnodes":{},"updated_at_ms":0}"#;
-        let parsed: AssignmentSnapshot = serde_json::from_str(legacy).unwrap();
-        assert!(!parsed.draining);
+    #[tokio::test]
+    async fn drain_finalization_commits_the_certified_target_version() {
+        let directory = tempdir().unwrap();
+        let store = store_in(directory.path());
+        let committed = AssignmentSnapshot::empty()
+            .next_for_participants(BTreeMap::from([(0, NodeId(1))]), vec![participant(1, 1)])
+            .unwrap();
+        store.save_if_absent(&committed).await.unwrap();
+        let drain = committed
+            .next_draining(
+                BTreeMap::from([(0, NodeId(2))]),
+                vec![participant(2, 2)],
+                leader(1, 1, 7),
+            )
+            .unwrap();
+        store
+            .save_if_version(&drain, committed.version)
+            .await
+            .unwrap();
+        let transition = drain.drain_transition.as_ref().unwrap().clone();
+        let target = drain.committed_target().unwrap();
+
+        assert!(matches!(
+            store.finalize_drain(&drain, &target).await.unwrap(),
+            RotateOutcome::Rotated
+        ));
+        let loaded = store.load().await.unwrap().unwrap();
+        assert_eq!(loaded, target);
+        assert_eq!(loaded.version, drain.version);
+        assert_eq!(
+            loaded.assignment_fence().unwrap(),
+            transition.target.clone()
+        );
+        assert_eq!(
+            store.load_drain_transition(drain.version).await.unwrap(),
+            Some(transition)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_drain_commit_and_abort_have_one_append_only_winner() {
+        let memory: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let left = AssignmentSnapshotStore::new(Arc::clone(&memory));
+        let right = AssignmentSnapshotStore::new(memory);
+        let predecessor = AssignmentSnapshot::empty()
+            .next_for_participants(BTreeMap::from([(0, NodeId(1))]), vec![participant(1, 1)])
+            .unwrap();
+        left.save_if_absent(&predecessor).await.unwrap();
+        let drain = predecessor
+            .next_draining(
+                BTreeMap::from([(0, NodeId(2))]),
+                vec![participant(2, 2)],
+                leader(1, 1, 9),
+            )
+            .unwrap();
+        left.save_if_version(&drain, predecessor.version)
+            .await
+            .unwrap();
+        let commit = drain.committed_target().unwrap();
+        let abort = drain.aborted_target(&predecessor).unwrap();
+
+        let (commit_result, abort_result) = tokio::join!(
+            left.finalize_drain(&drain, &commit),
+            right.finalize_drain(&drain, &abort)
+        );
+        let outcomes = [commit_result.unwrap(), abort_result.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RotateOutcome::Rotated))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RotateOutcome::Conflict(_)))
+                .count(),
+            1
+        );
+        let loaded = left.load().await.unwrap().unwrap();
+        assert!(loaded == commit || loaded == abort);
     }
 }

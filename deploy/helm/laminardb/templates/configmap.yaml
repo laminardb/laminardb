@@ -28,12 +28,6 @@ data:
     {{- with .Values.laminardb.consoleCorsAllowedOrigins }}
     console_cors_allowed_origins = [{{ range $i, $o := . }}{{ if $i }}, {{ end }}"{{ $o }}"{{ end }}]
     {{- end }}
-    {{- if gt (.Values.laminardb.state.memoryBudgetBytes | int64) 0 }}
-    state_memory_budget_bytes = {{ .Values.laminardb.state.memoryBudgetBytes }}
-    {{- end }}
-    {{- if .Values.laminardb.state.tier.enabled }}
-    state_tier_dir = "{{ .Values.laminardb.state.tier.path }}"
-    {{- end }}
     {{- if .Values.laminardb.pgwire.enabled }}
     {{- $pg := .Values.laminardb.pgwire }}
     pgwire_bind = "{{ $pg.bind }}"
@@ -62,13 +56,8 @@ data:
     vnode_capacity = {{ .Values.laminardb.state.vnodeCapacity | default 256 }}
     {{- if eq .Values.laminardb.state.backend "local" }}
     path = "{{ .Values.laminardb.state.path }}"
-    instance_id = "{{ default "${HOSTNAME}" .Values.laminardb.state.instanceId }}"
     {{- else if eq .Values.laminardb.state.backend "object_store" }}
     url = "{{ .Values.laminardb.state.url }}"
-    instance_id = "{{ default "${HOSTNAME}" .Values.laminardb.state.instanceId }}"
-    {{- if .Values.laminardb.state.vnodes }}
-    vnodes = [{{ range $i, $v := .Values.laminardb.state.vnodes }}{{ if $i }}, {{ end }}{{ $v }}{{ end }}]
-    {{- end }}
     {{- end }}
 
     [checkpoint]

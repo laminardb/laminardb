@@ -14,7 +14,7 @@ pub use filter::{filter_batch_by_timestamp, FilterError, ThresholdOp};
 pub use watermark::{
     AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, PeriodicGenerator,
     ProcessingTimeGenerator, PunctuatedGenerator, SourceProvidedGenerator, WatermarkGenerator,
-    WatermarkTracker, DEFAULT_MAX_FUTURE_SKEW_MS,
+    WatermarkRestoreError, WatermarkTracker, DEFAULT_MAX_FUTURE_SKEW_MS,
 };
 
 use smallvec::SmallVec;

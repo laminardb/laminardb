@@ -1,549 +1,561 @@
-//! Arrow to `PostgreSQL` type mapping for sink operations.
-//!
-//! Maps Apache Arrow `DataType` to `PostgreSQL` SQL type names for:
-//! - UNNEST array casts in upsert queries
-//! - CREATE TABLE DDL generation
-//! - COPY BINARY column type declarations
+//! Validated Arrow-to-PostgreSQL type contract for the sink.
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 
-/// Maps an Arrow `DataType` to a `PostgreSQL` SQL type name for UNNEST casts.
-///
-/// Used in batched upsert queries:
-/// ```sql
-/// INSERT INTO t (col) SELECT * FROM UNNEST($1::int8[])
-/// ```
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// use arrow_schema::DataType;
-/// assert_eq!(arrow_type_to_pg_sql(&DataType::Int64), "int8");
-/// assert_eq!(arrow_type_to_pg_sql(&DataType::Utf8), "text");
-/// ```
-#[must_use]
-#[allow(clippy::match_same_arms)]
-pub fn arrow_type_to_pg_sql(dt: &DataType) -> &'static str {
-    match dt {
-        DataType::Boolean => "bool",
-        DataType::Int8 | DataType::UInt8 => "int2",
-        DataType::Int16 | DataType::UInt16 => "int2",
-        DataType::Int32 => "int4",
-        DataType::UInt32 => "int8", // Widened: no unsigned in PG
-        DataType::Int64 | DataType::UInt64 => "int8",
-        DataType::Float16 | DataType::Float32 => "float4",
-        DataType::Float64 => "float8",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "numeric",
-        DataType::Utf8 | DataType::LargeUtf8 => "text",
-        DataType::Binary | DataType::LargeBinary => "bytea",
-        DataType::FixedSizeBinary(16) => "uuid",
-        DataType::FixedSizeBinary(_) => "bytea",
-        DataType::Date32 | DataType::Date64 => "date",
-        DataType::Time32(_) | DataType::Time64(_) => "time",
-        DataType::Timestamp(_, None) => "timestamp",
-        DataType::Timestamp(_, Some(_)) => "timestamptz",
-        DataType::Duration(_) => "interval",
-        _ => "text", // Fallback for complex/nested types
+use crate::error::ConnectorError;
+
+/// SQL spellings used by COPY table DDL and typed UNNEST parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PostgresType {
+    sql: &'static str,
+    ddl: &'static str,
+}
+
+impl PostgresType {
+    #[must_use]
+    pub(super) const fn sql(self) -> &'static str {
+        self.sql
+    }
+
+    #[must_use]
+    pub(super) const fn ddl(self) -> &'static str {
+        self.ddl
     }
 }
 
-/// Maps an Arrow `DataType` to a `PostgreSQL` DDL type for CREATE TABLE.
+/// Returns the single supported type mapping used by admission, DDL, COPY, and UNNEST.
 ///
-/// Returns a type suitable for `CREATE TABLE` column definitions.
-/// More verbose than [`arrow_type_to_pg_sql`] where needed (e.g., `DOUBLE PRECISION`).
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// use arrow_schema::DataType;
-/// assert_eq!(arrow_to_pg_ddl_type(&DataType::Int64), "BIGINT");
-/// assert_eq!(arrow_to_pg_ddl_type(&DataType::Float64), "DOUBLE PRECISION");
-/// ```
-#[must_use]
-#[allow(clippy::match_same_arms)]
-pub fn arrow_to_pg_ddl_type(dt: &DataType) -> &'static str {
-    match dt {
-        DataType::Boolean => "BOOLEAN",
-        DataType::Int8 | DataType::UInt8 => "SMALLINT",
-        DataType::Int16 | DataType::UInt16 => "SMALLINT",
-        DataType::Int32 => "INTEGER",
-        DataType::UInt32 => "BIGINT",
-        DataType::Int64 | DataType::UInt64 => "BIGINT",
-        DataType::Float16 | DataType::Float32 => "REAL",
-        DataType::Float64 => "DOUBLE PRECISION",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "NUMERIC",
-        DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
-        DataType::Binary | DataType::LargeBinary => "BYTEA",
-        DataType::FixedSizeBinary(16) => "UUID",
-        DataType::FixedSizeBinary(_) => "BYTEA",
-        DataType::Date32 | DataType::Date64 => "DATE",
-        DataType::Time32(_) | DataType::Time64(_) => "TIME",
-        DataType::Timestamp(_, None) => "TIMESTAMP",
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ",
-        DataType::Duration(_) => "INTERVAL",
-        _ => "TEXT",
-    }
-}
-
-/// Returns the `PostgreSQL` array type suffix for UNNEST cast expressions.
-///
-/// Combines [`arrow_type_to_pg_sql`] with `[]` for array parameter casting:
-/// `$1::int8[]`
-#[must_use]
-pub fn arrow_type_to_pg_array_cast(dt: &DataType, param_index: usize) -> String {
-    format!("${}::{}[]", param_index, arrow_type_to_pg_sql(dt))
-}
-
-/// Converts an Arrow array column to a boxed `PostgreSQL` array parameter for UNNEST queries.
-///
-/// Each Arrow type maps to the corresponding Rust type that implements
-/// `postgres_types::ToSql`. The returned `Box` is passed as a bind parameter
-/// to `tokio_postgres::Client::execute`.
-///
-/// # Supported Types
-///
-/// `Boolean`, `Int8`–`Int64`, `UInt8`–`UInt64` (widened), `Float32`/`Float64`,
-/// `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`, `Date32`,
-/// `Timestamp` (all units, with/without tz).
-/// Unsupported types fall back to string representation.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::Internal` if the array cannot be downcast to
-/// the expected Arrow array type.
-#[cfg(feature = "postgres-sink")]
-#[allow(
-    clippy::too_many_lines,
-    clippy::cast_possible_truncation,
-    clippy::missing_panics_doc
-)]
-pub fn arrow_column_to_pg_array(
-    array: &dyn arrow_array::Array,
-) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, crate::error::ConnectorError> {
-    use crate::error::ConnectorError;
-    use arrow_array::{
-        Array as _, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+/// The surface is intentionally the intersection of the COPY encoder and the Rust PostgreSQL
+/// parameter encoder. Types are added only when both write paths have the same lossless contract.
+pub(super) fn postgres_type(data_type: &DataType) -> Result<PostgresType, ConnectorError> {
+    let mapping = match data_type {
+        DataType::Boolean => PostgresType {
+            sql: "bool",
+            ddl: "BOOLEAN",
+        },
+        DataType::Int8 | DataType::UInt8 | DataType::Int16 => PostgresType {
+            sql: "int2",
+            ddl: "SMALLINT",
+        },
+        DataType::UInt16 | DataType::Int32 => PostgresType {
+            sql: "int4",
+            ddl: "INTEGER",
+        },
+        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => PostgresType {
+            sql: "int8",
+            ddl: "BIGINT",
+        },
+        DataType::Float32 => PostgresType {
+            sql: "float4",
+            ddl: "REAL",
+        },
+        DataType::Float64 => PostgresType {
+            sql: "float8",
+            ddl: "DOUBLE PRECISION",
+        },
+        DataType::Utf8 | DataType::LargeUtf8 => PostgresType {
+            sql: "text",
+            ddl: "TEXT",
+        },
+        DataType::Binary | DataType::LargeBinary => PostgresType {
+            sql: "bytea",
+            ddl: "BYTEA",
+        },
+        DataType::Date32 => PostgresType {
+            sql: "date",
+            ddl: "DATE",
+        },
+        DataType::Timestamp(
+            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond,
+            None,
+        ) => PostgresType {
+            sql: "timestamp",
+            ddl: "TIMESTAMP",
+        },
+        DataType::Timestamp(
+            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond,
+            Some(_),
+        ) => PostgresType {
+            sql: "timestamptz",
+            ddl: "TIMESTAMPTZ",
+        },
+        unsupported => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "PostgreSQL sink does not support Arrow type {unsupported:?}; supported types are \
+                 Boolean, signed integers, UInt8/16/32, range-checked UInt64, Float32/64, \
+                 Utf8/LargeUtf8, Binary/LargeBinary, Date32, and second/millisecond/microsecond \
+                 Timestamp"
+            )));
+        }
     };
-    use arrow_schema::TimeUnit;
+    Ok(mapping)
+}
 
-    macro_rules! extract_primitive {
-        ($array:expr, $arrow_ty:ty, $rust_ty:ty) => {{
-            let arr = $array.as_any().downcast_ref::<$arrow_ty>().ok_or_else(|| {
-                ConnectorError::Internal(format!("downcast to {} failed", stringify!($arrow_ty)))
-            })?;
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_possible_wrap,
-                clippy::cast_sign_loss
-            )]
-            let vals: Vec<Option<$rust_ty>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
+/// PostgreSQL type used in an UNNEST cast.
+pub(super) fn arrow_type_to_pg_sql(data_type: &DataType) -> Result<&'static str, ConnectorError> {
+    postgres_type(data_type).map(PostgresType::sql)
+}
+
+/// PostgreSQL type used in generated CREATE TABLE DDL.
+pub(super) fn arrow_to_pg_ddl_type(data_type: &DataType) -> Result<&'static str, ConnectorError> {
+    postgres_type(data_type).map(PostgresType::ddl)
+}
+
+/// Typed PostgreSQL array parameter used by an UNNEST statement.
+pub(super) fn arrow_type_to_pg_array_cast(
+    data_type: &DataType,
+    parameter: usize,
+) -> Result<String, ConnectorError> {
+    Ok(format!(
+        "${parameter}::{}[]",
+        arrow_type_to_pg_sql(data_type)?
+    ))
+}
+
+#[cfg(feature = "postgres-sink")]
+fn checked_u64(value: u64, row: usize) -> Result<i64, ConnectorError> {
+    i64::try_from(value).map_err(|_| {
+        ConnectorError::SchemaMismatch(format!(
+            "PostgreSQL BIGINT cannot represent UInt64 value {value} at row {row}"
+        ))
+    })
+}
+
+#[cfg(feature = "postgres-sink")]
+fn checked_date32(value: i32, row: usize) -> Result<chrono::NaiveDate, ConnectorError> {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid Unix epoch");
+    epoch
+        .checked_add_signed(chrono::Duration::days(i64::from(value)))
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch(format!(
+                "PostgreSQL sink cannot represent Date32 value {value} at row {row}"
+            ))
+        })
+}
+
+/// Validates range-sensitive values before a batch is admitted to the sink buffer.
+#[cfg(feature = "postgres-sink")]
+pub(super) fn validate_postgres_array_values(
+    array: &dyn arrow_array::Array,
+) -> Result<(), ConnectorError> {
+    use arrow_array::{Array as _, Date32Array, UInt64Array};
+
+    postgres_type(array.data_type())?;
+    match array.data_type() {
+        DataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to UInt64Array failed".into()))?;
+            for row in 0..values.len() {
+                if !values.is_null(row) {
+                    checked_u64(values.value(row), row)?;
+                }
+            }
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to Date32Array failed".into()))?;
+            for row in 0..values.len() {
+                if !values.is_null(row) {
+                    checked_date32(values.value(row), row)?;
+                }
+            }
+        }
+        DataType::Timestamp(unit, _) => validate_timestamp_values(array, unit)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Produces the batch schema expected by COPY BINARY.
+///
+/// `pgpq` encodes Arrow UInt64 as PostgreSQL NUMERIC. The sink deliberately exposes UInt64 as a
+/// range-checked BIGINT so COPY and UNNEST have identical table types; values are therefore widened
+/// to an Int64 Arrow column after validation and before the COPY encoder is constructed.
+#[cfg(feature = "postgres-sink")]
+pub(super) fn postgres_copy_batch(
+    batch: &arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch, ConnectorError> {
+    use std::sync::Arc;
+
+    use arrow_array::{Array as _, ArrayRef, Int64Array, UInt64Array};
+    use arrow_schema::Schema;
+
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        postgres_type(column.data_type())?;
+        if field.data_type() == &DataType::UInt64 {
+            let values = column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to UInt64Array failed".into()))?;
+            let converted = (0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Ok(None)
                     } else {
-                        Some(arr.value(i) as $rust_ty)
+                        checked_u64(values.value(row), row).map(Some)
                     }
                 })
+                .collect::<Result<Vec<Option<i64>>, ConnectorError>>()?;
+            fields.push(Arc::new(
+                field.as_ref().clone().with_data_type(DataType::Int64),
+            ));
+            columns.push(Arc::new(Int64Array::from(converted)));
+            changed = true;
+        } else {
+            fields.push(field.clone());
+            columns.push(column.clone());
+        }
+    }
+
+    if changed {
+        arrow_array::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
+            ConnectorError::Internal(format!("build PostgreSQL COPY batch: {error}"))
+        })
+    } else {
+        Ok(batch.clone())
+    }
+}
+
+#[cfg(feature = "postgres-sink")]
+fn validate_timestamp_values(
+    array: &dyn arrow_array::Array,
+    unit: &TimeUnit,
+) -> Result<(), ConnectorError> {
+    use arrow_array::{
+        Array as _, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
+    };
+
+    macro_rules! validate {
+        ($array_type:ty) => {{
+            let values = array
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal(format!(
+                        "timestamp array does not match declared unit {unit:?}"
+                    ))
+                })?;
+            for row in 0..values.len() {
+                if !values.is_null(row) && to_naive_datetime(values.value(row), unit).is_none() {
+                    return Err(ConnectorError::SchemaMismatch(format!(
+                        "PostgreSQL sink cannot represent {unit:?} timestamp value {} at row {row}",
+                        values.value(row)
+                    )));
+                }
+            }
+        }};
+    }
+
+    match unit {
+        TimeUnit::Second => validate!(TimestampSecondArray),
+        TimeUnit::Millisecond => validate!(TimestampMillisecondArray),
+        TimeUnit::Microsecond => validate!(TimestampMicrosecondArray),
+        TimeUnit::Nanosecond => unreachable!("nanosecond timestamps fail type admission"),
+    }
+    Ok(())
+}
+
+/// Converts an Arrow column to a PostgreSQL array parameter for UNNEST.
+#[cfg(feature = "postgres-sink")]
+#[allow(clippy::too_many_lines)]
+pub(super) fn arrow_column_to_pg_array(
+    array: &dyn arrow_array::Array,
+) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, ConnectorError> {
+    use arrow_array::{
+        Array as _, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
+    };
+
+    postgres_type(array.data_type())?;
+
+    macro_rules! widen {
+        ($array_type:ty, $target:ty) => {{
+            let values = array
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal(format!(
+                        "downcast to {} failed",
+                        stringify!($array_type)
+                    ))
+                })?;
+            let converted: Vec<Option<$target>> = (0..values.len())
+                .map(|row| (!values.is_null(row)).then(|| <$target>::from(values.value(row))))
                 .collect();
-            Ok(Box::new(vals))
+            Ok(Box::new(converted))
         }};
     }
 
     match array.data_type() {
         DataType::Boolean => {
-            let arr = array
+            let values = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
                     ConnectorError::Internal("downcast to BooleanArray failed".into())
                 })?;
-            let vals: Vec<Option<bool>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-                .collect();
-            Ok(Box::new(vals))
+            Ok(Box::new(
+                (0..values.len())
+                    .map(|row| (!values.is_null(row)).then(|| values.value(row)))
+                    .collect::<Vec<Option<bool>>>(),
+            ))
         }
-        DataType::Int8 => extract_primitive!(array, Int8Array, i16),
-        DataType::UInt8 => extract_primitive!(array, UInt8Array, i16),
-        DataType::Int16 => extract_primitive!(array, Int16Array, i16),
-        DataType::UInt16 => extract_primitive!(array, UInt16Array, i32),
-        DataType::Int32 => extract_primitive!(array, Int32Array, i32),
-        DataType::UInt32 => extract_primitive!(array, UInt32Array, i64),
-        DataType::Int64 => extract_primitive!(array, Int64Array, i64),
+        DataType::Int8 => widen!(Int8Array, i16),
+        DataType::UInt8 => widen!(UInt8Array, i16),
+        DataType::Int16 => widen!(Int16Array, i16),
+        DataType::UInt16 => widen!(UInt16Array, i32),
+        DataType::Int32 => widen!(Int32Array, i32),
+        DataType::UInt32 => widen!(UInt32Array, i64),
+        DataType::Int64 => widen!(Int64Array, i64),
         DataType::UInt64 => {
-            // PG has no unsigned 64-bit; cast to i64 (wraps for > i64::MAX).
-            let arr = array
+            let values = array
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| ConnectorError::Internal("downcast to UInt64Array failed".into()))?;
-            #[allow(clippy::cast_possible_wrap)]
-            let vals: Vec<Option<i64>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
+            let converted = (0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Ok(None)
                     } else {
-                        Some(arr.value(i) as i64)
+                        checked_u64(values.value(row), row).map(Some)
                     }
                 })
-                .collect();
-            Ok(Box::new(vals))
+                .collect::<Result<Vec<Option<i64>>, ConnectorError>>()?;
+            Ok(Box::new(converted))
         }
-        DataType::Float32 => extract_primitive!(array, Float32Array, f32),
-        DataType::Float64 => extract_primitive!(array, Float64Array, f64),
+        DataType::Float32 => widen!(Float32Array, f32),
+        DataType::Float64 => widen!(Float64Array, f64),
         DataType::Utf8 => {
-            let arr = array
+            let values = array
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| ConnectorError::Internal("downcast to StringArray failed".into()))?;
-            let vals: Vec<Option<String>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_owned())
-                    }
-                })
-                .collect();
-            Ok(Box::new(vals))
+            Ok(Box::new(
+                (0..values.len())
+                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_owned()))
+                    .collect::<Vec<Option<String>>>(),
+            ))
         }
         DataType::LargeUtf8 => {
-            let arr = array
+            let values = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| {
                     ConnectorError::Internal("downcast to LargeStringArray failed".into())
                 })?;
-            let vals: Vec<Option<String>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_owned())
-                    }
-                })
-                .collect();
-            Ok(Box::new(vals))
+            Ok(Box::new(
+                (0..values.len())
+                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_owned()))
+                    .collect::<Vec<Option<String>>>(),
+            ))
         }
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
-            let arr = array
+        DataType::Binary => {
+            let values = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| ConnectorError::Internal("downcast to BinaryArray failed".into()))?;
-            let vals: Vec<Option<Vec<u8>>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_vec())
-                    }
-                })
-                .collect();
-            Ok(Box::new(vals))
+            Ok(Box::new(
+                (0..values.len())
+                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_vec()))
+                    .collect::<Vec<Option<Vec<u8>>>>(),
+            ))
+        }
+        DataType::LargeBinary => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal("downcast to LargeBinaryArray failed".into())
+                })?;
+            Ok(Box::new(
+                (0..values.len())
+                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_vec()))
+                    .collect::<Vec<Option<Vec<u8>>>>(),
+            ))
         }
         DataType::Date32 => {
-            let arr = array
+            let values = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| ConnectorError::Internal("downcast to Date32Array failed".into()))?;
-            let epoch =
-                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date");
-            let vals: Vec<Option<chrono::NaiveDate>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
+            let converted = (0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Ok(None)
                     } else {
-                        let days = i64::from(arr.value(i));
-                        if days >= 0 {
-                            epoch.checked_add_days(chrono::Days::new(days.unsigned_abs()))
-                        } else {
-                            epoch.checked_sub_days(chrono::Days::new(days.unsigned_abs()))
-                        }
+                        checked_date32(values.value(row), row).map(Some)
                     }
                 })
-                .collect();
-            Ok(Box::new(vals))
+                .collect::<Result<Vec<Option<chrono::NaiveDate>>, ConnectorError>>()?;
+            Ok(Box::new(converted))
         }
-        DataType::Timestamp(unit, tz) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .map(|a| {
-                    (0..a.len())
-                        .map(|i| {
-                            if a.is_null(i) {
-                                None
+        DataType::Timestamp(unit, timezone) => {
+            macro_rules! timestamps {
+                ($array_type:ty) => {{
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<$array_type>()
+                        .ok_or_else(|| {
+                            ConnectorError::Internal(format!(
+                                "timestamp array does not match declared unit {unit:?}"
+                            ))
+                        })?;
+                    (0..values.len())
+                        .map(|row| {
+                            if values.is_null(row) {
+                                Ok(None)
                             } else {
-                                to_naive_datetime(a.value(i), &TimeUnit::Microsecond)
+                                to_naive_datetime(values.value(row), unit)
+                                    .map(Some)
+                                    .ok_or_else(|| {
+                                        ConnectorError::SchemaMismatch(format!(
+                                            "PostgreSQL sink cannot represent {unit:?} timestamp \
+                                             value {} at row {row}",
+                                            values.value(row)
+                                        ))
+                                    })
                             }
                         })
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| {
-                    array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .map(|a| {
-                            (0..a.len())
-                                .map(|i| {
-                                    if a.is_null(i) {
-                                        None
-                                    } else {
-                                        to_naive_datetime(a.value(i), &TimeUnit::Millisecond)
-                                    }
-                                })
-                                .collect()
-                        })
-                })
-                .or_else(|| {
-                    array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .map(|a| {
-                            (0..a.len())
-                                .map(|i| {
-                                    if a.is_null(i) {
-                                        None
-                                    } else {
-                                        to_naive_datetime(a.value(i), &TimeUnit::Second)
-                                    }
-                                })
-                                .collect()
-                        })
-                })
-                .or_else(|| {
-                    array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .map(|a| {
-                            (0..a.len())
-                                .map(|i| {
-                                    if a.is_null(i) {
-                                        None
-                                    } else {
-                                        to_naive_datetime(a.value(i), &TimeUnit::Nanosecond)
-                                    }
-                                })
-                                .collect()
-                        })
-                });
+                        .collect::<Result<Vec<Option<chrono::NaiveDateTime>>, ConnectorError>>()?
+                }};
+            }
 
-            let vals = arr.ok_or_else(|| {
-                ConnectorError::Internal(format!(
-                    "unsupported timestamp unit {unit:?} for pg array conversion"
+            let values = match unit {
+                TimeUnit::Second => timestamps!(TimestampSecondArray),
+                TimeUnit::Millisecond => timestamps!(TimestampMillisecondArray),
+                TimeUnit::Microsecond => timestamps!(TimestampMicrosecondArray),
+                TimeUnit::Nanosecond => unreachable!("nanosecond timestamps fail type admission"),
+            };
+            if timezone.is_some() {
+                Ok(Box::new(
+                    values
+                        .into_iter()
+                        .map(|value| value.map(|timestamp| timestamp.and_utc()))
+                        .collect::<Vec<Option<chrono::DateTime<chrono::Utc>>>>(),
                 ))
-            })?;
-
-            if tz.is_some() {
-                // TIMESTAMPTZ: wrap as DateTime<Utc>
-                let tz_vals: Vec<Option<chrono::DateTime<chrono::Utc>>> = vals
-                    .into_iter()
-                    .map(|opt| opt.map(|ndt| ndt.and_utc()))
-                    .collect();
-                Ok(Box::new(tz_vals))
             } else {
-                Ok(Box::new(vals))
+                Ok(Box::new(values))
             }
         }
-        // Fallback: convert to string representation
-        other => {
-            let formatter = arrow_cast::display::ArrayFormatter::try_new(
-                array,
-                &arrow_cast::display::FormatOptions::default(),
-            )
-            .map_err(|e| ConnectorError::Internal(format!("arrow format error: {e}")))?;
-            let vals: Vec<Option<String>> = (0..array.len())
-                .map(|i| {
-                    if array.is_null(i) {
-                        None
-                    } else {
-                        Some(formatter.value(i).to_string())
-                    }
-                })
-                .collect();
-            tracing::debug!(
-                data_type = ?other,
-                "falling back to text conversion for unsupported Arrow type"
-            );
-            Ok(Box::new(vals))
-        }
+        unsupported => Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL sink does not support Arrow type {unsupported:?}"
+        ))),
     }
 }
 
-/// Converts a raw timestamp value to [`chrono::NaiveDateTime`] based on the Arrow `TimeUnit`.
+/// Converts a Unix timestamp using Euclidean division so negative fractional values retain their
+/// correct instant (for example, -1 ms is 1969-12-31 23:59:59.999, not one second late).
 #[cfg(feature = "postgres-sink")]
-#[allow(clippy::trivially_copy_pass_by_ref, clippy::cast_possible_truncation)]
-fn to_naive_datetime(value: i64, unit: &arrow_schema::TimeUnit) -> Option<chrono::NaiveDateTime> {
-    use arrow_schema::TimeUnit;
-    let (secs, nanos) = match unit {
-        TimeUnit::Second => (value, 0_u32),
-        TimeUnit::Millisecond => (
-            value / 1_000,
-            ((value % 1_000).unsigned_abs() as u32) * 1_000_000,
-        ),
-        TimeUnit::Microsecond => (
-            value / 1_000_000,
-            ((value % 1_000_000).unsigned_abs() as u32) * 1_000,
-        ),
-        TimeUnit::Nanosecond => (
-            value / 1_000_000_000,
-            (value % 1_000_000_000).unsigned_abs() as u32,
-        ),
+fn to_naive_datetime(value: i64, unit: &TimeUnit) -> Option<chrono::NaiveDateTime> {
+    let (units_per_second, nanos_per_unit) = match unit {
+        TimeUnit::Second => (1_i64, 1_000_000_000_u32),
+        TimeUnit::Millisecond => (1_000, 1_000_000),
+        TimeUnit::Microsecond => (1_000_000, 1_000),
+        TimeUnit::Nanosecond => (1_000_000_000, 1),
     };
-    chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.naive_utc())
+    let seconds = value.div_euclid(units_per_second);
+    let fraction = u32::try_from(value.rem_euclid(units_per_second)).ok()?;
+    let nanos = fraction.checked_mul(nanos_per_unit)?;
+    chrono::DateTime::from_timestamp(seconds, nanos).map(|timestamp| timestamp.naive_utc())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use arrow_schema::TimeUnit;
-
-    #[test]
-    fn test_boolean_mapping() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Boolean), "bool");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Boolean), "BOOLEAN");
-    }
-
-    #[test]
-    fn test_integer_mappings() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Int8), "int2");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Int16), "int2");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Int32), "int4");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Int64), "int8");
-
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Int32), "INTEGER");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Int64), "BIGINT");
-    }
-
-    #[test]
-    fn test_unsigned_widening() {
-        // UInt32 must widen to int8 (no unsigned in PG)
-        assert_eq!(arrow_type_to_pg_sql(&DataType::UInt32), "int8");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::UInt32), "BIGINT");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::UInt64), "int8");
-    }
-
-    #[test]
-    fn test_float_mappings() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Float32), "float4");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Float64), "float8");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Float64), "DOUBLE PRECISION");
-    }
-
-    #[test]
-    fn test_decimal_mapping() {
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::Decimal128(10, 2)),
-            "numeric"
-        );
-        assert_eq!(
-            arrow_to_pg_ddl_type(&DataType::Decimal128(10, 2)),
-            "NUMERIC"
-        );
-    }
-
-    #[test]
-    fn test_string_mappings() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Utf8), "text");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::LargeUtf8), "text");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Utf8), "TEXT");
-    }
-
-    #[test]
-    fn test_binary_mappings() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Binary), "bytea");
-        assert_eq!(arrow_type_to_pg_sql(&DataType::LargeBinary), "bytea");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Binary), "BYTEA");
-    }
-
-    #[test]
-    fn test_uuid_mapping() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::FixedSizeBinary(16)), "uuid");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::FixedSizeBinary(16)), "UUID");
-        // Non-16 byte fixed binary falls back to bytea
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::FixedSizeBinary(32)),
-            "bytea"
-        );
-    }
-
-    #[test]
-    fn test_date_time_mappings() {
-        assert_eq!(arrow_type_to_pg_sql(&DataType::Date32), "date");
-        assert_eq!(arrow_to_pg_ddl_type(&DataType::Date32), "DATE");
-
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::Time64(TimeUnit::Microsecond)),
-            "time"
-        );
-        assert_eq!(
-            arrow_to_pg_ddl_type(&DataType::Time64(TimeUnit::Microsecond)),
-            "TIME"
-        );
-    }
-
-    #[test]
-    fn test_timestamp_mappings() {
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::Timestamp(TimeUnit::Microsecond, None)),
-            "timestamp"
-        );
-        assert_eq!(
-            arrow_to_pg_ddl_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
-            "TIMESTAMP"
-        );
-
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into())
-            )),
-            "timestamptz"
-        );
-        assert_eq!(
-            arrow_to_pg_ddl_type(&DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into())
-            )),
-            "TIMESTAMPTZ"
-        );
-    }
-
-    #[test]
-    fn test_fallback_to_text() {
-        // Complex types fall back to text
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::List(Arc::new(arrow_schema::Field::new(
-                "item",
-                DataType::Int32,
-                true
-            )))),
-            "text"
-        );
-    }
-
-    #[test]
-    fn test_array_cast_expression() {
-        assert_eq!(
-            arrow_type_to_pg_array_cast(&DataType::Int64, 1),
-            "$1::int8[]"
-        );
-        assert_eq!(
-            arrow_type_to_pg_array_cast(&DataType::Utf8, 3),
-            "$3::text[]"
-        );
-        assert_eq!(
-            arrow_type_to_pg_array_cast(&DataType::Boolean, 2),
-            "$2::bool[]"
-        );
-    }
-
     use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn mappings_match_parameter_rust_types() {
+        assert_eq!(arrow_type_to_pg_sql(&DataType::UInt16).unwrap(), "int4");
+        assert_eq!(arrow_type_to_pg_sql(&DataType::UInt32).unwrap(), "int8");
+        assert_eq!(
+            arrow_to_pg_ddl_type(&DataType::Float64).unwrap(),
+            "DOUBLE PRECISION"
+        );
+        assert_eq!(
+            arrow_type_to_pg_array_cast(&DataType::Timestamp(TimeUnit::Microsecond, None), 2)
+                .unwrap(),
+            "$2::timestamp[]"
+        );
+    }
+
+    #[test]
+    fn unsupported_types_never_fall_back_to_text() {
+        let list = DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        )));
+        assert!(postgres_type(&list).is_err());
+        assert!(postgres_type(&DataType::FixedSizeBinary(16)).is_err());
+        assert!(postgres_type(&DataType::Timestamp(TimeUnit::Nanosecond, None)).is_err());
+    }
+
+    #[cfg(feature = "postgres-sink")]
+    #[test]
+    fn uint64_above_bigint_range_is_an_error() {
+        let values = arrow_array::UInt64Array::from(vec![u64::MAX]);
+        let error = validate_postgres_array_values(&values).unwrap_err();
+        assert!(!error.is_transient());
+        let error = error.to_string();
+        assert!(
+            error.contains("BIGINT") && error.contains(&u64::MAX.to_string()),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "postgres-sink")]
+    #[test]
+    fn copy_uint64_uses_the_same_bigint_wire_type_as_unnest() {
+        use arrow_array::Array as _;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::UInt64Array::from(vec![7]))],
+        )
+        .unwrap();
+        let normalized = postgres_copy_batch(&batch).unwrap();
+
+        assert_eq!(normalized.schema().field(0).data_type(), &DataType::Int64);
+        let values = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 7);
+    }
+
+    #[cfg(feature = "postgres-sink")]
+    #[test]
+    fn negative_fractional_timestamps_use_euclidean_division() {
+        let millis = to_naive_datetime(-1, &TimeUnit::Millisecond).unwrap();
+        assert_eq!(millis.and_utc().timestamp(), -1);
+        assert_eq!(millis.and_utc().timestamp_subsec_nanos(), 999_000_000);
+
+        let micros = to_naive_datetime(-1, &TimeUnit::Microsecond).unwrap();
+        assert_eq!(micros.and_utc().timestamp(), -1);
+        assert_eq!(micros.and_utc().timestamp_subsec_nanos(), 999_999_000);
+    }
+
+    #[cfg(feature = "postgres-sink")]
+    #[test]
+    fn out_of_range_non_null_temporal_value_is_rejected() {
+        let values = arrow_array::Date32Array::from(vec![i32::MAX]);
+        assert!(validate_postgres_array_values(&values).is_err());
+    }
 }

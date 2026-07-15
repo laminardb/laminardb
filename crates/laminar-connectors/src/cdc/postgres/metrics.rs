@@ -18,9 +18,6 @@ pub struct PostgresCdcMetrics {
     /// Total bytes received from the WAL stream.
     pub bytes_received: IntCounter,
 
-    /// Total errors encountered.
-    pub errors: IntCounter,
-
     /// Total batches produced for downstream.
     pub batches_produced: IntCounter,
 
@@ -41,12 +38,6 @@ pub struct PostgresCdcMetrics {
 
     /// Current replication lag in bytes (`write_lsn` - `confirmed_flush_lsn`).
     pub replication_lag_bytes: IntGauge,
-
-    /// Total keepalive/heartbeat messages sent.
-    pub keepalives_sent: IntCounter,
-
-    /// Total events dropped due to buffer cap enforcement.
-    pub events_dropped: IntCounter,
 }
 
 impl PostgresCdcMetrics {
@@ -66,7 +57,6 @@ impl PostgresCdcMetrics {
                 "postgres_cdc_bytes_received_total",
                 "Total bytes from WAL stream",
             ),
-            errors: reg.counter("postgres_cdc_errors_total", "Total CDC errors"),
             batches_produced: reg.counter(
                 "postgres_cdc_batches_produced_total",
                 "Total batches produced",
@@ -85,14 +75,6 @@ impl PostgresCdcMetrics {
             replication_lag_bytes: reg.gauge(
                 "postgres_cdc_replication_lag_bytes",
                 "Replication lag in bytes",
-            ),
-            keepalives_sent: reg.counter(
-                "postgres_cdc_keepalives_sent_total",
-                "Total keepalive messages sent",
-            ),
-            events_dropped: reg.counter(
-                "postgres_cdc_events_dropped_total",
-                "Total events dropped (buffer cap)",
             ),
         }
     }
@@ -125,11 +107,6 @@ impl PostgresCdcMetrics {
         self.bytes_received.inc_by(bytes);
     }
 
-    /// Records an error.
-    pub fn record_error(&self) {
-        self.errors.inc();
-    }
-
     /// Records a batch produced for downstream.
     pub fn record_batch(&self) {
         self.batches_produced.inc();
@@ -145,16 +122,6 @@ impl PostgresCdcMetrics {
     #[allow(clippy::cast_possible_wrap)]
     pub fn set_replication_lag_bytes(&self, lag: u64) {
         self.replication_lag_bytes.set(lag as i64);
-    }
-
-    /// Records a keepalive sent to `PostgreSQL`.
-    pub fn record_keepalive(&self) {
-        self.keepalives_sent.inc();
-    }
-
-    /// Records events dropped due to buffer cap.
-    pub fn record_dropped(&self, count: u64) {
-        self.events_dropped.inc_by(count);
     }
 }
 
@@ -177,9 +144,7 @@ mod tests {
         m.record_delete();
         m.record_transaction();
         m.record_bytes(1024);
-        m.record_error();
         m.record_batch();
-        m.record_keepalive();
 
         assert_eq!(m.events_received.get(), 4);
         assert_eq!(m.inserts.get(), 2);
@@ -187,9 +152,7 @@ mod tests {
         assert_eq!(m.deletes.get(), 1);
         assert_eq!(m.transactions.get(), 1);
         assert_eq!(m.bytes_received.get(), 1024);
-        assert_eq!(m.errors.get(), 1);
         assert_eq!(m.batches_produced.get(), 1);
-        assert_eq!(m.keepalives_sent.get(), 1);
     }
 
     #[test]

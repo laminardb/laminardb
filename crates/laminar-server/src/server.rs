@@ -19,13 +19,13 @@ use crate::http;
 use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
-#[cfg(all(test, any(feature = "otel", feature = "kafka")))]
+#[cfg(all(test, any(feature = "otel", feature = "kafka", feature = "cluster")))]
 use laminar_core::state::StateBackendConfig;
 use laminar_core::state::StateBackendDurability;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub enum ServerHandle {
-    Embedded {
+    Single {
         db: Arc<LaminarDB>,
         api_handle: tokio::task::JoinHandle<()>,
         pgwire_handle: Option<tokio::task::JoinHandle<()>>,
@@ -39,7 +39,7 @@ impl ServerHandle {
     /// Block until SIGINT/SIGTERM, then gracefully shut down.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
         match self {
-            Self::Embedded {
+            Self::Single {
                 db,
                 api_handle,
                 pgwire_handle,
@@ -127,17 +127,6 @@ pub async fn run_server(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
-    if let Some(budget) = config.server.state_memory_budget_bytes {
-        builder = builder.state_memory_budget_bytes(budget);
-    }
-    // The state_tier_dir contract (durable backend + budget + feature) is
-    // enforced by config validation at load; here we only wire the dir.
-    #[cfg(feature = "state-tier")]
-    if let Some(ref dir) = config.server.state_tier_dir {
-        builder = builder.state_tier_dir(dir);
-        builder = builder.state_tier_group_demotion(config.server.group_demotion());
-    }
-
     let storage_dir = config.state.local_storage_dir();
     let has_storage = config
         .state
@@ -148,8 +137,8 @@ pub async fn run_server(
     }
 
     let profile = match config.server.mode {
-        ServerMode::Embedded if has_storage => Profile::Embedded,
-        ServerMode::Embedded => Profile::BareMetal,
+        ServerMode::Single if has_storage => Profile::Embedded,
+        ServerMode::Single => Profile::BareMetal,
         ServerMode::Cluster => Profile::Cluster,
     };
     builder = builder.profile(profile);
@@ -159,7 +148,6 @@ pub async fn run_server(
 
     // Build the state backend + single-owner vnode registry from config so
     // the checkpoint coordinator's durability gate runs with real markers.
-    // Cluster mode overrides the owner id after its controller is built.
     let state_backend = config
         .state
         .build()
@@ -183,7 +171,6 @@ pub async fn run_server(
         .build()
         .await
         .map_err(|e| ServerError::Build(e.to_string()))?;
-    let db = Arc::new(db);
     // Auto-recover from a fatal cycle fault by restarting from the last checkpoint.
     db.enable_supervision();
 
@@ -202,7 +189,7 @@ pub async fn run_server(
     db.set_engine_metrics(Arc::clone(&engine_metrics));
     db.set_prometheus_registry(Arc::clone(&registry));
 
-    execute_config_ddl(&db, &config).await?;
+    execute_config_ddl(&db, &config, false).await?;
 
     db.start()
         .await
@@ -225,7 +212,7 @@ pub async fn run_server(
         registry,
         config_path.clone(),
         config,
-        // Single-node embedded mode has no cluster control plane.
+        // Single-node server mode has no cluster control plane.
         #[cfg(feature = "cluster")]
         None,
     )
@@ -269,7 +256,7 @@ pub async fn run_server(
         None
     };
 
-    Ok(ServerHandle::Embedded {
+    Ok(ServerHandle::Single {
         db,
         api_handle,
         pgwire_handle,
@@ -278,7 +265,7 @@ pub async fn run_server(
 }
 
 // ---------------------------------------------------------------------------
-// Shared helpers (used by both embedded and cluster startup)
+// Shared helpers (used by both single-node and cluster startup)
 // ---------------------------------------------------------------------------
 
 /// Apply checkpoint settings to a `LaminarDB` builder.
@@ -297,9 +284,7 @@ pub(crate) fn apply_checkpoint_config(
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
         data_dir: file_url_to_path(checkpoint_url),
         max_retained: Some(checkpoint.max_retained),
-        max_in_flight_epochs: checkpoint.max_in_flight_epochs,
         max_staged_bytes: checkpoint.max_staged_bytes,
-        delta_chain_max: checkpoint.delta_chain_max,
     };
     builder = builder.checkpoint(cfg);
 
@@ -318,68 +303,62 @@ pub(crate) fn apply_checkpoint_config(
 pub(crate) async fn execute_config_ddl(
     db: &LaminarDB,
     config: &ServerConfig,
+    cluster_bootstrap: bool,
 ) -> Result<(), ServerError> {
-    // Empty-schema + WATERMARK FOR is handled inside the laminar-db DDL
-    // layer: it calls `discover_schema` on the connector, populates the
-    // source columns from the result, then validates the watermark column
-    // against them. Connectors that cannot discover a schema (e.g. Kafka
-    // without a reachable Schema Registry) return a clear error from that
-    // path — we don't need to pre-empt it here.
+    let mut definitions = Vec::new();
     for source in &config.sources {
-        let ddl = source_to_ddl(source);
-        db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
-            section: "source".to_string(),
-            name: source.name.clone(),
-            source: e,
-        })?;
-        info!("Created source: {}", source.name);
+        definitions.push(("source", source.name.clone(), source_to_ddl(source)));
     }
-
     for lookup in &config.lookups {
-        let ddl = lookup_to_ddl(lookup)?;
-        db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
-            section: "lookup".to_string(),
-            name: lookup.name.clone(),
-            source: e,
-        })?;
-        info!("Created lookup table: {}", lookup.name);
+        definitions.push(("lookup", lookup.name.clone(), lookup_to_ddl(lookup)?));
     }
-
     for pipeline in &config.pipelines {
-        let ddl = pipeline_to_ddl(pipeline);
-        db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
-            section: "pipeline".to_string(),
-            name: pipeline.name.clone(),
-            source: e,
-        })?;
-        info!("Created pipeline: {}", pipeline.name);
+        definitions.push(("pipeline", pipeline.name.clone(), pipeline_to_ddl(pipeline)));
     }
-
     for sink in &config.sinks {
-        let ddl = sink_to_ddl(sink);
-        db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
-            section: "sink".to_string(),
-            name: sink.name.clone(),
-            source: e,
-        })?;
-        info!("Created sink: {}", sink.name);
+        definitions.push(("sink", sink.name.clone(), sink_to_ddl(sink)));
     }
-
     if let Some(ref sql) = config.sql {
         let trimmed = sql.trim();
         if !trimmed.is_empty() {
-            db.execute(trimmed).await.map_err(|e| {
-                let snippet: String = trimmed.chars().take(80).collect();
-                ServerError::Ddl {
-                    section: "sql".to_string(),
-                    name: snippet,
-                    source: e,
-                }
-            })?;
-            info!("Executed SQL pipeline definition");
+            definitions.push((
+                "sql",
+                trimmed.chars().take(80).collect(),
+                trimmed.to_owned(),
+            ));
         }
     }
 
+    #[cfg(feature = "cluster")]
+    if cluster_bootstrap {
+        let sql = definitions
+            .iter()
+            .map(|(_, _, sql)| sql.clone())
+            .collect::<Vec<_>>();
+        db.execute_cluster_bootstrap_batch(&sql)
+            .await
+            .map_err(|source| ServerError::Ddl {
+                section: "cluster catalog".to_string(),
+                name: "startup inventory".to_string(),
+                source,
+            })?;
+        info!(
+            entries = definitions.len(),
+            "Sealed cluster catalog inventory"
+        );
+        return Ok(());
+    }
+    #[cfg(not(feature = "cluster"))]
+    let _ = cluster_bootstrap;
+
+    for (section, name, sql) in definitions {
+        db.execute(&sql).await.map_err(|source| ServerError::Ddl {
+            section: section.to_string(),
+            name: name.clone(),
+            source,
+        })?;
+        info!(section, %name, "Applied configuration DDL");
+    }
     Ok(())
 }
 
@@ -406,7 +385,7 @@ pub(crate) async fn start_http_api(
         reload_guard: ReloadGuard::new(),
         registry,
         server_metrics,
-        ephemeral: Arc::new(http::EphemeralTracker::new()),
+        ws_slots: http::ws_connection_slots(),
         #[cfg(feature = "cluster")]
         cluster,
     });
@@ -677,6 +656,64 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    async fn catalog_test_db(
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> (
+        Arc<LaminarDB>,
+        Arc<laminar_core::cluster::control::CatalogManifestStore>,
+    ) {
+        use laminar_core::cluster::control::{
+            CatalogManifestStore, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
+            LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+
+        let node = NodeId(1);
+        let boot = uuid::Uuid::from_u128(101);
+        let owner = LeaderLeaseOwner {
+            node,
+            boot,
+            process_term: 1,
+        };
+        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&object_store), 1_000));
+        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&kv),
+            kv,
+            None,
+            members_rx,
+            boot,
+        ));
+        controller.set_active(false);
+        controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        )));
+        let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
+        controller
+            .set_leader_lease_watch(
+                lease_rx,
+                owner,
+                Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30))),
+            )
+            .unwrap();
+        controller.set_leader_lease_store(Arc::clone(&authority));
+        let manifest_store = Arc::new(CatalogManifestStore::new(authority));
+        let db = LaminarDB::builder()
+            .cluster_controller(controller)
+            .cluster_checkpoint_object_store(object_store)
+            .catalog_manifest_store(Arc::clone(&manifest_store))
+            .build()
+            .await
+            .unwrap();
+        (db, manifest_store)
+    }
+
     #[test]
     fn test_source_to_ddl_basic() {
         let source = make_source("events", "kafka");
@@ -730,7 +767,7 @@ mod tests {
             ai: Default::default(),
             models: Default::default(),
         };
-        execute_config_ddl(&db, &config)
+        execute_config_ddl(&db, &config, false)
             .await
             .expect("columnless OTel + WATERMARK FOR should compose");
     }
@@ -767,13 +804,76 @@ mod tests {
             ai: Default::default(),
             models: Default::default(),
         };
-        let err = execute_config_ddl(&db, &config).await.unwrap_err();
+        let err = execute_config_ddl(&db, &config, false).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("schema auto-discovery failed")
                 || msg.contains("could not auto-discover a schema")
                 || msg.contains("no columns declared"),
             "expected schema-discovery error from the DDL layer, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_config_rejects_expanded_connector_secret_before_manifest_write() {
+        use object_store::ObjectStore;
+
+        let mut source = make_source("secured", "generator");
+        source.properties.insert(
+            "password".to_string(),
+            toml::Value::String("expanded-password-must-not-persist".to_string()),
+        );
+        let config = ServerConfig {
+            server: ServerSection::default(),
+            state: StateBackendConfig::default(),
+            checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
+            sources: vec![source],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            sql: None,
+            discovery: None,
+            node_id: None,
+            ai: Default::default(),
+            models: Default::default(),
+        };
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (db, manifest_store) = catalog_test_db(object_store).await;
+
+        let error = execute_config_ddl(&db, &config, true).await.unwrap_err();
+        assert!(error.to_string().contains("cannot persist secret property"));
+        assert!(manifest_store.load().await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn empty_cluster_config_still_seals_an_empty_inventory() {
+        use object_store::ObjectStore;
+
+        let config = ServerConfig {
+            server: ServerSection::default(),
+            state: StateBackendConfig::default(),
+            checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
+            sources: vec![],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            sql: None,
+            discovery: None,
+            node_id: None,
+            ai: Default::default(),
+            models: Default::default(),
+        };
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (db, manifest_store) = catalog_test_db(object_store).await;
+
+        execute_config_ddl(&db, &config, true).await.unwrap();
+        assert_eq!(
+            manifest_store.load().await.unwrap().unwrap().entries,
+            Vec::new()
         );
     }
 

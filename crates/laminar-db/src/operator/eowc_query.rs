@@ -18,8 +18,7 @@ use crate::sql_analysis::compute_closed_boundary;
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
 
-/// Row cap for the raw-batch accumulator; triggers coalescing to bound memory.
-const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
+const MAX_EOWC_ACCUMULATED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -48,7 +47,7 @@ enum EowcInnerState {
     Raw {
         accumulated: Vec<RecordBatch>,
         last_closed_boundary: i64,
-        accumulated_rows: usize,
+        accumulated_bytes: usize,
         // Built on first close-cycle; cached thereafter to avoid re-planning.
         sql_cache: Option<RawSqlCache>,
     },
@@ -100,12 +99,36 @@ fn snapshot_raw(
     })
 }
 
-fn restore_raw(cp: &RawCheckpoint) -> Result<Vec<RecordBatch>, DbError> {
+fn raw_batches_bytes(batches: &[RecordBatch]) -> Result<usize, DbError> {
+    batches.iter().try_fold(0usize, |total, batch| {
+        total
+            .checked_add(batch.get_array_memory_size())
+            .ok_or_else(|| DbError::Pipeline("raw EOWC state byte accounting overflow".into()))
+    })
+}
+
+fn restore_raw(cp: &RawCheckpoint) -> Result<(Vec<RecordBatch>, usize), DbError> {
     if cp.ipc.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
-    crate::mv_store::ipc_to_batches(&cp.ipc)
-        .map_err(|e| DbError::Pipeline(format!("EOWC raw restore: {e}")))
+    if cp.ipc.len() > MAX_EOWC_ACCUMULATED_BYTES {
+        return Err(DbError::Checkpoint(format!(
+            "EOWC raw checkpoint is {} bytes, exceeding the {}-byte state limit",
+            cp.ipc.len(),
+            MAX_EOWC_ACCUMULATED_BYTES
+        )));
+    }
+    let batches = crate::mv_store::ipc_to_batches(&cp.ipc)
+        .map_err(|e| DbError::Checkpoint(format!("EOWC raw restore: {e}")))?;
+    let bytes = raw_batches_bytes(&batches)
+        .map_err(|e| DbError::Checkpoint(format!("EOWC raw restore accounting: {e}")))?;
+    if bytes > MAX_EOWC_ACCUMULATED_BYTES {
+        return Err(DbError::Checkpoint(format!(
+            "EOWC raw checkpoint expands to {bytes} bytes, exceeding the {}-byte state limit",
+            MAX_EOWC_ACCUMULATED_BYTES
+        )));
+    }
+    Ok((batches, bytes))
 }
 
 /// Replace every unqualified `source` table reference in SQL with `temp`.
@@ -283,7 +306,7 @@ impl EowcQueryOperator {
         self.state = EowcInnerState::Raw {
             accumulated: Vec::new(),
             last_closed_boundary: i64::MIN,
-            accumulated_rows: 0,
+            accumulated_bytes: 0,
             sql_cache: None,
         };
         self.apply_pending_restore()?;
@@ -294,42 +317,78 @@ impl EowcQueryOperator {
         let Some(envelope) = self.pending_restore.take() else {
             return Ok(());
         };
+        if let Err(error) = self.apply_checkpoint_envelope(&envelope) {
+            // Keep recovery pending so a caller that mishandles the error cannot
+            // process or checkpoint an empty/partially restored operator.
+            self.pending_restore = Some(envelope);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn apply_checkpoint_envelope(
+        &mut self,
+        envelope: &EowcCheckpointEnvelope,
+    ) -> Result<(), DbError> {
         match (&mut self.state, envelope) {
             (EowcInnerState::CoreWindow(cw), EowcCheckpointEnvelope::CoreWindow(cp)) => {
-                if let Err(e) = cw.restore_windows(&cp) {
-                    tracing::warn!(
-                        query = %self.op_name, error = %e,
-                        "Failed to restore EOWC CoreWindow checkpoint"
-                    );
+                let previous = cw.checkpoint_windows().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "EOWC CoreWindow restore snapshot for '{}': {error}",
+                        self.op_name
+                    ))
+                })?;
+                if let Err(apply_error) = cw.restore_windows(cp) {
+                    cw.restore_windows(&previous).map_err(|rollback_error| {
+                        DbError::Checkpoint(format!(
+                            "EOWC CoreWindow restore for '{}' failed: {apply_error}; \
+                             rollback also failed: {rollback_error}",
+                            self.op_name
+                        ))
+                    })?;
+                    return Err(DbError::Checkpoint(format!(
+                        "EOWC CoreWindow restore for '{}': {apply_error}",
+                        self.op_name
+                    )));
                 }
             }
             (EowcInnerState::EowcAgg(eowc), EowcCheckpointEnvelope::EowcAgg(cp)) => {
-                if let Err(e) = eowc.restore_windows(&cp) {
-                    tracing::warn!(
-                        query = %self.op_name, error = %e,
-                        "Failed to restore EOWC aggregate checkpoint"
-                    );
+                let previous = eowc.checkpoint_windows().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "EOWC aggregate restore snapshot for '{}': {error}",
+                        self.op_name
+                    ))
+                })?;
+                if let Err(apply_error) = eowc.restore_windows(cp) {
+                    eowc.restore_windows(&previous).map_err(|rollback_error| {
+                        DbError::Checkpoint(format!(
+                            "EOWC aggregate restore for '{}' failed: {apply_error}; \
+                             rollback also failed: {rollback_error}",
+                            self.op_name
+                        ))
+                    })?;
+                    return Err(DbError::Checkpoint(format!(
+                        "EOWC aggregate restore for '{}': {apply_error}",
+                        self.op_name
+                    )));
                 }
             }
             (
                 EowcInnerState::Raw {
                     accumulated,
                     last_closed_boundary,
-                    accumulated_rows,
+                    accumulated_bytes,
                     ..
                 },
                 EowcCheckpointEnvelope::Raw(cp),
-            ) => match restore_raw(&cp) {
-                Ok(batches) => {
-                    *accumulated_rows = batches.iter().map(RecordBatch::num_rows).sum();
-                    *accumulated = batches;
-                    *last_closed_boundary = cp.last_closed_boundary;
-                }
-                Err(e) => tracing::warn!(
-                    query = %self.op_name, error = %e,
-                    "Failed to restore EOWC raw-batch checkpoint"
-                ),
-            },
+            ) => {
+                // Decode before assigning any fields so malformed IPC cannot
+                // leave a mixture of old and restored raw state.
+                let (batches, bytes) = restore_raw(cp)?;
+                *accumulated = batches;
+                *accumulated_bytes = bytes;
+                *last_closed_boundary = cp.last_closed_boundary;
+            }
             (state, envelope) => {
                 let state_name = match state {
                     EowcInnerState::CoreWindow(_) => "CoreWindow",
@@ -337,18 +396,15 @@ impl EowcQueryOperator {
                     EowcInnerState::Raw { .. } => "Raw",
                     EowcInnerState::Uninit => "Uninit",
                 };
-                let cp_name = match envelope {
+                let checkpoint_name = match envelope {
                     EowcCheckpointEnvelope::CoreWindow(_) => "CoreWindow",
                     EowcCheckpointEnvelope::EowcAgg(_) => "EowcAgg",
                     EowcCheckpointEnvelope::Raw(_) => "Raw",
                 };
-                // Fail loud: silently discarding state here re-emits zeroed windows
-                // on restart, breaking exactly-once on the sink.
-                return Err(DbError::Pipeline(format!(
+                return Err(DbError::Checkpoint(format!(
                     "EOWC checkpoint variant mismatch for '{}': state={} checkpoint={}; \
-                     refusing to silently discard partial state. Drop the checkpoint or \
-                     keep the previous query shape.",
-                    self.op_name, state_name, cp_name
+                     refusing to discard state",
+                    self.op_name, state_name, checkpoint_name
                 )));
             }
         }
@@ -467,7 +523,7 @@ impl EowcQueryOperator {
     async fn process_raw(
         accumulated: &mut Vec<RecordBatch>,
         last_closed_boundary: &mut i64,
-        accumulated_rows: &mut usize,
+        accumulated_bytes: &mut usize,
         sql_cache: &mut Option<RawSqlCache>,
         inputs: &[RecordBatch],
         watermark: i64,
@@ -475,55 +531,57 @@ impl EowcQueryOperator {
         sql: &str,
         op_name: &str,
         ctx: &SessionContext,
+        max_accumulated_bytes: usize,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        for batch in inputs {
-            if batch.num_rows() > 0 {
-                *accumulated_rows += batch.num_rows();
-                accumulated.push(batch.clone());
-            }
+        let input_bytes = inputs
+            .iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .try_fold(0usize, |total, batch| {
+                total
+                    .checked_add(batch.get_array_memory_size())
+                    .ok_or_else(|| DbError::Pipeline("raw EOWC input byte overflow".into()))
+            })?;
+        let next_bytes = (*accumulated_bytes)
+            .checked_add(input_bytes)
+            .ok_or_else(|| {
+                DbError::Pipeline(format!("raw EOWC state byte overflow for '{op_name}'"))
+            })?;
+        if next_bytes > max_accumulated_bytes {
+            return Err(DbError::Pipeline(format!(
+                "raw EOWC state for '{op_name}' would grow to {next_bytes} bytes, exceeding the \
+                 {max_accumulated_bytes}-byte limit; the batch was not applied"
+            )));
         }
 
-        if *accumulated_rows > MAX_EOWC_ACCUMULATED_ROWS && accumulated.len() > 1 {
-            tracing::warn!(
-                query = op_name,
-                accumulated_rows = *accumulated_rows,
-                limit = MAX_EOWC_ACCUMULATED_ROWS,
-                "EOWC memory pressure: coalescing batches to reduce fragmentation"
-            );
-            let schema = accumulated[0].schema();
-            match arrow::compute::concat_batches(&schema, accumulated.as_slice()) {
-                Ok(coalesced) => {
-                    *accumulated = vec![coalesced];
-                }
-                Err(e) => {
-                    tracing::warn!("EOWC pressure coalescing failed: {e}");
-                }
-            }
-        }
+        let mut staged = accumulated.clone();
+        staged.extend(inputs.iter().filter(|batch| batch.num_rows() > 0).cloned());
 
         let closed_cut =
             window_config.map_or(watermark, |cfg| compute_closed_boundary(watermark, cfg));
 
         if closed_cut <= *last_closed_boundary {
+            *accumulated = staged;
+            *accumulated_bytes = next_bytes;
             return Ok(Vec::new());
         }
 
-        if accumulated.is_empty() {
+        if staged.is_empty() {
             *last_closed_boundary = closed_cut;
+            *accumulated_bytes = 0;
             return Ok(Vec::new());
         }
 
         let (query_batches, retained_batches) = if let Some(cfg) = window_config {
-            split_by_timestamp(accumulated, &cfg.time_column, closed_cut)
+            split_by_timestamp(&staged, &cfg.time_column, closed_cut)
         } else {
-            (std::mem::take(accumulated), Vec::new())
+            (staged, Vec::new())
         };
-
-        *accumulated = retained_batches;
-        *accumulated_rows = accumulated.iter().map(RecordBatch::num_rows).sum();
-        *last_closed_boundary = closed_cut;
+        let retained_bytes = raw_batches_bytes(&retained_batches)?;
 
         if query_batches.is_empty() {
+            *accumulated = retained_batches;
+            *accumulated_bytes = retained_bytes;
+            *last_closed_boundary = closed_cut;
             return Ok(Vec::new());
         }
 
@@ -531,11 +589,15 @@ impl EowcQueryOperator {
             *sql_cache =
                 Some(RawSqlCache::build(ctx, op_name, sql, query_batches[0].schema()).await?);
         }
-        sql_cache
+        let output = sql_cache
             .as_ref()
             .expect("just initialized")
             .apply(op_name, query_batches)
-            .await
+            .await?;
+        *accumulated = retained_batches;
+        *accumulated_bytes = retained_bytes;
+        *last_closed_boundary = closed_cut;
+        Ok(output)
     }
 }
 
@@ -552,6 +614,10 @@ impl GraphOperator for EowcQueryOperator {
 
         if matches!(self.state, EowcInnerState::Uninit) {
             self.initialize().await?;
+        } else {
+            // A failed deferred restore remains pending. Retrying it here
+            // prevents processing against empty state if the first error was ignored.
+            self.apply_pending_restore()?;
         }
 
         match &mut self.state {
@@ -584,14 +650,14 @@ impl GraphOperator for EowcQueryOperator {
             EowcInnerState::Raw {
                 ref mut accumulated,
                 ref mut last_closed_boundary,
-                ref mut accumulated_rows,
+                ref mut accumulated_bytes,
                 ref mut sql_cache,
             } => {
                 let wc = self.window_config.as_ref();
                 Self::process_raw(
                     accumulated,
                     last_closed_boundary,
-                    accumulated_rows,
+                    accumulated_bytes,
                     sql_cache,
                     &input_batches,
                     watermark,
@@ -599,6 +665,7 @@ impl GraphOperator for EowcQueryOperator {
                     &self.sql,
                     &self.op_name,
                     &self.ctx,
+                    MAX_EOWC_ACCUMULATED_BYTES,
                 )
                 .await
             }
@@ -606,6 +673,10 @@ impl GraphOperator for EowcQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        if !matches!(self.state, EowcInnerState::Uninit) {
+            // Never publish a checkpoint while recovery is unapplied.
+            self.apply_pending_restore()?;
+        }
         let envelope = match &mut self.state {
             EowcInnerState::Uninit => {
                 // Re-serialize a pending restore so a restore→checkpoint before
@@ -654,57 +725,19 @@ impl GraphOperator for EowcQueryOperator {
         let envelope: EowcCheckpointEnvelope =
             rkyv::from_bytes::<EowcCheckpointEnvelope, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| {
-                    DbError::Pipeline(format!(
+                    DbError::Checkpoint(format!(
                         "EOWC checkpoint deserialization for '{}': {e}",
                         self.op_name
                     ))
                 })?;
 
-        match (&mut self.state, &envelope) {
-            (EowcInnerState::CoreWindow(cw), EowcCheckpointEnvelope::CoreWindow(cp)) => {
-                cw.restore_windows(cp)?;
-            }
-            (EowcInnerState::EowcAgg(eowc), EowcCheckpointEnvelope::EowcAgg(cp)) => {
-                eowc.restore_windows(cp)?;
-            }
-            (
-                EowcInnerState::Raw {
-                    accumulated,
-                    last_closed_boundary,
-                    accumulated_rows,
-                    ..
-                },
-                EowcCheckpointEnvelope::Raw(cp),
-            ) => {
-                let batches = restore_raw(cp)?;
-                *accumulated_rows = batches.iter().map(RecordBatch::num_rows).sum();
-                *accumulated = batches;
-                *last_closed_boundary = cp.last_closed_boundary;
-            }
-            (EowcInnerState::Uninit, _) => {
-                self.pending_restore = Some(envelope);
-            }
-            _ => {
-                tracing::warn!(
-                    query = %self.op_name,
-                    "EOWC checkpoint/state variant mismatch, ignoring"
-                );
-            }
+        if matches!(self.state, EowcInnerState::Uninit) {
+            self.pending_restore = Some(envelope);
+        } else {
+            self.apply_checkpoint_envelope(&envelope)?;
         }
 
         Ok(())
-    }
-
-    fn estimated_state_bytes(&self) -> usize {
-        match &self.state {
-            EowcInnerState::Uninit => 0,
-            EowcInnerState::CoreWindow(cw) => cw.estimated_size_bytes(),
-            EowcInnerState::EowcAgg(eowc) => eowc.estimated_size_bytes(),
-            EowcInnerState::Raw { accumulated, .. } => accumulated
-                .iter()
-                .map(RecordBatch::get_array_memory_size)
-                .sum(),
-        }
     }
 }
 
@@ -772,6 +805,10 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use std::time::Duration;
+
+    const AGG_SQL: &str = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -799,6 +836,362 @@ mod tests {
         .unwrap()
     }
 
+    fn aggregate_context() -> SessionContext {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let empty = MemTable::try_new(test_schema(), vec![vec![]]).unwrap();
+        ctx.register_table("trades", Arc::new(empty)).unwrap();
+        ctx
+    }
+
+    fn test_window_config() -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            window_type: laminar_sql::translator::WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(60),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        }
+    }
+
+    fn checkpoint_from_envelope(envelope: &EowcCheckpointEnvelope) -> OperatorCheckpoint {
+        OperatorCheckpoint {
+            data: rkyv::to_bytes::<rkyv::rancor::Error>(envelope)
+                .unwrap()
+                .to_vec(),
+        }
+    }
+
+    fn envelope_from_checkpoint(checkpoint: &OperatorCheckpoint) -> EowcCheckpointEnvelope {
+        rkyv::from_bytes::<EowcCheckpointEnvelope, rkyv::rancor::Error>(&checkpoint.data).unwrap()
+    }
+
+    fn raw_operator() -> EowcQueryOperator {
+        let mut op = EowcQueryOperator::new(
+            "test_raw_restore",
+            "SELECT * FROM trades",
+            Some(EmitClause::OnWindowClose),
+            None,
+            laminar_sql::create_session_context(),
+            None,
+        );
+        op.state = raw_state(vec![test_batch(vec![100, 200])], 99);
+        op
+    }
+
+    fn raw_state(accumulated: Vec<RecordBatch>, last_closed_boundary: i64) -> EowcInnerState {
+        let accumulated_bytes = raw_batches_bytes(&accumulated).unwrap();
+        EowcInnerState::Raw {
+            accumulated,
+            last_closed_boundary,
+            accumulated_bytes,
+            sql_cache: None,
+        }
+    }
+
+    async fn core_window_operator() -> EowcQueryOperator {
+        let ctx = aggregate_context();
+        let config = test_window_config();
+        let state =
+            CoreWindowState::try_from_sql(&ctx, AGG_SQL, &config, Some(&EmitClause::OnWindowClose))
+                .await
+                .unwrap()
+                .unwrap();
+        let mut op = EowcQueryOperator::new(
+            "test_core_restore",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(config),
+            ctx,
+            None,
+        );
+        op.state = EowcInnerState::CoreWindow(Box::new(state));
+        op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
+            .await
+            .unwrap();
+        op
+    }
+
+    async fn eowc_aggregate_operator() -> EowcQueryOperator {
+        let ctx = aggregate_context();
+        let config = test_window_config();
+        let state = IncrementalEowcState::try_from_sql(
+            &ctx,
+            AGG_SQL,
+            &config,
+            Some(&EmitClause::OnWindowClose),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut op = EowcQueryOperator::new(
+            "test_eowc_agg_restore",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(config),
+            ctx,
+            None,
+        );
+        op.state = EowcInnerState::EowcAgg(Box::new(state));
+        op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
+            .await
+            .unwrap();
+        op
+    }
+
+    #[test]
+    fn corrupt_checkpoint_envelope_fails_without_mutating_raw_state() {
+        let mut op = raw_operator();
+        let before = op.checkpoint().unwrap().unwrap();
+
+        let error = op
+            .restore(OperatorCheckpoint {
+                data: vec![0xff, 0x00, 0x7f],
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("deserialization"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
+    }
+
+    #[test]
+    fn corrupt_raw_payload_fails_without_partial_state_mutation() {
+        let mut op = raw_operator();
+        let before = op.checkpoint().unwrap().unwrap();
+        let corrupt = EowcCheckpointEnvelope::Raw(RawCheckpoint {
+            ipc: vec![0xff, 0x00, 0x7f],
+            last_closed_boundary: 1234,
+        });
+
+        let error = op.restore(checkpoint_from_envelope(&corrupt)).unwrap_err();
+
+        assert!(error.to_string().contains("raw restore"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
+    }
+
+    #[tokio::test]
+    async fn corrupt_core_window_payload_rolls_back_all_state() {
+        let mut op = core_window_operator().await;
+        let before = op.checkpoint().unwrap().unwrap();
+        let mut corrupt = envelope_from_checkpoint(&before);
+        let EowcCheckpointEnvelope::CoreWindow(ref mut checkpoint) = corrupt else {
+            panic!("expected CoreWindow checkpoint");
+        };
+        checkpoint.high_watermark_ms = 1234;
+        checkpoint.windows[0].groups[0].key = vec![0xff, 0x00, 0x7f];
+
+        let error = op.restore(checkpoint_from_envelope(&corrupt)).unwrap_err();
+
+        assert!(error.to_string().contains("CoreWindow restore"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
+    }
+
+    #[tokio::test]
+    async fn corrupt_eowc_aggregate_payload_rolls_back_all_state() {
+        let mut op = eowc_aggregate_operator().await;
+        let before = op.checkpoint().unwrap().unwrap();
+        let mut corrupt = envelope_from_checkpoint(&before);
+        let EowcCheckpointEnvelope::EowcAgg(ref mut checkpoint) = corrupt else {
+            panic!("expected EowcAgg checkpoint");
+        };
+        checkpoint.high_watermark_ms = 1234;
+        checkpoint.windows[0].groups[0].key = vec![0xff, 0x00, 0x7f];
+
+        let error = op.restore(checkpoint_from_envelope(&corrupt)).unwrap_err();
+
+        assert!(error.to_string().contains("aggregate restore"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
+    }
+
+    #[tokio::test]
+    async fn every_checkpoint_variant_mismatch_fails_without_mutation() {
+        let core_checkpoint = CoreWindowCheckpoint {
+            fingerprint: 0,
+            windows: Vec::new(),
+            session_state: Vec::new(),
+            window_type: "tumbling".to_string(),
+            high_watermark_ms: i64::MIN,
+        };
+        let aggregate_checkpoint = EowcStateCheckpoint {
+            fingerprint: 0,
+            windows: Vec::new(),
+            high_watermark_ms: i64::MIN,
+        };
+
+        let mut raw = raw_operator();
+        let raw_before = raw.checkpoint().unwrap().unwrap();
+        for envelope in [
+            EowcCheckpointEnvelope::CoreWindow(core_checkpoint),
+            EowcCheckpointEnvelope::EowcAgg(aggregate_checkpoint),
+        ] {
+            let error = raw
+                .restore(checkpoint_from_envelope(&envelope))
+                .unwrap_err();
+            assert!(error.to_string().contains("variant mismatch"));
+            assert!(error.requires_pipeline_recovery());
+            assert_eq!(raw.checkpoint().unwrap().unwrap().data, raw_before.data);
+        }
+
+        let raw_checkpoint = EowcCheckpointEnvelope::Raw(RawCheckpoint {
+            ipc: Vec::new(),
+            last_closed_boundary: 1234,
+        });
+        let mut core = core_window_operator().await;
+        let core_before = core.checkpoint().unwrap().unwrap();
+        let error = core
+            .restore(checkpoint_from_envelope(&raw_checkpoint))
+            .unwrap_err();
+        assert!(error.to_string().contains("variant mismatch"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(core.checkpoint().unwrap().unwrap().data, core_before.data);
+
+        let mut aggregate = eowc_aggregate_operator().await;
+        let aggregate_before = aggregate.checkpoint().unwrap().unwrap();
+        let error = aggregate
+            .restore(checkpoint_from_envelope(&raw_checkpoint))
+            .unwrap_err();
+        assert!(error.to_string().contains("variant mismatch"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(
+            aggregate.checkpoint().unwrap().unwrap().data,
+            aggregate_before.data
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pending_restore_remains_fail_closed() {
+        let mut op = EowcQueryOperator::new(
+            "test_pending_restore",
+            "SELECT * FROM trades",
+            Some(EmitClause::OnWindowClose),
+            None,
+            laminar_sql::create_session_context(),
+            None,
+        );
+        let corrupt = EowcCheckpointEnvelope::Raw(RawCheckpoint {
+            ipc: vec![0xff, 0x00, 0x7f],
+            last_closed_boundary: 1234,
+        });
+        op.restore(checkpoint_from_envelope(&corrupt)).unwrap();
+
+        let error = op.process(&[vec![]], &[0]).await.unwrap_err();
+        assert!(error.requires_pipeline_recovery());
+        assert!(op.pending_restore.is_some());
+        let retry_error = op.process(&[vec![]], &[0]).await.unwrap_err();
+        assert!(retry_error.requires_pipeline_recovery());
+        let checkpoint_error = op
+            .checkpoint()
+            .err()
+            .expect("failed pending restore must reject checkpointing");
+        assert!(checkpoint_error.requires_pipeline_recovery());
+        let EowcInnerState::Raw {
+            accumulated,
+            last_closed_boundary,
+            accumulated_bytes,
+            ..
+        } = &op.state
+        else {
+            panic!("expected initialized Raw state");
+        };
+        assert!(accumulated.is_empty());
+        assert_eq!(*accumulated_bytes, 0);
+        assert_eq!(*last_closed_boundary, i64::MIN);
+    }
+
+    #[tokio::test]
+    async fn raw_byte_limit_accepts_boundary_and_close_releases_accounting() {
+        let ctx = laminar_sql::create_session_context();
+        let first = test_batch(vec![100]);
+        let second = test_batch(vec![200]);
+        let mut accumulated = vec![first];
+        let mut accumulated_bytes = raw_batches_bytes(&accumulated).unwrap();
+        let exact_limit = accumulated_bytes + second.get_array_memory_size();
+        let mut boundary = 0;
+        let mut cache = None;
+
+        let output = EowcQueryOperator::process_raw(
+            &mut accumulated,
+            &mut boundary,
+            &mut accumulated_bytes,
+            &mut cache,
+            &[second],
+            0,
+            None,
+            "SELECT * FROM trades",
+            "raw_limit",
+            &ctx,
+            exact_limit,
+        )
+        .await
+        .unwrap();
+        assert!(output.is_empty());
+        assert_eq!(accumulated_bytes, exact_limit);
+
+        let output = EowcQueryOperator::process_raw(
+            &mut accumulated,
+            &mut boundary,
+            &mut accumulated_bytes,
+            &mut cache,
+            &[],
+            1,
+            None,
+            "SELECT * FROM trades",
+            "raw_limit",
+            &ctx,
+            exact_limit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert!(accumulated.is_empty());
+        assert_eq!(accumulated_bytes, 0);
+        assert_eq!(boundary, 1);
+    }
+
+    #[tokio::test]
+    async fn raw_byte_limit_rejection_is_atomic_and_retryable() {
+        let ctx = laminar_sql::create_session_context();
+        let first = test_batch(vec![100]);
+        let incoming = test_batch(vec![200]);
+        let mut accumulated = vec![first];
+        let mut accumulated_bytes = raw_batches_bytes(&accumulated).unwrap();
+        let limit = accumulated_bytes + incoming.get_array_memory_size() - 1;
+        let mut boundary = 0;
+        let mut cache = None;
+        let before = snapshot_raw(&accumulated, boundary).unwrap();
+
+        for _ in 0..2 {
+            let error = EowcQueryOperator::process_raw(
+                &mut accumulated,
+                &mut boundary,
+                &mut accumulated_bytes,
+                &mut cache,
+                std::slice::from_ref(&incoming),
+                0,
+                None,
+                "SELECT * FROM trades",
+                "raw_limit",
+                &ctx,
+                limit,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("batch was not applied"));
+            let after = snapshot_raw(&accumulated, boundary).unwrap();
+            assert_eq!(after.ipc, before.ipc);
+            assert_eq!(after.last_closed_boundary, before.last_closed_boundary);
+            assert_eq!(accumulated_bytes, raw_batches_bytes(&accumulated).unwrap());
+        }
+    }
+
     /// Regression test for the raw-EOWC source-leak bug: before the fix,
     /// `process_raw` registered a `_eowc_raw_*` `MemTable` but then ran the
     /// user SQL referencing the real source. We set up a `SessionContext`
@@ -823,12 +1216,7 @@ mod tests {
             ctx,
             None,
         );
-        op.state = EowcInnerState::Raw {
-            accumulated: vec![test_batch(vec![10, 20])],
-            last_closed_boundary: i64::MIN,
-            accumulated_rows: 2,
-            sql_cache: None,
-        };
+        op.state = raw_state(vec![test_batch(vec![10, 20])], i64::MIN);
         // Drive process(): empty inputs, watermark advances to 100 — should
         // close the window and emit accumulated (ts in {10,20}).
         let out = op.process(&[vec![]], &[100]).await.unwrap();
@@ -889,28 +1277,6 @@ mod tests {
     }
 
     #[test]
-    fn test_eowc_raw_state_estimated_bytes() {
-        let ctx = laminar_sql::create_session_context();
-        let mut op = EowcQueryOperator::new(
-            "test_eowc",
-            "SELECT * FROM trades",
-            Some(EmitClause::OnWindowClose),
-            None,
-            ctx,
-            None,
-        );
-        // Manually set to raw state with a batch
-        let batch = test_batch(vec![100, 200]);
-        op.state = EowcInnerState::Raw {
-            accumulated: vec![batch],
-            last_closed_boundary: i64::MIN,
-            accumulated_rows: 2,
-            sql_cache: None,
-        };
-        assert!(op.estimated_state_bytes() > 0);
-    }
-
-    #[test]
     fn test_raw_checkpoint_roundtrip() {
         let mut op = EowcQueryOperator::new(
             "test_eowc",
@@ -920,12 +1286,7 @@ mod tests {
             laminar_sql::create_session_context(),
             None,
         );
-        op.state = EowcInnerState::Raw {
-            accumulated: vec![test_batch(vec![100, 200]), test_batch(vec![300])],
-            last_closed_boundary: 999,
-            accumulated_rows: 3,
-            sql_cache: None,
-        };
+        op.state = raw_state(vec![test_batch(vec![100, 200]), test_batch(vec![300])], 999);
         let cp = op.checkpoint().unwrap().unwrap();
 
         let mut restored = EowcQueryOperator::new(
@@ -936,23 +1297,18 @@ mod tests {
             laminar_sql::create_session_context(),
             None,
         );
-        restored.state = EowcInnerState::Raw {
-            accumulated: Vec::new(),
-            last_closed_boundary: i64::MIN,
-            accumulated_rows: 0,
-            sql_cache: None,
-        };
+        restored.state = raw_state(Vec::new(), i64::MIN);
         restored.restore(cp).unwrap();
         let EowcInnerState::Raw {
             accumulated,
             last_closed_boundary,
-            accumulated_rows,
+            accumulated_bytes,
             ..
         } = &restored.state
         else {
             panic!("expected Raw state after restore");
         };
-        assert_eq!(*accumulated_rows, 3);
+        assert_eq!(*accumulated_bytes, raw_batches_bytes(accumulated).unwrap());
         assert_eq!(*last_closed_boundary, 999);
         assert_eq!(
             accumulated.iter().map(RecordBatch::num_rows).sum::<usize>(),

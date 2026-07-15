@@ -2,7 +2,12 @@ use super::*;
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
+
+fn test_publication_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(5)
+}
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -26,6 +31,29 @@ fn test_batch(n: usize) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {
+    use deltalake::writer::{DeltaWriter, RecordBatchWriter};
+
+    let mut writer = RecordBatchWriter::for_table(table).unwrap();
+    writer.write(batch).await.unwrap();
+    writer.flush().await.unwrap()
+}
+
+fn coordinated_cursor(checkpoint_id: u64) -> crate::connector::CoordinatedCommitCursor {
+    crate::connector::CoordinatedCommitCursor {
+        checkpoint_id,
+        fencing_token: 1,
+    }
+}
+
+async fn assert_coordinated_cursor_absent(table: &DeltaTable, external_key: &str) {
+    assert_eq!(
+        get_coordinated_cursor(table, external_key).await.unwrap(),
+        None,
+        "failed publication must not advance the Delta transaction cursor"
+    );
 }
 
 #[tokio::test]
@@ -570,6 +598,1108 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
         .await
         .expect_err("uncertified Delta replay must fail closed");
     assert!(error.to_string().contains("ephemeral"));
+}
+
+#[tokio::test]
+async fn coordinated_cursor_persists_checkpoint_and_fence_atomically() {
+    use crate::connector::CoordinatedCommitCursor;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let cursor = CoordinatedCommitCursor {
+        checkpoint_id: 101,
+        fencing_token: 4,
+    };
+
+    assert!(get_coordinated_cursor(&table, "ldb-c3-test")
+        .await
+        .unwrap()
+        .is_none());
+    commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        cursor,
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap();
+
+    let reopened = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_coordinated_cursor(&reopened, "ldb-c3-test")
+            .await
+            .unwrap(),
+        Some(cursor)
+    );
+}
+
+#[tokio::test]
+async fn coordinated_cursor_rejects_token_change_stale_fence_and_checkpoint_rollback() {
+    use crate::connector::CoordinatedCommitCursor;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 4,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap();
+
+    let table = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let changed_token = commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 5,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        changed_token.contains("cannot change"),
+        "got: {changed_token}"
+    );
+
+    let stale = commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 3,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(stale.contains("stale"), "got: {stale}");
+
+    commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 5,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let rollback = commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 6,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(rollback.contains("roll back"), "got: {rollback}");
+}
+
+#[tokio::test]
+async fn coordinated_race_serializes_cursor_and_permanently_fences_stale_writer() {
+    use crate::connector::CoordinatedCommitCursor;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+
+    let stale_table = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let newer_table = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let stale_adds = staged_adds(&stale_table, test_batch(1)).await;
+    let newer_adds = staged_adds(&newer_table, test_batch(2)).await;
+    let newer_retry_adds = newer_adds.clone();
+
+    let (stale_result, newer_result) = tokio::join!(
+        commit_adds_coordinated(
+            &stale_table,
+            stale_adds,
+            "ldb-c3-race",
+            CoordinatedCommitCursor {
+                checkpoint_id: 101,
+                fencing_token: 1,
+            },
+            test_publication_deadline(),
+        ),
+        commit_adds_coordinated(
+            &newer_table,
+            newer_adds,
+            "ldb-c3-race",
+            CoordinatedCommitCursor {
+                checkpoint_id: 102,
+                fencing_token: 2,
+            },
+            test_publication_deadline(),
+        ),
+    );
+    assert!(
+        stale_result.is_ok() ^ newer_result.is_ok(),
+        "the shared transaction ids must admit exactly one stale-base winner: \
+         stale={stale_result:?}, newer={newer_result:?}"
+    );
+
+    let mut table = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let cursor = get_coordinated_cursor(&table, "ldb-c3-race")
+        .await
+        .unwrap()
+        .unwrap();
+    if cursor.fencing_token == 1 {
+        commit_adds_coordinated(
+            &table,
+            newer_retry_adds,
+            "ldb-c3-race",
+            CoordinatedCommitCursor {
+                checkpoint_id: 102,
+                fencing_token: 2,
+            },
+            test_publication_deadline(),
+        )
+        .await
+        .unwrap();
+        table = open_or_create_table(table_path, HashMap::new(), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        get_coordinated_cursor(&table, "ldb-c3-race").await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 2,
+        })
+    );
+
+    let latest = get_latest_version(&mut table).await.unwrap();
+    let (batches, _) = read_batches_at_version(&mut table, latest, 100)
+        .await
+        .unwrap();
+    let rows_before: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert!(
+        rows_before == 2 || rows_before == 3,
+        "valid serial histories contain newer data alone or stale then newer data; got {rows_before} rows"
+    );
+
+    let stale_after_fence = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let forbidden_adds = staged_adds(&stale_after_fence, test_batch(4)).await;
+    let error = commit_adds_coordinated(
+        &stale_after_fence,
+        forbidden_adds,
+        "ldb-c3-race",
+        CoordinatedCommitCursor {
+            checkpoint_id: 103,
+            fencing_token: 1,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("stale"), "got: {error}");
+
+    let mut final_table = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let latest = get_latest_version(&mut final_table).await.unwrap();
+    let (batches, _) = read_batches_at_version(&mut final_table, latest, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        rows_before
+    );
+}
+
+#[tokio::test]
+async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let writer = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let stale_committer = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let binding = coordinated_table_binding(&writer).unwrap();
+    let first_descriptor =
+        encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(1)).await).unwrap();
+    let second_descriptor =
+        encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(2)).await).unwrap();
+    let first_attempt = CheckpointAttempt::new(1, 101);
+    let second_attempt = CheckpointAttempt::new(2, 102);
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_overlap_refresh",
+    )
+    .unwrap();
+
+    let first = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 1,
+        target: first_attempt,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: first_attempt,
+            participant_id: 0,
+            payload: Some(first_descriptor.clone()),
+        }],
+    };
+    assert_eq!(
+        commit_batch_coordinated(&writer, &first, test_publication_deadline())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(stale_committer.version(), Some(0));
+
+    // This batch was assembled against checkpoint zero and includes both
+    // attempts. The helper must refresh the stale handle to checkpoint 101,
+    // filter its descriptor, and publish only checkpoint 102's file.
+    let overlap = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 2,
+        target: second_attempt,
+        entries: vec![
+            CoordinatedCommitPayload {
+                attempt: first_attempt,
+                participant_id: 0,
+                payload: Some(first_descriptor),
+            },
+            CoordinatedCommitPayload {
+                attempt: second_attempt,
+                participant_id: 0,
+                payload: Some(second_descriptor),
+            },
+        ],
+    };
+    assert_eq!(
+        commit_batch_coordinated(&stale_committer, &overlap, test_publication_deadline())
+            .await
+            .unwrap(),
+        1
+    );
+
+    let mut reopened = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_coordinated_cursor(&reopened, &namespace.external_key())
+            .await
+            .unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 2,
+        })
+    );
+    let latest = get_latest_version(&mut reopened).await.unwrap();
+    let (batches, _) = read_batches_at_version(&mut reopened, latest, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        3,
+        "checkpoint 101's descriptor must not be appended again"
+    );
+}
+
+#[tokio::test]
+async fn coordinated_descriptor_batch_rejects_mixed_table_bindings() {
+    let first_dir = TempDir::new().unwrap();
+    let second_dir = TempDir::new().unwrap();
+    let first = open_or_create_table(
+        first_dir.path().to_str().unwrap(),
+        HashMap::new(),
+        Some(&test_schema()),
+    )
+    .await
+    .unwrap();
+    let second = open_or_create_table(
+        second_dir.path().to_str().unwrap(),
+        HashMap::new(),
+        Some(&test_schema()),
+    )
+    .await
+    .unwrap();
+    let first_descriptor = encode_commit_descriptor(
+        &coordinated_table_binding(&first).unwrap(),
+        &staged_adds(&first, test_batch(1)).await,
+    )
+    .unwrap();
+    let second_descriptor = encode_commit_descriptor(
+        &coordinated_table_binding(&second).unwrap(),
+        &staged_adds(&second, test_batch(1)).await,
+    )
+    .unwrap();
+
+    let error = decode_commit_descriptors(&[first_descriptor, second_descriptor])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("different table metadata"), "got: {error}");
+}
+
+#[tokio::test]
+async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let writer = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let pending_committer = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let higher_committer = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    let binding = coordinated_table_binding(&writer).unwrap();
+    let pending_descriptor =
+        encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(1)).await).unwrap();
+    let higher_descriptor =
+        encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(2)).await).unwrap();
+    let second = CheckpointAttempt::new(2, 102);
+    let third = CheckpointAttempt::new(3, 103);
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_late_retry_race",
+    )
+    .unwrap();
+    let pending = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 1,
+        target: second,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: second,
+            participant_id: 0,
+            payload: Some(pending_descriptor.clone()),
+        }],
+    };
+    let higher = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 2,
+        target: third,
+        entries: vec![
+            CoordinatedCommitPayload {
+                attempt: second,
+                participant_id: 0,
+                payload: Some(pending_descriptor),
+            },
+            CoordinatedCommitPayload {
+                attempt: third,
+                participant_id: 0,
+                payload: Some(higher_descriptor),
+            },
+        ],
+    };
+
+    let (pending_result, higher_result) = tokio::join!(
+        commit_batch_coordinated(&pending_committer, &pending, test_publication_deadline()),
+        commit_batch_coordinated(&higher_committer, &higher, test_publication_deadline()),
+    );
+    assert!(
+        pending_result.is_ok() ^ higher_result.is_ok(),
+        "shared cursor transactions must admit one winner: pending={pending_result:?}, higher={higher_result:?}"
+    );
+
+    let mut current = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    if get_coordinated_cursor(&current, &namespace.external_key())
+        .await
+        .unwrap()
+        == Some(CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 1,
+        })
+    {
+        commit_batch_coordinated(&current, &higher, test_publication_deadline())
+            .await
+            .unwrap();
+        current = open_or_create_table(table_path, HashMap::new(), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        get_coordinated_cursor(&current, &namespace.external_key())
+            .await
+            .unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 103,
+            fencing_token: 2,
+        })
+    );
+    let latest = get_latest_version(&mut current).await.unwrap();
+    let (batches, _) = read_batches_at_version(&mut current, latest, 100)
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+}
+
+#[tokio::test]
+async fn coordinated_empty_batch_commits_cursor_without_object_io() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_empty",
+    )
+    .unwrap();
+    let target = CheckpointAttempt::new(1, 101);
+    let batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 1,
+        target,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: target,
+            participant_id: 0,
+            payload: None,
+        }],
+    };
+
+    assert_eq!(
+        commit_batch_coordinated(&table, &batch, test_publication_deadline())
+            .await
+            .unwrap(),
+        0
+    );
+    let reopened = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_coordinated_cursor(&reopened, &namespace.external_key())
+            .await
+            .unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 1,
+        })
+    );
+}
+
+#[tokio::test]
+async fn coordinated_cursor_rejects_partial_pair_and_finite_retention() {
+    use deltalake::kernel::transaction::{CommitBuilder, CommitProperties};
+    use deltalake::kernel::Transaction;
+    use deltalake::protocol::DeltaOperation;
+
+    let corrupt_dir = TempDir::new().unwrap();
+    let corrupt_path = corrupt_dir.path().to_str().unwrap();
+    let table = open_or_create_table(corrupt_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let snapshot = table.snapshot().unwrap();
+    CommitBuilder::from(
+        CommitProperties::default()
+            .with_application_transaction(Transaction::new("ldb-c3-test.checkpoint", 101)),
+    )
+    .with_actions(vec![])
+    .build(
+        Some(snapshot),
+        table.log_store(),
+        DeltaOperation::Write {
+            mode: SaveMode::Append,
+            partition_by: None,
+            predicate: None,
+        },
+    )
+    .await
+    .unwrap();
+    let corrupt = open_or_create_table(corrupt_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    assert!(get_coordinated_cursor(&corrupt, "ldb-c3-test")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("corrupt"));
+
+    let retained_dir = TempDir::new().unwrap();
+    let retained_path = retained_dir.path().to_str().unwrap();
+    let table = open_or_create_table(retained_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let table = table
+        .set_tbl_properties()
+        .with_properties(HashMap::from([(
+            SET_TRANSACTION_RETENTION.to_string(),
+            "interval 30 days".to_string(),
+        )]))
+        .await
+        .unwrap();
+    let error = get_coordinated_cursor(&table, "ldb-c3-test")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(SET_TRANSACTION_RETENTION), "got: {error}");
+}
+
+#[tokio::test]
+async fn coordinated_cursor_rejects_versions_outside_delta_range() {
+    use crate::connector::CoordinatedCommitCursor;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    assert!(commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: u64::MAX,
+            fencing_token: 1,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .is_err());
+    assert!(commit_adds_coordinated(
+        &table,
+        vec![],
+        "ldb-c3-test",
+        CoordinatedCommitCursor {
+            checkpoint_id: 1,
+            fencing_token: u64::MAX,
+        },
+        test_publication_deadline(),
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_missing_object_without_advancing_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let adds = staged_adds(&table, test_batch(2)).await;
+    let path = deltalake::Path::parse(&adds[0].path).unwrap();
+    table.object_store().delete(&path).await.unwrap();
+
+    let error = commit_adds_coordinated(
+        &table,
+        adds,
+        "ldb-c3-missing",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("HEAD Delta coordinated object"),
+        "got: {error}"
+    );
+    assert_coordinated_cursor_absent(&table, "ldb-c3-missing").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_truncated_object_without_advancing_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let adds = staged_adds(&table, test_batch(2)).await;
+    let path = deltalake::Path::parse(&adds[0].path).unwrap();
+    table
+        .object_store()
+        .put(&path, bytes::Bytes::from_static(b"x").into())
+        .await
+        .unwrap();
+
+    let error = commit_adds_coordinated(
+        &table,
+        adds,
+        "ldb-c3-truncated",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("size mismatch"), "got: {error}");
+    assert_coordinated_cursor_absent(&table, "ldb-c3-truncated").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_duplicate_object_without_advancing_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let mut adds = staged_adds(&table, test_batch(2)).await;
+    adds.push(adds[0].clone());
+
+    let error = commit_adds_coordinated(
+        &table,
+        adds,
+        "ldb-c3-duplicate",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("duplicate"), "got: {error}");
+    assert_coordinated_cursor_absent(&table, "ldb-c3-duplicate").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_invalid_descriptors_without_advancing_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let add = staged_adds(&table, test_batch(2)).await.remove(0);
+
+    let mut traversal = add.clone();
+    traversal.path = "../outside.parquet".to_string();
+    let traversal_error = commit_adds_coordinated(
+        &table,
+        vec![traversal],
+        "ldb-c3-invalid",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        traversal_error.contains("invalid Delta coordinated Add path"),
+        "got: {traversal_error}"
+    );
+
+    let mut absolute = add.clone();
+    absolute.path = "/outside.parquet".to_string();
+    let absolute_error = commit_adds_coordinated(
+        &table,
+        vec![absolute],
+        "ldb-c3-invalid",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(absolute_error.contains("relative object path"));
+
+    let mut negative_size = add;
+    negative_size.size = -1;
+    let size_error = commit_adds_coordinated(
+        &table,
+        vec![negative_size],
+        "ldb-c3-invalid",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(size_error.contains("negative size"));
+    assert_coordinated_cursor_absent(&table, "ldb-c3-invalid").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_metadata_change_after_staging() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let stale_table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let adds = staged_adds(&stale_table, test_batch(2)).await;
+
+    // Mutate live write metadata through another handle after the Add was staged.
+    let current = stale_table
+        .clone()
+        .set_tbl_properties()
+        .with_properties(HashMap::from([(
+            "delta.appendOnly".to_string(),
+            "true".to_string(),
+        )]))
+        .await
+        .unwrap();
+    let error = commit_adds_coordinated(
+        &stale_table,
+        adds,
+        "ldb-c3-metadata-race",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("table binding changed"), "got: {error}");
+    assert_coordinated_cursor_absent(&current, "ldb-c3-metadata-race").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_schema_change_after_staging() {
+    use deltalake::kernel::{PrimitiveType, StructField};
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let stale_table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let adds = staged_adds(&stale_table, test_batch(2)).await;
+    let current = stale_table
+        .clone()
+        .add_columns()
+        .with_fields([StructField::nullable(
+            "added_after_staging",
+            PrimitiveType::String,
+        )])
+        .await
+        .unwrap();
+
+    let error = commit_adds_coordinated(
+        &stale_table,
+        adds,
+        "ldb-c3-schema-race",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("table binding changed"), "got: {error}");
+    assert_coordinated_cursor_absent(&current, "ldb-c3-schema-race").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_protocol_change_after_staging() {
+    use deltalake::kernel::TableFeatures;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let stale_table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let adds = staged_adds(&stale_table, test_batch(2)).await;
+    let current = stale_table
+        .clone()
+        .add_feature()
+        .with_feature(TableFeatures::ChangeDataFeed)
+        .with_allow_protocol_versions_increase(true)
+        .await
+        .unwrap();
+
+    let error = commit_adds_coordinated(
+        &stale_table,
+        adds,
+        "ldb-c3-protocol-race",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("table binding changed"), "got: {error}");
+    assert_coordinated_cursor_absent(&current, "ldb-c3-protocol-race").await;
+}
+
+#[tokio::test]
+async fn coordinated_publication_rejects_drop_and_recreate_after_staging() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let stale_table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let old_binding = coordinated_table_binding(&stale_table).unwrap();
+    let adds = staged_adds(&stale_table, test_batch(2)).await;
+
+    std::fs::rename(
+        temp_dir.path().join("_delta_log"),
+        temp_dir.path().join("_replaced_delta_log"),
+    )
+    .unwrap();
+    let current = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    assert_ne!(
+        old_binding.table_id,
+        coordinated_table_binding(&current).unwrap().table_id
+    );
+
+    let error = commit_adds_coordinated(
+        &stale_table,
+        adds,
+        "ldb-c3-recreate-race",
+        coordinated_cursor(1),
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("table binding changed"), "got: {error}");
+    assert_coordinated_cursor_absent(&current, "ldb-c3-recreate-race").await;
+}
+
+#[tokio::test]
+async fn coordinated_descriptor_limits_accept_max_and_reject_max_plus_one() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let template = staged_adds(&table, test_batch(1)).await.remove(0);
+    let make_adds = |count: usize| {
+        (0..count)
+            .map(|index| {
+                let mut add = template.clone();
+                add.path = format!("limit-{index}.parquet");
+                add
+            })
+            .collect::<Vec<_>>()
+    };
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
+
+    assert!(validate_coordinated_descriptors(
+        &make_adds(MAX_COORDINATED_ADD_ACTIONS - 1),
+        &[],
+        deadline(),
+    )
+    .is_ok());
+    assert!(validate_coordinated_descriptors(
+        &make_adds(MAX_COORDINATED_ADD_ACTIONS),
+        &[],
+        deadline(),
+    )
+    .is_ok());
+    assert!(validate_coordinated_descriptors(
+        &make_adds(MAX_COORDINATED_ADD_ACTIONS + 1),
+        &[],
+        deadline(),
+    )
+    .is_err());
+
+    let per_payload = crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES;
+    assert!(validate_descriptor_batch_lengths(
+        [per_payload, per_payload, per_payload, per_payload - 1],
+        deadline(),
+    )
+    .is_ok());
+    assert!(validate_descriptor_batch_lengths(
+        [per_payload, per_payload, per_payload, per_payload],
+        deadline(),
+    )
+    .is_ok());
+    assert!(validate_descriptor_batch_lengths(
+        [per_payload, per_payload, per_payload, per_payload, 1],
+        deadline(),
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn coordinated_descriptor_field_limits_and_windows_paths_are_platform_independent() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let template = staged_adds(&table, test_batch(1)).await.remove(0);
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
+    let validate = |adds: &[deltalake::kernel::Add], partitions: &[String]| {
+        validate_coordinated_descriptors(adds, partitions, deadline())
+    };
+
+    for path in [
+        "_DELTA_LOG/file.parquet",
+        "_delta_log./file.parquet",
+        "folder./file.parquet",
+        "folder /file.parquet",
+        "%2e%2e/file.parquet",
+        "%252e%252e/file.parquet",
+        "folder%2fescape.parquet",
+        "%43%3a/file.parquet",
+        "%5c%5cserver/file.parquet",
+    ] {
+        let mut add = template.clone();
+        add.path = path.into();
+        assert!(
+            validate(&[add], &[]).is_err(),
+            "unsafe path was accepted: {path}"
+        );
+    }
+
+    let mut first = template.clone();
+    first.path = "Folder/File.PARQUET".into();
+    let mut duplicate = template.clone();
+    duplicate.path = "folder/file.parquet".into();
+    assert!(validate(&[first, duplicate], &[]).is_err());
+
+    let mut first = template.clone();
+    first.path = "folder/file.parquet".into();
+    let mut encoded_duplicate = template.clone();
+    encoded_duplicate.path = "folder/%66ile.parquet".into();
+    assert!(validate(&[first, encoded_duplicate], &[]).is_err());
+
+    let mut path_at_limit = template.clone();
+    path_at_limit.path = format!("{}.parquet", "a".repeat(MAX_COORDINATED_PATH_BYTES - 8));
+    assert_eq!(path_at_limit.path.len(), MAX_COORDINATED_PATH_BYTES);
+    assert!(validate(&[path_at_limit.clone()], &[]).is_ok());
+    path_at_limit.path.insert(0, 'a');
+    assert!(validate(&[path_at_limit], &[]).is_err());
+
+    let json_at_limit = |limit: usize| {
+        let prefix = "{\"value\":\"";
+        let suffix = "\"}";
+        format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(limit - prefix.len() - suffix.len())
+        )
+    };
+    let mut stats = template.clone();
+    stats.stats = Some(json_at_limit(MAX_COORDINATED_STATS_BYTES));
+    assert!(validate(&[stats.clone()], &[]).is_ok());
+    let insert_at = stats.stats.as_ref().unwrap().len() - 2;
+    stats.stats.as_mut().unwrap().insert(insert_at, 'x');
+    assert!(validate(&[stats], &[]).is_err());
+
+    let partitions = vec!["p".to_string()];
+    let mut partitioned = template.clone();
+    partitioned.partition_values.insert(
+        "p".into(),
+        Some("x".repeat(MAX_COORDINATED_PARTITION_BYTES - 1)),
+    );
+    assert!(validate(&[partitioned.clone()], &partitions).is_ok());
+    partitioned
+        .partition_values
+        .get_mut("p")
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .push('x');
+    assert!(validate(&[partitioned], &partitions).is_err());
+
+    let mut with_deletion_vector = template;
+    with_deletion_vector.deletion_vector = Some(deltalake::kernel::DeletionVectorDescriptor {
+        storage_type: deltalake::kernel::StorageType::Inline,
+        path_or_inline_dv: "00000".into(),
+        offset: None,
+        size_in_bytes: 1,
+        cardinality: 1,
+    });
+    assert!(validate(&[with_deletion_vector], &[]).is_err());
+}
+
+#[tokio::test]
+async fn coordinated_publication_accepts_recent_object_and_advances_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let adds = staged_adds(&table, test_batch(2)).await;
+    let cursor = coordinated_cursor(1);
+
+    commit_adds_coordinated(
+        &table,
+        adds,
+        "ldb-c3-recent",
+        cursor,
+        test_publication_deadline(),
+    )
+    .await
+    .unwrap();
+    let reopened = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_coordinated_cursor(&reopened, "ldb-c3-recent")
+            .await
+            .unwrap(),
+        Some(cursor)
+    );
 }
 
 #[tokio::test]

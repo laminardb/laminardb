@@ -1,8 +1,8 @@
 //! Postgres wire endpoint. Trust by default; MD5 with `pgwire_users`;
 //! TLS with `pgwire_tls_cert` + `pgwire_tls_key`. Non-loopback binds
-//! require `pgwire_allow_remote = true`.
+//! require authenticated users, TLS, and `pgwire_allow_remote = true`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,12 +18,13 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::{
     AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
 };
+use pgwire::api::cancel::DefaultCancelHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
@@ -32,53 +33,54 @@ use sqlparser::ast::{
     Value as AstValue,
 };
 use tokio::net::TcpListener;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
-use laminar_db::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
+use laminar_db::subscription::{
+    PortalFrame, SubscribeStart, SubscriptionFrameLease, SubscriptionPortal,
+};
 use laminar_db::LaminarDB;
 
 use crate::config::Secret;
 use crate::server::ServerError;
 
+const SUBSCRIPTION_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const SUBSCRIPTION_MAX_FETCH_ROWS: u64 = 1024;
+const SUBSCRIPTION_KIND_COLUMN: &str = "__laminar_kind";
+const SUBSCRIPTION_EPOCH_COLUMN: &str = "__laminar_epoch";
+const SUBSCRIPTION_CHECKPOINT_COLUMN: &str = "__laminar_checkpoint_id";
+const SUBSCRIPTION_LOG_SEQUENCE_COLUMN: &str = "__laminar_log_sequence";
+const SUBSCRIPTION_ROW_INDEX_COLUMN: &str = "__laminar_row_index";
+const SUBSCRIPTION_THROUGH_SEQUENCE_COLUMN: &str = "__laminar_through_sequence";
+const SUBSCRIPTION_METADATA_COLUMNS: usize = 6;
+const MAX_PENDING_PGWIRE_HANDSHAKES: usize = 64;
+
 pub struct LaminarPgwireHandler {
     db: Arc<LaminarDB>,
-    /// Per-peer SimpleQuery cursor map. Entries are evicted at the start of
-    /// every `do_query` call once their cursors are dead and no transaction
-    /// is open — pgwire 0.39 doesn't give us a connection-close hook, so this
-    /// is the cheapest way to keep stale state from leaking on port reuse.
-    connections: parking_lot::Mutex<HashMap<SocketAddr, Arc<ConnState>>>,
+    connection_manager: Arc<ConnectionManager>,
 }
 
 impl LaminarPgwireHandler {
-    fn new(db: Arc<LaminarDB>) -> Self {
+    fn new(db: Arc<LaminarDB>, connection_manager: Arc<ConnectionManager>) -> Self {
         Self {
             db,
-            connections: parking_lot::Mutex::new(HashMap::new()),
+            connection_manager,
         }
     }
 
-    fn conn_state(&self, peer: SocketAddr) -> Arc<ConnState> {
-        let mut guard = self.connections.lock();
-        Arc::clone(
-            guard
-                .entry(peer)
-                .or_insert_with(|| Arc::new(ConnState::default())),
-        )
-    }
-
-    fn evict_idle_peer(&self, peer: SocketAddr) {
-        let mut guard = self.connections.lock();
-        if let Some(state) = guard.get(&peer) {
-            if state.prune_dead_and_check_idle() {
-                guard.remove(&peer);
-            }
-        }
+    fn conn_state<C: ClientInfo>(&self, client: &C) -> Arc<ConnState> {
+        client
+            .session_extensions()
+            .get_or_insert_with(ConnState::default)
     }
 }
 
 #[async_trait]
 impl NoopStartupHandler for LaminarPgwireHandler {
+    fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
+        Some(Arc::clone(&self.connection_manager))
+    }
+
     async fn post_startup<C>(
         &self,
         client: &mut C,
@@ -106,46 +108,66 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
         if query.trim().is_empty() {
             return Ok(vec![Response::EmptyQuery]);
         }
-        let peer = client.socket_addr();
-        self.evict_idle_peer(peer);
+        let state = self.conn_state(client);
+        state.prune_dead();
+        let mut in_transaction = !matches!(
+            client.transaction_status(),
+            pgwire::messages::response::TransactionStatus::Idle
+        );
+        let mut failed_transaction = matches!(
+            client.transaction_status(),
+            pgwire::messages::response::TransactionStatus::Error
+        );
         let stmts = parse_streaming_sql(query)
             .map_err(|e| user_error("42601", format!("parse error: {e}")))?;
 
-        // SUBSCRIBE owns the socket for its lifetime; it can't share a
-        // simple-query batch with earlier or later statements. Reject
-        // up front so trailing statements aren't silently dropped.
-        if stmts.len() > 1
-            && stmts
-                .iter()
-                .any(|s| matches!(s, StreamingStatement::Subscribe(_)))
+        if stmts
+            .iter()
+            .any(|s| matches!(s, StreamingStatement::Subscribe(_)))
         {
             return Err(user_error(
                 "0A000",
-                "SUBSCRIBE must be the only statement in a simple query",
+                "continuous pgwire SUBSCRIBE is not supported; use WebSocket or a bounded portal/cursor fetch",
             ));
         }
 
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             out.push(match stmt {
-                StreamingStatement::Subscribe(s) => {
-                    let portal = open_portal_for_subscribe(&self.db, &s).await?;
-                    // Simple query is always text (no Bind result format).
-                    stream_subscribe_flushing(client, portal, true, None).await?;
-                    return Ok(Vec::new());
-                }
+                StreamingStatement::Subscribe(_) => unreachable!("rejected before dispatch"),
                 StreamingStatement::Show(cmd) => {
                     engine_metadata_response(&self.db, &show_sql(&cmd)).await?
                 }
                 StreamingStatement::DeclareCursorForSubscribe {
                     name, subscribe, ..
                 } => {
-                    let state = self.conn_state(peer);
+                    if !in_transaction {
+                        return Err(user_error(
+                            "25001",
+                            "subscription cursors require an explicit transaction",
+                        ));
+                    }
                     handle_declare_cursor(&self.db, &state, &name.value, *subscribe).await?
                 }
                 StreamingStatement::Standard(s) => {
-                    let state = self.conn_state(peer);
-                    standard_or_cursor_response(&self.db, &state, *s)?
+                    let starts_transaction = matches!(&*s, Statement::StartTransaction { .. });
+                    let ends_transaction =
+                        matches!(&*s, Statement::Commit { .. } | Statement::Rollback { .. });
+                    if failed_transaction && !ends_transaction {
+                        return Err(user_error(
+                            "25P02",
+                            "current transaction is aborted; commands are ignored until ROLLBACK",
+                        ));
+                    }
+                    let response =
+                        standard_or_cursor_response(&self.db, &state, *s, in_transaction)?;
+                    if starts_transaction {
+                        in_transaction = true;
+                    } else if ends_transaction {
+                        in_transaction = false;
+                        failed_transaction = false;
+                    }
+                    response
                 }
                 other => {
                     return Err(user_error(
@@ -168,85 +190,29 @@ async fn open_portal_for_subscribe(
         Some(n) => SubscribeStart::AsOfEpoch(n),
         None => SubscribeStart::Tail,
     };
-    db.open_subscription(&name, s.filter_sql.as_deref(), start)
+    let portal = db
+        .open_subscription(&name, s.filter_sql.as_deref(), start)
         .await
-        .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))
+        .map_err(|error| subscription_open_error(&name, error))?;
+    validate_subscription_schema(&portal.schema())?;
+    Ok(portal)
 }
 
-/// Stream a SUBSCRIBE, flushing the `Sink` after every batch.
-///
-/// Workaround: pgwire `feed()`s `DataRow`s and only flushes at
-/// end-of-response (never, for an unbounded SUBSCRIBE) or at its ~8 KB
-/// buffer, so a sparse stream stalls. Per-batch flush is unconditional
-/// (fine — batches amortise; not per-row). Retire when pgwire flushes
-/// streaming responses upstream. Both paths need it (psql=simple,
-/// psycopg/JDBC=extended).
-///
-/// `send_row_desc`: simple query carries `RowDescription`; extended
-/// already sent it via `Describe` (caller returns `Response::Execution`
-/// for `CommandComplete`). Returns `Ok(())` only on pump exit.
-async fn stream_subscribe_flushing<C>(
-    client: &mut C,
-    mut portal: SubscriptionPortal,
-    send_row_desc: bool,
-    result_format: Option<&Format>,
-) -> PgWireResult<()>
-where
-    C: Sink<PgWireBackendMessage> + Unpin + Send,
-    C::Error: Debug,
-    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-{
-    use futures::SinkExt;
-
-    let schema = portal.schema();
-    // Honour the extended client's per-column binary/text choice; pgwire's
-    // `Describe` advertised it, so the `DataRow` encoding must match.
-    let fields = std::sync::Arc::new(field_infos(&schema, result_format));
-
-    if send_row_desc {
-        // Equivalent to pgwire's crate-private `into_row_description`.
-        let row_desc =
-            pgwire::messages::data::RowDescription::new(fields.iter().map(Into::into).collect());
-        client
-            .feed(PgWireBackendMessage::RowDescription(row_desc))
-            .await?;
-        client.flush().await?;
-    }
-
-    let mut rows: usize = 0;
-    loop {
-        match portal.next_frame().await {
-            Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
-                for row in encode_batch(&b, &fields) {
-                    client.feed(PgWireBackendMessage::DataRow(row?)).await?;
-                    rows += 1;
-                }
-                client.flush().await?;
-            }
-            Some(PortalFrame::Batch(_)) => {}
-            // Checkpoint barriers have no Postgres wire representation.
-            Some(PortalFrame::Barrier { .. }) => {}
-            Some(PortalFrame::Lagged(n)) => {
-                return Err(user_error(
-                    "54000",
-                    format!("subscription lagged: skipped {n} messages, terminating"),
-                ));
-            }
-            None => {
-                // Simple query owns the whole response, so emit
-                // CommandComplete here. The extended path lets pgwire
-                // emit it from the returned `Response::Execution`.
-                if send_row_desc {
-                    let tag = Tag::new("SUBSCRIBE").with_rows(rows);
-                    client
-                        .feed(PgWireBackendMessage::CommandComplete(tag.into()))
-                        .await?;
-                    client.flush().await?;
-                }
-                return Ok(());
-            }
-        }
-    }
+fn subscription_open_error(name: &str, error: laminar_db::DbError) -> PgWireError {
+    let code = match &error {
+        laminar_db::DbError::StreamNotFound(_) => "42P01",
+        laminar_db::DbError::Unsupported(_) => "0A000",
+        laminar_db::DbError::InvalidOperation(_)
+        | laminar_db::DbError::SubscriptionReplayPruned { .. }
+        | laminar_db::DbError::SubscriptionEpochNotCommitted { .. } => "22023",
+        laminar_db::DbError::Pipeline(_) => "53300",
+        laminar_db::DbError::Sql(_)
+        | laminar_db::DbError::SqlParse(_)
+        | laminar_db::DbError::DataFusion(_)
+        | laminar_db::DbError::QueryPipeline { .. } => "42601",
+        _ => "XX000",
+    };
+    user_error(code, format!("SUBSCRIBE '{name}': {error}"))
 }
 
 /// Wrap a `SubscriptionPortal` in a pgwire `Response::Query` so the
@@ -258,33 +224,80 @@ fn subscription_query_response(
 ) -> Response {
     use futures::stream;
     let schema = portal.schema();
-    let fields = Arc::new(field_infos(&schema, result_format));
+    let fields = Arc::new(subscription_field_infos(&schema, result_format));
     struct State {
         portal: SubscriptionPortal,
         fields: Arc<Vec<FieldInfo>>,
-        pending: VecDeque<PgWireResult<pgwire::messages::data::DataRow>>,
+        batch: Option<BatchCursor>,
+        data_columns: usize,
+        failed: bool,
     }
     let init = State {
         portal,
         fields: Arc::clone(&fields),
-        pending: VecDeque::new(),
+        batch: None,
+        data_columns: schema.fields().len(),
+        failed: false,
     };
-    let row_stream = stream::unfold(init, |mut s| async move {
+    let row_stream = stream::unfold(init, move |mut s| async move {
         loop {
-            if let Some(row) = s.pending.pop_front() {
-                return Some((row, s));
+            if s.failed {
+                return None;
+            }
+            if let Some(batch) = s.batch.as_mut() {
+                if let Some(row) = batch.next_row(&s.fields) {
+                    let failed = row.is_err();
+                    let exhausted = batch.is_exhausted();
+                    if failed {
+                        s.failed = true;
+                    }
+                    if failed || exhausted {
+                        s.batch = None;
+                    }
+                    return Some((row, s));
+                }
+                s.batch = None;
             }
             match s.portal.next_frame().await {
                 None => return None,
-                Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
-                    s.pending.extend(encode_batch(&b, &s.fields));
+                Some(PortalFrame::Batch {
+                    batch,
+                    sequence,
+                    lease,
+                }) if batch.num_rows() > 0 => {
+                    s.batch = Some(BatchCursor::new(batch, sequence, lease));
                 }
-                Some(PortalFrame::Batch(_)) | Some(PortalFrame::Barrier { .. }) => {}
+                Some(PortalFrame::Batch { .. }) => {}
+                Some(PortalFrame::Barrier {
+                    sequence,
+                    epoch,
+                    checkpoint_id,
+                    through_sequence,
+                }) => {
+                    let row = encode_subscription_progress_row(
+                        &s.fields,
+                        s.data_columns,
+                        sequence,
+                        epoch,
+                        checkpoint_id,
+                        through_sequence,
+                    );
+                    if row.is_err() {
+                        s.failed = true;
+                    }
+                    return Some((row, s));
+                }
                 Some(PortalFrame::Lagged(n)) => {
                     let err = user_error(
                         "54000",
                         format!("subscription lagged: skipped {n} messages, terminating"),
                     );
+                    s.failed = true;
+                    return Some((Err(err), s));
+                }
+                Some(PortalFrame::Error { message }) => {
+                    let err = user_error("XX000", format!("subscription failed: {message}"));
+                    s.failed = true;
                     return Some((Err(err), s));
                 }
             }
@@ -299,16 +312,15 @@ fn subscription_query_response(
 /// buffer, and the exhausted flag. Held by `Arc` so a row stream can keep
 /// reading after `ConnState::get` returns.
 struct CursorInner {
-    /// Tokio mutex because a FETCH stream holds it across `await` while
-    /// pulling frames.
-    portal: TokioMutex<SubscriptionPortal>,
-    /// Rows encoded from a prior frame that the previous FETCH didn't
-    /// consume. Without this, a multi-row batch + `FETCH 1` would drop the
-    /// leftover rows when the response stream ends.
-    pending: parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>,
-    /// Flipped when the pump emits `None` or `Lagged`. The next `evict_idle_peer`
-    /// pass reaps the cursor.
+    state: TokioMutex<CursorState>,
+    /// Flipped when the portal emits `None`, `Lagged`, or `Error` so the next
+    /// command can reap the cursor.
     exhausted: AtomicBool,
+}
+
+struct CursorState {
+    portal: SubscriptionPortal,
+    batch: Option<BatchCursor>,
 }
 
 #[derive(Clone)]
@@ -320,7 +332,6 @@ struct ActiveCursor {
 #[derive(Default)]
 struct ConnState {
     cursors: parking_lot::Mutex<HashMap<String, ActiveCursor>>,
-    in_tx: AtomicBool,
 }
 
 impl ConnState {
@@ -351,12 +362,9 @@ impl ConnState {
         self.cursors.lock().clear();
     }
 
-    /// Drop dead cursors and report whether the connection is now idle
-    /// (no cursors, no transaction). Single inner-lock acquisition.
-    fn prune_dead_and_check_idle(&self) -> bool {
+    fn prune_dead(&self) {
         let mut cursors = self.cursors.lock();
         cursors.retain(|_, c| !c.inner.exhausted.load(Ordering::Acquire));
-        cursors.is_empty() && !self.in_tx.load(Ordering::Acquire)
     }
 }
 
@@ -380,8 +388,10 @@ async fn handle_declare_cursor(
         cursor_name,
         ActiveCursor {
             inner: Arc::new(CursorInner {
-                portal: TokioMutex::new(portal),
-                pending: parking_lot::Mutex::new(VecDeque::new()),
+                state: TokioMutex::new(CursorState {
+                    portal,
+                    batch: None,
+                }),
                 exhausted: AtomicBool::new(false),
             }),
             schema,
@@ -395,9 +405,21 @@ fn fetch_direction_count(dir: &FetchDirection) -> PgWireResult<FetchTarget> {
     match dir {
         FetchDirection::Next | FetchDirection::Forward { limit: None } => Ok(FetchTarget::Count(1)),
         FetchDirection::Count { limit } | FetchDirection::Forward { limit: Some(limit) } => {
-            value_to_u64(limit).map(FetchTarget::Count)
+            let count = value_to_u64(limit)?;
+            if count > SUBSCRIPTION_MAX_FETCH_ROWS {
+                return Err(user_error(
+                    "22023",
+                    format!(
+                        "FETCH count exceeds the bounded subscription limit of {SUBSCRIPTION_MAX_FETCH_ROWS} rows"
+                    ),
+                ));
+            }
+            Ok(FetchTarget::Count(count))
         }
-        FetchDirection::All | FetchDirection::ForwardAll => Ok(FetchTarget::All),
+        FetchDirection::All | FetchDirection::ForwardAll => Err(user_error(
+            "0A000",
+            "FETCH ALL is not supported for subscriptions; request a positive bounded row count",
+        )),
         FetchDirection::Prior
         | FetchDirection::First
         | FetchDirection::Last
@@ -414,7 +436,6 @@ fn fetch_direction_count(dir: &FetchDirection) -> PgWireResult<FetchTarget> {
 #[derive(Copy, Clone)]
 enum FetchTarget {
     Count(u64),
-    All,
 }
 
 fn value_to_u64(v: &AstValue) -> PgWireResult<u64> {
@@ -466,31 +487,41 @@ fn standard_or_cursor_response(
     db: &LaminarDB,
     state: &ConnState,
     stmt: Statement,
+    in_transaction: bool,
 ) -> PgWireResult<Response> {
     match stmt {
-        Statement::StartTransaction { .. } => {
-            state.in_tx.store(true, Ordering::Release);
-            Ok(Response::Execution(Tag::new("BEGIN")))
-        }
+        Statement::StartTransaction { .. } => Ok(Response::TransactionStart(Tag::new("BEGIN"))),
         Statement::Commit { .. } => {
             state.drop_all();
-            state.in_tx.store(false, Ordering::Release);
-            Ok(Response::Execution(Tag::new("COMMIT")))
+            Ok(Response::TransactionEnd(Tag::new("COMMIT")))
         }
         Statement::Rollback { .. } => {
             state.drop_all();
-            state.in_tx.store(false, Ordering::Release);
-            Ok(Response::Execution(Tag::new("ROLLBACK")))
+            Ok(Response::TransactionEnd(Tag::new("ROLLBACK")))
         }
         Statement::Fetch {
             ref name,
             ref direction,
             ..
         } => {
+            if !in_transaction {
+                return Err(user_error(
+                    "25001",
+                    "FETCH requires an explicit transaction",
+                ));
+            }
             let target = fetch_direction_count(direction)?;
             handle_fetch(state, &name.value, target)
         }
-        Statement::Close { ref cursor } => handle_close(state, cursor),
+        Statement::Close { ref cursor } => {
+            if !in_transaction {
+                return Err(user_error(
+                    "25001",
+                    "CLOSE requires an explicit transaction",
+                ));
+            }
+            handle_close(state, cursor)
+        }
         Statement::Declare { .. } => Err(user_error(
             "0A000",
             "DECLARE on pgwire only supports CURSOR FOR SUBSCRIBE …",
@@ -504,9 +535,9 @@ fn standard_or_cursor_response(
 /// the "use HTTP" error.
 fn standard_response(db: &LaminarDB, stmt: Statement) -> PgWireResult<Response> {
     match stmt {
-        Statement::StartTransaction { .. } => Ok(Response::Execution(Tag::new("BEGIN"))),
-        Statement::Commit { .. } => Ok(Response::Execution(Tag::new("COMMIT"))),
-        Statement::Rollback { .. } => Ok(Response::Execution(Tag::new("ROLLBACK"))),
+        Statement::StartTransaction { .. } => Ok(Response::TransactionStart(Tag::new("BEGIN"))),
+        Statement::Commit { .. } => Ok(Response::TransactionEnd(Tag::new("COMMIT"))),
+        Statement::Rollback { .. } => Ok(Response::TransactionEnd(Tag::new("ROLLBACK"))),
         Statement::Set(s) => apply_set(db, s),
         Statement::Query(q) => driver_select_response(*q),
         Statement::Insert { .. }
@@ -699,22 +730,18 @@ fn record_batch_response(batch: arrow_array::RecordBatch) -> Response {
     Response::Query(QueryResponse::new(fields, row_stream))
 }
 
-/// Strict-PG FETCH: blocks until `target` rows are produced, the pump exits,
-/// or the broadcast lags. Lag/exit flips `cursor.inner.exhausted` so the next
-/// `evict_idle_peer` reaps the cursor. Text format only; SimpleQuery has no
-/// binary. Leftover rows from a multi-row frame stay in `cursor.inner.pending`
-/// so successive FETCHes consume the frame in order.
+/// Strict-PG FETCH: blocks until `target` rows are produced, the portal exits,
+/// or the subscription faults. Text format only; SimpleQuery has no binary.
+/// A partially consumed Arrow batch remains on the cursor for the next FETCH.
 fn fetch_response(cursor: ActiveCursor, target: FetchTarget) -> Response {
-    let fields = Arc::new(field_infos(&cursor.schema, None));
-    let remaining = match target {
-        FetchTarget::Count(n) => Some(n),
-        FetchTarget::All => None,
-    };
+    let fields = Arc::new(subscription_field_infos(&cursor.schema, None));
+    let data_columns = cursor.schema.fields().len();
+    let FetchTarget::Count(remaining) = target;
 
     struct State {
         cursor: ActiveCursor,
         fields: Arc<Vec<FieldInfo>>,
-        remaining: Option<u64>,
+        remaining: u64,
     }
 
     let init = State {
@@ -723,43 +750,98 @@ fn fetch_response(cursor: ActiveCursor, target: FetchTarget) -> Response {
         remaining,
     };
 
-    let row_stream = stream::unfold(init, |mut s| async move {
+    let row_stream = stream::unfold(init, move |mut s| async move {
         loop {
-            if matches!(s.remaining, Some(0)) {
+            if s.remaining == 0 {
                 return None;
-            }
-            // Pending rows from a prior FETCH come out first. Anything left
-            // here when remaining hits 0 stays for the next call.
-            let popped = s.cursor.inner.pending.lock().pop_front();
-            if let Some(row) = popped {
-                if let Some(n) = s.remaining.as_mut() {
-                    *n = n.saturating_sub(1);
-                }
-                return Some((row, s));
             }
             if s.cursor.inner.exhausted.load(Ordering::Acquire) {
                 return None;
             }
 
-            let next = s.cursor.inner.portal.lock().await.next_frame().await;
+            let mut cursor_state = s.cursor.inner.state.lock().await;
+            if let Some(batch) = cursor_state.batch.as_mut() {
+                if let Some(row) = batch.next_row(&s.fields) {
+                    let failed = row.is_err();
+                    if failed || batch.is_exhausted() {
+                        cursor_state.batch = None;
+                    }
+                    if failed {
+                        s.cursor.inner.exhausted.store(true, Ordering::Release);
+                    }
+                    drop(cursor_state);
+                    if !failed {
+                        s.remaining = s.remaining.saturating_sub(1);
+                    }
+                    return Some((row, s));
+                }
+                cursor_state.batch = None;
+            }
+
+            let next = match tokio::time::timeout(
+                SUBSCRIPTION_FETCH_WAIT,
+                cursor_state.portal.next_frame(),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(_) => {
+                    drop(cursor_state);
+                    return None;
+                }
+            };
             match next {
                 None => {
+                    drop(cursor_state);
                     s.cursor.inner.exhausted.store(true, Ordering::Release);
                     return None;
                 }
-                Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
-                    let encoded = encode_batch(&b, &s.fields);
-                    s.cursor.inner.pending.lock().extend(encoded);
+                Some(PortalFrame::Batch {
+                    batch,
+                    sequence,
+                    lease,
+                }) if batch.num_rows() > 0 => {
+                    cursor_state.batch = Some(BatchCursor::new(batch, sequence, lease));
                 }
-                Some(PortalFrame::Batch(_)) => {}
-                Some(PortalFrame::Barrier { .. }) => {
-                    // Same as portal_to_response: PG has no out-of-band marker.
+                Some(PortalFrame::Batch { .. }) => {}
+                Some(PortalFrame::Barrier {
+                    sequence,
+                    epoch,
+                    checkpoint_id,
+                    through_sequence,
+                }) => {
+                    let row = encode_subscription_progress_row(
+                        &s.fields,
+                        data_columns,
+                        sequence,
+                        epoch,
+                        checkpoint_id,
+                        through_sequence,
+                    );
+                    let failed = row.is_err();
+                    drop(cursor_state);
+                    if failed {
+                        s.cursor.inner.exhausted.store(true, Ordering::Release);
+                    } else {
+                        s.remaining = s.remaining.saturating_sub(1);
+                    }
+                    return Some((row, s));
                 }
                 Some(PortalFrame::Lagged(n)) => {
+                    drop(cursor_state);
                     s.cursor.inner.exhausted.store(true, Ordering::Release);
                     let err = user_error(
                         "54000",
                         format!("subscription lagged: skipped {n} messages, terminating cursor"),
+                    );
+                    return Some((Err(err), s));
+                }
+                Some(PortalFrame::Error { message }) => {
+                    drop(cursor_state);
+                    s.cursor.inner.exhausted.store(true, Ordering::Release);
+                    let err = user_error(
+                        "XX000",
+                        format!("subscription failed: {message}; terminating cursor"),
                     );
                     return Some((Err(err), s));
                 }
@@ -769,10 +851,49 @@ fn fetch_response(cursor: ActiveCursor, target: FetchTarget) -> Response {
     Response::Query(QueryResponse::new(fields, row_stream))
 }
 
-fn encode_batch(
+struct BatchCursor {
+    batch: arrow_array::RecordBatch,
+    sequence: u64,
+    row: usize,
+    _lease: SubscriptionFrameLease,
+}
+
+impl BatchCursor {
+    fn new(batch: arrow_array::RecordBatch, sequence: u64, lease: SubscriptionFrameLease) -> Self {
+        Self {
+            batch,
+            sequence,
+            row: 0,
+            _lease: lease,
+        }
+    }
+
+    fn next_row(
+        &mut self,
+        fields: &Arc<Vec<FieldInfo>>,
+    ) -> Option<PgWireResult<pgwire::messages::data::DataRow>> {
+        if self.row >= self.batch.num_rows() {
+            return None;
+        }
+        let row = self.row;
+        let encoded = encode_subscription_batch_row(&self.batch, row, self.sequence, fields);
+        if encoded.is_ok() {
+            self.row += 1;
+        }
+        Some(encoded)
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.row >= self.batch.num_rows()
+    }
+}
+
+fn encode_subscription_batch_row(
     batch: &arrow_array::RecordBatch,
+    row: usize,
+    sequence: u64,
     fields: &Arc<Vec<FieldInfo>>,
-) -> Vec<PgWireResult<pgwire::messages::data::DataRow>> {
+) -> PgWireResult<pgwire::messages::data::DataRow> {
     let opts = arrow_cast::display::FormatOptions::default();
     let formatters: Vec<_> = match batch
         .columns()
@@ -782,12 +903,34 @@ fn encode_batch(
     {
         Ok(f) => f,
         Err(e) => {
-            return vec![Err(user_error("XX000", format!("format column: {e}")))];
+            return Err(user_error("XX000", format!("format column: {e}")));
         }
     };
-    (0..batch.num_rows())
-        .map(|row| encode_row(batch, row, fields, &formatters))
-        .collect()
+    if fields.len() != batch.num_columns() + SUBSCRIPTION_METADATA_COLUMNS {
+        return Err(user_error(
+            "XX000",
+            "subscription result schema does not match the emitted batch",
+        ));
+    }
+    let mut enc = DataRowEncoder::new(Arc::clone(fields));
+    for (i, col) in batch.columns().iter().enumerate() {
+        let info = &fields[i];
+        match info.format() {
+            FieldFormat::Text => encode_field_text(&mut enc, col.as_ref(), row, &formatters[i])?,
+            FieldFormat::Binary => {
+                encode_field_binary(&mut enc, col.as_ref(), row, info.name())?;
+            }
+        }
+    }
+    enc.encode_field(&Some("data"))?;
+    enc.encode_field(&None::<&str>)?;
+    enc.encode_field(&None::<&str>)?;
+    let sequence = sequence.to_string();
+    let row = row.to_string();
+    enc.encode_field(&Some(sequence.as_str()))?;
+    enc.encode_field(&Some(row.as_str()))?;
+    enc.encode_field(&None::<&str>)?;
+    Ok(enc.take_row())
 }
 
 /// Build pgwire `FieldInfo`s from an Arrow schema. `result_format` (from a
@@ -798,7 +941,7 @@ fn field_infos(schema: &arrow_schema::Schema, result_format: Option<&Format>) ->
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let format = result_format.map_or(FieldFormat::Text, |rf| rf.format_for(i));
+            let format = result_format.map_or(FieldFormat::Text, |rf| safe_format_for(rf, i));
             FieldInfo::new(
                 f.name().clone(),
                 None,
@@ -810,12 +953,130 @@ fn field_infos(schema: &arrow_schema::Schema, result_format: Option<&Format>) ->
         .collect()
 }
 
+fn subscription_field_infos(
+    schema: &arrow_schema::Schema,
+    result_format: Option<&Format>,
+) -> Vec<FieldInfo> {
+    let mut fields = field_infos(schema, result_format);
+    for name in [
+        SUBSCRIPTION_KIND_COLUMN,
+        SUBSCRIPTION_EPOCH_COLUMN,
+        SUBSCRIPTION_CHECKPOINT_COLUMN,
+        SUBSCRIPTION_LOG_SEQUENCE_COLUMN,
+        SUBSCRIPTION_ROW_INDEX_COLUMN,
+        SUBSCRIPTION_THROUGH_SEQUENCE_COLUMN,
+    ] {
+        let format =
+            result_format.map_or(FieldFormat::Text, |rf| safe_format_for(rf, fields.len()));
+        fields.push(FieldInfo::new(
+            name.to_string(),
+            None,
+            None,
+            Type::VARCHAR,
+            format,
+        ));
+    }
+    fields
+}
+
+fn safe_format_for(format: &Format, index: usize) -> FieldFormat {
+    match format {
+        Format::UnifiedText => FieldFormat::Text,
+        Format::UnifiedBinary => FieldFormat::Binary,
+        Format::Individual(codes) => codes
+            .get(index)
+            .copied()
+            .map(FieldFormat::from)
+            .unwrap_or(FieldFormat::Text),
+    }
+}
+
+fn validate_subscription_result_format(format: &Format, columns: usize) -> PgWireResult<()> {
+    if let Format::Individual(codes) = format {
+        if codes.len() != columns {
+            return Err(user_error(
+                "08P01",
+                format!(
+                    "Bind supplied {} result format codes for a {columns}-column subscription",
+                    codes.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_subscription_schema(schema: &arrow_schema::Schema) -> PgWireResult<()> {
+    if let Some(field) = schema
+        .fields()
+        .iter()
+        .find(|field| field.name().to_ascii_lowercase().starts_with("__laminar_"))
+    {
+        return Err(user_error(
+            "42701",
+            format!(
+                "subscription column '{}' uses the reserved __laminar_ prefix",
+                field.name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_subscription_progress_row(
+    fields: &Arc<Vec<FieldInfo>>,
+    data_columns: usize,
+    sequence: u64,
+    epoch: u64,
+    checkpoint_id: u64,
+    through_sequence: u64,
+) -> PgWireResult<pgwire::messages::data::DataRow> {
+    if fields.len() != data_columns + SUBSCRIPTION_METADATA_COLUMNS {
+        return Err(user_error(
+            "XX000",
+            "subscription progress schema does not match the result type",
+        ));
+    }
+    let mut enc = DataRowEncoder::new(Arc::clone(fields));
+    for _ in 0..data_columns {
+        enc.encode_field(&None::<&str>)?;
+    }
+    let epoch = epoch.to_string();
+    let checkpoint_id = checkpoint_id.to_string();
+    let sequence = sequence.to_string();
+    let through_sequence = through_sequence.to_string();
+    enc.encode_field(&Some("progress"))?;
+    enc.encode_field(&Some(epoch.as_str()))?;
+    enc.encode_field(&Some(checkpoint_id.as_str()))?;
+    enc.encode_field(&Some(sequence.as_str()))?;
+    enc.encode_field(&None::<&str>)?;
+    enc.encode_field(&Some(through_sequence.as_str()))?;
+    Ok(enc.take_row())
+}
+
+fn ensure_cached_subscription_schema(
+    cached: &arrow_schema::Schema,
+    current: &arrow_schema::Schema,
+) -> PgWireResult<()> {
+    if cached == current {
+        Ok(())
+    } else {
+        Err(user_error("0A000", "cached result type changed"))
+    }
+}
+
 fn encode_row(
     batch: &arrow_array::RecordBatch,
     row: usize,
     fields: &Arc<Vec<FieldInfo>>,
     formatters: &[arrow_cast::display::ArrayFormatter<'_>],
 ) -> PgWireResult<pgwire::messages::data::DataRow> {
+    if fields.len() != batch.num_columns() || formatters.len() != batch.num_columns() {
+        return Err(user_error(
+            "XX000",
+            "result schema does not match the emitted batch",
+        ));
+    }
     let mut enc = DataRowEncoder::new(Arc::clone(fields));
     for (i, col) in batch.columns().iter().enumerate() {
         let info = &fields[i];
@@ -836,6 +1097,16 @@ fn encode_field_text(
     use arrow_schema::DataType;
     if col.is_null(row) {
         return enc.encode_field(&None::<&str>);
+    }
+    if matches!(col.data_type(), DataType::UInt64) {
+        let values = col
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| user_error("XX000", "UInt64 column has an invalid Arrow array"))?;
+        let value = values.value(row);
+        let value = i64::try_from(value)
+            .map_err(|_| user_error("22003", "UInt64 value exceeds PostgreSQL BIGINT"))?;
+        return enc.encode_field(&Some(value.to_string()));
     }
     // A TEXT[] column must serialize as a Postgres array literal `{..}`, not
     // Arrow's `[..]` display, so text-mode clients parse it as an array.
@@ -895,8 +1166,8 @@ fn pg_text_array_literal(elements: &[Option<String>]) -> String {
 ///
 /// Coverage: Int{8,16,32,64}, UInt{8,16,32,64}, Float{32,64}, Bool,
 /// Utf8/LargeUtf8, Timestamp (any unit, naive), Date32, Date64, and
-/// `List<Utf8>` (as `text[]`). UInt64 is widened to INT8 with saturation
-/// since Postgres has no unsigned 64. Any other column type yields `0A000`.
+/// `List<Utf8>` (as `text[]`). UInt64 values outside PostgreSQL BIGINT fail
+/// with `22003`. Any other column type yields `0A000`.
 fn encode_field_binary(
     enc: &mut DataRowEncoder,
     col: &dyn arrow_array::Array,
@@ -932,9 +1203,10 @@ fn encode_field_binary(
         DataType::UInt16 => prim!(UInt16Type as i32),
         DataType::UInt32 => prim!(UInt32Type as i64),
         DataType::UInt64 => {
-            // PG has no unsigned 64; saturate so we never wrap.
             let v = col.as_primitive::<UInt64Type>().value(row);
-            enc.encode_field(&Some(i64::try_from(v).unwrap_or(i64::MAX)))
+            let v = i64::try_from(v)
+                .map_err(|_| user_error("22003", "UInt64 value exceeds PostgreSQL BIGINT"))?;
+            enc.encode_field(&Some(v))
         }
         DataType::Float32 => prim!(Float32Type as f64),
         DataType::Float64 => prim!(Float64Type),
@@ -1080,6 +1352,66 @@ enum StartupAuth {
     Md5(Arc<Md5Handler>),
 }
 
+/// Permit held for the full authenticated-session lifetime through the
+/// per-connection extension store.
+struct SessionPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Admission wrapper created per accepted socket. The pending-handshake
+/// permit protects TLS negotiation and startup decoding, then is released as
+/// soon as the first valid Startup packet has been classified.
+struct StartupAdmission {
+    auth: Arc<StartupAuth>,
+    sessions: Arc<Semaphore>,
+    pending: parking_lot::Mutex<Option<OwnedSemaphorePermit>>,
+    require_tls: bool,
+}
+
+#[async_trait]
+impl StartupHandler for StartupAdmission {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if matches!(&message, PgWireFrontendMessage::Startup(_)) {
+            // Classification is complete. CancelRequest never reaches this
+            // handler and therefore never consumes a normal session slot.
+            self.pending.lock().take();
+
+            if self.require_tls && !client.is_secure() {
+                return Err(fatal_startup_error(
+                    "08004",
+                    "TLS is required for this pgwire listener",
+                ));
+            }
+
+            let permit = Arc::clone(&self.sessions)
+                .try_acquire_owned()
+                .map_err(|_| fatal_startup_error("53300", "too many pgwire connections"))?;
+            client
+                .session_extensions()
+                .insert(SessionPermit { _permit: permit });
+        }
+
+        self.auth.on_startup(client, message).await
+    }
+}
+
+fn fatal_startup_error(code: &str, message: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "FATAL".into(),
+        code.into(),
+        message.into(),
+    )))
+}
+
 #[async_trait]
 impl StartupHandler for StartupAuth {
     async fn on_startup<C>(
@@ -1099,14 +1431,26 @@ impl StartupHandler for StartupAuth {
     }
 }
 
-pub struct LaminarHandlerFactory {
+struct LaminarHandlerFactory {
     handler: Arc<LaminarPgwireHandler>,
     startup: Arc<StartupAuth>,
+    cancel: Arc<DefaultCancelHandler>,
+    sessions: Arc<Semaphore>,
+    require_tls: bool,
 }
 
 impl LaminarHandlerFactory {
-    fn new(db: Arc<LaminarDB>, users: HashMap<String, Secret>) -> Self {
-        let handler = Arc::new(LaminarPgwireHandler::new(db));
+    fn new(
+        db: Arc<LaminarDB>,
+        users: HashMap<String, Secret>,
+        max_connections: usize,
+        require_tls: bool,
+    ) -> Self {
+        let connection_manager = Arc::new(ConnectionManager::new());
+        let handler = Arc::new(LaminarPgwireHandler::new(
+            db,
+            Arc::clone(&connection_manager),
+        ));
         let startup = if users.is_empty() {
             Arc::new(StartupAuth::Trust(Arc::clone(&handler)))
         } else {
@@ -1116,14 +1460,41 @@ impl LaminarHandlerFactory {
             let md5 = Md5PasswordAuthStartupHandler::new(
                 Arc::new(auth),
                 Arc::new(DefaultServerParameterProvider::default()),
-            );
+            )
+            .with_connection_manager(Arc::clone(&connection_manager));
             Arc::new(StartupAuth::Md5(Arc::new(md5)))
         };
-        Self { handler, startup }
+        let cancel = Arc::new(DefaultCancelHandler::new(connection_manager));
+        Self {
+            handler,
+            startup,
+            cancel,
+            sessions: Arc::new(Semaphore::new(max_connections)),
+            require_tls,
+        }
+    }
+
+    fn for_connection(&self, pending: OwnedSemaphorePermit) -> LaminarConnectionHandlers {
+        LaminarConnectionHandlers {
+            handler: Arc::clone(&self.handler),
+            startup: Arc::new(StartupAdmission {
+                auth: Arc::clone(&self.startup),
+                sessions: Arc::clone(&self.sessions),
+                pending: parking_lot::Mutex::new(Some(pending)),
+                require_tls: self.require_tls,
+            }),
+            cancel: Arc::clone(&self.cancel),
+        }
     }
 }
 
-impl PgWireServerHandlers for LaminarHandlerFactory {
+struct LaminarConnectionHandlers {
+    handler: Arc<LaminarPgwireHandler>,
+    startup: Arc<StartupAdmission>,
+    cancel: Arc<DefaultCancelHandler>,
+}
+
+impl PgWireServerHandlers for LaminarConnectionHandlers {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         Arc::clone(&self.handler)
     }
@@ -1134,6 +1505,10 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         Arc::clone(&self.startup)
+    }
+
+    fn cancel_handler(&self) -> Arc<impl pgwire::api::cancel::CancelHandler> {
+        Arc::clone(&self.cancel)
     }
 }
 
@@ -1188,9 +1563,10 @@ impl QueryParser for LaminarQueryParser {
         match stmt {
             StreamingStatement::Subscribe(s) => {
                 let name = s.name.to_string();
-                let (schema, _) = self.db.lookup_subscription_schema(&name).ok_or_else(|| {
+                let schema = self.db.lookup_subscription_schema(&name).ok_or_else(|| {
                     user_error("42P01", format!("SUBSCRIBE '{name}': stream not found"))
                 })?;
+                validate_subscription_schema(&schema)?;
                 Ok(LaminarStmt::Subscribe {
                     name,
                     filter_sql: s.filter_sql,
@@ -1221,7 +1597,15 @@ impl QueryParser for LaminarQueryParser {
         // materialises after execution; clients see it on Execute's
         // RowDescription instead.
         match stmt {
-            LaminarStmt::Subscribe { schema, .. } => Ok(field_infos(schema, column_format)),
+            LaminarStmt::Subscribe { schema, .. } => {
+                if let Some(format) = column_format {
+                    validate_subscription_result_format(
+                        format,
+                        schema.fields().len() + SUBSCRIPTION_METADATA_COLUMNS,
+                    )?;
+                }
+                Ok(subscription_field_infos(schema, column_format))
+            }
             LaminarStmt::Show(_) | LaminarStmt::Standard(_) => Ok(Vec::new()),
         }
     }
@@ -1240,7 +1624,7 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
 
     async fn do_query<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         portal: &Portal<Self::Statement>,
         max_rows: usize,
     ) -> PgWireResult<Response>
@@ -1255,8 +1639,18 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
                 name,
                 filter_sql,
                 as_of_epoch,
-                ..
+                schema,
             } => {
+                if max_rows == 0 {
+                    return Err(user_error(
+                        "0A000",
+                        "unbounded pgwire SUBSCRIBE is not supported; Execute must request a positive row count",
+                    ));
+                }
+                validate_subscription_result_format(
+                    &portal.result_column_format,
+                    schema.fields().len() + SUBSCRIPTION_METADATA_COLUMNS,
+                )?;
                 let start = match as_of_epoch {
                     Some(n) => SubscribeStart::AsOfEpoch(*n),
                     None => SubscribeStart::Tail,
@@ -1265,65 +1659,16 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
                     .db
                     .open_subscription(name, filter_sql.as_deref(), start)
                     .await
-                    .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
-                if max_rows == 0 {
-                    // Unbounded fetch — pgwire would buffer infinitely.
-                    // Drive the stream ourselves with per-batch flushing.
-                    stream_subscribe_flushing(
-                        client,
-                        sub,
-                        false,
-                        Some(&portal.result_column_format),
-                    )
-                    .await?;
-                    Ok(Response::Execution(Tag::new("SUBSCRIBE")))
-                } else {
-                    // Chunked (JDBC setFetchSize / tokio-postgres query_portal).
-                    // Hand pgwire a row stream so it honours max_rows and
-                    // emits PortalSuspended automatically.
-                    Ok(subscription_query_response(
-                        sub,
-                        Some(&portal.result_column_format),
-                    ))
-                }
+                    .map_err(|error| subscription_open_error(name, error))?;
+                ensure_cached_subscription_schema(schema, &sub.schema())?;
+                Ok(subscription_query_response(
+                    sub,
+                    Some(&portal.result_column_format),
+                ))
             }
             LaminarStmt::Show(cmd) => engine_metadata_response(&self.db, &show_sql(cmd)).await,
             LaminarStmt::Standard(s) => standard_response(&self.db, *s.clone()),
         }
-    }
-
-    /// Per-Sync portal cleanup: only the unnamed portal is destroyed.
-    ///
-    /// The pgwire 0.39 default `on_sync` calls `clear_portals()`, which wipes
-    /// every named portal on the connection. PostgreSQL keeps named portals
-    /// alive until `Close` or end-of-transaction, so the default would break
-    /// any client that does `Bind named_portal; Sync; Execute named_portal;`
-    /// — the standard JDBC / asyncpg / tokio-postgres pattern for chunked
-    /// fetches via `setFetchSize` / `query_portal`.
-    async fn on_sync<C>(
-        &self,
-        client: &mut C,
-        _message: pgwire::messages::extendedquery::Sync,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::PortalStore: PortalStore<Statement = Self::Statement>,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        use futures::SinkExt;
-        use pgwire::messages::response::ReadyForQuery;
-
-        // Drop only the unnamed portal; named portals survive Sync.
-        client.portal_store().rm_portal("");
-
-        client
-            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                client.transaction_status(),
-            )))
-            .await?;
-        client.flush().await?;
-        Ok(())
     }
 }
 
@@ -1797,8 +2142,13 @@ pub async fn serve(
     let local_addr = listener
         .local_addr()
         .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
+    let require_tls = !local_addr.ip().is_loopback() || mtls_on;
+    if require_tls && tls_state.is_none() {
+        return Err(ServerError::Http(format!(
+            "pgwire listener '{local_addr}' requires pgwire_tls_cert + pgwire_tls_key"
+        )));
+    }
 
-    let factory = Arc::new(LaminarHandlerFactory::new(db, users));
     let tls_mode = if tls_state.is_some() { "on" } else { "off" };
     let tls_min = tls_min_label.unwrap_or("-");
     let mtls = if mtls_on { "on" } else { "off" };
@@ -1824,6 +2174,13 @@ pub async fn serve(
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
     let failures = Arc::new(FailureTracker::default());
+    let factory = Arc::new(LaminarHandlerFactory::new(
+        db,
+        users,
+        max_connections,
+        require_tls,
+    ));
+    let pending_handshakes = Arc::new(Semaphore::new(MAX_PENDING_PGWIRE_HANDSHAKES));
     let watcher_state = tls_state.as_ref().map(Arc::clone);
     let watcher_disabled =
         std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
@@ -1845,17 +2202,18 @@ pub async fn serve(
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((sock, peer)) => {
-                            if sessions.len() >= max_connections {
+                            let Ok(pending) = Arc::clone(&pending_handshakes).try_acquire_owned()
+                            else {
                                 tracing::info!(
                                     target: "audit",
                                     event = "pgwire.connection_rejected",
                                     peer = %peer,
-                                    reason = "max_connections",
-                                    in_flight = sessions.len(),
+                                    reason = "pending_handshake_limit",
+                                    in_flight = MAX_PENDING_PGWIRE_HANDSHAKES,
                                 );
                                 drop(sock);
                                 continue;
-                            }
+                            };
                             if failures.is_blocked(
                                 peer.ip(),
                                 max_auth_failures_per_min,
@@ -1870,7 +2228,7 @@ pub async fn serve(
                                 drop(sock);
                                 continue;
                             }
-                            let factory_ref = Arc::clone(&factory);
+                            let handlers = factory.for_connection(pending);
                             // Snapshot the live acceptor so that an in-flight
                             // handshake completes against whatever cert was
                             // current when the socket was accepted, even if a
@@ -1888,7 +2246,7 @@ pub async fn serve(
                             );
                             let peer_ip = peer.ip();
                             sessions.spawn(async move {
-                                let result = process_socket(sock, tls_ref, factory_ref).await;
+                                let result = process_socket(sock, tls_ref, handlers).await;
                                 let outcome = classify_outcome(&result);
                                 if outcome == "auth_failed" {
                                     failures_ref.record_failure(peer_ip);
@@ -1951,6 +2309,102 @@ mod tests {
             pg_text_array_literal(&[Some("a\"b\\c".into())]),
             r#"{"a\"b\\c"}"#
         );
+    }
+
+    #[test]
+    fn subscription_progress_row_uses_ordered_envelope_columns() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let fields = Arc::new(subscription_field_infos(&schema, None));
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[1].name(), SUBSCRIPTION_KIND_COLUMN);
+        assert_eq!(fields[2].name(), SUBSCRIPTION_EPOCH_COLUMN);
+        assert_eq!(fields[3].name(), SUBSCRIPTION_CHECKPOINT_COLUMN);
+        assert_eq!(fields[4].name(), SUBSCRIPTION_LOG_SEQUENCE_COLUMN);
+        assert_eq!(fields[5].name(), SUBSCRIPTION_ROW_INDEX_COLUMN);
+        assert_eq!(fields[6].name(), SUBSCRIPTION_THROUGH_SEQUENCE_COLUMN);
+        encode_subscription_progress_row(&fields, 1, 8, 7, 99, 6).unwrap();
+    }
+
+    #[test]
+    fn uint64_subscription_fails_instead_of_corrupting_bigint() {
+        use arrow_array::{RecordBatch, UInt64Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        fn batch(value: u64) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+                vec![Arc::new(UInt64Array::from(vec![value]))],
+            )
+            .unwrap()
+        }
+
+        fn assert_out_of_range(error: PgWireError) {
+            let PgWireError::UserError(info) = error else {
+                panic!("expected user error");
+            };
+            assert_eq!(info.code, "22003");
+        }
+
+        for binary in [false, true] {
+            let ok = batch(i64::MAX as u64);
+            let mut fields = subscription_field_infos(&ok.schema(), None);
+            if binary {
+                fields[0] = FieldInfo::new(
+                    "id".to_string(),
+                    None,
+                    None,
+                    Type::INT8,
+                    FieldFormat::Binary,
+                );
+            }
+            let fields = Arc::new(fields);
+            encode_subscription_batch_row(&ok, 0, 7, &fields).unwrap();
+
+            for value in [i64::MAX as u64 + 1, u64::MAX] {
+                assert_out_of_range(
+                    encode_subscription_batch_row(&batch(value), 0, 7, &fields).unwrap_err(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_subscription_schema_change_is_rejected() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let cached = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let same = cached.clone();
+        let changed = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+        ensure_cached_subscription_schema(&cached, &same).unwrap();
+        let error = ensure_cached_subscription_schema(&cached, &changed).unwrap_err();
+        let PgWireError::UserError(info) = error else {
+            panic!("expected user error");
+        };
+        assert_eq!(info.code, "0A000");
+        assert_eq!(info.message, "cached result type changed");
+    }
+
+    #[test]
+    fn subscription_open_errors_keep_distinct_sqlstates() {
+        for (error, expected) in [
+            (laminar_db::DbError::StreamNotFound("s".into()), "42P01"),
+            (laminar_db::DbError::Unsupported("cluster".into()), "0A000"),
+            (
+                laminar_db::DbError::InvalidOperation("epoch is not committed".into()),
+                "22023",
+            ),
+            (
+                laminar_db::DbError::Pipeline("subscriber cap".into()),
+                "53300",
+            ),
+        ] {
+            let PgWireError::UserError(info) = subscription_open_error("s", error) else {
+                panic!("expected user error");
+            };
+            assert_eq!(info.code, expected);
+        }
     }
 
     #[tokio::test]
@@ -2110,7 +2564,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_rejects_remote_bind_in_trust_mode() {
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None, 256, 10)
             .await
             .expect_err("trust + 0.0.0.0 must fail");
@@ -2119,7 +2573,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_rejects_remote_bind_without_explicit_optin() {
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         let mut users = HashMap::new();
         users.insert("alice".into(), Secret::new("wonderland-key"));
         let err = serve(db, "0.0.0.0:0", users, false, None, 256, 10)
@@ -2127,6 +2581,20 @@ mod tests {
             .expect_err("md5 + 0.0.0.0 without allow_remote must fail");
         assert!(
             err.to_string().contains("pgwire_allow_remote"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_remote_bind_without_tls() {
+        let db = LaminarDB::open().expect("db opens");
+        let mut users = HashMap::new();
+        users.insert("alice".into(), Secret::new("wonderland-key"));
+        let err = serve(db, "0.0.0.0:0", users, true, None, 256, 10)
+            .await
+            .expect_err("remote pgwire must not start without TLS");
+        assert!(
+            err.to_string().contains("requires pgwire_tls_cert"),
             "got: {err}"
         );
     }
@@ -2142,15 +2610,23 @@ mod integration_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use bytes::{BufMut, BytesMut};
+    use laminar_db::subscription::SubscribeStart;
     use laminar_db::LaminarDB;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
     use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-    use super::Secret;
+    use super::{
+        Secret, SUBSCRIPTION_CHECKPOINT_COLUMN, SUBSCRIPTION_EPOCH_COLUMN, SUBSCRIPTION_FETCH_WAIT,
+        SUBSCRIPTION_KIND_COLUMN, SUBSCRIPTION_LOG_SEQUENCE_COLUMN, SUBSCRIPTION_ROW_INDEX_COLUMN,
+        SUBSCRIPTION_THROUGH_SEQUENCE_COLUMN,
+    };
 
     async fn spawn_server_with(
         users: HashMap<String, Secret>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
             .await
             .expect("create source");
@@ -2186,6 +2662,111 @@ mod integration_tests {
             let _ = conn.await;
         });
         client
+    }
+
+    async fn raw_read_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let message_type = stream.read_u8().await.expect("backend message type");
+        let length = stream.read_i32().await.expect("backend message length");
+        assert!(length >= 4, "invalid backend message length {length}");
+        let mut body = vec![0; (length - 4) as usize];
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("backend message body");
+        (message_type, body)
+    }
+
+    async fn raw_read_until_ready(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        let mut messages = Vec::new();
+        loop {
+            let message = raw_read_message(stream).await;
+            let ready = message.0 == b'Z';
+            messages.push(message);
+            if ready {
+                return messages;
+            }
+        }
+    }
+
+    fn raw_frame(message_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = BytesMut::with_capacity(body.len() + 5);
+        frame.put_u8(message_type);
+        frame.put_i32(i32::try_from(body.len() + 4).expect("test frame length"));
+        frame.extend_from_slice(body);
+        frame.to_vec()
+    }
+
+    async fn raw_connect(addr: std::net::SocketAddr) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).await.expect("raw connect");
+        let mut body = BytesMut::new();
+        body.put_i32(196_608);
+        body.extend_from_slice(b"user\0any\0database\0laminardb\0\0");
+        let mut startup = BytesMut::new();
+        startup.put_i32(i32::try_from(body.len() + 4).unwrap());
+        startup.extend_from_slice(&body);
+        stream.write_all(&startup).await.expect("write startup");
+        let messages = raw_read_until_ready(&mut stream).await;
+        assert!(messages.iter().all(|message| message.0 != b'E'));
+        stream
+    }
+
+    async fn raw_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        let mut body = BytesMut::new();
+        body.extend_from_slice(sql.as_bytes());
+        body.put_u8(0);
+        stream
+            .write_all(&raw_frame(b'Q', &body))
+            .await
+            .expect("write Query");
+        raw_read_until_ready(stream).await
+    }
+
+    async fn raw_parse_bind_sync(
+        stream: &mut TcpStream,
+        statement: &str,
+        portal: &str,
+        sql: &str,
+    ) -> Vec<(u8, Vec<u8>)> {
+        let mut parse = BytesMut::new();
+        parse.extend_from_slice(statement.as_bytes());
+        parse.put_u8(0);
+        parse.extend_from_slice(sql.as_bytes());
+        parse.put_u8(0);
+        parse.put_u16(0);
+
+        let mut bind = BytesMut::new();
+        bind.extend_from_slice(portal.as_bytes());
+        bind.put_u8(0);
+        bind.extend_from_slice(statement.as_bytes());
+        bind.put_u8(0);
+        bind.put_u16(0);
+        bind.put_u16(0);
+        bind.put_u16(0);
+
+        let mut frames = raw_frame(b'P', &parse);
+        frames.extend_from_slice(&raw_frame(b'B', &bind));
+        frames.extend_from_slice(&raw_frame(b'S', &[]));
+        stream
+            .write_all(&frames)
+            .await
+            .expect("write Parse/Bind/Sync");
+        raw_read_until_ready(stream).await
+    }
+
+    async fn raw_execute_sync(
+        stream: &mut TcpStream,
+        portal: &str,
+        max_rows: i32,
+    ) -> Vec<(u8, Vec<u8>)> {
+        let mut execute = BytesMut::new();
+        execute.extend_from_slice(portal.as_bytes());
+        execute.put_u8(0);
+        execute.put_i32(max_rows);
+
+        let mut frames = raw_frame(b'E', &execute);
+        frames.extend_from_slice(&raw_frame(b'S', &[]));
+        stream.write_all(&frames).await.expect("write Execute/Sync");
+        raw_read_until_ready(stream).await
     }
 
     fn first_row_value(messages: &[SimpleQueryMessage], col: usize) -> Option<&str> {
@@ -2232,17 +2813,18 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn subscribe_unknown_name_returns_pg_error() {
+    async fn simple_subscribe_is_rejected_as_unbounded() {
         let (addr, handle) = spawn_server().await;
         let client = connect(addr).await;
 
         let err = client
-            .simple_query("SUBSCRIBE no_such_view")
+            .simple_query("SUBSCRIBE prices")
             .await
             .expect_err("must fail");
         let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "0A000");
         assert!(
-            db_err.message().contains("no_such_view"),
+            db_err.message().contains("WebSocket"),
             "message: {}",
             db_err.message()
         );
@@ -2251,36 +2833,17 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn subscribe_with_valid_where_is_accepted() {
-        // SUBSCRIBE never returns CommandComplete, so a successful compile
-        // shows up as a timeout. Anything else — Ok(Ok) or Ok(Err) — is a
-        // regression.
+    async fn bounded_subscribe_with_unknown_filter_column_returns_pg_error() {
         let (addr, handle) = spawn_server().await;
-        let client = connect(addr).await;
-
-        let r = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            client.simple_query("SUBSCRIBE prices WHERE symbol = 'AAPL'"),
-        )
-        .await;
-
-        assert!(
-            r.is_err(),
-            "subscribe must stay open until timeout, got: {r:?}"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn subscribe_with_unknown_column_in_where_returns_pg_error() {
-        let (addr, handle) = spawn_server().await;
-        let client = connect(addr).await;
-
-        let err = client
-            .simple_query("SUBSCRIBE prices WHERE no_such_col > 1")
+        let mut client = connect(addr).await;
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx
+            .prepare("SUBSCRIBE prices WHERE no_such_col > 1")
             .await
-            .expect_err("must fail");
+            .expect("parse resolves the stream schema");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+
+        let err = tx.query_portal(&portal, 1).await.expect_err("must fail");
         let db_err = err.as_db_error().expect("typed PG error");
         assert!(
             db_err.message().contains("no_such_col"),
@@ -2292,19 +2855,23 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn subscribe_as_of_unretained_returns_pg_error() {
-        // No retention configured on the `prices` MV from the default setup,
-        // so AS OF EPOCH 1 must come back as a typed PG error.
+    async fn subscribe_as_of_uncommitted_returns_pg_error() {
+        // No checkpoint has committed on `prices`, so a future AS OF cut must
+        // be distinguished from pruned history.
         let (addr, handle) = spawn_server().await;
-        let client = connect(addr).await;
-
-        let err = client
-            .simple_query("SUBSCRIBE prices AS OF EPOCH 1")
+        let mut client = connect(addr).await;
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx
+            .prepare("SUBSCRIBE prices AS OF EPOCH 1")
             .await
-            .expect_err("must fail");
+            .expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+
+        let err = tx.query_portal(&portal, 1).await.expect_err("must fail");
         let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "22023");
         assert!(
-            db_err.message().contains("no longer retained"),
+            db_err.message().contains("not committed"),
             "message: {}",
             db_err.message()
         );
@@ -2321,7 +2888,7 @@ mod integration_tests {
 
         use arrow_array::{Float64Array, RecordBatch, StringArray};
 
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
             .await
             .expect("create source");
@@ -2394,7 +2961,7 @@ mod integration_tests {
 
         use arrow_array::{Int64Array, RecordBatch};
 
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.execute("CREATE SOURCE feed (id BIGINT)")
             .await
             .expect("create source");
@@ -2470,7 +3037,7 @@ mod integration_tests {
         handle.abort();
     }
 
-    async fn md5_users() -> HashMap<String, Secret> {
+    fn md5_users() -> HashMap<String, Secret> {
         let mut u = HashMap::new();
         u.insert("alice".to_string(), Secret::new(TEST_PASSWORD));
         u
@@ -2497,7 +3064,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn md5_auth_accepts_correct_password() {
-        let (addr, handle) = spawn_server_with(md5_users().await).await;
+        let (addr, handle) = spawn_server_with(md5_users()).await;
 
         let client = connect_with_password(addr, "alice", TEST_PASSWORD)
             .await
@@ -2514,8 +3081,34 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn concurrent_md5_challenges_are_session_isolated() {
+        let mut users = HashMap::new();
+        users.insert("alice".to_owned(), Secret::new("alice-password"));
+        users.insert("bob".to_owned(), Secret::new("bob-password"));
+        let (addr, handle) = spawn_server_with(users).await;
+
+        let attempts = (0..64).map(|index| async move {
+            let (user, password) = if index % 2 == 0 {
+                ("alice", "alice-password")
+            } else {
+                ("bob", "bob-password")
+            };
+            let client = connect_with_password(addr, user, password)
+                .await
+                .expect("concurrent authentication must succeed");
+            client
+                .simple_query("SELECT 1")
+                .await
+                .expect("authenticated session remains usable");
+        });
+        futures::future::join_all(attempts).await;
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn md5_auth_rejects_wrong_password() {
-        let (addr, handle) = spawn_server_with(md5_users().await).await;
+        let (addr, handle) = spawn_server_with(md5_users()).await;
 
         let err = connect_with_password(addr, "alice", "not-the-password")
             .await
@@ -2589,7 +3182,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn md5_auth_rejects_unknown_user() {
-        let (addr, handle) = spawn_server_with(md5_users().await).await;
+        let (addr, handle) = spawn_server_with(md5_users()).await;
 
         let err = connect_with_password(addr, "mallory", "anything")
             .await
@@ -2603,8 +3196,9 @@ mod integration_tests {
 
     #[tokio::test]
     async fn connection_cap_drops_excess_clients() {
-        // Cap of 1; first client occupies the slot, second is dropped.
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        // Cap of 1; first client occupies the slot, second receives a startup
+        // FATAL without displacing the active session.
+        let db = LaminarDB::open().expect("db opens");
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
             .await
             .expect("create source");
@@ -2624,24 +3218,96 @@ mod integration_tests {
         .await
         .expect("pgwire serve");
 
-        // First client occupies the slot via SUBSCRIBE (stays open until drop).
-        let first = connect(addr).await;
-        let _bg = tokio::spawn(async move {
-            let _ = first.simple_query("SUBSCRIBE prices").await;
-        });
-        // Give the server a moment to register the session in the JoinSet.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Second connect: server accepts the TCP, then closes it because the
-        // cap is hit. tokio_postgres surfaces this as an IO error during
-        // startup. Exact string varies; just assert it failed.
+        // An authenticated connection occupies the only session slot.
+        let _first = connect(addr).await;
         let conn_str = format!(
             "host={} port={} user=any dbname=laminardb",
             addr.ip(),
             addr.port()
         );
-        let result = tokio_postgres::connect(&conn_str, NoTls).await;
-        assert!(result.is_err(), "second connect must be refused");
+        let error = match tokio_postgres::connect(&conn_str, NoTls).await {
+            Ok(_) => panic!("second connect must be refused"),
+            Err(error) => error,
+        };
+        let db_error = error.as_db_error().expect("typed startup FATAL");
+        assert_eq!(db_error.code().code(), "53300");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_request_bypasses_full_session_cap() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let db = LaminarDB::open().expect("db opens");
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "0.0.0.0:0",
+            md5_users(),
+            true,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: None,
+            }),
+            1,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        // Prefer negotiates TLS for the normal session but lets NoTls below
+        // send the protocol-defined plaintext CancelRequest on a fresh socket.
+        let conn_str = format!(
+            "host=localhost hostaddr=127.0.0.1 port={} user=alice password={} \
+             dbname=laminardb sslmode=prefer",
+            addr.port(),
+            TEST_PASSWORD,
+        );
+        let tls = make_client_tls(&cert_path, None);
+        let (client, connection) = tokio_postgres::connect(&conn_str, tls)
+            .await
+            .expect("TLS pgwire connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let cancel = client.cancel_token();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let query = tokio::spawn(async move {
+            let mut client = client;
+            let transaction = client.transaction().await.expect("BEGIN");
+            let statement = transaction
+                .prepare("SUBSCRIBE prices")
+                .await
+                .expect("prepare");
+            let portal = transaction.bind(&statement, &[]).await.expect("bind");
+            ready_tx.send(()).expect("query ready");
+            transaction
+                .query_portal(&portal, 1)
+                .await
+                .expect_err("quiet fetch must be cancelled")
+                .as_db_error()
+                .map(|error| error.code().code().to_owned())
+        });
+
+        ready_rx.await.expect("query ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel
+            .cancel_query(NoTls)
+            .await
+            .expect("plaintext CancelRequest bypasses TLS and the full session semaphore");
+        let code = tokio::time::timeout(std::time::Duration::from_secs(3), query)
+            .await
+            .expect("cancel response")
+            .expect("query task");
+        assert_eq!(code.as_deref(), Some("57014"));
 
         handle.abort();
     }
@@ -2724,6 +3390,93 @@ mod integration_tests {
         tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg)
     }
 
+    async fn assert_plaintext_startup_is_fatal(addr: std::net::SocketAddr) {
+        let mut stream = TcpStream::connect(addr).await.expect("raw NoTls connect");
+        let mut body = BytesMut::new();
+        body.put_i32(196_608);
+        body.extend_from_slice(b"user\0alice\0database\0laminardb\0\0");
+        let mut startup = BytesMut::new();
+        startup.put_i32(i32::try_from(body.len() + 4).expect("startup length"));
+        startup.extend_from_slice(&body);
+        stream
+            .write_all(&startup)
+            .await
+            .expect("write plaintext StartupMessage");
+
+        let (message_type, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            raw_read_message(&mut stream),
+        )
+        .await
+        .expect("startup FATAL response");
+        assert_eq!(
+            message_type, b'E',
+            "authentication must not begin on plaintext"
+        );
+        assert!(
+            body.windows(b"TLS is required".len())
+                .any(|window| window == b"TLS is required"),
+            "unexpected ErrorResponse: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_listener_rejects_raw_notls_startup_before_auth() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let db = LaminarDB::open().expect("db opens");
+        db.start().await.expect("db starts");
+        let (bound, handle) = super::serve(
+            Arc::clone(&db),
+            "0.0.0.0:0",
+            md5_users(),
+            true,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: None,
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("remote TLS listener");
+
+        assert_plaintext_startup_is_fatal(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            bound.port(),
+        )))
+        .await;
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn client_ca_requires_tls_on_loopback() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let pki = mint_ca_and_client_leaf("alice");
+        let db = LaminarDB::open().expect("db opens");
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&pki.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("mTLS listener");
+
+        assert_plaintext_startup_is_fatal(addr).await;
+        handle.abort();
+    }
+
     /// Self-signed cert with notAfter in the past, for the expiry test.
     fn expired_self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
@@ -2743,7 +3496,7 @@ mod integration_tests {
     #[tokio::test]
     async fn tls_load_rejects_expired_cert() {
         let (_dir, cert_path, key_path) = expired_self_signed_pem();
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.start().await.expect("db starts");
         let err = super::serve(
             Arc::clone(&db),
@@ -2767,7 +3520,7 @@ mod integration_tests {
     #[tokio::test]
     async fn tls_min_1_3_rejects_tls_1_2_client() {
         let (_dir, cert_path, key_path) = self_signed_pem();
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.start().await.expect("db starts");
         let (addr, handle) = super::serve(
             Arc::clone(&db),
@@ -2829,7 +3582,7 @@ mod integration_tests {
     #[tokio::test]
     async fn tls_handshake_succeeds() {
         let (_dir, cert_path, key_path) = self_signed_pem();
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.start().await.expect("db starts");
         let (addr, handle) = super::serve(
             Arc::clone(&db),
@@ -2891,7 +3644,7 @@ mod integration_tests {
     async fn mtls_rejects_client_without_cert() {
         let (_dir, cert_path, key_path) = self_signed_pem();
         let pki = mint_ca_and_client_leaf("alice");
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.start().await.expect("db starts");
         let (addr, handle) = super::serve(
             Arc::clone(&db),
@@ -2936,7 +3689,7 @@ mod integration_tests {
         let (_dir, cert_path, key_path) = self_signed_pem();
         let trusted = mint_ca_and_client_leaf("trusted");
         let stranger = mint_ca_and_client_leaf("stranger");
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.start().await.expect("db starts");
         let (addr, handle) = super::serve(
             Arc::clone(&db),
@@ -2991,7 +3744,7 @@ mod integration_tests {
     async fn mtls_accepts_trusted_client_cert() {
         let (_dir, cert_path, key_path) = self_signed_pem();
         let pki = mint_ca_and_client_leaf("alice");
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.start().await.expect("db starts");
         let (addr, handle) = super::serve(
             Arc::clone(&db),
@@ -3151,7 +3904,7 @@ mod integration_tests {
         std::net::SocketAddr,
         tokio::task::JoinHandle<()>,
     ) {
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
             .await
             .expect("create source");
@@ -3185,7 +3938,7 @@ mod integration_tests {
         std::net::SocketAddr,
         tokio::task::JoinHandle<()>,
     ) {
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
             .await
             .expect("create source");
@@ -3225,11 +3978,317 @@ mod integration_tests {
             .expect("prepare SUBSCRIBE prices");
 
         let cols = stmt.columns();
-        assert_eq!(cols.len(), 2, "expected 2 columns, got {}", cols.len());
+        assert_eq!(cols.len(), 8, "expected 8 columns, got {}", cols.len());
         assert_eq!(cols[0].name(), "symbol");
         assert_eq!(cols[1].name(), "price");
         assert_eq!(cols[0].type_(), &tokio_postgres::types::Type::VARCHAR);
         assert_eq!(cols[1].type_(), &tokio_postgres::types::Type::FLOAT8);
+        assert_eq!(cols[2].name(), SUBSCRIPTION_KIND_COLUMN);
+        assert_eq!(cols[3].name(), SUBSCRIPTION_EPOCH_COLUMN);
+        assert_eq!(cols[4].name(), SUBSCRIPTION_CHECKPOINT_COLUMN);
+        assert_eq!(cols[5].name(), SUBSCRIPTION_LOG_SEQUENCE_COLUMN);
+        assert_eq!(cols[6].name(), SUBSCRIPTION_ROW_INDEX_COLUMN);
+        assert_eq!(cols[7].name(), SUBSCRIPTION_THROUGH_SEQUENCE_COLUMN);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_zero_rejects_before_acquiring_subscription_slot() {
+        let (db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+        let stmt = client.prepare("SUBSCRIBE prices").await.expect("prepare");
+
+        let error = client
+            .query(&stmt, &[])
+            .await
+            .expect_err("Execute(0) must be rejected");
+        let db_error = error.as_db_error().expect("typed PG error");
+        assert_eq!(db_error.code().code(), "0A000");
+
+        let mut portals = Vec::new();
+        for _ in 0..64 {
+            portals.push(
+                db.open_subscription("prices", None, SubscribeStart::Tail)
+                    .await
+                    .expect("rejected Execute must not consume a slot"),
+            );
+        }
+        assert!(
+            db.open_subscription("prices", None, SubscribeStart::Tail)
+                .await
+                .is_err(),
+            "the configured 64-slot limit must still be enforced"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_obeys_transaction_scoped_portal_lifetime() {
+        let (_db, addr, handle) = spawn_with_data().await;
+
+        let mut outside = raw_connect(addr).await;
+        let bind = raw_parse_bind_sync(
+            &mut outside,
+            "outside_statement",
+            "outside_portal",
+            "SUBSCRIBE prices",
+        )
+        .await;
+        assert!(bind.iter().all(|message| message.0 != b'E'));
+        let execute = raw_execute_sync(&mut outside, "outside_portal", 1).await;
+        assert!(
+            execute.iter().any(|message| message.0 == b'E'),
+            "Sync outside BEGIN must end the implicit transaction and destroy portals"
+        );
+
+        let mut inside = raw_connect(addr).await;
+        let begin = raw_query(&mut inside, "BEGIN").await;
+        assert_eq!(
+            begin.last().and_then(|message| message.1.first()).copied(),
+            Some(b'T')
+        );
+        for (statement, portal) in [("named_statement", "named_portal"), ("", "")] {
+            let bind =
+                raw_parse_bind_sync(&mut inside, statement, portal, "SUBSCRIBE prices").await;
+            assert!(bind.iter().all(|message| message.0 != b'E'));
+            assert_eq!(
+                bind.last().and_then(|message| message.1.first()).copied(),
+                Some(b'T')
+            );
+
+            let execute = raw_execute_sync(&mut inside, portal, i32::MAX).await;
+            assert!(execute.iter().all(|message| message.0 != b'E'));
+            assert!(
+                execute.iter().any(|message| message.0 == b's'),
+                "bounded fetch must suspend without allocating from i32::MAX"
+            );
+        }
+        let rollback = raw_query(&mut inside, "ROLLBACK").await;
+        assert_eq!(
+            rollback
+                .last()
+                .and_then(|message| message.1.first())
+                .copied(),
+            Some(b'I')
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_subscription_fetch_and_releases_slot() {
+        let (db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+        let cancel = client.cancel_token();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let query = tokio::spawn(async move {
+            let mut client = client;
+            let tx = client.transaction().await.expect("BEGIN");
+            let statement = tx.prepare("SUBSCRIBE prices").await.expect("prepare");
+            let portal = tx.bind(&statement, &[]).await.expect("bind");
+            ready_tx.send(()).expect("signal query readiness");
+            let error = tx
+                .query_portal(&portal, 1)
+                .await
+                .expect_err("cancel must interrupt the fetch");
+            error
+                .as_db_error()
+                .map(|error| error.code().code().to_owned())
+        });
+
+        ready_rx.await.expect("query ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel
+            .cancel_query(NoTls)
+            .await
+            .expect("send CancelRequest");
+        let code = tokio::time::timeout(std::time::Duration::from_secs(3), query)
+            .await
+            .expect("cancel response")
+            .expect("query task");
+        assert_eq!(code.as_deref(), Some("57014"));
+
+        let mut portals = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while portals.len() < 64 {
+            match db
+                .open_subscription("prices", None, SubscribeStart::Tail)
+                .await
+            {
+                Ok(portal) => portals.push(portal),
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("cancel did not release subscription slot: {error}"),
+            }
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn extended_query_emits_committed_checkpoint_progress() {
+        let checkpoint_dir = tempfile::tempdir().expect("checkpoint tempdir");
+        let db = LaminarDB::open_with_config(laminar_db::LaminarConfig {
+            checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                data_dir: Some(checkpoint_dir.path().to_path_buf()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("db opens");
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+        let mut client = connect(addr).await;
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx.prepare("SUBSCRIBE prices").await.expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind portal");
+
+        let pusher = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                push_one_trade(&db, "AAPL", 150.0).await;
+            }
+        });
+        let mut rows = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tx.query_portal(&portal, 1),
+        )
+        .await
+        .expect("data row arrives")
+        .expect("query portal");
+        pusher.await.expect("pusher");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let committed = db.checkpoint().await.expect("checkpoint");
+        rows.extend(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tx.query_portal(&portal, 1),
+            )
+            .await
+            .expect("progress row arrives")
+            .expect("query portal"),
+        );
+
+        assert!(committed.success, "checkpoint must commit");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<_, &str>(0), "AAPL");
+        assert_eq!(rows[0].get::<_, &str>(2), "data");
+        assert!(rows[0].get::<_, Option<&str>>(3).is_none());
+        assert!(rows[0].get::<_, Option<&str>>(4).is_none());
+        assert_eq!(rows[0].get::<_, &str>(5), "0");
+        assert_eq!(rows[0].get::<_, &str>(6), "0");
+        assert!(rows[0].get::<_, Option<&str>>(7).is_none());
+        assert!(rows[1].get::<_, Option<&str>>(0).is_none());
+        assert!(rows[1].get::<_, Option<f64>>(1).is_none());
+        assert_eq!(rows[1].get::<_, &str>(2), "progress");
+        assert_eq!(rows[1].get::<_, &str>(3), committed.epoch.to_string());
+        assert_eq!(
+            rows[1].get::<_, &str>(4),
+            committed.checkpoint_id.to_string()
+        );
+        assert_eq!(rows[1].get::<_, &str>(5), "1");
+        assert!(rows[1].get::<_, Option<&str>>(6).is_none());
+        assert_eq!(rows[1].get::<_, &str>(7), "1");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_subscribe_rejects_drop_recreate_schema_change() {
+        let (db, addr, handle) = spawn_with_data().await;
+        let mut client = connect(addr).await;
+
+        let stmt = client
+            .prepare("SUBSCRIBE prices")
+            .await
+            .expect("prepare old result type");
+        db.execute("DROP MATERIALIZED VIEW prices")
+            .await
+            .expect("drop old view");
+        db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol FROM trades")
+            .await
+            .expect("create changed view");
+
+        let tx = client.transaction().await.expect("BEGIN");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind cached statement");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tx.query_portal(&portal, 1),
+        )
+        .await
+        .expect("schema fence responds")
+        .expect_err("cached result type must not execute");
+        let db_error = error.as_db_error().expect("typed PG error");
+        assert_eq!(db_error.code().code(), "0A000");
+        assert_eq!(db_error.message(), "cached result type changed");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn abrupt_disconnect_releases_named_cursor_subscription_slot() {
+        let (db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+        client.simple_query("BEGIN").await.expect("BEGIN");
+        client
+            .simple_query("DECLARE abandoned CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect("DECLARE");
+        drop(client);
+
+        let mut portals = Vec::new();
+        for _ in 0..63 {
+            portals.push(
+                db.open_subscription("prices", None, SubscribeStart::Tail)
+                    .await
+                    .expect("63 direct slots remain"),
+            );
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match db
+                .open_subscription("prices", None, SubscribeStart::Tail)
+                .await
+            {
+                Ok(portal) => {
+                    portals.push(portal);
+                    break;
+                }
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("disconnect did not release cursor slot: {error}"),
+            }
+        }
+        assert_eq!(portals.len(), 64);
+        assert!(
+            db.open_subscription("prices", None, SubscribeStart::Tail)
+                .await
+                .is_err(),
+            "the 64-slot limit remains enforced"
+        );
 
         handle.abort();
     }
@@ -3318,7 +4377,7 @@ mod integration_tests {
     /// the first row.
     #[tokio::test]
     async fn extended_query_binary_timestamp() {
-        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let db = LaminarDB::open().expect("db opens");
         // `WATERMARK FOR ts AS ts - INTERVAL '0' SECOND` declares event time
         // so the streaming pipeline drives progress on the timestamp
         // column — without it, the MV stays empty.
@@ -3451,6 +4510,71 @@ mod integration_tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn cursor_requires_explicit_transaction() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        let error = client
+            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect_err("DECLARE outside BEGIN must fail");
+        let db_error = error.as_db_error().expect("typed PG error");
+        assert_eq!(db_error.code().code(), "25001");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cursor_rejects_unbounded_and_oversized_fetches() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        for (sql, code) in [
+            ("FETCH ALL FROM c", "0A000"),
+            ("FETCH 1025 FROM c", "22023"),
+        ] {
+            client.simple_query("BEGIN").await.expect("BEGIN");
+            client
+                .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+                .await
+                .expect("DECLARE");
+            let error = client.simple_query(sql).await.expect_err("FETCH must fail");
+            let db_error = error.as_db_error().expect("typed PG error");
+            assert_eq!(db_error.code().code(), code, "{sql}: {db_error:?}");
+            client.simple_query("ROLLBACK").await.expect("ROLLBACK");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn quiet_cursor_fetch_returns_a_bounded_empty_poll() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+        client.simple_query("BEGIN").await.expect("BEGIN");
+        client
+            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect("DECLARE");
+
+        let started = tokio::time::Instant::now();
+        let messages = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.simple_query("FETCH 1 FROM c"),
+        )
+        .await
+        .expect("bounded poll must return")
+        .expect("FETCH");
+        assert!(messages
+            .iter()
+            .all(|message| !matches!(message, SimpleQueryMessage::Row(_))));
+        assert!(started.elapsed() >= SUBSCRIPTION_FETCH_WAIT);
+        client.simple_query("ROLLBACK").await.expect("ROLLBACK");
+
+        handle.abort();
+    }
+
     /// COMMIT must close any open cursors. After COMMIT, FETCH against the
     /// same name returns "cursor does not exist".
     #[tokio::test]
@@ -3464,6 +4588,7 @@ mod integration_tests {
             .await
             .expect("DECLARE");
         client.simple_query("COMMIT").await.expect("COMMIT");
+        client.simple_query("BEGIN").await.expect("BEGIN again");
 
         let err = client
             .simple_query("FETCH 1 FROM c")
@@ -3487,6 +4612,7 @@ mod integration_tests {
             .await
             .expect("DECLARE");
         client.simple_query("ROLLBACK").await.expect("ROLLBACK");
+        client.simple_query("BEGIN").await.expect("BEGIN again");
 
         let err = client
             .simple_query("FETCH 1 FROM c")
@@ -3498,13 +4624,13 @@ mod integration_tests {
         handle.abort();
     }
 
-    /// Explicit CLOSE works outside a transaction. PG allows DECLARE without
-    /// BEGIN; we follow that for parity with `\set FETCH_COUNT 0` clients.
+    /// Explicit CLOSE destroys the cursor while its transaction remains open.
     #[tokio::test]
     async fn cursor_close_explicit() {
         let (_db, addr, handle) = spawn_with_data().await;
         let client = connect(addr).await;
 
+        client.simple_query("BEGIN").await.expect("BEGIN");
         client
             .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
             .await
@@ -3555,11 +4681,6 @@ mod integration_tests {
         let (_db, addr, handle) = spawn_with_data().await;
         let client = connect(addr).await;
 
-        client
-            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
-            .await
-            .expect("DECLARE");
-
         for sql in [
             "FETCH PRIOR FROM c",
             "FETCH BACKWARD 1 FROM c",
@@ -3568,15 +4689,19 @@ mod integration_tests {
             "FETCH ABSOLUTE 1 FROM c",
             "FETCH RELATIVE 1 FROM c",
         ] {
+            client.simple_query("BEGIN").await.expect("BEGIN");
+            client
+                .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+                .await
+                .expect("DECLARE");
             let err = client
                 .simple_query(sql)
                 .await
                 .expect_err(&format!("{sql} must fail"));
             let db_err = err.as_db_error().expect("typed PG error");
             assert_eq!(db_err.code().code(), "0A000", "{sql}: got {db_err:?}");
+            client.simple_query("ROLLBACK").await.expect("ROLLBACK");
         }
-
-        client.simple_query("CLOSE c").await.expect("CLOSE");
         handle.abort();
     }
 
@@ -3603,6 +4728,7 @@ mod integration_tests {
         let (_db, addr, handle) = spawn_with_data().await;
         let client = connect(addr).await;
 
+        client.simple_query("BEGIN").await.expect("BEGIN");
         let err = client
             .simple_query("FETCH 1 FROM nope")
             .await
@@ -3633,6 +4759,7 @@ mod integration_tests {
         .expect("batch");
         src.push_arrow(batch).expect("push");
 
+        client.simple_query("BEGIN").await.expect("BEGIN");
         client
             .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
             .await
@@ -3665,6 +4792,7 @@ mod integration_tests {
         assert_eq!(r2, vec!["GOOG"]);
 
         client.simple_query("CLOSE c").await.expect("CLOSE");
+        client.simple_query("COMMIT").await.expect("COMMIT");
         handle.abort();
     }
 
@@ -3674,6 +4802,7 @@ mod integration_tests {
         let (_db, addr, handle) = spawn_with_data().await;
         let client = connect(addr).await;
 
+        client.simple_query("BEGIN").await.expect("BEGIN");
         client
             .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
             .await
@@ -3686,13 +4815,14 @@ mod integration_tests {
         let db_err = err.as_db_error().expect("typed PG error");
         assert_eq!(db_err.code().code(), "42P03", "got {db_err:?}");
 
-        // After CLOSE the name is free again.
-        client.simple_query("CLOSE c").await.expect("CLOSE");
+        client.simple_query("ROLLBACK").await.expect("ROLLBACK");
+        client.simple_query("BEGIN").await.expect("BEGIN");
         client
             .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
             .await
-            .expect("re-DECLARE after CLOSE");
-        client.simple_query("CLOSE c").await.expect("CLOSE again");
+            .expect("re-DECLARE after transaction rollback");
+        client.simple_query("CLOSE c").await.expect("CLOSE");
+        client.simple_query("COMMIT").await.expect("COMMIT");
 
         handle.abort();
     }
@@ -3704,6 +4834,7 @@ mod integration_tests {
         let client = connect(addr).await;
         push_one_trade(&db, "AAPL", 1.0).await;
 
+        client.simple_query("BEGIN").await.expect("BEGIN");
         client
             .simple_query("DECLARE MyCursor CURSOR FOR SUBSCRIBE prices")
             .await
@@ -3720,6 +4851,7 @@ mod integration_tests {
         assert_eq!(row_count, 1);
 
         client.simple_query("CLOSE MYCURSOR").await.expect("CLOSE");
+        client.simple_query("COMMIT").await.expect("COMMIT");
         handle.abort();
     }
 }

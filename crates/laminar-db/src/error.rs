@@ -53,6 +53,26 @@ pub enum DbError {
     /// Invalid SQL statement for the operation
     InvalidOperation(String),
 
+    /// Requested subscription epoch has committed but its replay suffix was pruned.
+    SubscriptionReplayPruned {
+        /// Subscription object name.
+        name: String,
+        /// Checkpoint epoch requested by the subscriber.
+        requested: u64,
+        /// Earliest checkpoint epoch whose cut remains replayable.
+        earliest_retained: u64,
+    },
+
+    /// Requested subscription epoch has not committed.
+    SubscriptionEpochNotCommitted {
+        /// Subscription object name.
+        name: String,
+        /// Checkpoint epoch requested by the subscriber.
+        requested: u64,
+        /// Newest durably committed checkpoint epoch, if one exists.
+        latest_committed: Option<u64>,
+    },
+
     /// SQL parse error (from streaming parser)
     SqlParse(#[from] laminar_sql::parser::ParseError),
 
@@ -84,11 +104,20 @@ pub enum DbError {
     /// Recoverable — `OperatorGraph::execute_single_operator` defers on it.
     ShuffleNotReady(String),
 
-    /// A cross-node shuffle send failed AFTER some peers already received this cycle's rows (a
-    /// partial send). Unlike [`Self::ShuffleNotReady`], this must NOT be replayed locally — a retry
-    /// would re-send to the peers that already folded (double-count). Under exactly-once /
-    /// coordinated recovery it faults for a rewind-all domain replay; otherwise the cycle is dropped.
+    /// A permanent structural shuffle-routing failure. Retrying or restoring the same input cannot
+    /// repair it, so the pipeline must halt instead of entering a recovery loop.
+    ShuffleTerminal(String),
+
+    /// A cross-node shuffle send failed after an earlier frame was admitted to the transport and
+    /// may reach its peer. Unlike [`Self::ShuffleNotReady`], this must not be replayed locally: a
+    /// retry could double-fold the admitted rows. Recovery rewinds the complete failure domain to a
+    /// durable cut before replay.
     ShufflePartialSend(String),
+
+    /// A stateful operator admitted input before a later step in the same cycle failed. The graph
+    /// must not replay that input against the mutated local state; recovery rewinds the failure
+    /// domain to its last durable cut.
+    StatefulOperatorPartialApply(String),
 
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
@@ -179,7 +208,10 @@ impl DbError {
             Self::SinkAlreadyExists(_) => error_codes::SINK_ALREADY_EXISTS,
             Self::InsertError(_) => error_codes::CONNECTOR_WRITE_ERROR,
             Self::SchemaMismatch(_) => error_codes::SCHEMA_MISMATCH,
-            Self::InvalidOperation(_) | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
+            Self::InvalidOperation(_)
+            | Self::SubscriptionReplayPruned { .. }
+            | Self::SubscriptionEpochNotCommitted { .. }
+            | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
             Self::Shutdown => error_codes::SHUTDOWN,
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
@@ -187,7 +219,9 @@ impl DbError {
             Self::Pipeline(_)
             | Self::BackpressureFail(_)
             | Self::ShuffleNotReady(_)
-            | Self::ShufflePartialSend(_) => error_codes::PIPELINE_ERROR,
+            | Self::ShuffleTerminal(_)
+            | Self::ShufflePartialSend(_)
+            | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
@@ -201,12 +235,21 @@ impl DbError {
         matches!(self, Self::ShuffleNotReady(_))
     }
 
-    /// `true` for errors whose input must NOT be preserved for local replay (a retry would
-    /// duplicate already-emitted effects) — currently a partial shuffle send. The operator graph
-    /// drops the input instead of holding it under shared-source isolation.
+    /// `true` when retry or recovery cannot repair the current input and the pipeline must stop.
     #[must_use]
-    pub fn must_not_replay(&self) -> bool {
-        matches!(self, Self::ShufflePartialSend(_))
+    pub fn requires_pipeline_halt(&self) -> bool {
+        matches!(self, Self::BackpressureFail(_) | Self::ShuffleTerminal(_))
+    }
+
+    /// `true` when failure-domain isolation cannot safely keep the current pipeline alive.
+    #[must_use]
+    pub fn requires_pipeline_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::Checkpoint(_)
+                | Self::ShufflePartialSend(_)
+                | Self::StatefulOperatorPartialApply(_)
+        )
     }
 
     /// Whether this error is transient (retryable).
@@ -269,6 +312,31 @@ impl std::fmt::Display for DbError {
             Self::InvalidOperation(msg) => {
                 write!(f, "[{}] Invalid operation: {msg}", self.code())
             }
+            Self::SubscriptionReplayPruned {
+                name,
+                requested,
+                earliest_retained,
+            } => write!(
+                f,
+                "[{}] Epoch {requested} for stream '{name}' is no longer retained (earliest retained is {earliest_retained})",
+                self.code()
+            ),
+            Self::SubscriptionEpochNotCommitted {
+                name,
+                requested,
+                latest_committed,
+            } => match latest_committed {
+                Some(latest) => write!(
+                    f,
+                    "[{}] Epoch {requested} for stream '{name}' is not committed (latest committed is {latest})",
+                    self.code()
+                ),
+                None => write!(
+                    f,
+                    "[{}] Epoch {requested} for stream '{name}' is not committed (no committed epoch is available)",
+                    self.code()
+                ),
+            },
             Self::SqlParse(e) => write!(f, "SQL parse error: {e}"),
             Self::Shutdown => {
                 write!(f, "[{}] Database is shut down", self.code())
@@ -297,8 +365,18 @@ impl std::fmt::Display for DbError {
             Self::ShuffleNotReady(msg) => {
                 write!(f, "[{}] Shuffle target not ready: {msg}", self.code())
             }
+            Self::ShuffleTerminal(msg) => {
+                write!(f, "[{}] Terminal shuffle routing error: {msg}", self.code())
+            }
             Self::ShufflePartialSend(msg) => {
                 write!(f, "[{}] Shuffle partial send: {msg}", self.code())
+            }
+            Self::StatefulOperatorPartialApply(msg) => {
+                write!(
+                    f,
+                    "[{}] Stateful operator partial apply: {msg}",
+                    self.code()
+                )
             }
             Self::QueryPipeline {
                 context,

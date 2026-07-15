@@ -6,27 +6,41 @@ pub mod catalog_manifest;
 pub mod controller;
 pub mod leader;
 pub mod leader_lease;
+mod lease_deadline;
+pub mod process_lease;
 pub mod snapshot;
 
+pub use crate::checkpoint::{
+    CheckpointAssignmentAdoption, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+    LeaderProofOwner,
+};
 pub use barrier::{
     BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, InMemoryKv, Phase,
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
-pub use controller::{ClusterController, RecoverPhase};
+pub use controller::{
+    ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryRound, RecoveryRoundId,
+};
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe
 // 2PC). Callers that already qualify with `cluster::control::…` keep
 // working.
 pub use crate::checkpoint_decision::{CheckpointDecisionStore, DecisionError};
 pub use catalog_manifest::{
-    CatalogManifest, CatalogManifestEntry, CatalogManifestError, CatalogManifestStore,
+    CatalogManifest, CatalogManifestEntry, CatalogManifestError, CatalogManifestRef,
+    CatalogManifestStore, CatalogObjectKind, CatalogSealOutcome,
 };
 pub use leader::leader_of;
-#[cfg(feature = "cluster")]
-pub use leader_lease::lease_currently_grants;
 pub use leader_lease::{
-    lease_grants_leadership, LeaderLease, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
-    LeaseError, LeaseOutcome,
+    lease_grants_leadership, lease_grants_proof, AssignmentDrainDecision, AssignmentDrainVerdict,
+    ClusterCheckpointAuthorityError, ClusterOutcomeRetentionBoundary, LeaderLease,
+    LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseObservation, LeaderLeaseOwner,
+    LeaderLeaseStore, LeaseError, LeaseOutcome, RecordAssignmentDrainDecisionResult,
+};
+pub use lease_deadline::LeaseDeadline;
+pub use process_lease::{
+    ProcessLease, ProcessLeaseConfig, ProcessLeaseError, ProcessLeaseManager,
+    ProcessLeaseObservation, ProcessLeaseOutcome, ProcessLeaseStore,
 };
 pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError};
 

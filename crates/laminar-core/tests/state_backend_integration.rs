@@ -42,7 +42,7 @@ async fn config_roundtrip_in_process_local_object_store() {
         "file://{}",
         dir.path().display().to_string().replace('\\', "/")
     );
-    let c = StateBackendConfig::object_store(url, "node-0");
+    let c = StateBackendConfig::object_store(url);
     let b = c.build().await.unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::NodeDurable);
     b.write_partial(attempt, 0, 0, Bytes::from_static(b"c"))
@@ -59,7 +59,7 @@ async fn config_roundtrip_in_process_local_object_store() {
 /// one execution incarnation wins.
 ///
 #[tokio::test]
-async fn distributed_embedded_static_two_instances_shared_store() {
+async fn cluster_shared_two_instances_share_state_and_fence_seals() {
     use laminar_core::state::StateBackendError;
 
     let dir = tempdir().unwrap();
@@ -101,17 +101,17 @@ async fn distributed_embedded_static_two_instances_shared_store() {
     );
 
     assert!(node_a
-        .seal_checkpoint(attempt, 0, &[0, 1, 2, 3], &[])
+        .seal_checkpoint(attempt, None, &[0, 1, 2, 3], &[])
         .await
         .unwrap());
     assert!(node_a
-        .seal_checkpoint(attempt, 0, &[0, 1, 2, 3], &[])
+        .seal_checkpoint(attempt, None, &[0, 1, 2, 3], &[])
         .await
         .unwrap());
 
     // node_b loses — it must not keep driving the commit phase.
     let err = node_b
-        .seal_checkpoint(attempt, 0, &[0, 1, 2, 3], &[])
+        .seal_checkpoint(attempt, None, &[0, 1, 2, 3], &[])
         .await
         .unwrap_err();
     assert!(matches!(err, StateBackendError::Conflict { .. }));
@@ -122,7 +122,7 @@ async fn distributed_embedded_static_two_instances_shared_store() {
         .await
         .unwrap();
     assert!(!node_a
-        .seal_checkpoint(next, 0, &[0, 1, 2, 3], &[])
+        .seal_checkpoint(next, None, &[0, 1, 2, 3], &[])
         .await
         .unwrap());
 }

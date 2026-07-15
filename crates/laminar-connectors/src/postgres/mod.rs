@@ -12,13 +12,13 @@ pub use sink_metrics::PostgresSinkMetrics;
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
-
 use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `PostgreSQL` sink connector with the given registry.
-pub fn register_postgres_sink(registry: &ConnectorRegistry) {
+pub fn register_postgres_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "postgres-sink".to_string(),
         display_name: "PostgreSQL Sink".to_string(),
@@ -31,19 +31,12 @@ pub fn register_postgres_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "postgres-sink",
         info,
-        Arc::new(|_config, registry: Option<&prometheus::Registry>| {
-            // Default schema (overridden during open).
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Ok(Box::new(PostgresSink::new(
-                schema,
-                PostgresSinkConfig::default(),
-                registry,
-            )))
+        Arc::new(|config, registry: Option<&prometheus::Registry>| {
+            Ok(Box::new(PostgresSink::from_connector_config(
+                config, registry,
+            )?))
         }),
-    );
+    )
 }
 
 fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
@@ -65,14 +58,18 @@ fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
             "Comma-separated primary key columns (required for upsert mode)",
             "",
         ),
-        ConfigKeySpec::optional("batch.size", "Max records before flush", "4096"),
-        ConfigKeySpec::optional("flush.interval.ms", "Max time before flush (ms)", "1000"),
-        ConfigKeySpec::optional("pool.size", "Connection pool size", "4"),
+        ConfigKeySpec::optional("flush.interval.ms", "Max time before flush (ms)", "250"),
         ConfigKeySpec::optional("connect.timeout.ms", "Connection timeout (ms)", "10000"),
+        ConfigKeySpec::optional("statement.timeout.ms", "Statement timeout (ms)", "30000"),
         ConfigKeySpec::optional(
             "ssl.mode",
-            "SSL mode: disable/prefer/require/verify-ca/verify-full",
-            "prefer",
+            "Connection security: verify-full or explicit disable",
+            "verify-full",
+        ),
+        ConfigKeySpec::optional(
+            "ssl.ca.cert.path",
+            "PEM file with trusted CA certificates; defaults to webpki roots",
+            "",
         ),
         ConfigKeySpec::optional(
             "auto.create.table",
@@ -90,11 +87,30 @@ fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+    fn base_factory_config() -> crate::config::ConnectorConfig {
+        let mut config = crate::config::ConnectorConfig::new("postgres-sink");
+        config.set("hostname", "localhost");
+        config.set("database", "analytics");
+        config.set("username", "writer");
+        config.set("table.name", "events");
+        config
+    }
+
+    fn factory_config(schema: &SchemaRef) -> crate::config::ConnectorConfig {
+        let mut config = base_factory_config();
+        config.set(
+            "_arrow_schema",
+            crate::config::encode_arrow_schema_ipc(schema.as_ref()),
+        );
+        config
+    }
 
     #[test]
     fn test_register_postgres_sink() {
         let registry = ConnectorRegistry::new();
-        register_postgres_sink(&registry);
+        register_postgres_sink(&registry).unwrap();
 
         let info = registry.sink_info("postgres-sink");
         assert!(info.is_some());
@@ -130,19 +146,55 @@ mod tests {
         assert!(optional.contains(&"port"));
         assert!(optional.contains(&"write.mode"));
         assert!(optional.contains(&"primary.key"));
-        assert!(optional.contains(&"batch.size"));
+        assert!(!optional.contains(&"batch.size"));
+        assert!(!optional.contains(&"pool.size"));
         assert!(!optional.contains(&"delivery.guarantee"));
         assert!(optional.contains(&"changelog.mode"));
         assert!(optional.contains(&"ssl.mode"));
+        assert!(optional.contains(&"ssl.ca.cert.path"));
+        assert!(optional.contains(&"statement.timeout.ms"));
     }
 
     #[test]
     fn test_factory_creates_sink() {
         let registry = ConnectorRegistry::new();
-        register_postgres_sink(&registry);
+        register_postgres_sink(&registry).unwrap();
 
-        let config = crate::config::ConnectorConfig::new("postgres-sink");
-        let sink = registry.create_sink(&config, None);
-        assert!(sink.is_ok());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("sequence", DataType::Int64, false),
+            Field::new("enabled", DataType::Boolean, true),
+        ]));
+        let sink = registry
+            .create_sink(&factory_config(&schema), None)
+            .unwrap();
+        assert_eq!(sink.schema(), schema);
+    }
+
+    #[test]
+    fn test_factory_rejects_missing_or_malformed_arrow_schema() {
+        let registry = ConnectorRegistry::new();
+        register_postgres_sink(&registry).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let missing = base_factory_config();
+        let missing_error = registry
+            .create_sink(&missing, None)
+            .err()
+            .expect("missing schema must fail")
+            .to_string();
+        assert!(missing_error.contains("_arrow_schema"), "{missing_error}");
+
+        let mut malformed = factory_config(&schema);
+        malformed.set("_arrow_schema", "not-arrow-ipc");
+        let malformed_error = registry
+            .create_sink(&malformed, None)
+            .err()
+            .expect("malformed schema must fail")
+            .to_string();
+        assert!(
+            malformed_error.contains("invalid") && malformed_error.contains("_arrow_schema"),
+            "{malformed_error}"
+        );
     }
 }

@@ -10,9 +10,13 @@ disjoint-source win (1B v1) are in (commit `6d907a34`).
   (`pipeline_lifecycle.rs` `spawn_supervised_restart`, `pipeline_callback.rs`
   `fault_on_cycle_error`). ExactlyOnce → recover, AtLeastOnce → continue + metric.
 - **1A-cluster** — leader-coordinated global restart-to-epoch (`coordinated_recovery.rs`): on a
-  fault every node rewinds to the highest cluster-wide committed epoch. Soak-validated.
-- **Convergence gate (Notes 2/3)** — the leader publishes a converged verdict off the hot path
-  through a `watch`; the checkpoint gate is a local borrow, no per-checkpoint gossip.
+  fault the assignment- and process-incarnation-frozen roster rewinds to the highest cluster-wide
+  committed epoch, then opens intake only after an exact durable `Release`. The current protocol
+  requires the gossip and static-discovery fault matrices to pass before it is re-certified.
+- **Assignment certificate (Notes 2/3)** — every node publishes a version-bound,
+  owner-complete `CheckpointAssignmentFence` off the hot path through a `watch`; checkpoint
+  admission locally requires that exact assignment version and canonical participant roster, with
+  no per-checkpoint gossip.
 - **1B v1 — failure domains + disjoint-source isolation** (commit `6d907a34`).
   `compute_node_domains` (`operator_graph.rs`) union-finds the DAG into connected components
   (`node_domain`); sources join the domains that read them, so disjoint queries are separate

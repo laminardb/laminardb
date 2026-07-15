@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::reference::RefreshMode;
 
 use crate::error::DbError;
 
@@ -39,6 +38,8 @@ pub(crate) struct StreamRegistration {
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
     pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
+    pub has_analytic: bool,
+    pub has_frame: bool,
     /// Marks this MV to emit a dirty-only changelog into a keyed `Upsert` store. Decided at DDL
     /// time (`incremental_emit` flag + terminal non-windowed agg); drives operator + store mode.
     pub incremental: bool,
@@ -52,7 +53,8 @@ pub(crate) struct TableRegistration {
     pub connector_options: HashMap<String, String>,
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
-    pub refresh: Option<RefreshMode>,
+    /// Whether misses are served directly by a lookup-source factory.
+    pub on_demand: bool,
     pub cache_max_bytes: Option<usize>,
     pub cache_ttl: Option<std::time::Duration>,
 }
@@ -118,6 +120,16 @@ pub(crate) fn build_sink_config(
     reg: &SinkRegistration,
     delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
 ) -> Result<ConnectorConfig, DbError> {
+    if reg
+        .connector_options
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("delivery.guarantee"))
+    {
+        return Err(DbError::Connector(format!(
+            "Sink '{}' cannot set 'delivery.guarantee'; delivery is configured once for the pipeline",
+            reg.name
+        )));
+    }
     let mut config = build_connector_config(
         "Sink",
         &reg.name,
@@ -126,8 +138,7 @@ pub(crate) fn build_sink_config(
         reg.format.as_deref(),
         &reg.format_options,
     )?;
-    // Delivery is an end-to-end pipeline contract, not a per-sink option. Always overwrite a
-    // DDL-provided value so connector behaviour and runtime admission cannot diverge.
+    // Internal connector behavior follows the one pipeline-wide delivery contract.
     config.set("delivery.guarantee", delivery_guarantee.to_string());
     Ok(config)
 }
@@ -141,24 +152,6 @@ pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorCon
         reg.format.as_deref(),
         &reg.format_options,
     )
-}
-
-/// Parse DDL `WITH (refresh = '...')` into a `RefreshMode`.
-pub(crate) fn parse_refresh_mode(s: &str) -> Result<RefreshMode, DbError> {
-    let lower = s.to_lowercase();
-    match lower.as_str() {
-        "snapshot_only" | "snapshot" => Ok(RefreshMode::SnapshotOnly),
-        "cdc" | "snapshot_plus_cdc" => Ok(RefreshMode::SnapshotPlusCdc),
-        "manual" => Ok(RefreshMode::Manual),
-        _ if lower.starts_with("periodic:") => Err(DbError::Connector(format!(
-            "Refresh mode '{s}' is not implemented: the pipeline does not yet \
-             schedule periodic re-snapshots. Use 'cdc' for incremental updates \
-             or 'manual' for caller-driven refresh."
-        ))),
-        _ => Err(DbError::Connector(format!(
-            "Unknown refresh mode '{s}': expected snapshot_only, cdc, or manual"
-        ))),
-    }
 }
 
 /// Accumulates DDL registrations; pipeline lifecycle reads them at start.
@@ -384,6 +377,8 @@ mod tests {
             window_config: None,
             order_config: None,
             join_config: None,
+            has_analytic: false,
+            has_frame: false,
             incremental: false,
         });
         assert_eq!(mgr.stream_names(), vec!["agg_stream"]);
@@ -543,6 +538,8 @@ mod tests {
             window_config: None,
             order_config: None,
             join_config: None,
+            has_analytic: false,
+            has_frame: false,
             incremental: false,
         });
         assert!(mgr.unregister_sink("s1"));
@@ -562,7 +559,7 @@ mod tests {
             connector_options: HashMap::from([("topic".to_string(), "instruments".to_string())]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         });
@@ -580,7 +577,7 @@ mod tests {
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         });
@@ -599,7 +596,7 @@ mod tests {
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         });
@@ -678,10 +675,7 @@ mod tests {
             name: "output".to_string(),
             input: "events".to_string(),
             connector_type: Some("KAFKA".to_string()),
-            connector_options: HashMap::from([
-                ("topic".to_string(), "output".to_string()),
-                ("delivery.guarantee".to_string(), "exactly_once".to_string()),
-            ]),
+            connector_options: HashMap::from([("topic".to_string(), "output".to_string())]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             filter_expr: Some("id > 10".to_string()),
@@ -697,8 +691,33 @@ mod tests {
         assert_eq!(
             config.get("delivery.guarantee"),
             Some("at-least-once"),
-            "pipeline-wide delivery must override a per-sink DDL option"
+            "the runtime must inject the pipeline-wide delivery contract"
         );
+    }
+
+    #[test]
+    fn test_build_sink_config_rejects_per_sink_delivery() {
+        let reg = SinkRegistration {
+            name: "output".to_string(),
+            input: "events".to_string(),
+            connector_type: Some("kafka".to_string()),
+            connector_options: HashMap::from([(
+                "DELIVERY.GUARANTEE".to_string(),
+                "exactly-once".to_string(),
+            )]),
+            format: None,
+            format_options: HashMap::new(),
+            filter_expr: None,
+        };
+
+        let error = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .expect_err("per-sink delivery must not be silently overwritten");
+        let message = error.to_string();
+        assert!(message.contains("delivery.guarantee"), "{message}");
+        assert!(message.contains("pipeline"), "{message}");
     }
 
     #[test]
@@ -764,7 +783,7 @@ mod tests {
             connector_options: HashMap::from([("topic".to_string(), "instruments".to_string())]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         };
@@ -783,43 +802,12 @@ mod tests {
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         };
         let err = build_table_config(&reg).unwrap_err();
         assert!(err.to_string().contains("no connector type"));
-    }
-
-    #[test]
-    fn test_parse_refresh_mode_variants() {
-        assert_eq!(
-            parse_refresh_mode("snapshot_only").unwrap(),
-            RefreshMode::SnapshotOnly
-        );
-        assert_eq!(
-            parse_refresh_mode("snapshot").unwrap(),
-            RefreshMode::SnapshotOnly
-        );
-        assert_eq!(
-            parse_refresh_mode("cdc").unwrap(),
-            RefreshMode::SnapshotPlusCdc
-        );
-        assert_eq!(
-            parse_refresh_mode("snapshot_plus_cdc").unwrap(),
-            RefreshMode::SnapshotPlusCdc
-        );
-        assert_eq!(parse_refresh_mode("manual").unwrap(), RefreshMode::Manual);
-    }
-
-    #[test]
-    fn test_parse_refresh_mode_invalid() {
-        assert!(parse_refresh_mode("bogus").is_err());
-        // Periodic was advertised but never wired to a scheduler. Until
-        // it is, the parser rejects it loudly rather than letting the
-        // request land in pipeline_callback as a no-op.
-        assert!(parse_refresh_mode("periodic:60").is_err());
-        assert!(parse_refresh_mode("PERIODIC:30").is_err());
     }
 
     #[test]
@@ -844,8 +832,6 @@ mod tests {
     fn test_normalize_connector_type_hyphenated() {
         assert_eq!(normalize_connector_type("postgres-cdc"), "postgres-cdc");
         assert_eq!(normalize_connector_type("POSTGRES_CDC"), "postgres-cdc");
-        assert_eq!(normalize_connector_type("mysql-cdc"), "mysql-cdc");
-        assert_eq!(normalize_connector_type("MYSQL_CDC"), "mysql-cdc");
         assert_eq!(normalize_connector_type("postgres-sink"), "postgres-sink");
         assert_eq!(normalize_connector_type("POSTGRES_SINK"), "postgres-sink");
     }

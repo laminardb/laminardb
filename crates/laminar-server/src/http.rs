@@ -1,9 +1,9 @@
 //! HTTP API for LaminarDB server.
 
-use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use prometheus::Registry;
 
@@ -45,91 +45,15 @@ pub struct AppState {
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
-    /// Tracks ephemeral streams created by the console (`POST /api/v1/queries`)
-    /// so abandoned ones can be reaped.
-    pub ephemeral: Arc<EphemeralTracker>,
+    pub(crate) ws_slots: Arc<tokio::sync::Semaphore>,
     /// Cluster control-plane handles (cluster mode only). `None` in
     /// single-node mode; the cluster endpoints 404 when absent.
     #[cfg(feature = "cluster")]
     pub cluster: Option<ClusterComponents>,
 }
 
-// ---------------------------------------------------------------------------
-// Ephemeral console streams
-// ---------------------------------------------------------------------------
-
-/// How long an ephemeral console stream may sit `Pending` (created but never
-/// connected to over WebSocket) before its one-shot reaper task drops it.
-const EPHEMERAL_PENDING_TTL: Duration = Duration::from_secs(30);
-
-/// Cap on concurrent ephemeral console streams (each a real CREATE STREAM
-/// pipeline), so `POST /api/v1/queries` spam can't accumulate live pipelines.
-const MAX_EPHEMERAL_STREAMS: usize = 256;
-
-/// Lifecycle state of a console-managed ephemeral stream.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EphemeralState {
-    /// Created by `POST /api/v1/queries`, no WebSocket attached yet.
-    Pending,
-    /// A WebSocket client is (or was) attached.
-    Connected,
-}
-
-/// Tracks console-initiated ephemeral streams so abandoned ones (created but
-/// never connected) can be reaped after [`EPHEMERAL_PENDING_TTL`].
-#[derive(Default)]
-pub struct EphemeralTracker {
-    inner: parking_lot::Mutex<HashMap<String, EphemeralState>>,
-}
-
-impl EphemeralTracker {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Reserve a `Pending` slot, enforcing [`MAX_EPHEMERAL_STREAMS`] under the
-    /// lock; returns `false` (inserting nothing) when already at capacity.
-    fn try_add_pending(&self, name: String) -> bool {
-        let mut guard = self.inner.lock();
-        if guard.len() >= MAX_EPHEMERAL_STREAMS {
-            return false;
-        }
-        guard.insert(name, EphemeralState::Pending);
-        true
-    }
-
-    /// Marks a pending stream `Connected`; returns `false` if it wasn't tracked.
-    fn mark_connected(&self, name: &str) -> bool {
-        let mut guard = self.inner.lock();
-        if let Some(state) = guard.get_mut(name) {
-            *state = EphemeralState::Connected;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn remove(&self, name: &str) -> bool {
-        self.inner.lock().remove(name).is_some()
-    }
-
-    /// Removes `name` only if still `Pending`, so the reaper leaves a stream
-    /// that connected (or was already torn down) in the meantime untouched.
-    fn remove_if_pending(&self, name: &str) -> bool {
-        let mut guard = self.inner.lock();
-        if matches!(guard.get(name), Some(EphemeralState::Pending)) {
-            guard.remove(name);
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(test)]
-    fn is_tracked(&self, name: &str) -> bool {
-        self.inner.lock().contains_key(name)
-    }
+pub(crate) fn ws_connection_slots() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(MAX_WS_CONNECTIONS))
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -152,7 +76,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/streams/{name}", get(get_stream))
         .route("/api/v1/mvs", get(list_mvs))
         .route("/api/v1/connectors", get(list_connectors))
-        .route("/api/v1/queries", post(create_query))
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
@@ -314,6 +237,8 @@ struct CheckpointResponse {
     duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_disposition: Option<laminar_db::CheckpointFailureDisposition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,87 +462,6 @@ async fn list_connectors(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(ConnectorsResponse { sources, sinks })
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateQueryRequest {
-    sql: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateQueryResponse {
-    stream_id: String,
-    ws_url: String,
-}
-
-/// Generate a unique name for an ephemeral console stream. Combines a
-/// millisecond timestamp with a random suffix so concurrent requests don't
-/// collide. The leading `__console_` marks it as console-managed.
-fn console_stream_name() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let rand: u32 = rand::random();
-    format!("__console_{ts}_{rand:08x}")
-}
-
-/// Register an ad-hoc live query as an ephemeral stream and return the URL the
-/// console connects its WebSocket to. The stream is reaped on WS disconnect, or
-/// by a one-shot reaper task if no client connects within
-/// [`EPHEMERAL_PENDING_TTL`].
-async fn create_query(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateQueryRequest>,
-) -> impl IntoResponse {
-    let name = console_stream_name();
-
-    // Reserve a slot before any DDL so the cap is enforced up front; released
-    // below if CREATE STREAM fails.
-    if !state.ephemeral.try_add_pending(name.clone()) {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "too many ephemeral console queries in flight; retry shortly",
-        )
-        .into_response();
-    }
-
-    // Register as a physical CREATE STREAM (reaped on WS disconnect / TTL): the
-    // `/ws/{name}` subscription path can only bind to a catalog-registered stream.
-    let ddl = format!("CREATE STREAM {name} AS {}", req.sql);
-
-    match state.db.execute(&ddl).await {
-        Ok(_) => {
-            // Arm a one-shot reaper: if no WebSocket connects within the TTL,
-            // drop the still-`Pending` stream so an abandoned request can't
-            // leak it.
-            let tracker = Arc::clone(&state.ephemeral);
-            let db = Arc::clone(&state.db);
-            let name_clone = name.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(EPHEMERAL_PENDING_TTL).await;
-                if tracker.remove_if_pending(&name_clone) {
-                    let ddl = format!("DROP STREAM IF EXISTS {name_clone}");
-                    if let Err(e) = db.execute(&ddl).await {
-                        warn!(stream = %name_clone, error = %e, "failed to drop abandoned ephemeral stream");
-                    } else {
-                        info!(stream = %name_clone, "reaped abandoned ephemeral console stream");
-                    }
-                }
-            });
-
-            let ws_url = format!("/ws/{name}");
-            Json(CreateQueryResponse {
-                stream_id: name,
-                ws_url,
-            })
-            .into_response()
-        }
-        Err(e) => {
-            // The stream was never created, so free the reserved slot.
-            state.ephemeral.remove(&name);
-            error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
-        }
-    }
-}
-
 async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.checkpoint().await {
         Ok(result) => {
@@ -636,6 +480,7 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
                     epoch: result.epoch,
                     duration_ms,
                     error: result.error,
+                    failure_disposition: result.failure_disposition,
                 }),
             )
                 .into_response()
@@ -1106,35 +951,283 @@ async fn cluster_checkpoints(State(state): State<Arc<AppState>>) -> impl IntoRes
 // WebSocket stream subscriptions
 // ---------------------------------------------------------------------------
 
-const MAX_WS_CONNECTIONS: i64 = 10_000;
+const MAX_WS_CONNECTIONS: usize = 10_000;
+const MAX_WS_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_WS_CONTROL_FIELD_BYTES: usize = 4096;
+const MAX_WS_SUBSCRIPTION_ID_BYTES: usize = 1024;
+const MAX_WS_INBOUND_BYTES: usize = 4096;
 const WS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const WS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_UNANSWERED_WS_PINGS: u8 = 2;
+
+#[derive(Default)]
+struct WsPongDeadline {
+    unanswered: u8,
+}
+
+impl WsPongDeadline {
+    fn before_ping(&mut self) -> bool {
+        if self.unanswered >= MAX_UNANSWERED_WS_PINGS {
+            return false;
+        }
+        self.unanswered += 1;
+        true
+    }
+
+    fn on_pong(&mut self) {
+        self.unanswered = 0;
+    }
+}
+
+fn try_acquire_ws_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    Arc::clone(slots).try_acquire_owned().ok()
+}
+
+fn ws_error_json(name: &str, code: &str, message: &str, sequence: u64) -> String {
+    let out = serde_json::json!({
+        "type": "error",
+        "subscription_id": name,
+        "code": truncate_utf8(code, MAX_WS_CONTROL_FIELD_BYTES),
+        "message": truncate_utf8(message, MAX_WS_CONTROL_FIELD_BYTES),
+        "sequence": sequence.to_string(),
+    })
+    .to_string();
+    debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
+    out
+}
+
+fn ws_gap_json(name: &str, skipped: u64, sequence: u64) -> String {
+    let out = serde_json::json!({
+        "type": "gap",
+        "subscription_id": name,
+        "code": "subscription_lagged",
+        "message": format!("subscription lagged: skipped {skipped} messages"),
+        "skipped_messages": skipped.to_string(),
+        "sequence": sequence.to_string(),
+    })
+    .to_string();
+    debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
+    out
+}
+
+fn ws_progress_json(
+    name: &str,
+    epoch: u64,
+    checkpoint_id: u64,
+    log_sequence: u64,
+    through_sequence: u64,
+    sequence: u64,
+) -> String {
+    let out = serde_json::json!({
+        "type": "progress",
+        "subscription_id": name,
+        "epoch": epoch.to_string(),
+        "checkpoint_id": checkpoint_id.to_string(),
+        "log_sequence": log_sequence.to_string(),
+        "through_log_sequence": through_sequence.to_string(),
+        "sequence": sequence.to_string(),
+    })
+    .to_string();
+    debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
+    out
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WsFrameBuildError {
+    TooLarge,
+    Serialization(String),
+}
+
+#[derive(Default)]
+struct WsBatchFrameState {
+    /// First row not yet included in a completed frame.
+    offset: usize,
+    /// A row encoded while filling the previous frame that did not fit.
+    pending_row: Option<Vec<u8>>,
+}
+
+const WS_DATA_SUFFIX_FIXED_BYTES: usize =
+    r#"],"sequence":"","log_sequence":"","row_offset":"","row_count":""}"#.len();
+
+fn decimal_digits_u64(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
+fn decimal_digits_usize(value: usize) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
+fn ws_data_suffix_len(sequence: u64, log_sequence: u64, offset: usize, rows: usize) -> usize {
+    WS_DATA_SUFFIX_FIXED_BYTES
+        + decimal_digits_u64(sequence)
+        + decimal_digits_u64(log_sequence)
+        + decimal_digits_usize(offset)
+        + decimal_digits_usize(rows)
+}
+
+fn ws_data_suffix(sequence: u64, log_sequence: u64, offset: usize, rows: usize) -> String {
+    format!(
+        "],\"sequence\":\"{sequence}\",\"log_sequence\":\"{log_sequence}\",\"row_offset\":\"{offset}\",\"row_count\":\"{rows}\"}}"
+    )
+}
+
+fn next_ws_data_frame(
+    name: &str,
+    batch: &arrow_array::RecordBatch,
+    state: &mut WsBatchFrameState,
+    sequence: u64,
+    log_sequence: u64,
+) -> Result<Option<String>, WsFrameBuildError> {
+    if state.offset >= batch.num_rows() {
+        debug_assert!(state.pending_row.is_none());
+        return Ok(None);
+    }
+
+    let subid = serde_json::to_string(name)
+        .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
+    let prefix = format!("{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":[");
+    let frame_offset = state.offset;
+    if prefix
+        .len()
+        .saturating_add(ws_data_suffix_len(sequence, log_sequence, frame_offset, 1))
+        >= MAX_WS_FRAME_BYTES
+    {
+        return Err(WsFrameBuildError::TooLarge);
+    }
+
+    // Build one root encoder per output frame. It is deliberately local so no
+    // non-Send Arrow encoder is retained across the socket write await.
+    let root = arrow_array::StructArray::from(batch.clone());
+    let root_field = Arc::new(arrow_schema::Field::new_struct(
+        "",
+        batch.schema().fields().clone(),
+        false,
+    ));
+    let options = exact_json_encoder_options();
+    let mut encoder = arrow_json::writer::make_encoder(&root_field, &root, &options)
+        .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
+
+    let mut bytes = Vec::with_capacity(MAX_WS_FRAME_BYTES.min(prefix.len() + 16 * 1024));
+    bytes.extend_from_slice(prefix.as_bytes());
+    let mut rows = 0_usize;
+
+    while state.offset < batch.num_rows() {
+        let row = state.pending_row.take().unwrap_or_else(|| {
+            let mut row = Vec::new();
+            encoder.encode(state.offset, &mut row);
+            row
+        });
+        let separator_bytes = usize::from(rows != 0);
+        let candidate_rows = rows + 1;
+        let candidate_len = bytes
+            .len()
+            .saturating_add(separator_bytes)
+            .saturating_add(row.len())
+            .saturating_add(ws_data_suffix_len(
+                sequence,
+                log_sequence,
+                frame_offset,
+                candidate_rows,
+            ));
+
+        if candidate_len > MAX_WS_FRAME_BYTES {
+            if rows == 0 {
+                return Err(WsFrameBuildError::TooLarge);
+            }
+            state.pending_row = Some(row);
+            break;
+        }
+
+        if separator_bytes != 0 {
+            bytes.push(b',');
+        }
+        bytes.extend_from_slice(&row);
+        state.offset += 1;
+        rows = candidate_rows;
+    }
+
+    debug_assert!(rows > 0);
+    bytes.extend_from_slice(ws_data_suffix(sequence, log_sequence, frame_offset, rows).as_bytes());
+    debug_assert!(bytes.len() <= MAX_WS_FRAME_BYTES);
+    let frame = String::from_utf8(bytes)
+        .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
+    Ok(Some(frame))
+}
+
+async fn ws_send(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WsSubscribeParams {
+    as_of_epoch: Option<u64>,
+}
 
 async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    Query(params): Query<WsSubscribeParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    if state.server_metrics.ws_connections.get() >= MAX_WS_CONNECTIONS {
+    if name.is_empty() || name.len() > MAX_WS_SUBSCRIPTION_ID_BYTES {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "WebSocket subscription name must contain 1..={MAX_WS_SUBSCRIPTION_ID_BYTES} UTF-8 bytes"
+            ),
+        )
+        .into_response();
+    }
+    let Some(slot) = try_acquire_ws_slot(&state.ws_slots) else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "too many WebSocket connections".to_string(),
         )
         .into_response();
-    }
+    };
 
-    if !state.db.streams().iter().any(|s| s.name == name) {
-        return error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
-            .into_response();
-    }
-
-    // Each WS client gets its own broadcast subscription — fan-out is in the Sink.
-    let portal = match state
-        .db
-        .open_subscription(&name, None, laminar_db::subscription::SubscribeStart::Tail)
-        .await
-    {
+    let start = params.as_of_epoch.map_or(
+        laminar_db::subscription::SubscribeStart::Tail,
+        laminar_db::subscription::SubscribeStart::AsOfEpoch,
+    );
+    let portal = match state.db.open_subscription(&name, None, start).await {
         Ok(p) => p,
-        Err(_) => {
+        Err(laminar_db::DbError::StreamNotFound(_)) => {
+            return error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
+                .into_response();
+        }
+        Err(error @ laminar_db::DbError::SubscriptionReplayPruned { .. }) => {
+            return error_response(StatusCode::GONE, error.to_string()).into_response();
+        }
+        Err(error @ laminar_db::DbError::SubscriptionEpochNotCommitted { .. }) => {
+            return error_response(StatusCode::CONFLICT, error.to_string()).into_response();
+        }
+        Err(error) => {
+            warn!(stream = %name, error = %error, "failed to open WebSocket subscription");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to subscribe to '{name}'"),
@@ -1144,27 +1237,15 @@ async fn ws_upgrade(
     };
 
     let st = Arc::clone(&state);
-    ws.on_upgrade(move |socket| async move {
-        // If this is a console-initiated ephemeral stream, transition it to
-        // `Connected` so the GC task won't reap it while a client is attached.
-        let is_console = st.ephemeral.mark_connected(&name);
-
-        st.server_metrics.ws_connections.inc();
-        ws_client(socket, portal, name.clone()).await;
-        st.server_metrics.ws_connections.dec();
-
-        // On disconnect, tear down the ephemeral stream so it doesn't linger
-        // after the console tab that owned it goes away.
-        if is_console {
-            let ddl = format!("DROP STREAM IF EXISTS {name}");
-            if let Err(e) = st.db.execute(&ddl).await {
-                warn!(stream = %name, error = %e, "failed to drop ephemeral stream on disconnect");
-            }
-            st.ephemeral.remove(&name);
-            info!(stream = %name, "dropped ephemeral console stream on disconnect");
-        }
-    })
-    .into_response()
+    ws.max_message_size(MAX_WS_INBOUND_BYTES)
+        .max_frame_size(MAX_WS_INBOUND_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _slot = slot;
+            st.server_metrics.ws_connections.inc();
+            ws_client(socket, portal, name).await;
+            st.server_metrics.ws_connections.dec();
+        })
+        .into_response()
 }
 
 async fn ws_client(
@@ -1174,52 +1255,106 @@ async fn ws_client(
 ) {
     let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pong_deadline = WsPongDeadline::default();
     let mut seq: u64 = 0;
 
-    loop {
+    'subscription: loop {
         tokio::select! {
-            biased;
             frame = portal.next_frame() => {
                 match frame {
-                    Some(laminar_db::subscription::PortalFrame::Batch(batch)) => {
+                    Some(laminar_db::subscription::PortalFrame::Batch {
+                        batch,
+                        sequence: log_sequence,
+                        lease: _lease,
+                    }) => {
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        // Embed the already-serialized data array directly in the
-                        // envelope to skip a RawValue parse + reserialize per frame.
-                        let data_json = match batches_to_json_string(&[batch]) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                warn!(stream = %name, error = %e, "serialize error");
-                                continue;
+                        let mut frame_state = WsBatchFrameState::default();
+                        while frame_state.offset < batch.num_rows() {
+                            let out = match next_ws_data_frame(
+                                &name,
+                                &batch,
+                                &mut frame_state,
+                                seq,
+                                log_sequence,
+                            ) {
+                                Ok(Some(frame)) => frame,
+                                Ok(None) => break,
+                                Err(WsFrameBuildError::TooLarge) => {
+                                    let out = ws_error_json(
+                                        &name,
+                                        "row_too_large",
+                                        "one subscription row exceeds the WebSocket frame limit",
+                                        seq,
+                                    );
+                                    let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                                    break 'subscription;
+                                }
+                                Err(WsFrameBuildError::Serialization(error)) => {
+                                    warn!(stream = %name, error = %error, "serialize error");
+                                    let message = format!("subscription batch serialization failed: {error}");
+                                    let out = ws_error_json(
+                                        &name,
+                                        "serialization_failed",
+                                        &message,
+                                        seq,
+                                    );
+                                    let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                                    break 'subscription;
+                                }
+                            };
+                            if !ws_send(&mut socket, Message::Text(out.into())).await {
+                                break 'subscription;
                             }
-                        };
-                        // serde-escape the URL-derived name; data_json is valid JSON.
-                        let subid =
-                            serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".to_string());
-                        let out = format!(
-                            "{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":{data_json},\"sequence\":{seq}}}"
-                        );
-                        seq += 1;
-                        if socket.send(Message::Text(out.into())).await.is_err() {
-                            break;
+                            let Some(next) = seq.checked_add(1) else {
+                                break 'subscription;
+                            };
+                            seq = next;
                         }
                     }
-                    Some(laminar_db::subscription::PortalFrame::Barrier { .. }) => {
-                        // Checkpoint barriers have no WS wire representation.
-                        continue;
+                    Some(laminar_db::subscription::PortalFrame::Barrier {
+                        sequence: log_sequence,
+                        epoch,
+                        checkpoint_id,
+                        through_sequence,
+                    }) => {
+                        let out = ws_progress_json(
+                            &name,
+                            epoch,
+                            checkpoint_id,
+                            log_sequence,
+                            through_sequence,
+                            seq,
+                        );
+                        if !ws_send(&mut socket, Message::Text(out.into())).await {
+                            break;
+                        }
+                        let Some(next) = seq.checked_add(1) else {
+                            break;
+                        };
+                        seq = next;
                     }
                     Some(laminar_db::subscription::PortalFrame::Lagged(n)) => {
                         warn!(stream = %name, skipped = n, "WS client fell behind, disconnecting");
+                        let out = ws_gap_json(&name, n, seq);
+                        let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                        break;
+                    }
+                    Some(laminar_db::subscription::PortalFrame::Error { message }) => {
+                        warn!(stream = %name, error = %message, "WS subscription failed, disconnecting");
+                        let out = ws_error_json(&name, "subscription_failed", &message, seq);
+                        let _ = ws_send(&mut socket, Message::Text(out.into())).await;
                         break;
                     }
                     None => break, // disconnected
                 }
             }
             _ = heartbeat.tick() => {
-                // Native WebSocket Ping for liveness (client auto-Pongs); no
-                // app-level heartbeat message needed.
-                if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                if !pong_deadline.before_ping() {
+                    break;
+                }
+                if !ws_send(&mut socket, Message::Ping(bytes::Bytes::new())).await {
                     break;
                 }
             }
@@ -1229,20 +1364,156 @@ async fn ws_client(
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() { break; }
+                        if !ws_send(&mut socket, Message::Pong(data)).await { break; }
                     }
-                    _ => {}
+                    Some(Ok(Message::Pong(_))) => pong_deadline.on_pong(),
+                    Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                        let out = ws_error_json(
+                            &name,
+                            "unsupported_client_message",
+                            "subscription WebSocket accepts control frames only",
+                            seq,
+                        );
+                        let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        warn!(stream = %name, %error, "WebSocket receive failed");
+                        break;
+                    }
                 }
             }
         }
     }
+    let _ = ws_send(&mut socket, Message::Close(None)).await;
 }
 
-/// Serialize Arrow batches to a JSON array string via `arrow_json::ArrayWriter`.
-/// The single serialization pass shared by `batches_to_json_raw` and the WS path.
+const EXACT_DISPLAY_OPTIONS: arrow_cast::display::FormatOptions<'static> =
+    arrow_cast::display::FormatOptions::new().with_display_error(true);
+
+#[derive(Debug)]
+struct ExactJsonEncoderFactory;
+
+struct QuotedFormatterEncoder<'a> {
+    formatter: arrow_cast::display::ArrayFormatter<'a>,
+}
+
+impl arrow_json::writer::Encoder for QuotedFormatterEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        out.push(b'"');
+        write!(out, "{}", self.formatter.value(idx)).expect("writing to Vec cannot fail");
+        out.push(b'"');
+    }
+}
+
+fn encode_non_finite_float(value: f64, out: &mut Vec<u8>) -> bool {
+    let value = if value.is_nan() {
+        "\"NaN\""
+    } else if value == f64::INFINITY {
+        "\"Infinity\""
+    } else if value == f64::NEG_INFINITY {
+        "\"-Infinity\""
+    } else {
+        return false;
+    };
+    out.extend_from_slice(value.as_bytes());
+    true
+}
+
+struct Float16JsonEncoder<'a>(&'a arrow_array::Float16Array);
+
+impl arrow_json::writer::Encoder for Float16JsonEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let value = f32::from(self.0.value(idx));
+        if !encode_non_finite_float(f64::from(value), out) {
+            serde_json::to_writer(out, &value).expect("finite f32 is valid JSON");
+        }
+    }
+}
+
+struct Float32JsonEncoder<'a>(&'a arrow_array::Float32Array);
+
+impl arrow_json::writer::Encoder for Float32JsonEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let value = self.0.value(idx);
+        if !encode_non_finite_float(f64::from(value), out) {
+            serde_json::to_writer(out, &value).expect("finite f32 is valid JSON");
+        }
+    }
+}
+
+struct Float64JsonEncoder<'a>(&'a arrow_array::Float64Array);
+
+impl arrow_json::writer::Encoder for Float64JsonEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let value = self.0.value(idx);
+        if !encode_non_finite_float(value, out) {
+            serde_json::to_writer(out, &value).expect("finite f64 is valid JSON");
+        }
+    }
+}
+
+impl arrow_json::writer::EncoderFactory for ExactJsonEncoderFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        _field: &'a arrow_schema::FieldRef,
+        array: &'a dyn arrow_array::Array,
+        _options: &'a arrow_json::writer::EncoderOptions,
+    ) -> Result<Option<arrow_json::writer::NullableEncoder<'a>>, arrow_schema::ArrowError> {
+        use arrow_schema::DataType;
+
+        let encoder: Option<Box<dyn arrow_json::writer::Encoder + 'a>> = match array.data_type() {
+            // These types cannot be represented exactly by all JSON consumers.
+            DataType::Int64
+            | DataType::UInt64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _) => {
+                let formatter =
+                    arrow_cast::display::ArrayFormatter::try_new(array, &EXACT_DISPLAY_OPTIONS)?;
+                Some(Box::new(QuotedFormatterEncoder { formatter }))
+            }
+            DataType::Float16 => Some(Box::new(Float16JsonEncoder(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .expect("Float16 data type must use Float16Array"),
+            ))),
+            DataType::Float32 => Some(Box::new(Float32JsonEncoder(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .expect("Float32 data type must use Float32Array"),
+            ))),
+            DataType::Float64 => Some(Box::new(Float64JsonEncoder(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .expect("Float64 data type must use Float64Array"),
+            ))),
+            _ => None,
+        };
+
+        Ok(encoder.map(|encoder| {
+            arrow_json::writer::NullableEncoder::new(encoder, array.nulls().cloned())
+        }))
+    }
+}
+
+fn exact_json_encoder_options() -> arrow_json::writer::EncoderOptions {
+    arrow_json::writer::EncoderOptions::default()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(Arc::new(ExactJsonEncoderFactory))
+}
+
+/// Serialize Arrow batches using the same exact JSON value contract as WS data frames.
 fn batches_to_json_string(batches: &[arrow_array::RecordBatch]) -> Result<String, String> {
     let mut buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+    let mut writer = arrow_json::writer::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(Arc::new(ExactJsonEncoderFactory))
+        .build::<_, arrow_json::writer::JsonArray>(&mut buf);
     for batch in batches {
         writer.write(batch).map_err(|e| e.to_string())?;
     }
@@ -1289,13 +1560,12 @@ mod tests {
         assert_eq!((rows(&b), t), (5, true));
     }
 
-    fn test_state() -> Arc<AppState> {
+    fn test_state_with_db(db: Arc<LaminarDB>) -> Arc<AppState> {
         let registry = Arc::new(crate::metrics::build_registry([
             ("instance".into(), "test".into()),
             ("pipeline".into(), "test".into()),
         ]));
         let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
-        let db = Arc::new(LaminarDB::open().unwrap());
         db.set_engine_metrics(engine_metrics);
         let server_metrics = crate::metrics::ServerMetrics::new(&registry);
         Arc::new(AppState {
@@ -1320,10 +1590,14 @@ mod tests {
 
             registry,
             server_metrics,
-            ephemeral: Arc::new(EphemeralTracker::new()),
+            ws_slots: ws_connection_slots(),
             #[cfg(feature = "cluster")]
             cluster: None,
         })
+    }
+
+    fn test_state() -> Arc<AppState> {
+        test_state_with_db(LaminarDB::open().unwrap())
     }
 
     /// Like [`test_state`] but with a console bearer token configured, so the
@@ -1334,7 +1608,7 @@ mod tests {
             ("pipeline".into(), "test".into()),
         ]));
         let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
-        let db = Arc::new(LaminarDB::open().unwrap());
+        let db = LaminarDB::open().unwrap();
         db.set_engine_metrics(engine_metrics);
         let server_metrics = crate::metrics::ServerMetrics::new(&registry);
         let server = crate::config::ServerSection {
@@ -1362,7 +1636,7 @@ mod tests {
             reload_guard: ReloadGuard::new(),
             registry,
             server_metrics,
-            ephemeral: Arc::new(EphemeralTracker::new()),
+            ws_slots: ws_connection_slots(),
             #[cfg(feature = "cluster")]
             cluster: None,
         })
@@ -1702,7 +1976,7 @@ mod tests {
             ("instance".into(), "test".into()),
             ("pipeline".into(), "test".into()),
         ]));
-        let db = Arc::new(LaminarDB::open().unwrap());
+        let db = LaminarDB::open().unwrap();
         let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
         db.set_engine_metrics(engine_metrics);
         let server_metrics = crate::metrics::ServerMetrics::new(&registry);
@@ -1728,7 +2002,7 @@ mod tests {
 
             registry,
             server_metrics,
-            ephemeral: Arc::new(EphemeralTracker::new()),
+            ws_slots: ws_connection_slots(),
             #[cfg(feature = "cluster")]
             cluster: None,
         });
@@ -1841,128 +2115,269 @@ mod tests {
         assert!(json["sinks"].is_array(), "sinks should be an array");
     }
 
-    #[tokio::test]
-    async fn test_create_query_returns_stream_id_and_ws_url() {
-        let state = test_state();
-        let app = build_router(state.clone());
-
-        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/queries")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "SELECT * FROM events" }))
-                    .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let stream_id = json["stream_id"].as_str().expect("stream_id present");
-        assert!(
-            stream_id.starts_with("__console_"),
-            "unexpected stream_id: {stream_id}"
-        );
-        assert_eq!(json["ws_url"], format!("/ws/{stream_id}"));
-
-        // The ephemeral stream is registered and tracked as pending.
-        assert!(
-            state.db.streams().iter().any(|s| s.name == stream_id),
-            "ephemeral stream should be registered"
-        );
-        assert!(state.ephemeral.is_tracked(stream_id));
-    }
-
-    #[tokio::test]
-    async fn test_create_query_invalid_sql_returns_400() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/queries")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "NOT VALID SQL BLAH" })).unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// Unit test of the ephemeral-stream lifecycle the WS handler and reaper
-    /// task drive: pending → connected, removal, and pending-only reaping.
     #[test]
-    fn test_ephemeral_tracker_lifecycle() {
-        let tracker = EphemeralTracker::new();
+    fn test_ws_terminal_frames_expose_error_and_gap_details() {
+        let error: serde_json::Value = serde_json::from_str(&ws_error_json(
+            "orders",
+            "subscription_failed",
+            "bad filter",
+            7,
+        ))
+        .unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["subscription_id"], "orders");
+        assert_eq!(error["code"], "subscription_failed");
+        assert_eq!(error["message"], "bad filter");
+        assert_eq!(error["sequence"], "7");
 
-        // Unknown stream: not tracked, can't be marked connected or reaped.
-        assert!(!tracker.is_tracked("__console_x"));
-        assert!(!tracker.mark_connected("__console_x"));
-        assert!(!tracker.remove_if_pending("__console_x"));
+        let gap: serde_json::Value = serde_json::from_str(&ws_gap_json("orders", 12, 8)).unwrap();
+        assert_eq!(gap["type"], "gap");
+        assert_eq!(gap["code"], "subscription_lagged");
+        assert_eq!(gap["skipped_messages"], "12");
+        assert_eq!(gap["sequence"], "8");
 
-        // A pending stream is tracked and reaped by `remove_if_pending`.
-        assert!(tracker.try_add_pending("__console_x".to_string()));
-        assert!(tracker.is_tracked("__console_x"));
-        assert!(
-            tracker.remove_if_pending("__console_x"),
-            "a pending stream is reaped"
-        );
-        assert!(
-            !tracker.is_tracked("__console_x"),
-            "reaping stops tracking the stream"
-        );
-
-        // Once connected, the reaper must never drop it.
-        assert!(tracker.try_add_pending("__console_x".to_string()));
-        assert!(tracker.mark_connected("__console_x"));
-        assert!(
-            !tracker.remove_if_pending("__console_x"),
-            "a connected stream is never reaped"
-        );
-        assert!(
-            tracker.is_tracked("__console_x"),
-            "a connected stream stays tracked"
-        );
-
-        // Removal stops tracking.
-        assert!(tracker.remove("__console_x"));
-        assert!(!tracker.is_tracked("__console_x"));
-        assert!(!tracker.remove("__console_x"));
+        let progress: serde_json::Value =
+            serde_json::from_str(&ws_progress_json("orders", 9, 42, 8, 6, 10)).unwrap();
+        assert_eq!(progress["type"], "progress");
+        assert_eq!(progress["epoch"], "9");
+        assert_eq!(progress["checkpoint_id"], "42");
+        assert_eq!(progress["log_sequence"], "8");
+        assert_eq!(progress["through_log_sequence"], "6");
+        assert_eq!(progress["sequence"], "10");
     }
 
-    /// The cap rejects reservations past [`MAX_EPHEMERAL_STREAMS`]; a freed slot
-    /// is reusable.
     #[test]
-    fn test_ephemeral_tracker_caps_concurrent_streams() {
-        let tracker = EphemeralTracker::new();
+    fn ws_terminal_frames_bound_untrusted_text() {
+        let text = "\u{10ffff}".repeat(MAX_WS_CONTROL_FIELD_BYTES + 1);
+        let frame = ws_error_json(&text, &text, &text, 1);
+        assert!(frame.len() <= MAX_WS_FRAME_BYTES);
+        let parsed: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert!(parsed["message"].as_str().unwrap().len() <= MAX_WS_CONTROL_FIELD_BYTES);
+    }
 
-        for i in 0..MAX_EPHEMERAL_STREAMS {
-            assert!(
-                tracker.try_add_pending(format!("__console_{i}")),
-                "reservations below the cap succeed"
+    #[test]
+    fn ws_data_frames_split_before_the_wire_limit() {
+        use arrow_array::{Int32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let value = "x".repeat(MAX_WS_FRAME_BYTES / 2);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec![
+                    value.as_str(),
+                    value.as_str(),
+                    value.as_str(),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let mut state = WsBatchFrameState::default();
+        let mut sequence = 0;
+        let mut ids = Vec::new();
+        while state.offset < batch.num_rows() {
+            let expected_offset = state.offset;
+            let frame = next_ws_data_frame("large", &batch, &mut state, sequence, u64::MAX)
+                .unwrap()
+                .unwrap();
+            let consumed = state.offset - expected_offset;
+            assert!(frame.len() <= MAX_WS_FRAME_BYTES);
+            let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(json["sequence"], sequence.to_string());
+            assert_eq!(json["log_sequence"], u64::MAX.to_string());
+            assert_eq!(json["row_offset"], expected_offset.to_string());
+            assert_eq!(json["row_count"], consumed.to_string());
+            assert_eq!(json["data"].as_array().unwrap().len(), consumed);
+            ids.extend(
+                json["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_i64().unwrap()),
             );
+            sequence += 1;
         }
-
-        // At capacity the next reservation is rejected and inserts nothing.
-        assert!(
-            !tracker.try_add_pending("__console_overflow".to_string()),
-            "reservation at the cap is rejected"
+        assert!(sequence > 1, "oversized batches must be split");
+        assert_eq!(state.offset, batch.num_rows());
+        assert_eq!(ids, vec![0, 1, 2], "rows must not be duplicated or skipped");
+        assert!(state.pending_row.is_none());
+        assert_eq!(
+            next_ws_data_frame("large", &batch, &mut state, sequence, 99).unwrap(),
+            None
         );
-        assert!(!tracker.is_tracked("__console_overflow"));
+    }
 
-        // Freeing one slot lets exactly one more reservation through.
-        assert!(tracker.remove("__console_0"));
-        assert!(
-            tracker.try_add_pending("__console_overflow".to_string()),
-            "a freed slot is reusable"
+    #[test]
+    fn ws_data_frame_rejects_a_single_oversized_row() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let value = "x".repeat(MAX_WS_FRAME_BYTES);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+        )
+        .unwrap();
+        let mut state = WsBatchFrameState::default();
+        assert_eq!(
+            next_ws_data_frame("large", &batch, &mut state, 0, 0),
+            Err(WsFrameBuildError::TooLarge)
         );
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn http_and_ws_json_preserve_exact_nested_values_and_nulls() {
+        use arrow_array::builder::{Float64Builder, ListBuilder};
+        use arrow_array::types::Int8Type;
+        use arrow_array::{
+            Array, Decimal128Array, DictionaryArray, Float32Array, Int64Array, Int8Array,
+            RecordBatch, StructArray, UInt64Array,
+        };
+        use arrow_schema::{DataType, Field, Fields, Schema};
+
+        let nested_decimal = Decimal128Array::from(vec![Some(12_345_i128), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let nested_fields = Fields::from(vec![
+            Arc::new(Field::new("large", DataType::Int64, true)),
+            Arc::new(Field::new(
+                "amount",
+                nested_decimal.data_type().clone(),
+                true,
+            )),
+        ]);
+        let nested = StructArray::try_new(
+            nested_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(i64::MIN), None])),
+                Arc::new(nested_decimal),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), None]),
+            Arc::new(UInt64Array::from(vec![u64::MAX])),
+        )
+        .unwrap();
+
+        let mut floats = ListBuilder::new(Float64Builder::new());
+        floats.values().append_value(1.25);
+        floats.values().append_value(f64::NAN);
+        floats.values().append_value(f64::INFINITY);
+        floats.values().append_value(f64::NEG_INFINITY);
+        floats.values().append_null();
+        floats.append(true);
+        floats.append_null();
+        let floats = floats.finish();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("unsigned", DataType::UInt64, false),
+                Field::new("nested", nested.data_type().clone(), false),
+                Field::new("dictionary", dictionary.data_type().clone(), true),
+                Field::new("floats", floats.data_type().clone(), true),
+                Field::new("float32", DataType::Float32, false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![u64::MAX, 0])),
+                Arc::new(nested),
+                Arc::new(dictionary),
+                Arc::new(floats),
+                Arc::new(Float32Array::from(vec![1.234_567_f32, f32::INFINITY])),
+            ],
+        )
+        .unwrap();
+
+        let rows: serde_json::Value =
+            serde_json::from_str(&batches_to_json_string(std::slice::from_ref(&batch)).unwrap())
+                .unwrap();
+        let first = &rows[0];
+        assert_eq!(first["unsigned"], u64::MAX.to_string());
+        assert_eq!(first["nested"]["large"], i64::MIN.to_string());
+        assert_eq!(first["nested"]["amount"], "123.45");
+        assert_eq!(first["dictionary"], u64::MAX.to_string());
+        assert!(first["floats"][0].is_number());
+        assert_eq!(first["floats"][0].as_f64(), Some(1.25));
+        assert_eq!(first["floats"][1], "NaN");
+        assert_eq!(first["floats"][2], "Infinity");
+        assert_eq!(first["floats"][3], "-Infinity");
+        assert!(first["floats"][4].is_null());
+        assert!(first["float32"].is_number());
+
+        let second = &rows[1];
+        assert!(second["nested"]["large"].is_null());
+        assert!(second["nested"]["amount"].is_null());
+        assert!(second["dictionary"].is_null());
+        assert!(second["floats"].is_null());
+        assert_eq!(second["float32"], "Infinity");
+
+        let mut state = WsBatchFrameState::default();
+        let frame = next_ws_data_frame("exact", &batch, &mut state, 0, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.offset, 2);
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["data"], rows);
+        assert_eq!(frame["log_sequence"], u64::MAX.to_string());
+    }
+
+    #[test]
+    fn ws_slot_admission_is_atomic() {
+        const CAPACITY: usize = 4;
+        const CONTENDERS: usize = 32;
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(CAPACITY));
+        let start = Arc::new(std::sync::Barrier::new(CONTENDERS + 1));
+        let release = Arc::new(std::sync::Barrier::new(CONTENDERS + 1));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+        for _ in 0..CONTENDERS {
+            let slots = Arc::clone(&slots);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let tx = tx.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let permit = try_acquire_ws_slot(&slots);
+                tx.send(permit.is_some()).unwrap();
+                release.wait();
+                drop(permit);
+            }));
+        }
+        drop(tx);
+        start.wait();
+        let admitted = (0..CONTENDERS)
+            .map(|_| rx.recv().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, CAPACITY);
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(slots.available_permits(), CAPACITY);
+    }
+
+    #[test]
+    fn ws_liveness_expires_without_pongs_and_recovers_on_pong() {
+        let mut deadline = WsPongDeadline::default();
+        assert!(deadline.before_ping());
+        assert!(deadline.before_ping());
+        assert!(!deadline.before_ping());
+        deadline.on_pong();
+        assert!(deadline.before_ping());
     }
 
     /// Bind a real ephemeral-port server so the WebSocket upgrade runs over a
@@ -2002,28 +2417,20 @@ mod tests {
     #[tokio::test]
     async fn test_ws_upgrade_switching_protocols() {
         let state = test_state();
-        let app = build_router(state.clone());
-        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
-
-        // Create an ephemeral console stream to connect to.
-        let create = Request::builder()
-            .method("POST")
-            .uri("/api/v1/queries")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "SELECT * FROM events" }))
-                    .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(create).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        state
+            .db
+            .execute("CREATE SOURCE events (id INT, value DOUBLE)")
             .await
             .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let stream_id = json["stream_id"].as_str().unwrap().to_string();
+        state
+            .db
+            .execute("CREATE STREAM visible AS SELECT * FROM events")
+            .await
+            .unwrap();
+        state.db.start().await.unwrap();
 
         let addr = spawn_test_server(state).await;
-        let resp = ws_handshake(addr, &format!("/ws/{stream_id}")).await;
+        let resp = ws_handshake(addr, "/ws/visible").await;
         assert!(
             resp.starts_with("HTTP/1.1 101"),
             "expected 101 Switching Protocols, got: {resp}"
@@ -2032,8 +2439,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ws_upgrade_unknown_stream_returns_404() {
-        // Over a real connection the upgrade extractor succeeds, so the
-        // handler's stream-existence check runs and returns 404.
         let state = test_state();
         let addr = spawn_test_server(state).await;
         let resp = ws_handshake(addr, "/ws/does_not_exist").await;
@@ -2041,6 +2446,87 @@ mod tests {
             resp.starts_with("HTTP/1.1 404"),
             "expected 404 Not Found for unknown stream, got: {resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn ws_emits_committed_checkpoint_progress() {
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let db = LaminarDB::open_with_config(laminar_db::LaminarConfig {
+            checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                data_dir: Some(checkpoint_dir.path().to_path_buf()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let state = test_state_with_db(db);
+        state
+            .db
+            .execute("CREATE SOURCE events (id BIGINT)")
+            .await
+            .unwrap();
+        state
+            .db
+            .execute("CREATE MATERIALIZED VIEW visible AS SELECT id FROM events")
+            .await
+            .unwrap();
+        state.db.start().await.unwrap();
+        let addr = spawn_test_server(Arc::clone(&state)).await;
+
+        let (attached_tx, attached_rx) = tokio::sync::oneshot::channel();
+        let reader = tokio::task::spawn_blocking(move || {
+            let (mut socket, _) =
+                tungstenite::connect(format!("ws://{addr}/ws/visible")).expect("WS connect");
+            let _ = attached_tx.send(());
+            let mut frames = Vec::new();
+            loop {
+                match socket.read().expect("WS frame") {
+                    tungstenite::Message::Text(text) => {
+                        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        frames.push(json.clone());
+                        if json["type"] == "progress" {
+                            return frames;
+                        }
+                    }
+                    tungstenite::Message::Ping(data) => {
+                        socket.send(tungstenite::Message::Pong(data)).expect("pong");
+                    }
+                    tungstenite::Message::Close(_) => panic!("WS closed before progress"),
+                    _ => {}
+                }
+            }
+        });
+        attached_rx.await.expect("reader attached");
+        let source = state.db.source_untyped("events").unwrap();
+        source
+            .push_arrow(
+                arrow_array::RecordBatch::try_new(
+                    source.schema().clone(),
+                    vec![Arc::new(arrow_array::Int64Array::from(vec![7]))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let committed = state.db.checkpoint().await.expect("checkpoint");
+        assert!(committed.success);
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("progress frame arrives")
+            .expect("reader task");
+        assert_eq!(frames.len(), 2, "data must precede its progress cut");
+        assert_eq!(frames[0]["type"], "data");
+        assert_eq!(frames[0]["sequence"], "0");
+        assert_eq!(frames[0]["log_sequence"], "0");
+        let progress = &frames[1];
+        assert_eq!(progress["epoch"], committed.epoch.to_string());
+        assert_eq!(
+            progress["checkpoint_id"],
+            committed.checkpoint_id.to_string()
+        );
+        assert_eq!(progress["log_sequence"], "1");
+        assert_eq!(progress["through_log_sequence"], "1");
+        assert_eq!(progress["sequence"], "1");
     }
 
     #[tokio::test]

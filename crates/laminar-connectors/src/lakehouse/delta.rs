@@ -35,6 +35,8 @@ use deltalake::DeltaTable;
 use deltalake::protocol::SaveMode;
 
 use crate::config::{ConnectorConfig, ConnectorState};
+#[cfg(feature = "delta-lake")]
+use crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES;
 use crate::connector::{
     SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
 };
@@ -78,6 +80,24 @@ fn count_collapsed_ops(batch: &RecordBatch) -> (u64, u64) {
     (upserts, deletes)
 }
 
+#[cfg(feature = "delta-lake")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedDeltaPublication {
+    external_key: String,
+    target: crate::connector::CoordinatedCommitCursor,
+    exact_batch_fingerprint: [u8; 32],
+}
+
+#[cfg(feature = "delta-lake")]
+impl UnresolvedDeltaPublication {
+    fn reconciled_by(
+        self: &Self,
+        observed: Option<crate::connector::CoordinatedCommitCursor>,
+    ) -> bool {
+        observed == Some(self.target)
+    }
+}
+
 /// Delta Lake sink connector.
 ///
 /// Writes Arrow `RecordBatch` to Delta Lake tables with ACID transactions,
@@ -88,7 +108,7 @@ fn count_collapsed_ops(batch: &RecordBatch) -> (u64, u64) {
 ///
 /// `pre_commit()` materializes immutable Parquet files and returns their Delta
 /// `Add` actions. The runtime durably seals the checkpoint before one
-/// designated committer calls `commit_aggregated()` with every writer's
+/// designated committer calls `commit_aggregated()` with every participant's
 /// descriptor. `rollback_epoch()` discards in-memory state; unreferenced files
 /// are reclaimed later by retention-safe vacuum.
 pub struct DeltaLakeSink {
@@ -123,6 +143,23 @@ pub struct DeltaLakeSink {
     staged_rows: usize,
     /// Estimated bytes staged for commit.
     staged_bytes: u64,
+    /// Uncommitted `Add` actions for immutable Parquet files materialized in
+    /// the current coordinated epoch.
+    #[cfg(feature = "delta-lake")]
+    coordinated_adds: Vec<deltalake::kernel::Add>,
+    /// Canonical table incarnation and write-metadata fingerprint captured
+    /// from the exact immutable snapshot used to create `coordinated_adds`.
+    #[cfg(feature = "delta-lake")]
+    coordinated_binding: Option<super::commit_descriptor::DeltaTableBinding>,
+    /// Exact encoded descriptor size for `coordinated_adds`, or zero when the
+    /// vector is empty.
+    #[cfg(feature = "delta-lake")]
+    coordinated_descriptor_bytes: usize,
+    /// Exact publication that must be retried or observed at its target before
+    /// this instance stages a later cut. Absence cannot resolve a timed-out
+    /// remote catalog mutation because the server may still complete it.
+    #[cfg(feature = "delta-lake")]
+    coordinated_unresolved_publication: parking_lot::Mutex<Option<UnresolvedDeltaPublication>>,
     /// Resolved table path after catalog lookup (may differ from `config.table_path`
     /// when using Unity/Glue catalogs). Used by `reopen_table()` so retries
     /// target the same resolved path that `open()` connected to.
@@ -182,6 +219,14 @@ impl DeltaLakeSink {
             staged_batches: Vec::new(),
             staged_rows: 0,
             staged_bytes: 0,
+            #[cfg(feature = "delta-lake")]
+            coordinated_adds: Vec::new(),
+            #[cfg(feature = "delta-lake")]
+            coordinated_binding: None,
+            #[cfg(feature = "delta-lake")]
+            coordinated_descriptor_bytes: 0,
+            #[cfg(feature = "delta-lake")]
+            coordinated_unresolved_publication: parking_lot::Mutex::new(None),
             #[cfg(feature = "delta-lake")]
             table: None,
             #[cfg(feature = "delta-lake")]
@@ -607,10 +652,21 @@ impl DeltaLakeSink {
             && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
     }
 
-    /// Write staged batches to Parquet (no commit) and serialize the resulting
-    /// `Add` actions as the designated committer's descriptor.
     #[cfg(feature = "delta-lake")]
-    async fn write_staged_to_descriptor(&self) -> Result<Vec<u8>, ConnectorError> {
+    fn ensure_coordinated_reconciled(&self) -> Result<(), ConnectorError> {
+        if self.is_coordinated() && self.coordinated_unresolved_publication.lock().is_some() {
+            return Err(ConnectorError::TransactionError(
+                "Delta coordinated publication outcome is unresolved; reconcile or retry the exact cut before processing later work"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write staged batches to uniquely named Parquet files without making
+    /// them visible in the Delta log.
+    #[cfg(feature = "delta-lake")]
+    async fn materialize_staged_adds(&self) -> Result<Vec<deltalake::kernel::Add>, ConnectorError> {
         use deltalake::writer::{DeltaWriter, RecordBatchWriter};
 
         #[cfg(test)]
@@ -643,7 +699,106 @@ impl DeltaLakeSink {
             .flush()
             .await
             .map_err(|e| ConnectorError::WriteError(format!("delta flush: {e}")))?;
-        super::delta_io::encode_commit_descriptor(adds)
+        Ok(adds)
+    }
+
+    /// Materialize the current exact-mode staging buffer and retain only its
+    /// bounded Delta metadata. The Parquet objects remain invisible until
+    /// `commit_aggregated` publishes these Adds with the checkpoint cursor.
+    #[cfg(feature = "delta-lake")]
+    async fn materialize_coordinated_staged(&mut self) -> Result<(), ConnectorError> {
+        if self.staged_batches.is_empty() {
+            return Ok(());
+        }
+
+        let binding =
+            super::delta_io::coordinated_table_binding(self.table.as_ref().ok_or_else(|| {
+                ConnectorError::InvalidState {
+                    expected: "open".into(),
+                    actual: "delta table not loaded".into(),
+                }
+            })?)?;
+        if self
+            .coordinated_binding
+            .as_ref()
+            .is_some_and(|existing| existing != &binding)
+        {
+            return Err(ConnectorError::TransactionError(
+                "Delta table binding changed while materializing one coordinated checkpoint cut"
+                    .into(),
+            ));
+        }
+
+        let write_timeout = self.config.write_timeout;
+        let adds = await_delta_write(write_timeout, self.materialize_staged_adds()).await?;
+        if adds.is_empty() {
+            self.staged_batches.clear();
+            self.staged_rows = 0;
+            self.staged_bytes = 0;
+            return Ok(());
+        }
+
+        let projected_add_count = self
+            .coordinated_adds
+            .len()
+            .checked_add(adds.len())
+            .ok_or_else(|| {
+                ConnectorError::WriteError("Delta coordinated Add count overflow".into())
+            })?;
+        if projected_add_count > super::delta_io::MAX_COORDINATED_ADD_ACTIONS {
+            return Err(ConnectorError::WriteError(format!(
+                "Delta coordinated checkpoint would exceed the fixed {} Add-action limit",
+                super::delta_io::MAX_COORDINATED_ADD_ACTIONS
+            )));
+        }
+
+        // Account only for the new Add array. Once the binding is encoded, appending another
+        // non-empty chunk replaces no envelope fields and inserts one comma between array items.
+        let chunk_add_array_bytes = super::delta_io::encoded_add_array_len(&adds)?;
+        let projected_descriptor_bytes = if self.coordinated_adds.is_empty() {
+            super::delta_io::encode_commit_descriptor(&binding, &adds)?.len()
+        } else {
+            self.coordinated_descriptor_bytes
+                .checked_add(chunk_add_array_bytes)
+                .and_then(|bytes| bytes.checked_sub(2))
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| {
+                    ConnectorError::WriteError("Delta coordinated descriptor size overflow".into())
+                })?
+        };
+        if projected_descriptor_bytes > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+            return Err(ConnectorError::WriteError(format!(
+                "Delta coordinated descriptor would exceed the fixed {} byte control-plane \
+                 limit; the checkpoint cut produced too many files or partition values",
+                MAX_COORDINATED_COMMIT_PAYLOAD_BYTES
+            )));
+        }
+
+        self.coordinated_binding = Some(binding);
+        self.coordinated_adds.extend(adds);
+        self.coordinated_descriptor_bytes = projected_descriptor_bytes;
+        self.staged_batches.clear();
+        self.staged_rows = 0;
+        self.staged_bytes = 0;
+        Ok(())
+    }
+
+    /// Flush any prior retry buffer first, then move the current in-memory
+    /// exact-mode buffer into invisible Parquet staging.
+    #[cfg(feature = "delta-lake")]
+    async fn stage_coordinated_buffer(&mut self) -> Result<(), ConnectorError> {
+        self.materialize_coordinated_staged().await?;
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        self.staged_batches = std::mem::take(&mut self.buffer);
+        self.staged_rows = self.buffered_rows;
+        self.staged_bytes = self.buffered_bytes;
+        self.buffered_rows = 0;
+        self.buffered_bytes = 0;
+        self.buffer_start_time = None;
+        self.materialize_coordinated_staged().await
     }
 
     /// Retries on optimistic concurrency conflicts with exponential backoff.
@@ -1193,6 +1348,9 @@ impl SinkConnector for DeltaLakeSink {
             });
         }
 
+        #[cfg(feature = "delta-lake")]
+        self.ensure_coordinated_reconciled()?;
+
         if batch.num_rows() == 0 {
             return Ok(WriteResult::new(0, 0));
         }
@@ -1225,36 +1383,27 @@ impl SinkConnector for DeltaLakeSink {
         let num_rows = batch.num_rows();
         let estimated_bytes = Self::estimate_batch_size(batch);
 
-        // Hard cap on combined buffered + staged data. Applies to both
-        // delivery guarantees:
-        // - Exactly-once cannot flush opportunistically from write_batch
-        //   (a mid-epoch flush would leak rows on rollback), so pending
-        //   accumulates until the next checkpoint.
-        // - At-least-once normally auto-flushes via `should_flush()`, but
-        //   if flushes fail repeatedly, `staged_batches` holds data while
-        //   `buffer` keeps growing — without this cap the sink can OOM.
-        //
-        // A single incoming batch may itself exceed the cap; we cannot
-        // split or reject it (the rows would be lost), so we widen the
-        // cap to `num_rows`/`estimated_bytes` when a batch alone is
-        // larger. This still rejects the *next* batch if that one-shot
-        // admission left us bloated.
-        let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
-        let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
-        let row_cap = self
-            .config
-            .max_buffer_records
-            .saturating_mul(4)
-            .max(num_rows);
-        let byte_cap = (self.config.target_file_size as u64)
-            .saturating_mul(4)
-            .max(estimated_bytes);
-        if pending_rows > row_cap || pending_bytes > byte_cap {
-            return Err(ConnectorError::WriteError(format!(
-                "delta sink buffer full ({pending_rows} rows, \
-                 {pending_bytes} bytes pending; cap {row_cap} rows, \
-                 {byte_cap} bytes) — backpressure until next flush/commit"
-            )));
+        // At-least-once retries retain failed staged data, so cap the combined
+        // in-memory backlog. Coordinated append instead drains full buffers to
+        // invisible Parquet files below and bounds only their retained Adds.
+        if !self.is_coordinated() {
+            let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
+            let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
+            let row_cap = self
+                .config
+                .max_buffer_records
+                .saturating_mul(4)
+                .max(num_rows);
+            let byte_cap = (self.config.target_file_size as u64)
+                .saturating_mul(4)
+                .max(estimated_bytes);
+            if pending_rows > row_cap || pending_bytes > byte_cap {
+                return Err(ConnectorError::WriteError(format!(
+                    "delta sink buffer full ({pending_rows} rows, \
+                     {pending_bytes} bytes pending; cap {row_cap} rows, \
+                     {byte_cap} bytes) — backpressure until next flush/commit"
+                )));
+            }
         }
 
         // Buffer the batch.
@@ -1266,7 +1415,11 @@ impl SinkConnector for DeltaLakeSink {
         self.buffered_bytes += estimated_bytes;
 
         #[cfg(feature = "delta-lake")]
-        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce && self.should_flush() {
+        if self.is_coordinated() && self.should_flush() {
+            self.stage_coordinated_buffer().await?;
+        } else if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce
+            && self.should_flush()
+        {
             if !self.staged_batches.is_empty() {
                 self.flush_staged_to_delta().await?;
             }
@@ -1289,6 +1442,9 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        #[cfg(feature = "delta-lake")]
+        self.ensure_coordinated_reconciled()?;
+
         // Complete deferred Delta table init on the first epoch.
         #[cfg(feature = "delta-lake")]
         if self.needs_deferred_delta_init {
@@ -1312,6 +1468,18 @@ impl SinkConnector for DeltaLakeSink {
             }
         }
 
+        #[cfg(feature = "delta-lake")]
+        if self.is_coordinated()
+            && (!self.buffer.is_empty()
+                || !self.staged_batches.is_empty()
+                || !self.coordinated_adds.is_empty())
+        {
+            return Err(ConnectorError::InvalidState {
+                expected: "the previous coordinated epoch to be prepared or rolled back".into(),
+                actual: "unresolved Delta staging data remains".into(),
+            });
+        }
+
         self.current_epoch = epoch;
         self.buffer.clear();
         self.buffered_rows = 0;
@@ -1323,8 +1491,47 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
-        // Stage buffered data. Coordinated append materializes immutable
-        // Parquet files below and publishes them only after a durable seal.
+        // Coordinated append may already have materialized several invisible
+        // Parquet chunks during writes. Flush only the remainder, then return
+        // one bounded descriptor for the entire checkpoint cut.
+        #[cfg(feature = "delta-lake")]
+        if self.is_coordinated() {
+            self.ensure_coordinated_reconciled()?;
+            self.stage_coordinated_buffer().await?;
+            if self.coordinated_adds.is_empty() {
+                if self.coordinated_binding.is_some() {
+                    return Err(ConnectorError::Internal(
+                        "empty Delta coordinated cut retained a table binding".into(),
+                    ));
+                }
+                return Ok(None);
+            }
+
+            let binding = self.coordinated_binding.as_ref().ok_or_else(|| {
+                ConnectorError::Internal(
+                    "non-empty Delta coordinated cut has no table binding".into(),
+                )
+            })?;
+            let descriptor =
+                super::delta_io::encode_commit_descriptor(binding, &self.coordinated_adds)?;
+            if descriptor.len() != self.coordinated_descriptor_bytes
+                || descriptor.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES
+            {
+                return Err(ConnectorError::Internal(format!(
+                    "Delta coordinated descriptor accounting mismatch: tracked {}, encoded {}",
+                    self.coordinated_descriptor_bytes,
+                    descriptor.len()
+                )));
+            }
+            self.coordinated_adds.clear();
+            self.coordinated_binding = None;
+            self.coordinated_descriptor_bytes = 0;
+            return Ok(Some(descriptor));
+        }
+
+        // Non-coordinated callers retain the existing in-memory phase-one
+        // behavior; the checkpoint runtime only invokes this path for sinks
+        // whose contract admits it.
         if !self.buffer.is_empty() {
             self.staged_batches = std::mem::take(&mut self.buffer);
             self.staged_rows = self.buffered_rows;
@@ -1332,24 +1539,6 @@ impl SinkConnector for DeltaLakeSink {
             self.buffered_rows = 0;
             self.buffered_bytes = 0;
             self.buffer_start_time = None;
-        }
-
-        // Coordinated append: write Parquet now and hand the Add actions to the
-        // designated committer; the catalog commit happens in commit_aggregated.
-        #[cfg(feature = "delta-lake")]
-        if self.is_coordinated() {
-            if self.staged_batches.is_empty() {
-                return Ok(None);
-            }
-            // Same timeout the commit path uses: a stale object-store connection
-            // must not hang the sink task forever (Azure LB drops idle conns).
-            let write_timeout = self.config.write_timeout;
-            let descriptor =
-                await_delta_write(write_timeout, self.write_staged_to_descriptor()).await?;
-            self.staged_batches.clear();
-            self.staged_rows = 0;
-            self.staged_bytes = 0;
-            return Ok(Some(descriptor));
         }
 
         debug!(epoch, "Delta Lake: pre-committed (batches staged)");
@@ -1367,6 +1556,12 @@ impl SinkConnector for DeltaLakeSink {
         self.staged_batches.clear();
         self.staged_rows = 0;
         self.staged_bytes = 0;
+        #[cfg(feature = "delta-lake")]
+        {
+            self.coordinated_adds.clear();
+            self.coordinated_binding = None;
+            self.coordinated_descriptor_bytes = 0;
+        }
 
         self.metrics.record_rollback();
         warn!(epoch, "Delta Lake: rolled back epoch");
@@ -1379,6 +1574,9 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
+        #[cfg(feature = "delta-lake")]
+        self.ensure_coordinated_reconciled()?;
+
         // For at-least-once delivery, flush() is the commit trigger. Write
         // directly to Delta without entering the coordinated protocol.
         #[cfg(feature = "delta-lake")]
@@ -1404,19 +1602,10 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
+        #[cfg(feature = "delta-lake")]
+        return self.stage_coordinated_buffer().await;
 
-        // For exactly-once, just coalesce in memory. `pre_commit` creates the
-        // descriptor and `commit_aggregated` publishes it after the seal.
-        if self.buffer.len() > 1 {
-            let schema = self.buffer[0].schema();
-            let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
-                .map_err(|e| ConnectorError::Internal(format!("concat failed: {e}")))?;
-            self.buffer.clear();
-            self.buffer.push(combined);
-        }
+        #[cfg(not(feature = "delta-lake"))]
         Ok(())
     }
 
@@ -1433,6 +1622,9 @@ impl SinkConnector for DeltaLakeSink {
             self.buffered_bytes = 0;
             self.staged_rows = 0;
             self.staged_bytes = 0;
+            self.coordinated_adds.clear();
+            self.coordinated_binding = None;
+            self.coordinated_descriptor_bytes = 0;
         } else {
             self.flush().await?;
         }
@@ -1484,67 +1676,114 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
     async fn commit_aggregated(
         &self,
         batch: crate::connector::CoordinatedCommitBatch,
+        context: crate::connector::CoordinatedCommitContext,
     ) -> Result<(), ConnectorError> {
+        let deadline = context.deadline();
+        let publication_budget = context.remaining();
+        if publication_budget.is_zero() {
+            return Err(ConnectorError::TransactionError(
+                "Delta coordinated publication deadline elapsed before I/O".into(),
+            ));
+        }
+
+        batch.validate_shape().map_err(|error| {
+            ConnectorError::TransactionError(format!(
+                "Delta coordinated batch validation failed: {error}"
+            ))
+        })?;
         let external_key = batch.namespace.external_key();
-        let table = super::delta_io::open_or_create_table(
-            &self.resolved_table_path,
-            self.resolved_storage_options.clone(),
-            None,
-        )
-        .await?;
-        // Idempotent: skip if this exact-or-newer checkpoint id is already
-        // committed in this pipeline/sink namespace.
-        let observed_cursor = super::delta_io::get_last_committed_version(&table, &external_key)
-            .await?
-            .unwrap_or(0);
-        batch
-            .validate_observed_cursor(observed_cursor)
-            .map_err(|error| {
-                ConnectorError::TransactionError(format!(
-                    "Delta coordinated cursor continuity check failed: {error}"
-                ))
-            })?;
-        if observed_cursor >= batch.target.checkpoint_id {
+        let exact_batch_fingerprint = batch.exact_fingerprint();
+        let target_cursor = crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: batch.target.checkpoint_id,
+            fencing_token: batch.fencing_token,
+        };
+        let pending = UnresolvedDeltaPublication {
+            external_key,
+            target: target_cursor,
+            exact_batch_fingerprint,
+        };
+        {
+            let mut unresolved = self.coordinated_unresolved_publication.lock();
+            if unresolved
+                .as_ref()
+                .is_some_and(|unresolved| unresolved != &pending)
+            {
+                return Err(ConnectorError::TransactionError(
+                    "Delta has a different unresolved coordinated publication; only that exact cut may be retried"
+                        .into(),
+                ));
+            }
+            *unresolved = Some(pending);
+        }
+
+        let result = async {
+            let table = tokio::time::timeout_at(
+                deadline,
+                super::delta_io::open_or_create_table(
+                    &self.resolved_table_path,
+                    self.resolved_storage_options.clone(),
+                    None,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ConnectorError::TransactionError(
+                    "Delta coordinated table open exceeded the publication deadline".into(),
+                )
+            })??;
+            // Refresh, cursor validation, overlap filtering, object validation,
+            // and commit are one operation over one optimistic snapshot.
+            let descriptor_count =
+                super::delta_io::commit_batch_coordinated(&table, &batch, deadline).await?;
+            info!(
+                epoch = batch.target.epoch,
+                checkpoint_id = batch.target.checkpoint_id,
+                descriptors = descriptor_count,
+                "delta coordinated commit"
+            );
+            Ok(())
+        }
+        .await;
+
+        if result.is_ok() && tokio::time::Instant::now() < deadline {
+            let mut unresolved = self.coordinated_unresolved_publication.lock();
+            if unresolved.as_ref().is_some_and(|pending| {
+                pending.external_key == batch.namespace.external_key()
+                    && pending.target == target_cursor
+                    && pending.exact_batch_fingerprint == exact_batch_fingerprint
+            }) {
+                *unresolved = None;
+            }
             return Ok(());
         }
-        let descriptors: Vec<Vec<u8>> = batch
-            .entries
-            .iter()
-            // Leadership may change after the runtime built this batch. Never append payloads
-            // already covered by the target's freshly observed cursor.
-            .filter(|entry| entry.attempt.checkpoint_id > observed_cursor)
-            .filter_map(|entry| entry.payload.clone())
-            .collect();
-        let adds = super::delta_io::decode_commit_descriptors(&descriptors)?;
-        // An empty cut still commits the application transaction so restart
-        // cannot rescan it forever or merge later descriptors across the gap.
-        super::delta_io::commit_adds_coordinated(
-            &table,
-            adds,
-            &external_key,
-            batch.target.checkpoint_id,
-        )
-        .await?;
-        info!(
-            epoch = batch.target.epoch,
-            checkpoint_id = batch.target.checkpoint_id,
-            writers = descriptors.len(),
-            "delta coordinated commit"
-        );
-        Ok(())
+        if result.is_ok() {
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated publication exceeded its {publication_budget:?} remaining \
+                 budget; the external outcome must be reconciled from its cursor"
+            )));
+        }
+        result
     }
 
-    async fn committed_checkpoint_id(
+    async fn committed_cursor(
         &self,
         namespace: &crate::connector::CoordinatedCommitNamespace,
-    ) -> Result<Option<u64>, ConnectorError> {
+    ) -> Result<Option<crate::connector::CoordinatedCommitCursor>, ConnectorError> {
         let table = super::delta_io::open_or_create_table(
             &self.resolved_table_path,
             self.resolved_storage_options.clone(),
             None,
         )
         .await?;
-        super::delta_io::get_last_committed_version(&table, &namespace.external_key()).await
+        let external_key = namespace.external_key();
+        let observed = super::delta_io::get_coordinated_cursor(&table, &external_key).await?;
+        let mut unresolved = self.coordinated_unresolved_publication.lock();
+        if unresolved.as_ref().is_some_and(|pending| {
+            pending.external_key == external_key && pending.reconciled_by(observed)
+        }) {
+            *unresolved = None;
+        }
+        Ok(observed)
     }
 }
 

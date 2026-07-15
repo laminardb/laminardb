@@ -70,7 +70,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { version = "0.40", default-features = false, features = [
+pgwire = { version = "=0.40.4", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",
@@ -88,6 +88,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
+sha2 = { workspace = true, optional = true }
 percent-encoding = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 
@@ -146,14 +147,12 @@ default = [
     "iceberg",
     "postgres-cdc",
     "postgres-sink",
-    "mysql-cdc",
     "mongodb-cdc",
     "nats",
     "files",
     "parquet-lookup",
     "otel",
     "cluster",
-    "state-tier",
     "aws",
     "gcs",
     "azure",
@@ -165,7 +164,6 @@ kafka = ["laminar-db/kafka"]
 websocket = ["laminar-db/websocket"]
 postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
-mysql-cdc = ["laminar-db/mysql-cdc"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
 nats = ["laminar-db/nats"]
 delta-lake = ["laminar-db/delta-lake"]
@@ -192,9 +190,8 @@ cluster = [
     "laminar-db/cluster",
     "dep:uuid",
     "dep:xxhash-rust",
+    "dep:sha2",
     "dep:tokio-util",
     "dep:reqwest",
 ]
-# Disk cold tier for demoted operator state (experimental). Implies cluster.
-state-tier = ["cluster", "laminar-db/state-tier"]
 vendored-openssl = ["dep:openssl"]

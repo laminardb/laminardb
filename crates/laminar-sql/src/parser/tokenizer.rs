@@ -602,7 +602,7 @@ pub fn parse_with_options(parser: &mut Parser) -> Result<HashMap<String, String>
         // Parse value
         let value = parse_option_string(parser)?;
 
-        options.insert(key, value);
+        insert_unique_option(&mut options, key, value)?;
 
         // Comma or closing paren
         if !parser.consume_token(&Token::Comma) {
@@ -614,6 +614,41 @@ pub fn parse_with_options(parser: &mut Parser) -> Result<HashMap<String, String>
     }
 
     Ok(options)
+}
+
+/// Insert a connector option, rejecting case-insensitive duplicates instead of silently
+/// retaining only the last spelling. The original SQL is durable catalog identity, so ignored
+/// duplicate values would otherwise remain in storage without being admitted by the typed AST.
+pub(crate) fn insert_unique_option(
+    options: &mut HashMap<String, String>,
+    key: String,
+    value: String,
+) -> Result<(), ParseError> {
+    if options
+        .keys()
+        .any(|existing| existing.eq_ignore_ascii_case(&key))
+    {
+        return Err(ParseError::StreamingError(format!(
+            "duplicate connector option '{key}'"
+        )));
+    }
+    options.insert(key, value);
+    Ok(())
+}
+
+/// Require a custom statement parser to consume every significant token.
+pub(crate) fn expect_statement_end(parser: &mut Parser) -> Result<(), ParseError> {
+    let mut trailing = parser.next_token();
+    if trailing.token == Token::SemiColon {
+        trailing = parser.next_token();
+    }
+    if trailing.token != Token::EOF {
+        return Err(ParseError::StreamingError(format!(
+            "unexpected trailing token {}",
+            trailing.token
+        )));
+    }
+    Ok(())
 }
 
 /// Parse a string value for WITH options (key or value).

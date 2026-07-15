@@ -15,8 +15,9 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, AggFuncSpec,
-    CompiledProjection, EowcStateCheckpoint, PreAggBuilder,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate,
+    query_fingerprint_with_config, AggFuncSpec, CompiledProjection, EowcStateCheckpoint,
+    PreAggBuilder,
 };
 use crate::error::DbError;
 
@@ -107,7 +108,7 @@ pub(crate) struct IncrementalEowcState {
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
     group_types: Vec<DataType>,
-    pre_agg_sql: String,
+    query_sql: String,
     output_schema: SchemaRef,
     time_col_index: usize,
     compiled_projection: Option<CompiledProjection>,
@@ -318,7 +319,7 @@ impl IncrementalEowcState {
             agg_specs,
             num_group_cols,
             group_types,
-            pre_agg_sql,
+            query_sql: sql.to_string(),
             output_schema,
             time_col_index,
             compiled_projection,
@@ -607,44 +608,24 @@ impl IncrementalEowcState {
     }
 
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::hash::DefaultHasher::new();
-        self.pre_agg_sql.hash(&mut h);
-        for f in self.output_schema.fields() {
-            f.name().hash(&mut h);
-            f.data_type().to_string().hash(&mut h);
-        }
+        let mut config = Vec::with_capacity(25);
         match &self.window_type {
             EowcWindowType::Tumbling { size_ms } => {
-                "tumbling".hash(&mut h);
-                size_ms.hash(&mut h);
+                config.push(1);
+                config.extend_from_slice(&size_ms.to_le_bytes());
             }
             EowcWindowType::Hopping { size_ms, slide_ms } => {
-                "hopping".hash(&mut h);
-                size_ms.hash(&mut h);
-                slide_ms.hash(&mut h);
+                config.push(2);
+                config.extend_from_slice(&size_ms.to_le_bytes());
+                config.extend_from_slice(&slide_ms.to_le_bytes());
             }
             EowcWindowType::Session { gap_ms } => {
-                "session".hash(&mut h);
-                gap_ms.hash(&mut h);
+                config.push(3);
+                config.extend_from_slice(&gap_ms.to_le_bytes());
             }
         }
-        self.allowed_lateness_ms.hash(&mut h);
-        h.finish()
-    }
-
-    /// Estimated memory usage in bytes across all open windows and groups.
-    pub(crate) fn estimated_size_bytes(&self) -> usize {
-        let mut total = 0;
-        for groups in self.windows.values() {
-            for (key, accs) in groups {
-                total += key.as_ref().len();
-                for acc in accs {
-                    total += acc.size();
-                }
-            }
-        }
-        total
+        config.extend_from_slice(&self.allowed_lateness_ms.to_le_bytes());
+        query_fingerprint_with_config(&self.query_sql, &self.output_schema, &config)
     }
 
     pub(crate) fn checkpoint_windows(&mut self) -> Result<EowcStateCheckpoint, DbError> {
@@ -984,7 +965,7 @@ mod tests {
                 DataType::Utf8,
             )])
             .unwrap(),
-            pre_agg_sql: String::new(),
+            query_sql: String::new(),
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
@@ -1247,6 +1228,22 @@ mod tests {
         let result = state2.restore_windows(&cp);
         assert!(result.is_err());
         assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint mismatch"));
+    }
+
+    #[test]
+    fn eowc_checkpoint_rejects_a_different_state_query() {
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        state.query_sql = "SELECT symbol, SUM(value) FROM trades GROUP BY symbol".into();
+        let checkpoint = state.checkpoint_windows().unwrap();
+
+        let mut restored = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        restored.query_sql = "SELECT symbol, MAX(value) FROM trades GROUP BY symbol".into();
+
+        assert!(restored
+            .restore_windows(&checkpoint)
             .unwrap_err()
             .to_string()
             .contains("fingerprint mismatch"));

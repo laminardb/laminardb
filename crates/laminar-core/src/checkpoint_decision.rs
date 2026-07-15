@@ -1,27 +1,22 @@
-//! Durable write-ahead decision intent and commit marker for checkpoint 2PC.
-//!
-//! Recovery needs to distinguish "we decided to commit this epoch and
-//! crashed mid-commit" from "we never reached the commit point". The
-//! coordinator first persists an immutable canonical intent, then creates the
-//! matching commit marker at the irrevocable commit point. A matching marker
-//! on restart means re-drive commit; an intent without its marker means the
-//! outcome remains in doubt and recovery must fail closed; absence of both is
-//! safe to roll back. In cluster mode the records also carry the leader's
-//! decision across leader re-election.
+//! Durable checkpoint identity, ID allocation, and immutable terminal outcomes.
 
+#[cfg(feature = "cluster")]
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::StreamExt;
 use object_store::path::Path as OsPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
-use rustc_hash::FxHashMap;
-use tokio_stream::StreamExt;
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+#[cfg(feature = "cluster")]
+use sha2::{Digest, Sha256};
 
-/// Per-epoch write-ahead intent and commit-marker store.
-///
-/// A valid commit marker means committed. Absence is safe to abort only when no matching durable
-/// intent exists; an intent without its marker fences recovery until the final create is resolved.
+use crate::checkpoint::{
+    CheckpointAssignmentFence, ClusterRecoveryCapsule, LeaderProof, RecoveryCapsuleRef,
+};
+
+/// Durable checkpoint metadata store.
 pub struct CheckpointDecisionStore {
     store: Arc<dyn ObjectStore>,
     /// Serializes candidates from this instance so its durable creates cannot reorder.
@@ -51,120 +46,188 @@ pub enum DecisionError {
     /// retired a resolved pair. Callers may retry the complete audit from a fresh LIST.
     #[error("checkpoint decision inventory changed during audit: {0}")]
     InventoryChanged(String),
-    /// The write-ahead intent is durable but its matching commit create has no terminal outcome.
-    #[error(
-        "checkpoint decision outcome is in doubt for epoch {epoch}, checkpoint {checkpoint_id}"
-    )]
-    InDoubt {
-        /// Epoch whose commit create may still become visible.
-        epoch: u64,
-        /// Exact checkpoint attempt bound by the durable intent.
-        checkpoint_id: u64,
-    },
 }
 
-/// Runtime scope of a durable checkpoint decision.
+/// Runtime scope of a durable checkpoint outcome.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum CommitDecisionScope {
+pub enum CheckpointScope {
     /// Embedded or standalone recovery domain.
     Local,
     /// Multi-participant cluster recovery domain.
     Cluster,
 }
 
-/// Durable commit decision bound to one concrete checkpoint attempt.
+/// Irrevocable terminal verdict for one concrete checkpoint attempt.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct CommitDecision {
-    /// Decision payload format.
-    pub version: u32,
-    /// Recovery domain that created the decision.
-    pub scope: CommitDecisionScope,
-    /// Committed epoch.
-    pub epoch: u64,
-    /// Exact checkpoint attempt selected for that epoch.
-    pub checkpoint_id: u64,
-    /// Durable deployment incarnation that owns this decision.
-    pub deployment_id: String,
-    /// Canonical (sorted, duplicate-free) checkpoint participant IDs.
-    ///
-    /// A participant absent from this set was not required to persist a local manifest for this
-    /// cut. Recovery uses that distinction to avoid treating an intentionally shed node as
-    /// participant-local storage loss.
-    pub participants: Vec<u64>,
-    /// Participant whose prepared manifest is the canonical manifest for this decision.
-    pub manifest_participant_id: u64,
-    /// Vnode-assignment generation captured by the checkpoint durability gate.
-    ///
-    /// Local runtimes use generation `0`; cluster decisions require a non-zero generation.
-    pub assignment_version: u64,
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointVerdict {
+    /// Every participant prepared successfully and recovery must finish commit.
+    Commit,
+    /// Recovery must roll back this exact checkpoint attempt.
+    Abort,
 }
 
-// v3 binds the manifest owner and exact assignment participant set to the durable decision.
-const COMMIT_DECISION_VERSION: u32 = 3;
+/// Single create-once terminal outcome for one epoch.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CheckpointOutcome {
+    /// Outcome payload format.
+    pub version: u32,
+    /// Recovery domain that created the outcome.
+    pub scope: CheckpointScope,
+    /// Terminal epoch, matching the object path.
+    pub epoch: u64,
+    /// Exact checkpoint attempt resolved for the epoch.
+    pub checkpoint_id: u64,
+    /// Durable deployment incarnation that owns the outcome.
+    pub deployment_id: String,
+    /// Exact assignment certificate for a cluster outcome.
+    pub assignment_fence: Option<CheckpointAssignmentFence>,
+    /// Exact leader authority that selected a cluster outcome.
+    pub leader_proof: Option<LeaderProof>,
+    /// Exact global recovery image selected by a cluster Commit.
+    pub recovery_capsule: Option<RecoveryCapsuleRef>,
+    /// Create-once terminal verdict.
+    pub verdict: CheckpointVerdict,
+}
 
-impl CommitDecision {
-    fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
-        if self.version != COMMIT_DECISION_VERSION {
+/// Result of attempting to create a terminal checkpoint outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordOutcomeResult {
+    /// This call durably created the outcome.
+    Created(CheckpointOutcome),
+    /// An identical outcome was already durable.
+    Unchanged(CheckpointOutcome),
+    /// A different outcome won the create-once race for the epoch.
+    Conflict {
+        /// Durable winner that callers must obey.
+        winner: CheckpointOutcome,
+    },
+}
+
+/// Scalar continuity boundary for outcome retention.
+///
+/// This is not a checkpoint recovery target: it deliberately carries neither an assignment fence,
+/// leader proof, verdict, nor manifest owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutcomeRetentionBoundary {
+    /// Outcomes below this epoch are continuity-only and their raw records may be absent.
+    pub before_epoch: u64,
+    /// Greatest committed checkpoint ID compacted below the horizon, if any.
+    pub committed_checkpoint_id: Option<u64>,
+    /// Greatest terminal epoch compacted below the horizon, including aborts.
+    pub highest_closed_epoch: Option<u64>,
+}
+
+const CHECKPOINT_OUTCOME_VERSION: u32 = 2;
+#[cfg(feature = "cluster")]
+const RECOVERY_CAPSULE_GC_BATCH_SIZE: usize = 64;
+
+impl CheckpointOutcome {
+    pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
+        if self.version != CHECKPOINT_OUTCOME_VERSION {
             return Err(DecisionError::Conflict(format!(
-                "decision for epoch {path_epoch} has unsupported version {}; expected \
-                 {COMMIT_DECISION_VERSION}",
+                "outcome for epoch {path_epoch} has unsupported version {}; expected \
+                 {CHECKPOINT_OUTCOME_VERSION}",
                 self.version
             )));
         }
         if self.epoch == 0 || self.epoch != path_epoch {
             return Err(DecisionError::Conflict(format!(
-                "decision path epoch {path_epoch} does not match non-zero payload epoch {}",
+                "outcome path epoch {path_epoch} does not match non-zero payload epoch {}",
                 self.epoch
             )));
         }
         if self.checkpoint_id == 0 {
             return Err(DecisionError::Conflict(format!(
-                "decision for epoch {path_epoch} has checkpoint ID 0"
-            )));
-        }
-        if self.participants.is_empty() {
-            return Err(DecisionError::Conflict(format!(
-                "decision for epoch {path_epoch} has no participants"
-            )));
-        }
-        if self.participants.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(DecisionError::Conflict(format!(
-                "decision for epoch {path_epoch} participants are not canonical"
-            )));
-        }
-        if self
-            .participants
-            .binary_search(&self.manifest_participant_id)
-            .is_err()
-        {
-            return Err(DecisionError::Conflict(format!(
-                "decision for epoch {path_epoch} manifest participant {} is absent from \
-                 participants {:?}",
-                self.manifest_participant_id, self.participants
+                "outcome for epoch {path_epoch} has checkpoint ID 0"
             )));
         }
 
-        match self.scope {
-            CommitDecisionScope::Local
-                if self.participants != [0]
-                    || self.manifest_participant_id != 0
-                    || self.assignment_version != 0 =>
+        let deployment = uuid::Uuid::parse_str(&self.deployment_id).map_err(|error| {
+            DecisionError::Conflict(format!(
+                "outcome for epoch {path_epoch} has invalid deployment identity: {error}"
+            ))
+        })?;
+        if deployment.is_nil() || deployment.to_string() != self.deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "outcome for epoch {path_epoch} must use a canonical non-nil deployment identity"
+            )));
+        }
+
+        match (
+            self.scope,
+            self.assignment_fence.as_ref(),
+            self.leader_proof.as_ref(),
+        ) {
+            (CheckpointScope::Local, None, None) => {}
+            (CheckpointScope::Local, _, _) => {
+                return Err(DecisionError::Conflict(format!(
+                    "local outcome for epoch {path_epoch} cannot carry an assignment fence or \
+                     leader proof"
+                )));
+            }
+            (CheckpointScope::Cluster, Some(fence), Some(proof))
+                if fence.is_canonical()
+                    && proof.is_canonical()
+                    && fence.participant_incarnation(proof.owner.node_id)
+                        == Some(proof.owner.boot_id) => {}
+            (CheckpointScope::Cluster, Some(fence), Some(proof))
+                if !fence.is_canonical() || !proof.is_canonical() =>
             {
                 return Err(DecisionError::Conflict(format!(
-                    "local decision for epoch {path_epoch} must use participant 0 and assignment \
-                     version 0"
+                    "cluster outcome for epoch {path_epoch} has a non-canonical assignment fence \
+                     or leader proof"
                 )));
             }
-            CommitDecisionScope::Cluster if self.assignment_version == 0 => {
+            (CheckpointScope::Cluster, Some(_), Some(proof)) => {
                 return Err(DecisionError::Conflict(format!(
-                    "cluster decision for epoch {path_epoch} requires a non-zero assignment \
-                     version"
+                    "cluster outcome for epoch {path_epoch} leader node {} boot {} is absent from \
+                     the assignment fence",
+                    proof.owner.node_id, proof.owner.boot_id
                 )));
             }
-            _ => {}
+            (CheckpointScope::Cluster, _, _) => {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster outcome for epoch {path_epoch} requires an assignment fence and \
+                     leader proof"
+                )));
+            }
+        }
+
+        match (self.scope, &self.verdict, self.recovery_capsule.as_ref()) {
+            (CheckpointScope::Local, _, None)
+            | (CheckpointScope::Cluster, CheckpointVerdict::Abort, None) => {}
+            (CheckpointScope::Cluster, CheckpointVerdict::Commit, Some(reference)) => {
+                reference.validate().map_err(|error| {
+                    DecisionError::Conflict(format!(
+                        "cluster commit outcome for epoch {path_epoch} has an invalid recovery capsule reference: {error}"
+                    ))
+                })?;
+            }
+            (CheckpointScope::Local, _, Some(_)) => {
+                return Err(DecisionError::Conflict(format!(
+                    "local outcome for epoch {path_epoch} cannot carry a recovery capsule"
+                )));
+            }
+            (CheckpointScope::Cluster, CheckpointVerdict::Commit, None) => {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster commit outcome for epoch {path_epoch} requires a recovery capsule"
+                )));
+            }
+            (CheckpointScope::Cluster, CheckpointVerdict::Abort, Some(_)) => {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster abort outcome for epoch {path_epoch} cannot carry a recovery capsule"
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// Whether this outcome irrevocably selected commit.
+    #[must_use]
+    pub fn is_commit(&self) -> bool {
+        matches!(self.verdict, CheckpointVerdict::Commit)
     }
 }
 
@@ -190,19 +253,110 @@ struct DeploymentIdentity {
 
 const DEPLOYMENT_IDENTITY_VERSION: u32 = 1;
 
-/// Immutable tombstone for every raw decision epoch below `before_epoch`. The full canonical
-/// continuity anchor is embedded in the floor itself, so deleted/corrupt raw objects cannot be
-/// recreated with different metadata. Floors are never overwritten; readers select the greatest
-/// horizon within the current deployment namespace.
+/// Monotonic tombstone for terminal outcomes below `before_epoch`.
+///
+/// The terminal and committed anchors are continuity metadata only. Recovery must select a live
+/// commit outcome at or above the floor rather than treating an anchor whose checkpoint artifacts
+/// may have been deleted as a recovery cut. The canonical object is advanced with compare-and-swap
+/// so concurrent retention workers cannot regress either the horizon or its anchors.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct DecisionGcFloor {
+struct OutcomeGcFloor {
     version: u32,
     deployment_id: String,
     before_epoch: u64,
-    anchor: Option<CommitDecision>,
+    terminal_anchor: Option<CheckpointOutcome>,
+    committed_anchor: Option<CheckpointOutcome>,
 }
 
-const DECISION_GC_FLOOR_VERSION: u32 = 1;
+const OUTCOME_GC_FLOOR_VERSION: u32 = 4;
+
+#[derive(Debug)]
+struct VersionedOutcomeGcFloor {
+    floor: OutcomeGcFloor,
+    update_version: UpdateVersion,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCapsuleGcCursor {
+    version: u32,
+    deployment_id: String,
+    /// Last path examined in the current pass. `None` starts a new pass from the prefix root.
+    offset: Option<String>,
+}
+
+#[cfg(feature = "cluster")]
+const RECOVERY_CAPSULE_GC_CURSOR_VERSION: u32 = 1;
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct RecoveryCapsuleListCandidate {
+    location: String,
+    meta: object_store::ObjectMeta,
+}
+
+#[cfg(feature = "cluster")]
+impl PartialEq for RecoveryCapsuleListCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Eq for RecoveryCapsuleListCandidate {}
+
+#[cfg(feature = "cluster")]
+impl PartialOrd for RecoveryCapsuleListCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Ord for RecoveryCapsuleListCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.location.cmp(&other.location)
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn retain_lexically_oldest_recovery_capsule(
+    oldest: &mut BinaryHeap<RecoveryCapsuleListCandidate>,
+    meta: object_store::ObjectMeta,
+) {
+    let candidate = RecoveryCapsuleListCandidate {
+        location: meta.location.to_string(),
+        meta,
+    };
+    if oldest.len() < RECOVERY_CAPSULE_GC_BATCH_SIZE {
+        oldest.push(candidate);
+    } else if oldest.peek().is_some_and(|largest| &candidate < largest) {
+        oldest.pop();
+        oldest.push(candidate);
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct VersionedRecoveryCapsuleGcCursor {
+    cursor: RecoveryCapsuleGcCursor,
+    update_version: UpdateVersion,
+}
+
+/// Result of one bounded cluster recovery-capsule maintenance step.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryCapsuleGcStep {
+    /// Number of active-prefix entries selected and processed in this step.
+    pub examined: usize,
+    /// Number of old unreferenced capsules deleted.
+    pub deleted: usize,
+    /// Number of malformed or corrupt objects moved out of the active prefix.
+    pub quarantined: usize,
+    /// Whether an existing floor requires periodic rescans for delayed or previously failed work.
+    pub pending: bool,
+}
 
 impl CheckpointDecisionStore {
     /// Wrap an existing object store.
@@ -216,12 +370,60 @@ impl CheckpointDecisionStore {
         }
     }
 
-    fn path(epoch: u64) -> OsPath {
-        OsPath::from(format!("checkpoint-decisions/epoch={epoch}/commit"))
+    fn outcome_root() -> OsPath {
+        OsPath::from("checkpoint-outcomes/")
     }
 
-    fn intent_path(epoch: u64) -> OsPath {
-        OsPath::from(format!("checkpoint-decision-intents/epoch={epoch}/intent"))
+    fn outcome_path(epoch: u64) -> OsPath {
+        OsPath::from(format!("checkpoint-outcomes/epoch={epoch}/outcome"))
+    }
+
+    fn recovery_capsule_path(reference: &RecoveryCapsuleRef) -> OsPath {
+        OsPath::from(format!(
+            "checkpoint-recovery-capsules/epoch={:020}/checkpoint={:020}/sha256={}",
+            reference.epoch, reference.checkpoint_id, reference.sha256
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn recovery_capsule_root() -> OsPath {
+        OsPath::from("checkpoint-recovery-capsules/")
+    }
+
+    #[cfg(feature = "cluster")]
+    fn recovery_capsule_coordinates_from_path(location: &str) -> Option<(u64, u64, &str)> {
+        let suffix = location.strip_prefix("checkpoint-recovery-capsules/epoch=")?;
+        let (epoch, suffix) = suffix.split_once("/checkpoint=")?;
+        let (checkpoint_id, digest) = suffix.split_once("/sha256=")?;
+        if epoch.len() != 20
+            || checkpoint_id.len() != 20
+            || digest.len() != 64
+            || digest.contains('/')
+        {
+            return None;
+        }
+        Some((epoch.parse().ok()?, checkpoint_id.parse().ok()?, digest))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn recovery_capsule_gc_cursor_path(deployment_id: &str) -> OsPath {
+        OsPath::from(format!(
+            "checkpoint-recovery-capsule-gc/deployment={deployment_id}/cursor"
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn recovery_capsule_quarantine_path(location: &str) -> OsPath {
+        let digest = format!("{:x}", Sha256::digest(location.as_bytes()));
+        OsPath::from(format!(
+            "checkpoint-recovery-capsule-quarantine/path-sha256={digest}"
+        ))
+    }
+
+    fn outcome_gc_floor_path(deployment_id: &str) -> OsPath {
+        OsPath::from(format!(
+            "checkpoint-outcome-gc/deployment={deployment_id}/floor"
+        ))
     }
 
     fn reservation_root() -> OsPath {
@@ -236,16 +438,230 @@ impl CheckpointDecisionStore {
         OsPath::from("checkpoint-deployment/identity.json")
     }
 
-    fn gc_root(deployment_id: &str) -> OsPath {
-        OsPath::from(format!(
-            "checkpoint-decision-gc/deployment={deployment_id}/"
-        ))
+    #[cfg(feature = "cluster")]
+    async fn read_recovery_capsule_gc_cursor(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<VersionedRecoveryCapsuleGcCursor>, DecisionError> {
+        let path = Self::recovery_capsule_gc_cursor_path(deployment_id);
+        let result = match self.store.get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(DecisionError::Io(error.to_string())),
+        };
+        let update_version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| DecisionError::Io(error.to_string()))?;
+        let cursor: RecoveryCapsuleGcCursor = serde_json::from_slice(&bytes).map_err(|error| {
+            DecisionError::Conflict(format!("recovery capsule GC cursor: {error}"))
+        })?;
+        if cursor.version != RECOVERY_CAPSULE_GC_CURSOR_VERSION
+            || cursor.deployment_id != deployment_id
+            || cursor.offset.as_ref().is_some_and(|offset| {
+                !offset.starts_with("checkpoint-recovery-capsules/")
+                    || OsPath::parse(offset).is_err()
+            })
+        {
+            return Err(DecisionError::Conflict(
+                "recovery capsule GC cursor does not match its path, deployment, or progress"
+                    .into(),
+            ));
+        }
+        let canonical = serde_json::to_vec(&cursor)
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(DecisionError::Conflict(
+                "recovery capsule GC cursor does not use its canonical body".into(),
+            ));
+        }
+        Ok(Some(VersionedRecoveryCapsuleGcCursor {
+            cursor,
+            update_version,
+        }))
     }
 
-    fn gc_floor_path(deployment_id: &str, before_epoch: u64) -> OsPath {
-        OsPath::from(format!(
-            "checkpoint-decision-gc/deployment={deployment_id}/horizon={before_epoch}/floor"
-        ))
+    #[cfg(feature = "cluster")]
+    async fn compare_and_swap_recovery_capsule_gc_cursor(
+        &self,
+        cursor: &RecoveryCapsuleGcCursor,
+        expected: Option<UpdateVersion>,
+    ) -> Result<bool, DecisionError> {
+        let path = Self::recovery_capsule_gc_cursor_path(&cursor.deployment_id);
+        let payload = serde_json::to_vec(cursor)
+            .map(Bytes::from)
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let options = PutOptions {
+            mode: expected.map_or(PutMode::Create, PutMode::Update),
+            ..PutOptions::default()
+        };
+        match self
+            .store
+            .put_opts(&path, PutPayload::from(payload), options)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. }
+                | object_store::Error::NotFound { .. },
+            ) => Ok(false),
+            Err(error) => match self
+                .read_recovery_capsule_gc_cursor(&cursor.deployment_id)
+                .await?
+            {
+                Some(current) if current.cursor == *cursor => Ok(true),
+                _ => Err(DecisionError::Io(error.to_string())),
+            },
+        }
+    }
+
+    /// Create the canonical content-addressed body for a cluster recovery capsule.
+    ///
+    /// Identical retries converge on the existing immutable body. The returned reference is safe
+    /// to publish only after this method succeeds.
+    ///
+    /// # Errors
+    /// Object-store I/O, malformed capsule content, deployment mismatch, or a conflicting body.
+    pub async fn create_recovery_capsule(
+        &self,
+        capsule: &ClusterRecoveryCapsule,
+    ) -> Result<RecoveryCapsuleRef, DecisionError> {
+        let (encoded, reference) = capsule
+            .encode_and_reference()
+            .map_err(DecisionError::Conflict)?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if capsule.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "recovery capsule belongs to deployment {}, current deployment is {deployment_id}",
+                capsule.deployment_id
+            )));
+        }
+
+        let path = Self::recovery_capsule_path(&reference);
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let put_error = self
+            .store
+            .put_opts(
+                &path,
+                PutPayload::from(Bytes::copy_from_slice(&encoded)),
+                options,
+            )
+            .await
+            .err();
+
+        match self.load_recovery_capsule(&reference).await {
+            Ok(stored) if stored == *capsule => Ok(reference),
+            Ok(_) => Err(DecisionError::Conflict(format!(
+                "recovery capsule '{}' differs from the proposed content",
+                reference.sha256
+            ))),
+            Err(reconcile_error) => {
+                if let Some(put_error) = put_error {
+                    Err(DecisionError::Io(format!(
+                        "recovery capsule write failed ({put_error}); reconciliation failed ({reconcile_error})"
+                    )))
+                } else {
+                    Err(reconcile_error)
+                }
+            }
+        }
+    }
+
+    /// Load and verify one exact content-addressed recovery capsule.
+    ///
+    /// Verification covers the object path, recorded and observed lengths, canonical JSON body,
+    /// SHA-256 reference, deployment identity, and capsule-internal invariants.
+    ///
+    /// # Errors
+    /// Object-store I/O, a missing object, malformed content, or any reference mismatch.
+    pub async fn load_recovery_capsule(
+        &self,
+        reference: &RecoveryCapsuleRef,
+    ) -> Result<ClusterRecoveryCapsule, DecisionError> {
+        reference.validate().map_err(DecisionError::Conflict)?;
+        let result = match self
+            .store
+            .get(&Self::recovery_capsule_path(reference))
+            .await
+        {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(DecisionError::Conflict(format!(
+                    "recovery capsule '{}' is missing",
+                    reference.sha256
+                )));
+            }
+            Err(error) => return Err(DecisionError::Io(error.to_string())),
+        };
+        if result.meta.size != reference.len {
+            return Err(DecisionError::Conflict(format!(
+                "recovery capsule '{}' is {} bytes, expected {}",
+                reference.sha256, result.meta.size, reference.len
+            )));
+        }
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| DecisionError::Io(error.to_string()))?;
+        if u64::try_from(bytes.len()).ok() != Some(reference.len) {
+            return Err(DecisionError::Conflict(format!(
+                "recovery capsule '{}' payload length changed while reading",
+                reference.sha256
+            )));
+        }
+        let capsule: ClusterRecoveryCapsule = serde_json::from_slice(&bytes).map_err(|error| {
+            DecisionError::Conflict(format!("recovery capsule '{}': {error}", reference.sha256))
+        })?;
+        let (canonical, actual_reference) = capsule
+            .encode_and_reference()
+            .map_err(DecisionError::Conflict)?;
+        if actual_reference != *reference || canonical.as_slice() != bytes.as_ref() {
+            return Err(DecisionError::Conflict(format!(
+                "recovery capsule '{}' does not match its content-addressed reference",
+                reference.sha256
+            )));
+        }
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if capsule.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "recovery capsule belongs to deployment {}, current deployment is {deployment_id}",
+                capsule.deployment_id
+            )));
+        }
+        Ok(capsule)
+    }
+
+    pub(crate) async fn validate_recovery_capsule_for_outcome(
+        &self,
+        outcome: &CheckpointOutcome,
+    ) -> Result<(), DecisionError> {
+        outcome.validate_shape(outcome.epoch)?;
+        let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
+            DecisionError::Conflict(format!(
+                "cluster commit outcome for epoch {} requires a recovery capsule",
+                outcome.epoch
+            ))
+        })?;
+        let capsule = self.load_recovery_capsule(reference).await?;
+        if capsule.attempt.epoch != outcome.epoch
+            || capsule.attempt.checkpoint_id != outcome.checkpoint_id
+            || Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
+            || capsule.deployment_id != outcome.deployment_id
+        {
+            return Err(DecisionError::Conflict(format!(
+                "cluster commit outcome for epoch {} does not match recovery capsule '{}'",
+                outcome.epoch, reference.sha256
+            )));
+        }
+        Ok(())
     }
 
     fn decode_deployment_identity(bytes: &[u8]) -> Result<String, DecisionError> {
@@ -446,62 +862,47 @@ impl CheckpointDecisionStore {
         }
     }
 
-    /// Epoch segment of a canonical `checkpoint-decisions/epoch={N}/commit` marker.
-    fn epoch_segment(loc: &str) -> Option<&str> {
-        loc.strip_prefix("checkpoint-decisions/")?
-            .strip_suffix("/commit")?
+    /// Epoch segment of a canonical create-once terminal outcome object.
+    fn outcome_epoch_segment(loc: &str) -> Option<&str> {
+        loc.strip_prefix("checkpoint-outcomes/")?
+            .strip_suffix("/outcome")?
             .strip_prefix("epoch=")
     }
 
-    /// Epoch segment of a canonical write-ahead decision-intent object.
-    fn intent_epoch_segment(loc: &str) -> Option<&str> {
-        loc.strip_prefix("checkpoint-decision-intents/")?
-            .strip_suffix("/intent")?
-            .strip_prefix("epoch=")
-    }
-
-    fn gc_horizon_segment<'a>(loc: &'a str, deployment_id: &str) -> Option<&'a str> {
-        loc.strip_prefix(&format!(
-            "checkpoint-decision-gc/deployment={deployment_id}/"
-        ))?
-        .strip_suffix("/floor")?
-        .strip_prefix("horizon=")
-    }
-
-    async fn canonical_decision(
+    pub(crate) async fn canonical_outcome(
         &self,
         epoch: u64,
         checkpoint_id: u64,
-        scope: CommitDecisionScope,
-        participants: &[u64],
-        manifest_participant_id: u64,
-        assignment_version: u64,
-    ) -> Result<CommitDecision, DecisionError> {
-        let mut participants = participants.to_vec();
-        participants.sort_unstable();
-        participants.dedup();
-        let mut decision = CommitDecision {
-            version: COMMIT_DECISION_VERSION,
+        scope: CheckpointScope,
+        assignment_fence: Option<CheckpointAssignmentFence>,
+        leader_proof: Option<LeaderProof>,
+        verdict: CheckpointVerdict,
+        recovery_capsule: Option<RecoveryCapsuleRef>,
+    ) -> Result<CheckpointOutcome, DecisionError> {
+        let outcome = CheckpointOutcome {
+            version: CHECKPOINT_OUTCOME_VERSION,
             scope,
             epoch,
             checkpoint_id,
-            deployment_id: String::new(),
-            participants,
-            manifest_participant_id,
-            assignment_version,
+            deployment_id: self.load_or_create_deployment_id().await?,
+            assignment_fence,
+            leader_proof,
+            recovery_capsule,
+            verdict,
         };
-        // Validate caller-controlled metadata before creating the durable deployment identity.
-        decision.validate_shape(epoch)?;
-        decision.deployment_id = self.load_or_create_deployment_id().await?;
-        Ok(decision)
+        if outcome.recovery_capsule.is_some() {
+            self.validate_recovery_capsule_for_outcome(&outcome).await?;
+        } else {
+            outcome.validate_shape(epoch)?;
+        }
+        Ok(outcome)
     }
 
-    async fn read_decision_record(
+    async fn read_outcome_record(
         &self,
         path: &OsPath,
         epoch: u64,
-        label: &str,
-    ) -> Result<Option<CommitDecision>, DecisionError> {
+    ) -> Result<Option<CheckpointOutcome>, DecisionError> {
         let result = match self.store.get(path).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -511,641 +912,378 @@ impl CheckpointDecisionStore {
             .bytes()
             .await
             .map_err(|error| DecisionError::Io(error.to_string()))?;
-        let decision: CommitDecision = serde_json::from_slice(&bytes)
-            .map_err(|error| DecisionError::Conflict(format!("{label} epoch {epoch}: {error}")))?;
-        decision.validate_shape(epoch)?;
-        let canonical = serde_json::to_vec(&decision)
+        let outcome: CheckpointOutcome = serde_json::from_slice(&bytes)
+            .map_err(|error| DecisionError::Conflict(format!("outcome epoch {epoch}: {error}")))?;
+        outcome.validate_shape(epoch)?;
+        if outcome.scope == CheckpointScope::Cluster {
+            return Err(DecisionError::Conflict(format!(
+                "cluster outcome epoch {epoch} is stored outside the shared leader authority"
+            )));
+        }
+        let canonical = serde_json::to_vec(&outcome)
             .map_err(|error| DecisionError::Conflict(error.to_string()))?;
         if canonical.as_slice() != bytes.as_ref() {
             return Err(DecisionError::Conflict(format!(
-                "{label} for epoch {epoch} does not use the canonical decision body"
+                "outcome for epoch {epoch} does not use the canonical body"
             )));
         }
         let expected_deployment = self.load_or_create_deployment_id().await?;
-        if decision.deployment_id != expected_deployment {
+        if outcome.deployment_id != expected_deployment {
             return Err(DecisionError::Conflict(format!(
-                "{label} for epoch {epoch} belongs to deployment {}, current deployment is {}",
-                decision.deployment_id, expected_deployment
+                "outcome for epoch {epoch} belongs to deployment {}, current deployment is \
+                 {expected_deployment}",
+                outcome.deployment_id
             )));
         }
-        Ok(Some(decision))
+        Ok(Some(outcome))
     }
 
-    async fn create_decision_record(
+    async fn create_outcome(
         &self,
-        path: &OsPath,
-        decision: &CommitDecision,
-        label: &str,
-    ) -> Result<bool, DecisionError> {
-        let payload = serde_json::to_vec(decision)
+        candidate: CheckpointOutcome,
+    ) -> Result<RecordOutcomeResult, DecisionError> {
+        let path = Self::outcome_path(candidate.epoch);
+        let payload = serde_json::to_vec(&candidate)
             .map(Bytes::from)
             .map_err(|error| DecisionError::Conflict(error.to_string()))?;
         let options = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
         };
-        match self
+        let Err(create_error) = self
             .store
-            .put_opts(path, PutPayload::from(payload), options)
+            .put_opts(&path, PutPayload::from(payload), options)
             .await
-        {
-            Ok(_) => Ok(true),
-            Err(
-                object_store::Error::Precondition { .. }
-                | object_store::Error::AlreadyExists { .. },
-            ) => {
-                let existing = self
-                    .read_decision_record(path, decision.epoch, label)
-                    .await?
-                    .ok_or_else(|| {
-                        DecisionError::Conflict(format!(
-                            "{label} for epoch {} disappeared during idempotence check",
-                            decision.epoch
-                        ))
-                    })?;
-                if existing == *decision {
-                    Ok(false)
-                } else {
-                    Err(DecisionError::Conflict(format!(
-                        "{label} for epoch {} already binds checkpoint {} with participants {:?}, \
-                         manifest participant {}, and assignment version {}; cannot bind \
-                         checkpoint {} with participants {:?}, manifest participant {}, and \
-                         assignment version {}",
-                        decision.epoch,
-                        existing.checkpoint_id,
-                        existing.participants,
-                        existing.manifest_participant_id,
-                        existing.assignment_version,
-                        decision.checkpoint_id,
-                        decision.participants,
-                        decision.manifest_participant_id,
-                        decision.assignment_version,
-                    )))
-                }
-            }
-            Err(error) => Err(DecisionError::Io(error.to_string())),
+        else {
+            return Ok(RecordOutcomeResult::Created(candidate));
+        };
+
+        // A failed create response may be ambiguous: read the create-once key before deciding
+        // whether the call failed. Recovery will not proceed past a valid Prepared witness until
+        // this exact epoch has a terminal winner.
+        if let Some(winner) = self.read_outcome_record(&path, candidate.epoch).await? {
+            return if winner == candidate {
+                Ok(RecordOutcomeResult::Unchanged(winner))
+            } else {
+                Ok(RecordOutcomeResult::Conflict { winner })
+            };
+        }
+
+        match create_error {
+            object_store::Error::Precondition { .. }
+            | object_store::Error::AlreadyExists { .. } => Err(DecisionError::Conflict(format!(
+                "outcome for epoch {} disappeared after create conflict",
+                candidate.epoch
+            ))),
+            error => Err(DecisionError::Io(error.to_string())),
         }
     }
 
-    async fn decision_intent(&self, epoch: u64) -> Result<Option<CommitDecision>, DecisionError> {
-        self.read_decision_record(&Self::intent_path(epoch), epoch, "decision intent")
-            .await
-    }
-
-    async fn read_gc_floor(
+    async fn read_outcome_gc_floor(
         &self,
         deployment_id: &str,
-        before_epoch: u64,
-    ) -> Result<Option<DecisionGcFloor>, DecisionError> {
-        let path = Self::gc_floor_path(deployment_id, before_epoch);
+    ) -> Result<Option<VersionedOutcomeGcFloor>, DecisionError> {
+        let path = Self::outcome_gc_floor_path(deployment_id);
         let result = match self.store.get(&path).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(DecisionError::Io(error.to_string())),
         };
+        let update_version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
         let bytes = result
             .bytes()
             .await
             .map_err(|error| DecisionError::Io(error.to_string()))?;
-        let floor: DecisionGcFloor = serde_json::from_slice(&bytes).map_err(|error| {
-            DecisionError::Conflict(format!("decision GC floor {before_epoch}: {error}"))
-        })?;
-        if floor.version != DECISION_GC_FLOOR_VERSION
+        let floor: OutcomeGcFloor = serde_json::from_slice(&bytes)
+            .map_err(|error| DecisionError::Conflict(format!("outcome GC floor: {error}")))?;
+        let before_epoch = floor.before_epoch;
+        if floor.version != OUTCOME_GC_FLOOR_VERSION
             || floor.before_epoch == 0
-            || floor.before_epoch != before_epoch
+            || floor.deployment_id != deployment_id
         {
-            return Err(DecisionError::Conflict(format!(
-                "decision GC floor path horizon {before_epoch} does not match valid versioned body horizon {}",
-                floor.before_epoch
-            )));
+            return Err(DecisionError::Conflict(
+                "outcome GC floor does not match its canonical path, deployment, and version"
+                    .to_owned(),
+            ));
         }
-        if let Some(anchor) = floor.anchor.as_ref() {
+        if let Some(anchor) = floor.terminal_anchor.as_ref() {
             anchor.validate_shape(anchor.epoch)?;
-            if anchor.epoch >= before_epoch || anchor.deployment_id != floor.deployment_id {
+            if anchor.epoch >= floor.before_epoch || anchor.deployment_id != floor.deployment_id {
                 return Err(DecisionError::Conflict(format!(
-                    "decision GC floor {before_epoch} has invalid anchor epoch {} checkpoint {}",
+                    "outcome GC floor {before_epoch} has invalid terminal anchor epoch {} checkpoint {}",
                     anchor.epoch, anchor.checkpoint_id
                 )));
             }
         }
-        if floor.deployment_id != deployment_id {
+        if let Some(anchor) = floor.committed_anchor.as_ref() {
+            anchor.validate_shape(anchor.epoch)?;
+            if !anchor.is_commit()
+                || anchor.epoch >= floor.before_epoch
+                || anchor.deployment_id != floor.deployment_id
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "outcome GC floor {before_epoch} has invalid committed anchor epoch {} checkpoint {}",
+                    anchor.epoch, anchor.checkpoint_id
+                )));
+            }
+            let terminal = floor.terminal_anchor.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "outcome GC floor {before_epoch} has a committed anchor without a terminal anchor"
+                ))
+            })?;
+            let ordered = if anchor.epoch == terminal.epoch {
+                anchor == terminal
+            } else {
+                anchor.epoch < terminal.epoch && anchor.checkpoint_id < terminal.checkpoint_id
+            };
+            if !ordered {
+                return Err(DecisionError::Conflict(format!(
+                    "outcome GC floor {before_epoch} committed anchor epoch {} checkpoint {} is not ordered before terminal anchor epoch {} checkpoint {}",
+                    anchor.epoch,
+                    anchor.checkpoint_id,
+                    terminal.epoch,
+                    terminal.checkpoint_id
+                )));
+            }
+        }
+        if floor
+            .terminal_anchor
+            .as_ref()
+            .is_some_and(CheckpointOutcome::is_commit)
+            && floor.committed_anchor != floor.terminal_anchor
+        {
             return Err(DecisionError::Conflict(format!(
-                "decision GC floor {before_epoch} belongs to deployment {}, current deployment is {deployment_id}",
-                floor.deployment_id
+                "outcome GC floor {before_epoch} does not retain its terminal commit as the committed anchor"
             )));
         }
         let canonical = serde_json::to_vec(&floor)
             .map_err(|error| DecisionError::Conflict(error.to_string()))?;
         if canonical.as_slice() != bytes.as_ref() {
             return Err(DecisionError::Conflict(format!(
-                "decision GC floor {before_epoch} does not use its canonical body"
+                "outcome GC floor {before_epoch} does not use its canonical body"
             )));
         }
-        Ok(Some(floor))
+        Ok(Some(VersionedOutcomeGcFloor {
+            floor,
+            update_version,
+        }))
     }
 
-    async fn list_gc_horizons(&self, deployment_id: &str) -> Result<Vec<u64>, DecisionError> {
-        let mut entries = self.store.list(Some(&Self::gc_root(deployment_id)));
-        let mut horizons = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
-            let location = entry.location.as_ref();
-            let horizon = Self::gc_horizon_segment(location, deployment_id)
-                .and_then(|segment| segment.parse::<u64>().ok())
-                .filter(|horizon| *horizon > 0)
-                .ok_or_else(|| {
-                    DecisionError::Conflict(format!(
-                        "malformed checkpoint-decision GC floor: {location}"
-                    ))
-                })?;
-            horizons.push(horizon);
-        }
-        horizons.sort_unstable();
-        horizons.dedup();
-        Ok(horizons)
+    async fn current_outcome_gc_floor(&self) -> Result<Option<OutcomeGcFloor>, DecisionError> {
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        Ok(self
+            .read_outcome_gc_floor(&deployment_id)
+            .await?
+            .map(|versioned| versioned.floor))
     }
 
-    async fn latest_gc_floor(&self) -> Result<Option<DecisionGcFloor>, DecisionError> {
-        const FLOOR_RETRIES: usize = 3;
-        for attempt in 0..FLOOR_RETRIES {
-            match self.latest_gc_floor_once().await {
-                Err(DecisionError::InventoryChanged(_)) if attempt + 1 < FLOOR_RETRIES => {
-                    tokio::task::yield_now().await;
-                }
-                result => return result,
+    async fn ensure_outcome_not_tombstoned(
+        &self,
+        outcome: &CheckpointOutcome,
+    ) -> Result<(), DecisionError> {
+        if let Some(floor) = self.current_outcome_gc_floor().await? {
+            if outcome.epoch < floor.before_epoch {
+                return Err(DecisionError::Conflict(format!(
+                    "outcome epoch {} checkpoint {} is below durable outcome GC horizon {}",
+                    outcome.epoch, outcome.checkpoint_id, floor.before_epoch
+                )));
             }
         }
-        Err(DecisionError::InventoryChanged(
-            "decision GC floor exhausted stability retries".into(),
-        ))
+        Ok(())
     }
 
-    async fn latest_gc_floor_once(&self) -> Result<Option<DecisionGcFloor>, DecisionError> {
-        let deployment_id = self.load_or_create_deployment_id().await?;
-        let horizons = self.list_gc_horizons(&deployment_id).await?;
-        let Some(horizon) = horizons.last().copied() else {
-            return Ok(None);
-        };
-        self.read_gc_floor(&deployment_id, horizon)
-            .await?
-            .ok_or_else(|| {
-                DecisionError::InventoryChanged(format!(
-                    "decision GC floor {horizon} disappeared during inventory"
-                ))
-            })
-            .map(Some)
-    }
-
-    /// Greatest durable GC horizon for the current deployment, or zero before compaction.
-    /// Followers use this read-only check before deleting participant-local artifacts.
+    /// Advance the canonical floor if `expected` still names its current object version.
     ///
-    /// # Errors
-    /// Object-store I/O or malformed/conflicting floor metadata.
-    pub async fn gc_floor_horizon(&self) -> Result<u64, DecisionError> {
-        Ok(self
-            .latest_gc_floor()
-            .await?
-            .map_or(0, |floor| floor.before_epoch))
-    }
-
-    fn retained_by_floor(decision: &CommitDecision, floor: Option<&DecisionGcFloor>) -> bool {
-        let Some(floor) = floor else {
-            return true;
-        };
-        decision.epoch >= floor.before_epoch
-    }
-
-    async fn ensure_not_tombstoned(&self, decision: &CommitDecision) -> Result<(), DecisionError> {
-        let floor = self.latest_gc_floor().await?;
-        if Self::retained_by_floor(decision, floor.as_ref()) {
-            Ok(())
-        } else {
-            let Some(floor) = floor else {
-                return Err(DecisionError::Conflict(
-                    "decision was rejected without a durable GC floor".into(),
-                ));
-            };
-            Err(DecisionError::Conflict(format!(
-                "decision epoch {} checkpoint {} is below durable GC horizon {}",
-                decision.epoch, decision.checkpoint_id, floor.before_epoch
-            )))
-        }
-    }
-
-    async fn create_gc_floor(&self, floor: &DecisionGcFloor) -> Result<(), DecisionError> {
-        let path = Self::gc_floor_path(&floor.deployment_id, floor.before_epoch);
+    /// `false` is ordinary CAS contention and requires the caller to rebuild its candidate from
+    /// the winner. Ambiguous write failures are reconciled by reading the canonical object.
+    async fn compare_and_swap_outcome_gc_floor(
+        &self,
+        floor: &OutcomeGcFloor,
+        expected: Option<UpdateVersion>,
+    ) -> Result<bool, DecisionError> {
+        let path = Self::outcome_gc_floor_path(&floor.deployment_id);
         let payload = serde_json::to_vec(floor)
             .map(Bytes::from)
             .map_err(|error| DecisionError::Conflict(error.to_string()))?;
         let options = PutOptions {
-            mode: PutMode::Create,
+            mode: expected.map_or(PutMode::Create, PutMode::Update),
             ..PutOptions::default()
         };
-        match self
+        let result = self
             .store
             .put_opts(&path, PutPayload::from(payload), options)
-            .await
-        {
-            Ok(_) => Ok(()),
+            .await;
+        match result {
+            Ok(_) => Ok(true),
             Err(
                 object_store::Error::Precondition { .. }
-                | object_store::Error::AlreadyExists { .. },
-            ) => {
-                let existing = self
-                    .read_gc_floor(&floor.deployment_id, floor.before_epoch)
-                    .await?
-                    .ok_or_else(|| {
-                        DecisionError::InventoryChanged(format!(
-                            "decision GC floor {} disappeared after create conflict",
-                            floor.before_epoch
-                        ))
-                    })?;
-                if existing == *floor {
-                    Ok(())
-                } else {
-                    Err(DecisionError::Conflict(format!(
-                        "decision GC floor {} already exists with a different continuity anchor",
-                        floor.before_epoch
-                    )))
-                }
-            }
-            Err(error) => Err(DecisionError::Io(error.to_string())),
+                | object_store::Error::AlreadyExists { .. }
+                | object_store::Error::NotFound { .. },
+            ) => Ok(false),
+            Err(error) => match self.read_outcome_gc_floor(&floor.deployment_id).await? {
+                Some(current) if current.floor.before_epoch >= floor.before_epoch => Ok(true),
+                _ => Err(DecisionError::Io(error.to_string())),
+            },
         }
     }
 
-    /// CAS-create the write-ahead intent and then the commit marker for `epoch`.
+    /// Create or read the one local terminal outcome allowed for an epoch.
     ///
-    /// `Ok(true)` means this call created the commit marker; `Ok(false)` means an identical marker
-    /// already existed (idempotent retries after commit are cheap no-ops).
-    ///
-    /// # Errors
-    /// Object-store I/O or invalid/conflicting decision metadata.
-    pub async fn record_committed(
-        &self,
-        epoch: u64,
-        checkpoint_id: u64,
-    ) -> Result<bool, DecisionError> {
-        self.record_committed_scoped(epoch, checkpoint_id, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-    }
-
-    /// CAS-create the intent and commit marker for a participant-complete cluster checkpoint.
-    ///
-    /// `participants` is treated as a set and canonicalized before persistence, so retries from
-    /// independent coordinators produce byte-equivalent metadata regardless of discovery order.
-    /// The canonical manifest participant must belong to that set. Cluster decisions require a
-    /// non-zero assignment version; local callers should use [`Self::record_committed`].
+    /// Identical retries return [`RecordOutcomeResult::Unchanged`]. A different checkpoint,
+    /// authority, assignment, recovery image, or verdict returns the durable winner in
+    /// [`RecordOutcomeResult::Conflict`]; it never overwrites that winner.
     ///
     /// # Errors
-    /// Object-store I/O or invalid/conflicting decision metadata.
-    pub async fn record_committed_for_participants(
+    /// Object-store I/O, malformed/non-canonical metadata, or any cluster-scoped proposal.
+    pub async fn record_outcome(
         &self,
         epoch: u64,
         checkpoint_id: u64,
-        participants: &[u64],
-        manifest_participant_id: u64,
-        assignment_version: u64,
-    ) -> Result<bool, DecisionError> {
-        self.record_committed_scoped(
-            epoch,
-            checkpoint_id,
-            CommitDecisionScope::Cluster,
-            participants,
-            manifest_participant_id,
-            assignment_version,
-        )
-        .await
-    }
-
-    async fn record_committed_scoped(
-        &self,
-        epoch: u64,
-        checkpoint_id: u64,
-        scope: CommitDecisionScope,
-        participants: &[u64],
-        manifest_participant_id: u64,
-        assignment_version: u64,
-    ) -> Result<bool, DecisionError> {
-        let decision = self
-            .canonical_decision(
+        scope: CheckpointScope,
+        assignment_fence: Option<CheckpointAssignmentFence>,
+        leader_proof: Option<LeaderProof>,
+        verdict: CheckpointVerdict,
+        recovery_capsule: Option<RecoveryCapsuleRef>,
+    ) -> Result<RecordOutcomeResult, DecisionError> {
+        if scope == CheckpointScope::Cluster {
+            return Err(DecisionError::Conflict(
+                "cluster outcomes must be admitted through the shared leader authority".into(),
+            ));
+        }
+        let candidate = self
+            .canonical_outcome(
                 epoch,
                 checkpoint_id,
                 scope,
-                participants,
-                manifest_participant_id,
-                assignment_version,
+                assignment_fence,
+                leader_proof,
+                verdict,
+                recovery_capsule,
             )
             .await?;
-
-        // The commit create is not invoked until the canonical intent create has completed. If
-        // cancellation happens after that point, recovery observes the durable intent and fails
-        // closed until it completes the exact commit marker. A remote intent create that outlives
-        // its process still requires a term-fenced authority for a linearizable negative proof;
-        // exactly-once admission therefore excludes remote/shared decision stores for now.
-        self.ensure_not_tombstoned(&decision).await?;
-        self.create_decision_record(&Self::intent_path(epoch), &decision, "decision intent")
-            .await?;
-        // Retention can advance while intent creation is in flight. Recheck before the final
-        // commit create; a stale/tombstoned intent remains inert under the durable floor.
-        self.ensure_not_tombstoned(&decision).await?;
-        let created = self
-            .create_decision_record(&Self::path(epoch), &decision, "commit decision")
-            .await?;
-        // A GC floor published during the final create wins. Do not report a tombstoned decision
-        // as committed even though its late raw bytes may remain for a later sweep.
-        self.ensure_not_tombstoned(&decision).await?;
-        Ok(created)
+        self.ensure_outcome_not_tombstoned(&candidate).await?;
+        let result = self.create_outcome(candidate.clone()).await?;
+        // A floor published while the create was in flight wins. The late raw object is inert and
+        // remains eligible for a later best-effort sweep.
+        self.ensure_outcome_not_tombstoned(&candidate).await?;
+        Ok(result)
     }
 
-    /// Load the commit decision for `epoch`.
+    /// Load the standalone/local terminal outcome for `epoch`.
+    ///
+    /// `None` means unresolved; it is never evidence of abort.
     ///
     /// # Errors
-    /// Object-store I/O or a malformed/conflicting decision body.
-    pub async fn decision(&self, epoch: u64) -> Result<Option<CommitDecision>, DecisionError> {
+    /// Object-store I/O or a malformed/conflicting outcome body.
+    pub async fn outcome(&self, epoch: u64) -> Result<Option<CheckpointOutcome>, DecisionError> {
         const FLOOR_RETRIES: usize = 3;
         for attempt in 0..FLOOR_RETRIES {
-            let floor_before = self.latest_gc_floor().await?;
+            let floor_before = self.current_outcome_gc_floor().await?;
             if floor_before
                 .as_ref()
                 .is_some_and(|floor| epoch < floor.before_epoch)
             {
-                let floor_after = self.latest_gc_floor().await?;
+                let floor_after = self.current_outcome_gc_floor().await?;
                 if floor_before == floor_after {
                     return Ok(None);
                 }
-                if attempt + 1 < FLOOR_RETRIES {
-                    tokio::task::yield_now().await;
-                    continue;
+            } else {
+                let outcome = self
+                    .read_outcome_record(&Self::outcome_path(epoch), epoch)
+                    .await?;
+                let floor_after = self.current_outcome_gc_floor().await?;
+                if floor_before == floor_after {
+                    return Ok(outcome.filter(|outcome| {
+                        floor_after
+                            .as_ref()
+                            .is_none_or(|floor| outcome.epoch >= floor.before_epoch)
+                    }));
                 }
-                return Err(DecisionError::InventoryChanged(
-                    "decision GC floor kept advancing during tombstoned exact lookup".into(),
-                ));
             }
-            let decision = match self
-                .read_decision_record(&Self::path(epoch), epoch, "decision")
-                .await
-            {
-                Ok(decision) => decision,
-                Err(error) => {
-                    let floor_after = self.latest_gc_floor().await?;
-                    if floor_after
-                        .as_ref()
-                        .is_some_and(|floor| epoch < floor.before_epoch)
-                        && floor_after != floor_before
-                    {
-                        if attempt + 1 < FLOOR_RETRIES {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        return Err(DecisionError::InventoryChanged(
-                            "decision became tombstoned during exact lookup".into(),
-                        ));
-                    }
-                    return Err(error);
-                }
-            };
-            let floor_after = self.latest_gc_floor().await?;
-            if floor_before != floor_after {
-                if attempt + 1 < FLOOR_RETRIES {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                return Err(DecisionError::InventoryChanged(
-                    "decision GC floor kept advancing during exact lookup".into(),
-                ));
+            if attempt + 1 < FLOOR_RETRIES {
+                tokio::task::yield_now().await;
             }
-            return Ok(
-                decision.filter(|decision| Self::retained_by_floor(decision, floor_after.as_ref()))
-            );
         }
         Err(DecisionError::InventoryChanged(
-            "decision exact lookup exhausted floor retries".into(),
+            "outcome GC floor kept advancing during exact lookup".into(),
         ))
     }
 
-    /// True iff a valid commit decision exists for `epoch`.
+    /// Whether the durable outcome for `epoch` is commit.
+    ///
+    /// `false` can mean either abort or unresolved. Call [`Self::outcome`] when that distinction
+    /// matters.
     ///
     /// # Errors
-    /// Returns an error when the decision cannot be read or validated.
-    pub async fn is_committed(&self, epoch: u64) -> Result<bool, DecisionError> {
-        Ok(self.decision(epoch).await?.is_some())
+    /// Object-store I/O or a malformed/conflicting outcome body.
+    pub async fn outcome_is_committed(&self, epoch: u64) -> Result<bool, DecisionError> {
+        Ok(self
+            .outcome(epoch)
+            .await?
+            .is_some_and(|outcome| outcome.is_commit()))
     }
 
-    /// Decision with the highest globally unique checkpoint ID, or `None`.
-    ///
-    /// # Errors
-    /// Object-store I/O, malformed/conflicting inventory, or an unresolved commit intent.
-    pub async fn highest_committed(&self) -> Result<Option<CommitDecision>, DecisionError> {
-        Ok(self.recovery_decisions().await?.pop())
-    }
-
-    async fn list_committed_epochs(&self) -> Result<Vec<u64>, DecisionError> {
-        let root = OsPath::from("checkpoint-decisions/");
-        let mut entries = self.store.list(Some(&root));
+    async fn list_outcome_epochs(&self) -> Result<Vec<u64>, DecisionError> {
+        let mut entries = self.store.list(Some(&Self::outcome_root()));
         let mut epochs = Vec::new();
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
             let location = entry.location.as_ref();
-            let segment = Self::epoch_segment(location).ok_or_else(|| {
-                DecisionError::Conflict(format!("malformed checkpoint-decision marker: {location}"))
-            })?;
-            let epoch = segment.parse::<u64>().map_err(|_| {
-                DecisionError::Conflict(format!("malformed checkpoint-decision marker: {location}"))
-            })?;
+            let epoch = Self::outcome_epoch_segment(location)
+                .and_then(|segment| segment.parse::<u64>().ok())
+                .filter(|epoch| *epoch != 0)
+                .ok_or_else(|| {
+                    DecisionError::Conflict(format!(
+                        "malformed checkpoint outcome path: {location}"
+                    ))
+                })?;
             epochs.push(epoch);
         }
         epochs.sort_unstable();
-        epochs.dedup();
-        Ok(epochs)
-    }
-
-    async fn load_committed_inventory_from(
-        &self,
-        min_epoch: u64,
-    ) -> Result<Vec<CommitDecision>, DecisionError> {
-        let epochs = self.list_committed_epochs().await?;
-        let mut decisions = Vec::with_capacity(epochs.len());
-        for epoch in epochs.into_iter().filter(|epoch| *epoch >= min_epoch) {
-            let decision = match self
-                .read_decision_record(&Self::path(epoch), epoch, "decision")
-                .await
-            {
-                Ok(decision) => decision,
-                Err(error) => {
-                    if self
-                        .latest_gc_floor()
-                        .await?
-                        .is_some_and(|floor| epoch < floor.before_epoch)
-                    {
-                        return Err(DecisionError::InventoryChanged(format!(
-                            "decision epoch {epoch} became tombstoned during decode"
-                        )));
-                    }
-                    return Err(error);
-                }
-            }
-            .ok_or_else(|| {
-                DecisionError::InventoryChanged(format!(
-                    "decision for epoch {epoch} disappeared during inventory"
-                ))
-            })?;
-            decisions.push(decision);
-        }
-        decisions.sort_unstable_by_key(|decision| decision.checkpoint_id);
-        Ok(decisions)
-    }
-
-    async fn list_intent_epochs(&self) -> Result<Vec<u64>, DecisionError> {
-        let root = OsPath::from("checkpoint-decision-intents/");
-        let mut entries = self.store.list(Some(&root));
-        let mut epochs = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
-            let location = entry.location.as_ref();
-            let segment = Self::intent_epoch_segment(location).ok_or_else(|| {
-                DecisionError::Conflict(format!("malformed checkpoint-decision intent: {location}"))
-            })?;
-            let epoch = segment.parse::<u64>().map_err(|_| {
-                DecisionError::Conflict(format!("malformed checkpoint-decision intent: {location}"))
-            })?;
-            epochs.push(epoch);
-        }
-        epochs.sort_unstable();
-        epochs.dedup();
-        Ok(epochs)
-    }
-
-    async fn load_intent_inventory_from(
-        &self,
-        min_epoch: u64,
-    ) -> Result<Vec<CommitDecision>, DecisionError> {
-        let epochs = self.list_intent_epochs().await?;
-        let mut intents = Vec::with_capacity(epochs.len());
-        for epoch in epochs.into_iter().filter(|epoch| *epoch >= min_epoch) {
-            let intent = match self.decision_intent(epoch).await {
-                Ok(intent) => intent,
-                Err(error) => {
-                    if self
-                        .latest_gc_floor()
-                        .await?
-                        .is_some_and(|floor| epoch < floor.before_epoch)
-                    {
-                        return Err(DecisionError::InventoryChanged(format!(
-                            "decision intent epoch {epoch} became tombstoned during decode"
-                        )));
-                    }
-                    return Err(error);
-                }
-            }
-            .ok_or_else(|| {
-                DecisionError::InventoryChanged(format!(
-                    "decision intent for epoch {epoch} disappeared during inventory"
-                ))
-            })?;
-            intents.push(intent);
-        }
-        intents.sort_unstable_by_key(|intent| intent.checkpoint_id);
-        Ok(intents)
-    }
-
-    fn validate_unique_checkpoint_ids(
-        records: &[CommitDecision],
-        label: &str,
-    ) -> Result<(), DecisionError> {
-        if let Some(pair) = records
-            .windows(2)
-            .find(|pair| pair[0].checkpoint_id == pair[1].checkpoint_id)
-        {
-            return Err(DecisionError::Conflict(format!(
-                "globally unique checkpoint ID {} is bound to both epoch {} and epoch {} in the {label} inventory",
-                pair[0].checkpoint_id, pair[0].epoch, pair[1].epoch
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_cross_inventory_ids(
-        decisions: &[CommitDecision],
-        intents: &[CommitDecision],
-    ) -> Result<(), DecisionError> {
-        let decision_epochs: FxHashMap<u64, u64> = decisions
-            .iter()
-            .map(|decision| (decision.checkpoint_id, decision.epoch))
-            .collect();
-        if let Some(intent) = intents.iter().find(|intent| {
-            decision_epochs
-                .get(&intent.checkpoint_id)
-                .is_some_and(|epoch| *epoch != intent.epoch)
-        }) {
-            let decision_epoch = decision_epochs[&intent.checkpoint_id];
-            return Err(DecisionError::Conflict(format!(
-                "globally unique checkpoint ID {} is bound to decision epoch {} and intent epoch {}",
-                intent.checkpoint_id, decision_epoch, intent.epoch
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_global_attempt_order(
-        decisions: &[CommitDecision],
-        intents: &[CommitDecision],
-    ) -> Result<(), DecisionError> {
-        let mut attempts: Vec<(u64, u64)> = decisions
-            .iter()
-            .chain(intents)
-            .map(|record| (record.checkpoint_id, record.epoch))
-            .collect();
-        attempts.sort_unstable();
-        attempts.dedup();
-        if let Some(pair) = attempts.windows(2).find(|pair| pair[0].1 >= pair[1].1) {
-            return Err(DecisionError::Conflict(format!(
-                "checkpoint attempt order regresses from ID {} epoch {} to ID {} epoch {}",
-                pair[0].0, pair[0].1, pair[1].0, pair[1].1
-            )));
-        }
-        Ok(())
-    }
-
-    async fn load_audited_inventories_once(
-        &self,
-    ) -> Result<
-        (
-            Vec<CommitDecision>,
-            Vec<CommitDecision>,
-            Option<DecisionGcFloor>,
-        ),
-        DecisionError,
-    > {
-        let floor_before = self.latest_gc_floor().await?;
-        let min_epoch = floor_before.as_ref().map_or(0, |floor| floor.before_epoch);
-        // Intent first matches publication order. A writer that starts between LISTs can add a
-        // resolved commit to the later inventory; commit-first can instead miss C then observe I
-        // and manufacture false InDoubt.
-        let mut intents = self.load_intent_inventory_from(min_epoch).await?;
-        let mut decisions = self.load_committed_inventory_from(min_epoch).await?;
-        let floor_after = self.latest_gc_floor().await?;
-        if floor_before != floor_after {
-            return Err(DecisionError::InventoryChanged(
-                "decision GC floor advanced during inventory audit".into(),
+        if epochs.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(DecisionError::Conflict(
+                "checkpoint outcome inventory contains a duplicate epoch".into(),
             ));
         }
-        if let Some(anchor) = floor_after.as_ref().and_then(|floor| floor.anchor.as_ref()) {
-            decisions.push(anchor.clone());
-        }
-        intents.sort_unstable_by_key(|intent| intent.checkpoint_id);
-        decisions.sort_unstable_by_key(|decision| decision.checkpoint_id);
-        Self::validate_unique_checkpoint_ids(&intents, "decision intent")?;
-        Self::validate_unique_checkpoint_ids(&decisions, "decision")?;
-        Self::validate_cross_inventory_ids(&decisions, &intents)?;
-        Ok((intents, decisions, floor_after))
+        Ok(epochs)
     }
 
-    async fn recovery_snapshot_with_floor(
-        &self,
-    ) -> Result<(Vec<CommitDecision>, Option<DecisionGcFloor>), DecisionError> {
+    /// Load every live standalone/local outcome in ascending epoch order.
+    ///
+    /// Continuity-only GC anchors are audited internally but never returned to callers because
+    /// their checkpoint artifacts may already have been deleted.
+    ///
+    /// # Errors
+    /// Object-store I/O, a malformed object name/body, or an inventory that changed during read.
+    pub async fn outcomes(&self) -> Result<Vec<CheckpointOutcome>, DecisionError> {
+        const FLOOR_RETRIES: usize = 3;
+        for attempt in 0..FLOOR_RETRIES {
+            let floor_before = self.current_outcome_gc_floor().await?;
+            let mut outcomes = self.audited_outcomes().await?;
+            let floor_after = self.current_outcome_gc_floor().await?;
+            if floor_before == floor_after {
+                if let Some(floor) = floor_after {
+                    outcomes.retain(|outcome| outcome.epoch >= floor.before_epoch);
+                }
+                return Ok(outcomes);
+            }
+            if attempt + 1 < FLOOR_RETRIES {
+                tokio::task::yield_now().await;
+            }
+        }
+        Err(DecisionError::InventoryChanged(
+            "outcome GC floor kept advancing while selecting live outcomes".into(),
+        ))
+    }
+
+    /// Anchor-inclusive inventory used for monotonic-history audits and retention metadata.
+    async fn audited_outcomes(&self) -> Result<Vec<CheckpointOutcome>, DecisionError> {
         const INVENTORY_RETRIES: usize = 3;
         for attempt in 0..INVENTORY_RETRIES {
-            match self.recovery_snapshot_once().await {
+            match self.outcomes_once().await {
                 Err(DecisionError::InventoryChanged(_)) if attempt + 1 < INVENTORY_RETRIES => {
                     tokio::task::yield_now().await;
                 }
@@ -1153,270 +1291,451 @@ impl CheckpointDecisionStore {
             }
         }
         Err(DecisionError::InventoryChanged(
-            "decision inventory exhausted stability retries".into(),
+            "checkpoint outcome inventory exhausted stability retries".into(),
         ))
     }
 
-    /// Audited recovery view of durable decisions.
-    ///
-    /// Every write-ahead intent must have a byte-identical canonical commit marker before a caller
-    /// may select any recovery frontier. An unresolved newer intent therefore prevents fallback to
-    /// an older committed cut while its final create may still become visible.
-    ///
-    /// # Errors
-    /// Object-store I/O, malformed/conflicting inventory, or an unresolved commit intent.
-    pub async fn recovery_snapshot(&self) -> Result<Vec<CommitDecision>, DecisionError> {
-        self.recovery_snapshot_with_floor()
-            .await
-            .map(|(decisions, _)| decisions)
-    }
+    async fn outcomes_once(&self) -> Result<Vec<CheckpointOutcome>, DecisionError> {
+        let floor_before = self.current_outcome_gc_floor().await?;
+        let min_epoch = floor_before.as_ref().map_or(0, |floor| floor.before_epoch);
+        let epochs = self
+            .list_outcome_epochs()
+            .await?
+            .into_iter()
+            .filter(|epoch| *epoch >= min_epoch);
 
-    async fn recovery_snapshot_once(
-        &self,
-    ) -> Result<(Vec<CommitDecision>, Option<DecisionGcFloor>), DecisionError> {
-        let (intents, decisions, floor) = self.load_audited_inventories_once().await?;
-        let by_epoch: FxHashMap<u64, &CommitDecision> = decisions
-            .iter()
-            .map(|decision| (decision.epoch, decision))
-            .collect();
-        for intent in &intents {
-            match by_epoch.get(&intent.epoch) {
-                Some(decision) if *decision == intent => {}
-                Some(decision) => {
-                    return Err(DecisionError::Conflict(format!(
-                        "decision intent for epoch {} checkpoint {} does not match committed checkpoint {}",
-                        intent.epoch, intent.checkpoint_id, decision.checkpoint_id
-                    )));
-                }
-                None => {
-                    return Err(DecisionError::InDoubt {
-                        epoch: intent.epoch,
-                        checkpoint_id: intent.checkpoint_id,
-                    });
-                }
+        let mut outcomes = Vec::new();
+        if let Some(anchor) = floor_before
+            .as_ref()
+            .and_then(|floor| floor.committed_anchor.as_ref())
+        {
+            outcomes.push(anchor.clone());
+        }
+        if let Some(anchor) = floor_before
+            .as_ref()
+            .and_then(|floor| floor.terminal_anchor.as_ref())
+        {
+            if outcomes.last() != Some(anchor) {
+                outcomes.push(anchor.clone());
             }
         }
-        Self::validate_global_attempt_order(&decisions, &intents)?;
-        Ok((decisions, floor))
-    }
-
-    /// Live recovery decisions, excluding the compacted continuity-only anchor below the GC
-    /// horizon. Recovery must never select an anchor whose manifest/state artifacts were deleted.
-    ///
-    /// # Errors
-    /// Object-store I/O, malformed/conflicting inventory, or an unresolved commit intent.
-    pub async fn recovery_decisions(&self) -> Result<Vec<CommitDecision>, DecisionError> {
-        let (mut decisions, floor) = self.recovery_snapshot_with_floor().await?;
-        if let Some(floor) = floor {
-            decisions.retain(|decision| decision.epoch >= floor.before_epoch);
-            if decisions.is_empty() {
+        for epoch in epochs {
+            let outcome = self
+                .read_outcome_record(&Self::outcome_path(epoch), epoch)
+                .await?
+                .ok_or_else(|| {
+                    DecisionError::InventoryChanged(format!(
+                        "checkpoint outcome for epoch {epoch} disappeared during inventory"
+                    ))
+                })?;
+            outcomes.push(outcome);
+        }
+        let floor_after = self.current_outcome_gc_floor().await?;
+        if floor_before != floor_after {
+            return Err(DecisionError::InventoryChanged(
+                "outcome GC floor advanced during outcome inventory".into(),
+            ));
+        }
+        for pair in outcomes.windows(2) {
+            let previous = &pair[0];
+            let current = &pair[1];
+            if current.epoch <= previous.epoch || current.checkpoint_id <= previous.checkpoint_id {
                 return Err(DecisionError::Conflict(format!(
-                    "decision GC floor {} proves committed history, but no live recovery decision remains at or above it",
-                    floor.before_epoch
+                    "checkpoint outcomes regress from epoch {} checkpoint {} to epoch {} checkpoint {}",
+                    previous.epoch,
+                    previous.checkpoint_id,
+                    current.epoch,
+                    current.checkpoint_id
                 )));
             }
         }
-        Ok(decisions)
+        Ok(outcomes)
     }
 
-    /// Complete every durable write-ahead intent that does not yet have its matching commit marker.
-    ///
-    /// Intent creation happens only after the exact state seal and participant inventory are
-    /// durable, so restart may safely re-drive the idempotent final create. Callers must invoke
-    /// this explicitly before recovery or rollback; ordinary inventory reads remain fail-closed.
+    /// Greatest committed terminal outcome, ignoring durable aborts.
     ///
     /// # Errors
-    /// Object-store I/O or malformed/conflicting intent/decision inventory.
-    pub async fn resolve_in_doubt(&self) -> Result<usize, DecisionError> {
-        const INVENTORY_RETRIES: usize = 3;
-        for attempt in 0..INVENTORY_RETRIES {
-            match self.resolve_in_doubt_once().await {
-                Err(DecisionError::InventoryChanged(_)) if attempt + 1 < INVENTORY_RETRIES => {
-                    tokio::task::yield_now().await;
-                }
-                result => return result,
-            }
-        }
-        Err(DecisionError::InventoryChanged(
-            "in-doubt resolution exhausted stability retries".into(),
+    /// Object-store I/O or malformed/conflicting outcome inventory.
+    pub async fn highest_committed_outcome(
+        &self,
+    ) -> Result<Option<CheckpointOutcome>, DecisionError> {
+        Ok(self
+            .outcomes()
+            .await?
+            .into_iter()
+            .rev()
+            .find(CheckpointOutcome::is_commit))
+    }
+
+    /// Greatest terminal outcome, including the continuity anchor when it is the newest closed
+    /// epoch retained by the store.
+    ///
+    /// # Errors
+    /// Object-store I/O or malformed/conflicting outcome inventory.
+    pub async fn highest_terminal_outcome(
+        &self,
+    ) -> Result<Option<CheckpointOutcome>, DecisionError> {
+        Ok(self.audited_outcomes().await?.pop())
+    }
+
+    /// Greatest durable outcome GC horizon for the current deployment, or zero before pruning.
+    ///
+    /// # Errors
+    /// Object-store I/O or malformed/conflicting floor metadata.
+    pub async fn outcome_gc_floor_horizon(&self) -> Result<u64, DecisionError> {
+        Ok(self
+            .current_outcome_gc_floor()
+            .await?
+            .map_or(0, |floor| floor.before_epoch))
+    }
+
+    /// Read scalar continuity metadata for compacted terminal outcomes.
+    ///
+    /// The returned boundary can fence external cursor rollback, but it cannot be used to recover
+    /// a checkpoint. Recovery must use a live commit from [`Self::outcomes`] or
+    /// [`Self::highest_committed_outcome`].
+    ///
+    /// # Errors
+    /// Object-store I/O or malformed/conflicting floor metadata.
+    pub async fn outcome_retention_boundary(
+        &self,
+    ) -> Result<OutcomeRetentionBoundary, DecisionError> {
+        let floor = self.current_outcome_gc_floor().await?;
+        Ok(floor.map_or(
+            OutcomeRetentionBoundary {
+                before_epoch: 0,
+                committed_checkpoint_id: None,
+                highest_closed_epoch: None,
+            },
+            |floor| OutcomeRetentionBoundary {
+                before_epoch: floor.before_epoch,
+                committed_checkpoint_id: floor.committed_anchor.map(|anchor| anchor.checkpoint_id),
+                highest_closed_epoch: floor.terminal_anchor.map(|anchor| anchor.epoch),
+            },
         ))
     }
 
-    async fn resolve_in_doubt_once(&self) -> Result<usize, DecisionError> {
-        let (intents, decisions, starting_floor) = self.load_audited_inventories_once().await?;
-        let by_epoch: FxHashMap<u64, &CommitDecision> = decisions
-            .iter()
-            .map(|decision| (decision.epoch, decision))
-            .collect();
-        for intent in &intents {
-            if let Some(decision) = by_epoch.get(&intent.epoch) {
-                if *decision != intent {
-                    return Err(DecisionError::Conflict(format!(
-                        "decision intent for epoch {} checkpoint {} does not match committed checkpoint {}",
-                        intent.epoch, intent.checkpoint_id, decision.checkpoint_id
-                    )));
-                }
-            }
+    #[cfg(feature = "cluster")]
+    async fn quarantine_recovery_capsule_object(
+        &self,
+        location: &OsPath,
+    ) -> Result<(), DecisionError> {
+        let quarantine = Self::recovery_capsule_quarantine_path(location.as_ref());
+        match self.store.rename(location, &quarantine).await {
+            Ok(()) => Ok(()),
+            Err(error) => match self.store.head(location).await {
+                Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Ok(_) => Err(DecisionError::Io(format!(
+                    "failed to quarantine recovery capsule '{location}': {error}"
+                ))),
+                Err(head_error) => Err(DecisionError::Io(format!(
+                    "failed to quarantine recovery capsule '{location}' ({error}); reconciliation failed ({head_error})"
+                ))),
+            },
         }
-        Self::validate_global_attempt_order(&decisions, &intents)?;
-        let mut resolved = 0usize;
-        for intent in intents {
-            match by_epoch.get(&intent.epoch) {
-                Some(decision) if *decision == &intent => {}
-                Some(decision) => {
-                    return Err(DecisionError::Conflict(format!(
-                        "decision intent for epoch {} checkpoint {} does not match committed checkpoint {}",
-                        intent.epoch, intent.checkpoint_id, decision.checkpoint_id
-                    )));
-                }
-                None => {
-                    if !Self::retained_by_floor(&intent, self.latest_gc_floor().await?.as_ref()) {
-                        continue;
-                    }
-                    self.create_decision_record(
-                        &Self::path(intent.epoch),
-                        &intent,
-                        "commit decision",
-                    )
-                    .await?;
-                    if Self::retained_by_floor(&intent, self.latest_gc_floor().await?.as_ref()) {
-                        resolved += 1;
-                    }
-                }
-            }
-        }
-        if self.latest_gc_floor().await? != starting_floor {
-            return Err(DecisionError::InventoryChanged(
-                "decision GC floor advanced during in-doubt resolution".into(),
-            ));
-        }
-        Ok(resolved)
     }
 
-    /// Retained durable decisions ordered by globally unique checkpoint ID.
+    /// Perform one bounded-memory cleanup step for capsule epochs below a durable cluster floor.
     ///
-    /// The first item may be the GC continuity anchor immediately below the
-    /// retained seal window. Callers use it to reject external cursor rollback.
-    ///
-    /// # Errors
-    /// Object-store I/O, malformed marker names/bodies, conflicting intent, or an unresolved
-    /// commit create.
-    pub async fn committed_decisions(&self) -> Result<Vec<CommitDecision>, DecisionError> {
-        self.recovery_snapshot().await
-    }
-
-    /// Publish an immutable GC floor for `epoch < before`, embedding the greatest-checkpoint-ID
-    /// victim as a canonical continuity anchor, then best-effort delete tombstoned raw pairs.
-    /// The floor is authoritative before any artifact deletion, so stale or late creates below it
-    /// remain inert. An unresolved intent blocks floor advancement.
-    ///
-    /// # Errors
-    /// Object-store I/O or malformed/conflicting decision inventory. Returns the effective durable
-    /// floor (which may be higher when another pruner advanced it concurrently).
-    pub async fn prune_before(&self, before: u64) -> Result<u64, DecisionError> {
-        if before == 0 {
-            return Ok(self
-                .latest_gc_floor()
-                .await?
-                .map_or(0, |floor| floor.before_epoch));
-        }
-        if let Some(floor) = self.latest_gc_floor().await? {
-            if floor.before_epoch >= before {
-                return Ok(floor.before_epoch);
-            }
+    /// Each step full-scans the unordered listing and processes the lexically oldest bounded batch
+    /// after the cursor. The cursor wraps so delayed creates and failed paths are retried.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn sweep_recovery_capsules_step(
+        &self,
+        before_epoch: u64,
+        known_live_digests: &std::collections::BTreeSet<String>,
+    ) -> Result<RecoveryCapsuleGcStep, DecisionError> {
+        if before_epoch <= 1 {
+            return Ok(RecoveryCapsuleGcStep {
+                examined: 0,
+                deleted: 0,
+                quarantined: 0,
+                pending: false,
+            });
         }
 
-        // This audit rejects every unmatched intent before floor publication. The returned view
-        // also carries the prior embedded anchor, which participates in max-ID compaction.
-        let (decisions, observed_floor) = self.recovery_snapshot_with_floor().await?;
-        if let Some(floor) = observed_floor.as_ref() {
-            if floor.before_epoch >= before {
-                return Ok(floor.before_epoch);
-            }
-        }
-        if !decisions.iter().any(|decision| decision.epoch >= before) {
-            return Err(DecisionError::Conflict(format!(
-                "cannot advance decision GC floor to {before}: no live recovery decision would remain"
-            )));
-        }
-        let anchor = decisions
-            .iter()
-            .filter(|decision| decision.epoch < before)
-            .max_by_key(|decision| decision.checkpoint_id)
-            .cloned();
-        let floor = DecisionGcFloor {
-            version: DECISION_GC_FLOOR_VERSION,
-            deployment_id: self.load_or_create_deployment_id().await?,
-            before_epoch: before,
-            anchor,
-        };
-        self.create_gc_floor(&floor).await?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        let observed = self.read_recovery_capsule_gc_cursor(&deployment_id).await?;
+        let (cursor, update_version) = observed.map_or_else(
+            || {
+                (
+                    RecoveryCapsuleGcCursor {
+                        version: RECOVERY_CAPSULE_GC_CURSOR_VERSION,
+                        deployment_id: deployment_id.clone(),
+                        offset: None,
+                    },
+                    None,
+                )
+            },
+            |observed| (observed.cursor, Some(observed.update_version)),
+        );
 
-        // A concurrent higher floor supersedes this plan. Reload it and sweep against the
-        // effective tombstone rather than deleting from a stale victim set.
-        let effective = self.latest_gc_floor().await?.ok_or_else(|| {
-            DecisionError::InventoryChanged(
-                "decision GC floor disappeared immediately after publication".into(),
-            )
-        })?;
-        if effective.before_epoch < before {
-            return Err(DecisionError::InventoryChanged(format!(
-                "decision GC floor regressed to {} after publishing {before}",
-                effective.before_epoch
-            )));
-        }
-
-        let raw_intent_epochs = self.list_intent_epochs().await?;
-        let raw_decision_epochs = self.list_committed_epochs().await?;
-        for epoch in raw_intent_epochs
-            .into_iter()
-            .filter(|epoch| *epoch < effective.before_epoch)
-        {
-            if let Err(error) = self.store.delete(&Self::intent_path(epoch)).await {
-                if !matches!(&error, object_store::Error::NotFound { .. }) {
-                    tracing::warn!(
-                        epoch,
-                        %error,
-                        "decision prune: tombstoned intent delete failed"
-                    );
-                }
-            }
-        }
-        for epoch in raw_decision_epochs
-            .into_iter()
-            .filter(|epoch| *epoch < effective.before_epoch)
-        {
-            match self.store.delete(&Self::path(epoch)).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(error) => tracing::warn!(
-                    epoch,
-                    %error,
-                    "decision prune: tombstoned commit delete failed"
-                ),
-            }
-        }
-        for horizon in self
-            .list_gc_horizons(&effective.deployment_id)
-            .await?
-            .into_iter()
-            .filter(|horizon| *horizon < effective.before_epoch)
-        {
-            if let Err(error) = self
-                .store
-                .delete(&Self::gc_floor_path(&effective.deployment_id, horizon))
-                .await
+        let root = Self::recovery_capsule_root();
+        let mut listed = self.store.list(Some(&root));
+        let mut oldest = BinaryHeap::with_capacity(RECOVERY_CAPSULE_GC_BATCH_SIZE);
+        let mut eligible = 0usize;
+        while let Some(entry) = listed.next().await {
+            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
+            if cursor
+                .offset
+                .as_deref()
+                .is_some_and(|offset| entry.location.as_ref() <= offset)
             {
-                if !matches!(&error, object_store::Error::NotFound { .. }) {
-                    tracing::warn!(
-                        horizon,
-                        effective = effective.before_epoch,
-                        %error,
-                        "decision prune: superseded GC floor delete failed"
-                    );
-                }
+                continue;
             }
+            eligible = eligible.saturating_add(1);
+            retain_lexically_oldest_recovery_capsule(&mut oldest, entry);
         }
-        Ok(effective.before_epoch)
+        let list_exhausted = eligible <= RECOVERY_CAPSULE_GC_BATCH_SIZE;
+        let entries = oldest
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| candidate.meta)
+            .collect::<Vec<_>>();
+        let examined = entries.len();
+
+        enum ObjectWork {
+            Retained,
+            Deleted,
+            Quarantined,
+            Failed,
+        }
+
+        let work = futures::stream::iter(entries.iter().cloned())
+            .map(|entry| async move {
+                let Some((epoch, checkpoint_id, digest)) =
+                    Self::recovery_capsule_coordinates_from_path(entry.location.as_ref())
+                else {
+                    return match self
+                        .quarantine_recovery_capsule_object(&entry.location)
+                        .await
+                    {
+                        Ok(()) => ObjectWork::Quarantined,
+                        Err(error) => {
+                            tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
+                            ObjectWork::Failed
+                        }
+                    };
+                };
+                if epoch >= before_epoch {
+                    return ObjectWork::Retained;
+                }
+                let reference = RecoveryCapsuleRef {
+                    epoch,
+                    checkpoint_id,
+                    sha256: digest.to_owned(),
+                    len: entry.size,
+                };
+                if reference.validate().is_err() {
+                    return match self
+                        .quarantine_recovery_capsule_object(&entry.location)
+                        .await
+                    {
+                        Ok(()) => ObjectWork::Quarantined,
+                        Err(error) => {
+                            tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
+                            ObjectWork::Failed
+                        }
+                    };
+                }
+                if known_live_digests.contains(&reference.sha256) {
+                    return ObjectWork::Retained;
+                }
+                match self.load_recovery_capsule(&reference).await {
+                    Ok(_) => match self.store.delete(&entry.location).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => ObjectWork::Deleted,
+                        Err(error) => {
+                            tracing::warn!(epoch, checkpoint_id, %error, "recovery capsule delete failed; retrying on the next scan pass");
+                            ObjectWork::Failed
+                        }
+                    },
+                    Err(DecisionError::Conflict(error)) => {
+                        if matches!(
+                            self.store.head(&entry.location).await,
+                            Err(object_store::Error::NotFound { .. })
+                        ) {
+                            return ObjectWork::Deleted;
+                        }
+                        match self
+                            .quarantine_recovery_capsule_object(&entry.location)
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::warn!(path = %entry.location, %error, "corrupt recovery capsule quarantined");
+                                ObjectWork::Quarantined
+                            }
+                            Err(quarantine_error) => {
+                                tracing::warn!(path = %entry.location, %error, %quarantine_error, "corrupt recovery capsule quarantine failed; retrying on the next scan pass");
+                                ObjectWork::Failed
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %entry.location, %error, "recovery capsule read failed; retrying on the next scan pass");
+                        ObjectWork::Failed
+                    }
+                }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+
+        let deleted = work
+            .iter()
+            .filter(|result| matches!(result, ObjectWork::Deleted))
+            .count();
+        let quarantined = work
+            .iter()
+            .filter(|result| matches!(result, ObjectWork::Quarantined))
+            .count();
+
+        let mut updated = cursor.clone();
+        updated.offset = if list_exhausted {
+            None
+        } else {
+            entries.iter().map(|entry| entry.location.to_string()).max()
+        };
+        let cursor_was_absent = update_version.is_none();
+        if updated != cursor
+            && !self
+                .compare_and_swap_recovery_capsule_gc_cursor(&updated, update_version)
+                .await?
+        {
+            return Ok(RecoveryCapsuleGcStep {
+                examined,
+                deleted,
+                quarantined,
+                pending: true,
+            });
+        }
+        if cursor_was_absent && updated == cursor {
+            let _ = self
+                .compare_and_swap_recovery_capsule_gc_cursor(&updated, None)
+                .await?;
+        }
+
+        Ok(RecoveryCapsuleGcStep {
+            examined,
+            deleted,
+            quarantined,
+            // Maintenance intentionally keeps cycling while a floor exists so delayed creates
+            // and previously failed paths cannot be stranded after a quiet pass.
+            pending: true,
+        })
+    }
+
+    /// Advance the outcome GC floor for `epoch < before`, then best-effort delete raw
+    /// tombstoned outcomes.
+    ///
+    /// At least one live commit must remain at or above the effective horizon. The embedded anchors
+    /// preserve terminal and committed-cursor continuity but are never eligible as recovery cuts.
+    /// Concurrent higher floors supersede this request and are included in the same best-effort
+    /// sweep.
+    ///
+    /// # Errors
+    /// Object-store I/O, malformed/conflicting inventory, or a horizon that would remove the last
+    /// recoverable commit outcome.
+    pub async fn prune_outcomes_before(&self, before: u64) -> Result<u64, DecisionError> {
+        if before == 0 {
+            return self.outcome_gc_floor_horizon().await;
+        }
+        let deployment_id = self.load_or_create_deployment_id().await?;
+
+        // A failed CAS means another worker advanced the floor. Rebuild from that winner instead
+        // of publishing anchors derived from an older view: reusing a stale candidate could
+        // discard a terminal outcome admitted between the two floor generations.
+        loop {
+            let observed = self.read_outcome_gc_floor(&deployment_id).await?;
+            if observed
+                .as_ref()
+                .is_some_and(|versioned| versioned.floor.before_epoch >= before)
+            {
+                // The floor may have become durable immediately before its publisher crashed.
+                // Re-enter the idempotent sweep so retries repair any raw outcomes or capsules
+                // left behind by that incomplete retention pass.
+                break;
+            }
+
+            let outcomes = match self.audited_outcomes().await {
+                Err(DecisionError::InventoryChanged(_)) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                result => result?,
+            };
+            if !outcomes
+                .iter()
+                .any(|outcome| outcome.epoch >= before && outcome.is_commit())
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "cannot advance outcome GC floor to {before}: no live commit recovery cut would remain"
+                )));
+            }
+            let floor = OutcomeGcFloor {
+                version: OUTCOME_GC_FLOOR_VERSION,
+                deployment_id: deployment_id.clone(),
+                before_epoch: before,
+                terminal_anchor: outcomes
+                    .iter()
+                    .rev()
+                    .find(|outcome| outcome.epoch < before)
+                    .cloned(),
+                committed_anchor: outcomes
+                    .iter()
+                    .rev()
+                    .find(|outcome| outcome.epoch < before && outcome.is_commit())
+                    .cloned(),
+            };
+            let expected = observed.map(|versioned| versioned.update_version);
+            if self
+                .compare_and_swap_outcome_gc_floor(&floor, expected)
+                .await?
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let mut swept_horizon = 0;
+        loop {
+            let effective = self.current_outcome_gc_floor().await?.ok_or_else(|| {
+                DecisionError::InventoryChanged(
+                    "outcome GC floor disappeared immediately after publication".into(),
+                )
+            })?;
+            if effective.before_epoch < before || effective.before_epoch < swept_horizon {
+                return Err(DecisionError::InventoryChanged(format!(
+                    "outcome GC floor regressed to {} after publishing {before}",
+                    effective.before_epoch
+                )));
+            }
+            if effective.before_epoch > swept_horizon {
+                let raw_epochs = self.list_outcome_epochs().await?;
+                for epoch in raw_epochs
+                    .into_iter()
+                    .filter(|epoch| *epoch < effective.before_epoch)
+                {
+                    match self.store.delete(&Self::outcome_path(epoch)).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                        Err(error) => tracing::warn!(
+                            epoch,
+                            %error,
+                            "outcome prune: tombstoned outcome delete failed"
+                        ),
+                    }
+                }
+                swept_horizon = effective.before_epoch;
+            }
+            let current = self.current_outcome_gc_floor().await?.ok_or_else(|| {
+                DecisionError::InventoryChanged(
+                    "outcome GC floor disappeared during best-effort sweep".into(),
+                )
+            })?;
+            if current.before_epoch == swept_horizon {
+                return Ok(swept_horizon);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -1428,35 +1747,91 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::tempdir;
 
-    struct CommitGateStore {
-        inner: Arc<dyn ObjectStore>,
-        puts: Arc<parking_lot::Mutex<Vec<String>>>,
-        release_commit: Arc<tokio::sync::Notify>,
+    fn store_in(dir: &std::path::Path) -> CheckpointDecisionStore {
+        let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
+        CheckpointDecisionStore::new(fs)
     }
 
-    impl std::fmt::Debug for CommitGateStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("CommitGateStore").finish_non_exhaustive()
+    struct DeferredPutStore {
+        inner: Arc<dyn ObjectStore>,
+        target: std::sync::Mutex<Option<OsPath>>,
+        intercepted: std::sync::atomic::AtomicBool,
+        pending: std::sync::Mutex<Option<(OsPath, PutPayload, PutOptions)>>,
+        reverse_lists: bool,
+    }
+
+    impl DeferredPutStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                target: std::sync::Mutex::new(None),
+                intercepted: std::sync::atomic::AtomicBool::new(false),
+                pending: std::sync::Mutex::new(None),
+                reverse_lists: false,
+            }
+        }
+
+        #[cfg(feature = "cluster")]
+        fn with_reversed_lists(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                target: std::sync::Mutex::new(None),
+                intercepted: std::sync::atomic::AtomicBool::new(false),
+                pending: std::sync::Mutex::new(None),
+                reverse_lists: true,
+            }
+        }
+
+        fn intercept(&self, target: OsPath) {
+            *self.target.lock().unwrap() = Some(target);
+            self.intercepted
+                .store(false, std::sync::atomic::Ordering::Release);
+            *self.pending.lock().unwrap() = None;
+        }
+
+        async fn apply_pending(&self) -> object_store::Result<object_store::PutResult> {
+            let (location, payload, options) =
+                self.pending.lock().unwrap().take().expect("deferred put");
+            self.inner.put_opts(&location, payload, options).await
         }
     }
 
-    impl std::fmt::Display for CommitGateStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("CommitGateStore")
+    impl std::fmt::Debug for DeferredPutStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("DeferredPutStore")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Display for DeferredPutStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("DeferredPutStore")
         }
     }
 
     #[async_trait]
-    impl ObjectStore for CommitGateStore {
+    impl ObjectStore for DeferredPutStore {
         async fn put_opts(
             &self,
             location: &OsPath,
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            self.puts.lock().push(location.to_string());
-            if location == &CheckpointDecisionStore::path(5) {
-                self.release_commit.notified().await;
+            let target = self.target.lock().unwrap().clone();
+            if target.as_ref() == Some(location)
+                && !self
+                    .intercepted
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                *self.pending.lock().unwrap() =
+                    Some((location.clone(), payload.clone(), options.clone()));
+                return Err(object_store::Error::Generic {
+                    store: "DeferredPutStore",
+                    source: Box::new(std::io::Error::other(
+                        "injected response loss before remote visibility",
+                    )),
+                });
             }
             self.inner.put_opts(location, payload, options).await
         }
@@ -1489,7 +1864,22 @@ mod tests {
             prefix: Option<&OsPath>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.inner.list(prefix)
+            let listed = self.inner.list(prefix);
+            if !self.reverse_lists {
+                return listed;
+            }
+            futures::stream::once(async move {
+                let mut entries = listed.collect::<Vec<_>>().await;
+                entries.sort_by(|left, right| match (left, right) {
+                    (Ok(left), Ok(right)) => right.location.as_ref().cmp(left.location.as_ref()),
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+                });
+                futures::stream::iter(entries)
+            })
+            .flatten()
+            .boxed()
         }
 
         async fn list_with_delimiter(
@@ -1509,165 +1899,957 @@ mod tests {
         }
     }
 
-    fn store_in(dir: &std::path::Path) -> CheckpointDecisionStore {
-        let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
-        CheckpointDecisionStore::new(fs)
+    fn assignment_fence(
+        assignment_version: u64,
+        participant_ids: &[u64],
+    ) -> CheckpointAssignmentFence {
+        let participants = participant_ids
+            .iter()
+            .map(|node_id| crate::checkpoint::CheckpointParticipant {
+                node_id: *node_id,
+                boot_incarnation: uuid::Uuid::from_u128(u128::from(*node_id) + 1_000),
+            })
+            .collect();
+        CheckpointAssignmentFence::from_owner_map(assignment_version, participant_ids, participants)
+            .unwrap()
+    }
+
+    fn leader_proof(
+        fence: &CheckpointAssignmentFence,
+        node_id: u64,
+        process_term: u64,
+        fencing_token: u64,
+    ) -> LeaderProof {
+        LeaderProof {
+            owner: crate::checkpoint::LeaderProofOwner {
+                node_id,
+                boot_id: fence.participant_incarnation(node_id).unwrap(),
+                process_term,
+            },
+            fencing_token,
+        }
+    }
+
+    fn digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    async fn test_capsule(
+        store: &CheckpointDecisionStore,
+        epoch: u64,
+        checkpoint_id: u64,
+        fence: &CheckpointAssignmentFence,
+    ) -> ClusterRecoveryCapsule {
+        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
+        let portable_state_sha256 = digest(9);
+        let participants = fence
+            .participant_ids()
+            .into_iter()
+            .map(|participant_id| crate::checkpoint::ParticipantRecoveryRef {
+                participant_id,
+                readiness_sha256: digest(3),
+                manifest_sha256: digest(4),
+                portable_state_sha256: portable_state_sha256.clone(),
+            })
+            .collect();
+        ClusterRecoveryCapsule {
+            version: crate::checkpoint::CLUSTER_RECOVERY_CAPSULE_VERSION,
+            attempt: crate::state::CheckpointAttempt::new(epoch, checkpoint_id),
+            deployment_id,
+            pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
+            assignment_fence: fence.clone(),
+            seal_inventory_sha256: digest(2),
+            participants,
+            source_offsets: std::collections::BTreeMap::new(),
+            source_metadata: std::collections::BTreeMap::new(),
+            source_watermarks: std::collections::BTreeMap::new(),
+            cluster_watermark: crate::checkpoint::CheckpointWatermark::Uninitialized,
+            recovery_watermark_frontier: None,
+            portable_state_sha256,
+        }
+    }
+
+    async fn create_capsule_ref(
+        store: &CheckpointDecisionStore,
+        epoch: u64,
+        checkpoint_id: u64,
+        fence: &CheckpointAssignmentFence,
+    ) -> RecoveryCapsuleRef {
+        let capsule = test_capsule(store, epoch, checkpoint_id, fence).await;
+        store.create_recovery_capsule(&capsule).await.unwrap()
     }
 
     #[test]
     fn inventory_paths_require_canonical_protocol_names() {
         assert_eq!(
-            CheckpointDecisionStore::epoch_segment("checkpoint-decisions/epoch=5/commit"),
+            CheckpointDecisionStore::outcome_epoch_segment("checkpoint-outcomes/epoch=5/outcome"),
             Some("5")
         );
         assert_eq!(
-            CheckpointDecisionStore::intent_epoch_segment(
-                "checkpoint-decision-intents/epoch=5/intent"
-            ),
-            Some("5")
-        );
-        assert_eq!(
-            CheckpointDecisionStore::epoch_segment("checkpoint-decisions/epoch=5/other"),
-            None
-        );
-        assert_eq!(
-            CheckpointDecisionStore::intent_epoch_segment(
-                "checkpoint-decision-intents/epoch=5/other"
-            ),
+            CheckpointDecisionStore::outcome_epoch_segment("checkpoint-outcomes/epoch=5/other"),
             None
         );
     }
 
     #[tokio::test]
-    async fn decision_body_must_use_canonical_encoding() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        let decision = store
-            .canonical_decision(5, 50, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-            .unwrap();
-        let mut body = serde_json::to_vec(&decision).unwrap();
-        body.push(b'\n');
-        store
-            .store
-            .put_opts(
-                &CheckpointDecisionStore::intent_path(5),
-                PutPayload::from(Bytes::from(body)),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..PutOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+    async fn recovery_capsule_create_is_idempotent_and_load_verifies_reference() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let fence = assignment_fence(12, &[2, 7]);
+        let capsule = test_capsule(&store, 4, 40, &fence).await;
 
-        let error = store.recovery_snapshot().await.unwrap_err();
-        assert!(matches!(error, DecisionError::Conflict(_)));
-        assert!(error.to_string().contains("canonical decision body"));
+        let reference = store.create_recovery_capsule(&capsule).await.unwrap();
+        assert_eq!(
+            store.create_recovery_capsule(&capsule).await.unwrap(),
+            reference
+        );
+        assert_eq!(
+            store.load_recovery_capsule(&reference).await.unwrap(),
+            capsule
+        );
+
+        let mut wrong_length = reference.clone();
+        wrong_length.len += 1;
+        assert!(store.load_recovery_capsule(&wrong_length).await.is_err());
+
+        let mut wrong_digest = reference;
+        wrong_digest.sha256 = digest(0xaa);
+        assert!(store.load_recovery_capsule(&wrong_digest).await.is_err());
     }
 
-    async fn persist_local_intent_only(
-        store: &CheckpointDecisionStore,
-        epoch: u64,
-        checkpoint_id: u64,
-    ) -> CommitDecision {
-        let decision = store
-            .canonical_decision(epoch, checkpoint_id, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-            .unwrap();
-        store
-            .create_decision_record(
-                &CheckpointDecisionStore::intent_path(epoch),
-                &decision,
-                "decision intent",
-            )
-            .await
-            .unwrap();
-        decision
-    }
-
-    async fn put_raw_decision_record(
-        store: &CheckpointDecisionStore,
-        path: OsPath,
-        body: &'static [u8],
-    ) {
-        store
-            .store
-            .put_opts(
-                &path,
-                PutPayload::from(Bytes::from_static(body)),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..PutOptions::default()
-                },
-            )
-            .await
-            .unwrap();
-    }
-
+    #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn commit_create_is_not_invoked_until_intent_is_durable() {
-        let puts = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let release_commit = Arc::new(tokio::sync::Notify::new());
-        let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gated: Arc<dyn ObjectStore> = Arc::new(CommitGateStore {
-            inner: backing,
-            puts: Arc::clone(&puts),
-            release_commit: Arc::clone(&release_commit),
-        });
-        let store = Arc::new(CheckpointDecisionStore::new(gated));
-        let commit_path = CheckpointDecisionStore::path(5).to_string();
-        let record = {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move { store.record_committed(5, 50).await })
-        };
+    async fn cyclic_capsule_cleanup_finds_a_create_visible_after_client_failure() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        let fence = assignment_fence(12, &[2, 7]);
+        let capsule = test_capsule(&store, 1, 40, &fence).await;
+        let (_, reference) = capsule.encode_and_reference().unwrap();
+        let path = CheckpointDecisionStore::recovery_capsule_path(&reference);
+        fault.intercept(path.clone());
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if puts.lock().iter().any(|path| path == &commit_path) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let intent_path = CheckpointDecisionStore::intent_path(5).to_string();
-        let protocol_puts: Vec<String> = puts
-            .lock()
-            .iter()
-            .filter(|path| {
-                path.as_str() == intent_path.as_str() || path.as_str() == commit_path.as_str()
-            })
-            .cloned()
-            .collect();
-        assert_eq!(protocol_puts, vec![intent_path, commit_path]);
+        let error = store
+            .create_recovery_capsule(&capsule)
+            .await
+            .expect_err("the client must observe the injected ambiguous failure");
+        assert!(matches!(error, DecisionError::Io(_)));
         assert!(matches!(
-            store.highest_committed().await,
-            Err(DecisionError::InDoubt {
-                epoch: 5,
-                checkpoint_id: 50
-            })
+            inner.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
         ));
 
-        release_commit.notify_one();
-        assert!(record.await.unwrap().unwrap());
+        let live = std::collections::BTreeSet::new();
+        assert!(
+            store
+                .sweep_recovery_capsules_step(2, &live)
+                .await
+                .unwrap()
+                .pending
+        );
+        fault.apply_pending().await.unwrap();
+        inner
+            .head(&path)
+            .await
+            .expect("deferred server-side create became visible");
+
+        let step = store.sweep_recovery_capsules_step(2, &live).await.unwrap();
+        assert_eq!(step.deleted, 1);
+        assert!(step.pending);
+        assert!(matches!(
+            inner.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn capsule_cleanup_progress_is_independent_of_list_order() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let reversed: Arc<dyn ObjectStore> =
+            Arc::new(DeferredPutStore::with_reversed_lists(Arc::clone(&inner)));
+        let store = CheckpointDecisionStore::new(reversed);
+        let fence = assignment_fence(12, &[2, 7]);
+        let oldest = create_capsule_ref(&store, 1, 10, &fence).await;
+        let oldest_path = CheckpointDecisionStore::recovery_capsule_path(&oldest);
+        let mut newest_path = None;
+        for epoch in 2..=70u64 {
+            let reference = RecoveryCapsuleRef {
+                epoch,
+                checkpoint_id: epoch * 10,
+                sha256: digest(u8::try_from(epoch).unwrap()),
+                len: 1,
+            };
+            let path = CheckpointDecisionStore::recovery_capsule_path(&reference);
+            inner
+                .put(&path, PutPayload::from(Bytes::from_static(b"x")))
+                .await
+                .unwrap();
+            newest_path = Some(path);
+        }
+
+        let step = store
+            .sweep_recovery_capsules_step(2, &std::collections::BTreeSet::new())
+            .await
+            .unwrap();
+        assert_eq!(step.examined, RECOVERY_CAPSULE_GC_BATCH_SIZE);
+        assert_eq!(step.deleted, 1);
+        assert!(matches!(
+            inner.head(&oldest_path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        inner
+            .head(&newest_path.unwrap())
+            .await
+            .expect("newer retained capsule must survive unordered maintenance");
+    }
+
+    #[tokio::test]
+    async fn recovery_capsule_load_rejects_tampered_body() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let fence = assignment_fence(12, &[2, 7]);
+        let capsule = test_capsule(&store, 4, 40, &fence).await;
+        let reference = store.create_recovery_capsule(&capsule).await.unwrap();
+        let path = CheckpointDecisionStore::recovery_capsule_path(&reference);
+        let mut encoded = crate::checkpoint::canonical_json_bytes(&capsule).unwrap();
+        let position = encoded
+            .iter()
+            .position(|byte| *byte == b'4')
+            .expect("test capsule contains a digit");
+        encoded[position] = b'5';
+        object_store
+            .put(&path, PutPayload::from(Bytes::from(encoded)))
+            .await
+            .unwrap();
+
+        let error = store.load_recovery_capsule(&reference).await.unwrap_err();
+        assert!(matches!(error, DecisionError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn outcome_shape_requires_capsule_only_for_cluster_commit() {
+        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
+        let fence = assignment_fence(12, &[2, 7]);
+        let proof = leader_proof(&fence, 2, 3, 4);
+        let reference = create_capsule_ref(&store, 4, 40, &fence).await;
+
+        let missing = store
+            .canonical_outcome(
+                4,
+                40,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                Some(proof.clone()),
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("requires a recovery capsule"));
+
+        let abort_with_capsule = store
+            .canonical_outcome(
+                4,
+                40,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                Some(proof),
+                CheckpointVerdict::Abort,
+                Some(reference.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(abort_with_capsule
+            .to_string()
+            .contains("abort outcome for epoch 4 cannot carry"));
+
+        let local_with_capsule = store
+            .canonical_outcome(
+                4,
+                40,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                Some(reference),
+            )
+            .await
+            .unwrap_err();
+        assert!(local_with_capsule
+            .to_string()
+            .contains("local outcome for epoch 4 cannot carry"));
+    }
+
+    #[tokio::test]
+    async fn outcome_rejects_capsule_for_a_different_attempt() {
+        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
+        let fence = assignment_fence(12, &[2, 7]);
+        let proof = leader_proof(&fence, 2, 3, 4);
+        let reference = create_capsule_ref(&store, 4, 40, &fence).await;
+
+        let error = store
+            .canonical_outcome(
+                5,
+                50,
+                CheckpointScope::Cluster,
+                Some(fence),
+                Some(proof),
+                CheckpointVerdict::Commit,
+                Some(reference),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match recovery capsule"));
+    }
+
+    #[tokio::test]
+    async fn standalone_outcome_objects_reject_cluster_authority() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let fence = assignment_fence(12, &[2, 7]);
+        let proof = leader_proof(&fence, 2, 3, 4);
+        let error = store
+            .record_outcome(
+                4,
+                40,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                Some(proof.clone()),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shared leader authority"));
+
+        let forged = store
+            .canonical_outcome(
+                4,
+                40,
+                CheckpointScope::Cluster,
+                Some(fence),
+                Some(proof),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        object_store
+            .put(
+                &CheckpointDecisionStore::outcome_path(4),
+                PutPayload::from(Bytes::from(serde_json::to_vec(&forged).unwrap())),
+            )
+            .await
+            .unwrap();
+        let error = store.outcome(4).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside the shared leader authority"));
+    }
+
+    #[tokio::test]
+    async fn terminal_outcome_retry_is_idempotent_and_conflict_returns_winner() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let commit = CheckpointVerdict::Commit;
+
+        let created = store
+            .record_outcome(
+                7,
+                70,
+                CheckpointScope::Local,
+                None,
+                None,
+                commit.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let RecordOutcomeResult::Created(winner) = created else {
+            panic!("first create must win");
+        };
+
         assert_eq!(
             store
-                .highest_committed()
+                .record_outcome(7, 70, CheckpointScope::Local, None, None, commit, None)
+                .await
+                .unwrap(),
+            RecordOutcomeResult::Unchanged(winner.clone())
+        );
+        assert_eq!(
+            store
+                .record_outcome(
+                    7,
+                    71,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap(),
+            RecordOutcomeResult::Conflict {
+                winner: winner.clone()
+            }
+        );
+        assert_eq!(store.outcome(7).await.unwrap(), Some(winner));
+    }
+
+    #[tokio::test]
+    async fn recovery_abort_wins_against_a_delayed_commit_create() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        fault.intercept(CheckpointDecisionStore::outcome_path(2));
+
+        let error = store
+            .record_outcome(
+                2,
+                20,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .expect_err("the delayed create is not yet durably visible");
+        assert!(matches!(error, DecisionError::Io(_)));
+
+        let RecordOutcomeResult::Created(abort) = store
+            .record_outcome(
+                2,
+                20,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("recovery Abort must win the create-once race");
+        };
+        assert!(matches!(
+            fault.apply_pending().await,
+            Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. })
+        ));
+        assert_eq!(store.outcome(2).await.unwrap(), Some(abort));
+    }
+
+    #[tokio::test]
+    async fn delayed_commit_wins_before_recovery_abort_create() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        fault.intercept(CheckpointDecisionStore::outcome_path(2));
+
+        let error = store
+            .record_outcome(
+                2,
+                20,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .expect_err("the delayed create is not yet durably visible");
+        assert!(matches!(error, DecisionError::Io(_)));
+        fault.apply_pending().await.unwrap();
+
+        let RecordOutcomeResult::Conflict { winner } = store
+            .record_outcome(
+                2,
+                20,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the visible Commit must remain the terminal winner");
+        };
+        assert!(winner.is_commit());
+        assert_eq!(store.outcome(2).await.unwrap(), Some(winner));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_commit_and_abort_converge_on_one_terminal_winner() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let commit_store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let commit = tokio::spawn(async move {
+            commit_store
+                .record_outcome(
+                    8,
+                    80,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Commit,
+                    None,
+                )
+                .await
+                .unwrap()
+        });
+
+        let abort_store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let abort = tokio::spawn(async move {
+            abort_store
+                .record_outcome(
+                    8,
+                    80,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap()
+        });
+
+        let results = [commit.await.unwrap(), abort.await.unwrap()];
+        let restarted = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let winner = restarted.outcome(8).await.unwrap().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, RecordOutcomeResult::Created(_)))
+                .count(),
+            1
+        );
+        for result in results {
+            match result {
+                RecordOutcomeResult::Created(observed)
+                | RecordOutcomeResult::Unchanged(observed)
+                | RecordOutcomeResult::Conflict { winner: observed } => {
+                    assert_eq!(observed, winner);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_outcomes_survive_restart_and_absence_is_not_abort() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        store
+            .record_outcome(
+                4,
+                40,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .record_outcome(
+                5,
+                50,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = CheckpointDecisionStore::new(object_store);
+        assert!(matches!(
+            restarted.outcome(5).await.unwrap().unwrap().verdict,
+            CheckpointVerdict::Abort
+        ));
+        assert_eq!(restarted.outcome(6).await.unwrap(), None);
+        assert!(!restarted.outcome_is_committed(5).await.unwrap());
+        assert!(!restarted.outcome_is_committed(6).await.unwrap());
+        assert_eq!(
+            restarted
+                .highest_committed_outcome()
                 .await
                 .unwrap()
                 .unwrap()
-                .checkpoint_id,
-            50
+                .epoch,
+            4
         );
     }
 
     #[tokio::test]
-    async fn absent_before_recorded() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        assert!(!s.is_committed(1).await.unwrap());
+    async fn abort_after_commit_advances_terminal_without_replacing_live_commit() {
+        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
+        store
+            .record_outcome(
+                4,
+                40,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .record_outcome(
+                5,
+                50,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .highest_terminal_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            5
+        );
+        assert_eq!(
+            store
+                .highest_committed_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_floor_rejects_late_create_and_survives_restart() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        for (epoch, checkpoint_id, verdict) in [
+            (1, 10, CheckpointVerdict::Commit),
+            (2, 20, CheckpointVerdict::Abort),
+            (5, 50, CheckpointVerdict::Commit),
+        ] {
+            store
+                .record_outcome(
+                    epoch,
+                    checkpoint_id,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    verdict,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.prune_outcomes_before(4).await.unwrap(), 4);
+
+        let error = store
+            .record_outcome(
+                3,
+                30,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DecisionError::Conflict(_)));
+        assert!(error
+            .to_string()
+            .contains("below durable outcome GC horizon 4"));
+        assert_eq!(store.outcome(3).await.unwrap(), None);
+        drop(store);
+
+        let restarted = CheckpointDecisionStore::new(object_store);
+        assert_eq!(restarted.outcome_gc_floor_horizon().await.unwrap(), 4);
+        let live = restarted.outcomes().await.unwrap();
+        assert_eq!(
+            live.iter()
+                .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
+                .collect::<Vec<_>>(),
+            vec![(5, 50)]
+        );
+        let continuity = restarted.audited_outcomes().await.unwrap();
+        assert_eq!(
+            continuity
+                .iter()
+                .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (2, 20), (5, 50)]
+        );
+        assert!(matches!(&continuity[1].verdict, CheckpointVerdict::Abort));
+        assert_eq!(
+            restarted
+                .highest_committed_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            5
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_outcome_floor_advancement_is_monotonic() {
+        const LAST_EPOCH: u64 = 32;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        for epoch in 1..=LAST_EPOCH {
+            writer
+                .record_outcome(
+                    epoch,
+                    epoch * 10,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Commit,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for before in 2..=LAST_EPOCH {
+            let object_store = Arc::clone(&object_store);
+            tasks.spawn(async move {
+                let store = CheckpointDecisionStore::new(object_store);
+                (before, store.prune_outcomes_before(before).await)
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (requested, horizon) = result.unwrap();
+            assert!(
+                horizon.unwrap() >= requested,
+                "a concurrent floor winner may supersede but never regress a request"
+            );
+        }
+
+        let restarted = CheckpointDecisionStore::new(object_store);
+        assert_eq!(
+            restarted.outcome_gc_floor_horizon().await.unwrap(),
+            LAST_EPOCH
+        );
+        assert_eq!(
+            restarted.outcome_retention_boundary().await.unwrap(),
+            OutcomeRetentionBoundary {
+                before_epoch: LAST_EPOCH,
+                committed_checkpoint_id: Some((LAST_EPOCH - 1) * 10),
+                highest_closed_epoch: Some(LAST_EPOCH - 1),
+            }
+        );
+        assert_eq!(
+            restarted
+                .outcomes()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|outcome| outcome.epoch)
+                .collect::<Vec<_>>(),
+            vec![LAST_EPOCH]
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_floor_object_count_is_bounded_across_many_horizons() {
+        const LAST_EPOCH: u64 = 64;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
+        for epoch in 1..=LAST_EPOCH {
+            store
+                .record_outcome(
+                    epoch,
+                    epoch * 10,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Commit,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for before in 2..=LAST_EPOCH {
+            assert_eq!(store.prune_outcomes_before(before).await.unwrap(), before);
+        }
+
+        let mut entries = object_store.list(Some(&OsPath::from("checkpoint-outcome-gc/")));
+        let mut locations = Vec::new();
+        while let Some(entry) = entries.next().await {
+            locations.push(entry.unwrap().location);
+        }
+        assert_eq!(
+            locations,
+            vec![CheckpointDecisionStore::outcome_gc_floor_path(
+                &deployment_id
+            )],
+            "retention must overwrite one canonical floor instead of leaking horizon history"
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_retention_boundary_preserves_commit_cursor_and_closed_epoch() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        for (epoch, checkpoint_id, verdict) in [
+            (1, 10, CheckpointVerdict::Commit),
+            (2, 20, CheckpointVerdict::Abort),
+            (3, 30, CheckpointVerdict::Commit),
+        ] {
+            store
+                .record_outcome(
+                    epoch,
+                    checkpoint_id,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    verdict,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.prune_outcomes_before(3).await.unwrap(), 3);
+        drop(store);
+
+        let restarted = CheckpointDecisionStore::new(object_store);
+        assert_eq!(
+            restarted.outcome_retention_boundary().await.unwrap(),
+            OutcomeRetentionBoundary {
+                before_epoch: 3,
+                committed_checkpoint_id: Some(10),
+                highest_closed_epoch: Some(2),
+            }
+        );
+        assert_eq!(
+            restarted
+                .outcomes()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
+                .collect::<Vec<_>>(),
+            vec![(3, 30)]
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_inventory_rejects_checkpoint_order_regression() {
+        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
+        store
+            .record_outcome(
+                8,
+                80,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .record_outcome(
+                10,
+                100,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .unwrap();
+        store.prune_outcomes_before(9).await.unwrap();
+        store
+            .record_outcome(
+                9,
+                79,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        let error = store
+            .outcomes()
+            .await
+            .expect_err("the audited inventory must reject checkpoint-order regression");
+        assert!(matches!(error, DecisionError::Conflict(_)));
+        assert!(error.to_string().contains("epoch 8 checkpoint 80"));
+        assert!(error.to_string().contains("epoch 9 checkpoint 79"));
+    }
+
+    #[tokio::test]
+    async fn outcome_prune_cannot_remove_last_live_commit() {
+        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
+        store
+            .record_outcome(
+                4,
+                40,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .record_outcome(
+                5,
+                50,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = store.prune_outcomes_before(5).await.unwrap_err();
+        assert!(matches!(error, DecisionError::Conflict(_)));
+        assert!(error.to_string().contains("no live commit recovery cut"));
+        assert_eq!(store.outcome_gc_floor_horizon().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .highest_committed_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            4
+        );
     }
 
     #[tokio::test]
@@ -1692,538 +2874,6 @@ mod tests {
             first.load_or_create_deployment_id().await.unwrap(),
             second.load_or_create_deployment_id().await.unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn record_then_read() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        assert!(s.record_committed(5, 50).await.unwrap());
-        assert!(s.is_committed(5).await.unwrap());
-        let decision = s.decision(5).await.unwrap().unwrap();
-        assert_eq!(s.decision_intent(5).await.unwrap(), Some(decision.clone()));
-        assert_eq!(decision.checkpoint_id, 50);
-        assert_eq!(decision.scope, CommitDecisionScope::Local);
-        assert_eq!(decision.participants, [0]);
-        assert_eq!(decision.manifest_participant_id, 0);
-        assert_eq!(decision.assignment_version, 0);
-    }
-
-    #[tokio::test]
-    async fn unresolved_intent_blocks_every_recovery_frontier() {
-        let dir = tempdir().unwrap();
-        let store = store_in(dir.path());
-        store.record_committed(3, 30).await.unwrap();
-        persist_local_intent_only(&store, 5, 50).await;
-
-        for error in [
-            store.recovery_snapshot().await.unwrap_err(),
-            store.committed_decisions().await.unwrap_err(),
-            store.highest_committed().await.unwrap_err(),
-        ] {
-            assert!(matches!(
-                error,
-                DecisionError::InDoubt {
-                    epoch: 5,
-                    checkpoint_id: 50
-                }
-            ));
-        }
-        assert_eq!(store.decision(5).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn matching_commit_resolves_a_durable_intent() {
-        let dir = tempdir().unwrap();
-        let store = store_in(dir.path());
-        let intent = persist_local_intent_only(&store, 5, 50).await;
-        assert!(matches!(
-            store.highest_committed().await,
-            Err(DecisionError::InDoubt { .. })
-        ));
-
-        assert_eq!(store.resolve_in_doubt().await.unwrap(), 1);
-        assert_eq!(store.resolve_in_doubt().await.unwrap(), 0);
-
-        assert_eq!(store.highest_committed().await.unwrap(), Some(intent));
-    }
-
-    #[tokio::test]
-    async fn conflicting_intent_and_commit_fail_the_recovery_snapshot() {
-        let dir = tempdir().unwrap();
-        let store = store_in(dir.path());
-        persist_local_intent_only(&store, 5, 50).await;
-        let conflicting = store
-            .canonical_decision(5, 51, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-            .unwrap();
-        store
-            .create_decision_record(
-                &CheckpointDecisionStore::path(5),
-                &conflicting,
-                "commit decision",
-            )
-            .await
-            .unwrap();
-
-        let error = store.recovery_snapshot().await.unwrap_err();
-        assert!(matches!(error, DecisionError::Conflict(_)));
-        assert!(error.to_string().contains("does not match"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn cluster_decision_canonicalizes_and_round_trips_participants() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-
-        assert!(s
-            .record_committed_for_participants(5, 50, &[9, 3, 9, 5], 5, 42)
-            .await
-            .unwrap());
-        let decision = s.decision(5).await.unwrap().unwrap();
-
-        assert_eq!(decision.version, COMMIT_DECISION_VERSION);
-        assert_eq!(decision.scope, CommitDecisionScope::Cluster);
-        assert_eq!(decision.participants, [3, 5, 9]);
-        assert_eq!(decision.manifest_participant_id, 5);
-        assert_eq!(decision.assignment_version, 42);
-    }
-
-    #[tokio::test]
-    async fn cluster_decision_rejects_invalid_participant_metadata() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-
-        for (participants, manifest_participant, assignment_version) in [
-            (Vec::new(), 3, 1),
-            (vec![3, 5], 7, 1),
-            (vec![3, 5], 3, 0),
-            (vec![0, 3], 3, 0),
-        ] {
-            assert!(matches!(
-                s.record_committed_for_participants(
-                    5,
-                    50,
-                    &participants,
-                    manifest_participant,
-                    assignment_version
-                )
-                .await,
-                Err(DecisionError::Conflict(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn durable_decision_shape_requires_canonical_participants() {
-        let base = CommitDecision {
-            version: COMMIT_DECISION_VERSION,
-            scope: CommitDecisionScope::Cluster,
-            epoch: 5,
-            checkpoint_id: 50,
-            deployment_id: uuid::Uuid::now_v7().to_string(),
-            participants: vec![3, 5],
-            manifest_participant_id: 3,
-            assignment_version: 7,
-        };
-        assert!(base.validate_shape(5).is_ok());
-
-        for participants in [vec![5, 3], vec![3, 3], Vec::new()] {
-            let malformed = CommitDecision {
-                participants,
-                ..base.clone()
-            };
-            assert!(matches!(
-                malformed.validate_shape(5),
-                Err(DecisionError::Conflict(_))
-            ));
-        }
-
-        for malformed in [
-            CommitDecision {
-                version: COMMIT_DECISION_VERSION - 1,
-                ..base.clone()
-            },
-            CommitDecision {
-                epoch: 0,
-                ..base.clone()
-            },
-            CommitDecision {
-                checkpoint_id: 0,
-                ..base.clone()
-            },
-            CommitDecision {
-                manifest_participant_id: 7,
-                ..base.clone()
-            },
-            CommitDecision {
-                assignment_version: 0,
-                ..base.clone()
-            },
-        ] {
-            assert!(matches!(
-                malformed.validate_shape(5),
-                Err(DecisionError::Conflict(_))
-            ));
-        }
-
-        let malformed_local = CommitDecision {
-            scope: CommitDecisionScope::Local,
-            participants: vec![0, 3],
-            manifest_participant_id: 0,
-            assignment_version: 0,
-            ..base
-        };
-        assert!(matches!(
-            malformed_local.validate_shape(5),
-            Err(DecisionError::Conflict(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn cluster_decision_accepts_zero_as_a_real_node_id() {
-        let dir = tempdir().unwrap();
-        let store = store_in(dir.path());
-
-        store
-            .record_committed_for_participants(5, 50, &[2, 0, 1], 0, 7)
-            .await
-            .unwrap();
-        let decision = store.decision(5).await.unwrap().unwrap();
-
-        assert_eq!(decision.participants, [0, 1, 2]);
-        assert_eq!(decision.manifest_participant_id, 0);
-        assert_eq!(decision.assignment_version, 7);
-    }
-
-    #[tokio::test]
-    async fn second_record_is_noop() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        assert!(s.record_committed(7, 70).await.unwrap());
-        assert!(!s.record_committed(7, 70).await.unwrap());
-        assert!(s.is_committed(7).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn epochs_are_independent() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        s.record_committed(1, 10).await.unwrap();
-        assert!(s.is_committed(1).await.unwrap());
-        assert!(!s.is_committed(2).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn highest_committed_picks_max() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        assert_eq!(s.highest_committed().await.unwrap(), None);
-        s.record_committed(3, 30).await.unwrap();
-        s.record_committed(7, 70).await.unwrap();
-        s.record_committed(5, 50).await.unwrap();
-        assert_eq!(s.highest_committed().await.unwrap().unwrap().epoch, 7);
-    }
-
-    #[tokio::test]
-    async fn prune_drops_older() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        for e in 1..=5 {
-            s.record_committed(e, e * 10).await.unwrap();
-        }
-        s.prune_before(4).await.unwrap();
-        for e in 1..=3 {
-            assert!(
-                !s.is_committed(e).await.unwrap(),
-                "epoch {e} should not be a live recovery decision"
-            );
-            assert_eq!(
-                s.decision_intent(e).await.unwrap(),
-                None,
-                "epoch {e} raw intent should be pruned after compaction"
-            );
-        }
-        for e in 4..=5 {
-            assert!(s.is_committed(e).await.unwrap(), "epoch {e} should remain");
-            assert!(
-                s.decision_intent(e).await.unwrap().is_some(),
-                "epoch {e} intent should remain"
-            );
-        }
-        assert_eq!(
-            s.committed_decisions()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|decision| decision.epoch)
-                .collect::<Vec<_>>(),
-            vec![3, 4, 5]
-        );
-    }
-
-    #[tokio::test]
-    async fn tombstoned_malformed_raw_records_are_ignored_before_decode() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        for epoch in 1..=3 {
-            store.record_committed(epoch, epoch * 10).await.unwrap();
-        }
-        assert_eq!(store.prune_before(3).await.unwrap(), 3);
-
-        put_raw_decision_record(
-            &store,
-            CheckpointDecisionStore::intent_path(1),
-            b"not-json-intent",
-        )
-        .await;
-        put_raw_decision_record(
-            &store,
-            CheckpointDecisionStore::path(1),
-            b"not-json-decision",
-        )
-        .await;
-
-        assert_eq!(
-            store
-                .committed_decisions()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|decision| decision.epoch)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        assert_eq!(
-            store
-                .recovery_decisions()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|decision| decision.epoch)
-                .collect::<Vec<_>>(),
-            vec![3]
-        );
-    }
-
-    #[tokio::test]
-    async fn advancing_floor_carries_anchor_but_excludes_it_from_live_recovery() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        let anchor = store
-            .canonical_decision(1, 10, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-            .unwrap();
-        store.record_committed(1, 10).await.unwrap();
-        store.record_committed(5, 50).await.unwrap();
-
-        assert_eq!(store.prune_before(3).await.unwrap(), 3);
-        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
-        let first_floor = store
-            .read_gc_floor(&deployment_id, 3)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first_floor.anchor, Some(anchor.clone()));
-        assert!(matches!(
-            store
-                .store
-                .get(&CheckpointDecisionStore::intent_path(1))
-                .await,
-            Err(object_store::Error::NotFound { .. })
-        ));
-        assert!(matches!(
-            store.store.get(&CheckpointDecisionStore::path(1)).await,
-            Err(object_store::Error::NotFound { .. })
-        ));
-
-        assert_eq!(store.prune_before(4).await.unwrap(), 4);
-        let second_floor = store.latest_gc_floor().await.unwrap().unwrap();
-        assert_eq!(second_floor.before_epoch, 4);
-        assert_eq!(second_floor.anchor, Some(anchor));
-        assert_eq!(
-            store
-                .committed_decisions()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|decision| decision.epoch)
-                .collect::<Vec<_>>(),
-            vec![1, 5]
-        );
-        assert_eq!(
-            store
-                .recovery_decisions()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|decision| decision.epoch)
-                .collect::<Vec<_>>(),
-            vec![5]
-        );
-    }
-
-    #[tokio::test]
-    async fn unresolved_intent_below_requested_horizon_blocks_floor_creation() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        let intent = persist_local_intent_only(&store, 2, 20).await;
-        store.record_committed(5, 50).await.unwrap();
-
-        assert!(matches!(
-            store.prune_before(4).await,
-            Err(DecisionError::InDoubt {
-                epoch: 2,
-                checkpoint_id: 20
-            })
-        ));
-        assert_eq!(store.gc_floor_horizon().await.unwrap(), 0);
-        assert_eq!(store.decision_intent(2).await.unwrap(), Some(intent));
-    }
-
-    #[tokio::test]
-    async fn floor_fails_closed_when_all_live_decision_records_disappear() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        store.record_committed(1, 10).await.unwrap();
-        store.record_committed(5, 50).await.unwrap();
-        store.prune_before(4).await.unwrap();
-
-        store
-            .store
-            .delete(&CheckpointDecisionStore::intent_path(5))
-            .await
-            .unwrap();
-        store
-            .store
-            .delete(&CheckpointDecisionStore::path(5))
-            .await
-            .unwrap();
-
-        let error = store.recovery_decisions().await.unwrap_err();
-        assert!(matches!(error, DecisionError::Conflict(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("no live recovery decision remains"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_lookup_below_floor_is_none_even_if_raw_decision_reappears() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        let tombstoned = store
-            .canonical_decision(1, 10, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-            .unwrap();
-        store.record_committed(1, 10).await.unwrap();
-        store.record_committed(5, 50).await.unwrap();
-        store.prune_before(4).await.unwrap();
-
-        store
-            .create_decision_record(
-                &CheckpointDecisionStore::path(1),
-                &tombstoned,
-                "commit decision",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(store.decision(1).await.unwrap(), None);
-        assert!(!store.is_committed(1).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn stale_lower_floor_does_not_override_the_highest_horizon() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        let stale_anchor = store
-            .canonical_decision(1, 10, CommitDecisionScope::Local, &[0], 0, 0)
-            .await
-            .unwrap();
-        store.record_committed(1, 10).await.unwrap();
-        store.record_committed(5, 50).await.unwrap();
-        assert_eq!(store.prune_before(4).await.unwrap(), 4);
-
-        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
-        store
-            .create_gc_floor(&DecisionGcFloor {
-                version: DECISION_GC_FLOOR_VERSION,
-                deployment_id,
-                before_epoch: 2,
-                anchor: Some(stale_anchor),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(store.gc_floor_horizon().await.unwrap(), 4);
-        assert_eq!(store.prune_before(3).await.unwrap(), 4);
-        assert_eq!(store.decision(2).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn prune_never_removes_an_unresolved_intent() {
-        let dir = tempdir().unwrap();
-        let store = store_in(dir.path());
-        let intent = persist_local_intent_only(&store, 2, 20).await;
-
-        assert!(matches!(
-            store.prune_before(100).await,
-            Err(DecisionError::InDoubt {
-                epoch: 2,
-                checkpoint_id: 20
-            })
-        ));
-        assert_eq!(store.gc_floor_horizon().await.unwrap(), 0);
-
-        assert_eq!(store.decision_intent(2).await.unwrap(), Some(intent));
-        assert!(matches!(
-            store.recovery_snapshot().await,
-            Err(DecisionError::InDoubt {
-                epoch: 2,
-                checkpoint_id: 20
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn conflicting_checkpoint_for_epoch_is_rejected() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        s.record_committed(9, 90).await.unwrap();
-        assert!(matches!(
-            s.record_committed(9, 91).await,
-            Err(DecisionError::Conflict(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn duplicate_checkpoint_id_across_epochs_is_rejected_from_inventory() {
-        let dir = tempdir().unwrap();
-        let store = store_in(dir.path());
-        store.record_committed(8, 90).await.unwrap();
-        store.record_committed(9, 90).await.unwrap();
-
-        let error = store.committed_decisions().await.unwrap_err();
-        assert!(error.to_string().contains("checkpoint ID 90"));
-        assert!(error.to_string().contains("epoch 8"));
-        assert!(error.to_string().contains("epoch 9"));
-    }
-
-    #[tokio::test]
-    async fn conflicting_cluster_metadata_for_epoch_is_rejected() {
-        let dir = tempdir().unwrap();
-        let s = store_in(dir.path());
-        s.record_committed_for_participants(9, 90, &[3, 5], 3, 12)
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            s.record_committed_for_participants(9, 90, &[3, 5], 5, 12)
-                .await,
-            Err(DecisionError::Conflict(_))
-        ));
-        assert!(matches!(
-            s.record_committed_for_participants(9, 90, &[3, 5], 3, 13)
-                .await,
-            Err(DecisionError::Conflict(_))
-        ));
     }
 
     #[tokio::test]

@@ -11,10 +11,12 @@
 
 use super::lsn::Lsn;
 use super::types::PgColumn;
+use bytes::Bytes;
 
 /// Offset from `PostgreSQL` epoch (2000-01-01) to Unix epoch (1970-01-01)
 /// in microseconds.
 const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
+const MAX_POSTGRES_COLUMNS: usize = 1_600;
 
 /// A decoded WAL message from the `pgoutput` protocol.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,13 +89,22 @@ pub struct InsertMessage {
     pub new_tuple: TupleData,
 }
 
+/// Old tuple representation identified by the pgoutput wire tag.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OldTuple {
+    /// Replica-identity key (`K`); non-key column positions are unavailable.
+    Key(TupleData),
+    /// Old tuple (`O`) emitted for `REPLICA IDENTITY FULL`.
+    Full(TupleData),
+}
+
 /// Row update message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateMessage {
     /// Relation OID of the target table.
     pub relation_id: u32,
-    /// Old row data (present when replica identity is FULL or INDEX).
-    pub old_tuple: Option<TupleData>,
+    /// Old identity/full-row data when pgoutput includes a `K` or `O` tuple.
+    pub old_tuple: Option<OldTuple>,
     /// The new row data.
     pub new_tuple: TupleData,
 }
@@ -103,8 +114,8 @@ pub struct UpdateMessage {
 pub struct DeleteMessage {
     /// Relation OID of the target table.
     pub relation_id: u32,
-    /// The old row data (key columns only unless REPLICA IDENTITY FULL).
-    pub old_tuple: TupleData,
+    /// The old identity or full-row tuple.
+    pub old_tuple: OldTuple,
 }
 
 /// Table truncate message.
@@ -151,7 +162,7 @@ pub enum ColumnValue {
     /// Unchanged TOAST value (not sent by server).
     Unchanged,
     /// Text-format value.
-    Text(String),
+    Text(Bytes),
 }
 
 impl ColumnValue {
@@ -159,7 +170,7 @@ impl ColumnValue {
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            ColumnValue::Text(s) => Some(s),
+            ColumnValue::Text(bytes) => std::str::from_utf8(bytes).ok(),
             _ => None,
         }
     }
@@ -197,13 +208,13 @@ pub enum DecoderError {
 }
 
 /// A cursor for reading binary data from a byte buffer.
-struct Cursor<'a> {
-    data: &'a [u8],
+struct Cursor {
+    data: Bytes,
     pos: usize,
 }
 
-impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
+impl Cursor {
+    fn new(data: Bytes) -> Self {
         Self { data, pos: 0 }
     }
 
@@ -297,9 +308,9 @@ impl<'a> Cursor<'a> {
         Ok(s.to_string())
     }
 
-    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], DecoderError> {
+    fn read_bytes(&mut self, len: usize) -> Result<Bytes, DecoderError> {
         self.check_remaining(len)?;
-        let slice = &self.data[self.pos..self.pos + len];
+        let slice = self.data.slice(self.pos..self.pos + len);
         self.pos += len;
         Ok(slice)
     }
@@ -317,9 +328,15 @@ impl<'a> Cursor<'a> {
 
 /// Converts a `PostgreSQL` timestamp (microseconds since 2000-01-01) to
 /// milliseconds since Unix epoch (1970-01-01).
-#[must_use]
-pub fn pg_timestamp_to_unix_ms(pg_us: i64) -> i64 {
-    (pg_us + PG_EPOCH_OFFSET_US) / 1000
+///
+/// # Errors
+///
+/// Returns [`DecoderError`] when converting to the Unix epoch overflows.
+pub(super) fn pg_timestamp_to_unix_ms(pg_us: i64) -> Result<i64, DecoderError> {
+    pg_us
+        .checked_add(PG_EPOCH_OFFSET_US)
+        .map(|unix_us| unix_us.div_euclid(1000))
+        .ok_or_else(|| DecoderError::InvalidData("PostgreSQL timestamp overflow".into()))
 }
 
 /// Decodes a single `pgoutput` WAL message from raw bytes.
@@ -328,7 +345,7 @@ pub fn pg_timestamp_to_unix_ms(pg_us: i64) -> i64 {
 ///
 /// Returns [`DecoderError`] if the data is truncated, malformed, or
 /// contains an unknown message type.
-pub fn decode_message(data: &[u8]) -> Result<WalMessage, DecoderError> {
+pub(super) fn decode_message(data: Bytes) -> Result<WalMessage, DecoderError> {
     if data.is_empty() {
         return Err(DecoderError::InvalidData("empty message".to_string()));
     }
@@ -336,7 +353,7 @@ pub fn decode_message(data: &[u8]) -> Result<WalMessage, DecoderError> {
     let mut cur = Cursor::new(data);
     let msg_type = cur.read_u8()?;
 
-    match msg_type {
+    let message = match msg_type {
         b'B' => decode_begin(&mut cur),
         b'C' => decode_commit(&mut cur),
         b'R' => decode_relation(&mut cur),
@@ -347,22 +364,34 @@ pub fn decode_message(data: &[u8]) -> Result<WalMessage, DecoderError> {
         b'O' => decode_origin(&mut cur),
         b'Y' => decode_type(&mut cur),
         _ => Err(DecoderError::UnknownMessageType(msg_type)),
+    }?;
+    if cur.remaining() != 0 {
+        return Err(DecoderError::InvalidData(format!(
+            "trailing bytes after pgoutput message: {}",
+            cur.remaining()
+        )));
     }
+    Ok(message)
 }
 
-fn decode_begin(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_begin(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let final_lsn = Lsn::new(cur.read_u64()?);
     let commit_ts_us = cur.read_i64()?;
     let xid = cur.read_u32()?;
     Ok(WalMessage::Begin(BeginMessage {
         final_lsn,
-        commit_ts_ms: pg_timestamp_to_unix_ms(commit_ts_us),
+        commit_ts_ms: pg_timestamp_to_unix_ms(commit_ts_us)?,
         xid,
     }))
 }
 
-fn decode_commit(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_commit(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let flags = cur.read_u8()?;
+    if flags != 0 {
+        return Err(DecoderError::InvalidData(format!(
+            "unsupported COMMIT flags: 0x{flags:02X}"
+        )));
+    }
     let commit_lsn = Lsn::new(cur.read_u64()?);
     let end_lsn = Lsn::new(cur.read_u64()?);
     let commit_ts_us = cur.read_i64()?;
@@ -370,11 +399,11 @@ fn decode_commit(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
         flags,
         commit_lsn,
         end_lsn,
-        commit_ts_ms: pg_timestamp_to_unix_ms(commit_ts_us),
+        commit_ts_ms: pg_timestamp_to_unix_ms(commit_ts_us)?,
     }))
 }
 
-fn decode_relation(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_relation(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let relation_id = cur.read_u32()?;
     let namespace = cur.read_cstring()?;
     let name = cur.read_cstring()?;
@@ -382,6 +411,7 @@ fn decode_relation(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     let n_cols_raw = cur.read_i16()?;
     let n_cols = usize::try_from(n_cols_raw)
         .map_err(|_| DecoderError::InvalidData(format!("negative column count: {n_cols_raw}")))?;
+    validate_column_count(n_cols)?;
 
     let mut columns = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
@@ -406,7 +436,7 @@ fn decode_relation(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     }))
 }
 
-fn decode_insert(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_insert(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let relation_id = cur.read_u32()?;
     let tag = cur.read_u8()?;
     if tag != b'N' {
@@ -421,16 +451,21 @@ fn decode_insert(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     }))
 }
 
-fn decode_update(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_update(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let relation_id = cur.read_u32()?;
     let tag = cur.read_u8()?;
 
     let (old_tuple, new_tuple) = match tag {
         // No old tuple, just new
         b'N' => (None, decode_tuple_data(cur)?),
-        // Old key tuple followed by new
+        // Old replica-identity key or full tuple followed by new.
         b'K' | b'O' => {
-            let old = decode_tuple_data(cur)?;
+            let old_data = decode_tuple_data(cur)?;
+            let old = if tag == b'K' {
+                OldTuple::Key(old_data)
+            } else {
+                OldTuple::Full(old_data)
+            };
             let new_tag = cur.read_u8()?;
             if new_tag != b'N' {
                 return Err(DecoderError::InvalidData(format!(
@@ -454,7 +489,7 @@ fn decode_update(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     }))
 }
 
-fn decode_delete(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_delete(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let relation_id = cur.read_u32()?;
     let tag = cur.read_u8()?;
     if tag != b'K' && tag != b'O' {
@@ -462,16 +497,35 @@ fn decode_delete(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
             "expected 'K' or 'O' tag in DELETE, got 0x{tag:02X}"
         )));
     }
-    let old_tuple = decode_tuple_data(cur)?;
+    let old_data = decode_tuple_data(cur)?;
+    let old_tuple = if tag == b'K' {
+        OldTuple::Key(old_data)
+    } else {
+        OldTuple::Full(old_data)
+    };
     Ok(WalMessage::Delete(DeleteMessage {
         relation_id,
         old_tuple,
     }))
 }
 
-fn decode_truncate(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
-    let n_relations = cur.read_u32()? as usize;
+fn decode_truncate(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
+    let n_relations_raw = cur.read_u32()?;
+    let n_relations = usize::try_from(n_relations_raw).map_err(|_| {
+        DecoderError::InvalidData(format!(
+            "TRUNCATE relation count {n_relations_raw} does not fit this platform"
+        ))
+    })?;
     let options = cur.read_u8()?;
+    let relation_bytes = n_relations
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| DecoderError::InvalidData("TRUNCATE relation count overflow".into()))?;
+    if relation_bytes != cur.remaining() {
+        return Err(DecoderError::InvalidData(format!(
+            "TRUNCATE relation count {n_relations} requires {relation_bytes} bytes, but {} remain",
+            cur.remaining()
+        )));
+    }
     let mut relation_ids = Vec::with_capacity(n_relations);
     for _ in 0..n_relations {
         relation_ids.push(cur.read_u32()?);
@@ -482,13 +536,13 @@ fn decode_truncate(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     }))
 }
 
-fn decode_origin(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_origin(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let origin_lsn = Lsn::new(cur.read_u64()?);
     let name = cur.read_cstring()?;
     Ok(WalMessage::Origin(OriginMessage { origin_lsn, name }))
 }
 
-fn decode_type(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
+fn decode_type(cur: &mut Cursor) -> Result<WalMessage, DecoderError> {
     let type_id = cur.read_u32()?;
     let namespace = cur.read_cstring()?;
     let name = cur.read_cstring()?;
@@ -499,10 +553,11 @@ fn decode_type(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     }))
 }
 
-fn decode_tuple_data(cur: &mut Cursor<'_>) -> Result<TupleData, DecoderError> {
+fn decode_tuple_data(cur: &mut Cursor) -> Result<TupleData, DecoderError> {
     let n_cols_raw = cur.read_i16()?;
     let n_cols = usize::try_from(n_cols_raw)
         .map_err(|_| DecoderError::InvalidData(format!("negative column count: {n_cols_raw}")))?;
+    validate_column_count(n_cols)?;
     let mut columns = Vec::with_capacity(n_cols);
 
     for _ in 0..n_cols {
@@ -516,9 +571,8 @@ fn decode_tuple_data(cur: &mut Cursor<'_>) -> Result<TupleData, DecoderError> {
                     DecoderError::InvalidData(format!("negative text length: {len_raw}"))
                 })?;
                 let data = cur.read_bytes(len)?;
-                let text = std::str::from_utf8(data)
-                    .map_err(|_| DecoderError::InvalidUtf8(cur.pos - len))?;
-                columns.push(ColumnValue::Text(text.to_string()));
+                std::str::from_utf8(&data).map_err(|_| DecoderError::InvalidUtf8(cur.pos - len))?;
+                columns.push(ColumnValue::Text(data));
             }
             _ => {
                 return Err(DecoderError::InvalidData(format!(
@@ -531,9 +585,22 @@ fn decode_tuple_data(cur: &mut Cursor<'_>) -> Result<TupleData, DecoderError> {
     Ok(TupleData { columns })
 }
 
+fn validate_column_count(count: usize) -> Result<(), DecoderError> {
+    if count > MAX_POSTGRES_COLUMNS {
+        return Err(DecoderError::InvalidData(format!(
+            "column count {count} exceeds PostgreSQL maximum {MAX_POSTGRES_COLUMNS}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_message(data: &[u8]) -> Result<WalMessage, DecoderError> {
+        super::decode_message(Bytes::copy_from_slice(data))
+    }
 
     // ── Test helpers: build binary pgoutput messages ──
 
@@ -761,8 +828,9 @@ mod tests {
         let msg = decode_message(&data).unwrap();
         match msg {
             WalMessage::Update(upd) => {
-                assert!(upd.old_tuple.is_some());
-                let old = upd.old_tuple.unwrap();
+                let Some(OldTuple::Full(old)) = upd.old_tuple else {
+                    panic!("expected full old tuple");
+                };
                 assert_eq!(old.columns[1].as_text(), Some("Alice"));
                 assert_eq!(upd.new_tuple.columns[1].as_text(), Some("Bob"));
             }
@@ -785,7 +853,10 @@ mod tests {
         match msg {
             WalMessage::Delete(del) => {
                 assert_eq!(del.relation_id, 16384);
-                assert_eq!(del.old_tuple.columns[0].as_text(), Some("42"));
+                let OldTuple::Key(old) = del.old_tuple else {
+                    panic!("expected key old tuple");
+                };
+                assert_eq!(old.columns[0].as_text(), Some("42"));
             }
             _ => panic!("expected Delete"),
         }
@@ -804,7 +875,10 @@ mod tests {
         let msg = decode_message(&data).unwrap();
         match msg {
             WalMessage::Delete(del) => {
-                assert_eq!(del.old_tuple.columns.len(), 2);
+                let OldTuple::Full(old) = del.old_tuple else {
+                    panic!("expected full old tuple");
+                };
+                assert_eq!(old.columns.len(), 2);
             }
             _ => panic!("expected Delete"),
         }
@@ -922,26 +996,57 @@ mod tests {
         assert!(decode_message(&data).is_err());
     }
 
+    #[test]
+    fn nonzero_commit_flags_are_rejected() {
+        let data = MessageBuilder::new(b'C')
+            .u8(1)
+            .u64(0x100)
+            .u64(0x200)
+            .i64(0)
+            .build();
+        let error = decode_message(&data).unwrap_err();
+        assert!(error.to_string().contains("COMMIT flags"), "{error}");
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut data = MessageBuilder::new(b'B').u64(1).i64(0).u32(1).build();
+        data.push(0xff);
+        let error = decode_message(&data).unwrap_err();
+        assert!(error.to_string().contains("trailing bytes"), "{error}");
+    }
+
     // ── Timestamp conversion ──
 
     #[test]
     fn test_pg_timestamp_to_unix_ms() {
         // 2000-01-01 00:00:00 UTC in PG epoch = 0
         // In Unix epoch = 946684800 seconds = 946684800000 ms
-        assert_eq!(pg_timestamp_to_unix_ms(0), 946_684_800_000);
+        assert_eq!(pg_timestamp_to_unix_ms(0).unwrap(), 946_684_800_000);
 
         // 2024-01-01 00:00:00 UTC
         // PG epoch: 757382400 seconds = 757382400000000 us
         let pg_us: i64 = 757_382_400_000_000;
-        let expected_unix_ms = (pg_us + PG_EPOCH_OFFSET_US) / 1000;
-        assert_eq!(pg_timestamp_to_unix_ms(pg_us), expected_unix_ms);
+        let expected_unix_ms = (pg_us + PG_EPOCH_OFFSET_US).div_euclid(1000);
+        assert_eq!(pg_timestamp_to_unix_ms(pg_us).unwrap(), expected_unix_ms);
+
+        // Sub-millisecond instants before Unix epoch round toward negative infinity.
+        assert_eq!(
+            pg_timestamp_to_unix_ms(-PG_EPOCH_OFFSET_US - 1).unwrap(),
+            -1
+        );
+        assert_eq!(
+            pg_timestamp_to_unix_ms(-PG_EPOCH_OFFSET_US - 1_001).unwrap(),
+            -2
+        );
+        assert!(pg_timestamp_to_unix_ms(i64::MAX).is_err());
     }
 
     // ── ColumnValue methods ──
 
     #[test]
     fn test_column_value_as_text() {
-        let text = ColumnValue::Text("hello".to_string());
+        let text = ColumnValue::Text(Bytes::from_static(b"hello"));
         assert_eq!(text.as_text(), Some("hello"));
         assert!(!text.is_null());
 
@@ -961,8 +1066,9 @@ mod tests {
         let data = MessageBuilder::new(b'U')
             .u32(16384)
             .u8(b'K') // key identity
-            .i16(1) // old: 1 col (key only)
+            .i16(2) // old tuple retains the relation's published-column cardinality
             .text_col("42")
+            .null_col() // non-key position is unavailable
             .u8(b'N') // new tuple
             .i16(2) // new: 2 cols
             .text_col("42")
@@ -972,11 +1078,94 @@ mod tests {
         let msg = decode_message(&data).unwrap();
         match msg {
             WalMessage::Update(upd) => {
-                let old = upd.old_tuple.unwrap();
-                assert_eq!(old.columns.len(), 1);
+                let Some(OldTuple::Key(old)) = upd.old_tuple else {
+                    panic!("expected key old tuple");
+                };
+                assert_eq!(old.columns.len(), 2);
+                assert!(old.columns[1].is_null());
                 assert_eq!(upd.new_tuple.columns.len(), 2);
             }
             _ => panic!("expected Update"),
         }
+    }
+
+    #[test]
+    fn tuple_text_is_a_zero_copy_slice_of_the_wal_frame() {
+        let frame = Bytes::from(
+            MessageBuilder::new(b'I')
+                .u32(16_384)
+                .u8(b'N')
+                .i16(1)
+                .text_col("allocation-free")
+                .build(),
+        );
+        let start = frame.as_ptr() as usize;
+        let end = start + frame.len();
+
+        let message = super::decode_message(frame).unwrap();
+        let WalMessage::Insert(insert) = message else {
+            panic!("expected insert");
+        };
+        let ColumnValue::Text(value) = &insert.new_tuple.columns[0] else {
+            panic!("expected text");
+        };
+        let value_ptr = value.as_ptr() as usize;
+        assert!(value_ptr >= start && value_ptr + value.len() <= end);
+        assert_eq!(
+            insert.new_tuple.columns[0].as_text(),
+            Some("allocation-free")
+        );
+    }
+
+    #[test]
+    fn tuple_column_count_above_postgres_limit_is_rejected_before_values() {
+        let data = MessageBuilder::new(b'I')
+            .u32(16_384)
+            .u8(b'N')
+            .i16((MAX_POSTGRES_COLUMNS + 1) as i16)
+            .build();
+        let error = decode_message(&data).unwrap_err();
+        assert!(error.to_string().contains("PostgreSQL maximum"), "{error}");
+    }
+
+    #[test]
+    fn maximum_postgres_tuple_column_count_is_accepted() {
+        let mut data = MessageBuilder::new(b'I')
+            .u32(16_384)
+            .u8(b'N')
+            .i16(MAX_POSTGRES_COLUMNS as i16)
+            .build();
+        data.extend(std::iter::repeat_n(b'n', MAX_POSTGRES_COLUMNS));
+
+        let message = decode_message(&data).unwrap();
+        let WalMessage::Insert(insert) = message else {
+            panic!("expected insert");
+        };
+        assert_eq!(insert.new_tuple.columns.len(), MAX_POSTGRES_COLUMNS);
+    }
+
+    #[test]
+    fn invalid_tuple_utf8_is_rejected() {
+        let mut data = MessageBuilder::new(b'I')
+            .u32(16_384)
+            .u8(b'N')
+            .i16(1)
+            .build();
+        data.push(b't');
+        data.extend_from_slice(&1_i32.to_be_bytes());
+        data.push(0xff);
+
+        assert!(matches!(
+            decode_message(&data),
+            Err(DecoderError::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn truncate_count_is_validated_before_allocation() {
+        let data = MessageBuilder::new(b'T').u32(u32::MAX).u8(0).build();
+
+        let error = decode_message(&data).unwrap_err();
+        assert!(error.to_string().contains("requires"), "{error}");
     }
 }

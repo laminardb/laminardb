@@ -143,10 +143,10 @@ impl DeltaSource {
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for DeltaSource {
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(SourceContract {
-            consistency: SourceConsistency::Ephemeral,
-            topology: SourceTopology::Singleton,
-        })
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::Singleton,
+        ))
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {

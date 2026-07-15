@@ -46,8 +46,8 @@ impl LaminarDB {
         }
     }
 
-    /// The panic message from the last compute-thread crash, if any. Populated
-    /// when state is `Faulted`; cleared on a clean start.
+    /// The last runtime-fault or terminal resource-exhaustion reason. Populated when state is
+    /// `Faulted`; cleared on a clean start.
     #[must_use]
     pub fn last_fault(&self) -> Option<String> {
         self.last_fault.lock().clone()
@@ -92,26 +92,6 @@ impl LaminarDB {
         }
     }
 
-    /// Cold-tier demotion/promotion metrics — the embedded equivalent of the
-    /// server's `laminardb_state_tier_*` gauges. All zero until the tier is
-    /// active.
-    #[cfg(feature = "state-tier")]
-    #[must_use]
-    pub fn tier_metrics(&self) -> crate::metrics::TierMetrics {
-        let guard = self.engine_metrics.lock();
-        guard
-            .as_ref()
-            .map_or_else(crate::metrics::TierMetrics::default, |m| {
-                crate::metrics::TierMetrics {
-                    demote_total: m.state_tier_demote_total.get(),
-                    fetch_total: m.state_tier_fetch_total.get(),
-                    resident_bytes: m.state_tier_bytes.get(),
-                    resident_slices: m.state_tier_slices.get(),
-                    overlap_total: m.state_tier_overlap_total.get(),
-                }
-            })
-    }
-
     /// Get metrics for a single source by name.
     #[must_use]
     pub fn source_metrics(&self, name: &str) -> Option<crate::metrics::SourceMetrics> {
@@ -143,8 +123,6 @@ impl LaminarDB {
     #[must_use]
     pub fn stream_metrics(&self, name: &str) -> Option<crate::metrics::StreamMetrics> {
         let entry = self.catalog.get_stream_entry(name)?;
-        let pending = entry.source.pending();
-        let capacity = entry.source.capacity();
         let sql = self
             .connector_manager
             .lock()
@@ -153,11 +131,7 @@ impl LaminarDB {
             .map(|reg| reg.query_sql.clone());
         Some(crate::metrics::StreamMetrics {
             name: entry.name.clone(),
-            total_events: entry.source.sequence(),
-            pending,
-            capacity,
-            is_backpressured: crate::metrics::is_backpressured(pending, capacity),
-            watermark: entry.source.current_watermark(),
+            total_events: entry.emitted_rows(),
             sql,
         })
     }

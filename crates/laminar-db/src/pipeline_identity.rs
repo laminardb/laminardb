@@ -21,8 +21,6 @@ use laminar_core::storage::checkpoint_manifest::{PipelineIdentity, PIPELINE_IDEN
 /// Recovery-state serialization contract. Bump when persisted operator/vnode bytes become
 /// incompatible even if the logical pipeline is unchanged.
 const STATE_ABI_VERSION: u32 = crate::operator_graph::GRAPH_CHECKPOINT_VERSION;
-const REDACTED: &str = "<redacted>";
-
 #[derive(Serialize)]
 struct CanonicalPipeline {
     canonical_version: u16,
@@ -65,7 +63,7 @@ struct CanonicalTable {
     connector_type: String,
     options: BTreeMap<String, String>,
     schema: Option<CanonicalSchema>,
-    refresh: String,
+    on_demand: bool,
     cache_max_bytes: Option<usize>,
     cache_ttl_ms: Option<u64>,
 }
@@ -155,7 +153,7 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
     let payload = CanonicalPipeline {
         canonical_version: PIPELINE_IDENTITY_VERSION,
         state_abi_version: STATE_ABI_VERSION,
-        state_layout: state_layout(context.clustered, context.config.state_tier_dir.is_some()),
+        state_layout: state_layout(context.clustered),
         vnode_count: context.vnode_count,
         delivery_guarantee: context.config.delivery_guarantee.to_string(),
         sources: canonical_sources(context.catalog, &context.registrations)?,
@@ -172,12 +170,11 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
     })
 }
 
-const fn state_layout(clustered: bool, tiered: bool) -> &'static str {
-    match (clustered, tiered) {
-        (true, true) => "partitioned-vnode-tiered",
-        (true, false) => "partitioned-vnode",
-        (false, true) => "local-tiered",
-        (false, false) => "local",
+const fn state_layout(clustered: bool) -> &'static str {
+    if clustered {
+        "partitioned-vnode"
+    } else {
+        "local"
     }
 }
 
@@ -188,7 +185,7 @@ fn canonical_sources(
     let mut sources = Vec::with_capacity(registrations.sources.len());
     for reg in registrations.sources.values() {
         let (connector_type, options) = if reg.connector_type.is_some() {
-            canonical_connector(&build_source_config(reg)?)
+            canonical_source_connector(&build_source_config(reg)?)?
         } else {
             ("catalog-bridge".into(), BTreeMap::new())
         };
@@ -277,7 +274,7 @@ fn canonical_tables(
                 .get_source(&reg.name)
                 .as_ref()
                 .map(|entry| canonical_schema(&entry.schema)),
-            refresh: format!("{:?}", reg.refresh),
+            on_demand: reg.on_demand,
             cache_max_bytes: reg.cache_max_bytes,
             cache_ttl_ms: reg.cache_ttl.map(duration_millis),
         });
@@ -315,34 +312,22 @@ fn canonical_connector(config: &ConnectorConfig) -> (String, BTreeMap<String, St
         .iter()
         .map(|(key, value)| {
             let normalized = key.to_ascii_lowercase();
-            let value = if is_secret_key(&normalized) {
-                REDACTED.to_string()
-            } else {
-                value.clone()
-            };
+            let value = laminar_connectors::security::sanitize_identity_value(&normalized, value);
             (normalized, value)
         })
         .collect();
     (config.connector_type().to_string(), options)
 }
 
-fn is_secret_key(key: &str) -> bool {
-    [
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "credential",
-        "private.key",
-        "private_key",
-        "sasl.jaas",
-        "access.key",
-        "access_key",
-        "api.key",
-        "api_key",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
+fn canonical_source_connector(
+    config: &ConnectorConfig,
+) -> Result<(String, BTreeMap<String, String>), DbError> {
+    let options = laminar_connectors::recovery_identity::source_options(config)
+        .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
+    Ok(options.map_or_else(
+        || canonical_connector(config),
+        |options| (config.connector_type().to_string(), options),
+    ))
 }
 
 fn canonical_schema(schema: &Schema) -> CanonicalSchema {
@@ -398,6 +383,58 @@ mod tests {
         right.set("password", "rotated");
         right.set("topic", "trades");
         assert_eq!(canonical_connector(&left), canonical_connector(&right));
+    }
+
+    #[test]
+    fn connector_uri_credentials_are_absent_from_durable_identity() {
+        let mut config = ConnectorConfig::new("mongodb");
+        config.set(
+            "connection.uri",
+            "mongodb://alice:catalog-secret@db.test/app?token=query-secret",
+        );
+        let (_, properties) = canonical_connector(&config);
+        let identity = properties.get("connection.uri").unwrap();
+        assert_eq!(
+            identity,
+            "mongodb://<redacted>@db.test/app?token=<redacted>"
+        );
+        let serialized = serde_json::to_string(&properties).unwrap();
+        assert!(!serialized.contains("alice"));
+        assert!(!serialized.contains("catalog-secret"));
+        assert!(!serialized.contains("query-secret"));
+
+        let mut rotated = ConnectorConfig::new("mongodb");
+        rotated.set(
+            "connection.uri",
+            "mongodb://bob:rotated@db.test/app?token=rotated-query",
+        );
+        assert_eq!(canonical_connector(&config), canonical_connector(&rotated));
+    }
+
+    #[cfg(feature = "postgres-cdc")]
+    #[test]
+    fn adapted_source_uses_semantic_connector_identity() {
+        let mut left = ConnectorConfig::new("postgres-cdc");
+        left.set("host", "db-a.internal");
+        left.set("database", "orders");
+        left.set("slot.name", "orders_slot");
+        left.set("publication", "orders_pub");
+
+        let mut moved = left.clone();
+        moved.set("host", "db-b.internal");
+        moved.set("password", "rotated");
+        moved.set("max.buffered.bytes", "134217728");
+        assert_eq!(
+            canonical_source_connector(&left).unwrap(),
+            canonical_source_connector(&moved).unwrap()
+        );
+
+        let mut different_publication = left.clone();
+        different_publication.set("publication", "other_pub");
+        assert_ne!(
+            canonical_source_connector(&left).unwrap(),
+            canonical_source_connector(&different_publication).unwrap()
+        );
     }
 
     #[test]

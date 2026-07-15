@@ -80,6 +80,12 @@ impl ClusterConfig {
             .clone()
             .ok_or_else(|| ClusterConfigError::MissingSection("[discovery]".to_string()))?;
 
+        if !matches!(discovery.strategy.as_str(), "gossip" | "static") {
+            return Err(ClusterConfigError::InvalidDiscoveryStrategy(
+                discovery.strategy,
+            ));
+        }
+
         if discovery.seeds.is_empty() && discovery.strategy == "static" {
             return Err(ClusterConfigError::EmptySeeds);
         }
@@ -105,6 +111,8 @@ pub enum ClusterConfigError {
     InvalidNodeId(String),
     #[error("static discovery requires at least one seed address")]
     EmptySeeds,
+    #[error("unsupported discovery strategy {0:?}; expected \"gossip\" or \"static\"")]
+    InvalidDiscoveryStrategy(String),
 }
 
 #[cfg(test)]
@@ -160,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_config_embedded_mode_returns_none() {
+    fn test_cluster_config_single_mode_returns_none() {
         let config = base_config();
         let result = ClusterConfig::from_server_config(&config).unwrap();
         assert!(result.is_none());
@@ -214,5 +222,17 @@ mod tests {
             ClusterConfigError::EmptySeeds => {}
             other => panic!("expected EmptySeeds, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_unknown_discovery_strategy_is_rejected() {
+        let mut config = cluster_config();
+        config.discovery.as_mut().unwrap().strategy = "typo".into();
+
+        let err = ClusterConfig::from_server_config(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterConfigError::InvalidDiscoveryStrategy(strategy) if strategy == "typo"
+        ));
     }
 }

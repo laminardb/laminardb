@@ -502,10 +502,10 @@ impl SourceConnector for WebSocketSource {
     }
 
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(SourceContract {
-            consistency: SourceConsistency::Ephemeral,
-            topology: SourceTopology::NodeLocalIngress,
-        })
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::NodeLocalIngress,
+        ))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

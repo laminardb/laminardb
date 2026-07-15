@@ -39,7 +39,10 @@ SELECT ... EMIT FINAL
 SELECT ... FROM orders ASOF JOIN trades ON o.symbol = t.symbol AND o.ts >= t.ts
 
 -- Lookup tables
-CREATE LOOKUP TABLE instruments FROM POSTGRES (...)
+CREATE LOOKUP TABLE instruments (
+    symbol VARCHAR NOT NULL,
+    PRIMARY KEY (symbol)
+) WITH ('connector' = 'postgres', 'connection' = '...', 'table' = 'instruments')
 
 -- Late data handling
 SELECT ... ALLOW LATENESS INTERVAL '10' SECOND
@@ -55,7 +58,6 @@ SELECT ..., SUM(vol) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 5 PRECEDING
 -- Connector DDL
 CREATE SOURCE ... FROM KAFKA (brokers = '...', topic = '...', format = 'json')
 CREATE SOURCE ... FROM POSTGRES_CDC (hostname = '...', database = '...')
-CREATE SOURCE ... FROM MYSQL_CDC (hostname = '...', database = '...')
 CREATE SINK ... INTO KAFKA (brokers = '...', topic = '...')
 CREATE SINK ... INTO DELTA_LAKE (path = '...')
 
