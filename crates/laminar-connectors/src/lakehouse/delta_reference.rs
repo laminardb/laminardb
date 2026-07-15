@@ -1,42 +1,33 @@
 //! Delta Lake startup snapshot source for reference tables.
 
-#[cfg(feature = "delta-lake")]
 use std::collections::VecDeque;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-#[cfg(feature = "delta-lake")]
 use deltalake::DeltaTable;
-#[cfg(feature = "delta-lake")]
 use tracing::info;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::lakehouse::delta_source_config::DeltaSourceConfig;
 use crate::reference::ReferenceTableSource;
-#[cfg(feature = "delta-lake")]
-use crate::reference::{conform_snapshot_batch, validate_snapshot_schema};
+
+use super::snapshot_schema::{conform_snapshot_batch, validate_snapshot_schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Ready,
-    #[cfg(feature = "delta-lake")]
     Draining,
-    #[cfg(feature = "delta-lake")]
     Done,
     Closed,
 }
 
 /// A finite snapshot of one Delta Lake table.
 pub struct DeltaReferenceTableSource {
-    #[cfg(feature = "delta-lake")]
     config: DeltaSourceConfig,
-    #[cfg(feature = "delta-lake")]
     declared_schema: SchemaRef,
     phase: Phase,
-    #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
-    #[cfg(feature = "delta-lake")]
     pending_batches: VecDeque<RecordBatch>,
 }
 
@@ -44,17 +35,11 @@ impl DeltaReferenceTableSource {
     /// Creates a source from parsed connector configuration and the declared table schema.
     #[must_use]
     pub fn from_source_config(config: DeltaSourceConfig, declared_schema: SchemaRef) -> Self {
-        #[cfg(not(feature = "delta-lake"))]
-        let _ = (config, declared_schema);
         Self {
-            #[cfg(feature = "delta-lake")]
             config,
-            #[cfg(feature = "delta-lake")]
             declared_schema,
             phase: Phase::Ready,
-            #[cfg(feature = "delta-lake")]
             table: None,
-            #[cfg(feature = "delta-lake")]
             pending_batches: VecDeque::new(),
         }
     }
@@ -74,7 +59,6 @@ impl DeltaReferenceTableSource {
         ))
     }
 
-    #[cfg(feature = "delta-lake")]
     async fn open_table(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
@@ -92,7 +76,6 @@ impl DeltaReferenceTableSource {
         Ok(())
     }
 
-    #[cfg(feature = "delta-lake")]
     async fn load_snapshot(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
@@ -138,7 +121,6 @@ impl DeltaReferenceTableSource {
         Ok(())
     }
 
-    #[cfg(feature = "delta-lake")]
     async fn load_filtered_snapshot(
         &mut self,
         version: i64,
@@ -193,53 +175,33 @@ impl DeltaReferenceTableSource {
 #[async_trait::async_trait]
 impl ReferenceTableSource for DeltaReferenceTableSource {
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        #[cfg(not(feature = "delta-lake"))]
-        {
-            return match self.phase {
-                Phase::Closed => Err(ConnectorError::InvalidState {
+        match self.phase {
+            Phase::Closed => {
+                return Err(ConnectorError::InvalidState {
                     expected: "open reference snapshot source".into(),
                     actual: "closed".into(),
-                }),
-                Phase::Ready => Err(ConnectorError::ConfigurationError(
-                    "Delta reference tables require the 'delta-lake' feature".into(),
-                )),
-            };
+                });
+            }
+            Phase::Done => return Ok(None),
+            Phase::Ready => {
+                self.open_table().await?;
+                self.load_snapshot().await?;
+                self.phase = Phase::Draining;
+            }
+            Phase::Draining => {}
         }
 
-        #[cfg(feature = "delta-lake")]
-        {
-            match self.phase {
-                Phase::Closed => {
-                    return Err(ConnectorError::InvalidState {
-                        expected: "open reference snapshot source".into(),
-                        actual: "closed".into(),
-                    });
-                }
-                Phase::Done => return Ok(None),
-                Phase::Ready => {
-                    self.open_table().await?;
-                    self.load_snapshot().await?;
-                    self.phase = Phase::Draining;
-                }
-                Phase::Draining => {}
-            }
-
-            if let Some(batch) = self.pending_batches.pop_front() {
-                return Ok(Some(batch));
-            }
-            self.phase = Phase::Done;
-            Ok(None)
+        if let Some(batch) = self.pending_batches.pop_front() {
+            return Ok(Some(batch));
         }
+        self.phase = Phase::Done;
+        Ok(None)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.phase = Phase::Closed;
-        #[cfg(feature = "delta-lake")]
         self.pending_batches.clear();
-        #[cfg(feature = "delta-lake")]
-        {
-            self.table = None;
-        }
+        self.table = None;
         Ok(())
     }
 }
@@ -256,7 +218,6 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    #[cfg(feature = "delta-lake")]
     #[test]
     fn construction_carries_declared_schema() {
         let source = DeltaReferenceTableSource::from_source_config(
@@ -286,7 +247,6 @@ mod tests {
         assert!(source.poll_snapshot().await.is_err());
     }
 
-    #[cfg(feature = "delta-lake")]
     mod integration {
         use std::collections::HashMap;
 

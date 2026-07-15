@@ -5,31 +5,21 @@
 //! one file-/partition-pruned scan; [`KeyAligner`](laminar_core::lookup::KeyAligner) handles key decode and
 //! result realignment.
 
-#[cfg(feature = "delta-lake")]
 use std::sync::Arc;
 
-#[cfg(feature = "delta-lake")]
 use arrow_array::{Array, ArrayRef, RecordBatch};
-#[cfg(feature = "delta-lake")]
 use arrow_row::SortField;
-#[cfg(feature = "delta-lake")]
 use arrow_schema::SchemaRef;
-#[cfg(feature = "delta-lake")]
 use datafusion::common::ScalarValue;
-#[cfg(feature = "delta-lake")]
 use datafusion::prelude::{col, Expr, SessionContext};
 
-#[cfg(feature = "delta-lake")]
 use laminar_core::lookup::predicate::Predicate;
-#[cfg(feature = "delta-lake")]
 use laminar_core::lookup::source::{
     projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
 };
-#[cfg(feature = "delta-lake")]
 use laminar_core::lookup::KeyAligner;
 
 /// Configuration for [`DeltaLookupSource`].
-#[cfg(feature = "delta-lake")]
 #[derive(Debug, Clone)]
 pub struct DeltaLookupSourceConfig {
     /// Table path (resolved, post-catalog).
@@ -43,7 +33,6 @@ pub struct DeltaLookupSourceConfig {
 }
 
 /// Delta Lake lookup source for on-demand/partial cache mode.
-#[cfg(feature = "delta-lake")]
 pub struct DeltaLookupSource {
     ctx: Arc<SessionContext>,
     table_name: String,
@@ -51,7 +40,6 @@ pub struct DeltaLookupSource {
     aligner: KeyAligner,
 }
 
-#[cfg(feature = "delta-lake")]
 impl DeltaLookupSource {
     /// Opens the Delta table and registers it as a `DataFusion` `TableProvider`.
     ///
@@ -91,7 +79,6 @@ impl DeltaLookupSource {
 }
 
 /// Resolve the `RowConverter` sort fields for the primary-key columns.
-#[cfg(feature = "delta-lake")]
 fn pk_sort_fields(
     schema: &SchemaRef,
     pk_columns: &[String],
@@ -110,7 +97,6 @@ fn pk_sort_fields(
 /// Build a typed `pk IN (...)` (single column) or OR-of-AND-groups (composite)
 /// filter from the decoded primary-key columns. Using typed `Expr` literals
 /// (not string SQL) keeps type handling and escaping correct.
-#[cfg(feature = "delta-lake")]
 fn build_in_list_filter(
     pk_columns: &[String],
     pk_arrays: &[ArrayRef],
@@ -176,7 +162,6 @@ fn build_in_list_filter(
 /// Best-effort clustering diagnostic: an on-demand lookup is only cheap if the
 /// dimension is partitioned/clustered on the key. Delta exposes partition
 /// columns (not Z-ORDER), so this is a warning, never an error.
-#[cfg(feature = "delta-lake")]
 async fn warn_if_unclustered(config: &DeltaLookupSourceConfig) {
     let Ok(table) = crate::lakehouse::delta_io::open_or_create_table(
         &config.table_path,
@@ -204,7 +189,6 @@ async fn warn_if_unclustered(config: &DeltaLookupSourceConfig) {
     }
 }
 
-#[cfg(feature = "delta-lake")]
 impl LookupSource for DeltaLookupSource {
     async fn query(
         &self,
@@ -309,7 +293,7 @@ impl LookupSource for DeltaLookupSource {
     }
 }
 
-#[cfg(all(test, feature = "delta-lake"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};

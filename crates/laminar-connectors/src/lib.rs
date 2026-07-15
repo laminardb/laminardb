@@ -77,9 +77,6 @@ pub mod kafka;
 #[cfg(any(feature = "postgres-cdc", feature = "postgres-sink"))]
 pub mod postgres;
 
-/// Lookup table support for enrichment joins.
-pub mod lookup;
-
 /// Lakehouse connectors (Delta Lake, Iceberg).
 pub mod lakehouse;
 

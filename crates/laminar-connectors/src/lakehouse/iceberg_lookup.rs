@@ -5,36 +5,24 @@
 //! probe fold into one manifest-pruned scan. [`KeyAligner`](laminar_core::lookup::KeyAligner) handles key decode
 //! and result realignment.
 
-#[cfg(feature = "iceberg")]
 use std::sync::Arc;
 
-#[cfg(feature = "iceberg")]
 use arrow_array::{Array, ArrayRef, RecordBatch};
-#[cfg(feature = "iceberg")]
 use arrow_row::SortField;
-#[cfg(feature = "iceberg")]
 use arrow_schema::SchemaRef;
-#[cfg(feature = "iceberg")]
 use iceberg::expr::{Predicate as IcebergPredicate, Reference};
-#[cfg(feature = "iceberg")]
 use iceberg::spec::Datum;
-#[cfg(feature = "iceberg")]
 use iceberg::Catalog;
 
-#[cfg(feature = "iceberg")]
 use laminar_core::lookup::predicate::Predicate;
-#[cfg(feature = "iceberg")]
 use laminar_core::lookup::source::{
     projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
 };
-#[cfg(feature = "iceberg")]
 use laminar_core::lookup::KeyAligner;
 
-#[cfg(feature = "iceberg")]
 use crate::lakehouse::iceberg_config::IcebergCatalogConfig;
 
 /// Configuration for [`IcebergLookupSource`].
-#[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
 pub struct IcebergLookupSourceConfig {
     /// Shared catalog connection settings (also carries namespace + table).
@@ -44,7 +32,6 @@ pub struct IcebergLookupSourceConfig {
 }
 
 /// Iceberg lookup source for on-demand/partial cache mode.
-#[cfg(feature = "iceberg")]
 pub struct IcebergLookupSource {
     catalog: Arc<dyn Catalog>,
     namespace: String,
@@ -53,7 +40,6 @@ pub struct IcebergLookupSource {
     aligner: KeyAligner,
 }
 
-#[cfg(feature = "iceberg")]
 impl IcebergLookupSource {
     /// Opens the catalog, loads the table, and derives the Arrow schema.
     ///
@@ -199,7 +185,6 @@ impl IcebergLookupSource {
     }
 }
 
-#[cfg(feature = "iceberg")]
 impl LookupSource for IcebergLookupSource {
     async fn query(
         &self,
@@ -282,7 +267,7 @@ impl LookupSource for IcebergLookupSource {
     }
 }
 
-#[cfg(all(test, feature = "iceberg"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};

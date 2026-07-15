@@ -1,40 +1,32 @@
 //! Iceberg startup snapshot source for reference tables.
 
-#[cfg(feature = "iceberg")]
 use std::collections::VecDeque;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-#[cfg(feature = "iceberg")]
 use tracing::info;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::reference::ReferenceTableSource;
-#[cfg(feature = "iceberg")]
-use crate::reference::{conform_snapshot_batch, validate_snapshot_schema};
 
 use super::iceberg_config::IcebergSourceConfig;
+use super::snapshot_schema::{conform_snapshot_batch, validate_snapshot_schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Ready,
-    #[cfg(feature = "iceberg")]
     Draining,
-    #[cfg(feature = "iceberg")]
     Done,
     Closed,
 }
 
 /// A finite snapshot of one Iceberg table.
 pub struct IcebergReferenceTableSource {
-    #[cfg(feature = "iceberg")]
     config: IcebergSourceConfig,
-    #[cfg(feature = "iceberg")]
     declared_schema: SchemaRef,
     phase: Phase,
-    #[cfg(feature = "iceberg")]
     snapshot_batches: VecDeque<RecordBatch>,
 }
 
@@ -59,21 +51,15 @@ impl IcebergReferenceTableSource {
                     .into(),
             ));
         }
-        #[cfg(feature = "iceberg")]
         let config = {
             let mut config = config;
             config.select_columns = declared_columns;
             config
         };
-        #[cfg(not(feature = "iceberg"))]
-        let _ = (config, declared_schema, declared_columns);
         Ok(Self {
-            #[cfg(feature = "iceberg")]
             config,
-            #[cfg(feature = "iceberg")]
             declared_schema,
             phase: Phase::Ready,
-            #[cfg(feature = "iceberg")]
             snapshot_batches: VecDeque::new(),
         })
     }
@@ -90,7 +76,6 @@ impl IcebergReferenceTableSource {
         Self::new(IcebergSourceConfig::from_config(config)?, declared_schema)
     }
 
-    #[cfg(feature = "iceberg")]
     async fn load_initial_snapshot(&mut self) -> Result<(), ConnectorError> {
         let catalog = super::iceberg_io::build_catalog(&self.config.catalog).await?;
         let table = super::iceberg_io::load_table(
@@ -148,47 +133,30 @@ impl IcebergReferenceTableSource {
 #[async_trait]
 impl ReferenceTableSource for IcebergReferenceTableSource {
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        #[cfg(not(feature = "iceberg"))]
-        {
-            return match self.phase {
-                Phase::Closed => Err(ConnectorError::InvalidState {
+        match self.phase {
+            Phase::Closed => {
+                return Err(ConnectorError::InvalidState {
                     expected: "open reference snapshot source".into(),
                     actual: "closed".into(),
-                }),
-                Phase::Ready => Err(ConnectorError::ConfigurationError(
-                    "Iceberg reference tables require the 'iceberg' feature".into(),
-                )),
-            };
+                });
+            }
+            Phase::Done => return Ok(None),
+            Phase::Ready => {
+                self.load_initial_snapshot().await?;
+                self.phase = Phase::Draining;
+            }
+            Phase::Draining => {}
         }
 
-        #[cfg(feature = "iceberg")]
-        {
-            match self.phase {
-                Phase::Closed => {
-                    return Err(ConnectorError::InvalidState {
-                        expected: "open reference snapshot source".into(),
-                        actual: "closed".into(),
-                    });
-                }
-                Phase::Done => return Ok(None),
-                Phase::Ready => {
-                    self.load_initial_snapshot().await?;
-                    self.phase = Phase::Draining;
-                }
-                Phase::Draining => {}
-            }
-
-            if let Some(batch) = self.snapshot_batches.pop_front() {
-                return Ok(Some(batch));
-            }
-            self.phase = Phase::Done;
-            Ok(None)
+        if let Some(batch) = self.snapshot_batches.pop_front() {
+            return Ok(Some(batch));
         }
+        self.phase = Phase::Done;
+        Ok(None)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.phase = Phase::Closed;
-        #[cfg(feature = "iceberg")]
         self.snapshot_batches.clear();
         Ok(())
     }
@@ -218,7 +186,6 @@ mod tests {
         ]))
     }
 
-    #[cfg(feature = "iceberg")]
     #[test]
     fn construction_carries_declared_non_null_key_schema() {
         let source =
@@ -235,7 +202,6 @@ mod tests {
         assert!(IcebergReferenceTableSource::new(config, declared_schema()).is_err());
     }
 
-    #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn exhaustion_and_close_are_stable_without_external_io() {
         let mut source =

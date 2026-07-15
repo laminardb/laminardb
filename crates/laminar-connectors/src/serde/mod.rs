@@ -172,7 +172,7 @@ pub fn create_deserializer(format: Format) -> Result<Box<dyn RecordDeserializer>
         Format::Raw => Ok(Box::new(raw::RawBytesDeserializer::new())),
         Format::Debezium => Ok(Box::new(debezium::DebeziumDeserializer::new())),
         Format::Avro => Err(SerdeError::UnsupportedFormat(
-            "Avro deserialization requires the 'kafka' feature".into(),
+            "Avro requires a connector-provided deserializer".into(),
         )),
     }
 }
@@ -191,7 +191,7 @@ pub fn create_serializer(format: Format) -> Result<Box<dyn RecordSerializer>, Se
             "Debezium is a deserialization-only format".into(),
         )),
         Format::Avro => Err(SerdeError::UnsupportedFormat(
-            "Avro serialization requires the 'kafka' feature".into(),
+            "Avro requires a connector-provided serializer".into(),
         )),
     }
 }
@@ -236,5 +236,26 @@ mod tests {
         assert!(create_serializer(Format::Csv).is_ok());
         assert!(create_serializer(Format::Raw).is_ok());
         assert!(create_serializer(Format::Debezium).is_err()); // deser-only
+    }
+
+    #[test]
+    fn generic_avro_errors_are_connector_neutral() {
+        let deserialize_error = create_deserializer(Format::Avro)
+            .err()
+            .expect("generic Avro deserialization must require a connector codec")
+            .to_string();
+        let serialize_error = create_serializer(Format::Avro)
+            .err()
+            .expect("generic Avro serialization must require a connector codec")
+            .to_string();
+
+        assert_eq!(
+            deserialize_error,
+            "unsupported format: Avro requires a connector-provided deserializer"
+        );
+        assert_eq!(
+            serialize_error,
+            "unsupported format: Avro requires a connector-provided serializer"
+        );
     }
 }

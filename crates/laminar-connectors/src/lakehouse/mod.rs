@@ -9,7 +9,11 @@ pub mod delta;
 pub mod delta_config;
 #[cfg(feature = "delta-lake")]
 pub mod delta_io;
+#[cfg(feature = "delta-lake")]
+pub mod delta_lookup;
 pub mod delta_metrics;
+#[cfg(feature = "delta-lake")]
+pub mod delta_reference;
 pub mod delta_source;
 pub mod delta_source_config;
 #[cfg(feature = "delta-lake")]
@@ -24,16 +28,25 @@ pub mod iceberg_config;
 pub mod iceberg_incremental;
 #[cfg(feature = "iceberg")]
 pub mod iceberg_io;
+#[cfg(feature = "iceberg")]
+pub mod iceberg_lookup;
+#[cfg(feature = "iceberg")]
 pub mod iceberg_reference;
 pub mod iceberg_source;
 
 // Common metrics
 pub mod metrics;
+#[cfg(any(test, feature = "delta-lake", feature = "iceberg"))]
+mod snapshot_schema;
 
 // Re-export Delta Lake types at module level.
 pub use delta::DeltaLakeSink;
 pub use delta_config::{CompactionConfig, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode};
+#[cfg(feature = "delta-lake")]
+pub use delta_lookup::{DeltaLookupSource, DeltaLookupSourceConfig};
 pub use delta_metrics::DeltaLakeSinkMetrics;
+#[cfg(feature = "delta-lake")]
+pub use delta_reference::DeltaReferenceTableSource;
 pub use delta_source::DeltaSource;
 pub use delta_source_config::{DeltaReadMode, DeltaSourceConfig, SchemaEvolutionAction};
 pub use metrics::LakehouseSinkMetrics;
@@ -43,6 +56,9 @@ pub use iceberg::IcebergSink;
 pub use iceberg_config::{
     IcebergCatalogConfig, IcebergCatalogType, IcebergSinkConfig, IcebergSourceConfig,
 };
+#[cfg(feature = "iceberg")]
+pub use iceberg_lookup::{IcebergLookupSource, IcebergLookupSourceConfig};
+#[cfg(feature = "iceberg")]
 pub use iceberg_reference::IcebergReferenceTableSource;
 pub use iceberg_source::IcebergSource;
 
@@ -111,12 +127,10 @@ pub fn register_delta_lake_source(
         "delta-lake",
         info.clone(),
         Arc::new(|config, declared_schema| {
-            Ok(Box::new(
-                crate::lookup::delta_reference::DeltaReferenceTableSource::from_connector_config(
-                    config,
-                    declared_schema,
-                )?,
-            ))
+            Ok(Box::new(DeltaReferenceTableSource::from_connector_config(
+                config,
+                declared_schema,
+            )?))
         }),
     )?;
 
@@ -140,8 +154,6 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
         use crate::lakehouse::delta_source_config::DeltaSourceConfig;
-        use crate::lookup::delta_lookup::{DeltaLookupSource, DeltaLookupSourceConfig};
-
         let pk_columns: Vec<String> = config
             .get("_primary_key_columns")
             .unwrap_or("")
@@ -284,8 +296,6 @@ impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
         use crate::lakehouse::iceberg_config::IcebergCatalogConfig;
-        use crate::lookup::iceberg_lookup::{IcebergLookupSource, IcebergLookupSourceConfig};
-
         let pk_columns: Vec<String> = config
             .get("_primary_key_columns")
             .unwrap_or("")

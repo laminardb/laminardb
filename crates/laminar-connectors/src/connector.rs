@@ -985,8 +985,7 @@ impl CoordinatedCommitBatch {
     /// Every variable-length field is length framed so distinct batches cannot
     /// share an input byte stream before hashing.
     #[must_use]
-    #[cfg(any(test, feature = "delta-lake"))]
-    pub(crate) fn exact_fingerprint(&self) -> [u8; 32] {
+    pub fn exact_fingerprint(&self) -> [u8; 32] {
         fn update_length(hasher: &mut Sha256, length: usize) {
             let source = length.to_be_bytes();
             let mut encoded = [0_u8; 16];

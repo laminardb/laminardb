@@ -2584,37 +2584,6 @@ impl LaminarDB {
         self.ctx.register_udaf(udaf);
     }
 
-    /// Register a Delta Lake table as a `DataFusion` table provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DbError` if the table cannot be opened or registered.
-    #[cfg(feature = "delta-lake")]
-    pub async fn register_delta_table(
-        &self,
-        name: &str,
-        table_uri: &str,
-        storage_options: HashMap<String, String>,
-    ) -> Result<(), DbError> {
-        self.ensure_catalog_cleanup_unfenced("Delta table registration")?;
-        let _topology = self.topology_ddl_lock.write().await;
-        self.ensure_catalog_cleanup_unfenced("Delta table registration")?;
-        if self.is_cluster_runtime() {
-            return Err(DbError::InvalidOperation(
-                "Delta table registration is not supported in cluster mode until it has a typed, durable catalog definition"
-                    .into(),
-            ));
-        }
-        laminar_connectors::lakehouse::delta_table_provider::register_delta_table(
-            &self.ctx,
-            name,
-            table_uri,
-            storage_options,
-        )
-        .await
-        .map_err(DbError::from)
-    }
-
     /// Execute a SQL statement.
     ///
     /// # Errors
