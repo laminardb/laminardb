@@ -4375,10 +4375,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        if self.prom.cycles.get() == 0 {
-            return BarrierOutcome::Skipped(SkipReason::NoCyclesSinceLastCheckpoint);
-        }
-
         #[cfg(feature = "cluster")]
         let assignment_fence =
             match self.validate_checkpoint_assignment(admitted_assignment_fence.as_ref()) {
@@ -5049,6 +5045,34 @@ mod tests {
             checkpoint_committable_sinks: false,
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn zero_cycle_barrier_is_not_suppressed_by_process_metrics() {
+        let mut callback = empty_callback_fixture();
+        callback.sink_timed_out = true;
+        let mut source_checkpoint = SourceCheckpoint::new();
+        source_checkpoint.set_offset("seq", "4096");
+        let mut source_checkpoints = FxHashMap::default();
+        source_checkpoints.insert("gen".to_string(), source_checkpoint);
+
+        assert_eq!(callback.prom.cycles.get(), 0);
+        let outcome = crate::pipeline::PipelineCallback::checkpoint_with_barrier(
+            &mut callback,
+            source_checkpoints,
+            CheckpointAttempt::new(38, 40),
+            std::time::Instant::now(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            crate::pipeline::BarrierOutcome::Skipped(
+                crate::pipeline::SkipReason::PreservingReplayWindowAfterSinkTimeout
+            )
+        ));
+        assert!(!callback.sink_timed_out);
     }
 
     #[cfg(feature = "cluster")]

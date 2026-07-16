@@ -5491,8 +5491,8 @@ mod tests {
 
         let outcomes = [
             (
-                BarrierOutcome::Skipped(SkipReason::NoCyclesSinceLastCheckpoint),
-                "no_cycles_since_last_checkpoint",
+                BarrierOutcome::Skipped(SkipReason::PreservingReplayWindowAfterSinkTimeout),
+                "preserving_replay_window_after_sink_timeout",
                 false,
             ),
             (

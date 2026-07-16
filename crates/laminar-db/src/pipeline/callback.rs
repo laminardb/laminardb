@@ -90,8 +90,6 @@ impl SourceBarrierControl {
 /// attempted-and-failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// No execution cycles ran since the last checkpoint.
-    NoCyclesSinceLastCheckpoint,
     /// A sink write timed out; skip to keep the replay window intact.
     PreservingReplayWindowAfterSinkTimeout,
 }
@@ -99,7 +97,6 @@ pub enum SkipReason {
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            SkipReason::NoCyclesSinceLastCheckpoint => "no_cycles_since_last_checkpoint",
             SkipReason::PreservingReplayWindowAfterSinkTimeout => {
                 "preserving_replay_window_after_sink_timeout"
             }
