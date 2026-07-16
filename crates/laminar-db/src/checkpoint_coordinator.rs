@@ -2103,8 +2103,8 @@ impl CheckpointCoordinator {
     /// Persist this participant's final prepare attestation.
     ///
     /// The payload also carries the exact source-offset handoff. Requiring its key in `_SEAL`
-    /// proves both manifest completion and a complete participant offset inventory, including
-    /// participants with zero vnodes or empty offsets.
+    /// proves both manifest completion and a complete vnode-owner offset inventory, including
+    /// owners whose connectors have empty offsets.
     #[cfg(feature = "cluster")]
     async fn persist_participant_ready_until(
         &mut self,
@@ -2941,9 +2941,8 @@ impl CheckpointCoordinator {
                             ))),
                         }
                     } else {
-                        // At-least-once: a plain buffer flush, NOT pre_commit — ALO sinks never got
-                        // begin_epoch, and some (Postgres) reject a pre_commit for an epoch they didn't
-                        // open. This lands buffered rows before the manifest seals offsets (CP-5).
+                        // At-least-once sinks flush buffered rows before the manifest seals offsets;
+                        // they do not enter the transactional pre-commit path.
                         match handle.flush_until(deadline).await {
                             Ok(()) => {
                                 debug!(sink = %name, epoch, "at-least-once sink flushed");
@@ -3635,7 +3634,7 @@ impl CheckpointCoordinator {
             }
             if let Some(participant) = participants
                 .iter()
-                .find(|participant| controller.is_recently_unresponsive(**participant))
+                .find(|participant| controller.is_unresponsive(**participant))
             {
                 return Some(format!(
                     "durability gate fail-fast: follower {} missed a capture quorum",

@@ -137,7 +137,7 @@ fn spawn_membership_watcher(
     })
 }
 
-use laminar_db::{LaminarDB, Profile};
+use laminar_db::{ClusterStartupDisposition, LaminarDB, Profile};
 
 use crate::cluster_config::ClusterConfig;
 use crate::config::{DiscoverySection, ServerConfig};
@@ -312,13 +312,17 @@ impl ClusterHandle {
 
         // 2. Flip the local draining flag so that if we are the leader,
         //    our own rebalance controller excludes us from assignment.
-        if let Some(controller) = &self.cluster_controller {
-            controller.begin_drain();
-        }
-        // Stop renewing before waiting for reassignment. The local controller is already
-        // ineligible to lead, and the durable lease must lapse so a peer can drive the drain.
-        if let Some(token) = &self.lease_shutdown_token {
-            token.cancel();
+        let retains_drain_leadership = self
+            .cluster_controller
+            .as_ref()
+            .is_some_and(|controller| controller.begin_drain());
+        // A non-leader yields immediately. The certified current leader must keep renewing until
+        // it checkpoints its own predecessor cut; the target roster excludes it and transfers
+        // candidacy after the committed assignment is adopted.
+        if !retains_drain_leadership {
+            if let Some(token) = &self.lease_shutdown_token {
+                token.cancel();
+            }
         }
 
         // 3. Block until the leader has reassigned every vnode we own,
@@ -351,6 +355,9 @@ impl ClusterHandle {
             } else {
                 info!("Control plane is inactive; skipping drain");
             }
+        }
+        if let Some(token) = &self.lease_shutdown_token {
+            token.cancel();
         }
 
         // Tell rebalance tasks to exit at their next select point.
@@ -751,15 +758,21 @@ fn start_process_lease_runtime(
     store: Arc<laminar_core::cluster::control::ProcessLeaseStore>,
     owner: uuid::Uuid,
     config: laminar_core::cluster::control::ProcessLeaseConfig,
+    acquisition_started_at: std::time::Instant,
     acquired: laminar_core::cluster::control::ProcessLease,
 ) -> Result<ProcessLeaseRuntime, ClusterStartupError> {
-    let manager =
-        laminar_core::cluster::control::ProcessLeaseManager::new(store, owner, config, &acquired)
-            .map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!(
-                "start stable node identity lease renewal: {error}"
-            ))
-        })?;
+    let manager = laminar_core::cluster::control::ProcessLeaseManager::new(
+        store,
+        owner,
+        config,
+        acquisition_started_at,
+        &acquired,
+    )
+    .map_err(|error| {
+        ClusterStartupError::EngineConstruction(format!(
+            "start stable node identity lease renewal: {error}"
+        ))
+    })?;
     let live_rx = manager.live_watch();
     let deadline = manager.deadline();
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -791,6 +804,7 @@ async fn acquire_process_lease(
             )));
         }
         let attempt_timeout = PROCESS_LEASE_IO_TIMEOUT.min(remaining);
+        let acquisition_started_at = std::time::Instant::now();
         match tokio::time::timeout(
             attempt_timeout,
             store.try_acquire(owner, unix_time_millis()),
@@ -798,7 +812,13 @@ async fn acquire_process_lease(
         .await
         {
             Ok(Ok(ProcessLeaseOutcome::Acquired(acquired))) => {
-                return start_process_lease_runtime(store, owner, config, acquired);
+                return start_process_lease_runtime(
+                    store,
+                    owner,
+                    config,
+                    acquisition_started_at,
+                    acquired,
+                );
             }
             Ok(Ok(ProcessLeaseOutcome::Held(incumbent))) => {
                 last_failure = format!(
@@ -816,6 +836,7 @@ async fn acquire_process_lease(
                 if observation_time < config.ttl {
                     continue;
                 }
+                let takeover_started_at = std::time::Instant::now();
                 match tokio::time::timeout(
                     PROCESS_LEASE_IO_TIMEOUT
                         .min(deadline.saturating_duration_since(std::time::Instant::now())),
@@ -824,7 +845,13 @@ async fn acquire_process_lease(
                 .await
                 {
                     Ok(Ok(ProcessLeaseOutcome::Acquired(acquired))) => {
-                        return start_process_lease_runtime(store, owner, config, acquired);
+                        return start_process_lease_runtime(
+                            store,
+                            owner,
+                            config,
+                            takeover_started_at,
+                            acquired,
+                        );
                     }
                     Ok(Ok(ProcessLeaseOutcome::Held(current))) => {
                         last_failure = format!(
@@ -925,11 +952,18 @@ pub async fn start_cluster(
                 "process lease TTL exceeds i64 milliseconds".into(),
             )
         })?;
-    let process_lease_store = Arc::new(laminar_core::cluster::control::ProcessLeaseStore::new(
-        Arc::clone(&control_store),
-        node_id,
-        process_lease_ttl_ms,
-    ));
+    let process_lease_authority = Arc::new(
+        laminar_core::cluster::control::process_lease::ProcessLeaseAuthority::new(
+            Arc::clone(&control_store),
+            process_lease_config.ttl,
+        )
+        .map_err(|error| {
+            ClusterStartupError::EngineConstruction(format!(
+                "construct shared process lease authority: {error}"
+            ))
+        })?,
+    );
+    let process_lease_store = process_lease_authority.store_for(node_id);
     let mut process_lease = acquire_process_lease(
         process_lease_store,
         process_incarnation,
@@ -1240,6 +1274,9 @@ pub async fn start_cluster(
                 local_node.metadata.failure_domain.as_deref().unwrap_or(""),
             ));
             controller.set_process_lease_deadline(Arc::clone(&process_lease.deadline));
+            controller
+                .set_process_lease_authority(Arc::clone(&process_lease_authority))
+                .map_err(ClusterStartupError::EngineConstruction)?;
             builder = builder.cluster_controller(Arc::clone(&controller));
             Some(controller)
         }
@@ -1615,8 +1652,8 @@ pub async fn start_cluster(
         controller.set_active(true);
     }
 
-    // Rebalance and assignment certification use the same durable snapshot in gossip and static
-    // discovery modes.
+    // Rebalance and assignment certification use the same durable snapshot in every discovery
+    // mode.
     let rebalance_shutdown = Arc::new(tokio::sync::Notify::new());
     let mut rebalance_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let (Some(snap_store), Some(controller)) =
@@ -1641,11 +1678,73 @@ pub async fn start_cluster(
         info!("Rebalance control plane started");
     }
 
+    // Reserve the API address while intake is still fenced. Serving starts only after startup
+    // recovery establishes the final data-plane disposition.
+    let cluster_components = crate::http::ClusterComponents {
+        controller: cluster_controller.clone(),
+        snapshot_store: snapshot_store.clone(),
+        membership_rx: discovery.membership_watch(),
+    };
+    let prepared_api = match server::prepare_http_api(
+        Arc::clone(&db),
+        registry,
+        config_path.clone(),
+        config,
+        Some(cluster_components),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            db.fence_cluster_startup();
+            if let Some(controller) = cluster_controller.as_ref() {
+                controller.set_active(false);
+            }
+            let mut left = active.clone();
+            left.state = NodeState::Left;
+            let _ = discovery.announce(left).await;
+            rebalance_shutdown.notify_waiters();
+            for task in &rebalance_tasks {
+                task.abort();
+            }
+            for task in rebalance_tasks.drain(..) {
+                let _ = task.await;
+            }
+            if let Some(token) = &lease_shutdown_token {
+                token.cancel();
+            }
+            let _ = db.shutdown().await;
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::HttpStartup(error.to_string()));
+        }
+    };
+
     let startup_controller = cluster_controller
         .as_ref()
         .expect("cluster controller was required before database construction");
+    let leader_authority_timeout =
+        startup_leader_authority_timeout(lease_cfg, OBJECT_STORE_CONTROL_IO_TIMEOUT).ok_or_else(
+            || {
+                ClusterStartupError::EngineConstruction(
+                    "leader authority convergence timeout exceeds the monotonic timer range".into(),
+                )
+            },
+        )?;
     let startup_gate = async {
         wait_for_startup_assignment_fence(startup_controller, &vnode_registry).await?;
+        wait_for_startup_leader_authority(
+            &db,
+            startup_controller,
+            &vnode_registry,
+            &lease_store,
+            &process_lease_authority,
+            leader_authority_timeout,
+        )
+        .await?;
+        info!(
+            timeout = ?leader_authority_timeout,
+            "Durable leader authority converged with the certified assignment"
+        );
         let authority_deadline = tokio::time::Instant::now() + rebalance_config.checkpoint_timeout;
         db.finish_cluster_startup(authority_deadline)
             .await
@@ -1656,9 +1755,10 @@ pub async fn start_cluster(
             })
     }
     .await;
-    let intake_open = match startup_gate {
-        Ok(open) => open,
+    let startup_disposition = match startup_gate {
+        Ok(disposition) => disposition,
         Err(error) => {
+            db.fence_cluster_startup();
             startup_controller.set_active(false);
             let mut left = active.clone();
             left.state = NodeState::Left;
@@ -1678,78 +1778,50 @@ pub async fn start_cluster(
             return Err(error);
         }
     };
-    if intake_open {
-        info!("Cluster assignment certified; source intake opened");
-    } else {
-        info!("Cluster source intake remains fenced for coordinated recovery");
-        if tokio::time::timeout(STARTUP_RECOVERY_TIMEOUT, async {
-            while db.cluster_intake_fenced() || startup_controller.is_recovering() {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    match startup_disposition {
+        ClusterStartupDisposition::Serving => {
+            info!("Cluster assignment certified; source intake opened");
+        }
+        ClusterStartupDisposition::Idle => {
+            info!("Cluster worker owns no vnodes; data plane remains fenced pending assignment");
+        }
+        ClusterStartupDisposition::RecoveryFenced => {
+            info!("Cluster source intake remains fenced for coordinated recovery");
+            if tokio::time::timeout(STARTUP_RECOVERY_TIMEOUT, async {
+                while db.cluster_intake_fenced() || startup_controller.is_recovering() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_err()
+            {
+                db.fence_cluster_startup();
+                startup_controller.set_active(false);
+                let mut left = active.clone();
+                left.state = NodeState::Left;
+                let _ = discovery.announce(left).await;
+                rebalance_shutdown.notify_waiters();
+                for task in &rebalance_tasks {
+                    task.abort();
+                }
+                for task in rebalance_tasks.drain(..) {
+                    let _ = task.await;
+                }
+                if let Some(token) = &lease_shutdown_token {
+                    token.cancel();
+                }
+                let _ = db.shutdown().await;
+                let _ = discovery.stop().await;
+                return Err(ClusterStartupError::EngineConstruction(format!(
+                    "coordinated startup recovery did not release intake within {STARTUP_RECOVERY_TIMEOUT:?}"
+                )));
             }
-        })
-        .await
-        .is_err()
-        {
-            startup_controller.set_active(false);
-            let mut left = active.clone();
-            left.state = NodeState::Left;
-            let _ = discovery.announce(left).await;
-            rebalance_shutdown.notify_waiters();
-            for task in &rebalance_tasks {
-                task.abort();
-            }
-            for task in rebalance_tasks.drain(..) {
-                let _ = task.await;
-            }
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
-            return Err(ClusterStartupError::EngineConstruction(format!(
-                "coordinated startup recovery did not release intake within {STARTUP_RECOVERY_TIMEOUT:?}"
-            )));
         }
     }
 
-    // Bind the data/control API only after the exact assignment and any required rewind have
-    // released intake. This prevents readiness, queries, reloads, and subscriptions from exposing
-    // restored-but-not-yet-coordinated state.
-    let cluster_components = crate::http::ClusterComponents {
-        controller: cluster_controller.clone(),
-        snapshot_store: snapshot_store.clone(),
-        membership_rx: discovery.membership_watch(),
-    };
-    let api_start = server::start_http_api(
-        Arc::clone(&db),
-        registry,
-        config_path.clone(),
-        config,
-        Some(cluster_components),
-    )
-    .await;
-    let (app_state, api_handle) = match api_start {
-        Ok(started) => started,
-        Err(error) => {
-            startup_controller.set_active(false);
-            let mut left = active.clone();
-            left.state = NodeState::Left;
-            let _ = discovery.announce(left).await;
-            rebalance_shutdown.notify_waiters();
-            for task in &rebalance_tasks {
-                task.abort();
-            }
-            for task in rebalance_tasks.drain(..) {
-                let _ = task.await;
-            }
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
-            return Err(ClusterStartupError::HttpStartup(error.to_string()));
-        }
-    };
+    // An idle worker serves control-plane readiness while its data plane remains fenced until the
+    // watcher grants ownership.
+    let (app_state, api_handle) = prepared_api.start();
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
     let membership_rx = discovery.membership_watch();
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
@@ -1788,6 +1860,271 @@ fn cluster_state_backend(
 
 const STARTUP_ASSIGNMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STARTUP_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const STARTUP_LEADER_AUTHORITY_MIN_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(25);
+const STARTUP_LEADER_AUTHORITY_MAX_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const STARTUP_LEADER_AUTHORITY_MAX_SLEEP: std::time::Duration =
+    std::time::Duration::from_millis(375);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CertifiedLeaderCandidate {
+    assignment_version: u64,
+    assignment_digest: [u8; 32],
+    participant: laminar_core::checkpoint::CheckpointParticipant,
+}
+
+impl CertifiedLeaderCandidate {
+    fn same_assignment_process(&self, other: &Self) -> bool {
+        self.assignment_version == other.assignment_version
+            && self.assignment_digest == other.assignment_digest
+            && self.participant == other.participant
+    }
+}
+
+fn certified_leader_candidate(
+    controller: &laminar_core::cluster::control::ClusterController,
+    registry: &laminar_core::state::VnodeRegistry,
+) -> Option<CertifiedLeaderCandidate> {
+    let assignment = registry.versioned_snapshot();
+    let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+    let fence = controller.checkpoint_assignment_fence(assignment.version())?;
+    if !fence.matches_owner_map(&owners) {
+        return None;
+    }
+    let leader = controller.current_leader()?;
+    let participant = fence
+        .participants
+        .iter()
+        .find(|participant| participant.node_id == leader.0)
+        .copied()?;
+    Some(CertifiedLeaderCandidate {
+        assignment_version: fence.assignment_version,
+        assignment_digest: fence.assignment_digest,
+        participant,
+    })
+}
+
+fn startup_control_operation_deadline(overall: tokio::time::Instant) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        .checked_add(OBJECT_STORE_CONTROL_IO_TIMEOUT)
+        .map_or(overall, |deadline| deadline.min(overall))
+}
+
+fn startup_leader_authority_timeout(
+    config: laminar_core::cluster::control::LeaderLeaseConfig,
+    control_io: std::time::Duration,
+) -> Option<std::time::Duration> {
+    // Initial attempt, full rival observation, and takeover can each consume one TTL. The
+    // successful remote audit then serializes five bounded operations: durable head, live RPC,
+    // process-term verification, live RPC, and final durable head.
+    config
+        .ttl
+        .checked_mul(3)?
+        .checked_add(config.renew_interval)?
+        .checked_add(control_io.checked_mul(5)?)?
+        .checked_add(STARTUP_LEADER_AUTHORITY_MAX_SLEEP)
+}
+
+async fn capture_startup_leader_proof(
+    controller: &laminar_core::cluster::control::ClusterController,
+    candidate: CertifiedLeaderCandidate,
+    lease: &laminar_core::cluster::control::LeaderLease,
+    deadline: tokio::time::Instant,
+) -> Result<Option<laminar_core::cluster::control::LeaderProof>, String> {
+    if lease.owner.node.0 != candidate.participant.node_id
+        || lease.owner.boot != candidate.participant.boot_incarnation
+    {
+        return Ok(None);
+    }
+    let proof = if candidate.participant.node_id == controller.instance_id().0 {
+        controller.capture_leader_proof()
+    } else {
+        controller
+            .capture_remote_leader_proof(candidate.participant, lease.owner.process_term, deadline)
+            .await?
+    };
+    Ok(proof.filter(|proof| lease.matches_proof(proof)))
+}
+
+async fn wait_for_startup_leader_authority(
+    db: &LaminarDB,
+    controller: &laminar_core::cluster::control::ClusterController,
+    registry: &laminar_core::state::VnodeRegistry,
+    authority: &laminar_core::cluster::control::LeaderLeaseStore,
+    process_authority: &laminar_core::cluster::control::process_lease::ProcessLeaseAuthority,
+    timeout: std::time::Duration,
+) -> Result<(), ClusterStartupError> {
+    db.fence_cluster_startup();
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            ClusterStartupError::EngineConstruction(
+                "leader authority convergence deadline exceeds the monotonic timer range".into(),
+            )
+        })?;
+    let mut last_candidate = None;
+    let mut last_owner = None;
+    let mut last_read_error = None;
+    let mut backoff = STARTUP_LEADER_AUTHORITY_MIN_BACKOFF;
+    let mut previous_candidate = None;
+    let wait = async {
+        loop {
+            let candidate = certified_leader_candidate(controller, registry);
+            if candidate != previous_candidate {
+                backoff = STARTUP_LEADER_AUTHORITY_MIN_BACKOFF;
+                previous_candidate = candidate;
+            }
+            last_candidate = candidate;
+            if let Some(candidate) = candidate {
+                let operation_deadline = startup_control_operation_deadline(deadline);
+                match tokio::time::timeout_at(operation_deadline, authority.load()).await {
+                    Ok(Ok(current)) => {
+                        last_read_error = None;
+                        last_owner = current.as_ref().map(|lease| lease.owner.clone());
+                        let captured = if let Some(lease) = current.as_ref() {
+                            capture_startup_leader_proof(
+                                controller,
+                                candidate,
+                                lease,
+                                startup_control_operation_deadline(deadline),
+                            )
+                            .await
+                        } else {
+                            Ok(None)
+                        };
+                        match (current, captured) {
+                            (Some(lease), Ok(Some(proof))) => {
+                                let process_deadline = startup_control_operation_deadline(deadline);
+                                match process_authority
+                                    .verify_current_participant_term(
+                                        candidate.participant,
+                                        lease.owner.process_term,
+                                        process_deadline,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        let recaptured = capture_startup_leader_proof(
+                                            controller,
+                                            candidate,
+                                            &lease,
+                                            startup_control_operation_deadline(deadline),
+                                        )
+                                        .await;
+                                        if matches!(recaptured, Ok(Some(ref current)) if current == &proof)
+                                        {
+                                            let audit_deadline =
+                                                startup_control_operation_deadline(deadline);
+                                            match tokio::time::timeout_at(
+                                                audit_deadline,
+                                                authority.load(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(Some(after)))
+                                                    if after.owner == lease.owner
+                                                        && after.token == lease.token
+                                                        && after.seq >= lease.seq
+                                                        && certified_leader_candidate(
+                                                            controller, registry,
+                                                        )
+                                                        .is_some_and(|current| {
+                                                            current
+                                                                .same_assignment_process(&candidate)
+                                                        })
+                                                        && after.matches_proof(&proof) =>
+                                                {
+                                                    return;
+                                                }
+                                                Ok(Ok(after)) => {
+                                                    last_owner =
+                                                        after.map(|lease| lease.owner.clone());
+                                                }
+                                                Ok(Err(error)) => {
+                                                    last_read_error = Some(error.to_string());
+                                                }
+                                                Err(_) => {
+                                                    last_read_error = Some(
+                                                        "final leader authority audit timed out"
+                                                            .into(),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            last_read_error = Some(match recaptured {
+                                                Ok(_) => "process-local leader grant expired during startup audit".into(),
+                                                Err(error) => error,
+                                            });
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        last_read_error = Some(
+                                            "durable leader owner is not the current process lease term"
+                                                .into(),
+                                        );
+                                    }
+                                    Err(error) => last_read_error = Some(error.to_string()),
+                                }
+                            }
+                            (_, Err(error)) => last_read_error = Some(error),
+                            (Some(_), Ok(None)) => {
+                                last_read_error =
+                                    Some("nominated process has no live local leader grant".into());
+                            }
+                            (None, Ok(_)) => {}
+                        }
+                    }
+                    Ok(Err(error)) => last_read_error = Some(error.to_string()),
+                    Err(_) => {
+                        last_read_error = Some("leader authority read timed out".into());
+                    }
+                }
+            } else {
+                last_read_error = Some("no assignment-certified leader candidate".into());
+            }
+            use rand::RngExt as _;
+            let base_ms = u64::try_from(backoff.as_millis()).unwrap_or(250);
+            let jitter_ms = rand::rng().random_range(0..=base_ms / 2);
+            tokio::time::sleep(backoff + std::time::Duration::from_millis(jitter_ms)).await;
+            backoff = backoff
+                .checked_mul(2)
+                .unwrap_or(STARTUP_LEADER_AUTHORITY_MAX_BACKOFF)
+                .min(STARTUP_LEADER_AUTHORITY_MAX_BACKOFF);
+        }
+    };
+    if tokio::time::timeout_at(deadline, wait).await.is_ok() {
+        return Ok(());
+    }
+
+    db.fence_cluster_startup();
+    let expected = last_candidate.map_or_else(
+        || "no assignment-certified leader candidate".to_string(),
+        |candidate| {
+            format!(
+                "assignment {} candidate {} boot {}",
+                candidate.assignment_version,
+                candidate.participant.node_id,
+                candidate.participant.boot_incarnation
+            )
+        },
+    );
+    let observed = last_owner.map_or_else(
+        || "no durable leader owner".to_string(),
+        |owner| {
+            format!(
+                "durable owner {} boot {} term {}",
+                owner.node.0, owner.boot, owner.process_term
+            )
+        },
+    );
+    let read_error = last_read_error
+        .map(|error| format!("; last authority audit failed: {error}"))
+        .unwrap_or_default();
+    Err(ClusterStartupError::EngineConstruction(format!(
+        "durable leader authority did not converge with a live certified grant within {timeout:?}: {expected}; {observed}{read_error}"
+    )))
+}
 
 async fn wait_for_startup_assignment_fence(
     controller: &laminar_core::cluster::control::ClusterController,
@@ -2046,10 +2383,22 @@ async fn resolve_vnode_assignment(
 
     // Nothing stored yet — propose ours and CAS-create. A racing peer
     // may win; if so, re-load and adopt the winner.
+    let owner_ids: std::collections::BTreeSet<u64> =
+        assignment.iter().map(|owner| owner.0).collect();
+    let owner_participants: Vec<_> = startup_participants
+        .iter()
+        .filter(|participant| owner_ids.contains(&participant.node_id))
+        .cloned()
+        .collect();
+    if owner_participants.len() != owner_ids.len() {
+        return Err(ClusterStartupError::EngineConstruction(
+            "initial assignment has an owner without a certified process incarnation".into(),
+        ));
+    }
     let proposal = AssignmentSnapshot::empty()
         .next_for_participants(
             AssignmentSnapshot::vnodes_from_vec(&assignment),
-            startup_participants.to_vec(),
+            owner_participants,
         )
         .map_err(|error| {
             ClusterStartupError::EngineConstruction(format!("initial assignment snapshot: {error}"))
@@ -2132,6 +2481,7 @@ async fn install_cluster_controller(
         recovery_incarnation,
     ));
     controller.set_active(false);
+    controller.install_local_leader_proof_provider();
 
     let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
         ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
@@ -3603,6 +3953,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_process_phase_cannot_clobber_replacement_release() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome,
+            RecoverPhase, RecoveryAnnouncement, RecoveryFault, RecoveryRound,
+        };
+
+        let inner: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let delayed = Arc::new(DelayedControlPutStore::new(Arc::clone(&inner)));
+        let store: Arc<dyn object_store::ObjectStore> = delayed.clone();
+        let node = NodeId(7);
+        let ttl_ms = 1;
+        let old_boot = uuid::Uuid::from_u128(71);
+        let old_process =
+            acquire_test_process_lease(Arc::clone(&store), node, old_boot, ttl_ms).await;
+        let old_deadline = live_test_process_deadline();
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let old_kv_impl = Arc::new(ObjectStoreClusterKv::new(
+            old_process.clone(),
+            Arc::clone(&old_deadline),
+            ttl_ms,
+            Arc::clone(&store),
+            members_rx.clone(),
+        ));
+        let old_kv: Arc<dyn ClusterKv> = old_kv_impl;
+        let old_controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&old_kv),
+            old_kv,
+            None,
+            members_rx.clone(),
+            old_boot,
+        ));
+        old_controller.set_process_lease_deadline(Arc::clone(&old_deadline));
+        old_controller
+            .publish_leased_recovery_incarnation(&old_process)
+            .await
+            .unwrap();
+
+        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&store), ttl_ms));
+        let old_owner = LeaderLeaseOwner {
+            node,
+            boot: old_process.owner,
+            process_term: old_process.term,
+        };
+        let LeaseOutcome::Acquired(old_leader) =
+            authority.try_acquire(&old_owner, 0).await.unwrap()
+        else {
+            panic!("old process must acquire empty leader authority");
+        };
+        let (_old_leader_tx, old_leader_rx) = watch::channel(Some(old_leader.clone()));
+        old_controller
+            .set_leader_lease_watch(old_leader_rx, old_owner, old_deadline)
+            .unwrap();
+        old_controller.set_leader_lease_store(Arc::clone(&authority));
+
+        let old_participant = CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: old_boot,
+        };
+        let old_round = RecoveryRound::new(
+            61,
+            old_leader.proof(),
+            CheckpointAssignmentFence::from_owner_map(7, &[node.0], vec![old_participant]).unwrap(),
+            vec![RecoveryFault {
+                reporter: node,
+                sequence: 1,
+            }],
+        )
+        .unwrap();
+        old_controller
+            .publish_checkpoint_assignment_fence(Some(old_round.assignment_fence.clone()));
+        old_controller
+            .announce_recover_prepare(&old_round)
+            .await
+            .unwrap();
+        old_controller
+            .announce_recover_start(&old_round, 4)
+            .await
+            .unwrap();
+
+        let stale_path = object_store_control_record_path(&old_process, "control:recover", 3);
+        delayed.block_once(stale_path.clone());
+        let stale_release = {
+            let controller = Arc::clone(&old_controller);
+            let round = old_round.clone();
+            tokio::spawn(async move { controller.announce_recover_release(&round, 4).await })
+        };
+        delayed.wait_until_blocked().await;
+
+        let replacement_boot = uuid::Uuid::from_u128(72);
+        let replacement_process = take_over_test_process_lease(
+            Arc::clone(&store),
+            &old_process,
+            replacement_boot,
+            ttl_ms,
+        )
+        .await;
+        let replacement_owner = LeaderLeaseOwner {
+            node,
+            boot: replacement_process.owner,
+            process_term: replacement_process.term,
+        };
+        let leader_observation = authority
+            .observe_rival(&replacement_owner, &old_leader)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let LeaseOutcome::Acquired(replacement_leader) = authority
+            .try_takeover(&replacement_owner, &leader_observation, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("replacement process must take over leader authority");
+        };
+
+        let replacement_deadline = live_test_process_deadline();
+        let replacement_kv_impl = Arc::new(ObjectStoreClusterKv::new(
+            replacement_process.clone(),
+            Arc::clone(&replacement_deadline),
+            ttl_ms,
+            Arc::clone(&store),
+            members_rx.clone(),
+        ));
+        let replacement_kv: Arc<dyn ClusterKv> = replacement_kv_impl;
+        let replacement_controller = ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&replacement_kv),
+            replacement_kv,
+            None,
+            members_rx,
+            replacement_boot,
+        );
+        replacement_controller.set_process_lease_deadline(Arc::clone(&replacement_deadline));
+        replacement_controller
+            .publish_leased_recovery_incarnation(&replacement_process)
+            .await
+            .unwrap();
+        let (_replacement_leader_tx, replacement_leader_rx) =
+            watch::channel(Some(replacement_leader.clone()));
+        replacement_controller
+            .set_leader_lease_watch(
+                replacement_leader_rx,
+                replacement_owner,
+                replacement_deadline,
+            )
+            .unwrap();
+        replacement_controller.set_leader_lease_store(authority);
+
+        let replacement_participant = CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: replacement_boot,
+        };
+        let replacement_round = RecoveryRound::new(
+            62,
+            replacement_leader.proof(),
+            CheckpointAssignmentFence::from_owner_map(8, &[node.0], vec![replacement_participant])
+                .unwrap(),
+            vec![RecoveryFault {
+                reporter: node,
+                sequence: 2,
+            }],
+        )
+        .unwrap();
+        replacement_controller
+            .publish_checkpoint_assignment_fence(Some(replacement_round.assignment_fence.clone()));
+        replacement_controller
+            .announce_recover_prepare(&replacement_round)
+            .await
+            .unwrap();
+        replacement_controller
+            .announce_recover_start(&replacement_round, 5)
+            .await
+            .unwrap();
+        replacement_controller
+            .announce_recover_release(&replacement_round, 5)
+            .await
+            .unwrap();
+        let replacement_release = RecoveryAnnouncement {
+            round: replacement_round,
+            phase: RecoverPhase::Release { epoch: 5 },
+        };
+        assert_eq!(
+            replacement_controller.observe_recover().await.unwrap(),
+            Some(replacement_release.clone())
+        );
+
+        delayed.release();
+        delayed.wait_until_completed().await;
+        let stale_error = stale_release.await.unwrap().unwrap_err();
+        assert!(
+            stale_error.contains("local process lease owner or term changed"),
+            "{stale_error}"
+        );
+        assert!(inner.get(&stale_path).await.is_ok());
+        assert_eq!(
+            replacement_controller.observe_recover().await.unwrap(),
+            Some(replacement_release)
+        );
+    }
+
+    #[tokio::test]
     async fn object_store_control_kv_delayed_lower_sequence_cannot_regress_same_term() {
         use laminar_core::cluster::control::ClusterKv;
 
@@ -4295,6 +4847,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_assignment_roster_excludes_zero_vnode_workers() {
+        use laminar_core::checkpoint::CheckpointParticipant;
+
+        let nodes = [NodeId(1), NodeId(2), NodeId(3)];
+        let peers: Vec<NodeInfo> = nodes[1..]
+            .iter()
+            .map(|node| NodeInfo {
+                id: *node,
+                name: format!("node-{}", node.0),
+                rpc_address: String::new(),
+                raft_address: String::new(),
+                state: NodeState::Joining,
+                metadata: NodeMetadata::default(),
+                last_heartbeat_ms: 0,
+            })
+            .collect();
+        let participants: Vec<_> = nodes
+            .iter()
+            .map(|node| CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: uuid::Uuid::from_u128(u128::from(node.0)),
+            })
+            .collect();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        let (registry, snapshot_store) =
+            resolve_vnode_assignment(nodes[0], &peers, 1, Some(store), &participants)
+                .await
+                .unwrap();
+        let snapshot = snapshot_store.unwrap().load().await.unwrap().unwrap();
+        let owner = registry.snapshot()[0];
+
+        assert_eq!(snapshot.participants.len(), 1);
+        assert_eq!(snapshot.participants[0].node_id, owner.0);
+        assert_eq!(
+            nodes.iter().filter(|node| **node != owner).count(),
+            2,
+            "one vnode across three live workers must leave two workers idle"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_waits_for_exact_local_assignment_certificate() {
         use laminar_core::checkpoint::CheckpointAssignmentFence;
         use laminar_core::cluster::control::{
@@ -4333,5 +4928,370 @@ mod tests {
         .await
         .expect("startup wait did not observe the assignment certificate")
         .unwrap();
+    }
+
+    #[test]
+    fn startup_leader_timeout_covers_manager_and_remote_audit_phases() {
+        let timeout = startup_leader_authority_timeout(
+            laminar_core::cluster::control::LeaderLeaseConfig {
+                ttl: std::time::Duration::from_secs(5),
+                renew_interval: std::time::Duration::from_secs(2),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(timeout, std::time::Duration::from_millis(42_375));
+    }
+
+    #[tokio::test]
+    async fn startup_leader_authority_requires_a_live_full_owner_and_keeps_intake_fenced() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore,
+            LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
+        };
+        use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+        let node = NodeId(7);
+        let stale_boot = uuid::Uuid::from_u128(71);
+        let certified_boot = uuid::Uuid::from_u128(72);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&kv),
+            kv,
+            None,
+            members_rx,
+            certified_boot,
+        );
+        controller.publish_checkpoint_assignment_fence(Some(
+            CheckpointAssignmentFence::from_owner_map(
+                1,
+                &[node.0],
+                vec![CheckpointParticipant {
+                    node_id: node.0,
+                    boot_incarnation: certified_boot,
+                }],
+            )
+            .unwrap(),
+        ));
+        controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        )));
+        let registry = VnodeRegistry::single_owner(1, StateNodeId(node.0));
+
+        let delayed = Arc::new(DelayedControlPutStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )));
+        let backing: Arc<dyn object_store::ObjectStore> = delayed.clone();
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&backing), std::time::Duration::from_millis(1))
+                .unwrap(),
+        );
+        let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+            .store_for(node)
+            .try_acquire(certified_boot, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("empty process authority must be acquired");
+        };
+        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1));
+        let stale_owner = LeaderLeaseOwner {
+            node,
+            boot: stale_boot,
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(stale_lease) =
+            authority.try_acquire(&stale_owner, 0).await.unwrap()
+        else {
+            panic!("empty test authority must be acquired");
+        };
+        let certified_owner = LeaderLeaseOwner {
+            node,
+            boot: certified_boot,
+            process_term: process_lease.term,
+        };
+        let (leader_tx, leader_rx) = watch::channel(None);
+        controller
+            .set_leader_lease_watch(
+                leader_rx,
+                certified_owner.clone(),
+                Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30))),
+            )
+            .unwrap();
+        controller.set_leader_lease_store(Arc::clone(&authority));
+        let observation = authority
+            .observe_rival(&certified_owner, &stale_lease)
+            .unwrap();
+        let db = LaminarDB::builder().build().await.unwrap();
+        assert!(!db.cluster_intake_fenced());
+
+        let error = wait_for_startup_leader_authority(
+            &db,
+            &controller,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(&stale_boot.to_string()),
+            "{error}"
+        );
+        assert!(db.cluster_intake_fenced());
+
+        let LeaseOutcome::Acquired(takeover) = authority
+            .try_takeover(&certified_owner, &observation, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("certified process must take over stale leader authority");
+        };
+
+        let no_grant = wait_for_startup_leader_authority(
+            &db,
+            &controller,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            no_grant.to_string().contains("live certified grant"),
+            "{no_grant}"
+        );
+        assert!(db.cluster_intake_fenced());
+
+        leader_tx.send_replace(Some(takeover));
+
+        wait_for_startup_leader_authority(
+            &db,
+            &controller,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(db.cluster_intake_fenced());
+    }
+
+    #[tokio::test]
+    async fn remote_startup_requires_a_live_exact_process_proof_and_resets_with_the_candidate() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::{
+            CatalogManifest, CatalogManifestStore, ClusterController, LeaderLeaseOwner,
+            LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority,
+            ProcessLeaseOutcome,
+        };
+        use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+        fn active_node(node: NodeId) -> NodeInfo {
+            NodeInfo {
+                id: node,
+                name: format!("node-{}", node.0),
+                rpc_address: String::new(),
+                raft_address: String::new(),
+                state: NodeState::Active,
+                metadata: NodeMetadata::default(),
+                last_heartbeat_ms: 0,
+            }
+        }
+
+        let leader_node = NodeId(1);
+        let observer_node = NodeId(2);
+        let replacement_node = NodeId(3);
+        let leader_boot = uuid::Uuid::from_u128(11);
+        let observer_boot = uuid::Uuid::from_u128(22);
+        let replacement_boot = uuid::Uuid::from_u128(33);
+        let controls = namespace_proof_test_kvs();
+        let (observer_members_tx, observer_members_rx) =
+            watch::channel(vec![active_node(leader_node)]);
+        let (_leader_members_tx, leader_members_rx) =
+            watch::channel(vec![active_node(observer_node)]);
+        let observer = Arc::new(ClusterController::new_with_recovery_incarnation(
+            observer_node,
+            Arc::clone(&controls[1]),
+            Arc::clone(&controls[1]),
+            None,
+            observer_members_rx,
+            observer_boot,
+        ));
+        let leader = Arc::new(ClusterController::new_with_recovery_incarnation(
+            leader_node,
+            Arc::clone(&controls[0]),
+            Arc::clone(&controls[0]),
+            None,
+            leader_members_rx,
+            leader_boot,
+        ));
+        for controller in [&observer, &leader] {
+            controller.install_local_leader_proof_provider();
+            controller
+                .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(30),
+            )));
+            controller.set_active(true);
+        }
+
+        let registry = VnodeRegistry::single_owner(1, StateNodeId(leader_node.0));
+        let leader_participant = CheckpointParticipant {
+            node_id: leader_node.0,
+            boot_incarnation: leader_boot,
+        };
+        let leader_fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[leader_node.0],
+            vec![leader_participant],
+        )
+        .unwrap();
+        observer.publish_checkpoint_assignment_fence(Some(leader_fence.clone()));
+        leader.publish_checkpoint_assignment_fence(Some(leader_fence));
+
+        let delayed = Arc::new(DelayedControlPutStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )));
+        let backing: Arc<dyn object_store::ObjectStore> = delayed.clone();
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&backing), std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+        let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+            .store_for(leader_node)
+            .try_acquire(leader_boot, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("remote process lease must be acquired");
+        };
+        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1_000));
+        let owner = LeaderLeaseOwner {
+            node: leader_node,
+            boot: leader_boot,
+            process_term: process_lease.term,
+        };
+        let LeaseOutcome::Acquired(initial_lease) = authority.try_acquire(&owner, 0).await.unwrap()
+        else {
+            panic!("remote leader lease must be acquired");
+        };
+        observer.set_leader_lease_store(Arc::clone(&authority));
+        leader.set_leader_lease_store(Arc::clone(&authority));
+        let (leader_grant_tx, leader_grant_rx) = watch::channel(None);
+        leader
+            .set_leader_lease_watch(
+                leader_grant_rx,
+                owner,
+                Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30))),
+            )
+            .unwrap();
+        let db = LaminarDB::builder().build().await.unwrap();
+
+        let no_grant = wait_for_startup_leader_authority(
+            &db,
+            &observer,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(no_grant.to_string().contains("live certified grant"));
+
+        delayed.block_get_once(object_store::path::Path::from(
+            "control/leader-lease/v0000000000000001.json",
+        ));
+        let unrelated_wait = wait_for_startup_leader_authority(
+            &db,
+            &observer,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_millis(250),
+        );
+        tokio::pin!(unrelated_wait);
+        tokio::select! {
+            biased;
+            result = &mut unrelated_wait => panic!("startup audit completed before its first authority read was blocked: {result:?}"),
+            () = delayed.wait_until_get_blocked() => {}
+        }
+        CatalogManifestStore::new(Arc::clone(&authority))
+            .seal(&CatalogManifest::default(), &initial_lease.proof())
+            .await
+            .unwrap();
+        delayed.release_get();
+        let after_catalog = authority.load().await.unwrap().unwrap();
+        assert!(after_catalog.seq > initial_lease.seq);
+        assert_eq!(after_catalog.expires_at_ms, initial_lease.expires_at_ms);
+        let unrelated_mutation = unrelated_wait.await.unwrap_err();
+        assert!(
+            unrelated_mutation
+                .to_string()
+                .contains("live certified grant"),
+            "{unrelated_mutation}"
+        );
+
+        leader_grant_tx.send_replace(Some(after_catalog));
+        wait_for_startup_leader_authority(
+            &db,
+            &observer,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        leader_grant_tx.send_replace(None);
+        let dead_process = wait_for_startup_leader_authority(
+            &db,
+            &observer,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(dead_process.to_string().contains("live certified grant"));
+        leader_grant_tx.send_replace(authority.load().await.unwrap());
+
+        let replacement = CheckpointParticipant {
+            node_id: replacement_node.0,
+            boot_incarnation: replacement_boot,
+        };
+        registry.set_assignment_and_version(vec![StateNodeId(replacement_node.0)].into(), 2);
+        observer.publish_checkpoint_assignment_fence(Some(
+            CheckpointAssignmentFence::from_owner_map(2, &[replacement_node.0], vec![replacement])
+                .unwrap(),
+        ));
+        observer_members_tx
+            .send(vec![
+                active_node(leader_node),
+                active_node(replacement_node),
+            ])
+            .unwrap();
+        let reset = wait_for_startup_leader_authority(
+            &db,
+            &observer,
+            &registry,
+            &authority,
+            &process_authority,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(reset.to_string().contains(&replacement_boot.to_string()));
     }
 }

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -26,23 +27,84 @@ use crate::cluster::discovery::NodeId;
 use super::catalog_manifest::{
     CatalogManifest, CatalogManifestError, CatalogManifestRef, CatalogSealOutcome,
 };
+use super::controller::{RecoverPhase, RecoveryAnnouncement, RecoveryReleaseId};
 use super::lease_deadline::LeaseDeadline;
-use super::process_lease::ProcessLease;
+use super::process_lease::{ProcessLease, ProcessLeaseFence};
+use super::snapshot::{
+    AssignmentSnapshotRef, AssignmentSnapshotStore, RotateOutcome, SnapshotError,
+};
 
 const LEASE_PREFIX: &str = "control/leader-lease/";
-const AUTHORITY_RECORD_VERSION: u32 = 4;
+const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v1/";
+const AUTHORITY_RECORD_VERSION: u32 = 6;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
+const MAX_RECOVERY_RELEASE_TERMINAL_BYTES: u64 = 256 * 1024;
 const MAX_LEASE_HEAD_READ_ATTEMPTS: usize = 4;
 const MAX_LIVE_AUTHORITY_LINKS: usize = 4096;
 const LEADER_LEASE_HISTORY_TO_RETAIN: usize = 2;
 const LEADER_LEASE_PRUNE_BATCH_RECORDS: usize = 256;
 const LEADER_LEASE_MAX_PRUNE_BATCHES: usize = 4;
+const RECOVERY_RELEASE_GC_BATCH_RECORDS: usize = 64;
+const RECOVERY_RELEASE_GC_MAX_BATCHES: usize = 4;
 const LEADER_LEASE_PRUNE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const MAX_TEST_LEADER_LEASE_RECORDS: usize = 4096;
 
+fn assignment_snapshot_error(context: &str, error: SnapshotError) -> LeaseError {
+    match error {
+        SnapshotError::Io(message) => LeaseError::Io(format!("{context}: {message}")),
+        error => LeaseError::Invalid(format!("{context}: {error}")),
+    }
+}
+
 fn lease_path(sequence: u64) -> OsPath {
     OsPath::from(format!("{LEASE_PREFIX}v{sequence:016}.json"))
+}
+
+fn recovery_release_terminal_path(reference: &RecoveryReleaseTerminalRef) -> OsPath {
+    OsPath::from(format!(
+        "{RECOVERY_RELEASE_TERMINAL_PREFIX}generation={:020}/sha256={}.json",
+        reference.release.generation(),
+        reference.sha256
+    ))
+}
+
+fn recovery_release_terminal_coordinates(path: &OsPath) -> Result<(u64, String), LeaseError> {
+    let raw = path
+        .as_ref()
+        .strip_prefix(RECOVERY_RELEASE_TERMINAL_PREFIX)
+        .and_then(|value| value.strip_prefix("generation="))
+        .ok_or_else(|| {
+            LeaseError::Invalid(format!("invalid recovery release terminal path {path}"))
+        })?;
+    let (generation, digest) = raw.split_once("/sha256=").ok_or_else(|| {
+        LeaseError::Invalid(format!("invalid recovery release terminal path {path}"))
+    })?;
+    let digest = digest.strip_suffix(".json").ok_or_else(|| {
+        LeaseError::Invalid(format!("invalid recovery release terminal path {path}"))
+    })?;
+    if generation.len() != 20
+        || !generation.bytes().all(|byte| byte.is_ascii_digit())
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(LeaseError::Invalid(format!(
+            "invalid recovery release terminal path {path}"
+        )));
+    }
+    let generation = generation.parse::<u64>().map_err(|error| {
+        LeaseError::Invalid(format!(
+            "invalid recovery release terminal generation in {path}: {error}"
+        ))
+    })?;
+    if generation == 0 {
+        return Err(LeaseError::Invalid(format!(
+            "invalid recovery release terminal path {path}"
+        )));
+    }
+    Ok((generation, digest.to_owned()))
 }
 
 fn lease_sequence_from_path(path: &OsPath) -> Result<u64, LeaseError> {
@@ -201,9 +263,121 @@ struct OutcomeLink {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AssignmentDrainDecisionLink {
+struct AssignmentDecisionLink {
     sequence: u64,
     target_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryReleaseTerminalRef {
+    release: RecoveryReleaseId,
+    sha256: String,
+    encoded_len: u64,
+}
+
+impl RecoveryReleaseTerminalRef {
+    fn validate(&self) -> Result<(), LeaseError> {
+        if !self.release.is_canonical()
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.encoded_len == 0
+            || self.encoded_len > MAX_RECOVERY_RELEASE_TERMINAL_BYTES
+        {
+            return Err(LeaseError::Invalid(
+                "recovery release terminal reference is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.release.generation()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityRecoveryReleaseCommit {
+    terminal: RecoveryReleaseTerminalRef,
+    leader_proof: LeaderProof,
+}
+
+impl AuthorityRecoveryReleaseCommit {
+    fn validate(&self) -> Result<(), LeaseError> {
+        self.terminal.validate()?;
+        if !self.leader_proof.is_canonical() {
+            return Err(LeaseError::Invalid(
+                "recovery release commit has no canonical leader proof".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryReleaseLink {
+    sequence: u64,
+    terminal: RecoveryReleaseTerminalRef,
+}
+
+impl RecoveryReleaseLink {
+    fn validate(&self) -> Result<(), LeaseError> {
+        if self.sequence == 0 {
+            return Err(LeaseError::Invalid(
+                "recovery release authority link has a zero sequence".into(),
+            ));
+        }
+        self.terminal.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecordRecoveryReleaseCommitResult {
+    Created(RecoveryReleaseTerminalRef),
+    Unchanged(RecoveryReleaseTerminalRef),
+    Conflict { winner: RecoveryReleaseTerminalRef },
+}
+
+fn recovery_release_id_for_terminal(
+    terminal: &RecoveryAnnouncement,
+) -> Result<RecoveryReleaseId, LeaseError> {
+    terminal.validate().map_err(LeaseError::Invalid)?;
+    let RecoverPhase::ReleaseCommitted { epoch } = terminal.phase else {
+        return Err(LeaseError::Invalid(
+            "recovery release terminal must carry ReleaseCommitted".into(),
+        ));
+    };
+    RecoveryReleaseId::for_pending(&RecoveryAnnouncement {
+        round: terminal.round.clone(),
+        phase: RecoverPhase::Release { epoch },
+    })
+    .map_err(LeaseError::Invalid)
+}
+
+fn encode_recovery_release_terminal(
+    terminal: &RecoveryAnnouncement,
+) -> Result<(Bytes, RecoveryReleaseTerminalRef), LeaseError> {
+    let release = recovery_release_id_for_terminal(terminal)?;
+    let encoded = serde_json::to_vec(terminal)?;
+    let encoded_len = u64::try_from(encoded.len())
+        .map_err(|_| LeaseError::Invalid("recovery release terminal is too large".into()))?;
+    if encoded_len == 0 || encoded_len > MAX_RECOVERY_RELEASE_TERMINAL_BYTES {
+        return Err(LeaseError::Invalid(format!(
+            "recovery release terminal is {encoded_len} bytes; maximum is {MAX_RECOVERY_RELEASE_TERMINAL_BYTES}"
+        )));
+    }
+    let reference = RecoveryReleaseTerminalRef {
+        release,
+        sha256: format!("{:x}", Sha256::digest(&encoded)),
+        encoded_len,
+    };
+    reference.validate()?;
+    Ok((Bytes::from(encoded), reference))
 }
 
 /// Immutable settlement of one exact assignment-drain transition.
@@ -291,6 +465,151 @@ pub enum RecordAssignmentDrainDecisionResult {
     },
 }
 
+/// Immutable authorization to install one staged failure-recovery assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentRecoveryDecision {
+    /// Exact assignment being replaced.
+    pub predecessor: CheckpointAssignmentFence,
+    /// Exact successor assignment authorized for installation.
+    pub target: CheckpointAssignmentFence,
+    /// Content-addressed staged snapshot whose assignment must equal `target`.
+    pub proposal: AssignmentSnapshotRef,
+    /// Exact process-lease takeover proofs for every predecessor process absent from `target`.
+    pub removed_process_fences: Vec<ProcessLeaseFence>,
+    /// Durable leader term that authorized this recovery.
+    pub leader_proof: LeaderProof,
+}
+
+impl AssignmentRecoveryDecision {
+    /// Construct one exact failure-recovery authorization.
+    ///
+    /// # Errors
+    /// Rejects invalid fences, a non-successor proposal, or an incomplete process-removal proof.
+    pub fn new(
+        predecessor: CheckpointAssignmentFence,
+        target: CheckpointAssignmentFence,
+        proposal: AssignmentSnapshotRef,
+        removed_process_fences: Vec<ProcessLeaseFence>,
+        leader_proof: LeaderProof,
+    ) -> Result<Self, String> {
+        let decision = Self {
+            predecessor,
+            target,
+            proposal,
+            removed_process_fences,
+            leader_proof,
+        };
+        decision.validate().map_err(|error| error.to_string())?;
+        Ok(decision)
+    }
+
+    /// Target assignment version settled by this decision.
+    #[must_use]
+    pub fn target_version(&self) -> u64 {
+        self.target.assignment_version
+    }
+
+    fn validate(&self) -> Result<(), LeaseError> {
+        if !self.predecessor.is_canonical()
+            || !self.target.is_canonical()
+            || !self.leader_proof.is_canonical()
+            || self.predecessor.vnode_count != self.target.vnode_count
+            || self.predecessor.assignment_version.checked_add(1)
+                != Some(self.target.assignment_version)
+            || self.proposal.validate().is_err()
+            || self.proposal.version != self.target.assignment_version
+        {
+            return Err(LeaseError::Invalid(
+                "assignment recovery decision is not a canonical successor".into(),
+            ));
+        }
+
+        let removed: Vec<_> = self
+            .predecessor
+            .participants
+            .iter()
+            .filter(|participant| {
+                self.target.participant_incarnation(participant.node_id)
+                    != Some(participant.boot_incarnation)
+            })
+            .collect();
+        if removed.is_empty() || removed.len() != self.removed_process_fences.len() {
+            return Err(LeaseError::Invalid(
+                "assignment recovery decision requires the exact removed predecessor process set"
+                    .into(),
+            ));
+        }
+        for (participant, fence) in removed.iter().zip(&self.removed_process_fences) {
+            if !fence.is_canonical()
+                || fence.predecessor.node.0 != participant.node_id
+                || fence.predecessor.owner != participant.boot_incarnation
+            {
+                return Err(LeaseError::Invalid(
+                    "assignment recovery process fences are incomplete, unsorted, or unrelated"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Result of admitting a recovery decision through the shared authority sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordAssignmentRecoveryDecisionResult {
+    /// This call created the immutable decision.
+    Created(AssignmentRecoveryDecision),
+    /// The same decision was already durable.
+    Unchanged(AssignmentRecoveryDecision),
+    /// Another recovery decision already won for this target version.
+    Conflict {
+        /// Immutable winner.
+        winner: AssignmentRecoveryDecision,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "decision",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum AuthorityAssignmentDecision {
+    Drain(AssignmentDrainDecision),
+    Recovery(AssignmentRecoveryDecision),
+}
+
+impl AuthorityAssignmentDecision {
+    fn target_version(&self) -> u64 {
+        match self {
+            Self::Drain(decision) => decision.target_version(),
+            Self::Recovery(decision) => decision.target_version(),
+        }
+    }
+
+    fn leader_proof(&self) -> &LeaderProof {
+        match self {
+            Self::Drain(decision) => &decision.leader_proof,
+            Self::Recovery(decision) => &decision.leader_proof,
+        }
+    }
+
+    fn validate(&self) -> Result<(), LeaseError> {
+        match self {
+            Self::Drain(decision) => decision.validate(),
+            Self::Recovery(decision) => decision.validate(),
+        }
+    }
+}
+
+enum RecordAuthorityAssignmentDecisionResult {
+    Created(AuthorityAssignmentDecision),
+    Unchanged(AuthorityAssignmentDecision),
+    Conflict { winner: AuthorityAssignmentDecision },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorityOutcomeFloor {
@@ -303,10 +622,10 @@ struct AuthorityOutcomeFloor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AuthorityAssignmentDrainFloor {
+struct AuthorityAssignmentDecisionFloor {
     before_target_version: u64,
-    terminal_anchor: Option<AssignmentDrainDecision>,
-    terminal_anchor_link: Option<AssignmentDrainDecisionLink>,
+    terminal_anchor: Option<AuthorityAssignmentDecision>,
+    terminal_anchor_link: Option<AssignmentDecisionLink>,
 }
 
 /// One immutable entry in the cluster's shared leadership and checkpoint-decision sequence.
@@ -323,14 +642,18 @@ struct LeaderAuthorityRecord {
     outcome_head: Option<OutcomeLink>,
     /// Monotonic cluster outcome retention boundary and its continuity anchors.
     outcome_floor: Option<AuthorityOutcomeFloor>,
-    /// Present only on the sequence that admitted this assignment-drain decision.
-    assignment_drain_decision: Option<AssignmentDrainDecision>,
-    /// Link to the preceding drain decision, present only on a decision-bearing record.
-    previous_assignment_drain_decision: Option<AssignmentDrainDecisionLink>,
-    /// Latest admitted drain decision. Every other authority mutation preserves it.
-    assignment_drain_decision_head: Option<AssignmentDrainDecisionLink>,
-    /// Monotonic assignment-drain retention boundary and its continuity anchor.
-    assignment_drain_floor: Option<AuthorityAssignmentDrainFloor>,
+    /// Present only on the sequence that admitted an assignment decision.
+    assignment_decision: Option<AuthorityAssignmentDecision>,
+    /// Link to the preceding assignment decision, present only on a decision-bearing record.
+    previous_assignment_decision: Option<AssignmentDecisionLink>,
+    /// Latest admitted assignment decision. Every other authority mutation preserves it.
+    assignment_decision_head: Option<AssignmentDecisionLink>,
+    /// Monotonic assignment-decision retention boundary and its continuity anchor.
+    assignment_decision_floor: Option<AuthorityAssignmentDecisionFloor>,
+    /// Present only on the sequence that admitted the latest recovery release.
+    recovery_release_commit: Option<AuthorityRecoveryReleaseCommit>,
+    /// Latest admitted recovery release, preserved by every later authority mutation.
+    recovery_release_head: Option<RecoveryReleaseLink>,
 }
 
 impl LeaderLease {
@@ -444,11 +767,11 @@ impl AuthorityOutcomeFloor {
     }
 }
 
-impl AuthorityAssignmentDrainFloor {
+impl AuthorityAssignmentDecisionFloor {
     fn validate(&self) -> Result<(), LeaseError> {
         if self.before_target_version == 0 {
             return Err(LeaseError::Invalid(
-                "assignment drain floor requires a nonzero target version".into(),
+                "assignment decision floor requires a nonzero target version".into(),
             ));
         }
         match (self.terminal_anchor.as_ref(), self.terminal_anchor_link) {
@@ -459,7 +782,7 @@ impl AuthorityAssignmentDrainFloor {
                     || anchor.target_version() >= self.before_target_version
                 {
                     return Err(LeaseError::Invalid(
-                        "assignment drain floor anchor does not match its exact authority link"
+                        "assignment decision floor anchor does not match its exact authority link"
                             .into(),
                     ));
                 }
@@ -467,7 +790,7 @@ impl AuthorityAssignmentDrainFloor {
             (None, None) => {}
             _ => {
                 return Err(LeaseError::Invalid(
-                    "assignment drain floor has an incomplete terminal anchor".into(),
+                    "assignment decision floor has an incomplete terminal anchor".into(),
                 ));
             }
         }
@@ -484,10 +807,12 @@ impl LeaderAuthorityRecord {
             previous_outcome: None,
             outcome_head: None,
             outcome_floor: None,
-            assignment_drain_decision: None,
-            previous_assignment_drain_decision: None,
-            assignment_drain_decision_head: None,
-            assignment_drain_floor: None,
+            assignment_decision: None,
+            previous_assignment_decision: None,
+            assignment_decision_head: None,
+            assignment_decision_floor: None,
+            recovery_release_commit: None,
+            recovery_release_head: None,
         }
     }
 
@@ -499,10 +824,12 @@ impl LeaderAuthorityRecord {
             previous_outcome: None,
             outcome_head: self.outcome_head,
             outcome_floor: self.outcome_floor.clone(),
-            assignment_drain_decision: None,
-            previous_assignment_drain_decision: None,
-            assignment_drain_decision_head: self.assignment_drain_decision_head,
-            assignment_drain_floor: self.assignment_drain_floor.clone(),
+            assignment_decision: None,
+            previous_assignment_decision: None,
+            assignment_decision_head: self.assignment_decision_head,
+            assignment_decision_floor: self.assignment_decision_floor.clone(),
+            recovery_release_commit: None,
+            recovery_release_head: self.recovery_release_head.clone(),
         }
     }
 
@@ -517,12 +844,21 @@ impl LeaderAuthorityRecord {
         if let Some(floor) = &self.outcome_floor {
             floor.validate()?;
         }
-        if let Some(floor) = &self.assignment_drain_floor {
+        if let Some(floor) = &self.assignment_decision_floor {
             floor.validate()?;
         }
-        if self.checkpoint_outcome.is_some() && self.assignment_drain_decision.is_some() {
+        if [
+            self.checkpoint_outcome.is_some(),
+            self.assignment_decision.is_some(),
+            self.recovery_release_commit.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+            > 1
+        {
             return Err(LeaseError::Invalid(
-                "one authority sequence cannot admit two decision domains".into(),
+                "one authority sequence cannot admit two terminal domains".into(),
             ));
         }
         match self.checkpoint_outcome.as_ref() {
@@ -588,77 +924,107 @@ impl LeaderAuthorityRecord {
                 }
             }
         }
-        match self.assignment_drain_decision.as_ref() {
+        match self.assignment_decision.as_ref() {
             Some(decision) => {
                 decision.validate()?;
                 if self
-                    .assignment_drain_floor
+                    .assignment_decision_floor
                     .as_ref()
                     .is_some_and(|floor| decision.target_version() < floor.before_target_version)
                 {
                     return Err(LeaseError::Invalid(
-                        "assignment drain decision is below its durable authority floor".into(),
+                        "assignment decision is below its durable authority floor".into(),
                     ));
                 }
-                if !self.lease.matches_proof(&decision.leader_proof)
-                    || self.assignment_drain_decision_head
-                        != Some(AssignmentDrainDecisionLink {
+                if !self.lease.matches_proof(decision.leader_proof())
+                    || self.assignment_decision_head
+                        != Some(AssignmentDecisionLink {
                             sequence: self.lease.seq,
                             target_version: decision.target_version(),
                         })
                 {
                     return Err(LeaseError::Invalid(
-                        "assignment drain decision is not bound to its exact authority sequence and term"
+                        "assignment decision is not bound to its exact authority sequence and term"
                             .into(),
                     ));
                 }
-                if let Some(previous) = self.previous_assignment_drain_decision {
+                if let Some(previous) = self.previous_assignment_decision {
                     if previous.sequence >= self.lease.seq
                         || previous.target_version >= decision.target_version()
                     {
                         return Err(LeaseError::Invalid(
-                            "assignment drain decision link does not move backward".into(),
+                            "assignment decision link does not move backward".into(),
                         ));
                     }
                 }
             }
             None => {
-                if self.previous_assignment_drain_decision.is_some() {
+                if self.previous_assignment_decision.is_some() {
                     return Err(LeaseError::Invalid(
-                        "non-drain authority record carries a previous drain-decision link".into(),
+                        "non-decision authority record carries a previous assignment-decision link"
+                            .into(),
                     ));
                 }
                 if self
-                    .assignment_drain_decision_head
+                    .assignment_decision_head
                     .is_some_and(|head| head.sequence > self.lease.seq || head.target_version == 0)
                 {
                     return Err(LeaseError::Invalid(
-                        "authority drain-decision head is outside the durable sequence".into(),
+                        "authority assignment-decision head is outside the durable sequence".into(),
                     ));
                 }
             }
         }
-        if let Some(floor) = self.assignment_drain_floor.as_ref() {
+        if let Some(floor) = self.assignment_decision_floor.as_ref() {
             if floor
                 .terminal_anchor_link
                 .is_some_and(|link| link.sequence >= self.lease.seq)
             {
                 return Err(LeaseError::Invalid(
-                    "assignment drain floor anchor is outside the authority sequence".into(),
+                    "assignment decision floor anchor is outside the authority sequence".into(),
                 ));
             }
-            if let Some(head) = self.assignment_drain_decision_head {
+            if let Some(head) = self.assignment_decision_head {
                 if head.target_version < floor.before_target_version
                     && Some(head) != floor.terminal_anchor_link
                 {
                     return Err(LeaseError::Invalid(
-                        "authority drain-decision head does not meet its durable floor".into(),
+                        "authority assignment-decision head does not meet its durable floor".into(),
                     ));
                 }
             } else if floor.terminal_anchor_link.is_some() {
                 return Err(LeaseError::Invalid(
-                    "assignment drain floor anchor is disconnected from the authority head".into(),
+                    "assignment decision floor anchor is disconnected from the authority head"
+                        .into(),
                 ));
+            }
+        }
+        match self.recovery_release_commit.as_ref() {
+            Some(commit) => {
+                commit.validate()?;
+                let expected = RecoveryReleaseLink {
+                    sequence: self.lease.seq,
+                    terminal: commit.terminal.clone(),
+                };
+                if !self.lease.matches_proof(&commit.leader_proof)
+                    || self.recovery_release_head.as_ref() != Some(&expected)
+                {
+                    return Err(LeaseError::Invalid(
+                        "recovery release commit is not bound to its exact authority sequence and term"
+                            .into(),
+                    ));
+                }
+            }
+            None => {
+                if let Some(head) = self.recovery_release_head.as_ref() {
+                    head.validate()?;
+                    if head.sequence >= self.lease.seq {
+                        return Err(LeaseError::Invalid(
+                            "recovery release head is outside the durable authority sequence"
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -761,6 +1127,255 @@ impl LeaderLeaseStore {
             ttl_ms,
             prune_running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) async fn stage_recovery_release_terminal(
+        &self,
+        terminal: &RecoveryAnnouncement,
+    ) -> Result<RecoveryReleaseTerminalRef, ClusterCheckpointAuthorityError> {
+        let (encoded, reference) = encode_recovery_release_terminal(terminal)?;
+        let path = recovery_release_terminal_path(&reference);
+        let put_error = match self
+            .store
+            .put_opts(
+                &path,
+                PutPayload::from(encoded),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_)
+            | Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => None,
+            Err(error) => Some(error),
+        };
+        match self.load_recovery_release_terminal(&reference).await {
+            Ok(stored) if stored == *terminal => Ok(reference),
+            Ok(_) => Err(LeaseError::Invalid(format!(
+                "recovery release terminal '{}' differs from the proposed content",
+                reference.sha256
+            ))
+            .into()),
+            Err(reconcile_error) => {
+                if let Some(put_error) = put_error {
+                    Err(LeaseError::Io(format!(
+                        "recovery release terminal write failed ({put_error}); reconciliation failed ({reconcile_error})"
+                    ))
+                    .into())
+                } else {
+                    Err(reconcile_error)
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn load_recovery_release_terminal(
+        &self,
+        reference: &RecoveryReleaseTerminalRef,
+    ) -> Result<RecoveryAnnouncement, ClusterCheckpointAuthorityError> {
+        reference.validate()?;
+        let result = match self
+            .store
+            .get(&recovery_release_terminal_path(reference))
+            .await
+        {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(LeaseError::Invalid(format!(
+                    "recovery release terminal '{}' is missing",
+                    reference.sha256
+                ))
+                .into());
+            }
+            Err(error) => return Err(LeaseError::Io(error.to_string()).into()),
+        };
+        if result.meta.size != reference.encoded_len {
+            return Err(LeaseError::Invalid(format!(
+                "recovery release terminal '{}' is {} bytes, expected {}",
+                reference.sha256, result.meta.size, reference.encoded_len
+            ))
+            .into());
+        }
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| LeaseError::Io(error.to_string()))?;
+        if u64::try_from(bytes.len()).ok() != Some(reference.encoded_len) {
+            return Err(LeaseError::Invalid(format!(
+                "recovery release terminal '{}' payload length changed while reading",
+                reference.sha256
+            ))
+            .into());
+        }
+        let terminal: RecoveryAnnouncement = serde_json::from_slice(&bytes).map_err(|error| {
+            LeaseError::Invalid(format!(
+                "recovery release terminal '{}': {error}",
+                reference.sha256
+            ))
+        })?;
+        let (canonical, actual_reference) = encode_recovery_release_terminal(&terminal)?;
+        if &actual_reference != reference || canonical.as_ref() != bytes.as_ref() {
+            return Err(LeaseError::Invalid(format!(
+                "recovery release terminal '{}' does not match its content-addressed reference",
+                reference.sha256
+            ))
+            .into());
+        }
+        Ok(terminal)
+    }
+
+    pub(crate) async fn record_recovery_release_commit(
+        &self,
+        proof: &LeaderProof,
+        reference: RecoveryReleaseTerminalRef,
+    ) -> Result<RecordRecoveryReleaseCommitResult, ClusterCheckpointAuthorityError> {
+        reference.validate()?;
+        let terminal = self.load_recovery_release_terminal(&reference).await?;
+        if &terminal.round.leader_proof != proof || !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+
+        loop {
+            let current = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            if let Some(winner) = current.recovery_release_head.as_ref() {
+                if winner.terminal == reference
+                    || winner.terminal.generation() >= reference.generation()
+                {
+                    self.load_recovery_release_terminal(&winner.terminal)
+                        .await?;
+                    return if winner.terminal == reference {
+                        Ok(RecordRecoveryReleaseCommitResult::Unchanged(reference))
+                    } else {
+                        Ok(RecordRecoveryReleaseCommitResult::Conflict {
+                            winner: winner.terminal.clone(),
+                        })
+                    };
+                }
+            }
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+
+            let base_sequence = current.lease.seq;
+            let sequence = base_sequence
+                .checked_add(1)
+                .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
+            let mut candidate = current.preserve_with_lease(LeaderLease {
+                seq: sequence,
+                token: current.lease.token,
+                owner: current.lease.owner.clone(),
+                expires_at_ms: current.lease.expires_at_ms,
+                catalog_manifest: current.lease.catalog_manifest.clone(),
+            });
+            candidate.recovery_release_commit = Some(AuthorityRecoveryReleaseCommit {
+                terminal: reference.clone(),
+                leader_proof: proof.clone(),
+            });
+            candidate.recovery_release_head = Some(RecoveryReleaseLink {
+                sequence,
+                terminal: reference.clone(),
+            });
+            candidate.validate()?;
+
+            match self.create_authority_record(&candidate).await? {
+                AuthorityCreateOutcome::Created => {
+                    return Ok(RecordRecoveryReleaseCommitResult::Created(reference));
+                }
+                AuthorityCreateOutcome::Contended(winner_head) => {
+                    if let Some(winner) = winner_head.recovery_release_head.as_ref() {
+                        if winner.terminal == reference
+                            || winner.terminal.generation() >= reference.generation()
+                        {
+                            self.load_recovery_release_terminal(&winner.terminal)
+                                .await?;
+                            return if winner.terminal == reference {
+                                Ok(RecordRecoveryReleaseCommitResult::Unchanged(reference))
+                            } else {
+                                Ok(RecordRecoveryReleaseCommitResult::Conflict {
+                                    winner: winner.terminal.clone(),
+                                })
+                            };
+                        }
+                    }
+                    if !winner_head.lease.matches_proof(proof) {
+                        return Err(ClusterCheckpointAuthorityError::Fenced);
+                    }
+                    if winner_head.lease.seq <= base_sequence {
+                        return Err(LeaseError::Invalid(
+                            "recovery release authority contention did not advance the sequence"
+                                .into(),
+                        )
+                        .into());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn latest_recovery_release_terminal(
+        &self,
+    ) -> Result<Option<RecoveryAnnouncement>, ClusterCheckpointAuthorityError> {
+        for _ in 0..MAX_LEASE_HEAD_READ_ATTEMPTS {
+            let Some(head) = self.load_record().await? else {
+                return Ok(None);
+            };
+            let Some(link) = head.recovery_release_head.clone() else {
+                return Ok(None);
+            };
+            let admission = if link.sequence == head.lease.seq {
+                head.clone()
+            } else {
+                read_authority_record(self.store.as_ref(), link.sequence)
+                    .await?
+                    .ok_or_else(|| {
+                        LeaseError::Invalid(
+                            "recovery release admission is missing from retained authority history"
+                                .into(),
+                        )
+                    })?
+            };
+            let commit = admission
+                .recovery_release_commit
+                .as_ref()
+                .filter(|commit| {
+                    commit.terminal == link.terminal
+                        && admission.recovery_release_head.as_ref() == Some(&link)
+                })
+                .ok_or_else(|| {
+                    LeaseError::Invalid(
+                        "recovery release head does not match its admitting authority record"
+                            .into(),
+                    )
+                })?;
+            let terminal = self.load_recovery_release_terminal(&link.terminal).await?;
+            if terminal.round.leader_proof != commit.leader_proof {
+                return Err(LeaseError::Invalid(
+                    "recovery release terminal does not match its admitting leader proof".into(),
+                )
+                .into());
+            }
+            let rechecked = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            if rechecked.recovery_release_head.as_ref() == Some(&link) {
+                return Ok(Some(terminal));
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(LeaseError::Io(format!(
+            "recovery release head changed during {MAX_LEASE_HEAD_READ_ATTEMPTS} read attempts"
+        ))
+        .into())
     }
 
     fn ttl(&self) -> Result<Duration, LeaseError> {
@@ -909,27 +1524,27 @@ impl LeaderLeaseStore {
             retained.insert(current.sequence);
             link = outcome_record.previous_outcome;
         }
-        let mut drain_link = head.assignment_drain_decision_head;
-        let mut drain_links = 0;
-        while let Some(current) = drain_link {
-            if !consume_live_authority_link(&mut drain_links) {
+        let mut assignment_link = head.assignment_decision_head;
+        let mut assignment_links = 0;
+        while let Some(current) = assignment_link {
+            if !consume_live_authority_link(&mut assignment_links) {
                 return Err(LeaseError::Invalid(format!(
-                    "live assignment-drain retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound"
+                    "live assignment-decision retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound"
                 )));
             }
             if head
-                .assignment_drain_floor
+                .assignment_decision_floor
                 .as_ref()
                 .is_some_and(|floor| current.target_version < floor.before_target_version)
             {
                 if head
-                    .assignment_drain_floor
+                    .assignment_decision_floor
                     .as_ref()
                     .and_then(|floor| floor.terminal_anchor_link)
                     != Some(current)
                 {
                     return Err(LeaseError::Invalid(
-                        "assignment-drain floor does not anchor the retained authority chain"
+                        "assignment-decision floor does not anchor the retained authority chain"
                             .into(),
                     ));
                 }
@@ -938,25 +1553,133 @@ impl LeaderLeaseStore {
             let decision_record = read_authority_record(store.as_ref(), current.sequence)
                 .await?
                 .filter(|record| {
-                    record.assignment_drain_decision_head == Some(current)
+                    record.assignment_decision_head == Some(current)
                         && record
-                            .assignment_drain_decision
+                            .assignment_decision
                             .as_ref()
-                            .map(AssignmentDrainDecision::target_version)
+                            .map(AuthorityAssignmentDecision::target_version)
                             == Some(current.target_version)
                 })
                 .ok_or_else(|| {
                     LeaseError::Invalid(
-                        "retained assignment-drain authority chain is broken".into(),
+                        "retained assignment-decision authority chain is broken".into(),
                     )
                 })?;
             retained.insert(current.sequence);
-            drain_link = decision_record.previous_assignment_drain_decision;
+            assignment_link = decision_record.previous_assignment_decision;
         }
+        let retained_release = match head.recovery_release_head.as_ref() {
+            Some(link) => {
+                let admission = read_authority_record(store.as_ref(), link.sequence)
+                    .await?
+                    .filter(|record| {
+                        record.recovery_release_head.as_ref() == Some(link)
+                            && record
+                                .recovery_release_commit
+                                .as_ref()
+                                .is_some_and(|commit| commit.terminal == link.terminal)
+                    })
+                    .ok_or_else(|| {
+                        LeaseError::Invalid(
+                            "retained recovery release authority link is broken".into(),
+                        )
+                    })?;
+                if admission.lease.seq != link.sequence {
+                    return Err(LeaseError::Invalid(
+                        "recovery release admission sequence does not match its retained link"
+                            .into(),
+                    ));
+                }
+                let terminal = authority
+                    .load_recovery_release_terminal(&link.terminal)
+                    .await
+                    .map_err(|error| LeaseError::Invalid(error.to_string()))?;
+                if admission
+                    .recovery_release_commit
+                    .as_ref()
+                    .is_none_or(|commit| terminal.round.leader_proof != commit.leader_proof)
+                {
+                    return Err(LeaseError::Invalid(
+                        "retained recovery release terminal does not match its admission".into(),
+                    ));
+                }
+                retained.insert(link.sequence);
+                Some(link.terminal.clone())
+            }
+            None => None,
+        };
 
+        let mut history_exhausted = false;
         for _ in 0..LEADER_LEASE_MAX_PRUNE_BATCHES {
             let (candidates, exhausted) =
                 Self::prune_candidates(store, &retained, head_sequence, grace_ms).await?;
+            if candidates.is_empty() {
+                history_exhausted = true;
+                break;
+            }
+            let deletions =
+                futures::stream::iter(candidates.into_iter().map(Ok::<_, object_store::Error>));
+            let mut results = store.delete_stream(Box::pin(deletions));
+            while let Some(result) = results.next().await {
+                if let Err(error) = result {
+                    if !matches!(error, object_store::Error::NotFound { .. }) {
+                        return Err(LeaseError::Io(error.to_string()));
+                    }
+                }
+            }
+            if exhausted {
+                history_exhausted = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if !history_exhausted {
+            return Err(LeaseError::Io(
+                "leader lease history still exceeds the bounded prune budget".into(),
+            ));
+        }
+        Self::prune_recovery_release_terminals(store, retained_release.as_ref(), grace_ms).await
+    }
+
+    async fn prune_recovery_release_terminals(
+        store: &Arc<dyn ObjectStore>,
+        retained: Option<&RecoveryReleaseTerminalRef>,
+        grace_ms: i64,
+    ) -> Result<(), LeaseError> {
+        let Some(retained) = retained else {
+            return Ok(());
+        };
+        retained.validate()?;
+        for _ in 0..RECOVERY_RELEASE_GC_MAX_BATCHES {
+            let prefix = OsPath::from(RECOVERY_RELEASE_TERMINAL_PREFIX);
+            let mut listed = store.list(Some(&prefix));
+            let now = now_millis();
+            let mut candidates = Vec::with_capacity(RECOVERY_RELEASE_GC_BATCH_RECORDS);
+            let mut exhausted = true;
+            while let Some(entry) = listed.next().await {
+                let entry = entry.map_err(|error| LeaseError::Io(error.to_string()))?;
+                let (generation, digest) = recovery_release_terminal_coordinates(&entry.location)?;
+                let canonical = OsPath::from(format!(
+                    "{RECOVERY_RELEASE_TERMINAL_PREFIX}generation={generation:020}/sha256={digest}.json"
+                ));
+                if canonical != entry.location {
+                    return Err(LeaseError::Invalid(format!(
+                        "noncanonical recovery release terminal path {}",
+                        entry.location
+                    )));
+                }
+                if entry.location == recovery_release_terminal_path(retained)
+                    || generation > retained.generation()
+                    || now.saturating_sub(entry.last_modified.timestamp_millis()) < grace_ms
+                {
+                    continue;
+                }
+                candidates.push(entry.location);
+                if candidates.len() == RECOVERY_RELEASE_GC_BATCH_RECORDS {
+                    exhausted = false;
+                    break;
+                }
+            }
             if candidates.is_empty() {
                 return Ok(());
             }
@@ -975,9 +1698,7 @@ impl LeaderLeaseStore {
             }
             tokio::task::yield_now().await;
         }
-        Err(LeaseError::Io(
-            "leader lease history still exceeds the bounded prune budget".into(),
-        ))
+        Ok(())
     }
 
     async fn prune_candidates(
@@ -1444,27 +2165,27 @@ impl LeaderLeaseStore {
         .into())
     }
 
-    async fn audited_assignment_drain_decisions_from(
+    async fn audited_assignment_decisions_from(
         &self,
         head: &LeaderAuthorityRecord,
-    ) -> Result<Vec<AssignmentDrainDecision>, ClusterCheckpointAuthorityError> {
+    ) -> Result<Vec<AuthorityAssignmentDecision>, ClusterCheckpointAuthorityError> {
         let mut newest_first = Vec::new();
-        let floor = head.assignment_drain_floor.as_ref();
+        let floor = head.assignment_decision_floor.as_ref();
         let before_target_version = floor.map_or(0, |floor| floor.before_target_version);
         let mut stopped_at_anchor = false;
-        let mut link = head.assignment_drain_decision_head;
+        let mut link = head.assignment_decision_head;
         let mut traversed = 0;
         while let Some(current) = link {
             if !consume_live_authority_link(&mut traversed) {
                 return Err(DecisionError::Conflict(format!(
-                    "live assignment-drain retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound"
+                    "live assignment-decision retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound"
                 ))
                 .into());
             }
             if current.target_version < before_target_version {
                 if floor.and_then(|floor| floor.terminal_anchor_link) != Some(current) {
                     return Err(DecisionError::Conflict(format!(
-                        "assignment drain decision chain does not meet durable floor {before_target_version} at its terminal anchor"
+                        "assignment decision chain does not meet durable floor {before_target_version} at its terminal anchor"
                     ))
                     .into());
                 }
@@ -1475,32 +2196,31 @@ impl LeaderLeaseStore {
                 .await?
                 .ok_or_else(|| {
                     DecisionError::InventoryChanged(format!(
-                        "assignment drain decision authority record {} disappeared during audit",
+                        "assignment decision authority record {} disappeared during audit",
                         current.sequence
                     ))
                 })?;
-            let decision = record.assignment_drain_decision.clone().ok_or_else(|| {
+            let decision = record.assignment_decision.clone().ok_or_else(|| {
                 DecisionError::Conflict(format!(
-                    "assignment drain decision head version {} points to non-decision authority record {}",
+                    "assignment decision head version {} points to non-decision authority record {}",
                     current.target_version, current.sequence
                 ))
             })?;
-            if record.assignment_drain_decision_head != Some(current)
+            if record.assignment_decision_head != Some(current)
                 || decision.target_version() != current.target_version
             {
                 return Err(DecisionError::Conflict(format!(
-                    "assignment drain decision link version {} sequence {} does not match its authority record",
+                    "assignment decision link version {} sequence {} does not match its authority record",
                     current.target_version, current.sequence
                 ))
                 .into());
             }
             newest_first.push(decision);
-            link = record.previous_assignment_drain_decision;
+            link = record.previous_assignment_decision;
         }
         if floor.and_then(|floor| floor.terminal_anchor_link).is_some() && !stopped_at_anchor {
             return Err(DecisionError::Conflict(
-                "assignment drain decision chain stopped without its durable retention anchor"
-                    .into(),
+                "assignment decision chain stopped without its durable retention anchor".into(),
             )
             .into());
         }
@@ -1510,7 +2230,7 @@ impl LeaderLeaseStore {
             .find(|pair| pair[0].target_version() >= pair[1].target_version())
         {
             return Err(DecisionError::Conflict(format!(
-                "assignment drain decisions regress from version {} to {}",
+                "assignment decisions regress from version {} to {}",
                 pair[0].target_version(),
                 pair[1].target_version()
             ))
@@ -1519,31 +2239,31 @@ impl LeaderLeaseStore {
         Ok(newest_first)
     }
 
-    async fn exact_assignment_drain_decision_link(
+    async fn exact_assignment_decision_link(
         &self,
         head: &LeaderAuthorityRecord,
-        decision: &AssignmentDrainDecision,
-    ) -> Result<AssignmentDrainDecisionLink, ClusterCheckpointAuthorityError> {
-        if let Some(floor) = head.assignment_drain_floor.as_ref() {
+        decision: &AuthorityAssignmentDecision,
+    ) -> Result<AssignmentDecisionLink, ClusterCheckpointAuthorityError> {
+        if let Some(floor) = head.assignment_decision_floor.as_ref() {
             if floor.terminal_anchor.as_ref() == Some(decision) {
                 return floor.terminal_anchor_link.ok_or_else(|| {
                     DecisionError::Conflict(
-                        "assignment drain floor lost its terminal authority link".into(),
+                        "assignment decision floor lost its terminal authority link".into(),
                     )
                     .into()
                 });
             }
         }
         let before_target_version = head
-            .assignment_drain_floor
+            .assignment_decision_floor
             .as_ref()
             .map_or(0, |floor| floor.before_target_version);
-        let mut link = head.assignment_drain_decision_head;
+        let mut link = head.assignment_decision_head;
         let mut traversed = 0;
         while let Some(current) = link {
             if !consume_live_authority_link(&mut traversed) {
                 return Err(DecisionError::Conflict(format!(
-                    "live assignment-drain retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound during exact lookup"
+                    "live assignment-decision retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound during exact lookup"
                 ))
                 .into());
             }
@@ -1554,17 +2274,17 @@ impl LeaderLeaseStore {
                 .await?
                 .ok_or_else(|| {
                     DecisionError::InventoryChanged(format!(
-                        "assignment drain decision authority record {} disappeared during exact lookup",
+                        "assignment decision authority record {} disappeared during exact lookup",
                         current.sequence
                     ))
                 })?;
-            if record.assignment_drain_decision.as_ref() == Some(decision) {
+            if record.assignment_decision.as_ref() == Some(decision) {
                 return Ok(current);
             }
-            link = record.previous_assignment_drain_decision;
+            link = record.previous_assignment_decision;
         }
         Err(DecisionError::Conflict(format!(
-            "assignment drain decision version {} is not linked from the durable authority head",
+            "assignment decision version {} is not linked from the durable authority head",
             decision.target_version()
         ))
         .into())
@@ -1768,20 +2488,60 @@ impl LeaderLeaseStore {
         }
     }
 
-    /// Admit one assignment-drain settlement through the exact next authority sequence.
-    ///
-    /// Lease renewals, takeovers, checkpoint outcomes, and other decisions contend on that same
-    /// create-only sequence. An identical retry converges on the durable winner.
-    ///
-    /// # Errors
-    /// Fails closed for a stale proof, malformed/non-monotonic decision, or storage failure.
-    pub async fn record_assignment_drain_decision(
+    async fn validate_assignment_recovery_snapshot(
+        &self,
+        decision: &AssignmentRecoveryDecision,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        let snapshots = AssignmentSnapshotStore::new(Arc::clone(&self.store));
+        let predecessor = snapshots
+            .load()
+            .await
+            .map_err(|error| {
+                assignment_snapshot_error("load assignment recovery predecessor", error)
+            })?
+            .ok_or_else(|| {
+                LeaseError::Invalid(
+                    "assignment recovery requires a durable predecessor snapshot".into(),
+                )
+            })?;
+        let predecessor_fence = predecessor.assignment_fence().map_err(|error| {
+            LeaseError::Invalid(format!(
+                "assignment recovery predecessor has no valid fence: {error}"
+            ))
+        })?;
+        if predecessor.draining || predecessor_fence != decision.predecessor {
+            return Err(LeaseError::Invalid(
+                "assignment recovery predecessor is not the exact committed assignment head".into(),
+            )
+            .into());
+        }
+        let proposal = snapshots
+            .load_recovery_proposal(&decision.proposal)
+            .await
+            .map_err(|error| {
+                assignment_snapshot_error("load assignment recovery proposal", error)
+            })?;
+        let proposal_fence = proposal.assignment_fence().map_err(|error| {
+            LeaseError::Invalid(format!(
+                "assignment recovery proposal has no valid fence: {error}"
+            ))
+        })?;
+        if proposal_fence != decision.target {
+            return Err(LeaseError::Invalid(
+                "assignment recovery proposal does not match its authorized target fence".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn record_assignment_decision(
         &self,
         proof: &LeaderProof,
-        decision: AssignmentDrainDecision,
-    ) -> Result<RecordAssignmentDrainDecisionResult, ClusterCheckpointAuthorityError> {
+        decision: AuthorityAssignmentDecision,
+    ) -> Result<RecordAuthorityAssignmentDecisionResult, ClusterCheckpointAuthorityError> {
         decision.validate()?;
-        if &decision.leader_proof != proof || !proof.is_canonical() {
+        if decision.leader_proof() != proof || !proof.is_canonical() {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
 
@@ -1793,29 +2553,27 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
-            if let Some(floor) = current.assignment_drain_floor.as_ref() {
+            if let Some(floor) = current.assignment_decision_floor.as_ref() {
                 if decision.target_version() < floor.before_target_version {
                     return Err(DecisionError::Conflict(format!(
-                        "assignment drain decision version {} is below durable retention floor {}",
+                        "assignment decision version {} is below durable retention floor {}",
                         decision.target_version(),
                         floor.before_target_version
                     ))
                     .into());
                 }
             }
-            let decisions = self
-                .audited_assignment_drain_decisions_from(&current)
-                .await?;
+            let decisions = self.audited_assignment_decisions_from(&current).await?;
             if let Some(winner) = decisions
                 .iter()
                 .find(|winner| winner.target_version() == decision.target_version())
             {
                 return if winner == &decision {
-                    Ok(RecordAssignmentDrainDecisionResult::Unchanged(
+                    Ok(RecordAuthorityAssignmentDecisionResult::Unchanged(
                         winner.clone(),
                     ))
                 } else {
-                    Ok(RecordAssignmentDrainDecisionResult::Conflict {
+                    Ok(RecordAuthorityAssignmentDecisionResult::Conflict {
                         winner: winner.clone(),
                     })
                 };
@@ -1823,12 +2581,15 @@ impl LeaderLeaseStore {
             if let Some(last) = decisions.last() {
                 if decision.target_version() <= last.target_version() {
                     return Err(DecisionError::Conflict(format!(
-                        "assignment drain decision version {} does not advance durable version {}",
+                        "assignment decision version {} does not advance durable version {}",
                         decision.target_version(),
                         last.target_version()
                     ))
                     .into());
                 }
+            }
+            if let AuthorityAssignmentDecision::Recovery(recovery) = &decision {
+                self.validate_assignment_recovery_snapshot(recovery).await?;
             }
 
             let base_sequence = current.lease.seq;
@@ -1842,9 +2603,9 @@ impl LeaderLeaseStore {
                 expires_at_ms: current.lease.expires_at_ms,
                 catalog_manifest: current.lease.catalog_manifest.clone(),
             });
-            candidate.assignment_drain_decision = Some(decision.clone());
-            candidate.previous_assignment_drain_decision = current.assignment_drain_decision_head;
-            candidate.assignment_drain_decision_head = Some(AssignmentDrainDecisionLink {
+            candidate.assignment_decision = Some(decision.clone());
+            candidate.previous_assignment_decision = current.assignment_decision_head;
+            candidate.assignment_decision_head = Some(AssignmentDecisionLink {
                 sequence,
                 target_version: decision.target_version(),
             });
@@ -1852,22 +2613,20 @@ impl LeaderLeaseStore {
 
             match self.create_authority_record(&candidate).await? {
                 AuthorityCreateOutcome::Created => {
-                    return Ok(RecordAssignmentDrainDecisionResult::Created(decision));
+                    return Ok(RecordAuthorityAssignmentDecisionResult::Created(decision));
                 }
                 AuthorityCreateOutcome::Contended(winner_head) => {
-                    let winners = self
-                        .audited_assignment_drain_decisions_from(&winner_head)
-                        .await?;
+                    let winners = self.audited_assignment_decisions_from(&winner_head).await?;
                     if let Some(winner) = winners
                         .iter()
                         .find(|winner| winner.target_version() == decision.target_version())
                     {
                         return if winner == &decision {
-                            Ok(RecordAssignmentDrainDecisionResult::Unchanged(
+                            Ok(RecordAuthorityAssignmentDecisionResult::Unchanged(
                                 winner.clone(),
                             ))
                         } else {
-                            Ok(RecordAssignmentDrainDecisionResult::Conflict {
+                            Ok(RecordAuthorityAssignmentDecisionResult::Conflict {
                                 winner: winner.clone(),
                             })
                         };
@@ -1880,12 +2639,161 @@ impl LeaderLeaseStore {
                         continue;
                     }
                     return Err(LeaseError::Invalid(
-                        "assignment drain authority contention did not advance the sequence".into(),
+                        "assignment authority contention did not advance the sequence".into(),
                     )
                     .into());
                 }
             }
         }
+    }
+
+    /// Admit one assignment-drain settlement through the exact next authority sequence.
+    ///
+    /// Lease renewals, takeovers, checkpoint outcomes, and other decisions contend on that same
+    /// create-only sequence. An identical retry converges on the durable winner.
+    ///
+    /// # Errors
+    /// Fails closed for a stale proof, malformed/non-monotonic decision, or storage failure.
+    pub async fn record_assignment_drain_decision(
+        &self,
+        proof: &LeaderProof,
+        decision: AssignmentDrainDecision,
+    ) -> Result<RecordAssignmentDrainDecisionResult, ClusterCheckpointAuthorityError> {
+        match self
+            .record_assignment_decision(proof, AuthorityAssignmentDecision::Drain(decision))
+            .await?
+        {
+            RecordAuthorityAssignmentDecisionResult::Created(
+                AuthorityAssignmentDecision::Drain(decision),
+            ) => Ok(RecordAssignmentDrainDecisionResult::Created(decision)),
+            RecordAuthorityAssignmentDecisionResult::Unchanged(
+                AuthorityAssignmentDecision::Drain(decision),
+            ) => Ok(RecordAssignmentDrainDecisionResult::Unchanged(decision)),
+            RecordAuthorityAssignmentDecisionResult::Conflict {
+                winner: AuthorityAssignmentDecision::Drain(winner),
+            } => Ok(RecordAssignmentDrainDecisionResult::Conflict { winner }),
+            RecordAuthorityAssignmentDecisionResult::Conflict {
+                winner: AuthorityAssignmentDecision::Recovery(winner),
+            } => Err(DecisionError::Conflict(format!(
+                "assignment recovery decision already settled target version {}",
+                winner.target_version()
+            ))
+            .into()),
+            RecordAuthorityAssignmentDecisionResult::Created(_)
+            | RecordAuthorityAssignmentDecisionResult::Unchanged(_) => Err(LeaseError::Invalid(
+                "assignment decision recorder returned the wrong decision kind".into(),
+            )
+            .into()),
+        }
+    }
+
+    /// Admit one failure-recovery assignment through the exact next authority sequence.
+    ///
+    /// # Errors
+    /// Fails closed for a stale proof, malformed/non-monotonic decision, or storage failure.
+    pub(crate) async fn record_assignment_recovery_decision(
+        &self,
+        proof: &LeaderProof,
+        decision: AssignmentRecoveryDecision,
+    ) -> Result<RecordAssignmentRecoveryDecisionResult, ClusterCheckpointAuthorityError> {
+        decision.validate()?;
+        if &decision.leader_proof != proof || !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        let current = self
+            .load_record()
+            .await?
+            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        if !current.lease.matches_proof(proof) {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        if let Some(floor) = current.assignment_decision_floor.as_ref() {
+            if decision.target_version() < floor.before_target_version {
+                return Err(DecisionError::Conflict(format!(
+                    "assignment decision version {} is below durable retention floor {}",
+                    decision.target_version(),
+                    floor.before_target_version
+                ))
+                .into());
+            }
+        }
+        if let Some(winner) = self
+            .audited_assignment_decisions_from(&current)
+            .await?
+            .into_iter()
+            .find(|winner| winner.target_version() == decision.target_version())
+        {
+            return match winner {
+                AuthorityAssignmentDecision::Recovery(winner) if winner == decision => {
+                    Ok(RecordAssignmentRecoveryDecisionResult::Unchanged(winner))
+                }
+                AuthorityAssignmentDecision::Recovery(winner) => {
+                    Ok(RecordAssignmentRecoveryDecisionResult::Conflict { winner })
+                }
+                AuthorityAssignmentDecision::Drain(winner) => {
+                    Err(DecisionError::Conflict(format!(
+                        "assignment drain decision already settled target version {}",
+                        winner.target_version()
+                    ))
+                    .into())
+                }
+            };
+        }
+        match self
+            .record_assignment_decision(proof, AuthorityAssignmentDecision::Recovery(decision))
+            .await?
+        {
+            RecordAuthorityAssignmentDecisionResult::Created(
+                AuthorityAssignmentDecision::Recovery(decision),
+            ) => Ok(RecordAssignmentRecoveryDecisionResult::Created(decision)),
+            RecordAuthorityAssignmentDecisionResult::Unchanged(
+                AuthorityAssignmentDecision::Recovery(decision),
+            ) => Ok(RecordAssignmentRecoveryDecisionResult::Unchanged(decision)),
+            RecordAuthorityAssignmentDecisionResult::Conflict {
+                winner: AuthorityAssignmentDecision::Recovery(winner),
+            } => Ok(RecordAssignmentRecoveryDecisionResult::Conflict { winner }),
+            RecordAuthorityAssignmentDecisionResult::Conflict {
+                winner: AuthorityAssignmentDecision::Drain(winner),
+            } => Err(DecisionError::Conflict(format!(
+                "assignment drain decision already settled target version {}",
+                winner.target_version()
+            ))
+            .into()),
+            RecordAuthorityAssignmentDecisionResult::Created(_)
+            | RecordAuthorityAssignmentDecisionResult::Unchanged(_) => Err(LeaseError::Invalid(
+                "assignment decision recorder returned the wrong decision kind".into(),
+            )
+            .into()),
+        }
+    }
+
+    async fn assignment_decision(
+        &self,
+        target_version: u64,
+    ) -> Result<Option<AuthorityAssignmentDecision>, ClusterCheckpointAuthorityError> {
+        if target_version == 0 {
+            return Err(LeaseError::Invalid(
+                "assignment decision target version must be nonzero".into(),
+            )
+            .into());
+        }
+        let Some(head) = self.load_record().await? else {
+            return Ok(None);
+        };
+        if let Some(floor) = head.assignment_decision_floor.as_ref() {
+            if target_version < floor.before_target_version {
+                return Err(DecisionError::Conflict(format!(
+                    "assignment decision version {target_version} is below durable retention floor {}",
+                    floor.before_target_version
+                ))
+                .into());
+            }
+        }
+        Ok(self
+            .audited_assignment_decisions_from(&head)
+            .await?
+            .into_iter()
+            .find(|decision| decision.target_version() == target_version))
     }
 
     /// Read the immutable settlement for one exact target assignment version.
@@ -1896,36 +2804,87 @@ impl LeaderLeaseStore {
         &self,
         target_version: u64,
     ) -> Result<Option<AssignmentDrainDecision>, ClusterCheckpointAuthorityError> {
-        if target_version == 0 {
+        match self.assignment_decision(target_version).await? {
+            Some(AuthorityAssignmentDecision::Drain(decision)) => Ok(Some(decision)),
+            Some(AuthorityAssignmentDecision::Recovery(_)) => Err(DecisionError::Conflict(
+                format!("target version {target_version} was settled by assignment recovery"),
+            )
+            .into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the immutable recovery authorization for one exact target assignment version.
+    ///
+    /// # Errors
+    /// Fails closed on malformed, incomplete, or cross-kind authority history.
+    pub async fn assignment_recovery_decision(
+        &self,
+        target_version: u64,
+    ) -> Result<Option<AssignmentRecoveryDecision>, ClusterCheckpointAuthorityError> {
+        match self.assignment_decision(target_version).await? {
+            Some(AuthorityAssignmentDecision::Recovery(decision)) => Ok(Some(decision)),
+            Some(AuthorityAssignmentDecision::Drain(_)) => Err(DecisionError::Conflict(format!(
+                "target version {target_version} was settled by assignment drain"
+            ))
+            .into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Materialize the immutable authority winner for one recovery target version.
+    ///
+    /// The caller supplies only the version; an arbitrary staged proposal can never bypass the
+    /// shared leader-decision chain.
+    ///
+    /// # Errors
+    /// Fails closed when no recovery decision exists, its proposal is invalid, or storage fails.
+    pub async fn materialize_assignment_recovery(
+        &self,
+        target_version: u64,
+    ) -> Result<RotateOutcome, ClusterCheckpointAuthorityError> {
+        let decision = self
+            .assignment_recovery_decision(target_version)
+            .await?
+            .ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "assignment recovery target {target_version} has no authority decision"
+                ))
+            })?;
+        let snapshots = AssignmentSnapshotStore::new(Arc::clone(&self.store));
+        let proposal = snapshots
+            .load_recovery_proposal(&decision.proposal)
+            .await
+            .map_err(|error| {
+                assignment_snapshot_error("load authorized assignment recovery proposal", error)
+            })?;
+        if proposal.assignment_fence().map_err(|error| {
+            LeaseError::Invalid(format!(
+                "authorized assignment recovery proposal has no valid fence: {error}"
+            ))
+        })? != decision.target
+        {
             return Err(LeaseError::Invalid(
-                "assignment drain decision target version must be nonzero".into(),
+                "authorized assignment recovery proposal does not match its target".into(),
             )
             .into());
         }
-        let Some(head) = self.load_record().await? else {
-            return Ok(None);
-        };
-        if let Some(floor) = head.assignment_drain_floor.as_ref() {
-            if target_version < floor.before_target_version {
-                return Err(DecisionError::Conflict(format!(
-                    "assignment drain decision version {target_version} is below durable retention floor {}",
-                    floor.before_target_version
-                ))
-                .into());
-            }
-        }
-        Ok(self
-            .audited_assignment_drain_decisions_from(&head)
-            .await?
-            .into_iter()
-            .find(|decision| decision.target_version() == target_version))
+        snapshots
+            .materialize_recovery(&decision.proposal)
+            .await
+            .map_err(|error| {
+                assignment_snapshot_error("materialize authorized assignment recovery", error)
+                    .into()
+            })
     }
 
-    /// Advance the assignment-drain floor through the exact next authority sequence.
+    /// Advance the shared assignment-decision floor through the exact next authority sequence.
     ///
-    /// The caller must first durably prune assignment snapshots below the same target-version
-    /// horizon. Decision-bearing authority records below the durable floor then become eligible
-    /// for best-effort deletion while the exact terminal anchor preserves chain continuity.
+    /// The compatibility-shaped API retains both drain and recovery decisions on one ordered
+    /// chain. The caller must first durably prune assignment snapshots below the same
+    /// target-version horizon. Decision-bearing authority records below the durable floor then
+    /// become eligible for best-effort deletion while the exact terminal anchor preserves chain
+    /// continuity.
     pub async fn prune_assignment_drain_decisions_before(
         &self,
         proof: &LeaderProof,
@@ -1935,7 +2894,7 @@ impl LeaderLeaseStore {
             return Ok(self
                 .load_record()
                 .await?
-                .and_then(|head| head.assignment_drain_floor)
+                .and_then(|head| head.assignment_decision_floor)
                 .map_or(0, |floor| floor.before_target_version));
         }
         if !proof.is_canonical() {
@@ -1949,16 +2908,14 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
-            if let Some(floor) = current.assignment_drain_floor.as_ref() {
+            if let Some(floor) = current.assignment_decision_floor.as_ref() {
                 if floor.before_target_version >= before_target_version {
                     self.schedule_history_prune();
                     return Ok(floor.before_target_version);
                 }
             }
 
-            let decisions = self
-                .audited_assignment_drain_decisions_from(&current)
-                .await?;
+            let decisions = self.audited_assignment_decisions_from(&current).await?;
             let terminal_anchor = decisions
                 .iter()
                 .rev()
@@ -1966,18 +2923,18 @@ impl LeaderLeaseStore {
                 .cloned()
                 .or_else(|| {
                     current
-                        .assignment_drain_floor
+                        .assignment_decision_floor
                         .as_ref()
                         .and_then(|floor| floor.terminal_anchor.clone())
                 });
             let terminal_anchor_link = match terminal_anchor.as_ref() {
                 Some(anchor) => Some(
-                    self.exact_assignment_drain_decision_link(&current, anchor)
+                    self.exact_assignment_decision_link(&current, anchor)
                         .await?,
                 ),
                 None => None,
             };
-            let floor = AuthorityAssignmentDrainFloor {
+            let floor = AuthorityAssignmentDecisionFloor {
                 before_target_version,
                 terminal_anchor,
                 terminal_anchor_link,
@@ -1995,13 +2952,13 @@ impl LeaderLeaseStore {
                 expires_at_ms: current.lease.expires_at_ms,
                 catalog_manifest: current.lease.catalog_manifest.clone(),
             });
-            next.assignment_drain_floor = Some(floor);
+            next.assignment_decision_floor = Some(floor);
             next.validate()?;
 
             match self.create_authority_record(&next).await? {
                 AuthorityCreateOutcome::Created => return Ok(before_target_version),
                 AuthorityCreateOutcome::Contended(winner) => {
-                    if let Some(winner_floor) = winner.assignment_drain_floor.as_ref() {
+                    if let Some(winner_floor) = winner.assignment_decision_floor.as_ref() {
                         if winner_floor.before_target_version >= before_target_version {
                             self.schedule_history_prune();
                             return Ok(winner_floor.before_target_version);
@@ -2015,7 +2972,7 @@ impl LeaderLeaseStore {
                         continue;
                     }
                     return Err(LeaseError::Invalid(
-                        "assignment drain floor contention did not advance the sequence".into(),
+                        "assignment decision floor contention did not advance the sequence".into(),
                     )
                     .into());
                 }
@@ -2578,7 +3535,10 @@ enum LeaseOperationEvent {
     Shutdown,
     Candidacy(Result<(), watch::error::RecvError>),
     Deadline,
-    Completed(Result<LeaseOutcome, LeaseError>),
+    Completed {
+        result: Result<LeaseOutcome, LeaseError>,
+        valid_until: tokio::time::Instant,
+    },
 }
 
 #[cfg(feature = "cluster")]
@@ -2669,6 +3629,13 @@ impl LeaderLeaseManager {
         valid_until: Option<tokio::time::Instant>,
         observation: Option<&LeaderLeaseObservation>,
     ) -> LeaseOperationEvent {
+        let Some(attempt_valid_until) = tokio::time::Instant::now().checked_add(self.config.ttl)
+        else {
+            return LeaseOperationEvent::Deadline;
+        };
+        let operation_deadline = valid_until.map_or(attempt_valid_until, |current| {
+            current.min(attempt_valid_until)
+        });
         let operation = async {
             if let Some(observation) = observation {
                 self.store
@@ -2682,8 +3649,11 @@ impl LeaderLeaseManager {
             biased;
             () = shutdown.cancelled() => LeaseOperationEvent::Shutdown,
             changed = candidate.changed() => LeaseOperationEvent::Candidacy(changed),
-            () = wait_for_deadline(valid_until) => LeaseOperationEvent::Deadline,
-            result = operation => LeaseOperationEvent::Completed(result),
+            () = wait_for_deadline(Some(operation_deadline)) => LeaseOperationEvent::Deadline,
+            result = operation => LeaseOperationEvent::Completed {
+                result,
+                valid_until: attempt_valid_until,
+            },
         }
     }
 
@@ -2757,7 +3727,7 @@ impl LeaderLeaseManager {
                 _ = ticker.tick() => {}
             }
 
-            let result = match self
+            let (result, attempt_valid_until) = match self
                 .attempt_lease(&shutdown, &mut candidate, valid_until, observation.as_ref())
                 .await
             {
@@ -2775,20 +3745,33 @@ impl LeaderLeaseManager {
                     }
                     continue;
                 }
-                LeaseOperationEvent::Completed(result) => result,
+                LeaseOperationEvent::Completed {
+                    result,
+                    valid_until: attempt_valid_until,
+                } => {
+                    let response_at = tokio::time::Instant::now();
+                    if response_at >= attempt_valid_until
+                        || valid_until.is_some_and(|current| response_at >= current)
+                    {
+                        self.fence();
+                        return;
+                    }
+                    (result, attempt_valid_until)
+                }
             };
 
             match result {
                 Ok(LeaseOutcome::Acquired(lease)) if lease.owner == self.owner => {
-                    let Some(next_deadline) =
-                        tokio::time::Instant::now().checked_add(self.config.ttl)
-                    else {
+                    let publication_at = tokio::time::Instant::now();
+                    if publication_at >= attempt_valid_until
+                        || valid_until.is_some_and(|current| publication_at >= current)
+                    {
                         self.fence();
                         return;
-                    };
+                    }
                     observation = None;
-                    valid_until = Some(next_deadline);
-                    self.deadline.extend(self.config.ttl);
+                    valid_until = Some(attempt_valid_until);
+                    self.deadline.extend_until(attempt_valid_until.into_std());
                     self.lease_tx.send_replace(Some(lease));
                 }
                 Ok(LeaseOutcome::Acquired(_)) => {
@@ -2834,10 +3817,13 @@ impl LeaderLeaseManager {
 
 #[cfg(test)]
 mod tests {
+    use super::super::controller::{RecoveryFault, RecoveryRound};
+    use super::super::snapshot::AssignmentSnapshot;
     use super::*;
     use async_trait::async_trait;
     use futures::StreamExt as FuturesStreamExt;
     use object_store::memory::InMemory;
+    use std::collections::BTreeMap;
 
     fn owner(node: u64, boot: u128, process_term: u64) -> LeaderLeaseOwner {
         LeaderLeaseOwner {
@@ -2896,6 +3882,27 @@ mod tests {
         .unwrap()
     }
 
+    fn recovery_release_terminal(
+        lease: &LeaderLease,
+        generation: u64,
+        epoch: u64,
+    ) -> RecoveryAnnouncement {
+        let round = RecoveryRound::new(
+            generation,
+            lease.proof(),
+            assignment_fence(&lease.owner),
+            vec![RecoveryFault {
+                reporter: lease.owner.node,
+                sequence: generation,
+            }],
+        )
+        .unwrap();
+        RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::ReleaseCommitted { epoch },
+        }
+    }
+
     fn assignment_drain_transition(
         owner: &LeaderLeaseOwner,
         leader_proof: LeaderProof,
@@ -2925,6 +3932,143 @@ mod tests {
         )
         .unwrap();
         AssignmentDrainTransition::new(predecessor, target, leader_proof).unwrap()
+    }
+
+    async fn assignment_recovery_decision(
+        store: &LeaderLeaseStore,
+        predecessor_version: u64,
+        predecessor_processes: &[LeaderLeaseOwner],
+        target_processes: &[LeaderLeaseOwner],
+        leader_proof: LeaderProof,
+        updated_at_ms: i64,
+    ) -> AssignmentRecoveryDecision {
+        assert!(!predecessor_processes.is_empty());
+        assert!(!target_processes.is_empty());
+        assert!(predecessor_processes
+            .windows(2)
+            .all(|pair| pair[0].node.0 < pair[1].node.0));
+        assert!(target_processes
+            .windows(2)
+            .all(|pair| pair[0].node.0 < pair[1].node.0));
+        let vnode_count = predecessor_processes.len().max(target_processes.len());
+        let predecessor_owners: Vec<_> = (0..vnode_count)
+            .map(|index| {
+                predecessor_processes[index % predecessor_processes.len()]
+                    .node
+                    .0
+            })
+            .collect();
+        let target_owners: Vec<_> = (0..vnode_count)
+            .map(|index| target_processes[index % target_processes.len()].node.0)
+            .collect();
+        let participants = |processes: &[LeaderLeaseOwner]| {
+            processes
+                .iter()
+                .map(|process| crate::checkpoint::CheckpointParticipant {
+                    node_id: process.node.0,
+                    boot_incarnation: process.boot,
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshots = AssignmentSnapshotStore::new(Arc::clone(&store.store));
+        let mut durable_version = snapshots
+            .load()
+            .await
+            .unwrap()
+            .map_or(0, |snapshot| snapshot.version);
+        while durable_version < predecessor_version {
+            let version = durable_version.checked_add(1).unwrap();
+            let snapshot = AssignmentSnapshot {
+                version,
+                partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
+                vnodes: predecessor_owners
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(vnode, node)| (u32::try_from(vnode).unwrap(), NodeId(node)))
+                    .collect(),
+                participants: participants(predecessor_processes),
+                updated_at_ms: i64::try_from(version).unwrap(),
+                draining: false,
+                drain_transition: None,
+            };
+            if version == 1 {
+                let _ = snapshots.save_if_absent(&snapshot).await.unwrap();
+            } else {
+                let _ = snapshots
+                    .save_if_version(&snapshot, durable_version)
+                    .await
+                    .unwrap();
+            }
+            durable_version = snapshots.load().await.unwrap().unwrap().version;
+        }
+        let predecessor_snapshot = snapshots.load().await.unwrap().unwrap();
+        assert_eq!(predecessor_snapshot.version, predecessor_version);
+        let predecessor = predecessor_snapshot.assignment_fence().unwrap();
+        assert_eq!(
+            predecessor,
+            CheckpointAssignmentFence::from_owner_map(
+                predecessor_version,
+                &predecessor_owners,
+                participants(predecessor_processes),
+            )
+            .unwrap()
+        );
+        let target_version = predecessor_version.checked_add(1).unwrap();
+        let target_snapshot = AssignmentSnapshot {
+            version: target_version,
+            partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
+            vnodes: target_owners
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(vnode, node)| (u32::try_from(vnode).unwrap(), NodeId(node)))
+                .collect(),
+            participants: participants(target_processes),
+            updated_at_ms,
+            draining: false,
+            drain_transition: None,
+        };
+        let target = target_snapshot.assignment_fence().unwrap();
+        let proposal = snapshots
+            .stage_recovery_proposal(&target_snapshot)
+            .await
+            .unwrap();
+        let removed_process_fences = predecessor_processes
+            .iter()
+            .enumerate()
+            .filter(|(_, process)| {
+                target.participant_incarnation(process.node.0) != Some(process.boot)
+            })
+            .map(|(index, process)| {
+                let predecessor = ProcessLease {
+                    node: process.node,
+                    owner: process.boot,
+                    term: process.process_term,
+                    seq: u64::try_from(index).unwrap().saturating_add(10),
+                    expires_at_ms: 1,
+                };
+                let successor_owner = target
+                    .participant_incarnation(process.node.0)
+                    .unwrap_or_else(|| Uuid::from_u128(10_000 + u128::from(process.node.0)));
+                let successor = ProcessLease {
+                    node: process.node,
+                    owner: successor_owner,
+                    term: predecessor.term.checked_add(1).unwrap(),
+                    seq: predecessor.seq.checked_add(1).unwrap(),
+                    expires_at_ms: 2,
+                };
+                ProcessLeaseFence::new(predecessor, successor).unwrap()
+            })
+            .collect();
+        AssignmentRecoveryDecision::new(
+            predecessor,
+            target,
+            proposal,
+            removed_process_fences,
+            leader_proof,
+        )
+        .unwrap()
     }
 
     fn digest(byte: u8) -> String {
@@ -3237,6 +4381,7 @@ mod tests {
             inner,
             blocked_path: lease_path(1),
             block_once: true,
+            block_after_put: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -3264,6 +4409,7 @@ mod tests {
         inner: Arc<dyn ObjectStore>,
         blocked_path: OsPath,
         block_once: bool,
+        block_after_put: bool,
         did_block: std::sync::atomic::AtomicBool,
         ambiguous_path: Option<OsPath>,
         did_return_ambiguous: std::sync::atomic::AtomicBool,
@@ -3340,7 +4486,7 @@ mod tests {
                     || !self
                         .did_block
                         .swap(true, std::sync::atomic::Ordering::AcqRel));
-            if should_block {
+            if should_block && !self.block_after_put {
                 self.entered.add_permits(1);
                 let permit =
                     self.release
@@ -3353,6 +4499,18 @@ mod tests {
                 permit.forget();
             }
             let result = self.inner.put_opts(location, payload, options).await;
+            if should_block && self.block_after_put {
+                self.entered.add_permits(1);
+                let permit =
+                    self.release
+                        .acquire()
+                        .await
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "BlockingStore",
+                            source: Box::new(error),
+                        })?;
+                permit.forget();
+            }
             if result.is_ok()
                 && self.ambiguous_path.as_ref() == Some(location)
                 && !self
@@ -3493,6 +4651,7 @@ mod tests {
             inner: Arc::new(InMemory::new()),
             blocked_path,
             block_once: false,
+            block_after_put: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -3519,6 +4678,35 @@ mod tests {
             inner: Arc::new(InMemory::new()),
             blocked_path,
             block_once: true,
+            block_after_put: false,
+            did_block: std::sync::atomic::AtomicBool::new(false),
+            ambiguous_path: None,
+            did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
+            replacement_on_get: None,
+            did_replace: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
+            track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
+            active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
+            max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let object_store: Arc<dyn ObjectStore> = raw.clone();
+        let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
+        (raw, authority)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn delayed_response_once_at(
+        ttl_ms: i64,
+        blocked_path: OsPath,
+    ) -> (Arc<BlockingStore>, Arc<LeaderLeaseStore>) {
+        let raw = Arc::new(BlockingStore {
+            inner: Arc::new(InMemory::new()),
+            blocked_path,
+            block_once: true,
+            block_after_put: true,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -3545,6 +4733,7 @@ mod tests {
             inner: Arc::new(InMemory::new()),
             blocked_path: OsPath::from("control/never-block"),
             block_once: true,
+            block_after_put: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: Some(ambiguous_path),
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -3570,6 +4759,299 @@ mod tests {
             ddl: format!("CREATE SOURCE {name} (id BIGINT)"),
         }])
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn committed_recovery_release_survives_renewal_and_takeover() {
+        let store = Arc::new(store(1));
+        let incumbent = owner(1, 11, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let terminal = recovery_release_terminal(&first, 7, 4);
+        let reference = store
+            .stage_recovery_release_terminal(&terminal)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .record_recovery_release_commit(&proof, reference.clone())
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Created(_)
+        ));
+        let LeaseOutcome::Acquired(renewed) = store.try_acquire(&incumbent, 1).await.unwrap()
+        else {
+            unreachable!()
+        };
+        let successor = owner(2, 22, 1);
+        let observation = store.observe_rival(&successor, &renewed).unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        let LeaseOutcome::Acquired(_) = store
+            .try_takeover(&successor, &observation, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("successor must acquire the expired authority");
+        };
+
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            Some(terminal)
+        );
+        assert!(matches!(
+            store
+                .record_recovery_release_commit(&proof, reference)
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Unchanged(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn takeover_before_recovery_release_append_fences_the_old_commit() {
+        let (raw, store) = blocking_once_at(10, lease_path(2));
+        let incumbent = owner(1, 11, 1);
+        let successor = owner(2, 22, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let terminal = recovery_release_terminal(&first, 7, 4);
+        let reference = store
+            .stage_recovery_release_terminal(&terminal)
+            .await
+            .unwrap();
+        let observation = store.observe_rival(&successor, &first).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let committing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .record_recovery_release_commit(&proof, reference)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(matches!(
+            store
+                .try_takeover(&successor, &observation, 20)
+                .await
+                .unwrap(),
+            LeaseOutcome::Acquired(_)
+        ));
+        raw.release.add_permits(1);
+        assert!(matches!(
+            committing.await.unwrap(),
+            Err(ClusterCheckpointAuthorityError::Fenced)
+        ));
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_release_create_reconciles_the_exact_winner() {
+        let (raw, store) = ambiguous_once_at(1_000, lease_path(2));
+        let incumbent = owner(1, 11, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let terminal = recovery_release_terminal(&first, 7, 4);
+        let reference = store
+            .stage_recovery_release_terminal(&terminal)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .record_recovery_release_commit(&first.proof(), reference)
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Created(_)
+        ));
+        assert!(raw
+            .did_return_ambiguous
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            Some(terminal)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_release_generation_has_one_exact_winner() {
+        let store = store(1_000);
+        let incumbent = owner(1, 11, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let first_terminal = recovery_release_terminal(&first, 7, 4);
+        let first_reference = store
+            .stage_recovery_release_terminal(&first_terminal)
+            .await
+            .unwrap();
+        store
+            .record_recovery_release_commit(&proof, first_reference)
+            .await
+            .unwrap();
+
+        let mut divergent = first_terminal.clone();
+        divergent.phase = RecoverPhase::ReleaseCommitted { epoch: 5 };
+        let divergent_reference = store
+            .stage_recovery_release_terminal(&divergent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .record_recovery_release_commit(&proof, divergent_reference)
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Conflict { .. }
+        ));
+
+        let newer = recovery_release_terminal(&first, 8, 5);
+        let newer_reference = store.stage_recovery_release_terminal(&newer).await.unwrap();
+        assert!(matches!(
+            store
+                .record_recovery_release_commit(&proof, newer_reference)
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Created(_)
+        ));
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            Some(newer)
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_recovery_release_blob_is_revalidated_on_every_read() {
+        let raw = Arc::new(InMemory::new());
+        let object_store: Arc<dyn ObjectStore> = raw.clone();
+        let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+        let incumbent = owner(1, 11, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let terminal = recovery_release_terminal(&first, 7, 4);
+        let (encoded, expected_reference) = encode_recovery_release_terminal(&terminal).unwrap();
+        let reference = store
+            .stage_recovery_release_terminal(&terminal)
+            .await
+            .unwrap();
+        assert_eq!(reference, expected_reference);
+        store
+            .record_recovery_release_commit(&first.proof(), reference.clone())
+            .await
+            .unwrap();
+
+        let path = recovery_release_terminal_path(&reference);
+        raw.delete(&path).await.unwrap();
+        let missing = store
+            .latest_recovery_release_terminal()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("is missing"), "{missing}");
+
+        raw.put(&path, PutPayload::from(encoded)).await.unwrap();
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            Some(terminal)
+        );
+        raw.put(&path, PutPayload::from(Bytes::from_static(b"broken")))
+            .await
+            .unwrap();
+        let corrupt = store
+            .latest_recovery_release_terminal()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(corrupt.contains("bytes, expected"), "{corrupt}");
+    }
+
+    #[tokio::test]
+    async fn existing_invalid_release_blob_is_a_validation_conflict() {
+        let raw = Arc::new(InMemory::new());
+        let object_store: Arc<dyn ObjectStore> = raw.clone();
+        let store = LeaderLeaseStore::new(object_store, 1_000);
+        let incumbent = owner(1, 11, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let terminal = recovery_release_terminal(&first, 7, 4);
+        let (_, reference) = encode_recovery_release_terminal(&terminal).unwrap();
+        raw.put(
+            &recovery_release_terminal_path(&reference),
+            PutPayload::from(Bytes::from_static(b"invalid")),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            store.stage_recovery_release_terminal(&terminal).await,
+            Err(ClusterCheckpointAuthorityError::Authority(
+                LeaseError::Invalid(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pruning_retains_latest_release_admission_and_collects_orphan_blobs() {
+        let raw = Arc::new(InMemory::new());
+        let object_store: Arc<dyn ObjectStore> = raw.clone();
+        let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+        let incumbent = owner(1, 11, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let terminal = recovery_release_terminal(&first, 7, 4);
+        let retained = store
+            .stage_recovery_release_terminal(&terminal)
+            .await
+            .unwrap();
+        let mut orphan = terminal.clone();
+        orphan.phase = RecoverPhase::ReleaseCommitted { epoch: 5 };
+        let orphan = store
+            .stage_recovery_release_terminal(&orphan)
+            .await
+            .unwrap();
+        store
+            .record_recovery_release_commit(&first.proof(), retained.clone())
+            .await
+            .unwrap();
+        for now in 1..=4 {
+            assert!(matches!(
+                store.try_acquire(&incumbent, now).await.unwrap(),
+                LeaseOutcome::Acquired(_)
+            ));
+        }
+
+        LeaderLeaseStore::prune_history(&object_store, 0)
+            .await
+            .unwrap();
+        let sequences = store.list_seqs().await.unwrap();
+        assert!(sequences.contains(&2), "{sequences:?}");
+        assert!(raw
+            .get(&recovery_release_terminal_path(&retained))
+            .await
+            .is_ok());
+        assert!(matches!(
+            raw.get(&recovery_release_terminal_path(&orphan)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            Some(terminal)
+        );
     }
 
     #[test]
@@ -3604,6 +5086,438 @@ mod tests {
             AssignmentDrainVerdict::Abort,
         )
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn assignment_recovery_requires_exact_sorted_removals_and_matching_proposal() {
+        let store = store(1_000);
+        let incumbent = owner(1, 11, 1);
+        let failed_two = owner(2, 22, 1);
+        let failed_three = owner(3, 33, 1);
+        let LeaseOutcome::Acquired(lease) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = lease.proof();
+        let decision = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent.clone(), failed_two, failed_three],
+            std::slice::from_ref(&incumbent),
+            proof.clone(),
+            1,
+        )
+        .await;
+        assert!(decision.validate().is_ok());
+
+        let mut missing = decision.clone();
+        missing.removed_process_fences.pop();
+        assert!(missing.validate().is_err());
+
+        let mut unsorted = decision.clone();
+        unsorted.removed_process_fences.swap(0, 1);
+        assert!(unsorted.validate().is_err());
+
+        let mut wrong_version = decision.clone();
+        wrong_version.proposal.version = wrong_version.proposal.version.checked_add(1).unwrap();
+        assert!(wrong_version.validate().is_err());
+
+        let mut wrong_predecessor = decision.clone();
+        wrong_predecessor.predecessor.assignment_digest[0] ^= 1;
+        assert!(wrong_predecessor.validate().is_ok());
+        assert!(matches!(
+            store
+                .record_assignment_recovery_decision(&proof, wrong_predecessor)
+                .await,
+            Err(ClusterCheckpointAuthorityError::Authority(
+                LeaseError::Invalid(_)
+            ))
+        ));
+
+        let mut wrong_target = decision;
+        wrong_target.target.assignment_digest[0] ^= 1;
+        assert!(wrong_target.validate().is_ok());
+        assert!(matches!(
+            store
+                .record_assignment_recovery_decision(&proof, wrong_target)
+                .await,
+            Err(ClusterCheckpointAuthorityError::Authority(
+                LeaseError::Invalid(_)
+            ))
+        ));
+        assert_eq!(store.load().await.unwrap().unwrap().seq, 1);
+    }
+
+    #[tokio::test]
+    async fn competing_assignment_recoveries_have_one_same_version_winner() {
+        let (raw, store) = blocking_store_at(1_000, lease_path(2));
+        let incumbent = owner(1, 11, 1);
+        let failed = owner(2, 22, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let left = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent.clone(), failed.clone()],
+            std::slice::from_ref(&incumbent),
+            proof.clone(),
+            1,
+        )
+        .await;
+        let right = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent.clone(), failed],
+            std::slice::from_ref(&incumbent),
+            proof.clone(),
+            2,
+        )
+        .await;
+        assert_ne!(left.proposal, right.proposal);
+
+        let left_store = Arc::clone(&store);
+        let left_proof = proof.clone();
+        let left_task = tokio::spawn(async move {
+            left_store
+                .record_assignment_recovery_decision(&left_proof, left)
+                .await
+        });
+        let right_store = Arc::clone(&store);
+        let right_proof = proof.clone();
+        let right_task = tokio::spawn(async move {
+            right_store
+                .record_assignment_recovery_decision(&right_proof, right)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        raw.release.add_permits(2);
+
+        let (left_result, right_result) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(left_task, right_task)
+        })
+        .await
+        .unwrap();
+        let left_result = left_result.unwrap().unwrap();
+        let right_result = right_result.unwrap().unwrap();
+        assert_eq!(
+            usize::from(matches!(
+                &left_result,
+                RecordAssignmentRecoveryDecisionResult::Created(_)
+            )) + usize::from(matches!(
+                &right_result,
+                RecordAssignmentRecoveryDecisionResult::Created(_)
+            )),
+            1
+        );
+        assert_eq!(
+            usize::from(matches!(
+                &left_result,
+                RecordAssignmentRecoveryDecisionResult::Conflict { .. }
+            )) + usize::from(matches!(
+                &right_result,
+                RecordAssignmentRecoveryDecisionResult::Conflict { .. }
+            )),
+            1
+        );
+        let durable = store
+            .assignment_recovery_decision(2)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshots = AssignmentSnapshotStore::new(Arc::clone(&store.store));
+        let _ = store.materialize_assignment_recovery(2).await.unwrap();
+        assert_eq!(snapshots.load().await.unwrap().unwrap().version, 2);
+        assert_eq!(
+            store
+                .record_assignment_recovery_decision(&proof, durable.clone())
+                .await
+                .unwrap(),
+            RecordAssignmentRecoveryDecisionResult::Unchanged(durable)
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_recovery_supersedes_a_delayed_same_version_drain_write() {
+        let store = store(1_000);
+        let incumbent = owner(1, 11, 1);
+        let failed = owner(2, 22, 1);
+        let LeaseOutcome::Acquired(lease) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = lease.proof();
+        let recovery = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent.clone(), failed.clone()],
+            std::slice::from_ref(&incumbent),
+            proof.clone(),
+            1,
+        )
+        .await;
+        assert!(matches!(
+            store
+                .record_assignment_recovery_decision(&proof, recovery.clone())
+                .await
+                .unwrap(),
+            RecordAssignmentRecoveryDecisionResult::Created(_)
+        ));
+
+        let snapshots = AssignmentSnapshotStore::new(Arc::clone(&store.store));
+        let predecessor = snapshots.load().await.unwrap().unwrap();
+        let delayed_drain = predecessor
+            .next_draining(
+                BTreeMap::from([(0, failed.node), (1, incumbent.node)]),
+                predecessor.participants.clone(),
+                proof,
+            )
+            .unwrap();
+        assert!(matches!(
+            snapshots
+                .save_if_version(&delayed_drain, predecessor.version)
+                .await
+                .unwrap(),
+            RotateOutcome::Rotated
+        ));
+        assert_eq!(snapshots.load().await.unwrap(), Some(delayed_drain));
+
+        assert!(matches!(
+            store.materialize_assignment_recovery(2).await.unwrap(),
+            RotateOutcome::Rotated
+        ));
+        let authorized = snapshots
+            .load_recovery_proposal(&recovery.proposal)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.load().await.unwrap(), Some(authorized));
+        assert_eq!(snapshots.load_drain_transition(2).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn drain_and_recovery_share_one_ordered_retention_chain() {
+        let store = store(1_000);
+        let incumbent = owner(1, 11, 1);
+        let failed = owner(2, 22, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let participants = vec![
+            crate::checkpoint::CheckpointParticipant {
+                node_id: incumbent.node.0,
+                boot_incarnation: incumbent.boot,
+            },
+            crate::checkpoint::CheckpointParticipant {
+                node_id: failed.node.0,
+                boot_incarnation: failed.boot,
+            },
+        ];
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[incumbent.node.0, failed.node.0],
+            participants.clone(),
+        )
+        .unwrap();
+        let target = CheckpointAssignmentFence::from_owner_map(
+            2,
+            &[incumbent.node.0, failed.node.0],
+            participants,
+        )
+        .unwrap();
+        let transition =
+            AssignmentDrainTransition::new(predecessor, target, proof.clone()).unwrap();
+        let drain = AssignmentDrainDecision::new(
+            &transition,
+            proof.clone(),
+            AssignmentDrainVerdict::Commit,
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .record_assignment_drain_decision(&proof, drain.clone())
+                .await
+                .unwrap(),
+            RecordAssignmentDrainDecisionResult::Created(_)
+        ));
+
+        let losing_recovery = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent.clone(), failed.clone()],
+            std::slice::from_ref(&incumbent),
+            proof.clone(),
+            2,
+        )
+        .await;
+        assert!(matches!(
+            store
+                .record_assignment_recovery_decision(&proof, losing_recovery)
+                .await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+
+        let recovery = assignment_recovery_decision(
+            &store,
+            2,
+            &[incumbent.clone(), failed],
+            std::slice::from_ref(&incumbent),
+            proof.clone(),
+            3,
+        )
+        .await;
+        assert!(matches!(
+            store
+                .record_assignment_recovery_decision(&proof, recovery.clone())
+                .await
+                .unwrap(),
+            RecordAssignmentRecoveryDecisionResult::Created(_)
+        ));
+
+        let losing_drain_transition = assignment_drain_transition_at(&incumbent, proof.clone(), 3);
+        let losing_drain = AssignmentDrainDecision::new(
+            &losing_drain_transition,
+            proof.clone(),
+            AssignmentDrainVerdict::Commit,
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .record_assignment_drain_decision(&proof, losing_drain)
+                .await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+
+        let head = store.load_record().await.unwrap().unwrap();
+        assert!(matches!(
+            head.assignment_decision,
+            Some(AuthorityAssignmentDecision::Recovery(ref durable)) if durable == &recovery
+        ));
+        let previous = head.previous_assignment_decision.unwrap();
+        assert_eq!(previous.target_version, 2);
+        let previous_record = read_authority_record(store.store.as_ref(), previous.sequence)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            previous_record.assignment_decision,
+            Some(AuthorityAssignmentDecision::Drain(ref durable)) if durable == &drain
+        ));
+        assert!(matches!(
+            store.assignment_drain_decision(3).await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+        assert!(matches!(
+            store.assignment_recovery_decision(2).await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+
+        assert_eq!(
+            store
+                .prune_assignment_drain_decisions_before(&proof, 3)
+                .await
+                .unwrap(),
+            3
+        );
+        let floor = store
+            .load_record()
+            .await
+            .unwrap()
+            .unwrap()
+            .assignment_decision_floor
+            .unwrap();
+        assert!(matches!(
+            floor.terminal_anchor,
+            Some(AuthorityAssignmentDecision::Drain(anchor)) if anchor == drain
+        ));
+        assert_eq!(
+            store.assignment_recovery_decision(3).await.unwrap(),
+            Some(recovery)
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_fences_a_delayed_assignment_recovery_decision() {
+        let (raw, store) = blocking_once_at(10, lease_path(2));
+        let incumbent = owner(1, 11, 1);
+        let successor = owner(1, 12, 2);
+        let failed = owner(2, 22, 1);
+        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+            unreachable!()
+        };
+        let old_proof = first.proof();
+        let old_decision = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent.clone(), failed.clone()],
+            std::slice::from_ref(&incumbent),
+            old_proof.clone(),
+            1,
+        )
+        .await;
+        let observation = store.observe_rival(&successor, &first).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let delayed_store = Arc::clone(&store);
+        let delayed_proof = old_proof.clone();
+        let delayed_task = tokio::spawn(async move {
+            delayed_store
+                .record_assignment_recovery_decision(&delayed_proof, old_decision)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let LeaseOutcome::Acquired(takeover) = store
+            .try_takeover(&successor, &observation, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("successor must win the authority sequence");
+        };
+        raw.release.add_permits(1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), delayed_task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ClusterCheckpointAuthorityError::Fenced)
+        ));
+
+        let takeover_proof = takeover.proof();
+        let winner = assignment_recovery_decision(
+            &store,
+            1,
+            &[incumbent, failed],
+            std::slice::from_ref(&successor),
+            takeover_proof.clone(),
+            2,
+        )
+        .await;
+        assert!(matches!(
+            store
+                .record_assignment_recovery_decision(&takeover_proof, winner.clone())
+                .await
+                .unwrap(),
+            RecordAssignmentRecoveryDecisionResult::Created(_)
+        ));
+        assert_eq!(
+            store.assignment_recovery_decision(2).await.unwrap(),
+            Some(winner)
+        );
     }
 
     #[tokio::test]
@@ -3778,14 +5692,14 @@ mod tests {
 
         let head = store.load_record().await.unwrap().unwrap();
         let mut by_target_version = std::collections::BTreeMap::new();
-        let mut link = head.assignment_drain_decision_head;
+        let mut link = head.assignment_decision_head;
         while let Some(current) = link {
             by_target_version.insert(current.target_version, current.sequence);
             link = read_authority_record(store.store.as_ref(), current.sequence)
                 .await
                 .unwrap()
                 .unwrap()
-                .previous_assignment_drain_decision;
+                .previous_assignment_decision;
         }
 
         assert_eq!(
@@ -3800,7 +5714,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
-            .assignment_drain_floor
+            .assignment_decision_floor
             .unwrap();
         assert_eq!(floor.before_target_version, 4);
         assert_eq!(floor.terminal_anchor.unwrap().target_version(), 3);
@@ -3902,7 +5816,7 @@ mod tests {
 
         let mut corrupt = store.load_record().await.unwrap().unwrap();
         corrupt
-            .assignment_drain_floor
+            .assignment_decision_floor
             .as_mut()
             .unwrap()
             .terminal_anchor_link
@@ -4904,6 +6818,45 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn delayed_durable_acquisition_response_fails_closed_at_attempt_deadline() {
+        let ttl = Duration::from_millis(40);
+        let (raw, store) = delayed_response_once_at(40, lease_path(1));
+        let owner = owner(1, 1, 1);
+        let manager = LeaderLeaseManager::new(
+            Arc::clone(&store),
+            &process(&owner),
+            LeaderLeaseConfig {
+                ttl,
+                renew_interval: Duration::from_millis(5),
+            },
+        )
+        .unwrap();
+        let deadline = manager.deadline();
+        let lease = manager.lease_watch();
+        let (_candidate_tx, candidate_rx) = watch::channel(true);
+        let task = manager.spawn(tokio_util::sync::CancellationToken::new(), candidate_rx);
+
+        tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(matches!(
+            store.load().await.unwrap(),
+            Some(LeaderLease { owner: current, .. }) if current == owner
+        ));
+        tokio::time::timeout(ttl + Duration::from_millis(100), task)
+            .await
+            .expect("manager must not wait beyond the attempt's anchored TTL")
+            .unwrap();
+
+        assert!(lease.borrow().is_none());
+        assert!(!deadline.is_live());
+        raw.release.add_permits(1);
     }
 
     #[cfg(feature = "cluster")]

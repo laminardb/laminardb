@@ -5,9 +5,6 @@ use uuid::Uuid;
 use super::LeaderProof;
 use crate::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 
-/// Canonical wire version for source-drain receipts.
-pub const SOURCE_DRAIN_RECEIPT_VERSION: u16 = 1;
-
 /// Maximum participants supported by the current all-to-all shuffle transport.
 ///
 /// Every receiver admits one persistent stream from each of the other 128 participants; the
@@ -168,8 +165,14 @@ impl CheckpointAssignmentFence {
         if !fence.is_canonical() {
             return Err("checkpoint assignment certificate is not canonical".into());
         }
-        if owners.iter().any(|owner| !fence.contains(*owner)) {
-            return Err("checkpoint assignment owner is absent from the participant roster".into());
+        let owner_ids: std::collections::BTreeSet<u64> = owners.iter().copied().collect();
+        if owner_ids.len() != fence.participants.len()
+            || fence
+                .participants
+                .iter()
+                .any(|participant| !owner_ids.contains(&participant.node_id))
+        {
+            return Err("checkpoint participants must be the exact vnode-owner set".into());
         }
         Ok(fence)
     }
@@ -252,6 +255,14 @@ impl CheckpointAssignmentFence {
         self.partitioning_abi_version == PARTITIONING_ABI_VERSION
             && usize::try_from(self.vnode_count).ok() == Some(owners.len())
             && self.assignment_digest == Self::owner_map_digest(self.vnode_count, owners)
+            && {
+                let owner_ids: std::collections::BTreeSet<u64> = owners.iter().copied().collect();
+                owner_ids.len() == self.participants.len()
+                    && self
+                        .participants
+                        .iter()
+                        .all(|participant| owner_ids.contains(&participant.node_id))
+            }
     }
 
     /// Stable SHA-256 binding of every certificate dimension.
@@ -299,7 +310,7 @@ impl AssignmentDrainId {
     }
 }
 
-/// Exact predecessor-to-target transition whose revoking source inputs must drain.
+/// Exact predecessor-to-target transition at which every predecessor source must stop input.
 ///
 /// Required drain participants always come from `predecessor`. A process that only joins the
 /// target has no predecessor input authority and therefore cannot block the drain quorum.
@@ -404,220 +415,11 @@ impl AssignmentDrainTransition {
     }
 }
 
-/// Canonical digest of an ascending, duplicate-free vnode set.
-///
-/// # Errors
-/// Returns an error when the set is not strictly ascending.
-pub fn source_drain_vnode_digest(vnodes: &[u32]) -> Result<[u8; 32], String> {
-    use sha2::{Digest, Sha256};
-
-    if !vnodes.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err("source drain vnode set is not strictly ascending".into());
-    }
-    let mut hash = Sha256::new();
-    hash.update(b"laminardb-source-drain-vnodes-v1\0");
-    hash.update(
-        u64::try_from(vnodes.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    for vnode in vnodes {
-        hash.update(vnode.to_le_bytes());
-    }
-    Ok(hash.finalize().into())
-}
-
-/// Stable source identity used by drain receipt sets.
-#[must_use]
-pub fn source_drain_source_id(source_name: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-
-    let mut hash = Sha256::new();
-    hash.update(b"laminardb-source-drain-source-v1\0");
-    hash.update(
-        u64::try_from(source_name.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    hash.update(source_name.as_bytes());
-    hash.finalize().into()
-}
-
-/// Receipt proving one exact local source reached its external-input cut.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SourceDrainReceipt {
-    /// Receipt schema version.
-    pub protocol_version: u16,
-    /// Exact predecessor/target/leader transition.
-    pub round: AssignmentDrainId,
-    /// Process that owns this source task.
-    pub participant: CheckpointParticipant,
-    /// Stable catalog source identity.
-    pub source_id: [u8; 32],
-    /// Boot-unique source-task identity, preventing reuse across an in-process restart.
-    pub source_task_incarnation: Uuid,
-    /// Number of revoking vnodes observed by the source task.
-    pub revoking_vnode_count: u32,
-    /// Canonical digest of those vnodes.
-    pub revoking_vnode_digest: [u8; 32],
-    /// Number of concrete connector inputs paused for the cut.
-    pub revoked_input_count: u32,
-    /// Canonical connector-defined digest of those inputs.
-    pub revoked_input_digest: [u8; 32],
-    /// Canonical connector-defined digest of their next-to-read positions.
-    pub cut_cursor_digest: [u8; 32],
-}
-
-impl SourceDrainReceipt {
-    /// Whether every field has its canonical production shape.
-    #[must_use]
-    pub fn is_canonical(&self) -> bool {
-        self.protocol_version == SOURCE_DRAIN_RECEIPT_VERSION
-            && self.round.is_canonical()
-            && self.participant.node_id != 0
-            && !self.participant.boot_incarnation.is_nil()
-            && self.source_id != [0; 32]
-            && !self.source_task_incarnation.is_nil()
-            && self.revoking_vnode_digest != [0; 32]
-            && self.revoked_input_digest != [0; 32]
-            && self.cut_cursor_digest != [0; 32]
-    }
-
-    /// Stable digest included in the node-local receipt-set proof.
-    #[must_use]
-    pub fn digest(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-
-        let mut hash = Sha256::new();
-        hash.update(b"laminardb-source-drain-receipt-v1\0");
-        hash.update(self.protocol_version.to_le_bytes());
-        hash.update(self.round.predecessor_version.to_le_bytes());
-        hash.update(self.round.target_version.to_le_bytes());
-        hash.update(self.round.digest);
-        hash.update(self.participant.node_id.to_le_bytes());
-        hash.update(self.participant.boot_incarnation.as_bytes());
-        hash.update(self.source_id);
-        hash.update(self.source_task_incarnation.as_bytes());
-        hash.update(self.revoking_vnode_count.to_le_bytes());
-        hash.update(self.revoking_vnode_digest);
-        hash.update(self.revoked_input_count.to_le_bytes());
-        hash.update(self.revoked_input_digest);
-        hash.update(self.cut_cursor_digest);
-        hash.finalize().into()
-    }
-}
-
-/// Canonical digest of the exact local source plan required to acknowledge a drain.
-///
-/// # Errors
-/// Returns an error for an empty/non-canonical identity or duplicate source identity.
-pub fn source_drain_plan_digest(source_ids: &[[u8; 32]]) -> Result<[u8; 32], String> {
-    use sha2::{Digest, Sha256};
-
-    let mut sorted = source_ids.to_vec();
-    sorted.sort_unstable();
-    if sorted.contains(&[0; 32]) {
-        return Err("source drain plan contains an empty source identity".into());
-    }
-    if !sorted.windows(2).all(|pair| pair[0] != pair[1]) {
-        return Err("source drain plan contains a duplicate source identity".into());
-    }
-    let mut hash = Sha256::new();
-    hash.update(b"laminardb-source-drain-plan-v1\0");
-    hash.update(
-        u64::try_from(sorted.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    for identity in sorted {
-        hash.update(identity);
-    }
-    Ok(hash.finalize().into())
-}
-
-/// Bounded node-local proof that every required source task reached the same drain round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NodeDrainReceiptAggregate {
-    /// Exact predecessor/target/leader transition digest.
-    pub round_digest: [u8; 32],
-    /// Canonical digest of the source identities required on this process.
-    pub source_plan_digest: [u8; 32],
-    /// Exact number of receipts included in `receipt_set_digest`.
-    pub receipt_count: u32,
-    /// Canonical sorted digest of the complete local receipt set.
-    pub receipt_set_digest: [u8; 32],
-}
-
-impl NodeDrainReceiptAggregate {
-    /// Build the aggregate for one exact process and transition.
-    ///
-    /// # Errors
-    /// Returns an error for a missing, duplicate, stale, or cross-process source receipt.
-    pub fn new(
-        transition: &AssignmentDrainTransition,
-        participant: CheckpointParticipant,
-        receipts: &[SourceDrainReceipt],
-    ) -> Result<Self, String> {
-        use sha2::{Digest, Sha256};
-
-        if !transition.is_canonical()
-            || transition
-                .predecessor
-                .participant_incarnation(participant.node_id)
-                != Some(participant.boot_incarnation)
-        {
-            return Err("source drain aggregate participant is absent from predecessor".into());
-        }
-        let round = transition.id();
-        let mut ordered = receipts.to_vec();
-        ordered.sort_unstable_by_key(|receipt| receipt.source_id);
-        if ordered
-            .windows(2)
-            .any(|pair| pair[0].source_id == pair[1].source_id)
-        {
-            return Err("source drain aggregate contains duplicate source receipts".into());
-        }
-        if ordered.iter().any(|receipt| {
-            !receipt.is_canonical() || receipt.round != round || receipt.participant != participant
-        }) {
-            return Err("source drain aggregate contains a stale or non-canonical receipt".into());
-        }
-        let source_ids: Vec<[u8; 32]> = ordered.iter().map(|receipt| receipt.source_id).collect();
-        let source_plan_digest = source_drain_plan_digest(&source_ids)?;
-        let receipt_count = u32::try_from(ordered.len())
-            .map_err(|_| "source drain receipt count exceeds u32::MAX")?;
-        let mut hash = Sha256::new();
-        hash.update(b"laminardb-source-drain-receipt-set-v1\0");
-        hash.update(round.digest);
-        hash.update(source_plan_digest);
-        hash.update(receipt_count.to_le_bytes());
-        for receipt in ordered {
-            hash.update(receipt.digest());
-        }
-        Ok(Self {
-            round_digest: round.digest,
-            source_plan_digest,
-            receipt_count,
-            receipt_set_digest: hash.finalize().into(),
-        })
-    }
-
-    /// Whether every aggregate field has a canonical production value.
-    #[must_use]
-    pub fn is_canonical(self) -> bool {
-        self.round_digest != [0; 32]
-            && self.source_plan_digest != [0; 32]
-            && self.receipt_set_digest != [0; 32]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        source_drain_source_id, source_drain_vnode_digest, AssignmentDrainTransition,
-        CheckpointAssignmentAdoption, CheckpointAssignmentFence, CheckpointParticipant,
-        NodeDrainReceiptAggregate, SourceDrainReceipt, MAX_CHECKPOINT_PARTICIPANTS,
-        SOURCE_DRAIN_RECEIPT_VERSION,
+        AssignmentDrainTransition, CheckpointAssignmentAdoption, CheckpointAssignmentFence,
+        CheckpointParticipant, MAX_CHECKPOINT_PARTICIPANTS,
     };
     use crate::checkpoint::{LeaderProof, LeaderProofOwner};
     use crate::state::{MAX_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION};
@@ -749,6 +551,14 @@ mod tests {
         assert!(
             CheckpointAssignmentFence::from_owner_map(0, &[1], vec![participant(1, 11)]).is_err()
         );
+        assert!(matches!(
+            CheckpointAssignmentFence::from_owner_map(
+                7,
+                &[1],
+                vec![participant(1, 11), participant(2, 22)]
+            ),
+            Err(message) if message.contains("exact vnode-owner set")
+        ));
     }
 
     #[test]
@@ -768,15 +578,17 @@ mod tests {
         let participants = (1..=maximum)
             .map(|node_id| participant(node_id, u128::from(node_id)))
             .collect();
-        let fence = CheckpointAssignmentFence::from_owner_map(7, &[1], participants).unwrap();
+        let owners = (1..=maximum).collect::<Vec<_>>();
+        let fence = CheckpointAssignmentFence::from_owner_map(7, &owners, participants).unwrap();
         assert!(fence.is_canonical());
         assert_eq!(fence.participants.len(), MAX_CHECKPOINT_PARTICIPANTS);
 
         let oversized = (1..=maximum + 1)
             .map(|node_id| participant(node_id, u128::from(node_id)))
             .collect();
+        let oversized_owners = (1..=maximum + 1).collect::<Vec<_>>();
         assert!(matches!(
-            CheckpointAssignmentFence::from_owner_map(8, &[1], oversized),
+            CheckpointAssignmentFence::from_owner_map(8, &oversized_owners, oversized),
             Err(message) if message.contains("maximum is 129")
         ));
 
@@ -844,46 +656,5 @@ mod tests {
             digest: [1; 32],
         };
         assert!(!identity.is_canonical());
-    }
-
-    #[test]
-    fn node_drain_aggregate_is_canonical_and_rejects_duplicate_source_receipts() {
-        let predecessor = CheckpointAssignmentFence::from_owner_map(
-            7,
-            &[1, 2],
-            vec![participant(1, 11), participant(2, 22)],
-        )
-        .unwrap();
-        let target = CheckpointAssignmentFence::from_owner_map(
-            8,
-            &[2, 3],
-            vec![participant(2, 22), participant(3, 33)],
-        )
-        .unwrap();
-        let transition =
-            AssignmentDrainTransition::new(predecessor, target, leader(1, 11)).unwrap();
-        let process = participant(1, 11);
-        let receipt = SourceDrainReceipt {
-            protocol_version: SOURCE_DRAIN_RECEIPT_VERSION,
-            round: transition.id(),
-            participant: process,
-            source_id: source_drain_source_id("orders"),
-            source_task_incarnation: Uuid::from_u128(101),
-            revoking_vnode_count: 1,
-            revoking_vnode_digest: source_drain_vnode_digest(&[0]).unwrap(),
-            revoked_input_count: 1,
-            revoked_input_digest: [7; 32],
-            cut_cursor_digest: [8; 32],
-        };
-        let aggregate =
-            NodeDrainReceiptAggregate::new(&transition, process, std::slice::from_ref(&receipt))
-                .unwrap();
-        assert_eq!(aggregate.receipt_count, 1);
-        assert!(aggregate.is_canonical());
-
-        assert!(
-            NodeDrainReceiptAggregate::new(&transition, process, &[receipt.clone(), receipt])
-                .is_err()
-        );
     }
 }

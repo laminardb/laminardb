@@ -12,21 +12,26 @@ fn test_assignment_fence(
     cluster: &laminar_core::cluster::testing::MiniCluster,
     registry: &laminar_core::state::VnodeRegistry,
 ) -> laminar_core::checkpoint::CheckpointAssignmentFence {
-    let mut participants = cluster
-        .nodes
-        .iter()
-        .map(|node| laminar_core::checkpoint::CheckpointParticipant {
-            node_id: node.instance_id.0,
-            boot_incarnation: node.controller.recovery_incarnation(),
-        })
-        .collect::<Vec<_>>();
-    participants.sort_unstable_by_key(|participant| participant.node_id);
     let snapshot = registry.versioned_snapshot();
     let owners = snapshot
         .owners()
         .iter()
         .map(|owner| owner.0)
         .collect::<Vec<_>>();
+    let owner_set = owners
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut participants = cluster
+        .nodes
+        .iter()
+        .filter(|node| owner_set.contains(&node.instance_id.0))
+        .map(|node| laminar_core::checkpoint::CheckpointParticipant {
+            node_id: node.instance_id.0,
+            boot_incarnation: node.controller.recovery_incarnation(),
+        })
+        .collect::<Vec<_>>();
+    participants.sort_unstable_by_key(|participant| participant.node_id);
     laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
         snapshot.version(),
         &owners,
@@ -166,6 +171,37 @@ mod failures {
 
         assert_eq!(assignment_a, assignment_b);
         harness_b.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_vnode_workers_start_idle_without_joining_assignment_quorum() {
+        let mut harness = ClusterEngineHarness::spawn(3, 1).await;
+        setup_stateless_query(&harness).await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), harness.start_all())
+            .await
+            .expect("idle workers must not block cluster startup");
+
+        let snapshot = harness.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = snapshot.to_vnode_vec(1).unwrap()[0];
+        assert_eq!(snapshot.participants.len(), 1);
+        assert_eq!(snapshot.participants[0].node_id, owner.0);
+
+        for node in &harness.nodes {
+            let owns_vnode = node.instance_id == owner;
+            assert_eq!(node.owned_vnodes().len(), if owns_vnode { 1 } else { 0 });
+            assert_eq!(node.db.cluster_intake_fenced(), !owns_vnode);
+            if !owns_vnode {
+                assert_eq!(node.shuffle_sender.assignment_version(), 0);
+                assert_eq!(node.shuffle_receiver.assignment_version(), 0);
+            }
+        }
+
+        harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -334,7 +370,7 @@ mod rebalance {
     use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
     use laminar_core::state::{CheckpointAttempt, NodeId};
 
-    use super::cluster_harness::ClusterEngineHarness;
+    use super::cluster_harness::{AggregateObservation, ClusterEngineHarness};
 
     const VNODE_COUNT: u32 = 4;
     const N_NODES: usize = 2;
@@ -349,6 +385,280 @@ mod rebalance {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dead_aggregate_owner_advances_to_a_successor_recovery_quorum() {
+        let mut harness = ClusterEngineHarness::spawn(N_NODES, 1).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src",
+                super::cluster_harness::TEST_AGGREGATE_SINK_DDL,
+            ])
+            .await
+            .expect("bootstrap stateful cluster catalog");
+        harness.start_all().await;
+
+        let leader = harness.leader_idx();
+        let store = Arc::clone(&harness.nodes[leader].assignment_snapshot_store);
+        let predecessor = store.load().await.unwrap().unwrap();
+        let aggregate_owner = predecessor
+            .vnodes
+            .get(&0)
+            .copied()
+            .expect("global aggregate state is assigned through vnode zero");
+        let failed_index = harness
+            .nodes
+            .iter()
+            .position(|node| node.instance_id == aggregate_owner)
+            .expect("aggregate owner belongs to the running harness");
+
+        harness.source_log.append(&[(1, 10), (2, 20)]);
+        wait_for(
+            || {
+                harness
+                    .sink_state
+                    .observations()
+                    .contains(&AggregateObservation {
+                        node_id: aggregate_owner,
+                        total: 30,
+                        weight: 1,
+                    })
+            },
+            "aggregate owner to publish the non-empty total",
+        )
+        .await;
+
+        let committed = harness.nodes[leader]
+            .db
+            .checkpoint()
+            .await
+            .expect("seed cluster checkpoint");
+        assert!(
+            committed.success,
+            "seed cluster checkpoint failed: {:?}",
+            committed.error
+        );
+        let committed_attempt = CheckpointAttempt::new(committed.epoch, committed.checkpoint_id);
+        assert_eq!(
+            harness.nodes[failed_index]
+                .source_state
+                .last_checkpoint_cursor(),
+            2,
+            "the committed cut must own both scripted input rows"
+        );
+        let observations_at_commit = harness.sink_state.observations();
+        assert!(
+            observations_at_commit
+                .iter()
+                .all(|observation| observation.node_id == aggregate_owner),
+            "only the vnode owner may consume the scripted split before failover: {observations_at_commit:?}"
+        );
+        let mut baseline_relation = std::collections::BTreeMap::<i64, i64>::new();
+        for observation in &observations_at_commit {
+            *baseline_relation.entry(observation.total).or_default() += observation.weight;
+        }
+        baseline_relation.retain(|_, weight| *weight != 0);
+        assert_eq!(
+            baseline_relation,
+            std::collections::BTreeMap::from([(30, 1)]),
+            "the committed aggregate relation must contain exactly one total 30"
+        );
+        assert!(
+            harness.nodes[failed_index].source_state.polls() > 0,
+            "the vnode-zero owner must be the process that consumed the scripted split"
+        );
+        for (index, node) in harness.nodes.iter().enumerate() {
+            if index != failed_index {
+                assert_eq!(
+                    node.source_state.polls(),
+                    0,
+                    "a non-owner source process must never poll the shared split"
+                );
+            }
+        }
+
+        harness.source_log.block_resumes();
+        let survivor_index = (0..harness.nodes.len())
+            .find(|index| *index != failed_index)
+            .expect("two-node harness has one survivor");
+        let resume_starts_before_failure =
+            harness.nodes[survivor_index].source_state.resume_starts();
+        let stopped = harness.fail_node_runtime(failed_index).await;
+        assert_eq!(stopped, aggregate_owner);
+        assert_eq!(harness.nodes.len(), 1);
+        let survivor_id = harness.nodes[0].instance_id;
+        let survivor_db = Arc::clone(&harness.nodes[0].db);
+        let survivor_registry = Arc::clone(&harness.nodes[0].vnode_registry);
+        let survivor_source_state = Arc::clone(&harness.nodes[0].source_state);
+        let successor_version = predecessor.version + 1;
+
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while survivor_source_state.resume_starts() <= resume_starts_before_failure {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("successor source must install its durable cursor before intake opens");
+        assert_eq!(
+            survivor_source_state.last_resume_cursor(),
+            2,
+            "successor must resume after the committed input, not replay from zero"
+        );
+        assert!(
+            survivor_db.cluster_intake_fenced(),
+            "recovery must retain the source-intake fence while Resume is blocked"
+        );
+        assert!(
+            harness.cluster.nodes[0].controller.is_recovering(),
+            "the controller must remain in recovery while Resume is blocked"
+        );
+        let polls_while_fenced = survivor_source_state.polls();
+        assert_eq!(
+            harness.sink_state.observations(),
+            observations_at_commit,
+            "a fenced successor must not emit aggregate output"
+        );
+
+        harness.source_log.release_resumes();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let durable = store.load().await.unwrap().unwrap();
+                let recovered = durable.version == successor_version
+                    && !durable.draining
+                    && durable.participants.len() == 1
+                    && durable.participants[0].node_id == survivor_id.0
+                    && durable.vnodes.values().all(|owner| *owner == survivor_id)
+                    && survivor_registry.assignment_version() == successor_version
+                    && harness.cluster.nodes[0]
+                        .controller
+                        .checkpoint_assignment_fence(successor_version)
+                        .is_some_and(|fence| {
+                            fence.participants == durable.participants
+                                && fence.matches_owner_map(
+                                    &durable
+                                        .vnodes
+                                        .values()
+                                        .map(|owner| owner.0)
+                                        .collect::<Vec<_>>(),
+                                )
+                        })
+                    && harness.cluster.nodes[0].controller.is_leader()
+                    && !harness.cluster.nodes[0].controller.is_recovering()
+                    && !survivor_db.cluster_intake_fenced()
+                    && survivor_source_state.polls() > polls_while_fenced;
+                if recovered {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("successor owners must restore and resume serving");
+
+        let durable = store.load().await.unwrap().unwrap();
+        let survivor_controller = &harness.cluster.nodes[0].controller;
+        let decision = survivor_controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .assignment_recovery_decision(successor_version)
+            .await
+            .expect("recovery decision read")
+            .expect("successor must have a durable recovery decision");
+        assert_eq!(
+            decision.predecessor,
+            predecessor.assignment_fence().unwrap()
+        );
+        assert_eq!(decision.target, durable.assignment_fence().unwrap());
+        assert_eq!(
+            store
+                .load_recovery_proposal(&decision.proposal)
+                .await
+                .expect("staged recovery proposal"),
+            durable
+        );
+        assert_eq!(decision.removed_process_fences.len(), 1);
+        let removed = &decision.removed_process_fences[0];
+        assert_eq!(removed.predecessor.node, aggregate_owner);
+        assert_eq!(
+            removed.predecessor.owner,
+            predecessor
+                .participants
+                .iter()
+                .find(|participant| participant.node_id == aggregate_owner.0)
+                .expect("failed owner belongs to predecessor roster")
+                .boot_incarnation
+        );
+        assert!(
+            survivor_controller
+                .verify_process_lease_fence(
+                    removed,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .expect("failed-owner process fence verification"),
+            "the recovery decision must retain a verifiable takeover certificate"
+        );
+
+        let assignment = survivor_registry.versioned_snapshot();
+        assert_eq!(
+            assignment.source_handoff_attempt(),
+            Some(committed_attempt),
+            "new ownership must be restored from the last committed cluster cut"
+        );
+        harness.source_log.append(&[(3, 7)]);
+        wait_for(
+            || {
+                let observations = harness.sink_state.observations();
+                observations.contains(&AggregateObservation {
+                    node_id: survivor_id,
+                    total: 30,
+                    weight: -1,
+                }) && observations.contains(&AggregateObservation {
+                    node_id: survivor_id,
+                    total: 37,
+                    weight: 1,
+                })
+            },
+            "successor to retract restored total 30 and publish continued total 37",
+        )
+        .await;
+
+        let post_recovery = survivor_db
+            .checkpoint()
+            .await
+            .expect("checkpoint after successor recovery");
+        assert!(
+            post_recovery.success,
+            "post-recovery checkpoint failed: {:?}",
+            post_recovery.error
+        );
+        assert!(post_recovery.epoch > committed.epoch);
+        assert_eq!(
+            survivor_source_state.last_checkpoint_cursor(),
+            3,
+            "post-recovery checkpoint must advance the connector-local cursor once"
+        );
+        let observations = harness.sink_state.observations();
+        assert_eq!(
+            &observations[observations_at_commit.len()..],
+            &[
+                AggregateObservation {
+                    node_id: survivor_id,
+                    total: 30,
+                    weight: -1,
+                },
+                AggregateObservation {
+                    node_id: survivor_id,
+                    total: 37,
+                    weight: 1,
+                },
+            ],
+            "the post-barrier tail must contain no replay or stale-owner write"
+        );
+
+        harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -397,12 +707,29 @@ mod rebalance {
         harness.shutdown().await;
     }
 
-    /// Barrier-aligned handoff: the draining phase marks to-be-lost vnodes draining (source pauses
-    /// them for a clean cut) without changing ownership; the commit phase rotates and clears it.
+    /// Barrier-aligned handoff: the draining phase holds every predecessor source at one frontier
+    /// without changing ownership; the commit phase rotates and releases the cut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_watcher_handles_draining_phase() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
         harness.start_all().await;
+        // This test drives the durable assignment head directly. Retain the watchers under test
+        // and stop the independent placement drivers so they cannot abort the injected drain.
+        for node in &mut harness.nodes {
+            let placement_driver = node
+                .rebalance_tasks
+                .pop()
+                .expect("cluster harness starts one placement driver after each watcher");
+            placement_driver.abort();
+            let _ = placement_driver.await;
+        }
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -422,8 +749,8 @@ mod rebalance {
             vnodes.insert(v, leader);
         }
 
-        // Draining snapshot: the follower marks its lost vnodes draining, but ownership
-        // (the registry version) does not change.
+        // Draining snapshot: every predecessor process adopts the global source-cut transition,
+        // but ownership (the registry version) does not change.
         let pre_version = harness.nodes[follower_idx]
             .vnode_registry
             .assignment_version();
@@ -448,14 +775,35 @@ mod rebalance {
             store.save_if_version(&drain, seed.version).await.unwrap(),
             RotateOutcome::Rotated,
         ));
+        let transition = drain.drain_transition.clone();
         wait_for(
             || {
-                lost.iter()
-                    .all(|&v| harness.nodes[follower_idx].vnode_registry.is_draining(v))
+                harness.cluster.nodes[follower_idx]
+                    .controller
+                    .checkpoint_drain_transition()
+                    == transition
             },
-            "follower marks its lost vnodes draining",
+            "follower adopts the global source-cut transition",
         )
         .await;
+        let exact_transition = transition
+            .as_ref()
+            .expect("draining assignment has a transition");
+        tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
+                match harness.cluster.nodes[harness.leader_idx()]
+                    .controller
+                    .drain_ack_quorum_reached(exact_transition)
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => panic!("drain acknowledgement audit failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("every predecessor watcher must acknowledge the global source cut");
         assert_eq!(
             harness.nodes[follower_idx]
                 .vnode_registry
@@ -463,6 +811,23 @@ mod rebalance {
             pre_version,
             "drain phase must not change ownership",
         );
+
+        let checkpoint = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("pre-rotation checkpoint");
+        assert!(
+            checkpoint.success,
+            "pre-rotation checkpoint must consume the held FIFO barriers: {:?}",
+            checkpoint.error
+        );
+        let leader_idx = harness.leader_idx();
+        let held_polls = harness.nodes[leader_idx].source_state.polls();
+        assert_eq!(harness.nodes[leader_idx].source_state.drain_finishes(), 0);
+        let watcher = harness.nodes[leader_idx].rebalance_tasks.remove(0);
+        watcher.abort();
+        let _ = watcher.await;
 
         // Committed snapshot: ownership rotates and the drain clears.
         let commit = drain.committed_target().unwrap();
@@ -484,24 +849,62 @@ mod rebalance {
             store.finalize_drain(&drain, &commit).await.unwrap(),
             RotateOutcome::Rotated,
         ));
+        let restarted_watcher = laminar_db::rebalance::spawn_snapshot_watcher(
+            Arc::clone(&harness.nodes[leader_idx].db),
+            Arc::clone(&harness.nodes[leader_idx].assignment_snapshot_store),
+            Arc::clone(&harness.nodes[leader_idx].vnode_registry),
+            Arc::clone(&harness.nodes[leader_idx].rebalance_shutdown),
+            laminar_db::rebalance::RebalanceConfig::test_defaults(),
+            Some(Arc::clone(&harness.cluster.nodes[leader_idx].controller)),
+        );
+        harness.nodes[leader_idx]
+            .rebalance_tasks
+            .push(restarted_watcher);
+        let adoption_deadline = Instant::now() + POLL_DEADLINE;
+        while Instant::now() < adoption_deadline
+            && !harness
+                .nodes
+                .iter()
+                .all(|node| node.vnode_registry.assignment_version() >= expected)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let observed_versions: Vec<_> = harness
+            .nodes
+            .iter()
+            .map(|node| node.vnode_registry.assignment_version())
+            .collect();
+        assert!(
+            observed_versions.iter().all(|version| *version >= expected),
+            "every node must adopt committed assignment {expected}; observed {observed_versions:?}"
+        );
         wait_for(
             || {
                 harness
+                    .cluster
                     .nodes
                     .iter()
-                    .all(|n| n.vnode_registry.assignment_version() >= expected)
+                    .all(|node| node.controller.checkpoint_drain_transition().is_none())
             },
-            "every node adopts the committed snapshot",
+            "every watcher resolves the global source cut",
         )
         .await;
-        for node in &harness.nodes {
-            for v in 0..VNODE_COUNT {
-                assert!(
-                    !node.vnode_registry.is_draining(v),
-                    "draining must clear on commit",
-                );
-            }
-        }
+        wait_for(
+            || {
+                harness.nodes[leader_idx].source_state.drain_finishes() == 1
+                    && harness.nodes[leader_idx].source_state.polls() > held_polls
+                    && !harness.nodes[leader_idx].db.cluster_intake_fenced()
+            },
+            "fresh leader watcher to resolve durable source history before reopening intake",
+        )
+        .await;
+        let drain_resolutions = harness.nodes[leader_idx].source_state.drain_resolutions();
+        assert_eq!(drain_resolutions.len(), 1);
+        assert_eq!(
+            drain_resolutions[0].outcome,
+            laminar_connectors::connector::SourceDrainOutcome::Commit,
+            "the connector must observe the durable handoff outcome"
+        );
         assert_eq!(
             harness.nodes[harness.leader_idx()].owned_vnodes().len(),
             VNODE_COUNT as usize,

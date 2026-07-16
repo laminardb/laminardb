@@ -30,13 +30,21 @@ const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(8);
 /// 500 ms gossip_discovery watcher interval plus a margin.
 const FAILOVER_DEADLINE: Duration = Duration::from_secs(5);
 
-fn test_snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
-    let participants = (1_u64..=3)
+fn test_participants(vnodes: &BTreeMap<u32, NodeId>) -> Vec<CheckpointParticipant> {
+    let mut owners = vnodes.values().map(|owner| owner.0).collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+        .into_iter()
         .map(|node_id| CheckpointParticipant {
             node_id,
             boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
         })
-        .collect();
+        .collect()
+}
+
+fn test_snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
+    let participants = test_participants(&vnodes);
     AssignmentSnapshot::empty()
         .next_for_participants(vnodes, participants)
         .unwrap()
@@ -338,7 +346,9 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
     faulty.set_fault(ObjectStoreFault::FailWrites);
     let mut v2_map = BTreeMap::new();
     v2_map.insert(0u32, NodeId(2));
-    let v2 = v1.next(v2_map).unwrap();
+    let v2 = v1
+        .next_for_participants(v2_map.clone(), test_participants(&v2_map))
+        .unwrap();
     let write_err = store
         .save_if_version(&v2, v1.version)
         .await

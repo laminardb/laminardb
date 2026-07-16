@@ -375,6 +375,40 @@ pub(crate) async fn start_http_api(
     config: ServerConfig,
     #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
+    Ok(prepare_http_api(
+        db,
+        registry,
+        config_path,
+        config,
+        #[cfg(feature = "cluster")]
+        cluster,
+    )
+    .await?
+    .start())
+}
+
+pub(crate) struct PreparedHttpApi {
+    app_state: Arc<http::AppState>,
+    router: axum::Router,
+    listener: tokio::net::TcpListener,
+    bind: String,
+}
+
+impl PreparedHttpApi {
+    pub(crate) fn start(self) -> (Arc<http::AppState>, tokio::task::JoinHandle<()>) {
+        let handle = http::serve_listener(self.router, self.listener);
+        info!("HTTP API listening on {}", self.bind);
+        (self.app_state, handle)
+    }
+}
+
+pub(crate) async fn prepare_http_api(
+    db: Arc<LaminarDB>,
+    registry: Arc<prometheus::Registry>,
+    config_path: PathBuf,
+    config: ServerConfig,
+    #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
+) -> Result<PreparedHttpApi, ServerError> {
     let bind = config.server.bind.clone();
 
     let server_metrics = ServerMetrics::new(&registry);
@@ -391,9 +425,13 @@ pub(crate) async fn start_http_api(
         cluster,
     });
     let router = http::build_router(Arc::clone(&app_state));
-    let api_handle = http::serve(router, &bind).await?;
-    info!("HTTP API listening on {bind}");
-    Ok((app_state, api_handle))
+    let listener = http::bind_listener(&bind).await?;
+    Ok(PreparedHttpApi {
+        app_state,
+        router,
+        listener,
+        bind,
+    })
 }
 
 /// Spawn config file watcher unless disabled via `LAMINAR_DISABLE_FILE_WATCH=1`.

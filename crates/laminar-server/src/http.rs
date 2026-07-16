@@ -188,18 +188,21 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
 }
 
-pub async fn serve(router: Router, bind: &str) -> Result<tokio::task::JoinHandle<()>, ServerError> {
-    let listener = tokio::net::TcpListener::bind(bind)
+pub async fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener, ServerError> {
+    tokio::net::TcpListener::bind(bind)
         .await
-        .map_err(|e| ServerError::Http(format!("failed to bind to {bind}: {e}")))?;
+        .map_err(|e| ServerError::Http(format!("failed to bind to {bind}: {e}")))
+}
 
-    let handle = tokio::spawn(async move {
+pub fn serve_listener(
+    router: Router,
+    listener: tokio::net::TcpListener,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
             tracing::error!("HTTP server error: {e}");
         }
-    });
-
-    Ok(handle)
+    })
 }
 
 /// Health check response.

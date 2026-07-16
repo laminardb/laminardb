@@ -1665,12 +1665,10 @@ mod tests {
                     .unwrap(),
             })
             .collect::<Vec<_>>();
-        let owners = vec![
-            participants
-                .first()
-                .expect("test assignment has a participant")
-                .node_id,
-        ];
+        let owners = participants
+            .iter()
+            .map(|participant| participant.node_id)
+            .collect::<Vec<_>>();
         CheckpointAssignmentFence::from_owner_map(version, &owners, participants).unwrap()
     }
 

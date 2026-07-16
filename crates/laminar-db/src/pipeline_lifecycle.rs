@@ -14,6 +14,8 @@ use laminar_connectors::connector::{
 use laminar_core::state::StateBackendDurability;
 use rustc_hash::FxHashMap;
 
+#[cfg(feature = "cluster")]
+use crate::db::ClusterStartupDisposition;
 use crate::db::{exact_table_reference, DbState, LaminarDB, RuntimeMode, SourceWatermarkState};
 use crate::error::DbError;
 
@@ -1006,7 +1008,7 @@ impl LaminarDB {
     pub async fn finish_cluster_startup(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<bool, DbError> {
+    ) -> Result<ClusterStartupDisposition, DbError> {
         let authority_revision = self
             .assignment_authority_revision
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1028,13 +1030,57 @@ impl LaminarDB {
                     "cluster assignment {assignment_version} is not certified for source intake"
                 ))
             })?;
-        if assignment_fence.participant_incarnation(controller.instance_id().0)
-            != Some(controller.recovery_incarnation())
-        {
-            return Err(DbError::Checkpoint(format!(
-                "cluster assignment {assignment_version} does not certify this process"
-            )));
+        let local_id = controller.instance_id().0;
+        let local_incarnation = assignment_fence.participant_incarnation(local_id);
+        let idle = match local_incarnation {
+            Some(incarnation) if incarnation == controller.recovery_incarnation() => false,
+            Some(_) => {
+                return Err(DbError::Checkpoint(format!(
+                    "cluster assignment {assignment_version} certifies another incarnation of process {local_id}"
+                )));
+            }
+            None if owners.contains(&local_id) => {
+                return Err(DbError::Checkpoint(format!(
+                    "cluster assignment {assignment_version} gives process {local_id} ownership without checkpoint authority"
+                )));
+            }
+            None => true,
+        };
+        if idle {
+            controller.set_recovering(false);
+            let drain_transition = controller
+                .checkpoint_drain_transition()
+                .filter(|transition| transition.predecessor == assignment_fence);
+            let activation = self
+                .activate_assignment_authority(
+                    &assignment_fence,
+                    drain_transition,
+                    authority_revision,
+                    deadline,
+                )
+                .await?;
+            if !activation.installed {
+                self.set_source_gate(true);
+                return Ok(ClusterStartupDisposition::RecoveryFenced);
+            }
+            return Ok(ClusterStartupDisposition::Idle);
         }
+        let pending_fault =
+            match tokio::time::timeout_at(deadline, controller.read_fault_reports()).await {
+                Err(_) => {
+                    controller.set_recovering(true);
+                    return Err(DbError::Checkpoint(
+                        "cluster startup recovery fault audit timed out".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    controller.set_recovering(true);
+                    return Err(DbError::Checkpoint(format!(
+                        "cluster startup recovery fault audit failed: {error}"
+                    )));
+                }
+                Ok(Ok(reports)) => reports.iter().any(|(_, sequence)| *sequence != 0),
+            };
         let active = match tokio::time::timeout_at(deadline, controller.observe_recover()).await {
             Err(_) => {
                 return Err(DbError::Checkpoint(
@@ -1063,10 +1109,13 @@ impl LaminarDB {
                             "startup recovery authority failed ({error}); fault publication failed: {report_error}"
                         ))
                     })?;
-                return Ok(false);
+                return Ok(ClusterStartupDisposition::RecoveryFenced);
             }
         };
-        let open_intake = if let Some(active) = active {
+        let open_intake = if pending_fault {
+            controller.set_recovering(true);
+            false
+        } else if let Some(active) = active {
             controller.set_recovering(true);
             if !controller.recovery_driver_is_current(&active.round)
                 || !controller.recovery_round_contains_current_process(&active.round)
@@ -1113,9 +1162,13 @@ impl LaminarDB {
         if !activation.installed {
             controller.set_recovering(true);
             self.set_source_gate(true);
-            return Ok(false);
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
         }
-        Ok(open_intake && activation.intake_open)
+        Ok(if open_intake && activation.intake_open {
+            ClusterStartupDisposition::Serving
+        } else {
+            ClusterStartupDisposition::RecoveryFenced
+        })
     }
 
     /// Advance both shuffle directions to the coordinated recovery generation. Old streams are
@@ -1132,7 +1185,7 @@ impl LaminarDB {
     }
 
     /// Resolve only the cumulative shuffle-loss cutoff captured when this exact generation
-    /// started. Called after the local Release acknowledgement is durable and before intake opens.
+    /// started. This must succeed before publishing local `Release` readiness.
     #[cfg(feature = "cluster")]
     pub(crate) fn complete_shuffle_recovery(&self, gen: u64) -> bool {
         self.shuffle_receiver
@@ -2056,9 +2109,10 @@ impl LaminarDB {
     pub(crate) async fn revalidate_persisted_cluster_query_shapes(
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-    ) -> Result<(), DbError> {
+    ) -> Result<bool, DbError> {
         let mut streams: Vec<_> = stream_regs.values().collect();
         streams.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut has_ownership_partitioned_state = false;
         for stream in streams {
             let plan = crate::ddl::PlannedStreamingQuery {
                 emit_clause: stream.emit_clause.clone(),
@@ -2068,15 +2122,16 @@ impl LaminarDB {
                 has_analytic: stream.has_analytic,
                 has_frame: stream.has_frame,
             };
-            self.validate_cluster_query_shape(
-                "persisted stream",
-                &stream.name,
-                &stream.query_sql,
-                &plan,
-            )
-            .await?;
+            has_ownership_partitioned_state |= self
+                .validate_cluster_query_shape(
+                    "persisted stream",
+                    &stream.name,
+                    &stream.query_sql,
+                    &plan,
+                )
+                .await?;
         }
-        Ok(())
+        Ok(has_ownership_partitioned_state)
     }
 
     /// Build and start the unified pipeline with sources, sinks, and streams.
@@ -3432,26 +3487,14 @@ impl LaminarDB {
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         };
 
+        if pipeline_config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && pipeline_config.checkpoint_interval.is_none()
         {
-            use laminar_connectors::connector::DeliveryGuarantee;
-
-            if pipeline_config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-                && pipeline_config.checkpoint_interval.is_none()
-            {
-                return Err(DbError::Config(
-                    "[LDB-5032] exactly-once requires checkpointing to be enabled. \
+            return Err(DbError::Config(
+                "[LDB-5032] exactly-once requires checkpointing to be enabled. \
                      Set checkpoint.interval.ms in the pipeline configuration."
-                        .into(),
-                ));
-            }
-
-            // Drive the pre-rotation drain off the sinks, not the DB-level guarantee (set per sink
-            // by the server): an EO sink can't dedup a rotation dup, so rotation pauses the source.
-            let has_eo_sink = sinks
-                .iter()
-                .any(|(_, h, _, _, _)| h.checkpoint_committable());
-            self.rotation_drain_required
-                .store(has_eo_sink, std::sync::atomic::Ordering::Release);
+                    .into(),
+            ));
         }
 
         let shutdown = self.shutdown_signal.clone();
@@ -3652,6 +3695,7 @@ impl LaminarDB {
                 control_rx,
                 source_gate,
                 Arc::clone(&self.owned_source_tasks),
+                runtime_mode == RuntimeMode::Cluster,
             )
             .await?
             .with_force_checkpoint_rx(force_ckpt_rx)
@@ -5761,7 +5805,7 @@ mod mv_recovery_lifecycle_tests {
 mod cluster_fault_watcher_tests {
     use super::report_cluster_compute_fault;
     use crate::db::DbState;
-    use crate::LaminarDB;
+    use crate::{ClusterStartupDisposition, LaminarDB};
     use async_trait::async_trait;
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
@@ -5771,7 +5815,9 @@ mod cluster_fault_watcher_tests {
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::checkpoint::CheckpointAssignmentFence;
-    use laminar_core::cluster::control::controller::{RecoveryAnnouncement, RecoveryRound};
+    use laminar_core::cluster::control::controller::{
+        RecoveryAnnouncement, RecoveryFault, RecoveryRound,
+    };
     use laminar_core::cluster::control::{
         CatalogManifest, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
         CheckpointParticipant, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
@@ -5917,7 +5963,7 @@ mod cluster_fault_watcher_tests {
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
         let round = RecoveryRound::new(
             1,
-            node_id,
+            lease.proof(),
             CheckpointAssignmentFence::from_owner_map(
                 1,
                 &[node_id.0],
@@ -5927,6 +5973,10 @@ mod cluster_fault_watcher_tests {
                 }],
             )
             .unwrap(),
+            vec![RecoveryFault {
+                reporter: node_id,
+                sequence: 1,
+            }],
         )
         .unwrap();
         controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
@@ -5977,12 +6027,77 @@ mod cluster_fault_watcher_tests {
     async fn fresh_certified_cluster_startup_opens_intake() {
         let (db, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
 
-        assert!(db
-            .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap());
+        assert_eq!(
+            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ClusterStartupDisposition::Serving
+        );
         assert!(!db.source_gate.load(std::sync::atomic::Ordering::Acquire));
         assert!(!controller.is_recovering());
+    }
+
+    #[tokio::test]
+    async fn durable_fault_before_startup_audit_keeps_intake_closed() {
+        let (db, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
+        controller.report_fault(9).await.unwrap();
+
+        assert_eq!(
+            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ClusterStartupDisposition::RecoveryFenced
+        );
+        assert!(db.cluster_intake_fenced());
+        assert!(controller.is_recovering());
+    }
+
+    #[tokio::test]
+    async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
+        let local = StateNodeId(7);
+        let owner = StateNodeId(8);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(local));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(local, kv, None, members_rx));
+        controller.publish_recovery_incarnation().await.unwrap();
+        controller.set_active(true);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[owner.0],
+            vec![CheckpointParticipant {
+                node_id: owner.0,
+                boot_incarnation: uuid::Uuid::from_u128(88),
+            }],
+        )
+        .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
+            local.0,
+            controller.recovery_incarnation(),
+        ));
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, owner)))
+            .shuffle_sender(Arc::clone(&sender))
+            .build()
+            .await
+            .unwrap();
+        db.fence_cluster_startup();
+
+        assert_eq!(
+            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ClusterStartupDisposition::Idle
+        );
+        assert!(db.cluster_intake_fenced());
+        assert_eq!(sender.assignment_version(), 0);
+        assert!(sender.active_assignment_digest().is_none());
+        assert_eq!(controller.checkpoint_assignment_fence(1), Some(fence));
+        assert!(!controller.is_recovering());
+        assert!(controller.read_fault_reports().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6113,7 +6228,10 @@ mod cluster_fault_watcher_tests {
         db.suspend_shuffle_assignment_fence();
         drop(execution);
 
-        assert!(!starting.await.unwrap().unwrap());
+        assert_eq!(
+            starting.await.unwrap().unwrap(),
+            ClusterStartupDisposition::RecoveryFenced
+        );
         assert!(db.cluster_intake_fenced());
         assert_eq!(controller.checkpoint_assignment_fence(1), None);
     }
@@ -6184,10 +6302,13 @@ mod cluster_fault_watcher_tests {
     async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
         let (restored, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
         *restored.last_recovery_epoch.lock() = Some(9);
-        assert!(!restored
-            .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap());
+        assert_eq!(
+            restored
+                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ClusterStartupDisposition::RecoveryFenced
+        );
         assert!(restored
             .source_gate
             .load(std::sync::atomic::Ordering::Acquire));
@@ -6195,10 +6316,13 @@ mod cluster_fault_watcher_tests {
 
         let (active, controller, _kv, round, _manifest_store, _proof) = startup_db().await;
         controller.announce_recover_prepare(&round).await.unwrap();
-        assert!(!active
-            .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap());
+        assert_eq!(
+            active
+                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ClusterStartupDisposition::RecoveryFenced
+        );
         assert!(active
             .source_gate
             .load(std::sync::atomic::Ordering::Acquire));
@@ -6207,26 +6331,7 @@ mod cluster_fault_watcher_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn active_recovery_does_not_block_compute_fault_handoff() {
-        let node_id = NodeId(7);
-        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
-        controller.publish_recovery_incarnation().await.unwrap();
-        let round = RecoveryRound::new(
-            42,
-            node_id,
-            CheckpointAssignmentFence::from_owner_map(
-                1,
-                &[node_id.0],
-                vec![CheckpointParticipant {
-                    node_id: node_id.0,
-                    boot_incarnation: controller.recovery_incarnation(),
-                }],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+        let (_db, controller, _kv, round, _manifest_store, _proof) = startup_db().await;
         controller.announce_recover_prepare(&round).await.unwrap();
         assert_eq!(
             controller.observe_recover().await.unwrap(),
@@ -6249,7 +6354,7 @@ mod cluster_fault_watcher_tests {
             .await
             .unwrap()
             .into_iter()
-            .any(|(node, sequence)| node == node_id && sequence > 0));
+            .any(|(node, sequence)| node == controller.instance_id() && sequence > 0));
         assert_eq!(
             controller.observe_recover().await.unwrap(),
             Some(RecoveryAnnouncement {

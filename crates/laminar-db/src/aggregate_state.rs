@@ -818,6 +818,34 @@ impl IncrementalAggState {
     pub(crate) fn num_group_cols(&self) -> usize {
         self.num_group_cols
     }
+
+    pub(crate) fn cluster_state_rejection(&self, reads_changelog: bool) -> Option<String> {
+        if self.num_group_cols != 0 {
+            return Some(
+                "keyed aggregates retain operator-owned map state without a live-state byte budget"
+                    .into(),
+            );
+        }
+        for spec in &self.agg_specs {
+            let name = spec.udf.name().to_ascii_lowercase();
+            if spec.distinct {
+                return Some(format!(
+                    "DISTINCT aggregate '{name}' has unbounded per-key state and no spillable vnode lifecycle"
+                ));
+            }
+            if reads_changelog && matches!(name.as_str(), "min" | "max") {
+                return Some(format!(
+                    "aggregate '{name}' over a changelog uses an unbounded counted multiset and has no spillable vnode lifecycle"
+                ));
+            }
+            if !matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+                return Some(format!(
+                    "aggregate '{name}' has unbounded or unclassified per-key state and no spillable vnode lifecycle"
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// Z-set weight column name shared between the MV producer and upsert-sink consumers.

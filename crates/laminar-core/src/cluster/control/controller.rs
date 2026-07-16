@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -15,15 +17,20 @@ use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
 use crate::checkpoint::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentAdoption,
-    CheckpointAssignmentFence, CheckpointParticipant, NodeDrainReceiptAggregate,
+    CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
 };
 use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
 use crate::state::{CheckpointAttempt, Locality};
 
 const RECOVERY_INCARNATION_KEY: &str = "control:recovery-incarnation";
 const DRAIN_ACK_KEY: &str = "control:drain-ack";
+const DRAIN_ACK_PROTOCOL_VERSION: u16 = 1;
+const RELEASE_READY_ACK_KEY: &str = "control:recovery-release-ready";
+const RELEASE_READY_PROTOCOL_VERSION: u16 = 1;
 const RECOVERY_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DRAIN_ACK_BYTES: usize = 1_024;
+const MAX_RELEASE_READY_ACK_BYTES: usize = 1_024;
+const CONTROL_ROSTER_IO_CONCURRENCY: usize = 32;
 
 #[cfg(feature = "cluster")]
 struct LeaderLeaseGate {
@@ -43,32 +50,51 @@ pub struct RecoveryRoundId {
     pub driver: NodeId,
 }
 
-/// Frozen recovery quorum and its assignment certificate.
+/// Frozen recovery quorum, assignment certificate, and durable driver term.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryRound {
     /// Unique round identity.
     pub id: RecoveryRoundId,
+    /// Exact durable leader term that created and may advance this round.
+    pub leader_proof: LeaderProof,
     /// Exact owner-complete assignment cut from which the quorum was frozen.
     pub assignment_fence: CheckpointAssignmentFence,
+    /// Canonical nonzero fault reports covered by this round's terminal `Release`.
+    pub faults: Vec<RecoveryFault>,
+}
+
+/// One durable fault report covered by a coordinated recovery round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryFault {
+    /// Stable node slot that published the report.
+    pub reporter: NodeId,
+    /// Nonzero boot-bound report sequence observed by the recovery driver.
+    pub sequence: u64,
 }
 
 impl RecoveryRound {
     /// Construct a fresh uniquely identified recovery round.
     ///
     /// # Errors
-    /// Returns an error when the generation, driver, or assignment certificate is invalid.
+    /// Returns an error when the generation, leader proof, or assignment certificate is invalid.
     pub fn new(
         generation: u64,
-        driver: NodeId,
+        leader_proof: LeaderProof,
         assignment_fence: CheckpointAssignmentFence,
+        faults: Vec<RecoveryFault>,
     ) -> Result<Self, String> {
+        let driver = NodeId(leader_proof.owner.node_id);
         let round = Self {
             id: RecoveryRoundId {
                 generation,
                 nonce: Uuid::new_v4(),
                 driver,
             },
+            leader_proof,
             assignment_fence,
+            faults,
         };
         round.validate()?;
         Ok(round)
@@ -96,6 +122,15 @@ impl RecoveryRound {
         self.assignment_fence.participant_incarnation(node.0)
     }
 
+    /// Exact fault sequence this round covers for `node`.
+    #[must_use]
+    pub fn fault_sequence(&self, node: NodeId) -> Option<u64> {
+        self.faults
+            .binary_search_by_key(&node, |fault| fault.reporter)
+            .ok()
+            .map(|index| self.faults[index].sequence)
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.id.generation == 0 {
             return Err("recovery generation must be nonzero".into());
@@ -106,11 +141,30 @@ impl RecoveryRound {
         if self.id.driver.is_unassigned() {
             return Err("recovery driver must be assigned".into());
         }
+        if !self.leader_proof.is_canonical() || self.id.driver.0 != self.leader_proof.owner.node_id
+        {
+            return Err("recovery driver must match a canonical leader proof".into());
+        }
         if !self.assignment_fence.is_canonical() {
             return Err("recovery assignment certificate is not canonical".into());
         }
         if !self.contains(self.id.driver) {
             return Err("recovery driver is absent from the frozen quorum".into());
+        }
+        if self.participant_incarnation(self.id.driver) != Some(self.leader_proof.owner.boot_id) {
+            return Err("recovery leader proof is not bound to the frozen driver process".into());
+        }
+        if self.faults.is_empty()
+            || self
+                .faults
+                .iter()
+                .any(|fault| fault.reporter.is_unassigned() || fault.sequence == 0)
+            || self
+                .faults
+                .windows(2)
+                .any(|pair| pair[0].reporter >= pair[1].reporter)
+        {
+            return Err("recovery fault set is not canonical".into());
         }
         Ok(())
     }
@@ -126,9 +180,15 @@ pub enum RecoverPhase {
         /// Rewind target; `0` means no committed cut exists — restart fresh.
         epoch: u64,
     },
-    /// Terminal authorisation to open source gates after the exact restore quorum.
+    /// Every restored owner must prepare its local transport authority and publish readiness while
+    /// source gates remain closed.
     Release {
         /// The identical rewind target carried by `Start`.
+        epoch: u64,
+    },
+    /// Leader-fenced terminal decision that every exact owner was ready for the release intent.
+    ReleaseCommitted {
+        /// The identical rewind target carried by `Start` and `Release`.
         epoch: u64,
     },
 }
@@ -143,7 +203,7 @@ pub struct RecoveryAnnouncement {
 }
 
 impl RecoveryAnnouncement {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         self.round.validate()
     }
 }
@@ -160,36 +220,190 @@ struct RecoveryAnnouncementAck {
     incarnation: Uuid,
 }
 
-/// Bounded durable proof that one exact process paused its revoking partitions for one
-/// assignment handoff. The certificate digest binds the version, vnode-owner map, and complete
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryReleaseId {
+    protocol_version: u16,
+    generation: u64,
+    nonce: Uuid,
+    driver: NodeId,
+    epoch: u64,
+    round_sha256: String,
+}
+
+#[derive(serde::Serialize)]
+struct RecoveryReleaseDigestInput<'a> {
+    protocol: &'static str,
+    round: &'a RecoveryRound,
+    epoch: u64,
+}
+
+impl RecoveryReleaseId {
+    pub(crate) fn for_pending(release: &RecoveryAnnouncement) -> Result<Self, String> {
+        let RecoverPhase::Release { epoch } = release.phase else {
+            return Err("release readiness must bind a pending Release target".into());
+        };
+        release.validate()?;
+        let encoded = serde_json::to_vec(&RecoveryReleaseDigestInput {
+            protocol: "laminardb-recovery-release-v1",
+            round: &release.round,
+            epoch,
+        })
+        .map_err(|error| format!("could not encode recovery release identity: {error}"))?;
+        Ok(Self {
+            protocol_version: RELEASE_READY_PROTOCOL_VERSION,
+            generation: release.round.id.generation,
+            nonce: release.round.id.nonce,
+            driver: release.round.id.driver,
+            epoch,
+            round_sha256: sha256_hex(&encoded),
+        })
+    }
+
+    pub(crate) fn is_canonical(&self) -> bool {
+        self.protocol_version == RELEASE_READY_PROTOCOL_VERSION
+            && self.generation != 0
+            && !self.nonce.is_nil()
+            && !self.driver.is_unassigned()
+            && is_sha256_hex(&self.round_sha256)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryReleaseReadyAck {
+    release: RecoveryReleaseId,
+    participant: CheckpointParticipant,
+}
+
+impl RecoveryReleaseReadyAck {
+    fn is_canonical(&self) -> bool {
+        self.release.is_canonical()
+            && self.participant.node_id != 0
+            && !self.participant.boot_incarnation.is_nil()
+    }
+}
+
+/// Classified recovery-control failure. Only [`Self::Uncertain`] is retryable.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RecoveryControlError {
+    /// A bounded durable operation has an unknown outcome.
+    #[error("recovery control outcome is uncertain: {0}")]
+    Uncertain(String),
+    /// Durable state is malformed or contradicts the exact protocol identity.
+    #[error("recovery control conflict: {0}")]
+    Conflict(String),
+    /// A newer process, round, fault set, or leader term replaced this operation.
+    #[error("recovery round was superseded: {0}")]
+    Superseded(String),
+}
+
+impl RecoveryControlError {
+    #[cfg(feature = "cluster")]
+    fn from_authority(error: super::ClusterCheckpointAuthorityError) -> Self {
+        match error {
+            super::ClusterCheckpointAuthorityError::Authority(super::LeaseError::Io(reason)) => {
+                Self::Uncertain(reason)
+            }
+            super::ClusterCheckpointAuthorityError::Fenced => {
+                Self::Superseded("durable leader authority changed".into())
+            }
+            error => Self::Conflict(error.to_string()),
+        }
+    }
+}
+
+/// Exact leader-side observation of the compact release-readiness roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleaseReadyStatus {
+    /// At least one frozen owner has not published readiness for this release intent.
+    Pending {
+        /// Exact owner slots still missing a matching record.
+        missing: Vec<NodeId>,
+    },
+    /// Every frozen owner published the exact release identity.
+    Complete,
+}
+
+/// One bounded leader attempt to commit a pending recovery Release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseCommitStatus {
+    /// At least one frozen owner has not prepared this exact release intent.
+    Pending {
+        /// Exact owner slots still missing a matching readiness record.
+        missing: Vec<NodeId>,
+    },
+    /// The leader durably admitted the immutable terminal into shared authority.
+    Committed {
+        /// Exact terminal record followers resolve from shared authority across takeover.
+        terminal: RecoveryAnnouncement,
+    },
+}
+
+/// Held after this process conditionally consumes a committed recovery fault and until its local
+/// source gate transition is complete. A concurrent fault report cannot cross that transition.
+#[must_use = "keep the release guard until local source intake is opened or definitively fenced"]
+pub struct RecoveryReleaseGuard<'a> {
+    _write_guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl std::fmt::Debug for RecoveryReleaseGuard<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryReleaseGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+fn sha256_hex(encoded: &[u8]) -> String {
+    let digest = Sha256::digest(encoded);
+    let mut hex = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Bounded durable proof that one exact predecessor process reached the global source frontier
+/// for an assignment handoff. The round binds the version, vnode-owner map, and complete
 /// boot-incarnation roster; a version alone is not an assignment identity.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DrainAck {
+    protocol_version: u16,
     participant: CheckpointParticipant,
     round: AssignmentDrainId,
-    sources: NodeDrainReceiptAggregate,
 }
 
 impl DrainAck {
     fn for_transition(
         participant: CheckpointParticipant,
         transition: &AssignmentDrainTransition,
-        sources: NodeDrainReceiptAggregate,
     ) -> Self {
         Self {
+            protocol_version: DRAIN_ACK_PROTOCOL_VERSION,
             participant,
             round: transition.id(),
-            sources,
         }
     }
 
     fn is_canonical(&self) -> bool {
-        self.participant.node_id != 0
+        self.protocol_version == DRAIN_ACK_PROTOCOL_VERSION
+            && self.participant.node_id != 0
             && !self.participant.boot_incarnation.is_nil()
             && self.round.is_canonical()
-            && self.sources.is_canonical()
-            && self.sources.round_digest == self.round.digest
     }
 
     fn matches_transition(&self, transition: &AssignmentDrainTransition) -> bool {
@@ -276,6 +490,46 @@ fn parse_recovery_announcement_ack(
     Ok(ack.announcement)
 }
 
+fn encode_release_ready_ack(ack: &RecoveryReleaseReadyAck) -> Result<String, String> {
+    if !ack.is_canonical() {
+        return Err("release readiness acknowledgement is not canonical".into());
+    }
+    let encoded = serde_json::to_string(ack)
+        .map_err(|error| format!("could not encode release readiness: {error}"))?;
+    if encoded.len() > MAX_RELEASE_READY_ACK_BYTES {
+        return Err(format!(
+            "release readiness is {} bytes; maximum is {MAX_RELEASE_READY_ACK_BYTES}",
+            encoded.len()
+        ));
+    }
+    Ok(encoded)
+}
+
+fn parse_release_ready_ack(
+    raw: &str,
+    publisher: NodeId,
+) -> Result<RecoveryReleaseReadyAck, String> {
+    if raw.len() > MAX_RELEASE_READY_ACK_BYTES {
+        return Err(format!(
+            "release readiness from {publisher} is {} bytes; maximum is {MAX_RELEASE_READY_ACK_BYTES}",
+            raw.len()
+        ));
+    }
+    let ack: RecoveryReleaseReadyAck = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid release readiness from {publisher}: {error}"))?;
+    if !ack.is_canonical() || ack.participant.node_id != publisher.0 {
+        return Err(format!(
+            "release readiness from {publisher} has a non-canonical publisher"
+        ));
+    }
+    if encode_release_ready_ack(&ack)? != raw {
+        return Err(format!(
+            "release readiness from {publisher} is not canonically encoded"
+        ));
+    }
+    Ok(ack)
+}
+
 /// Facade composing the cluster-control primitives.
 pub struct ClusterController {
     instance_id: NodeId,
@@ -310,17 +564,23 @@ pub struct ClusterController {
     process_lease_live: Arc<AtomicBool>,
     /// Monotonic deadline consulted directly by hot compute/control paths.
     process_lease_deadline: std::sync::OnceLock<Arc<super::LeaseDeadline>>,
-    /// Whether this node may be elected leader. Draining nodes retain checkpoint ownership but
-    /// must yield coordination immediately so a successor can rotate their vnodes away.
+    /// Shared durable authority used to prove an unresponsive process term was revoked.
+    process_lease_authority: std::sync::OnceLock<Arc<super::process_lease::ProcessLeaseAuthority>>,
+    /// Whether this node may be elected leader. A certified leader may retain coordination while
+    /// draining so it can checkpoint its own predecessor cut.
     leader_eligible: Arc<AtomicBool>,
     /// Wakes the leader candidacy relay when local eligibility changes.
     leader_eligibility_changes: watch::Sender<bool>,
-    /// Serialises this node's recovery-slot compare-and-clear with phase transitions.
+    /// Last certified assignment roster. Retained across transient certificate suspension so an
+    /// ownerless worker cannot displace an available data owner. If every certified owner is
+    /// unavailable, a durably lease-fenced idle worker may lead placement repair only.
+    leadership_participants: parking_lot::RwLock<Option<(u64, Vec<u64>)>>,
+    /// Serialises this node's recovery and fault-slot conditional writes.
     recovery_writes: tokio::sync::Mutex<()>,
-    /// Peers that recently missed a capture quorum, keyed by node id. Gossip failure detection
-    /// can lag a hard kill by tens of seconds; the checkpoint gate consults this faster local
-    /// signal to fail doomed epochs. Cleared on re-ack, expires after [`UNRESPONSIVE_TTL`].
-    unresponsive: Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, std::time::Instant>>>,
+    /// Exact process incarnations that missed a capture quorum, keyed by stable node id. Entries
+    /// remain quarantined until that process acknowledges or a different lease-bound boot appears;
+    /// elapsed time is not evidence that a stalled owner became safe.
+    unresponsive: Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, Option<Uuid>>>>,
     /// This node's own failure-domain locality; peers carry theirs in `members_rx`.
     self_locality: parking_lot::RwLock<Locality>,
     /// Handler serving cross-node `RemoteScan`, shared with the query server.
@@ -412,8 +672,10 @@ impl ClusterController {
             active: Arc::new(AtomicBool::new(true)),
             process_lease_live: Arc::new(AtomicBool::new(true)),
             process_lease_deadline: std::sync::OnceLock::new(),
+            process_lease_authority: std::sync::OnceLock::new(),
             leader_eligible,
             leader_eligibility_changes: watch::channel(false).0,
+            leadership_participants: parking_lot::RwLock::new(None),
             recovery_writes: tokio::sync::Mutex::new(()),
             unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             self_locality: parking_lot::RwLock::new(Locality::default()),
@@ -443,6 +705,18 @@ impl ClusterController {
     #[cfg(feature = "cluster")]
     pub fn set_leader_lease_store(&self, store: Arc<super::LeaderLeaseStore>) {
         self.barrier.set_leader_lease_store(store);
+    }
+
+    /// Serve only leader proofs that remain live on this process's monotonic lease gate.
+    #[cfg(feature = "cluster")]
+    pub fn install_local_leader_proof_provider(self: &Arc<Self>) {
+        let controller = Arc::downgrade(self);
+        self.barrier
+            .set_local_leader_proof_provider(Arc::new(move || {
+                controller
+                    .upgrade()
+                    .and_then(|controller| controller.capture_leader_proof())
+            }));
     }
 
     /// Exact durable authority installed for this cluster controller.
@@ -497,19 +771,48 @@ impl ClusterController {
         &self.kv
     }
 
-    /// Current leader (lowest id among `Active` peers plus self).
+    /// Current leader: the lowest available active certified participant. A locally certified
+    /// incumbent may retain candidacy while it drains, but a remote draining process is never
+    /// nominated. When no certified participant is available, only a controller wired to durable
+    /// leader fencing may nominate the lowest idle worker so it can repair assignment authority.
     #[must_use]
     pub fn current_leader(&self) -> Option<NodeId> {
         let members = self.members_rx.borrow();
-        let mut ids: Vec<NodeId> = members
+        let participants = self.leadership_participants.read();
+        let unresponsive = self.unresponsive.lock();
+        let is_participant = |node: NodeId| {
+            participants
+                .as_ref()
+                .is_none_or(|(_, roster)| roster.binary_search(&node.0).is_ok())
+        };
+        let mut eligible: Vec<NodeId> = members
             .iter()
-            .filter(|m| m.id != self.instance_id && matches!(m.state, NodeState::Active))
+            .filter(|m| {
+                m.id != self.instance_id
+                    && matches!(m.state, NodeState::Active)
+                    && !unresponsive.contains_key(&m.id.0)
+            })
             .map(|m| m.id)
             .collect();
-        if self.leader_eligible.load(Ordering::SeqCst) && self.process_lease_is_live() {
-            ids.push(self.instance_id);
+        if self.leader_eligible.load(Ordering::SeqCst)
+            && self.process_lease_is_live()
+            && !unresponsive.contains_key(&self.instance_id.0)
+        {
+            eligible.push(self.instance_id);
         }
-        leader_of(&ids)
+        let certified = eligible
+            .iter()
+            .copied()
+            .filter(|node| is_participant(*node))
+            .collect::<Vec<_>>();
+        if let Some(leader) = leader_of(&certified) {
+            return Some(leader);
+        }
+        #[cfg(feature = "cluster")]
+        if self.has_leader_lease_fencing() {
+            return leader_of(&eligible);
+        }
+        None
     }
 
     /// True if this node is the gossip-elected candidate (lowest active id), ignoring the
@@ -760,6 +1063,142 @@ impl ClusterController {
         let _ = self.process_lease_deadline.set(deadline);
     }
 
+    /// Install the shared stable-node fencing authority before recovery starts.
+    ///
+    /// # Errors
+    /// Rejects replacing an already-installed authority.
+    pub fn set_process_lease_authority(
+        &self,
+        authority: Arc<super::process_lease::ProcessLeaseAuthority>,
+    ) -> Result<(), String> {
+        self.process_lease_authority
+            .set(authority)
+            .map_err(|_| "process lease authority is already installed".to_string())
+    }
+
+    /// Prove that an exact assignment participant was durably superseded within `deadline`.
+    ///
+    /// # Errors
+    /// Fails closed when no shared authority is installed or fencing cannot be proven in time.
+    pub async fn fence_process_incarnation(
+        &self,
+        participant: CheckpointParticipant,
+        deadline: tokio::time::Instant,
+    ) -> Result<super::process_lease::ProcessLeaseFence, String> {
+        self.process_lease_authority
+            .get()
+            .ok_or_else(|| "process lease authority is not installed".to_string())?
+            .fence_incarnation(participant, deadline)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Bound process fencing by the authority TTL plus the caller's existing control-plane I/O
+    /// budget, avoiding a second configurable timeout dimension.
+    ///
+    /// # Errors
+    /// Fails when no shared authority is installed or the deadline cannot be represented.
+    pub fn process_fencing_deadline(
+        &self,
+        io_budget: Duration,
+    ) -> Result<tokio::time::Instant, String> {
+        self.process_lease_authority
+            .get()
+            .ok_or_else(|| "process lease authority is not installed".to_string())?
+            .fencing_deadline(io_budget)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Verify one successor roster identity against the current durable process-lease head.
+    ///
+    /// # Errors
+    /// Fails when no authority is installed or the bounded durable read is uncertain.
+    pub async fn verify_current_process_incarnation(
+        &self,
+        participant: CheckpointParticipant,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, String> {
+        self.process_lease_authority
+            .get()
+            .ok_or_else(|| "process lease authority is not installed".to_string())?
+            .verify_current_participant(participant, deadline)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Re-read the exact durable records behind a process fence within `deadline`.
+    ///
+    /// # Errors
+    /// Fails closed when no shared authority is installed or verification cannot finish in time.
+    pub async fn verify_process_lease_fence(
+        &self,
+        fence: &super::process_lease::ProcessLeaseFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, String> {
+        self.process_lease_authority
+            .get()
+            .ok_or_else(|| "process lease authority is not installed".to_string())?
+            .verify_fence(fence, deadline)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Admit a recovery assignment only after re-verifying every durable process revocation.
+    ///
+    /// Keeping this operation on the controller binds the process-lease authority and leader
+    /// authority installed for this runtime. Callers cannot bypass revocation verification by
+    /// writing a structurally valid recovery decision directly to the leader store.
+    ///
+    /// # Errors
+    /// Fails closed when either authority is absent, a process fence is not durable, the deadline
+    /// expires, leadership changes, the decision conflicts, or storage is unavailable.
+    pub async fn record_assignment_recovery_decision(
+        &self,
+        proof: &super::LeaderProof,
+        decision: super::AssignmentRecoveryDecision,
+        deadline: tokio::time::Instant,
+    ) -> Result<super::RecordAssignmentRecoveryDecisionResult, String> {
+        let process_authority = Arc::clone(
+            self.process_lease_authority
+                .get()
+                .ok_or_else(|| "process lease authority is not installed".to_string())?,
+        );
+        let checks = futures::stream::iter(decision.removed_process_fences.iter().cloned())
+            .map(|fence| {
+                let process_authority = Arc::clone(&process_authority);
+                async move { process_authority.verify_fence(&fence, deadline).await }
+            })
+            .buffer_unordered(CONTROL_ROSTER_IO_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for check in checks {
+            match check {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err("assignment recovery contains an unverified process fence".into());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "assignment recovery process fence verification failed: {error}"
+                    ));
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("assignment recovery authority admission exceeded its deadline".into());
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout_at(
+            deadline,
+            authority.record_assignment_recovery_decision(proof, decision),
+        )
+        .await
+        .map_err(|_| "assignment recovery authority admission exceeded its deadline".to_string())?
+        .map_err(|error| error.to_string())
+    }
+
     /// Live instance IDs: `Active` peers plus self.
     #[must_use]
     pub fn live_instances(&self) -> Vec<NodeId> {
@@ -804,38 +1243,81 @@ impl ClusterController {
 
     /// Record peers that failed to ack a capture quorum in time.
     pub fn note_unresponsive(&self, peers: &[NodeId]) {
-        let now = std::time::Instant::now();
+        let fence = self.checkpoint_assignment_fence.borrow().clone();
         let mut map = self.unresponsive.lock();
+        let mut changed = false;
         for p in peers {
-            map.insert(p.0, now);
+            let incarnation = fence
+                .as_ref()
+                .and_then(|certificate| certificate.participant_incarnation(p.0));
+            changed |= map.insert(p.0, incarnation) != Some(incarnation);
+        }
+        drop(map);
+        if changed {
+            self.notify_leader_eligibility_change();
         }
     }
 
     /// Clear peers that acked (they are demonstrably alive).
     pub fn note_responsive(&self, peers: &[NodeId]) {
         let mut map = self.unresponsive.lock();
+        let mut changed = false;
         for p in peers {
-            map.remove(&p.0);
+            changed |= map.remove(&p.0).is_some();
         }
-    }
-
-    /// Whether `peer` failed a capture quorum within the TTL window.
-    #[must_use]
-    pub fn is_recently_unresponsive(&self, peer: NodeId) -> bool {
-        /// How long a quorum miss keeps a peer suspect for the gate.
-        const UNRESPONSIVE_TTL: Duration = Duration::from_secs(60);
-        self.unresponsive
-            .lock()
-            .get(&peer.0)
-            .is_some_and(|at| at.elapsed() < UNRESPONSIVE_TTL)
-    }
-
-    /// Mark this node as draining. Idempotent.
-    pub fn begin_drain(&self) {
-        self.draining.store(true, Ordering::SeqCst);
-        if self.leader_eligible.swap(false, Ordering::SeqCst) {
+        drop(map);
+        if changed {
             self.notify_leader_eligibility_change();
         }
+    }
+
+    /// Whether `peer` has an unresolved capture-quorum failure.
+    #[must_use]
+    pub fn is_unresponsive(&self, peer: NodeId) -> bool {
+        self.unresponsive.lock().contains_key(&peer.0)
+    }
+
+    /// Admit a placement candidate only when it was never quarantined or it is a different boot
+    /// incarnation. Callers must obtain `participant` from the lease-validated durable control KV.
+    pub fn admit_successor_process(&self, participant: CheckpointParticipant) -> bool {
+        let mut unresponsive = self.unresponsive.lock();
+        let admitted = match unresponsive.get(&participant.node_id).copied() {
+            None => true,
+            Some(Some(failed_boot)) if failed_boot != participant.boot_incarnation => {
+                unresponsive.remove(&participant.node_id);
+                drop(unresponsive);
+                self.notify_leader_eligibility_change();
+                return true;
+            }
+            Some(Some(_) | None) => false,
+        };
+        drop(unresponsive);
+        admitted
+    }
+
+    /// Mark this node as draining. Returns whether this exact certified leader must retain its
+    /// lease long enough to coordinate the predecessor cut. Idempotent.
+    pub fn begin_drain(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        let has_durable_leadership = self.has_leader_lease_fencing();
+        #[cfg(not(feature = "cluster"))]
+        let has_durable_leadership = false;
+        let retain_leadership = has_durable_leadership
+            && self.is_leader()
+            && self
+                .checkpoint_assignment_fence
+                .borrow()
+                .as_ref()
+                .is_some_and(|fence| {
+                    fence.is_canonical()
+                        && fence.participant_incarnation(self.instance_id.0)
+                            == Some(self.recovery_incarnation)
+                });
+        self.draining.store(true, Ordering::SeqCst);
+        if !retain_leadership && self.leader_eligible.swap(false, Ordering::SeqCst) {
+            self.notify_leader_eligibility_change();
+        }
+        retain_leadership
     }
 
     /// Whether this node is draining.
@@ -853,23 +1335,6 @@ impl ClusterController {
     #[must_use]
     pub fn is_recovering(&self) -> bool {
         self.recovering.load(Ordering::SeqCst)
-    }
-
-    /// Write a `u64` control signal into this node's `key` slot.
-    async fn write_u64(&self, key: &str, value: u64) {
-        if self.process_lease_is_live() {
-            self.kv.write(key, value.to_string()).await;
-        }
-    }
-
-    /// Every visible node's `u64` value for `key`.
-    async fn read_u64_map(&self, key: &str) -> Vec<(NodeId, u64)> {
-        self.kv
-            .scan(key)
-            .await
-            .into_iter()
-            .filter_map(|(n, v)| v.parse::<u64>().ok().map(|x| (n, x)))
-            .collect()
     }
 
     async fn write_recovery_value(&self, key: &str, value: String) -> Result<(), String> {
@@ -1049,6 +1514,36 @@ impl ClusterController {
         &self,
         participants: &[u64],
     ) -> Result<Vec<CheckpointParticipant>, String> {
+        let available = self
+            .available_recovery_participant_incarnations(participants)
+            .await?;
+        if available.len() != participants.len() {
+            let available_ids: std::collections::BTreeSet<u64> = available
+                .iter()
+                .map(|participant| participant.node_id)
+                .collect();
+            let missing = participants
+                .iter()
+                .find(|node_id| !available_ids.contains(node_id))
+                .copied()
+                .unwrap_or(0);
+            return Err(format!(
+                "node {missing} has no current recovery incarnation"
+            ));
+        }
+        Ok(available)
+    }
+
+    /// Resolve every currently readable boot identity among a canonical candidate set. Missing
+    /// candidates are omitted so placement can exclude lease-revoked or not-yet-started nodes
+    /// without weakening exact checkpoint/recovery roster validation.
+    ///
+    /// # Errors
+    /// Fails closed on malformed input, a durable scan error, or a malformed/duplicate identity.
+    pub async fn available_recovery_participant_incarnations(
+        &self,
+        participants: &[u64],
+    ) -> Result<Vec<CheckpointParticipant>, String> {
         if participants.is_empty()
             || participants.contains(&0)
             || participants.windows(2).any(|pair| pair[0] >= pair[1])
@@ -1073,9 +1568,9 @@ impl ClusterController {
                 ));
             }
         }
-        participants
+        Ok(participants
             .iter()
-            .map(|node_id| {
+            .filter_map(|node_id| {
                 reported
                     .get(node_id)
                     .copied()
@@ -1083,9 +1578,8 @@ impl ClusterController {
                         node_id: *node_id,
                         boot_incarnation: incarnation,
                     })
-                    .ok_or_else(|| format!("node {node_id} has no current recovery incarnation"))
             })
-            .collect()
+            .collect())
     }
 
     /// Whether every current participant boot identity still equals the frozen round.
@@ -1099,6 +1593,44 @@ impl ClusterController {
             == round.assignment_fence.participants)
     }
 
+    async fn recovery_incarnations_match_control(
+        &self,
+        round: &RecoveryRound,
+    ) -> Result<bool, RecoveryControlError> {
+        let participants = round.assignment_fence.participant_ids();
+        let expected: std::collections::BTreeSet<u64> = participants.iter().copied().collect();
+        let mut reported = std::collections::BTreeMap::new();
+        for (node, raw) in self
+            .scan_recovery_values(RECOVERY_INCARNATION_KEY)
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
+        {
+            if !expected.contains(&node.0) {
+                continue;
+            }
+            let incarnation = Uuid::parse_str(&raw).map_err(|error| {
+                RecoveryControlError::Conflict(format!(
+                    "invalid recovery incarnation published by {node}: {error}"
+                ))
+            })?;
+            if incarnation.is_nil() || reported.insert(node.0, incarnation).is_some() {
+                return Err(RecoveryControlError::Conflict(format!(
+                    "noncanonical recovery incarnation published by {node}"
+                )));
+            }
+        }
+        if reported.len() != participants.len() {
+            return Ok(false);
+        }
+        Ok(round
+            .assignment_fence
+            .participants
+            .iter()
+            .all(|participant| {
+                reported.get(&participant.node_id) == Some(&participant.boot_incarnation)
+            }))
+    }
+
     /// Publish this node's fault sequence so the leader drives a recovery round.
     ///
     /// # Errors
@@ -1107,18 +1639,100 @@ impl ClusterController {
         if seq == 0 {
             return Err("fault sequence must be nonzero".into());
         }
+        let _guard = self.recovery_writes.lock().await;
         self.write_recovery_value_exact("control:fault-report", seq.to_string())
             .await
     }
 
-    /// Clear this node's fault report (`0` = no fault) after it recovers, so a restarted
-    /// leader doesn't re-trigger recovery for an already-handled fault.
+    /// Clear this node's fault report only while it is still `expected`.
+    ///
+    /// `false` means a newer nonzero report replaced the released sequence. A missing or already
+    /// cleared report is an idempotent success. The local write mutex excludes `report_fault`
+    /// between the comparison and clear because `ClusterKv` has no compare-and-swap operation.
     ///
     /// # Errors
-    /// Returns an error when the bounded write or exact read-back fails.
-    pub async fn clear_fault_report(&self) -> Result<(), String> {
+    /// Returns an error for zero `expected`, malformed local state, or a failed bounded I/O.
+    pub async fn clear_fault_report(&self, expected: u64) -> Result<bool, String> {
+        self.begin_recovery_release(Some(expected))
+            .await
+            .map(|guard| guard.is_some())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Conditionally consume this process's released fault while retaining the local fault-write
+    /// fence. The caller must hold the returned guard through its source-gate transition.
+    ///
+    /// `Ok(None)` means a nonzero local report does not match the committed round. Missing and
+    /// already-cleared slots are idempotent success for a round that expected a fault.
+    ///
+    /// # Errors
+    /// Returns an error for a zero expected sequence, malformed state, or failed durable I/O.
+    pub async fn begin_recovery_release(
+        &self,
+        expected: Option<u64>,
+    ) -> Result<Option<RecoveryReleaseGuard<'_>>, RecoveryControlError> {
+        if expected == Some(0) {
+            return Err(RecoveryControlError::Conflict(
+                "expected fault sequence must be nonzero".into(),
+            ));
+        }
+        let guard = self.recovery_writes.lock().await;
+        let Some(raw) = self
+            .read_recovery_value(self.instance_id, "control:fault-report")
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
+        else {
+            return Ok(Some(RecoveryReleaseGuard {
+                _write_guard: guard,
+            }));
+        };
+        let current = raw.parse::<u64>().map_err(|error| {
+            RecoveryControlError::Conflict(format!("invalid local fault sequence: {error}"))
+        })?;
+        if current == 0 {
+            return Ok(Some(RecoveryReleaseGuard {
+                _write_guard: guard,
+            }));
+        }
+        if Some(current) != expected {
+            return Ok(None);
+        }
         self.write_recovery_value_exact("control:fault-report", "0".into())
             .await
+            .map_err(RecoveryControlError::Uncertain)?;
+        Ok(Some(RecoveryReleaseGuard {
+            _write_guard: guard,
+        }))
+    }
+
+    /// This process's durable fault sequence, if its slot contains a nonzero report.
+    ///
+    /// # Errors
+    /// Returns an error when the point read fails or the local slot is malformed.
+    pub async fn read_local_fault_report_control(
+        &self,
+    ) -> Result<Option<u64>, RecoveryControlError> {
+        let Some(raw) = self
+            .read_recovery_value(self.instance_id, "control:fault-report")
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
+        else {
+            return Ok(None);
+        };
+        let sequence = raw.parse::<u64>().map_err(|error| {
+            RecoveryControlError::Conflict(format!("invalid local fault sequence: {error}"))
+        })?;
+        Ok((sequence != 0).then_some(sequence))
+    }
+
+    /// This process's durable nonzero fault report with a display-stable error.
+    ///
+    /// # Errors
+    /// Returns an error when the point read fails or the local slot is malformed.
+    pub async fn read_local_fault_report(&self) -> Result<Option<u64>, String> {
+        self.read_local_fault_report_control()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Each visible node's reported fault sequence.
@@ -1133,6 +1747,23 @@ impl ClusterController {
                 raw.parse::<u64>()
                     .map(|sequence| (node, sequence))
                     .map_err(|error| format!("invalid fault sequence from {node}: {error}"))
+            })
+            .collect()
+    }
+
+    async fn read_fault_reports_control(&self) -> Result<Vec<(NodeId, u64)>, RecoveryControlError> {
+        self.scan_recovery_values("control:fault-report")
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
+            .into_iter()
+            .map(|(node, raw)| {
+                raw.parse::<u64>()
+                    .map(|sequence| (node, sequence))
+                    .map_err(|error| {
+                        RecoveryControlError::Conflict(format!(
+                            "invalid fault sequence from {node}: {error}"
+                        ))
+                    })
             })
             .collect()
     }
@@ -1174,39 +1805,132 @@ impl ClusterController {
             .await
     }
 
-    /// Publish that this exact process consumed the `Release` terminal record.
+    /// Publish that this exact process is prepared for the pending release intent.
+    ///
+    /// Readiness is published only after local recovery state, shuffle loss accounting, and
+    /// assignment transport authority are installed while source intake remains closed.
     ///
     /// # Errors
-    /// Returns an error for a non-Release phase or a stale/nonparticipant process.
-    pub async fn announce_released(&self, release: &RecoveryAnnouncement) -> Result<(), String> {
-        release.validate()?;
-        if !matches!(release.phase, RecoverPhase::Release { .. }) {
-            return Err("release acknowledgement must bind a Release target".into());
-        }
+    /// Returns an error for a non-Release phase, changed local fault, or stale process.
+    pub async fn announce_release_ready(
+        &self,
+        release: &RecoveryAnnouncement,
+    ) -> Result<(), RecoveryControlError> {
+        let release_id =
+            RecoveryReleaseId::for_pending(release).map_err(RecoveryControlError::Conflict)?;
         if release.round.participant_incarnation(self.instance_id)
             != Some(self.recovery_incarnation)
         {
-            return Err("release acknowledgement has a stale local process incarnation".into());
+            return Err(RecoveryControlError::Superseded(
+                "release readiness has a stale local process incarnation".into(),
+            ));
         }
-        if !self.recovery_incarnation_is_current().await? {
-            return Err("release acknowledgement came from a superseded local process".into());
-        }
-        let encoded = serde_json::to_string(&RecoveryAnnouncementAck {
-            announcement: release.clone(),
-            incarnation: self.recovery_incarnation,
-        })
-        .map_err(|error| format!("could not encode release acknowledgement: {error}"))?;
-        self.write_recovery_value_exact("control:recovery-released", encoded)
+        if !self
+            .recovery_incarnation_is_current()
             .await
+            .map_err(RecoveryControlError::Uncertain)?
+        {
+            return Err(RecoveryControlError::Superseded(
+                "release readiness came from a superseded local process".into(),
+            ));
+        }
+        if self.read_local_fault_report_control().await?
+            != release.round.fault_sequence(self.instance_id)
+        {
+            return Err(RecoveryControlError::Superseded(
+                "local fault set changed before release readiness".into(),
+            ));
+        }
+        match self.observe_recover_control().await? {
+            Some(active) if active == *release => {}
+            _ => {
+                return Err(RecoveryControlError::Superseded(
+                    "release readiness no longer matches the active intent".into(),
+                ));
+            }
+        }
+        let participant = CheckpointParticipant {
+            node_id: self.instance_id.0,
+            boot_incarnation: self.recovery_incarnation,
+        };
+        let encoded = encode_release_ready_ack(&RecoveryReleaseReadyAck {
+            release: release_id,
+            participant,
+        })
+        .map_err(RecoveryControlError::Conflict)?;
+        self.write_recovery_value_exact(RELEASE_READY_ACK_KEY, encoded)
+            .await
+            .map_err(RecoveryControlError::Uncertain)
     }
 
-    /// Each visible node's exact terminal Release acknowledgement.
+    /// Point-read the exact frozen owner roster's compact readiness records.
+    ///
+    /// Unrelated visible nodes are never scanned. Older records count as missing; malformed,
+    /// same-generation divergent, or newer records are explicit conflicts.
     ///
     /// # Errors
-    /// Returns an error when the bounded scan fails or any acknowledgement is malformed.
-    pub async fn read_released(&self) -> Result<Vec<(NodeId, RecoveryAnnouncement)>, String> {
-        self.read_recovery_announcement_map("control:recovery-released")
-            .await
+    /// Returns an error only when an exact point read is transport-uncertain.
+    async fn read_release_ready(
+        &self,
+        release: &RecoveryAnnouncement,
+    ) -> Result<ReleaseReadyStatus, RecoveryControlError> {
+        let expected =
+            RecoveryReleaseId::for_pending(release).map_err(RecoveryControlError::Conflict)?;
+        let reads = futures::stream::iter(
+            release
+                .round
+                .assignment_fence
+                .participants
+                .iter()
+                .copied()
+                .map(|participant| async move {
+                    let value = self
+                        .read_recovery_value(NodeId(participant.node_id), RELEASE_READY_ACK_KEY)
+                        .await;
+                    (participant, value)
+                }),
+        )
+        .buffer_unordered(CONTROL_ROSTER_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        let mut reads = reads;
+        reads.sort_unstable_by_key(|(participant, _)| participant.node_id);
+        let mut missing = Vec::new();
+        for (participant, value) in reads {
+            let raw = value.map_err(RecoveryControlError::Uncertain)?;
+            let Some(raw) = raw else {
+                missing.push(NodeId(participant.node_id));
+                continue;
+            };
+            let ack = parse_release_ready_ack(&raw, NodeId(participant.node_id))
+                .map_err(RecoveryControlError::Conflict)?;
+            if ack.participant != participant {
+                return Err(RecoveryControlError::Conflict(format!(
+                    "release readiness from {} does not match the frozen process",
+                    participant.node_id
+                )));
+            }
+            if ack.release != expected {
+                if ack.release.generation < expected.generation {
+                    missing.push(NodeId(participant.node_id));
+                    continue;
+                }
+                if ack.release.generation > expected.generation {
+                    return Err(RecoveryControlError::Superseded(format!(
+                        "release readiness from {} has newer generation {}",
+                        participant.node_id, ack.release.generation
+                    )));
+                }
+                return Err(RecoveryControlError::Conflict(format!(
+                    "release readiness from {} conflicts with generation {}",
+                    participant.node_id, expected.generation
+                )));
+            }
+        }
+        if !missing.is_empty() {
+            return Ok(ReleaseReadyStatus::Pending { missing });
+        }
+        Ok(ReleaseReadyStatus::Complete)
     }
 
     /// Node ids eligible to own vnodes: `Active` peers, plus self unless draining. Unlike
@@ -1260,20 +1984,6 @@ impl ClusterController {
         self.members_rx.clone()
     }
 
-    /// Write the current assignment snapshot version to gossip KV.
-    pub async fn announce_snapshot_version(&self, version: u64) {
-        self.write_u64("control:snapshot-version", version).await;
-    }
-
-    /// Max snapshot version across all peers.
-    pub async fn read_snapshot_version(&self) -> Option<u64> {
-        self.read_u64_map("control:snapshot-version")
-            .await
-            .into_iter()
-            .map(|(_, v)| v)
-            .max()
-    }
-
     async fn drain_transition_authority_is_current(
         &self,
         transition: &AssignmentDrainTransition,
@@ -1304,13 +2014,9 @@ impl ClusterController {
     pub async fn announce_drain_ack(
         &self,
         transition: &AssignmentDrainTransition,
-        sources: NodeDrainReceiptAggregate,
     ) -> Result<(), String> {
-        if !transition.is_canonical()
-            || !sources.is_canonical()
-            || sources.round_digest != transition.digest()
-        {
-            return Err("drain acknowledgement requires an exact source transition proof".into());
+        if !transition.is_canonical() {
+            return Err("drain acknowledgement requires an exact assignment transition".into());
         }
         let participant = CheckpointParticipant {
             node_id: self.instance_id.0,
@@ -1338,7 +2044,7 @@ impl ClusterController {
         }
         self.write_recovery_value_exact(
             DRAIN_ACK_KEY,
-            encode_drain_ack(&DrainAck::for_transition(participant, transition, sources))?,
+            encode_drain_ack(&DrainAck::for_transition(participant, transition))?,
         )
         .await
     }
@@ -1456,6 +2162,22 @@ impl ClusterController {
     /// Publish this node's version-bound checkpoint fence. Called off the hot path by the snapshot
     /// watcher; admission and recovery revalidate it locally against current membership.
     pub fn publish_checkpoint_assignment_fence(&self, fence: Option<CheckpointAssignmentFence>) {
+        if let Some(fence) = fence.as_ref().filter(|fence| fence.is_canonical()) {
+            let participants = fence.participant_ids();
+            let changed = {
+                let mut installed = self.leadership_participants.write();
+                match installed.as_ref() {
+                    Some((version, _)) if *version >= fence.assignment_version => false,
+                    _ => {
+                        *installed = Some((fence.assignment_version, participants));
+                        true
+                    }
+                }
+            };
+            if changed {
+                self.notify_leader_eligibility_change();
+            }
+        }
         self.checkpoint_assignment_fence.send_replace(fence);
     }
 
@@ -1482,31 +2204,33 @@ impl ClusterController {
         self.checkpoint_assignment_fence.subscribe()
     }
 
-    /// Return the exact locally certified assignment cut when it still matches current
-    /// membership. The clone is retained by the admitted attempt and propagated to followers.
+    /// Return the exact locally certified assignment cut while every participant remains
+    /// checkpoint-capable. Active workers that own no vnode do not expand the checkpoint quorum.
+    /// The clone is retained by the admitted attempt and propagated to followers.
     #[must_use]
     pub fn checkpoint_assignment_fence(
         &self,
         assignment_version: u64,
     ) -> Option<CheckpointAssignmentFence> {
-        let current: Vec<u64> = self
+        let checkpoint_capable: Vec<u64> = self
             .checkpoint_instances()
             .into_iter()
             .map(|node| node.0)
             .collect();
-        let transition = self.checkpoint_drain_transition.borrow();
         self.checkpoint_assignment_fence
             .borrow()
             .as_ref()
             .filter(|fence| {
                 fence.is_canonical()
                     && fence.assignment_version == assignment_version
-                    && fence.participant_incarnation(self.instance_id.0)
-                        == Some(self.recovery_incarnation)
-                    && (fence.participant_ids().as_slice() == current.as_slice()
-                        || transition.as_ref().is_some_and(|transition| {
-                            transition.is_canonical() && &transition.predecessor == *fence
-                        }))
+                    && fence
+                        .participant_incarnation(self.instance_id.0)
+                        .is_none_or(|incarnation| incarnation == self.recovery_incarnation)
+                    && fence.participants.iter().all(|participant| {
+                        checkpoint_capable
+                            .binary_search(&participant.node_id)
+                            .is_ok()
+                    })
             })
             .cloned()
     }
@@ -1552,6 +2276,22 @@ impl ClusterController {
     ) -> Result<std::net::SocketAddr, String> {
         self.barrier
             .start_server(bind_addr, advertise_host, Arc::clone(&self.query_handler))
+            .await
+    }
+
+    /// Capture the live process-local leader grant from one exact remote assignment process.
+    ///
+    /// # Errors
+    /// Fails closed when the control RPC is unavailable, malformed, or misses `deadline`.
+    #[cfg(feature = "cluster")]
+    pub async fn capture_remote_leader_proof(
+        &self,
+        participant: CheckpointParticipant,
+        process_term: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<LeaderProof>, String> {
+        self.barrier
+            .capture_remote_leader_proof(participant, process_term, deadline)
             .await
     }
 
@@ -1641,22 +2381,90 @@ impl ClusterController {
         self.barrier.ack(ack).await
     }
 
+    async fn durable_recovery_proof_is_current(&self, proof: &LeaderProof) -> Result<bool, String> {
+        if !proof.is_canonical() {
+            return Ok(false);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| format!("durable recovery authority is unavailable: {error}"))?;
+        let Some(lease) = authority
+            .load()
+            .await
+            .map_err(|error| format!("durable recovery authority read failed: {error}"))?
+        else {
+            return Ok(false);
+        };
+        Ok(lease.matches_proof(proof))
+    }
+
+    async fn recovery_driver_proof_is_current(
+        &self,
+        round: &RecoveryRound,
+    ) -> Result<bool, String> {
+        Ok(round.id.driver == self.instance_id
+            && self.proof_is_live(&round.leader_proof)
+            && self
+                .durable_recovery_proof_is_current(&round.leader_proof)
+                .await?)
+    }
+
+    async fn require_recovery_driver_proof(
+        &self,
+        round: &RecoveryRound,
+        boundary: &str,
+    ) -> Result<(), String> {
+        if self.recovery_driver_proof_is_current(round).await? {
+            Ok(())
+        } else {
+            Err(format!(
+                "recovery driver proof is no longer live at {boundary}"
+            ))
+        }
+    }
+
+    async fn require_recovery_driver_proof_control(
+        &self,
+        round: &RecoveryRound,
+        boundary: &str,
+    ) -> Result<(), RecoveryControlError> {
+        if round.id.driver != self.instance_id || !self.proof_is_live(&round.leader_proof) {
+            return Err(RecoveryControlError::Superseded(format!(
+                "recovery driver proof is no longer live at {boundary}"
+            )));
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        let current = authority.load().await.map_err(|error| match error {
+            super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
+            error => RecoveryControlError::Conflict(error.to_string()),
+        })?;
+        if !current.is_some_and(|lease| lease.matches_proof(&round.leader_proof)) {
+            return Err(RecoveryControlError::Superseded(format!(
+                "durable recovery driver proof changed at {boundary}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Announce phase 1 with the immutable assignment-certified quorum.
     ///
     /// # Errors
     /// Returns an error unless this node is the round's current leader and driver.
     pub async fn announce_recover_prepare(&self, round: &RecoveryRound) -> Result<(), String> {
         round.validate()?;
-        if round.id.driver != self.instance_id || !self.is_leader() {
+        if round.id.driver != self.instance_id {
             return Err("only the current leader may prepare its recovery round".into());
         }
+        self.require_recovery_driver_proof(round, "Prepare preflight")
+            .await?;
         if !self.recovery_incarnations_match(round).await? {
             return Err("recovery process-incarnation roster changed before Prepare".into());
         }
         let _guard = self.recovery_writes.lock().await;
-        if !self.is_leader() {
-            return Err("recovery driver lost leadership before Prepare publication".into());
-        }
+        self.require_recovery_driver_proof(round, "Prepare publication")
+            .await?;
         let announcement = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Prepare,
@@ -1664,6 +2472,8 @@ impl ClusterController {
         let encoded = serde_json::to_string(&announcement)
             .map_err(|error| format!("could not encode recovery prepare: {error}"))?;
         self.write_recovery_value_exact("control:recover", encoded)
+            .await?;
+        self.require_recovery_driver_proof(round, "Prepare read-back")
             .await
     }
 
@@ -1678,11 +2488,13 @@ impl ClusterController {
         epoch: u64,
     ) -> Result<(), String> {
         round.validate()?;
-        if round.id.driver != self.instance_id || !self.is_leader() {
+        if round.id.driver != self.instance_id {
             return Err("only the current leader may start its recovery round".into());
         }
+        self.require_recovery_driver_proof(round, "Start preflight")
+            .await?;
         let _guard = self.recovery_writes.lock().await;
-        if !self.is_leader() || !self.recovery_incarnations_match(round).await? {
+        if !self.recovery_incarnations_match(round).await? {
             return Err(
                 "recovery driver or process-incarnation roster changed before Start".into(),
             );
@@ -1696,6 +2508,8 @@ impl ClusterController {
         if prepared.round != *round || prepared.phase != RecoverPhase::Prepare {
             return Err("recovery Start does not match the exact active Prepare".into());
         }
+        self.require_recovery_driver_proof(round, "Start publication")
+            .await?;
         let announcement = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Start { epoch },
@@ -1703,11 +2517,13 @@ impl ClusterController {
         let encoded = serde_json::to_string(&announcement)
             .map_err(|error| format!("could not encode recovery start: {error}"))?;
         self.write_recovery_value_exact("control:recover", encoded)
+            .await?;
+        self.require_recovery_driver_proof(round, "Start read-back")
             .await
     }
 
-    /// Transition the identical `Start` to the terminal `Release`. Source gates may open
-    /// only after observing this exact record; it is never deleted as cleanup.
+    /// Transition the identical `Start` to a pending `Release`. Source gates remain closed until
+    /// the leader commits the exact compact readiness roster.
     ///
     /// # Errors
     /// Returns an error on lost leadership, a changed incarnation roster, or a mismatched Start.
@@ -1717,11 +2533,13 @@ impl ClusterController {
         epoch: u64,
     ) -> Result<(), String> {
         round.validate()?;
-        if round.id.driver != self.instance_id || !self.is_leader() {
+        if round.id.driver != self.instance_id {
             return Err("only the current leader may release its recovery round".into());
         }
+        self.require_recovery_driver_proof(round, "Release preflight")
+            .await?;
         let _guard = self.recovery_writes.lock().await;
-        if !self.is_leader() || !self.recovery_incarnations_match(round).await? {
+        if !self.recovery_incarnations_match(round).await? {
             return Err(
                 "recovery driver or process-incarnation roster changed before Release".into(),
             );
@@ -1735,6 +2553,8 @@ impl ClusterController {
         if started.round != *round || started.phase != (RecoverPhase::Start { epoch }) {
             return Err("recovery Release does not match the exact active Start target".into());
         }
+        self.require_recovery_driver_proof(round, "Release publication")
+            .await?;
         let release = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch },
@@ -1742,34 +2562,321 @@ impl ClusterController {
         let encoded = serde_json::to_string(&release)
             .map_err(|error| format!("could not encode recovery Release: {error}"))?;
         self.write_recovery_value_exact("control:recover", encoded)
+            .await?;
+        self.require_recovery_driver_proof(round, "Release read-back")
             .await
     }
 
-    /// Active recovery announcement from the locally elected driver. Reading its exact slot is
-    /// O(1); durable slots from retired drivers can neither mask nor conflict with the successor.
+    /// Commit a pending release after every frozen owner published its compact readiness record.
+    ///
+    /// Pending attempts point-read only the readiness roster. Once complete, the process roster
+    /// and fault set are validated under the driver's phase-transition mutex before admitting the
+    /// content-addressed terminal into durable leader authority.
     ///
     /// # Errors
-    /// Returns an error for malformed current-driver state or publisher/driver mismatch.
-    pub async fn observe_recover(&self) -> Result<Option<RecoveryAnnouncement>, String> {
+    /// Returns a classified uncertain, conflict, or superseded outcome. Missing readiness remains
+    /// a normal pending status.
+    pub async fn try_commit_recover_release(
+        &self,
+        release: &RecoveryAnnouncement,
+    ) -> Result<ReleaseCommitStatus, RecoveryControlError> {
+        release.validate().map_err(RecoveryControlError::Conflict)?;
+        let RecoverPhase::Release { epoch } = release.phase else {
+            return Err(RecoveryControlError::Conflict(
+                "release commit must bind a pending Release target".into(),
+            ));
+        };
+        let round = &release.round;
+        if round.id.driver != self.instance_id {
+            return Err(RecoveryControlError::Superseded(
+                "only the current leader may commit its recovery Release".into(),
+            ));
+        }
+        self.require_recovery_driver_proof_control(round, "Release commit preflight")
+            .await?;
+        match self.read_release_ready(release).await? {
+            ReleaseReadyStatus::Complete => {}
+            ReleaseReadyStatus::Pending { missing } => {
+                return Ok(ReleaseCommitStatus::Pending { missing });
+            }
+        }
+        let committed = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::ReleaseCommitted { epoch },
+        };
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        let reference = authority
+            .stage_recovery_release_terminal(&committed)
+            .await
+            .map_err(RecoveryControlError::from_authority)?;
+
+        let _guard = self.recovery_writes.lock().await;
+        if !self.recovery_incarnations_match_control(round).await? {
+            return Err(RecoveryControlError::Superseded(
+                "recovery process-incarnation roster changed before Release commit".into(),
+            ));
+        }
+        let mut observed_faults = self
+            .read_fault_reports_control()
+            .await?
+            .into_iter()
+            .filter_map(|(reporter, sequence)| {
+                (sequence != 0).then_some(RecoveryFault { reporter, sequence })
+            })
+            .collect::<Vec<_>>();
+        observed_faults.sort_unstable_by_key(|fault| fault.reporter);
+        if observed_faults != round.faults {
+            return Err(RecoveryControlError::Superseded(
+                "recovery fault set changed before Release commit".into(),
+            ));
+        }
+        let Some(current) = self
+            .read_recovery_value(self.instance_id, "control:recover")
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
+        else {
+            return Err(RecoveryControlError::Superseded(
+                "pending recovery Release disappeared before commit".into(),
+            ));
+        };
+        let active = match parse_recovery_announcement(&current) {
+            Ok(Some(active)) => active,
+            Ok(None) => {
+                return Err(RecoveryControlError::Superseded(
+                    "pending recovery Release was cleared before commit".into(),
+                ));
+            }
+            Err(reason) => return Err(RecoveryControlError::Conflict(reason)),
+        };
+        if active != *release {
+            let error = if active.round.id.generation > round.id.generation {
+                RecoveryControlError::Superseded(
+                    "a newer recovery intent replaced the pending Release".into(),
+                )
+            } else {
+                RecoveryControlError::Conflict(
+                    "recovery Release commit does not match the exact pending intent".into(),
+                )
+            };
+            return Err(error);
+        }
+        self.require_recovery_driver_proof_control(round, "Release commit publication")
+            .await?;
+        match authority
+            .record_recovery_release_commit(&round.leader_proof, reference)
+            .await
+            .map_err(RecoveryControlError::from_authority)?
+        {
+            super::leader_lease::RecordRecoveryReleaseCommitResult::Created(_)
+            | super::leader_lease::RecordRecoveryReleaseCommitResult::Unchanged(_) => {
+                Ok(ReleaseCommitStatus::Committed {
+                    terminal: committed,
+                })
+            }
+            super::leader_lease::RecordRecoveryReleaseCommitResult::Conflict { winner } => {
+                if winner.generation() > round.id.generation {
+                    Err(RecoveryControlError::Superseded(format!(
+                        "recovery release generation {} replaced generation {}",
+                        winner.generation(),
+                        round.id.generation
+                    )))
+                } else {
+                    Err(RecoveryControlError::Conflict(format!(
+                        "recovery release generation {} has a different durable winner",
+                        round.id.generation
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Active recovery announcement with semantic failures separated from uncertain I/O.
+    ///
+    /// # Errors
+    /// Classifies malformed state, superseded authority, and retryable durable I/O separately.
+    pub async fn observe_recover_control(
+        &self,
+    ) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
         let Some(current_driver) = self.current_leader() else {
             return Ok(None);
         };
         let Some(raw) = self
             .read_recovery_value(current_driver, "control:recover")
-            .await?
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
         else {
             return Ok(None);
         };
-        let Some(announcement) = parse_recovery_announcement(&raw)? else {
+        let Some(announcement) =
+            parse_recovery_announcement(&raw).map_err(RecoveryControlError::Conflict)?
+        else {
             return Ok(None);
         };
-        if announcement.round.id.driver != current_driver {
-            return Err(format!(
-                "recovery publisher {current_driver} is not declared driver {}",
-                announcement.round.id.driver
+        if matches!(announcement.phase, RecoverPhase::ReleaseCommitted { .. }) {
+            return Err(RecoveryControlError::Conflict(
+                "committed recovery release appeared in the mutable intent slot".into(),
             ));
         }
+        if announcement.round.id.driver != current_driver {
+            return Err(RecoveryControlError::Conflict(format!(
+                "recovery publisher {current_driver} is not declared driver {}",
+                announcement.round.id.driver
+            )));
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        let Some(authority_before) = authority.load().await.map_err(|error| match error {
+            super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
+            error => RecoveryControlError::Conflict(error.to_string()),
+        })?
+        else {
+            return Err(RecoveryControlError::Superseded(
+                "durable recovery authority has no leader".into(),
+            ));
+        };
+        if !authority_before.matches_proof(&announcement.round.leader_proof) {
+            return Err(RecoveryControlError::Superseded(format!(
+                "recovery phase from {current_driver} does not match durable leader authority"
+            )));
+        }
+        let Some(authority_after) = authority.load().await.map_err(|error| match error {
+            super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
+            error => RecoveryControlError::Conflict(error.to_string()),
+        })?
+        else {
+            return Err(RecoveryControlError::Superseded(
+                "durable recovery authority vanished during observation".into(),
+            ));
+        };
+        if self.current_leader() != Some(current_driver)
+            || !authority_after.matches_proof(&announcement.round.leader_proof)
+        {
+            return Err(RecoveryControlError::Superseded(format!(
+                "recovery authority changed while observing {current_driver}"
+            )));
+        }
         Ok(Some(announcement))
+    }
+
+    /// Latest irrevocable recovery release admitted by the append-only leader authority.
+    ///
+    /// # Errors
+    /// Classifies missing/corrupt terminal state as conflict, takeover as supersession, and
+    /// durable I/O as uncertainty.
+    pub async fn latest_committed_recover_release(
+        &self,
+    ) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
+        self.checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?
+            .latest_recovery_release_terminal()
+            .await
+            .map_err(RecoveryControlError::from_authority)
+    }
+
+    /// Resolve the exact committed terminal for one pending release intent across leader
+    /// takeover. An older terminal is unrelated; a same-generation divergence is corruption and a
+    /// newer terminal supersedes the caller.
+    ///
+    /// # Errors
+    /// Returns a classified conflict, supersession, or uncertain durable read.
+    pub async fn observe_committed_recover_release(
+        &self,
+        round: &RecoveryRound,
+        epoch: u64,
+    ) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
+        round.validate().map_err(RecoveryControlError::Conflict)?;
+        let expected = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::ReleaseCommitted { epoch },
+        };
+        let Some(terminal) = self.latest_committed_recover_release().await? else {
+            return Ok(None);
+        };
+        match terminal.round.id.generation.cmp(&round.id.generation) {
+            std::cmp::Ordering::Less => Ok(None),
+            std::cmp::Ordering::Greater => Err(RecoveryControlError::Superseded(format!(
+                "recovery release generation {} replaced generation {}",
+                terminal.round.id.generation, round.id.generation
+            ))),
+            std::cmp::Ordering::Equal if terminal == expected => Ok(Some(terminal)),
+            std::cmp::Ordering::Equal => Err(RecoveryControlError::Conflict(format!(
+                "committed recovery release generation {} differs from the expected round",
+                round.id.generation
+            ))),
+        }
+    }
+
+    /// Best-effort cleanup for this driver's mutable `Release` discovery hint after the exact
+    /// terminal is irrevocably present in leader authority. Cleanup never contributes to commit
+    /// validity; followers resolve the terminal from authority even if this write is uncertain.
+    ///
+    /// # Errors
+    /// Classifies malformed or divergent local intent separately from retryable I/O.
+    pub async fn retire_committed_recover_release_hint(
+        &self,
+        round: &RecoveryRound,
+        epoch: u64,
+    ) -> Result<bool, RecoveryControlError> {
+        round.validate().map_err(RecoveryControlError::Conflict)?;
+        if round.id.driver != self.instance_id {
+            return Err(RecoveryControlError::Conflict(
+                "only the publishing driver may retire its recovery Release hint".into(),
+            ));
+        }
+        if self
+            .observe_committed_recover_release(round, epoch)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let pending = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Release { epoch },
+        };
+        let _guard = self.recovery_writes.lock().await;
+        let Some(raw) = self
+            .read_recovery_value(self.instance_id, "control:recover")
+            .await
+            .map_err(RecoveryControlError::Uncertain)?
+        else {
+            return Ok(false);
+        };
+        let active = parse_recovery_announcement(&raw)
+            .map_err(RecoveryControlError::Conflict)?
+            .ok_or_else(|| {
+                RecoveryControlError::Conflict(
+                    "recovery Release hint decoded as an empty announcement".into(),
+                )
+            })?;
+        if active != pending {
+            return if active.round.id.generation > round.id.generation {
+                Err(RecoveryControlError::Superseded(
+                    "a newer recovery intent replaced the committed Release hint".into(),
+                ))
+            } else {
+                Err(RecoveryControlError::Conflict(
+                    "mutable recovery intent differs from its committed Release".into(),
+                ))
+            };
+        }
+        self.write_recovery_value_exact("control:recover", String::new())
+            .await
+            .map_err(RecoveryControlError::Uncertain)?;
+        Ok(true)
+    }
+
+    /// Active nonterminal recovery announcement from the locally elected driver.
+    ///
+    /// # Errors
+    /// Returns a display-stable classified control error.
+    pub async fn observe_recover(&self) -> Result<Option<RecoveryAnnouncement>, String> {
+        self.observe_recover_control()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Whether the round's declared driver is the current elected leader in this local view.
@@ -1951,6 +3058,119 @@ mod tests {
         }
     }
 
+    struct DelayedRecoveryKv {
+        inner: InMemoryKv,
+        block_next_recovery_write: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    struct FaultyReadyReadKv {
+        inner: InMemoryKv,
+        remaining_failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultyReadyReadKv {
+        fn new(local_id: NodeId) -> Self {
+            Self {
+                inner: InMemoryKv::new(local_id),
+                remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next_ready_reads(&self, failures: usize) {
+            self.remaining_failures.store(failures, Ordering::Release);
+        }
+
+        fn should_fail_ready_read(&self) -> bool {
+            self.remaining_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    (remaining != 0).then(|| remaining.saturating_sub(1))
+                })
+                .is_ok()
+        }
+    }
+
+    impl DelayedRecoveryKv {
+        fn new(local_id: NodeId) -> Self {
+            Self {
+                inner: InMemoryKv::new(local_id),
+                block_next_recovery_write: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        fn block_next_recovery_write(&self) {
+            self.block_next_recovery_write
+                .store(true, Ordering::Release);
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.entered.acquire().await.unwrap().forget();
+        }
+
+        fn release_blocked_write(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterKv for DelayedRecoveryKv {
+        async fn write(&self, key: &str, value: String) {
+            let _ = self.write_checked(key, value).await;
+        }
+
+        async fn write_checked(&self, key: &str, value: String) -> Result<(), String> {
+            if key == "control:recover"
+                && self.block_next_recovery_write.swap(false, Ordering::AcqRel)
+            {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .forget();
+            }
+            self.inner.write(key, value).await;
+            Ok(())
+        }
+
+        async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+            self.inner.read_from(who, key).await
+        }
+
+        async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+            self.inner.scan(key).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterKv for FaultyReadyReadKv {
+        async fn write(&self, key: &str, value: String) {
+            self.inner.write(key, value).await;
+        }
+
+        async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+            self.inner.read_from(who, key).await
+        }
+
+        async fn read_from_checked(
+            &self,
+            who: NodeId,
+            key: &str,
+        ) -> Result<Option<String>, String> {
+            if key == RELEASE_READY_ACK_KEY && self.should_fail_ready_read() {
+                return Err("injected release readiness read failure".into());
+            }
+            Ok(self.inner.read_from(who, key).await)
+        }
+
+        async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+            self.inner.scan(key).await
+        }
+    }
+
     fn info(id: u64) -> NodeInfo {
         NodeInfo {
             id: NodeId(id),
@@ -1986,6 +3206,111 @@ mod tests {
             &controller.checkpoint_authority().unwrap(),
             &authority
         ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn recovery_authority_rejects_a_structural_but_undurable_process_fence() {
+        use crate::cluster::control::{
+            AssignmentRecoveryDecision, AssignmentSnapshotRef, LeaderLeaseOwner, LeaseOutcome,
+            ProcessLease, ProcessLeaseAuthority, ProcessLeaseFence,
+        };
+
+        let controller = ctl(1, Vec::new());
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&backing), Duration::from_millis(1)).unwrap(),
+        );
+        controller
+            .set_process_lease_authority(process_authority)
+            .unwrap();
+        let authority = Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::clone(&backing),
+            1_000,
+        ));
+        let owner = LeaderLeaseOwner {
+            node: NodeId(1),
+            boot: controller.recovery_incarnation(),
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+            panic!("empty leader authority must be acquired");
+        };
+        controller.set_leader_lease_store(Arc::clone(&authority));
+
+        let removed_boot = Uuid::from_u128(2);
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: owner.boot,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: removed_boot,
+                },
+            ],
+        )
+        .unwrap();
+        let target = CheckpointAssignmentFence::from_owner_map(
+            2,
+            &[1, 1],
+            vec![CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: owner.boot,
+            }],
+        )
+        .unwrap();
+        let forged = ProcessLeaseFence::new(
+            ProcessLease {
+                node: NodeId(2),
+                owner: removed_boot,
+                term: 1,
+                seq: 1,
+                expires_at_ms: 1,
+            },
+            ProcessLease {
+                node: NodeId(2),
+                owner: Uuid::from_u128(3),
+                term: 2,
+                seq: 2,
+                expires_at_ms: 2,
+            },
+        )
+        .unwrap();
+        let decision = AssignmentRecoveryDecision::new(
+            predecessor,
+            target,
+            AssignmentSnapshotRef {
+                version: 2,
+                sha256: "0".repeat(64),
+                encoded_len: 1,
+            },
+            vec![forged],
+            lease.proof(),
+        )
+        .unwrap();
+
+        let error = controller
+            .record_assignment_recovery_decision(
+                &lease.proof(),
+                decision,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("process fence verification failed"),
+            "{error}"
+        );
+        assert!(authority
+            .assignment_recovery_decision(2)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(feature = "cluster")]
@@ -2254,9 +3579,9 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_assignment_fence_is_invalidated_by_membership_change() {
+    fn checkpoint_assignment_fence_allows_active_workers_without_vnodes() {
         let self_id = NodeId(1);
-        let (members_tx, members_rx) = watch::channel(vec![info(2)]);
+        let (_members_tx, members_rx) = watch::channel(vec![info(2), info(3)]);
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
         let c = ClusterController::new(self_id, kv, None, members_rx);
         let expected = CheckpointAssignmentFence::from_owner_map(
@@ -2275,23 +3600,280 @@ mod tests {
         )
         .unwrap();
         c.publish_checkpoint_assignment_fence(Some(expected.clone()));
+
+        assert_eq!(
+            c.checkpoint_assignment_fence(7),
+            Some(expected),
+            "an active worker that owns no vnode must not expand the checkpoint quorum"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn certified_leader_retains_local_candidacy_to_coordinate_its_drain() {
+        use crate::cluster::control::{LeaderLease, LeaderLeaseOwner, LeaseDeadline};
+
+        let self_id = NodeId(1);
+        let idle = NodeId(2);
+        let (_members_tx, members_rx) = watch::channel(vec![info(idle.0)]);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+        let c = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[self_id.0],
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: c.recovery_incarnation(),
+            }],
+        )
+        .unwrap();
+        c.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        let owner = LeaderLeaseOwner {
+            node: self_id,
+            boot: c.recovery_incarnation(),
+            process_term: 1,
+        };
+        let (_lease_tx, lease_rx) = watch::channel(Some(LeaderLease {
+            seq: 1,
+            token: 1,
+            owner: owner.clone(),
+            expires_at_ms: i64::MIN,
+            catalog_manifest: None,
+        }));
+        c.set_leader_lease_watch(
+            lease_rx,
+            owner,
+            Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))),
+        )
+        .unwrap();
+        let (idle_members_tx, idle_members_rx) = watch::channel(vec![info(self_id.0)]);
+        let idle_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(idle));
+        let idle_observer = ClusterController::new(idle, idle_kv, None, idle_members_rx);
+        idle_observer.publish_checkpoint_assignment_fence(Some(fence));
+        assert_eq!(idle_observer.current_leader(), Some(self_id));
+        let mut candidacy = c.leader_candidacy_watch();
+        assert!(*candidacy.borrow_and_update());
+
+        assert!(c.begin_drain());
+        let mut advertised_draining = info(self_id.0);
+        advertised_draining.state = NodeState::Draining;
+        idle_members_tx.send(vec![advertised_draining]).unwrap();
+        assert!(c.is_draining());
+        assert_eq!(c.assignable_instances(), vec![idle]);
+        assert_eq!(c.current_leader(), Some(self_id));
+        assert!(c.is_gossip_leader());
+        assert_eq!(idle_observer.current_leader(), None);
+        assert!(!idle_observer.is_gossip_leader());
+        assert!(
+            !candidacy.has_changed().unwrap(),
+            "coordinating the predecessor cut must not revoke the current leader's lease"
+        );
+    }
+
+    #[test]
+    fn certified_draining_peer_does_not_displace_an_active_participant() {
+        let observer = NodeId(3);
+        let draining = NodeId(1);
+        let active = NodeId(2);
+        let mut draining_info = info(draining.0);
+        draining_info.state = NodeState::Draining;
+        let (_members_tx, members_rx) = watch::channel(vec![info(active.0), draining_info]);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(observer));
+        let c = ClusterController::new(observer, kv, None, members_rx);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[active.0, draining.0],
+            vec![
+                CheckpointParticipant {
+                    node_id: draining.0,
+                    boot_incarnation: Uuid::new_v4(),
+                },
+                CheckpointParticipant {
+                    node_id: active.0,
+                    boot_incarnation: Uuid::new_v4(),
+                },
+            ],
+        )
+        .unwrap();
+        c.publish_checkpoint_assignment_fence(Some(fence));
+
+        assert_eq!(c.current_leader(), Some(active));
+        assert!(!c.is_gossip_leader());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn certified_idle_worker_yields_leadership_to_an_assignment_participant() {
+        let self_id = NodeId(1);
+        let owner = NodeId(2);
+        let (_members_tx, members_rx) = watch::channel(vec![info(owner.0)]);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+        let c = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        let mut candidacy = c.leader_candidacy_watch();
+        assert!(*candidacy.borrow_and_update());
+        assert_eq!(c.current_leader(), Some(self_id));
+
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[owner.0],
+            vec![CheckpointParticipant {
+                node_id: owner.0,
+                boot_incarnation: Uuid::new_v4(),
+            }],
+        )
+        .unwrap();
+        c.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+        assert_eq!(c.checkpoint_assignment_fence(7), Some(fence.clone()));
+        assert_eq!(c.current_leader(), Some(owner));
+        assert!(!c.is_gossip_leader());
+        tokio::time::timeout(Duration::from_secs(1), candidacy.changed())
+            .await
+            .expect("leader candidacy relay did not observe the assignment roster")
+            .unwrap();
+        assert!(!*candidacy.borrow_and_update());
+
+        c.publish_checkpoint_assignment_fence(None);
+        assert_eq!(
+            c.current_leader(),
+            Some(owner),
+            "transient authority suspension must not make an idle worker leader"
+        );
+
+        let newer = CheckpointAssignmentFence::from_owner_map(
+            8,
+            &[self_id.0],
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: c.recovery_incarnation(),
+            }],
+        )
+        .unwrap();
+        c.publish_checkpoint_assignment_fence(Some(newer));
+        assert_eq!(c.current_leader(), Some(self_id));
+        c.publish_checkpoint_assignment_fence(Some(fence));
+        assert_eq!(
+            c.current_leader(),
+            Some(self_id),
+            "a delayed older certificate must not restore an obsolete leadership roster"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn durably_fenced_idle_worker_leads_when_every_assignment_owner_is_unavailable() {
+        let self_id = NodeId(1);
+        let owner = NodeId(2);
+        let (_members_tx, members_rx) = watch::channel(vec![info(owner.0)]);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+        let c = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        let owner_process = CheckpointParticipant {
+            node_id: owner.0,
+            boot_incarnation: Uuid::from_u128(22),
+        };
+        c.publish_checkpoint_assignment_fence(Some(
+            CheckpointAssignmentFence::from_owner_map(7, &[owner.0], vec![owner_process]).unwrap(),
+        ));
+        let (_authority, _proof) = install_recovery_authority(&c, 1_000).await;
+        let mut candidacy = c.leader_candidacy_watch();
+
+        assert_eq!(c.current_leader(), Some(owner));
+        assert!(!*candidacy.borrow_and_update());
+        c.note_unresponsive(&[owner]);
+        tokio::time::timeout(Duration::from_secs(1), candidacy.changed())
+            .await
+            .expect("placement fallback candidacy did not update")
+            .unwrap();
+
+        assert!(*candidacy.borrow_and_update());
+        assert_eq!(c.current_leader(), Some(self_id));
+        assert!(c.is_leader());
+        assert!(!c
+            .checkpoint_assignment_fence(7)
+            .unwrap()
+            .contains(self_id.0));
+    }
+
+    #[test]
+    fn checkpoint_assignment_fence_rejects_missing_or_suspected_participant() {
+        let self_id = NodeId(1);
+        let (members_tx, members_rx) = watch::channel(vec![info(2), info(3)]);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+        let c = ClusterController::new(self_id, kv, None, members_rx);
+        let expected = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: c.recovery_incarnation(),
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: Uuid::new_v4(),
+                },
+            ],
+        )
+        .unwrap();
+        c.publish_checkpoint_assignment_fence(Some(expected.clone()));
+
         assert_eq!(c.checkpoint_assignment_fence(7), Some(expected.clone()));
         assert_eq!(c.checkpoint_assignment_fence(6), None);
         c.note_unresponsive(&[NodeId(2)]);
         assert_eq!(
             c.checkpoint_assignment_fence(7),
-            Some(expected),
+            Some(expected.clone()),
             "node-local quorum history must not make the shared assignment proof diverge"
         );
 
         let mut suspected = info(2);
         suspected.state = NodeState::Suspected;
-        members_tx.send(vec![suspected]).unwrap();
+        members_tx.send(vec![suspected, info(3)]).unwrap();
         assert_eq!(
             c.checkpoint_assignment_fence(7),
             None,
             "a cached fence must close immediately when a participant becomes unavailable"
         );
+
+        members_tx.send(vec![info(2), info(3)]).unwrap();
+        assert_eq!(c.checkpoint_assignment_fence(7), Some(expected));
+        members_tx.send(vec![info(3)]).unwrap();
+        assert_eq!(
+            c.checkpoint_assignment_fence(7),
+            None,
+            "a missing vnode owner must invalidate the cached fence"
+        );
+    }
+
+    #[test]
+    fn quorum_miss_quarantine_requires_an_ack_or_a_different_boot() {
+        let c = ctl(1, vec![info(2)]);
+        let failed = CheckpointParticipant {
+            node_id: 2,
+            boot_incarnation: Uuid::from_u128(22),
+        };
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: c.recovery_incarnation(),
+                },
+                failed,
+            ],
+        )
+        .unwrap();
+        c.publish_checkpoint_assignment_fence(Some(fence));
+        c.note_unresponsive(&[NodeId(2)]);
+
+        assert!(c.is_unresponsive(NodeId(2)));
+        assert!(!c.admit_successor_process(failed));
+        assert!(c.admit_successor_process(CheckpointParticipant {
+            node_id: 2,
+            boot_incarnation: Uuid::from_u128(23),
+        }));
+        assert!(!c.is_unresponsive(NodeId(2)));
     }
 
     #[test]
@@ -2514,17 +4096,7 @@ mod tests {
         let transition =
             AssignmentDrainTransition::new(predecessor, target, lease.proof()).unwrap();
         controller.publish_checkpoint_drain_transition(Some(transition.clone()));
-        let sources =
-            |candidate: &AssignmentDrainTransition, marker: u8| NodeDrainReceiptAggregate {
-                round_digest: candidate.digest(),
-                source_plan_digest: [marker; 32],
-                receipt_count: 1,
-                receipt_set_digest: [marker.saturating_add(1); 32],
-            };
-        controller
-            .announce_drain_ack(&transition, sources(&transition, 1))
-            .await
-            .unwrap();
+        controller.announce_drain_ack(&transition).await.unwrap();
         assert!(
             !controller
                 .drain_ack_quorum_reached(&transition)
@@ -2541,7 +4113,6 @@ mod tests {
                 boot_incarnation: Uuid::from_u128(21),
             },
             &transition,
-            sources(&transition, 2),
         ));
         assert!(!controller
             .drain_ack_quorum_reached(&transition)
@@ -2560,11 +4131,7 @@ mod tests {
             transition.leader.clone(),
         )
         .unwrap();
-        seed_peer_ack(DrainAck::for_transition(
-            participants[1],
-            &stale_transition,
-            sources(&stale_transition, 2),
-        ));
+        seed_peer_ack(DrainAck::for_transition(participants[1], &stale_transition));
         assert!(!controller
             .drain_ack_quorum_reached(&transition)
             .await
@@ -2585,7 +4152,6 @@ mod tests {
         seed_peer_ack(DrainAck::for_transition(
             participants[1],
             &future_transition,
-            sources(&future_transition, 2),
         ));
         assert!(!controller
             .drain_ack_quorum_reached(&transition)
@@ -2604,27 +4170,19 @@ mod tests {
             transition.leader.clone(),
         )
         .unwrap();
-        seed_peer_ack(DrainAck::for_transition(
-            participants[1],
-            &other_transition,
-            sources(&other_transition, 2),
-        ));
+        seed_peer_ack(DrainAck::for_transition(participants[1], &other_transition));
         assert!(!controller
             .drain_ack_quorum_reached(&transition)
             .await
             .unwrap());
 
-        seed_peer_ack(DrainAck::for_transition(
-            participants[1],
-            &transition,
-            sources(&transition, 2),
-        ));
+        seed_peer_ack(DrainAck::for_transition(participants[1], &transition));
         assert!(controller
             .drain_ack_quorum_reached(&transition)
             .await
             .unwrap());
         controller
-            .announce_drain_ack(&transition, sources(&transition, 1))
+            .announce_drain_ack(&transition)
             .await
             .expect("an exact retry is idempotent");
         assert!(controller
@@ -2673,13 +4231,7 @@ mod tests {
             },
         )
         .unwrap();
-        let sources = NodeDrainReceiptAggregate {
-            round_digest: transition.digest(),
-            source_plan_digest: [1; 32],
-            receipt_count: 1,
-            receipt_set_digest: [2; 32],
-        };
-        let ack = DrainAck::for_transition(predecessor.participants[0], &transition, sources);
+        let ack = DrainAck::for_transition(predecessor.participants[0], &transition);
         let encoded = encode_drain_ack(&ack).unwrap();
         assert!(encoded.len() <= MAX_DRAIN_ACK_BYTES);
         assert_eq!(parse_drain_ack(&encoded, NodeId(1)).unwrap(), ack);
@@ -2690,6 +4242,13 @@ mod tests {
         assert!(encode_drain_ack(&noncanonical).is_err());
         assert!(
             parse_drain_ack(&serde_json::to_string(&noncanonical).unwrap(), NodeId(1)).is_err()
+        );
+
+        let mut prior_protocol = DrainAck::for_transition(predecessor.participants[0], &transition);
+        prior_protocol.protocol_version = DRAIN_ACK_PROTOCOL_VERSION - 1;
+        assert!(encode_drain_ack(&prior_protocol).is_err());
+        assert!(
+            parse_drain_ack(&serde_json::to_string(&prior_protocol).unwrap(), NodeId(1)).is_err()
         );
     }
 
@@ -2855,37 +4414,199 @@ mod tests {
         assert_eq!(c.cluster_min_watermark(), Some(12_345));
     }
 
+    async fn install_recovery_authority(
+        controller: &ClusterController,
+        ttl_ms: i64,
+    ) -> (Arc<super::super::LeaderLeaseStore>, LeaderProof) {
+        use super::super::{LeaderLeaseOwner, LeaseDeadline, LeaseOutcome};
+
+        let authority = Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            ttl_ms,
+        ));
+        let owner = LeaderLeaseOwner {
+            node: controller.instance_id(),
+            boot: controller.recovery_incarnation(),
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+            panic!("empty recovery authority must be acquired");
+        };
+        let (_lease_tx, lease_rx) = watch::channel(Some(lease.clone()));
+        let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
+        controller.set_process_lease_deadline(Arc::clone(&deadline));
+        controller
+            .set_leader_lease_watch(lease_rx, owner, deadline)
+            .unwrap();
+        controller.set_leader_lease_store(Arc::clone(&authority));
+        (authority, lease.proof())
+    }
+
+    fn test_leader_proof(node_id: u64, boot_id: Uuid, process_term: u64) -> LeaderProof {
+        LeaderProof {
+            owner: crate::checkpoint::LeaderProofOwner {
+                node_id,
+                boot_id,
+                process_term,
+            },
+            fencing_token: process_term,
+        }
+    }
+
     fn recovery_round(
         controller: &ClusterController,
         generation: u64,
-        driver: u64,
+        leader_proof: &LeaderProof,
         participants: &[u64],
     ) -> RecoveryRound {
         let participant_roster = participants
             .iter()
             .map(|node_id| CheckpointParticipant {
                 node_id: *node_id,
-                boot_incarnation: if *node_id == controller.instance_id().0 {
+                boot_incarnation: if *node_id == leader_proof.owner.node_id {
+                    leader_proof.owner.boot_id
+                } else if *node_id == controller.instance_id().0 {
                     controller.recovery_incarnation()
                 } else {
-                    Uuid::new_v4()
+                    Uuid::from_u128((u128::from(generation) << 64) | u128::from(*node_id))
                 },
             })
             .collect();
         RecoveryRound::new(
             generation,
-            NodeId(driver),
+            leader_proof.clone(),
             CheckpointAssignmentFence::from_owner_map(7, participants, participant_roster).unwrap(),
+            vec![RecoveryFault {
+                reporter: NodeId(leader_proof.owner.node_id),
+                sequence: generation,
+            }],
         )
         .unwrap()
+    }
+
+    fn seed_release_ready(
+        kv: &InMemoryKv,
+        participant: CheckpointParticipant,
+        release: &RecoveryAnnouncement,
+    ) {
+        let encoded = encode_release_ready_ack(&RecoveryReleaseReadyAck {
+            release: RecoveryReleaseId::for_pending(release).unwrap(),
+            participant,
+        })
+        .unwrap();
+        kv.seed(NodeId(participant.node_id), RELEASE_READY_ACK_KEY, encoded);
+    }
+
+    async fn two_owner_pending_release() -> (
+        ClusterController,
+        Arc<InMemoryKv>,
+        RecoveryAnnouncement,
+        CheckpointParticipant,
+    ) {
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+        let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+        controller.publish_recovery_incarnation().await.unwrap();
+        let (_authority, proof) = install_recovery_authority(&controller, 10_000).await;
+        let round = recovery_round(&controller, 41, &proof, &[1, 2]);
+        let remote = round.assignment_fence.participants[1];
+        kv.seed(
+            NodeId(remote.node_id),
+            RECOVERY_INCARNATION_KEY,
+            remote.boot_incarnation.to_string(),
+        );
+        controller.report_fault(41).await.unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.announce_recover_start(&round, 8).await.unwrap();
+        controller
+            .announce_recover_release(&round, 8)
+            .await
+            .unwrap();
+        let release = RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Release { epoch: 8 },
+        };
+        (controller, kv, release, remote)
+    }
+
+    async fn faulty_single_owner_pending_release() -> (
+        ClusterController,
+        Arc<FaultyReadyReadKv>,
+        RecoveryAnnouncement,
+    ) {
+        let self_id = NodeId(1);
+        let kv = Arc::new(FaultyReadyReadKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+        controller.publish_recovery_incarnation().await.unwrap();
+        let (_authority, proof) = install_recovery_authority(&controller, 10_000).await;
+        let round = recovery_round(&controller, 43, &proof, &[1]);
+        controller.report_fault(43).await.unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.announce_recover_start(&round, 9).await.unwrap();
+        controller
+            .announce_recover_release(&round, 9)
+            .await
+            .unwrap();
+        let release = RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Release { epoch: 9 },
+        };
+        controller.announce_release_ready(&release).await.unwrap();
+        (controller, kv, release)
+    }
+
+    #[test]
+    fn recovery_round_requires_a_canonical_nonzero_fault_set() {
+        let c = ctl(1, vec![]);
+        let proof = test_leader_proof(1, c.recovery_incarnation(), 1);
+        let exact = recovery_round(&c, 11, &proof, &[1]);
+        assert_eq!(exact.fault_sequence(NodeId(1)), Some(11));
+
+        let mut mismatched_driver = exact.clone();
+        mismatched_driver.id.driver = NodeId(2);
+        assert!(mismatched_driver.validate().is_err());
+
+        let mut mismatched_boot = exact.clone();
+        mismatched_boot.leader_proof.owner.boot_id = Uuid::new_v4();
+        assert!(mismatched_boot.validate().is_err());
+
+        let mut empty = exact.clone();
+        empty.faults.clear();
+        assert!(empty.validate().is_err());
+
+        let mut zero = exact.clone();
+        zero.faults[0].sequence = 0;
+        assert!(zero.validate().is_err());
+
+        let mut duplicate = exact;
+        duplicate.faults.push(duplicate.faults[0]);
+        assert!(duplicate.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn fault_clear_never_overwrites_a_newer_local_sequence() {
+        let c = ctl(1, vec![]);
+        c.report_fault(12).await.unwrap();
+
+        assert!(!c.clear_fault_report(11).await.unwrap());
+        assert_eq!(c.read_fault_reports().await.unwrap(), vec![(NodeId(1), 12)]);
+
+        assert!(c.clear_fault_report(12).await.unwrap());
+        assert!(c.clear_fault_report(12).await.unwrap());
+        assert_eq!(c.read_fault_reports().await.unwrap(), vec![(NodeId(1), 0)]);
     }
 
     #[tokio::test]
     async fn recovery_start_and_clear_require_the_identical_prepared_round() {
         let c = ctl(1, vec![]);
         c.publish_recovery_incarnation().await.unwrap();
-        let round = recovery_round(&c, 11, 1, &[1]);
-        let other = recovery_round(&c, 12, 1, &[1]);
+        let (_authority, proof) = install_recovery_authority(&c, 1_000).await;
+        let round = recovery_round(&c, 11, &proof, &[1]);
+        let other = recovery_round(&c, 12, &proof, &[1]);
         c.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
 
         c.announce_recover_prepare(&round).await.unwrap();
@@ -2916,8 +4637,10 @@ mod tests {
         let (_tx, rx) = watch::channel(vec![old_driver]);
         let c = ClusterController::new(self_id, kv.clone(), None, rx);
         c.publish_recovery_incarnation().await.unwrap();
-        let local = recovery_round(&c, 17, 2, &[2]);
-        let stale = recovery_round(&c, 99, 1, &[1, 2]);
+        let (_authority, local_proof) = install_recovery_authority(&c, 1_000).await;
+        let stale_proof = test_leader_proof(1, Uuid::from_u128(99), 99);
+        let local = recovery_round(&c, 17, &local_proof, &[2]);
+        let stale = recovery_round(&c, 99, &stale_proof, &[1, 2]);
         c.publish_checkpoint_assignment_fence(Some(local.assignment_fence.clone()));
         c.announce_recover_prepare(&local).await.unwrap();
         kv.seed(
@@ -2945,6 +4668,7 @@ mod tests {
         let kv = Arc::new(InMemoryKv::new(self_id));
         let (_tx, rx) = watch::channel(Vec::new());
         let c = ClusterController::new(self_id, kv.clone(), None, rx);
+        let (_authority, _proof) = install_recovery_authority(&c, 1_000).await;
         kv.seed(self_id, "control:recover", "not-json".into());
 
         let error = c.observe_recover().await.unwrap_err();
@@ -2955,7 +4679,8 @@ mod tests {
     async fn recovered_ack_binds_the_start_target() {
         let c = ctl(1, vec![]);
         c.publish_recovery_incarnation().await.unwrap();
-        let round = recovery_round(&c, 21, 1, &[1]);
+        let proof = test_leader_proof(1, c.recovery_incarnation(), 1);
+        let round = recovery_round(&c, 21, &proof, &[1]);
         let start = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Start { epoch: 4 },
@@ -2972,10 +4697,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_is_terminal_and_cannot_be_cleared() {
+    async fn release_terminal_is_authoritative_and_hint_is_retirable() {
         let c = ctl(1, vec![]);
         c.publish_recovery_incarnation().await.unwrap();
-        let round = recovery_round(&c, 31, 1, &[1]);
+        let (_authority, proof) = install_recovery_authority(&c, 1_000).await;
+        let round = recovery_round(&c, 31, &proof, &[1]);
+        c.report_fault(31).await.unwrap();
         c.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
         c.announce_recover_prepare(&round).await.unwrap();
         c.announce_recover_start(&round, 8).await.unwrap();
@@ -2987,8 +4714,137 @@ mod tests {
         };
         assert_eq!(c.observe_recover().await.unwrap(), Some(release.clone()));
         assert!(!c.clear_recover(&round).await.unwrap());
-        c.announce_released(&release).await.unwrap();
-        assert_eq!(c.read_released().await.unwrap(), vec![(NodeId(1), release)]);
+        c.announce_release_ready(&release).await.unwrap();
+        assert_eq!(
+            c.read_release_ready(&release).await.unwrap(),
+            ReleaseReadyStatus::Complete
+        );
+        let ReleaseCommitStatus::Committed { terminal } =
+            c.try_commit_recover_release(&release).await.unwrap()
+        else {
+            panic!("exact readiness must commit the pending Release");
+        };
+        assert_eq!(terminal.phase, RecoverPhase::ReleaseCommitted { epoch: 8 });
+        assert_eq!(c.observe_recover().await.unwrap(), Some(release.clone()));
+        assert_eq!(
+            c.observe_committed_recover_release(&round, 8)
+                .await
+                .unwrap(),
+            Some(terminal)
+        );
+        assert!(!c.clear_recover(&round).await.unwrap());
+        assert!(c
+            .retire_committed_recover_release_hint(&round, 8)
+            .await
+            .unwrap());
+        assert_eq!(c.observe_recover().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn release_commit_requires_the_exact_compact_ready_roster() {
+        let (controller, kv, release, remote) = two_owner_pending_release().await;
+        controller.announce_release_ready(&release).await.unwrap();
+
+        assert_eq!(
+            controller.read_release_ready(&release).await.unwrap(),
+            ReleaseReadyStatus::Pending {
+                missing: vec![NodeId(remote.node_id)]
+            }
+        );
+        kv.seed(
+            NodeId(99),
+            RELEASE_READY_ACK_KEY,
+            "unrelated malformed value".into(),
+        );
+        assert!(matches!(
+            controller
+                .try_commit_recover_release(&release)
+                .await
+                .unwrap(),
+            ReleaseCommitStatus::Pending { .. }
+        ));
+
+        seed_release_ready(&kv, remote, &release);
+        assert_eq!(
+            controller.read_release_ready(&release).await.unwrap(),
+            ReleaseReadyStatus::Complete
+        );
+        let ReleaseCommitStatus::Committed { terminal } = controller
+            .try_commit_recover_release(&release)
+            .await
+            .unwrap()
+        else {
+            panic!("the exact compact readiness roster must commit");
+        };
+        assert_eq!(terminal.phase, RecoverPhase::ReleaseCommitted { epoch: 8 });
+        let local_ack = kv
+            .read_from(NodeId(1), RELEASE_READY_ACK_KEY)
+            .await
+            .unwrap();
+        assert!(local_ack.len() < 512);
+        assert!(!local_ack.contains("assignment_fence"));
+        assert!(!local_ack.contains("faults"));
+    }
+
+    #[tokio::test]
+    async fn restarted_ready_owner_cannot_commit_its_old_process_vote() {
+        let (controller, kv, release, remote) = two_owner_pending_release().await;
+        controller.announce_release_ready(&release).await.unwrap();
+        seed_release_ready(&kv, remote, &release);
+        kv.seed(
+            NodeId(remote.node_id),
+            RECOVERY_INCARNATION_KEY,
+            Uuid::new_v4().to_string(),
+        );
+
+        let RecoveryControlError::Superseded(reason) = controller
+            .try_commit_recover_release(&release)
+            .await
+            .unwrap_err()
+        else {
+            panic!("a restarted owner must invalidate its old process vote");
+        };
+        assert!(reason.contains("process-incarnation roster changed"));
+        assert_eq!(controller.observe_recover().await.unwrap(), Some(release));
+    }
+
+    #[tokio::test]
+    async fn fail_once_ready_read_retries_the_same_pending_release() {
+        let (controller, kv, release) = faulty_single_owner_pending_release().await;
+        kv.fail_next_ready_reads(1);
+
+        assert!(controller
+            .try_commit_recover_release(&release)
+            .await
+            .is_err());
+        assert_eq!(
+            controller.observe_recover().await.unwrap(),
+            Some(release.clone())
+        );
+        assert!(matches!(
+            controller
+                .try_commit_recover_release(&release)
+                .await
+                .unwrap(),
+            ReleaseCommitStatus::Committed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_ready_read_failure_leaves_the_release_pending_at_deadline() {
+        let (controller, kv, release) = faulty_single_owner_pending_release().await;
+        kv.fail_next_ready_reads(usize::MAX);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+
+        while tokio::time::Instant::now() < deadline {
+            assert!(controller
+                .try_commit_recover_release(&release)
+                .await
+                .is_err());
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(controller.observe_recover().await.unwrap(), Some(release));
     }
 
     #[tokio::test]
@@ -3005,7 +4861,8 @@ mod tests {
             members_rx,
         );
         controller.publish_recovery_incarnation().await.unwrap();
-        let round = recovery_round(&controller, 51, 1, &[1]);
+        let (authority, proof) = install_recovery_authority(&controller, 1_000).await;
+        let round = recovery_round(&controller, 51, &proof, &[1]);
         controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
         controller.adopt_recovery_generation(51).await.unwrap();
         controller.announce_recover_prepare(&round).await.unwrap();
@@ -3027,6 +4884,7 @@ mod tests {
             None,
             replacement_rx,
         );
+        replacement.set_leader_lease_store(authority);
         assert_eq!(replacement.max_recovery_generation().await.unwrap(), 51);
         assert_eq!(
             replacement.observe_recover().await.unwrap(),
@@ -3034,6 +4892,206 @@ mod tests {
                 round,
                 phase: RecoverPhase::Release { epoch: 13 },
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_old_phase_cannot_clobber_same_process_new_leader_term() {
+        use super::super::{LeaderLeaseOwner, LeaseDeadline, LeaseOutcome};
+
+        let node = NodeId(1);
+        let delayed = Arc::new(DelayedRecoveryKv::new(node));
+        let recovery_kv: Arc<dyn ClusterKv> = delayed.clone();
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node, recovery_kv, None, members_rx));
+        controller.publish_recovery_incarnation().await.unwrap();
+
+        let authority = Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            1,
+        ));
+        let owner = LeaderLeaseOwner {
+            node,
+            boot: controller.recovery_incarnation(),
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(old_lease) = authority.try_acquire(&owner, 0).await.unwrap()
+        else {
+            panic!("empty recovery authority must be acquired");
+        };
+        let (lease_tx, lease_rx) = watch::channel(Some(old_lease.clone()));
+        let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
+        controller.set_process_lease_deadline(Arc::clone(&deadline));
+        controller
+            .set_leader_lease_watch(lease_rx, owner.clone(), deadline)
+            .unwrap();
+        controller.set_leader_lease_store(Arc::clone(&authority));
+
+        let old_proof = old_lease.proof();
+        let old_round = recovery_round(&controller, 61, &old_proof, &[1]);
+        controller.publish_checkpoint_assignment_fence(Some(old_round.assignment_fence.clone()));
+        controller
+            .announce_recover_prepare(&old_round)
+            .await
+            .unwrap();
+
+        delayed.block_next_recovery_write();
+        let stale_start = {
+            let controller = Arc::clone(&controller);
+            let round = old_round.clone();
+            tokio::spawn(async move { controller.announce_recover_start(&round, 4).await })
+        };
+        delayed.wait_until_blocked().await;
+
+        let rival = LeaderLeaseOwner {
+            node: NodeId(2),
+            boot: Uuid::new_v4(),
+            process_term: 1,
+        };
+        let rival_observation = authority.observe_rival(&rival, &old_lease).unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        let LeaseOutcome::Acquired(rival_lease) = authority
+            .try_takeover(&rival, &rival_observation, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("rival must take over the expired old term");
+        };
+        let return_observation = authority.observe_rival(&owner, &rival_lease).unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        let LeaseOutcome::Acquired(current_lease) = authority
+            .try_takeover(&owner, &return_observation, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("original process must acquire a higher leader term");
+        };
+        assert_eq!(current_lease.owner, old_lease.owner);
+        assert!(current_lease.token > old_lease.token);
+        lease_tx.send_replace(Some(current_lease.clone()));
+
+        let current_round = recovery_round(&controller, 62, &current_lease.proof(), &[1]);
+        controller
+            .publish_checkpoint_assignment_fence(Some(current_round.assignment_fence.clone()));
+        let current_prepare = {
+            let controller = Arc::clone(&controller);
+            let round = current_round.clone();
+            tokio::spawn(async move { controller.announce_recover_prepare(&round).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !current_prepare.is_finished(),
+            "the replacement phase must serialize behind the in-flight old write"
+        );
+
+        delayed.release_blocked_write();
+        let stale_error = stale_start.await.unwrap().unwrap_err();
+        assert!(
+            stale_error.contains("proof is no longer live at Start read-back"),
+            "{stale_error}"
+        );
+        current_prepare.await.unwrap().unwrap();
+        assert_eq!(
+            controller.observe_recover().await.unwrap(),
+            Some(RecoveryAnnouncement {
+                round: current_round,
+                phase: RecoverPhase::Prepare,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_release_terminal_survives_leader_takeover() {
+        use super::super::{LeaderLeaseOwner, LeaseDeadline, LeaseOutcome};
+
+        let node = NodeId(1);
+        let delayed = Arc::new(DelayedRecoveryKv::new(node));
+        let recovery_kv: Arc<dyn ClusterKv> = delayed.clone();
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node, recovery_kv, None, members_rx));
+        controller.publish_recovery_incarnation().await.unwrap();
+        let authority = Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            1,
+        ));
+        let owner = LeaderLeaseOwner {
+            node,
+            boot: controller.recovery_incarnation(),
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(old_lease) = authority.try_acquire(&owner, 0).await.unwrap()
+        else {
+            panic!("empty recovery authority must be acquired");
+        };
+        let (_lease_tx, lease_rx) = watch::channel(Some(old_lease.clone()));
+        let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
+        controller.set_process_lease_deadline(Arc::clone(&deadline));
+        controller
+            .set_leader_lease_watch(lease_rx, owner, deadline)
+            .unwrap();
+        controller.set_leader_lease_store(Arc::clone(&authority));
+
+        let round = recovery_round(&controller, 63, &old_lease.proof(), &[1]);
+        controller.report_fault(63).await.unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.announce_recover_start(&round, 5).await.unwrap();
+        controller
+            .announce_recover_release(&round, 5)
+            .await
+            .unwrap();
+        let pending = RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Release { epoch: 5 },
+        };
+        controller.announce_release_ready(&pending).await.unwrap();
+
+        let ReleaseCommitStatus::Committed { terminal } = controller
+            .try_commit_recover_release(&pending)
+            .await
+            .unwrap()
+        else {
+            panic!("exact readiness must commit the authority terminal");
+        };
+        let raw = delayed.read_from(node, "control:recover").await.unwrap();
+        assert!(raw.contains("\"Release\""));
+        assert!(!raw.contains("ReleaseCommitted"));
+
+        let rival = LeaderLeaseOwner {
+            node: NodeId(2),
+            boot: Uuid::new_v4(),
+            process_term: 1,
+        };
+        let committed_lease = authority.load().await.unwrap().unwrap();
+        let observation = authority.observe_rival(&rival, &committed_lease).unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        let LeaseOutcome::Acquired(rival_lease) = authority
+            .try_takeover(&rival, &observation, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("rival must take over the expired release driver");
+        };
+
+        let (_replacement_tx, replacement_rx) = watch::channel(Vec::new());
+        let replacement = ClusterController::new(rival.node, delayed.clone(), None, replacement_rx);
+        let (_rival_lease_tx, rival_lease_rx) = watch::channel(Some(rival_lease));
+        let rival_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
+        replacement.set_process_lease_deadline(Arc::clone(&rival_deadline));
+        replacement
+            .set_leader_lease_watch(rival_lease_rx, rival, rival_deadline)
+            .unwrap();
+        replacement.set_leader_lease_store(authority);
+        assert_eq!(
+            replacement
+                .observe_committed_recover_release(&pending.round, 5)
+                .await
+                .unwrap(),
+            Some(terminal)
+        );
+        assert_eq!(
+            delayed.read_from(node, "control:recover").await.unwrap(),
+            raw
         );
     }
 
@@ -3057,7 +5115,8 @@ mod tests {
         let (_old_tx, old_rx) = watch::channel(Vec::new());
         let old = ClusterController::new(node, kv.clone(), None, old_rx);
         old.publish_recovery_incarnation().await.unwrap();
-        let old_round = recovery_round(&old, 41, 1, &[1]);
+        let proof = test_leader_proof(1, old.recovery_incarnation(), 1);
+        let old_round = recovery_round(&old, 41, &proof, &[1]);
 
         let (_new_tx, new_rx) = watch::channel(Vec::new());
         let replacement = ClusterController::new(node, kv, None, new_rx);

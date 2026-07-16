@@ -8,15 +8,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
 use laminar_connectors::connector::{
-    ConnectorDrainCut, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
-    SourceDrainRequest, SourceDrainStart, SourceStart, SourceTopology,
+    PartitionInfo, SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest,
+    SourceDrainResolution, SourcePosition, SourceStart, SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
+use laminar_core::changelog::WEIGHT_COLUMN;
 use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
+use laminar_core::cluster::control::process_lease::ProcessLeaseAuthority;
 use laminar_core::cluster::control::{
     AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifestStore, CheckpointDecisionStore,
     CheckpointParticipant, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore, ProcessLease,
@@ -28,7 +33,7 @@ use laminar_core::state::{
     rendezvous_assignment, NodeId, ObjectStoreBackend, StateBackend, VnodeRegistry,
 };
 use laminar_core::streaming::StreamCheckpointConfig;
-use laminar_db::LaminarDB;
+use laminar_db::{ClusterStartupDisposition, LaminarDB};
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use tempfile::TempDir;
@@ -38,35 +43,219 @@ const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(10);
 const TEST_LEASE_TTL: Duration = Duration::from_secs(2);
 const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
 pub const TEST_SOURCE_DDL: &str =
-    "CREATE SOURCE src (key BIGINT, value BIGINT) WITH ('connector' = 'cluster-harness-idle')";
+    "CREATE SOURCE src (key BIGINT, value BIGINT) WITH ('connector' = 'cluster-harness-scripted')";
+pub const TEST_AGGREGATE_SINK_DDL: &str =
+    "CREATE SINK observed_totals FROM totals WITH ('connector' = 'cluster-harness-observer')";
+
+pub struct ScriptedClusterHarnessLog {
+    rows: parking_lot::Mutex<Vec<(i64, i64)>>,
+    resume_gate: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ScriptedClusterHarnessLog {
+    fn default() -> Self {
+        let (resume_gate, _receiver) = tokio::sync::watch::channel(true);
+        Self {
+            rows: parking_lot::Mutex::new(Vec::new()),
+            resume_gate,
+        }
+    }
+}
+
+impl ScriptedClusterHarnessLog {
+    pub fn append(&self, rows: &[(i64, i64)]) {
+        self.rows.lock().extend_from_slice(rows);
+    }
+
+    pub fn block_resumes(&self) {
+        let _ = self.resume_gate.send_replace(false);
+    }
+
+    pub fn release_resumes(&self) {
+        let _ = self.resume_gate.send_replace(true);
+    }
+
+    fn len(&self) -> usize {
+        self.rows.lock().len()
+    }
+
+    fn read(&self, cursor: usize, max_records: usize) -> Vec<(i64, i64)> {
+        let rows = self.rows.lock();
+        let end = cursor.saturating_add(max_records).min(rows.len());
+        rows[cursor..end].to_vec()
+    }
+
+    async fn wait_for_resume_release(&self) {
+        let mut gate = self.resume_gate.subscribe();
+        while !*gate.borrow_and_update() {
+            gate.changed()
+                .await
+                .expect("cluster harness owns the resume gate sender");
+        }
+    }
+}
 
 #[derive(Default)]
-struct IdleClusterHarnessSource {
+pub struct ClusterHarnessSourceState {
+    polls: std::sync::atomic::AtomicU64,
+    resume_starts: std::sync::atomic::AtomicU64,
+    last_resume_cursor: std::sync::atomic::AtomicU64,
+    last_checkpoint_cursor: std::sync::atomic::AtomicU64,
+    failure_requested: std::sync::atomic::AtomicBool,
+    failure_observed: std::sync::atomic::AtomicBool,
+    drain_resolutions: parking_lot::Mutex<Vec<SourceDrainResolution>>,
+}
+
+impl ClusterHarnessSourceState {
+    #[must_use]
+    pub fn polls(&self) -> u64 {
+        self.polls.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn drain_finishes(&self) -> u64 {
+        u64::try_from(self.drain_resolutions.lock().len()).expect("drain count fits u64")
+    }
+
+    #[must_use]
+    pub fn drain_resolutions(&self) -> Vec<SourceDrainResolution> {
+        self.drain_resolutions.lock().clone()
+    }
+
+    #[must_use]
+    pub fn resume_starts(&self) -> u64 {
+        self.resume_starts
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn last_resume_cursor(&self) -> u64 {
+        self.last_resume_cursor
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn last_checkpoint_cursor(&self) -> u64 {
+        self.last_checkpoint_cursor
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+struct ScriptedClusterHarnessSource {
+    state: Arc<ClusterHarnessSourceState>,
+    log: Arc<ScriptedClusterHarnessLog>,
+    cursor: usize,
     vnode_registry: Option<Arc<VnodeRegistry>>,
+    self_id: Option<NodeId>,
+}
+
+impl ScriptedClusterHarnessSource {
+    fn owns_shared_split(&self) -> bool {
+        self.vnode_registry
+            .as_ref()
+            .zip(self.self_id)
+            .is_some_and(|(registry, self_id)| registry.owner(0) == self_id)
+    }
 }
 
 #[async_trait]
-impl SourceConnector for IdleClusterHarnessSource {
-    async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+impl SourceConnector for ScriptedClusterHarnessSource {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        match request.position {
+            SourcePosition::Initial => {
+                self.cursor = 0;
+            }
+            SourcePosition::Resume { checkpoint, .. } => {
+                let raw_cursor = checkpoint.get_offset("cursor").ok_or_else(|| {
+                    ConnectorError::ConfigurationError(
+                        "scripted source recovery checkpoint is missing cursor".into(),
+                    )
+                })?;
+                let cursor = raw_cursor.parse::<usize>().map_err(|error| {
+                    ConnectorError::ConfigurationError(format!(
+                        "scripted source recovery cursor '{raw_cursor}' is invalid: {error}"
+                    ))
+                })?;
+                if cursor > self.log.len() {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "scripted source recovery cursor {cursor} exceeds durable log length {}",
+                        self.log.len()
+                    )));
+                }
+                self.cursor = cursor;
+                self.state.last_resume_cursor.store(
+                    u64::try_from(cursor).expect("source cursor fits u64"),
+                    std::sync::atomic::Ordering::Release,
+                );
+                self.state
+                    .resume_starts
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                self.log.wait_for_resume_release().await;
+            }
+        }
         Ok(())
     }
 
     async fn poll_batch(
         &mut self,
-        _max_records: usize,
+        max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
-        Ok(None)
+        if !self.owns_shared_split() {
+            return Ok(None);
+        }
+        self.state
+            .polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .state
+            .failure_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.state
+                .failure_observed
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(ConnectorError::Internal(
+                "cluster harness injected a terminal data-plane failure".into(),
+            ));
+        }
+
+        let rows = self.log.read(self.cursor, max_records.max(1));
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let values = rows.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        self.cursor += rows.len();
+        let records = RecordBatch::try_new(
+            self.schema(),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .map_err(|error| ConnectorError::Internal(format!("scripted source batch: {error}")))?;
+        Ok(Some(SourceBatch::with_partition(
+            records,
+            PartitionInfo::new("scripted-log", self.cursor.to_string()),
+        )))
     }
 
-    fn schema(&self) -> arrow::datatypes::SchemaRef {
-        Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Int64, true),
-            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, true),
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, true),
+            Field::new("value", DataType::Int64, true),
         ]))
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
+        if self.owns_shared_split() {
+            checkpoint.set_offset("cursor", self.cursor.to_string());
+            self.state.last_checkpoint_cursor.store(
+                u64::try_from(self.cursor).expect("source cursor fits u64"),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         if let Some(version) = self
             .vnode_registry
             .as_ref()
@@ -88,17 +277,132 @@ impl SourceConnector for IdleClusterHarnessSource {
         &mut self,
         _source_identity: &str,
         registry: Arc<VnodeRegistry>,
-        _self_id: NodeId,
+        self_id: NodeId,
     ) -> Result<(), ConnectorError> {
         self.vnode_registry = Some(registry);
+        self.self_id = Some(self_id);
         Ok(())
     }
 
     fn begin_drain(
         &mut self,
         _request: &SourceDrainRequest,
-    ) -> Result<SourceDrainStart, ConnectorError> {
-        Ok(SourceDrainStart::Ready(ConnectorDrainCut::empty()))
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    fn poll_drain_ready(
+        &mut self,
+        _round: laminar_core::checkpoint::AssignmentDrainId,
+    ) -> Result<bool, ConnectorError> {
+        Ok(true)
+    }
+
+    async fn finish_drain(
+        &mut self,
+        resolution: SourceDrainResolution,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.state.drain_resolutions.lock().push(resolution);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateObservation {
+    pub node_id: NodeId,
+    pub total: i64,
+    pub weight: i64,
+}
+
+#[derive(Default)]
+pub struct ClusterHarnessSinkState {
+    observations: parking_lot::Mutex<Vec<AggregateObservation>>,
+}
+
+impl ClusterHarnessSinkState {
+    #[must_use]
+    pub fn observations(&self) -> Vec<AggregateObservation> {
+        self.observations.lock().clone()
+    }
+}
+
+struct ClusterHarnessObserverSink {
+    node_id: NodeId,
+    state: Arc<ClusterHarnessSinkState>,
+}
+
+#[async_trait]
+impl SinkConnector for ClusterHarnessObserverSink {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        Ok(SinkContract::new(
+            SinkConsistency::DurableAtLeastOnce,
+            SinkTopology::MultiWriter,
+            SinkInputMode::FullChangelog,
+        ))
+    }
+
+    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        let total_index = batch.schema().index_of("total").map_err(|error| {
+            ConnectorError::SchemaMismatch(format!("aggregate total column: {error}"))
+        })?;
+        let totals = batch
+            .column(total_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                ConnectorError::SchemaMismatch("aggregate total column is not Int64".into())
+            })?;
+        let weight_index = batch.schema().index_of(WEIGHT_COLUMN).map_err(|error| {
+            ConnectorError::SchemaMismatch(format!("aggregate weight column: {error}"))
+        })?;
+        let weights = batch
+            .column(weight_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                ConnectorError::SchemaMismatch("aggregate weight column is not Int64".into())
+            })?;
+
+        let mut observations = self.state.observations.lock();
+        for row in 0..batch.num_rows() {
+            if totals.is_null(row) {
+                return Err(ConnectorError::SchemaMismatch(
+                    "aggregate observer received a null total".into(),
+                ));
+            }
+            observations.push(AggregateObservation {
+                node_id: self.node_id,
+                total: totals.value(row),
+                weight: weights.value(row),
+            });
+        }
+        drop(observations);
+
+        Ok(WriteResult::new(
+            batch.num_rows(),
+            u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
+        ))
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("total", DataType::Int64, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]))
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(1)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -148,6 +452,7 @@ pub struct NodeRuntime {
     pub shuffle_sender: Arc<ShuffleSender>,
     pub shuffle_receiver: Arc<ShuffleReceiver>,
     pub assignment_snapshot_store: Arc<AssignmentSnapshotStore>,
+    pub source_state: Arc<ClusterHarnessSourceState>,
     pub rebalance_shutdown: Arc<tokio::sync::Notify>,
     pub rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
     control_leases: ControlLeaseRuntime,
@@ -173,10 +478,14 @@ pub struct ClusterEngineHarness {
     pub checkpoint_dirs: Vec<TempDir>,
     /// Shared immutable startup catalog authority.
     pub catalog_manifest_store: Arc<CatalogManifestStore>,
+    /// Durable scripted input shared by every test connector instance.
+    pub source_log: Arc<ScriptedClusterHarnessLog>,
+    /// Aggregate output written through the normal cluster sink path.
+    pub sink_state: Arc<ClusterHarnessSinkState>,
 }
 
 impl ClusterEngineHarness {
-    /// Spawn `n` nodes with `vnode_count` vnodes round-robin. Returns after
+    /// Spawn `n` nodes with `vnode_count` vnodes placed by rendezvous hashing. Returns after
     /// gossip converges; `db.start()` is deferred to `start_all`.
     ///
     /// # Panics
@@ -222,23 +531,23 @@ impl ClusterEngineHarness {
             .await
             .expect("gossip convergence");
 
-        // Lowest id wins leader election; tests rely on nodes[0].
+        // Before an assignment roster is installed, the lowest id is the cold-start candidate.
         assert!(cluster.nodes[0].controller.is_leader());
 
         let process_config = ProcessLeaseConfig {
             ttl: TEST_LEASE_TTL,
             renew_interval: TEST_LEASE_RENEW_INTERVAL,
         };
+        let process_lease_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&shared_store), TEST_LEASE_TTL)
+                .expect("shared process lease authority"),
+        );
         let process_leases = futures::future::join_all(cluster.nodes.iter().map(|node| {
-            let store = Arc::new(ProcessLeaseStore::new(
-                Arc::clone(&shared_store),
-                node.instance_id,
-                i64::try_from(TEST_LEASE_TTL.as_millis()).expect("test lease TTL fits i64"),
-            ));
+            let store = process_lease_authority.store_for(node.instance_id);
             let owner = node.controller.recovery_incarnation();
             async move {
-                let lease = acquire_process_lease(&store, owner).await;
-                (store, lease)
+                let (lease, acquisition_started_at) = acquire_process_lease(&store, owner).await;
+                (store, lease, acquisition_started_at)
             }
         }))
         .await;
@@ -253,13 +562,17 @@ impl ClusterEngineHarness {
         ));
         let catalog_store = Arc::new(CatalogManifestStore::new(Arc::clone(&leader_store)));
         let mut control_leases = Vec::with_capacity(n);
-        for (node, (process_store, process_lease)) in
+        for (node, (process_store, process_lease, acquisition_started_at)) in
             cluster.nodes.iter().zip(process_leases.into_iter())
         {
+            node.controller
+                .set_process_lease_authority(Arc::clone(&process_lease_authority))
+                .expect("install shared process lease authority");
             let process_manager = ProcessLeaseManager::new(
                 process_store,
                 process_lease.owner,
                 process_config,
+                acquisition_started_at,
                 &process_lease,
             )
             .expect("process lease manager");
@@ -343,6 +656,8 @@ impl ClusterEngineHarness {
         // Resolve one cluster-wide vnode assignment; every node shares it.
         let (assignment, snapshot_version) =
             resolve_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
+        let source_log = Arc::new(ScriptedClusterHarnessLog::default());
+        let sink_state = Arc::new(ClusterHarnessSinkState::default());
 
         // Bind receivers up front so senders can cross-register addresses below.
         let mut receivers: Vec<Arc<ShuffleReceiver>> = Vec::with_capacity(n);
@@ -396,6 +711,11 @@ impl ClusterEngineHarness {
 
             // Reuse the same shared namespace for checkpoint participants and decisions.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
+            let source_state = Arc::new(ClusterHarnessSourceState::default());
+            let connector_source_state = Arc::clone(&source_state);
+            let connector_source_log = Arc::clone(&source_log);
+            let connector_sink_state = Arc::clone(&sink_state);
+            let connector_node_id = self_id;
 
             let builder = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
@@ -409,19 +729,48 @@ impl ClusterEngineHarness {
                 .assignment_snapshot_store(Arc::clone(&snapshot_store))
                 .catalog_manifest_store(Arc::clone(&catalog_store))
                 .cluster_checkpoint_object_store(Arc::clone(&shared_store))
-                .register_connector(|registry| {
+                .register_connector(move |registry| {
+                    let source_state = Arc::clone(&connector_source_state);
+                    let source_log = Arc::clone(&connector_source_log);
                     registry.register_source(
-                        "cluster-harness-idle",
+                        "cluster-harness-scripted",
                         ConnectorInfo {
-                            name: "cluster-harness-idle".into(),
-                            display_name: "Cluster harness idle source".into(),
+                            name: "cluster-harness-scripted".into(),
+                            display_name: "Cluster harness scripted source".into(),
                             version: "1".into(),
                             is_source: true,
                             is_sink: false,
                             config_keys: vec![],
                         },
-                        Arc::new(|_| Ok(Box::new(IdleClusterHarnessSource::default()))),
-                    )
+                        Arc::new(move |_| {
+                            Ok(Box::new(ScriptedClusterHarnessSource {
+                                state: Arc::clone(&source_state),
+                                log: Arc::clone(&source_log),
+                                cursor: 0,
+                                vnode_registry: None,
+                                self_id: None,
+                            }))
+                        }),
+                    )?;
+                    let sink_state = Arc::clone(&connector_sink_state);
+                    registry.register_sink(
+                        "cluster-harness-observer",
+                        ConnectorInfo {
+                            name: "cluster-harness-observer".into(),
+                            display_name: "Cluster harness aggregate observer".into(),
+                            version: "1".into(),
+                            is_source: false,
+                            is_sink: true,
+                            config_keys: vec![],
+                        },
+                        Arc::new(move |_config, _prometheus| {
+                            Ok(Box::new(ClusterHarnessObserverSink {
+                                node_id: connector_node_id,
+                                state: Arc::clone(&sink_state),
+                            }))
+                        }),
+                    )?;
+                    Ok(())
                 })
                 // Mirror production: DataFusion partitions track vnode count.
                 .target_partitions(vnode_count as usize);
@@ -435,6 +784,7 @@ impl ClusterEngineHarness {
                 shuffle_sender: Arc::clone(&sender),
                 shuffle_receiver: Arc::clone(&receivers[idx]),
                 assignment_snapshot_store: Arc::clone(&snapshot_store),
+                source_state,
                 rebalance_shutdown: Arc::new(tokio::sync::Notify::new()),
                 rebalance_tasks: Vec::new(),
                 control_leases: control_leases.next().expect("one lease runtime per node"),
@@ -447,6 +797,8 @@ impl ClusterEngineHarness {
             shared_state_dir,
             checkpoint_dirs,
             catalog_manifest_store: catalog_store,
+            source_log,
+            sink_state,
         }
     }
 
@@ -534,11 +886,27 @@ impl ClusterEngineHarness {
                             .controller
                             .checkpoint_assignment_fence(version)
                             .is_some_and(|fence| {
-                                let digest = Some(fence.digest());
-                                runtime.shuffle_sender.assignment_version() == version
-                                    && runtime.shuffle_receiver.assignment_version() == version
-                                    && runtime.shuffle_sender.active_assignment_digest() == digest
-                                    && runtime.shuffle_receiver.active_assignment_digest() == digest
+                                if fence.contains(cluster_node.instance_id.0) {
+                                    let digest = Some(fence.digest());
+                                    runtime.shuffle_sender.assignment_version() == version
+                                        && runtime.shuffle_receiver.assignment_version() == version
+                                        && runtime.shuffle_sender.active_assignment_digest()
+                                            == digest
+                                        && runtime.shuffle_receiver.active_assignment_digest()
+                                            == digest
+                                } else {
+                                    runtime.shuffle_sender.assignment_version() == 0
+                                        && runtime.shuffle_receiver.assignment_version() == 0
+                                        && runtime
+                                            .shuffle_sender
+                                            .active_assignment_digest()
+                                            .is_none()
+                                        && runtime
+                                            .shuffle_receiver
+                                            .active_assignment_digest()
+                                            .is_none()
+                                        && runtime.db.cluster_intake_fenced()
+                                }
                             })
                     });
             if assignments_ready {
@@ -552,15 +920,16 @@ impl ClusterEngineHarness {
         }
 
         let authority_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let mut intake_open = true;
+        let mut recovery_fenced = false;
         for node in &self.nodes {
-            intake_open &= node
+            let disposition = node
                 .db
                 .finish_cluster_startup(authority_deadline)
                 .await
                 .expect("cluster startup authority activation");
+            recovery_fenced |= disposition == ClusterStartupDisposition::RecoveryFenced;
         }
-        if !intake_open {
+        if recovery_fenced {
             tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
                     if self
@@ -568,8 +937,15 @@ impl ClusterEngineHarness {
                         .iter()
                         .zip(&self.cluster.nodes)
                         .all(|(runtime, cluster_node)| {
-                            !runtime.db.cluster_intake_fenced()
-                                && !cluster_node.controller.is_recovering()
+                            let fence = cluster_node
+                                .controller
+                                .checkpoint_assignment_fence(
+                                    runtime.vnode_registry.assignment_version(),
+                                )
+                                .expect("recovery assignment fence");
+                            !fence.contains(runtime.instance_id.0)
+                                || (!runtime.db.cluster_intake_fenced()
+                                    && !cluster_node.controller.is_recovering())
                         })
                     {
                         break;
@@ -580,16 +956,43 @@ impl ClusterEngineHarness {
             .await
             .expect("coordinated startup recovery must release every node");
         }
-        for node in &self.nodes {
-            assert!(
-                !node.db.cluster_intake_fenced(),
-                "source intake remained fenced on node {}",
+        for (node, cluster_node) in self.nodes.iter().zip(&self.cluster.nodes) {
+            let fence = cluster_node
+                .controller
+                .checkpoint_assignment_fence(node.vnode_registry.assignment_version())
+                .expect("startup assignment fence");
+            assert_eq!(
+                node.db.cluster_intake_fenced(),
+                !fence.contains(node.instance_id.0),
+                "source-intake fence disagrees with ownership on node {}",
                 node.instance_id.0
             );
         }
+        self.await_leader_idx().await;
     }
 
-    /// Index of the current leader in `nodes` (always 0 today).
+    async fn await_leader_idx(&self) -> usize {
+        let deadline = std::time::Instant::now() + CONVERGENCE_DEADLINE;
+        loop {
+            let leaders = self
+                .cluster
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| node.controller.is_leader().then_some(index))
+                .collect::<Vec<_>>();
+            if let [leader] = leaders.as_slice() {
+                return *leader;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable leader lease did not converge: observed {leaders:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Index of the current assignment-certified durable leader in `nodes`.
     #[must_use]
     pub fn leader_idx(&self) -> usize {
         self.cluster
@@ -610,18 +1013,62 @@ impl ClusterEngineHarness {
     /// Seal the complete catalog on the durable leader, then replay that exact manifest on peers.
     pub async fn bootstrap_catalog(&self, ddl: &[&str]) -> Result<(), laminar_db::DbError> {
         let entries = ddl.iter().map(|sql| (*sql).to_owned()).collect::<Vec<_>>();
-        let leader = self.leader_idx();
+        let leader = self.await_leader_idx().await;
         self.nodes[leader]
             .db
             .execute_cluster_bootstrap_batch(&entries)
             .await?;
-        for follower in self.follower_idxs() {
+        for follower in (0..self.nodes.len()).filter(|index| *index != leader) {
             self.nodes[follower]
                 .db
                 .execute_cluster_bootstrap_batch(&entries)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Inject a terminal source failure on the vnode-zero owner, drop its runtime without DB
+    /// shutdown, and fail its in-process gossip peer. Subprocess tests cover operating-system hard
+    /// kills separately.
+    pub async fn fail_node_runtime(&mut self, index: usize) -> NodeId {
+        let mut runtime = self.nodes.remove(index);
+        let cluster_node = self.cluster.nodes.remove(index);
+        assert_eq!(runtime.instance_id, cluster_node.instance_id);
+        assert_eq!(
+            runtime.vnode_registry.owner(0),
+            runtime.instance_id,
+            "terminal scripted-source injection requires the vnode-zero owner"
+        );
+
+        runtime
+            .source_state
+            .failure_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        runtime.rebalance_shutdown.notify_waiters();
+        for task in &runtime.rebalance_tasks {
+            task.abort();
+        }
+        for task in runtime.rebalance_tasks.drain(..) {
+            let _ = task.await;
+        }
+
+        let source_state = Arc::clone(&runtime.source_state);
+        let instance_id = cluster_node.instance_id;
+        cluster_node.crash().await;
+        drop(runtime);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !source_state
+                .failure_observed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed source data plane must stop without DB shutdown");
+
+        instance_id
     }
 
     /// Shut down and return the durable dirs for a restart scenario.
@@ -632,6 +1079,8 @@ impl ClusterEngineHarness {
             shared_state_dir,
             checkpoint_dirs,
             catalog_manifest_store: _,
+            source_log: _,
+            sink_state: _,
         } = self;
         for mut node in nodes {
             node.rebalance_shutdown.notify_waiters();
@@ -654,24 +1103,29 @@ impl ClusterEngineHarness {
     }
 }
 
-async fn acquire_process_lease(store: &Arc<ProcessLeaseStore>, owner: uuid::Uuid) -> ProcessLease {
+async fn acquire_process_lease(
+    store: &Arc<ProcessLeaseStore>,
+    owner: uuid::Uuid,
+) -> (ProcessLease, std::time::Instant) {
+    let acquisition_started_at = std::time::Instant::now();
     match store
         .try_acquire(owner, unix_time_millis())
         .await
         .expect("acquire process lease")
     {
-        ProcessLeaseOutcome::Acquired(lease) => lease,
+        ProcessLeaseOutcome::Acquired(lease) => (lease, acquisition_started_at),
         ProcessLeaseOutcome::Held(incumbent) => {
             let observation = store
                 .observe_rival(&incumbent)
                 .expect("observe prior process lease");
             tokio::time::sleep(TEST_LEASE_TTL).await;
+            let takeover_started_at = std::time::Instant::now();
             match store
                 .try_takeover(owner, &observation, unix_time_millis())
                 .await
                 .expect("take over prior process lease")
             {
-                ProcessLeaseOutcome::Acquired(lease) => lease,
+                ProcessLeaseOutcome::Acquired(lease) => (lease, takeover_started_at),
                 ProcessLeaseOutcome::Held(current) => panic!(
                     "prior process lease was renewed during clean restart: node={}, term={}",
                     current.node.0, current.term
@@ -697,9 +1151,17 @@ async fn resolve_assignment(
     participants: Vec<CheckpointParticipant>,
 ) -> (Arc<[NodeId]>, u64) {
     if let Some(mut snap) = store.load().await.expect("load snapshot") {
-        if snap.participants != participants {
+        let owner_ids: std::collections::BTreeSet<u64> =
+            snap.vnodes.values().map(|owner| owner.0).collect();
+        let owner_participants: Vec<_> = participants
+            .iter()
+            .filter(|participant| owner_ids.contains(&participant.node_id))
+            .cloned()
+            .collect();
+        assert_eq!(owner_participants.len(), owner_ids.len());
+        if snap.participants != owner_participants {
             let next = snap
-                .next_for_participants(snap.vnodes.clone(), participants)
+                .next_for_participants(snap.vnodes.clone(), owner_participants)
                 .expect("restart participant snapshot");
             snap = match store
                 .save_if_version(&next, snap.version)
@@ -719,8 +1181,17 @@ async fn resolve_assignment(
     }
 
     let fresh = rendezvous_assignment(vnode_count, peer_ids);
+    let owner_ids: std::collections::BTreeSet<u64> = fresh.iter().map(|owner| owner.0).collect();
+    let owner_participants: Vec<_> = participants
+        .into_iter()
+        .filter(|participant| owner_ids.contains(&participant.node_id))
+        .collect();
+    assert_eq!(owner_participants.len(), owner_ids.len());
     let snap = AssignmentSnapshot::empty()
-        .next_for_participants(AssignmentSnapshot::vnodes_from_vec(&fresh), participants)
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&fresh),
+            owner_participants,
+        )
         .expect("canonical assignment snapshot");
     match store.save_if_absent(&snap).await.expect("save_if_absent") {
         Some(winner) => (fresh, winner.version),

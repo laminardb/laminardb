@@ -20,15 +20,12 @@ use laminar_connectors::connector::{
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
-    ConnectorDrainCut, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution,
-    SourceDrainStart,
+    SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution,
 };
 use laminar_connectors::error::ConnectorError;
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::{
-    source_drain_source_id, source_drain_vnode_digest, AssignmentDrainId,
-    AssignmentDrainTransition, CheckpointParticipant, NodeDrainReceiptAggregate,
-    SourceDrainReceipt, SOURCE_DRAIN_RECEIPT_VERSION,
+    AssignmentDrainId, AssignmentDrainTransition, CheckpointParticipant,
 };
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
@@ -114,8 +111,12 @@ enum SourceDrainCommand {
     Begin {
         request: SourceDrainRequest,
         participant: CheckpointParticipant,
+        deadline: tokio::time::Instant,
     },
-    Resolve(SourceDrainResolution),
+    Resolve {
+        resolution: SourceDrainResolution,
+        deadline: tokio::time::Instant,
+    },
 }
 
 #[cfg(feature = "cluster")]
@@ -131,9 +132,48 @@ enum SourceDrainTaskStatus {
 }
 
 #[cfg(feature = "cluster")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceDrainReceipt {
+    round: AssignmentDrainId,
+    participant: CheckpointParticipant,
+    source_task_incarnation: uuid::Uuid,
+}
+
+#[cfg(feature = "cluster")]
+impl SourceDrainReceipt {
+    fn is_canonical(&self) -> bool {
+        self.round.is_canonical()
+            && self.participant.node_id != 0
+            && !self.participant.boot_incarnation.is_nil()
+            && !self.source_task_incarnation.is_nil()
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn validate_source_drain_receipts(
+    round: AssignmentDrainId,
+    participant: CheckpointParticipant,
+    receipts: &[SourceDrainReceipt],
+) -> Result<(), String> {
+    if receipts.iter().any(|receipt| {
+        !receipt.is_canonical() || receipt.round != round || receipt.participant != participant
+    }) {
+        return Err("source drain contains a stale or non-canonical task receipt".into());
+    }
+    let mut task_incarnations: Vec<uuid::Uuid> = receipts
+        .iter()
+        .map(|receipt| receipt.source_task_incarnation)
+        .collect();
+    task_incarnations.sort_unstable();
+    if task_incarnations.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("source drain contains duplicate task receipts".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cluster")]
 #[derive(Clone)]
 struct SourceDrainLeaseControl {
-    source_id: [u8; 32],
     task_incarnation: uuid::Uuid,
     command_tx: tokio::sync::watch::Sender<Option<SourceDrainCommand>>,
     status_tx: tokio::sync::watch::Sender<SourceDrainTaskStatus>,
@@ -144,9 +184,17 @@ struct SourceDrainLeaseControl {
 struct ActiveSourceDrain {
     request: SourceDrainRequest,
     participant: CheckpointParticipant,
-    pending_cut: Option<ConnectorDrainCut>,
+    provider_drain: bool,
+    prepare_deadline: tokio::time::Instant,
     ready: bool,
-    pending_resolution: Option<SourceDrainResolution>,
+    pending_resolution: Option<PendingSourceDrainResolution>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+struct PendingSourceDrainResolution {
+    resolution: SourceDrainResolution,
+    deadline: tokio::time::Instant,
 }
 
 /// DB-owned proof that one source generation has reached terminal completion.
@@ -350,23 +398,26 @@ pub(crate) async fn prepare_owned_source_drain(
     tasks: &OwnedSourceTasks,
     transition: &AssignmentDrainTransition,
     participant: CheckpointParticipant,
-    revoking_vnodes: Arc<[u32]>,
     deadline: tokio::time::Instant,
-) -> Result<NodeDrainReceiptAggregate, String> {
-    if transition
-        .predecessor
-        .participant_incarnation(participant.node_id)
-        != Some(participant.boot_incarnation)
+) -> Result<(), String> {
+    if !transition.is_canonical()
+        || transition
+            .predecessor
+            .participant_incarnation(participant.node_id)
+            != Some(participant.boot_incarnation)
     {
         return Err("local source drain participant is absent from predecessor roster".into());
     }
-    let request = SourceDrainRequest::new(transition.id(), revoking_vnodes)
-        .map_err(|error| error.to_string())?;
+    let request = SourceDrainRequest::new(transition.id()).map_err(|error| error.to_string())?;
     let snapshot: Vec<(SourceTaskLease, SourceDrainLeaseControl)> = tasks
         .lock()
         .iter()
-        .filter_map(|task| task.drain_control().map(|control| (task.clone(), control)))
-        .collect();
+        .map(|task| {
+            task.drain_control()
+                .map(|control| (task.clone(), control))
+                .ok_or_else(|| format!("source '{}' has no cluster drain control", task.name()))
+        })
+        .collect::<Result<_, _>>()?;
     for (task, control) in &snapshot {
         if task.is_finished() {
             return Err(format!(
@@ -379,6 +430,7 @@ pub(crate) async fn prepare_owned_source_drain(
             .send(Some(SourceDrainCommand::Begin {
                 request: request.clone(),
                 participant,
+                deadline,
             }))
             .map_err(|_| format!("source '{}' drain command channel closed", task.name()))?;
         control.wake.notify_one();
@@ -386,9 +438,7 @@ pub(crate) async fn prepare_owned_source_drain(
     let mut receipts = Vec::with_capacity(snapshot.len());
     for (task, control) in &snapshot {
         let receipt = await_source_drain_receipt(task, control, request.round, deadline).await?;
-        if receipt.source_id != control.source_id
-            || receipt.source_task_incarnation != control.task_incarnation
-        {
+        if receipt.source_task_incarnation != control.task_incarnation {
             return Err(format!(
                 "source '{}' returned a receipt from a replaced task generation",
                 task.name()
@@ -396,24 +446,54 @@ pub(crate) async fn prepare_owned_source_drain(
         }
         receipts.push(receipt);
     }
+    validate_source_drain_receipts(request.round, participant, &receipts)?;
 
-    // Revalidate the exact active source generation immediately before producing the aggregate.
-    let mut expected: Vec<([u8; 32], uuid::Uuid)> = snapshot
+    // Revalidate the exact active source generation immediately before acknowledging the cut.
+    let mut expected: Vec<uuid::Uuid> = snapshot
         .iter()
-        .map(|(_, control)| (control.source_id, control.task_incarnation))
+        .map(|(_, control)| control.task_incarnation)
         .collect();
-    let mut current: Vec<([u8; 32], uuid::Uuid)> = tasks
+    let mut current: Vec<uuid::Uuid> = tasks
         .lock()
         .iter()
-        .filter_map(|task| task.drain_control())
-        .map(|control| (control.source_id, control.task_incarnation))
-        .collect();
+        .map(|task| {
+            task.drain_control()
+                .map(|control| control.task_incarnation)
+                .ok_or_else(|| format!("source '{}' lost cluster drain control", task.name()))
+        })
+        .collect::<Result<_, _>>()?;
     expected.sort_unstable();
     current.sort_unstable();
     if current != expected {
-        return Err("source task generation changed while preparing the drain aggregate".into());
+        return Err("source task generation changed while preparing the drain".into());
     }
-    NodeDrainReceiptAggregate::new(transition, participant, &receipts)
+    Ok(())
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn owned_source_drain_resolved(
+    tasks: &OwnedSourceTasks,
+    resolution: SourceDrainResolution,
+) -> Result<bool, String> {
+    for task in tasks.lock().iter() {
+        let control = task
+            .drain_control()
+            .ok_or_else(|| format!("source '{}' has no cluster drain control", task.name()))?;
+        if task.is_finished() {
+            if resolution.outcome == SourceDrainOutcome::Abort {
+                continue;
+            }
+            return Ok(false);
+        }
+        if !matches!(
+            control.status_tx.borrow().clone(),
+            SourceDrainTaskStatus::Resolved { round, outcome }
+                if round == resolution.round && outcome == resolution.outcome
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(feature = "cluster")]
@@ -425,8 +505,12 @@ pub(crate) async fn resolve_owned_source_drain(
     let snapshot: Vec<(SourceTaskLease, SourceDrainLeaseControl)> = tasks
         .lock()
         .iter()
-        .filter_map(|task| task.drain_control().map(|control| (task.clone(), control)))
-        .collect();
+        .map(|task| {
+            task.drain_control()
+                .map(|control| (task.clone(), control))
+                .ok_or_else(|| format!("source '{}' has no cluster drain control", task.name()))
+        })
+        .collect::<Result<_, _>>()?;
     for (task, control) in &snapshot {
         if task.is_finished() {
             if resolution.outcome == SourceDrainOutcome::Abort {
@@ -440,7 +524,10 @@ pub(crate) async fn resolve_owned_source_drain(
         }
         let sent = control
             .command_tx
-            .send(Some(SourceDrainCommand::Resolve(resolution)))
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution,
+                deadline,
+            }))
             .is_ok();
         if !sent {
             if resolution.outcome == SourceDrainOutcome::Abort {
@@ -780,6 +867,7 @@ async fn apply_latest_source_drain_command(
     command_rx: &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
     status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
     active: &mut Option<ActiveSourceDrain>,
+    provider_drain: bool,
 ) -> Result<(), ConnectorError> {
     match command_rx.has_changed() {
         Ok(false) => return Ok(()),
@@ -797,6 +885,7 @@ async fn apply_latest_source_drain_command(
         SourceDrainCommand::Begin {
             request,
             participant,
+            deadline,
         } => {
             if let Some(current) = active.as_ref() {
                 if current.request != request || current.participant != participant {
@@ -805,35 +894,62 @@ async fn apply_latest_source_drain_command(
                         actual: format!("conflicting source drain {:?}", request.round),
                     });
                 }
+                // A retry may carry a fresh caller wait budget, but it must not extend the
+                // provider operation that already started. Retain the original deadline.
                 return Ok(());
             }
-            let pending_cut = match connector.begin_drain(&request)? {
-                SourceDrainStart::Pending => None,
-                SourceDrainStart::Ready(cut) => Some(cut),
-            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ConnectorError::Internal(format!(
+                    "source drain {:?} expired before provider preparation began",
+                    request.round
+                )));
+            }
+            if provider_drain {
+                connector.begin_drain(&request, deadline)?;
+            }
             let _ = status_tx.send_replace(SourceDrainTaskStatus::Pausing(request.round));
             *active = Some(ActiveSourceDrain {
                 request,
                 participant,
-                pending_cut,
+                provider_drain,
+                prepare_deadline: deadline,
                 ready: false,
                 pending_resolution: None,
             });
         }
-        SourceDrainCommand::Resolve(resolution) => {
+        SourceDrainCommand::Resolve {
+            resolution,
+            deadline,
+        } => {
             let Some(current) = active.as_ref() else {
-                if matches!(
-                    status_tx.borrow().clone(),
+                match status_tx.borrow().clone() {
                     SourceDrainTaskStatus::Resolved { round, outcome }
-                        if round == resolution.round && outcome == resolution.outcome
-                ) {
-                    return Ok(());
+                        if round == resolution.round && outcome == resolution.outcome =>
+                    {
+                        return Ok(());
+                    }
+                    SourceDrainTaskStatus::Resolved { round, outcome } => {
+                        return Err(ConnectorError::InvalidState {
+                            expected: format!("resolved source drain {round:?} as {outcome:?}"),
+                            actual: format!("conflicting resolution {resolution:?}"),
+                        });
+                    }
+                    SourceDrainTaskStatus::Pausing(round)
+                    | SourceDrainTaskStatus::Ready(SourceDrainReceipt { round, .. }) => {
+                        return Err(ConnectorError::InvalidState {
+                            expected: format!("active source drain {round:?}"),
+                            actual: "source drain task state was lost".into(),
+                        });
+                    }
+                    SourceDrainTaskStatus::Idle => {}
                 }
                 // Prepare broadcasts Begin to every source before awaiting receipts. If one
                 // source fails quickly, cleanup may overwrite an unobserved Begin in another
                 // task's retained command slot. No connector work can have started while
-                // `active` is empty, so abort is a safe terminal no-op. Commit still requires
-                // the receipt-backed active drain and fails closed below.
+                // `active` is empty, so abort is a safe terminal no-op. A replacement task may
+                // also observe a durable commit after its predecessor published the receipt and
+                // exited. It has no provider cut to finish; accept that commit only after its
+                // target assignment and recovery cursor are reconciled.
                 if resolution.outcome == SourceDrainOutcome::Abort {
                     let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
                         round: resolution.round,
@@ -841,10 +957,45 @@ async fn apply_latest_source_drain_command(
                     });
                     return Ok(());
                 }
-                return Err(ConnectorError::InvalidState {
-                    expected: format!("active source drain {:?}", resolution.round),
-                    actual: "no active source drain".into(),
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ConnectorError::Internal(format!(
+                        "source drain resolution {:?} expired before replacement reconciliation",
+                        resolution.round
+                    )));
+                }
+                if provider_drain {
+                    if !connector.checkpoint_ready()? {
+                        command_rx.mark_changed();
+                        return Ok(());
+                    }
+                    let Some(checkpoint) = try_source_checkpoint(connector, true)? else {
+                        command_rx.mark_changed();
+                        return Ok(());
+                    };
+                    let expected = std::num::NonZeroU64::new(resolution.round.target_version)
+                        .ok_or_else(|| {
+                            ConnectorError::Internal(
+                                "replacement drain target has zero assignment version".into(),
+                            )
+                        })?;
+                    if checkpoint.assignment_version() != Some(expected) {
+                        return Err(ConnectorError::InvalidState {
+                            expected: format!(
+                                "replacement source assignment {}",
+                                resolution.round.target_version
+                            ),
+                            actual: checkpoint.assignment_version().map_or_else(
+                                || "unbound source checkpoint".into(),
+                                |version| format!("source assignment {version}"),
+                            ),
+                        });
+                    }
+                }
+                let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
+                    round: resolution.round,
+                    outcome: resolution.outcome,
                 });
+                return Ok(());
             };
             if current.request.round != resolution.round {
                 return Err(ConnectorError::InvalidState {
@@ -852,14 +1003,21 @@ async fn apply_latest_source_drain_command(
                     actual: format!("resolution for {:?}", resolution.round),
                 });
             }
-            if current
-                .pending_resolution
-                .is_some_and(|pending| pending != resolution)
-            {
-                return Err(ConnectorError::InvalidState {
-                    expected: format!("pending resolution for {:?}", current.request.round),
-                    actual: format!("conflicting resolution {resolution:?}"),
-                });
+            let resolution_deadline = match current.pending_resolution {
+                Some(pending) if pending.resolution != resolution => {
+                    return Err(ConnectorError::InvalidState {
+                        expected: format!("pending resolution for {:?}", current.request.round),
+                        actual: format!("conflicting resolution {resolution:?}"),
+                    });
+                }
+                Some(pending) => pending.deadline,
+                None => deadline,
+            };
+            if tokio::time::Instant::now() >= resolution_deadline {
+                return Err(ConnectorError::Internal(format!(
+                    "source drain resolution {:?} expired before provider resolution",
+                    resolution.round
+                )));
             }
             if !current.ready {
                 if resolution.outcome != SourceDrainOutcome::Abort {
@@ -871,11 +1029,20 @@ async fn apply_latest_source_drain_command(
                 let current = active.as_mut().expect("checked above");
                 // Rewinding before the FIFO boundary is consumed would duplicate payloads that
                 // are already queued ahead of it. Keep flushing, then resolve from the certified
-                // cut published by `take_drain_cut`.
-                current.pending_resolution = Some(resolution);
+                // cut published by `poll_drain_ready`.
+                if current.pending_resolution.is_none() {
+                    current.pending_resolution = Some(PendingSourceDrainResolution {
+                        resolution,
+                        deadline: resolution_deadline,
+                    });
+                }
                 return Ok(());
             }
-            connector.finish_drain(resolution).await?;
+            if current.provider_drain {
+                connector
+                    .finish_drain(resolution, resolution_deadline)
+                    .await?;
+            }
             *active = None;
             let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
                 round: resolution.round,
@@ -892,7 +1059,7 @@ async fn resolve_pending_source_drain(
     status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
     active: &mut Option<ActiveSourceDrain>,
 ) -> Result<(), ConnectorError> {
-    let Some(resolution) = active.as_ref().and_then(|current| {
+    let Some(pending) = active.as_ref().and_then(|current| {
         current
             .ready
             .then_some(current.pending_resolution)
@@ -900,11 +1067,24 @@ async fn resolve_pending_source_drain(
     }) else {
         return Ok(());
     };
-    connector.finish_drain(resolution).await?;
+    if tokio::time::Instant::now() >= pending.deadline {
+        return Err(ConnectorError::Internal(format!(
+            "source drain resolution {:?} exceeded its deadline while awaiting the FIFO cut",
+            pending.resolution.round
+        )));
+    }
+    if active
+        .as_ref()
+        .is_some_and(|current| current.provider_drain)
+    {
+        connector
+            .finish_drain(pending.resolution, pending.deadline)
+            .await?;
+    }
     *active = None;
     let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
-        round: resolution.round,
-        outcome: resolution.outcome,
+        round: pending.resolution.round,
+        outcome: pending.resolution.outcome,
     });
     Ok(())
 }
@@ -921,36 +1101,24 @@ fn publish_source_drain_ready(
     if current.ready {
         return Ok(());
     }
-    let cut = if let Some(cut) = current.pending_cut.take() {
-        Some(cut)
-    } else {
-        connector.take_drain_cut(current.request.round)?
-    };
-    let Some(cut) = cut else {
-        return Ok(());
-    };
-    if !cut.is_canonical() {
-        return Err(ConnectorError::Internal(
-            "source connector returned a non-canonical drain cut".into(),
-        ));
+    if tokio::time::Instant::now() >= current.prepare_deadline {
+        return Err(ConnectorError::Internal(format!(
+            "source drain {:?} exceeded its preparation deadline",
+            current.request.round
+        )));
     }
-    let revoking_vnode_count =
-        u32::try_from(current.request.revoking_vnodes.len()).map_err(|_| {
-            ConnectorError::Internal("source drain vnode count exceeds u32::MAX".into())
-        })?;
-    let revoking_vnode_digest = source_drain_vnode_digest(&current.request.revoking_vnodes)
-        .map_err(ConnectorError::Internal)?;
+    let ready = if current.provider_drain {
+        connector.poll_drain_ready(current.request.round)?
+    } else {
+        true
+    };
+    if !ready {
+        return Ok(());
+    }
     let receipt = SourceDrainReceipt {
-        protocol_version: SOURCE_DRAIN_RECEIPT_VERSION,
         round: current.request.round,
         participant: current.participant,
-        source_id: control.source_id,
         source_task_incarnation: control.task_incarnation,
-        revoking_vnode_count,
-        revoking_vnode_digest,
-        revoked_input_count: cut.revoked_input_count,
-        revoked_input_digest: cut.revoked_input_digest,
-        cut_cursor_digest: cut.cut_cursor_digest,
     };
     if !receipt.is_canonical() {
         return Err(ConnectorError::Internal(
@@ -967,6 +1135,11 @@ fn publish_source_drain_ready(
 #[cfg(feature = "cluster")]
 fn source_drain_flushing(active: &Option<ActiveSourceDrain>) -> bool {
     active.as_ref().is_some_and(|drain| !drain.ready)
+}
+
+#[cfg(feature = "cluster")]
+fn source_drain_held(active: &Option<ActiveSourceDrain>) -> bool {
+    active.as_ref().is_some_and(|drain| drain.ready)
 }
 
 /// Backoff between completed polls while still servicing durable commit
@@ -1007,6 +1180,35 @@ async fn wait_source_idle(
                 None => std::future::pending().await,
             }
         } => true,
+        () = tokio::time::sleep(poll_interval) => true,
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn wait_source_drain_hold(
+    connector: &mut dyn SourceConnector,
+    epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
+    delivery_guarantee: DeliveryGuarantee,
+    src_name: &str,
+    fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
+    shutdown: &tokio::sync::Notify,
+    control_wake: &tokio::sync::Notify,
+    poll_interval: Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.notified() => false,
+        changed = epoch_committed_rx.changed() => match changed {
+            Ok(()) => acknowledge_latest_source_commit(
+                connector,
+                epoch_committed_rx,
+                delivery_guarantee,
+                src_name,
+                fault_tx,
+            ).await,
+            Err(_) => false,
+        },
+        () = control_wake.notified() => true,
         () = tokio::time::sleep(poll_interval) => true,
     }
 }
@@ -1192,6 +1394,12 @@ impl StreamingCoordinator {
         control_rx: ControlMsgRx,
         source_gate: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, DbError> {
+        if let Some(source) = sources.iter().find(|source| source.assignment_scoped) {
+            return Err(DbError::Config(format!(
+                "assignment-scoped source '{}' requires the database-owned cluster runtime",
+                source.name
+            )));
+        }
         Self::new_with_source_registry(
             sources,
             config,
@@ -1199,6 +1407,7 @@ impl StreamingCoordinator {
             control_rx,
             source_gate,
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            false,
         )
         .await
     }
@@ -1211,6 +1420,7 @@ impl StreamingCoordinator {
         control_rx: ControlMsgRx,
         source_gate: Arc<std::sync::atomic::AtomicBool>,
         owned_source_tasks: OwnedSourceTasks,
+        cluster_source_drain: bool,
     ) -> Result<Self, DbError> {
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
@@ -1243,15 +1453,15 @@ impl StreamingCoordinator {
             }
         }
 
-        // A source that releases an upstream resource only on durable commit (e.g. a PostgreSQL
-        // replication slot, whose WAL advances via notify_epoch_committed) needs checkpointing —
-        // otherwise that resource grows without bound (CN-1). Reject the combination up front.
+        // A source that releases externally retained data only on durable commit needs
+        // checkpointing; otherwise that data can grow without bound. Reject the combination up
+        // front.
         if config.checkpoint_interval.is_none() {
             for src in &sources {
                 if src.contract.requires_checkpointing() {
                     return Err(DbError::Config(format!(
-                        "[LDB-5034] source '{}' requires checkpointing to be enabled: its upstream \
-                         resource (e.g. a replication slot) is only released at a durable checkpoint",
+                        "[LDB-5034] source '{}' requires checkpointing to be enabled: externally \
+                         retained data is only released at a durable checkpoint",
                         src.name
                     )));
                 }
@@ -1383,20 +1593,17 @@ impl StreamingCoordinator {
             let mut connector = src.connector;
 
             #[cfg(feature = "cluster")]
-            let drain_control = if assignment_scoped {
+            let drain_control = cluster_source_drain.then(|| {
                 let (command_tx, _) =
                     tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
                 let (status_tx, _) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
-                Some(SourceDrainLeaseControl {
-                    source_id: source_drain_source_id(&src_name),
+                SourceDrainLeaseControl {
                     task_incarnation: uuid::Uuid::new_v4(),
                     command_tx,
                     status_tx,
                     wake: Arc::new(tokio::sync::Notify::new()),
-                })
-            } else {
-                None
-            };
+                }
+            });
             #[cfg(feature = "cluster")]
             let task_drain_control = drain_control.clone();
             #[cfg(feature = "cluster")]
@@ -1462,6 +1669,7 @@ impl StreamingCoordinator {
                             command_rx,
                             &control.status_tx,
                             &mut active_source_drain,
+                            assignment_scoped,
                         )
                         .await
                         {
@@ -1615,12 +1823,29 @@ impl StreamingCoordinator {
                             false
                         }
                     };
+                    let drain_held = {
+                        #[cfg(feature = "cluster")]
+                        {
+                            source_drain_held(&active_source_drain)
+                        }
+                        #[cfg(not(feature = "cluster"))]
+                        {
+                            false
+                        }
+                    };
 
                     // Once claimed, a barrier stays ahead of all later data from this source.
                     // A transient publication race retries the same barrier instead of dropping
                     // it or polling another batch across the cut.
                     if !drain_flushing {
-                        if let Some(barrier) = pending_barrier.take() {
+                        let barrier = pending_barrier.take().or_else(|| {
+                            if drain_held {
+                                barrier_handle.poll()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(barrier) = barrier {
                             match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
@@ -1676,14 +1901,37 @@ impl StreamingCoordinator {
                         }
                     }
 
+                    #[cfg(feature = "cluster")]
+                    if drain_held {
+                        let control = task_drain_control
+                            .as_ref()
+                            .expect("active source drain has task control");
+                        if !wait_source_drain_hold(
+                            connector.as_mut(),
+                            &mut epoch_committed_rx,
+                            delivery_guarantee,
+                            &src_name,
+                            &task_fault_tx,
+                            &task_shutdown_clone,
+                            &control.wake,
+                            poll_interval,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
                     // Source-intake gate: held closed during a coordinated round until the
                     // restore quorum, so a rewound source doesn't re-shuffle its replay into a
                     // peer whose receiver hasn't rebound (the frames would be dropped). The
                     // compute loop keeps draining the shuffle receiver on idle cycles meanwhile.
                     if task_gate.load(std::sync::atomic::Ordering::Acquire) && !drain_flushing {
-                        // Barriers must still flow: the round waits for the rebalance rotation,
-                        // and the rotation's pre-rotation checkpoint aligns on a barrier from
-                        // every source. Starving them here deadlocks the round against itself.
+                        // Preserve a claimed barrier ahead of later data while the strong startup
+                        // or recovery fence is closed. The coordinator will not fold it until
+                        // authority reopens. A drain predecessor keeps this strong gate open and
+                        // uses the held-drain path above for its pre-rotation barrier.
                         if let Some(barrier) =
                             pending_barrier.take().or_else(|| barrier_handle.poll())
                         {
@@ -1919,57 +2167,64 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Bounded best-effort flush before close(): the `while` deadline bounds an
-                // always-ready poll (timeout() polls the future first). Unflushed rows resume
-                // from the committed offset.
-                if let Some(batch) = pending_batch.take() {
-                    if let Ok(Some(checkpoint)) =
-                        try_source_checkpoint(connector.as_ref(), assignment_scoped)
-                    {
-                        let _ = task_tx.try_send(SourceMsg::Batch {
-                            source_idx: idx,
-                            batch: batch.records,
-                            checkpoint,
-                        });
-                    }
-                }
-                let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
-                while Instant::now() < deadline {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let poll_result = {
-                        let cancellation_policy = connector.cancellation_policy();
-                        let mut poll = std::pin::pin!(connector.poll_batch(max_poll));
-                        match tokio::time::timeout(remaining, poll.as_mut()).await {
-                            Ok(result) => Some(result),
-                            Err(_)
-                                if cancellation_policy
-                                    == ConnectorCancellationPolicy::CompleteStarted =>
-                            {
-                                Some(poll.await)
-                            }
-                            Err(_) => None,
-                        }
-                    };
-                    match poll_result {
-                        Some(Ok(Some(batch))) => {
-                            let Ok(Some(checkpoint)) =
-                                try_source_checkpoint(connector.as_ref(), assignment_scoped)
-                            else {
-                                break;
-                            };
-                            let msg = SourceMsg::Batch {
+                #[cfg(feature = "cluster")]
+                let may_flush_on_shutdown = active_source_drain.is_none();
+                #[cfg(not(feature = "cluster"))]
+                let may_flush_on_shutdown = true;
+
+                if may_flush_on_shutdown {
+                    // Bounded best-effort flush before close(): the `while` deadline bounds an
+                    // always-ready poll (timeout() polls the future first). Unflushed rows resume
+                    // from the committed offset.
+                    if let Some(batch) = pending_batch.take() {
+                        if let Ok(Some(checkpoint)) =
+                            try_source_checkpoint(connector.as_ref(), assignment_scoped)
+                        {
+                            let _ = task_tx.try_send(SourceMsg::Batch {
                                 source_idx: idx,
                                 batch: batch.records,
                                 checkpoint,
-                            };
-                            if task_tx.try_send(msg).is_err() {
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                break;
-                            }
+                            });
                         }
-                        _ => break,
+                    }
+                    let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
+                    while Instant::now() < deadline {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let poll_result = {
+                            let cancellation_policy = connector.cancellation_policy();
+                            let mut poll = std::pin::pin!(connector.poll_batch(max_poll));
+                            match tokio::time::timeout(remaining, poll.as_mut()).await {
+                                Ok(result) => Some(result),
+                                Err(_)
+                                    if cancellation_policy
+                                        == ConnectorCancellationPolicy::CompleteStarted =>
+                                {
+                                    Some(poll.await)
+                                }
+                                Err(_) => None,
+                            }
+                        };
+                        match poll_result {
+                            Some(Ok(Some(batch))) => {
+                                let Ok(Some(checkpoint)) =
+                                    try_source_checkpoint(connector.as_ref(), assignment_scoped)
+                                else {
+                                    break;
+                                };
+                                let msg = SourceMsg::Batch {
+                                    source_idx: idx,
+                                    batch: batch.records,
+                                    checkpoint,
+                                };
+                                if task_tx.try_send(msg).is_err() {
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
                     }
                 }
 
@@ -5606,6 +5861,7 @@ mod tests {
     #[derive(Default)]
     struct BarrierRetrySourceState {
         allow_capture: AtomicBool,
+        block_checkpoint_ready: AtomicBool,
         emit_batch: AtomicBool,
         assignment_version: AtomicU64,
         capture_attempts: AtomicU64,
@@ -5622,6 +5878,8 @@ mod tests {
         polls: AtomicU64,
         control_drives: AtomicU64,
         data_ready: Arc<tokio::sync::Notify>,
+        #[cfg(feature = "cluster")]
+        drain_begins: AtomicU64,
         #[cfg(feature = "cluster")]
         drain_finishes: AtomicU64,
     }
@@ -5652,6 +5910,10 @@ mod tests {
             SourceCheckpoint::new()
         }
 
+        fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+            Ok(true)
+        }
+
         fn drive_control_plane(&mut self) {
             self.state.control_drives.fetch_add(1, Ordering::SeqCst);
         }
@@ -5661,9 +5923,25 @@ mod tests {
         }
 
         #[cfg(feature = "cluster")]
+        fn begin_drain(
+            &mut self,
+            _request: &SourceDrainRequest,
+            _deadline: tokio::time::Instant,
+        ) -> Result<(), ConnectorError> {
+            self.state.drain_begins.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        #[cfg(feature = "cluster")]
+        fn poll_drain_ready(&mut self, _round: AssignmentDrainId) -> Result<bool, ConnectorError> {
+            Ok(true)
+        }
+
+        #[cfg(feature = "cluster")]
         async fn finish_drain(
             &mut self,
             _resolution: SourceDrainResolution,
+            _deadline: tokio::time::Instant,
         ) -> Result<(), ConnectorError> {
             self.state.drain_finishes.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -5672,6 +5950,36 @@ mod tests {
         async fn close(&mut self) -> Result<(), ConnectorError> {
             Ok(())
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn source_drain_receipts_reject_stale_processes_and_duplicate_tasks() {
+        let round = AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        };
+        let participant = CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(11),
+        };
+        let receipt = SourceDrainReceipt {
+            round,
+            participant,
+            source_task_incarnation: uuid::Uuid::from_u128(101),
+        };
+        validate_source_drain_receipts(round, participant, std::slice::from_ref(&receipt)).unwrap();
+        assert!(validate_source_drain_receipts(
+            round,
+            participant,
+            &[receipt.clone(), receipt.clone()]
+        )
+        .is_err());
+
+        let mut stale = receipt;
+        stale.participant.boot_incarnation = uuid::Uuid::from_u128(12);
+        assert!(validate_source_drain_receipts(round, participant, &[stale]).is_err());
     }
 
     #[cfg(feature = "cluster")]
@@ -5685,7 +5993,7 @@ mod tests {
             target_version: 8,
             digest: [9; 32],
         };
-        let request = SourceDrainRequest::new(round, Arc::<[u32]>::from([])).unwrap();
+        let request = SourceDrainRequest::new(round).unwrap();
         let participant = CheckpointParticipant {
             node_id: 1,
             boot_incarnation: uuid::Uuid::from_u128(11),
@@ -5695,7 +6003,6 @@ mod tests {
         let (status_tx, status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
         drop(status_rx);
         let control = SourceDrainLeaseControl {
-            source_id: source_drain_source_id("orders"),
             task_incarnation: uuid::Uuid::from_u128(101),
             command_tx,
             status_tx,
@@ -5706,6 +6013,7 @@ mod tests {
             .send(Some(SourceDrainCommand::Begin {
                 request,
                 participant,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
             }))
             .unwrap();
 
@@ -5715,6 +6023,7 @@ mod tests {
             &mut command_rx,
             &control.status_tx,
             &mut active,
+            true,
         )
         .await
         .unwrap();
@@ -5726,13 +6035,471 @@ mod tests {
             SourceDrainTaskStatus::Ready(receipt)
                 if receipt.round == round
                     && receipt.participant == participant
-                    && receipt.revoking_vnode_count == 0
+                    && receipt.source_task_incarnation == control.task_incarnation
+                    && receipt.is_canonical()
         ));
     }
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn idle_source_drain_resolution_is_abort_only() {
+    async fn source_drain_deadlines_fail_before_provider_work() {
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let mut connector = BarrierHoldProbeSource {
+            state: Arc::clone(&state),
+        };
+        let round = AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        };
+        let request = SourceDrainRequest::new(round).unwrap();
+        let participant = CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(11),
+        };
+        let (command_tx, mut command_rx) =
+            tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+        command_tx
+            .send(Some(SourceDrainCommand::Begin {
+                request: request.clone(),
+                participant,
+                deadline: tokio::time::Instant::now(),
+            }))
+            .unwrap();
+
+        let error = apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut None,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ConnectorError::Internal(_)));
+        assert_eq!(state.drain_begins.load(Ordering::SeqCst), 0);
+
+        let mut active = Some(ActiveSourceDrain {
+            request,
+            participant,
+            provider_drain: true,
+            prepare_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            ready: true,
+            pending_resolution: Some(PendingSourceDrainResolution {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Abort,
+                },
+                deadline: tokio::time::Instant::now(),
+            }),
+        });
+        let error = resolve_pending_source_drain(&mut connector, &status_tx, &mut active)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConnectorError::Internal(_)));
+        assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
+        assert!(active.is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn ready_source_drain_outlives_prepare_deadline() {
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let mut connector = BarrierHoldProbeSource {
+            state: Arc::clone(&state),
+        };
+        let round = AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        };
+        let participant = CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(11),
+        };
+        let (command_tx, mut command_rx) =
+            tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+        let control = SourceDrainLeaseControl {
+            task_incarnation: uuid::Uuid::from_u128(101),
+            command_tx,
+            status_tx,
+            wake: Arc::new(tokio::sync::Notify::new()),
+        };
+        control
+            .command_tx
+            .send(Some(SourceDrainCommand::Begin {
+                request: SourceDrainRequest::new(round).unwrap(),
+                participant,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+            }))
+            .unwrap();
+
+        let mut active = None;
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &control.status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
+        publish_source_drain_ready(&mut connector, &control, &mut active).unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        control
+            .command_tx
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Commit,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+            }))
+            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &control.status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(active.is_none());
+        assert_eq!(state.drain_begins.load(Ordering::SeqCst), 1);
+        assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            control.status_tx.borrow().clone(),
+            SourceDrainTaskStatus::Resolved {
+                round: resolved,
+                outcome: SourceDrainOutcome::Commit,
+            } if resolved == round
+        ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn source_drain_retries_cannot_extend_phase_deadlines() {
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let mut connector = BarrierHoldProbeSource { state };
+        let round = AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        };
+        let request = SourceDrainRequest::new(round).unwrap();
+        let participant = CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(11),
+        };
+        let (command_tx, mut command_rx) =
+            tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+        let prepare_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        command_tx
+            .send(Some(SourceDrainCommand::Begin {
+                request: request.clone(),
+                participant,
+                deadline: prepare_deadline,
+            }))
+            .unwrap();
+        let mut active = None;
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
+        command_tx
+            .send(Some(SourceDrainCommand::Begin {
+                request,
+                participant,
+                deadline: prepare_deadline + Duration::from_secs(10),
+            }))
+            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(active.as_ref().unwrap().prepare_deadline, prepare_deadline);
+
+        let first_resolution_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let resolution = SourceDrainResolution {
+            round,
+            outcome: SourceDrainOutcome::Abort,
+        };
+        command_tx
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution,
+                deadline: first_resolution_deadline,
+            }))
+            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
+        command_tx
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution,
+                deadline: first_resolution_deadline + Duration::from_secs(10),
+            }))
+            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            active
+                .as_ref()
+                .unwrap()
+                .pending_resolution
+                .unwrap()
+                .deadline,
+            first_resolution_deadline
+        );
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let control = SourceDrainLeaseControl {
+            task_incarnation: uuid::Uuid::from_u128(101),
+            command_tx,
+            status_tx: status_tx.clone(),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        };
+        publish_source_drain_ready(&mut connector, &control, &mut active).unwrap();
+        let error = resolve_pending_source_drain(&mut connector, &status_tx, &mut active)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConnectorError::Internal(_)));
+        assert!(active.is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn ready_global_source_drain_holds_polling_but_still_emits_barriers() {
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let source = SourceRegistration {
+            name: "global-drain-probe".into(),
+            connector: Box::new(BarrierHoldProbeSource {
+                state: Arc::clone(&state),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("global-drain-probe"),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let mut coordinator = StreamingCoordinator::new_with_source_registry(
+            vec![source],
+            PipelineConfig {
+                fallback_poll_interval: Duration::from_millis(1),
+                checkpoint_interval: None,
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let task = coordinator.source_handles[0].task.clone();
+        let drain = task
+            .drain_control()
+            .expect("every cluster source has drain control");
+        let barrier_control = coordinator.source_handles[0].barrier_control();
+        let barrier_injector = coordinator.source_handles[0].barrier_injector.clone();
+        coordinator.source_handles[0]
+            .startup_activation
+            .take()
+            .unwrap()
+            .send(());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.polls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source was not activated");
+
+        let round = AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        };
+        let participant = CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(11),
+        };
+        let mut status_rx = drain.status_tx.subscribe();
+        drain
+            .command_tx
+            .send(Some(SourceDrainCommand::Begin {
+                request: SourceDrainRequest::new(round).unwrap(),
+                participant,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
+            .unwrap();
+        drain.wake.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    status_rx.borrow_and_update().clone(),
+                    SourceDrainTaskStatus::Ready(receipt) if receipt.round == round
+                ) {
+                    break;
+                }
+                status_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("source did not publish its global cut");
+
+        let polls_at_cut = state.polls.load(Ordering::SeqCst);
+        let control_at_cut = state.control_drives.load(Ordering::SeqCst);
+        for _ in 0..4 {
+            state.data_ready.notify_one();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            state.polls.load(Ordering::SeqCst),
+            polls_at_cut,
+            "source polled data after publishing its global cut"
+        );
+        assert!(
+            state.control_drives.load(Ordering::SeqCst) > control_at_cut,
+            "held source stopped servicing its control plane"
+        );
+
+        let barrier = CheckpointBarrier::new(80, 8);
+        assert!(barrier_injector.trigger(barrier));
+        drain.wake.notify_one();
+        let received = tokio::time::timeout(Duration::from_secs(2), coordinator.rx.recv())
+            .await
+            .expect("held source did not emit the checkpoint barrier")
+            .unwrap();
+        assert!(matches!(received, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier));
+        assert_eq!(state.polls.load(Ordering::SeqCst), polls_at_cut);
+
+        barrier_control.release_exact(CheckpointAttempt::new(8, 80));
+        drain
+            .command_tx
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Abort,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
+            .unwrap();
+        drain.wake.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    status_rx.borrow_and_update().clone(),
+                    SourceDrainTaskStatus::Resolved {
+                        round: resolved,
+                        outcome: SourceDrainOutcome::Abort,
+                    } if resolved == round
+                ) {
+                    break;
+                }
+                status_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("source did not resolve the global cut");
+        state.data_ready.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.polls.load(Ordering::SeqCst) == polls_at_cut {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source did not resume polling after drain resolution");
+
+        task.mark_expected_shutdown();
+        barrier_control.stop_hold();
+        task.notify_shutdown();
+        let handle = coordinator.source_handles.pop().unwrap();
+        drop(handle.epoch_committed_tx);
+        drop(handle.barrier_release_tx);
+        assert!(
+            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(2))
+                .await,
+            "source task did not stop"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn local_runtime_rejects_assignment_scoped_sources() {
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let source = SourceRegistration {
+            name: "local-drain-probe".into(),
+            connector: Box::new(BarrierHoldProbeSource {
+                state: Arc::clone(&state),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("local-drain-probe"),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Splittable,
+            ),
+            assignment_scoped: true,
+            position: SourcePosition::Initial,
+        };
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let result = StreamingCoordinator::new(
+            vec![source],
+            PipelineConfig {
+                fallback_poll_interval: Duration::from_millis(1),
+                checkpoint_interval: None,
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("local runtime accepted an assignment-scoped source"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("database-owned cluster runtime"));
+        assert_eq!(state.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.drain_begins.load(Ordering::SeqCst), 0);
+        assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn idle_source_drain_resolution_accepts_only_a_reconciled_replacement_commit() {
         let state = Arc::new(BarrierHoldProbeState::default());
         let mut connector = BarrierHoldProbeSource {
             state: Arc::clone(&state),
@@ -5746,16 +6513,25 @@ mod tests {
             tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
         let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
         command_tx
-            .send(Some(SourceDrainCommand::Resolve(SourceDrainResolution {
-                round,
-                outcome: SourceDrainOutcome::Abort,
-            })))
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Abort,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
             .unwrap();
 
         let mut active = None;
-        apply_latest_source_drain_command(&mut connector, &mut command_rx, &status_tx, &mut active)
-            .await
-            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
 
         assert!(active.is_none());
         assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
@@ -5767,8 +6543,15 @@ mod tests {
             } if resolved == round
         ));
 
-        let commit_state = Arc::new(BarrierHoldProbeState::default());
-        let mut commit_connector = BarrierHoldProbeSource {
+        let commit_state = Arc::new(BarrierRetrySourceState::default());
+        commit_state.allow_capture.store(true, Ordering::Release);
+        commit_state
+            .block_checkpoint_ready
+            .store(true, Ordering::Release);
+        commit_state
+            .assignment_version
+            .store(round.target_version, Ordering::Release);
+        let mut commit_connector = BarrierRetrySource {
             state: Arc::clone(&commit_state),
         };
         let (commit_tx, mut commit_rx) =
@@ -5776,26 +6559,99 @@ mod tests {
         let (commit_status_tx, _commit_status_rx) =
             tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
         commit_tx
-            .send(Some(SourceDrainCommand::Resolve(SourceDrainResolution {
-                round,
-                outcome: SourceDrainOutcome::Commit,
-            })))
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Commit,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
             .unwrap();
         let mut commit_active = None;
-        let error = apply_latest_source_drain_command(
+        apply_latest_source_drain_command(
             &mut commit_connector,
             &mut commit_rx,
             &commit_status_tx,
             &mut commit_active,
+            true,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(error, ConnectorError::InvalidState { .. }));
-        assert_eq!(commit_state.drain_finishes.load(Ordering::SeqCst), 0);
+        .unwrap();
         assert!(matches!(
             commit_status_tx.borrow().clone(),
             SourceDrainTaskStatus::Idle
         ));
+        assert!(commit_rx.has_changed().unwrap());
+        assert_eq!(commit_state.capture_attempts.load(Ordering::Acquire), 0);
+
+        commit_state
+            .block_checkpoint_ready
+            .store(false, Ordering::Release);
+        apply_latest_source_drain_command(
+            &mut commit_connector,
+            &mut commit_rx,
+            &commit_status_tx,
+            &mut commit_active,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            commit_status_tx.borrow().clone(),
+            SourceDrainTaskStatus::Resolved {
+                round: resolved,
+                outcome: SourceDrainOutcome::Commit,
+            } if resolved == round
+        ));
+
+        commit_tx
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Commit,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
+            .unwrap();
+        apply_latest_source_drain_command(
+            &mut commit_connector,
+            &mut commit_rx,
+            &commit_status_tx,
+            &mut commit_active,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let wrong_state = Arc::new(BarrierRetrySourceState::default());
+        wrong_state.allow_capture.store(true, Ordering::Release);
+        wrong_state
+            .assignment_version
+            .store(round.predecessor_version, Ordering::Release);
+        let mut wrong_connector = BarrierRetrySource { state: wrong_state };
+        let (wrong_tx, mut wrong_rx) =
+            tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
+        let (wrong_status_tx, _wrong_status_rx) =
+            tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+        wrong_tx
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Commit,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
+            .unwrap();
+        let error = apply_latest_source_drain_command(
+            &mut wrong_connector,
+            &mut wrong_rx,
+            &wrong_status_tx,
+            &mut None,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ConnectorError::InvalidState { .. }));
     }
 
     #[cfg(feature = "cluster")]
@@ -5810,7 +6666,7 @@ mod tests {
             target_version: 8,
             digest: [9; 32],
         };
-        let request = SourceDrainRequest::new(round, Arc::<[u32]>::from([])).unwrap();
+        let request = SourceDrainRequest::new(round).unwrap();
         let participant = CheckpointParticipant {
             node_id: 1,
             boot_incarnation: uuid::Uuid::from_u128(11),
@@ -5822,21 +6678,37 @@ mod tests {
             .send(Some(SourceDrainCommand::Begin {
                 request,
                 participant,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
             }))
             .unwrap();
         let mut active = None;
-        apply_latest_source_drain_command(&mut connector, &mut command_rx, &status_tx, &mut active)
-            .await
-            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
         command_tx
-            .send(Some(SourceDrainCommand::Resolve(SourceDrainResolution {
-                round,
-                outcome: SourceDrainOutcome::Abort,
-            })))
+            .send(Some(SourceDrainCommand::Resolve {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Abort,
+                },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            }))
             .unwrap();
-        apply_latest_source_drain_command(&mut connector, &mut command_rx, &status_tx, &mut active)
-            .await
-            .unwrap();
+        apply_latest_source_drain_command(
+            &mut connector,
+            &mut command_rx,
+            &status_tx,
+            &mut active,
+            true,
+        )
+        .await
+        .unwrap();
 
         resolve_pending_source_drain(&mut connector, &status_tx, &mut active)
             .await
@@ -5848,7 +6720,6 @@ mod tests {
         ));
 
         let control = SourceDrainLeaseControl {
-            source_id: source_drain_source_id("orders"),
             task_incarnation: uuid::Uuid::from_u128(101),
             command_tx,
             status_tx,
@@ -5922,6 +6793,10 @@ mod tests {
                 checkpoint.bind_assignment_version(version);
             }
             Ok(Some(checkpoint))
+        }
+
+        fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+            Ok(!self.state.block_checkpoint_ready.load(Ordering::Acquire))
         }
 
         async fn close(&mut self) -> Result<(), ConnectorError> {

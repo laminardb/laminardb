@@ -290,7 +290,7 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
     let sender = Arc::new(ShuffleSender::new(node_id.0, boot));
     let conflicting = CheckpointAssignmentFence::from_owner_map(
         target.assignment_version,
-        &[node_id.0],
+        &[node_id.0, 2],
         vec![
             CheckpointParticipant {
                 node_id: node_id.0,
@@ -304,7 +304,7 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
     )
     .unwrap();
     sender
-        .install_assignment_fence(&conflicting, &[node_id.0])
+        .install_assignment_fence(&conflicting, &[node_id.0, 2])
         .unwrap();
 
     let db = LaminarDB::builder()
@@ -337,7 +337,10 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn assignment_activation_installs_transport_before_controller_publication() {
-    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::checkpoint::{
+        AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+        LeaderProofOwner,
+    };
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
@@ -401,6 +404,100 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     assert_eq!(receiver.assignment_version(), 1);
     assert_eq!(controller.checkpoint_assignment_fence(1), Some(fence));
     assert!(!db.cluster_intake_fenced());
+
+    let predecessor = controller.checkpoint_assignment_fence(1).unwrap();
+    let target = CheckpointAssignmentFence::from_owner_map(
+        2,
+        &[node_id.0],
+        predecessor.participants.clone(),
+    )
+    .unwrap();
+    let transition = AssignmentDrainTransition::new(
+        predecessor.clone(),
+        target,
+        LeaderProof {
+            owner: LeaderProofOwner {
+                node_id: node_id.0,
+                boot_id: boot,
+                process_term: 1,
+            },
+            fencing_token: 1,
+        },
+    )
+    .unwrap();
+    let draining = db
+        .activate_assignment_authority(
+            &predecessor,
+            Some(transition.clone()),
+            db.assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(draining.installed);
+    assert!(draining.intake_open);
+    assert!(!db.cluster_intake_fenced());
+    assert_eq!(
+        controller.checkpoint_drain_transition(),
+        Some(transition.clone())
+    );
+
+    db.set_source_gate(true);
+    let target_only = db
+        .activate_assignment_authority(
+            &predecessor,
+            Some(transition.clone()),
+            db.assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(target_only.installed);
+    assert!(!target_only.intake_open);
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(controller.checkpoint_drain_transition(), Some(transition));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn source_drain_validation_requires_a_vnode_registry() {
+    use std::collections::BTreeMap;
+
+    use laminar_core::checkpoint::{CheckpointParticipant, LeaderProof, LeaderProofOwner};
+    use laminar_core::cluster::control::AssignmentSnapshot;
+    use laminar_core::state::NodeId;
+    use uuid::Uuid;
+
+    let db = LaminarDB::builder().build().await.unwrap();
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: Uuid::from_u128(11),
+    };
+    let committed = AssignmentSnapshot::empty()
+        .next_for_participants(BTreeMap::from([(0, NodeId(1))]), vec![participant])
+        .unwrap();
+    let draining = committed
+        .next_draining(
+            committed.vnodes.clone(),
+            vec![participant],
+            LeaderProof {
+                owner: LeaderProofOwner {
+                    node_id: 1,
+                    boot_id: participant.boot_incarnation,
+                    process_term: 1,
+                },
+                fencing_token: 1,
+            },
+        )
+        .unwrap();
+
+    let error = db.validate_source_drain_snapshot(&draining).unwrap_err();
+    assert!(
+        error.to_string().contains("without a vnode registry"),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -467,7 +564,7 @@ async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
                 },
             )
             .unwrap();
-        let error = db.adopt_draining_snapshot(&draining).unwrap_err();
+        let error = db.validate_source_drain_snapshot(&draining).unwrap_err();
         assert!(error.to_string().contains("vnode cardinality"), "{error}");
     }
 }
@@ -2113,7 +2210,6 @@ async fn test_connector_registry_accessor() {
         );
     }
     assert!(registry.is_frozen());
-    assert_eq!(registry.frozen_fingerprint().unwrap().len(), 64);
 }
 
 #[tokio::test]
@@ -5837,19 +5933,10 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 .sql("SELECT SUM(value) AS total FROM left_events")
                 .await
                 .unwrap();
-            let aggregate_physical = db
-                .ctx
-                .state()
-                .create_physical_plan(aggregate.logical_plan())
-                .await
-                .unwrap();
             assert_eq!(
-                (
-                    crate::ddl::logical_aggregate_stage_count(aggregate.logical_plan()),
-                    crate::ddl::physical_aggregate_stage_count(&aggregate_physical),
-                ),
-                (1, 1),
-                "the admitted global aggregate must use the single certified stage shape"
+                crate::ddl::logical_aggregate_stage_count(aggregate.logical_plan()),
+                1,
+                "the admitted global aggregate must use one logical aggregate stage"
             );
             db.execute(
                 "CREATE STREAM global_sum_ok AS \

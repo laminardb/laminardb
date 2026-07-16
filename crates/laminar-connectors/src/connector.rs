@@ -278,15 +278,12 @@ impl SourceBatch {
     }
 }
 
-/// Source partition identity + current offset (Kafka partition number,
-/// CDC slot name, etc.).
+/// Provider-defined source split identity and its current replay cursor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartitionInfo {
-    /// Partition id — free-form string (Kafka partition number as string,
-    /// CDC slot name, file path, …).
+    /// Provider-defined split identifier.
     pub id: String,
-    /// Current offset — interpretation is connector-specific (Kafka offset
-    /// as string, CDC LSN, etc.).
+    /// Provider-defined replay cursor for this split.
     pub offset: String,
 }
 
@@ -372,88 +369,38 @@ pub struct SourceStart {
     pub delivery: DeliveryGuarantee,
 }
 
-/// Exact cluster transition and local vnode subset a partitioned source must drain.
+/// Exact cluster transition for which a source must stop advancing input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDrainRequest {
     /// Compact predecessor/target/leader identity.
     pub round: laminar_core::checkpoint::AssignmentDrainId,
-    /// Strictly ascending local vnodes whose input ownership is being revoked.
-    pub revoking_vnodes: Arc<[u32]>,
 }
 
 impl SourceDrainRequest {
     /// Construct a canonical source drain request.
     ///
     /// # Errors
-    /// Returns an error when the round or vnode set is not canonical.
-    pub fn new(
-        round: laminar_core::checkpoint::AssignmentDrainId,
-        revoking_vnodes: Arc<[u32]>,
-    ) -> Result<Self, ConnectorError> {
+    /// Returns an error when the transition identity is not canonical.
+    pub fn new(round: laminar_core::checkpoint::AssignmentDrainId) -> Result<Self, ConnectorError> {
         if !round.is_canonical() {
             return Err(ConnectorError::ConfigurationError(
                 "source drain round is not canonical".into(),
             ));
         }
-        laminar_core::checkpoint::source_drain_vnode_digest(&revoking_vnodes)
-            .map_err(ConnectorError::ConfigurationError)?;
-        Ok(Self {
-            round,
-            revoking_vnodes,
-        })
+        Ok(Self { round })
     }
-}
-
-/// Connector-owned proof of the concrete external-input cut behind a source receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectorDrainCut {
-    /// Number of concrete external inputs paused by the connector.
-    pub revoked_input_count: u32,
-    /// Canonical digest of those connector-specific input identities.
-    pub revoked_input_digest: [u8; 32],
-    /// Canonical digest of their next-to-read positions at the cut.
-    pub cut_cursor_digest: [u8; 32],
-}
-
-impl ConnectorDrainCut {
-    /// Canonical empty cut used when no external input maps to the revoking vnode set.
-    #[must_use]
-    pub fn empty() -> Self {
-        let empty_inputs = Sha256::digest(b"laminardb-source-drain-inputs-v1\0\0\0\0\0\0\0\0");
-        let empty_cursor = Sha256::digest(b"laminardb-source-drain-cursor-v1\0\0\0\0\0\0\0\0");
-        Self {
-            revoked_input_count: 0,
-            revoked_input_digest: empty_inputs.into(),
-            cut_cursor_digest: empty_cursor.into(),
-        }
-    }
-
-    /// Whether the cut has non-empty canonical digests.
-    #[must_use]
-    pub fn is_canonical(self) -> bool {
-        self.revoked_input_digest != [0; 32] && self.cut_cursor_digest != [0; 32]
-    }
-}
-
-/// Result of starting a non-blocking connector drain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceDrainStart {
-    /// The connector reader is pausing inputs and will later publish a FIFO cut.
-    Pending,
-    /// No asynchronous reader work is required for this request.
-    Ready(ConnectorDrainCut),
 }
 
 /// Terminal resolution of one exact source drain round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceDrainOutcome {
-    /// The target assignment committed; revoked inputs must be unassigned before release.
+    /// The target assignment committed and the source may adopt its target input ownership.
     Commit,
-    /// The transition aborted; revoked inputs must rewind to the cut before release.
+    /// The transition aborted and the source must resume from the predecessor cut.
     Abort,
 }
 
-/// Exact round resolution delivered to a partitioned source connector.
+/// Exact round resolution delivered to a source connector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceDrainResolution {
     /// Round being resolved.
@@ -508,11 +455,9 @@ pub trait SourceConnector: Send {
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
     /// Resolve the source schema from the `WITH (...)` properties before
-    /// DDL reaches the planner. Implementations that hit the network
-    /// (e.g. Kafka fetching an Avro schema from a Schema Registry) must
-    /// bound their I/O with a timeout. Return `Err(ConnectorError::…)` on
-    /// failure so the runtime can surface the cause to DDL — do not log
-    /// and swallow.
+    /// DDL reaches the planner. Implementations that perform network I/O must
+    /// bound it with a timeout. Return `Err(ConnectorError::…)` on failure so
+    /// the runtime can surface the cause to DDL — do not log and swallow.
     async fn discover_schema(
         &mut self,
         _properties: &std::collections::HashMap<String, String>,
@@ -557,42 +502,49 @@ pub trait SourceConnector: Send {
     /// polling and barriers are fenced.
     fn drive_control_plane(&mut self) {}
 
-    /// Start an exact partition drain without waiting for the reader FIFO to empty.
+    /// Stop advancing external input for an exact cluster transition.
     ///
-    /// Implementations return [`SourceDrainStart::Pending`] and later expose the cut through
-    /// [`Self::take_drain_cut`]. The default accepts only an empty vnode set.
+    /// Implementations start the provider operation without blocking and later expose readiness
+    /// through [`Self::poll_drain_ready`]. `deadline` is the engine-owned absolute deadline for
+    /// this drain attempt; provider retries must not continue beyond it. Actor-only sources are
+    /// fenced by the engine and never call this hook; assignment-scoped sources must implement it
+    /// explicitly.
     fn begin_drain(
         &mut self,
-        request: &SourceDrainRequest,
-    ) -> Result<SourceDrainStart, ConnectorError> {
-        if request.revoking_vnodes.is_empty() {
-            Ok(SourceDrainStart::Ready(ConnectorDrainCut::empty()))
-        } else {
-            Err(ConnectorError::ConfigurationError(
-                "partitioned source does not implement vnode drain".into(),
-            ))
-        }
+        _request: &SourceDrainRequest,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "assignment-scoped source does not implement provider drain".into(),
+        ))
     }
 
-    /// Take the exact external-input cut after its FIFO boundary has been consumed.
+    /// Whether the exact provider FIFO boundary has been consumed.
     ///
-    /// Returns `None` while the reader is still pausing or while pre-boundary payloads remain.
-    fn take_drain_cut(
+    /// Returns `false` while the reader is still pausing or while pre-boundary payloads remain.
+    fn poll_drain_ready(
         &mut self,
         _round: laminar_core::checkpoint::AssignmentDrainId,
-    ) -> Result<Option<ConnectorDrainCut>, ConnectorError> {
-        Ok(None)
+    ) -> Result<bool, ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "assignment-scoped source does not expose provider drain readiness".into(),
+        ))
     }
 
     /// Resolve an exact drain after target commit or abort.
     ///
-    /// An abort must rewind any client-delivered but engine-unaccepted records before resuming;
-    /// a commit must unassign revoked inputs before clearing its post-cut filter.
+    /// An abort must rewind any client-delivered but engine-unaccepted records before resuming.
+    /// A commit must reconcile target ownership before clearing its post-cut filter.
+    /// `deadline` is the engine-owned absolute deadline for the complete resolution; provider
+    /// retries and blocking client calls must be bounded by its remaining time.
     async fn finish_drain(
         &mut self,
         _resolution: SourceDrainResolution,
+        _deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
-        Ok(())
+        Err(ConnectorError::ConfigurationError(
+            "assignment-scoped source does not implement provider drain resolution".into(),
+        ))
     }
 
     /// Install the cluster vnode assignment for a source that advertises
@@ -624,9 +576,8 @@ pub trait SourceConnector: Send {
     /// Returns a [`Notify`] handle that is signalled when new data is available.
     ///
     /// When `Some`, the pipeline coordinator awaits the notification instead of
-    /// polling on a timer, eliminating idle CPU usage. Sources that receive data
-    /// asynchronously (WebSocket, CDC replication streams, Kafka) should return
-    /// `Some` and call `notify.notify_one()` when data arrives.
+    /// polling on a timer, eliminating idle CPU usage. Push-driven sources should
+    /// return `Some` and call `notify.notify_one()` when data arrives.
     ///
     /// The default implementation returns `None`, which causes the pipeline to
     /// fall back to timer-based polling (suitable for batch/file sources).
@@ -1250,16 +1201,21 @@ mod tests {
     }
 
     #[test]
-    fn source_drain_request_requires_sorted_unique_vnodes() {
+    fn source_drain_request_requires_canonical_round() {
         let round = laminar_core::checkpoint::AssignmentDrainId {
             predecessor_version: 7,
             target_version: 8,
             digest: [9; 32],
         };
-        assert!(SourceDrainRequest::new(round, Arc::from([1_u32, 4, 9])).is_ok());
-        assert!(SourceDrainRequest::new(round, Arc::from([4_u32, 1])).is_err());
-        assert!(SourceDrainRequest::new(round, Arc::from([1_u32, 1])).is_err());
-        assert!(ConnectorDrainCut::empty().is_canonical());
+        assert_eq!(SourceDrainRequest::new(round).unwrap().round, round);
+        assert!(
+            SourceDrainRequest::new(laminar_core::checkpoint::AssignmentDrainId {
+                predecessor_version: 8,
+                target_version: 8,
+                digest: [9; 32],
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -13,6 +13,10 @@ syntax = "proto3";
 package laminar.barrier.v1;
 
 service BarrierSync {
+  // Read-only startup proof. The nominated process returns only a grant that
+  // is live on its own monotonic clock and matches the exact requested term.
+  rpc CaptureLeaderProof(LeaderProofRequest) returns (LeaderProofResponse);
+
   // Phase 1. Align + capture state locally, then report readiness.
   // The follower returns its local watermark so the leader can fold a
   // cluster-wide minimum for the matching Aligned/Commit. The durable
@@ -34,6 +38,16 @@ service BarrierSync {
   // Phase 2 (failure). Some peer's Prepare failed; roll back the
   // in-flight checkpoint.
   rpc Abort(AbortRequest) returns (Ack);
+}
+
+message LeaderProofRequest {
+  uint64 node_id = 1;
+  bytes boot_id = 2;
+  uint64 process_term = 3;
+}
+
+message LeaderProofResponse {
+  LeaderProof proof = 1;
 }
 
 // One exact process in the canonical checkpoint participant roster. The

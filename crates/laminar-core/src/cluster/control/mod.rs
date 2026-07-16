@@ -19,7 +19,8 @@ pub use barrier::{
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 pub use controller::{
-    ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryRound, RecoveryRoundId,
+    ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryControlError, RecoveryFault,
+    RecoveryRound, RecoveryRoundId, ReleaseCommitStatus,
 };
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe
@@ -33,16 +34,20 @@ pub use catalog_manifest::{
 pub use leader::leader_of;
 pub use leader_lease::{
     lease_grants_leadership, lease_grants_proof, AssignmentDrainDecision, AssignmentDrainVerdict,
-    ClusterCheckpointAuthorityError, ClusterOutcomeRetentionBoundary, LeaderLease,
-    LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseObservation, LeaderLeaseOwner,
+    AssignmentRecoveryDecision, ClusterCheckpointAuthorityError, ClusterOutcomeRetentionBoundary,
+    LeaderLease, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseObservation, LeaderLeaseOwner,
     LeaderLeaseStore, LeaseError, LeaseOutcome, RecordAssignmentDrainDecisionResult,
+    RecordAssignmentRecoveryDecisionResult,
 };
 pub use lease_deadline::LeaseDeadline;
 pub use process_lease::{
-    ProcessLease, ProcessLeaseConfig, ProcessLeaseError, ProcessLeaseManager,
-    ProcessLeaseObservation, ProcessLeaseOutcome, ProcessLeaseStore,
+    ProcessLease, ProcessLeaseAuthority, ProcessLeaseConfig, ProcessLeaseError, ProcessLeaseFence,
+    ProcessLeaseManager, ProcessLeaseObservation, ProcessLeaseOutcome, ProcessLeaseStore,
 };
-pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError};
+pub use snapshot::{
+    AssignmentSnapshot, AssignmentSnapshotRef, AssignmentSnapshotStore, RotateOutcome,
+    SnapshotError,
+};
 
 #[cfg(feature = "cluster")]
 pub mod chitchat_kv;

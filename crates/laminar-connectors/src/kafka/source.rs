@@ -9,10 +9,9 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -20,9 +19,9 @@ use tracing::{debug, info, warn};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorDrainCut, DeliveryGuarantee, PartitionInfo, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourceDrainStart, SourcePosition, SourceStart, SourceTopology,
+    DeliveryGuarantee, PartitionInfo, SourceBatch, SourceConnector, SourceConsistency,
+    SourceContract, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition,
+    SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, Format, RecordDeserializer};
@@ -88,8 +87,7 @@ struct KafkaDrainPartition {
 #[derive(Debug, Clone)]
 struct KafkaDrainBoundary {
     round: laminar_core::checkpoint::AssignmentDrainId,
-    revoked_inputs: Arc<[KafkaDrainPartition]>,
-    revoked_input_digest: [u8; 32],
+    inputs: Arc<[KafkaDrainPartition]>,
 }
 
 enum KafkaReaderItem {
@@ -105,31 +103,106 @@ struct KafkaDrainPosition {
 }
 
 enum KafkaReaderDrainCommand {
-    Begin(SourceDrainRequest),
+    Begin {
+        request: SourceDrainRequest,
+        deadline: tokio::time::Instant,
+    },
     Resolve {
         resolution: SourceDrainResolution,
         cut: Arc<[KafkaDrainPosition]>,
+        deadline: tokio::time::Instant,
+        execution: Arc<AtomicU8>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
 
 struct KafkaReaderDrain {
     request: SourceDrainRequest,
-    revoked: Arc<[KafkaDrainPartition]>,
+    prepare_deadline: tokio::time::Instant,
+    inputs: Arc<[KafkaDrainPartition]>,
+    held_inputs: Arc<[KafkaDrainPartition]>,
+    held_assignment_version: Option<u64>,
+    hold_complete: bool,
     boundary_queued: bool,
+}
+
+struct KafkaPendingDrainResolution {
+    resolution: SourceDrainResolution,
+    deadline: tokio::time::Instant,
+    execution: Arc<AtomicU8>,
+    reply: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    terminal_error: Option<Arc<str>>,
 }
 
 struct KafkaSourceDrain {
     request: SourceDrainRequest,
+    prepare_deadline: tokio::time::Instant,
     boundary: Option<KafkaDrainBoundary>,
     cut: Option<Arc<[KafkaDrainPosition]>>,
-    cut_taken: bool,
+    pending_resolution: Option<KafkaPendingDrainResolution>,
 }
 
 const KAFKA_BACKGROUND_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const KAFKA_DRAIN_EXECUTION_PENDING: u8 = 0;
+const KAFKA_DRAIN_EXECUTION_STARTED: u8 = 1;
+const KAFKA_DRAIN_EXECUTION_CANCELLED: u8 = 2;
 const KAFKA_PARTITION_INVENTORY_METADATA: &str = "kafka.partition.inventory.v1";
 const KAFKA_POSITION_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const KAFKA_POSITION_LOOKUP_CONCURRENCY: usize = 32;
+
+struct KafkaDrainWaitGuard {
+    execution: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl KafkaDrainWaitGuard {
+    fn new(execution: Arc<AtomicU8>) -> Self {
+        Self {
+            execution,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KafkaDrainWaitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.execution.compare_exchange(
+                KAFKA_DRAIN_EXECUTION_PENDING,
+                KAFKA_DRAIN_EXECUTION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+fn claim_kafka_drain_execution(
+    execution: &AtomicU8,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err("Kafka drain deadline expired before provider execution".into());
+    }
+    execution
+        .compare_exchange(
+            KAFKA_DRAIN_EXECUTION_PENDING,
+            KAFKA_DRAIN_EXECUTION_STARTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|state| match state {
+            KAFKA_DRAIN_EXECUTION_CANCELLED => {
+                "Kafka drain resolution was cancelled before execution".into()
+            }
+            _ => "Kafka drain resolution execution was already claimed".into(),
+        })
+}
 
 type KafkaPartitionSet = std::collections::HashSet<(String, i32)>;
 type KafkaPartitionBaselines = std::collections::HashMap<(String, i32), i64>;
@@ -137,73 +210,27 @@ type KafkaPartitionRoutes = std::collections::HashMap<Arc<str>, Arc<[u32]>>;
 type KafkaRotationBaselines =
     std::collections::HashMap<Arc<str>, std::collections::HashMap<i32, i64>>;
 
-fn kafka_drain_input_digest(inputs: &[KafkaDrainPartition]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"laminardb-kafka-drain-inputs-v1\0");
-    hash.update(
-        u64::try_from(inputs.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    for input in inputs {
-        hash.update(
-            u64::try_from(input.topic.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        hash.update(input.topic.as_bytes());
-        hash.update(input.partition.to_le_bytes());
-    }
-    hash.finalize().into()
-}
-
-fn kafka_drain_cursor_digest(cut: &[KafkaDrainPosition]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"laminardb-kafka-drain-cursor-v1\0");
-    hash.update(u64::try_from(cut.len()).unwrap_or(u64::MAX).to_le_bytes());
-    for position in cut {
-        hash.update(
-            u64::try_from(position.topic.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        hash.update(position.topic.as_bytes());
-        hash.update(position.partition.to_le_bytes());
-        hash.update(position.next_offset.to_le_bytes());
-    }
-    hash.finalize().into()
-}
-
 fn kafka_drain_partitions(
-    request: &SourceDrainRequest,
-    source_identity: &str,
-    vnode_count: u32,
-    topic_meta: &[(Arc<str>, i32)],
+    assignment: &TopicPartitionList,
 ) -> Result<Arc<[KafkaDrainPartition]>, ConnectorError> {
-    let revoking: std::collections::HashSet<u32> =
-        request.revoking_vnodes.iter().copied().collect();
-    let mut inputs = Vec::new();
-    for (topic, count) in topic_meta {
-        if *count < 0 {
+    let mut inputs = Vec::with_capacity(assignment.count());
+    for element in assignment.elements() {
+        if element.topic().is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka assignment contains an empty topic".into(),
+            ));
+        }
+        if element.partition() < 0 {
             return Err(ConnectorError::ConfigurationError(format!(
-                "Kafka topic '{}' reported a negative partition count {count}",
-                topic
+                "Kafka assignment contains invalid partition '{}-{}'",
+                element.topic(),
+                element.partition()
             )));
         }
-        for partition in 0..*count {
-            let vnode = super::partition_assignment::partition_vnode(
-                source_identity,
-                topic,
-                partition,
-                vnode_count,
-            )?;
-            if revoking.contains(&vnode) {
-                inputs.push(KafkaDrainPartition {
-                    topic: Arc::clone(topic),
-                    partition,
-                });
-            }
-        }
+        inputs.push(KafkaDrainPartition {
+            topic: Arc::from(element.topic()),
+            partition: element.partition(),
+        });
     }
     inputs.sort_unstable_by(|left, right| {
         left.topic
@@ -211,7 +238,12 @@ fn kafka_drain_partitions(
             .cmp(right.topic.as_ref())
             .then(left.partition.cmp(&right.partition))
     });
-    inputs.dedup();
+    if let Some(duplicate) = inputs.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Kafka assignment contains duplicate input '{}-{}'",
+            duplicate[0].topic, duplicate[0].partition
+        )));
+    }
     Ok(inputs.into())
 }
 
@@ -440,6 +472,24 @@ fn validate_kafka_partition_error_list(operation: &str, errors: &[String]) -> Re
     }
 }
 
+fn kafka_drain_target_ready(
+    target_version: u64,
+    registry_version: u64,
+    reconciled_version: u64,
+) -> Result<bool, String> {
+    if registry_version > target_version || reconciled_version > target_version {
+        return Err(format!(
+            "Kafka drain target {target_version} was superseded (registry {registry_version}, reconciled {reconciled_version})"
+        ));
+    }
+    if reconciled_version > registry_version {
+        return Err(format!(
+            "Kafka drain reconciliation {reconciled_version} is ahead of registry {registry_version}"
+        ));
+    }
+    Ok(registry_version == target_version && reconciled_version == target_version)
+}
+
 async fn resolve_kafka_reader_drain(
     consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
     vnode_reassign: Option<&(
@@ -450,84 +500,77 @@ async fn resolve_kafka_reader_drain(
     resolution: SourceDrainResolution,
     cut: &[KafkaDrainPosition],
     globally_paused: bool,
+    deadline: tokio::time::Instant,
+    execution: &Arc<AtomicU8>,
 ) -> Result<(), String> {
     if resolution.round != active.request.round {
         return Err("Kafka drain resolution does not match the active round".into());
     }
-    match resolution.outcome {
-        SourceDrainOutcome::Commit => {
-            let Some((registry, _)) = vnode_reassign else {
-                return Err("Kafka drain commit has no vnode assignment".into());
-            };
-            if registry.assignment_version() != resolution.round.target_version {
-                return Err(format!(
-                    "Kafka drain commit target {} is not installed (current {})",
-                    resolution.round.target_version,
-                    registry.assignment_version()
-                ));
-            }
-            let assigned = consumer
-                .assignment()
-                .map_err(|error| format!("Kafka drain could not inspect assignment: {error}"))?;
-            let assigned: std::collections::HashSet<(String, i32)> = assigned
-                .elements()
-                .iter()
-                .map(|element| (element.topic().to_string(), element.partition()))
-                .collect();
-            let remaining: Vec<(Arc<str>, i32)> = active
-                .revoked
-                .iter()
-                .filter(|input| assigned.contains(&(input.topic.to_string(), input.partition)))
-                .map(|input| (Arc::clone(&input.topic), input.partition))
-                .collect();
-            let to_remove = tpl_of(remaining.iter());
-            if to_remove.count() > 0 {
-                consumer
-                    .incremental_unassign(&to_remove)
-                    .map_err(|error| format!("Kafka drain unassign failed: {error}"))?;
-                validate_kafka_partition_results("drain unassign", &to_remove)?;
-            }
-        }
-        SourceDrainOutcome::Abort => {
-            let mut seek = TopicPartitionList::new();
-            for position in cut {
-                seek.add_partition_offset(
-                    position.topic.as_ref(),
-                    position.partition,
-                    rdkafka::Offset::Offset(position.next_offset),
+    let Some((registry, _)) = vnode_reassign else {
+        return Err("Kafka drain resolution has no cluster assignment".into());
+    };
+    if registry.assignment_version() != resolution.round.target_version {
+        return Err(format!(
+            "Kafka drain target {} is not installed (current {})",
+            resolution.round.target_version,
+            registry.assignment_version()
+        ));
+    }
+    let assignment = consumer
+        .assignment()
+        .map_err(|error| format!("Kafka drain could not inspect target assignment: {error}"))?;
+    if resolution.outcome == SourceDrainOutcome::Abort {
+        let assigned = kafka_partition_set(&assignment)
+            .map_err(|error| format!("Kafka drain target assignment is invalid: {error}"))?;
+        let mut seek = TopicPartitionList::new();
+        for position in cut
+            .iter()
+            .filter(|position| assigned.contains(&(position.topic.to_string(), position.partition)))
+        {
+            seek.add_partition_offset(
+                position.topic.as_ref(),
+                position.partition,
+                rdkafka::Offset::Offset(position.next_offset),
+            )
+            .map_err(|error| {
+                format!(
+                    "Kafka drain could not build abort seek for '{}-{}': {error}",
+                    position.topic, position.partition
                 )
-                .map_err(|error| {
-                    format!(
-                        "Kafka drain could not build abort seek for '{}-{}': {error}",
-                        position.topic, position.partition
-                    )
-                })?;
-            }
-            if seek.count() > 0 {
-                let seek_consumer = Arc::clone(consumer);
-                let positioned = tokio::task::spawn_blocking(move || {
-                    seek_consumer.seek_partitions(seek, std::time::Duration::from_secs(5))
-                })
-                .await
-                .map_err(|error| format!("Kafka drain abort seek task failed: {error}"))?
-                .map_err(|error| format!("Kafka drain abort seek failed: {error}"))?;
-                validate_kafka_partition_results("drain abort seek", &positioned)?;
-            }
-            if !globally_paused {
-                let resume: Vec<(Arc<str>, i32)> = active
-                    .revoked
-                    .iter()
-                    .map(|input| (Arc::clone(&input.topic), input.partition))
-                    .collect();
-                let resume = tpl_of(resume.iter());
-                if resume.count() > 0 {
-                    consumer
-                        .resume(&resume)
-                        .map_err(|error| format!("Kafka drain abort resume failed: {error}"))?;
-                    validate_kafka_partition_results("drain abort resume", &resume)?;
-                }
-            }
+            })?;
         }
+        if seek.count() > 0 {
+            let seek_consumer = Arc::clone(consumer);
+            let seek_execution = Arc::clone(execution);
+            let positioned = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                claim_kafka_drain_execution(&seek_execution, deadline)?;
+                let timeout = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(std::time::Duration::from_secs(5));
+                if timeout.is_zero() {
+                    return Err("Kafka drain deadline expired before abort seek".into());
+                }
+                seek_consumer
+                    .seek_partitions(seek, timeout)
+                    .map_err(|error| format!("Kafka drain abort seek failed: {error}"))
+            })
+            .await
+            .map_err(|error| format!("Kafka drain abort seek task failed: {error}"))??;
+            validate_kafka_partition_results("drain abort seek", &positioned)?;
+        } else {
+            claim_kafka_drain_execution(execution, deadline)?;
+        }
+    } else {
+        claim_kafka_drain_execution(execution, deadline)?;
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err("Kafka drain deadline expired before target resume".into());
+    }
+    if !globally_paused && assignment.count() > 0 {
+        consumer
+            .resume(&assignment)
+            .map_err(|error| format!("Kafka drain target resume failed: {error}"))?;
+        validate_kafka_partition_results("drain target resume", &assignment)?;
     }
     Ok(())
 }
@@ -676,7 +719,7 @@ pub struct KafkaSource {
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     /// First terminal reader reason, published before an assignment wait can hide its exit.
     reader_fault: Arc<Mutex<Option<Arc<str>>>>,
-    /// Allocated only for a vnode-assigned instance; embedded/single readers have no drain path.
+    /// Allocated only for a cluster-assigned instance; local readers have no rotation path.
     reader_drain_tx: Option<tokio::sync::mpsc::UnboundedSender<KafkaReaderDrainCommand>>,
     source_drain: Option<KafkaSourceDrain>,
     /// Offset snapshot for the rebalance callback's seek-on-assign, refreshed
@@ -699,8 +742,6 @@ pub struct KafkaSource {
         Arc<laminar_core::state::VnodeRegistry>,
         laminar_core::state::NodeId,
     )>,
-    /// `(topic, partition_count)` inventory retained for drain planning.
-    vnode_topic_meta: Vec<(Arc<str>, i32)>,
     /// Precomputed source/topic/partition routes used by the per-record stale-owner fence.
     vnode_partition_routes: KafkaPartitionRoutes,
     /// Canonical non-vnode manual assignment used by local guaranteed, specific, and timestamp
@@ -828,7 +869,6 @@ impl KafkaSource {
             deterministic_unrecorded_position: Arc::new(AtomicBool::new(false)),
             source_name: Arc::from(""),
             vnode_assignment: None,
-            vnode_topic_meta: Vec::new(),
             vnode_partition_routes: KafkaPartitionRoutes::new(),
             manual_topic_partitions: std::collections::HashSet::new(),
             manual_partition_baselines: std::collections::HashMap::new(),
@@ -877,10 +917,21 @@ impl KafkaSource {
     fn capture_drain_positions(
         &self,
         inputs: &[KafkaDrainPartition],
+        prepare_deadline: Option<tokio::time::Instant>,
     ) -> Result<Arc<[KafkaDrainPosition]>, ConnectorError> {
+        if prepare_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(ConnectorError::Internal(
+                "Kafka drain deadline expired before cursor capture".into(),
+            ));
+        }
         let publication = Arc::clone(&lock_or_recover(&self.assignment_publication));
         let mut cut = Vec::with_capacity(inputs.len());
         for input in inputs {
+            if prepare_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(ConnectorError::Internal(
+                    "Kafka drain deadline expired during cursor capture".into(),
+                ));
+            }
             let next_offset =
                 if let Some(offset) = self.offsets.get(input.topic.as_ref(), input.partition) {
                     offset.checked_add(1).ok_or_else(|| {
@@ -914,6 +965,11 @@ impl KafkaSource {
                 partition: input.partition,
                 next_offset,
             });
+        }
+        if prepare_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(ConnectorError::Internal(
+                "Kafka drain deadline expired during cursor capture".into(),
+            ));
         }
         Ok(cut.into())
     }
@@ -949,10 +1005,12 @@ impl KafkaSource {
                 "Kafka drain cut exists without its FIFO boundary".into(),
             ));
         };
-        let current = self.capture_drain_positions(&boundary.revoked_inputs)?;
+        // The certified cut remains valid while terminal materialization is pending; the
+        // preparation deadline no longer applies after the cut has been captured.
+        let current = self.capture_drain_positions(&boundary.inputs, None)?;
         if current.as_ref() != expected {
             return Err(ConnectorError::Internal(
-                "Kafka revoked-input cursor advanced after its drain receipt".into(),
+                "Kafka input cursor advanced after its drain receipt".into(),
             ));
         }
         Ok(())
@@ -968,7 +1026,7 @@ impl KafkaSource {
         }
 
         let consumer = Arc::clone(self.consumer.as_ref().unwrap());
-        // Drain control exists only on a vnode-assigned cluster source. Embedded and single-node
+        // Drain control exists only on a cluster-assigned source. Embedded and single-node
         // readers retain their existing allocation-free control path.
         let vnode_reassign = self
             .vnode_assignment
@@ -995,7 +1053,6 @@ impl KafkaSource {
 
         // -- Reader task: message consumption, backpressure, revoke pruning --
         // Engine-controlled re-assignment inputs (cluster mode; `None` otherwise).
-        let vnode_topic_meta = self.vnode_topic_meta.clone();
         let vnode_partition_routes = std::mem::take(&mut self.vnode_partition_routes);
         let reassign_snapshot = Arc::clone(&self.offset_snapshot);
         let reassign_baselines = self.manual_partition_baselines.clone();
@@ -1024,6 +1081,17 @@ impl KafkaSource {
             let mut deferred_drain_command = None;
 
             loop {
+                if active_drain.as_ref().is_some_and(|active| {
+                    !active.boundary_queued
+                        && tokio::time::Instant::now() >= active.prepare_deadline
+                }) {
+                    publish_reader_fault(
+                        &reader_fault,
+                        &data_ready,
+                        "Kafka source drain preparation exceeded its engine deadline",
+                    );
+                    return;
+                }
                 // On rotation, apply only the DELTA (incremental assign/unassign): a
                 // full re-assign would re-seek kept partitions and re-fetch records
                 // already buffered ahead, re-emitting committed rows. Newly-acquired
@@ -1356,8 +1424,16 @@ impl KafkaSource {
                                 "Kafka source rebound partitions after vnode rotation"
                             );
                         }
-                        // Revoked partitions are gone; their drain pauses no longer apply.
+                        // Reassignment can clear librdkafka's pause bit even when the same input
+                        // is re-acquired. Require every added input to prove its target pause.
+                        for element in to_add.elements() {
+                            drain_paused.remove(&(Arc::from(element.topic()), element.partition()));
+                        }
                         drain_paused.retain(|(t, p)| owned_set.contains(&(t.to_string(), *p)));
+                        if let Some(active) = active_drain.as_mut() {
+                            active.held_assignment_version = None;
+                            active.hold_complete = false;
+                        }
                         // A stale stint position must not shadow the handoff on re-acquire.
                         lock_or_recover(&reassign_snapshot).retain_assigned(&owned_set);
                         data_ready.notify_one();
@@ -1373,9 +1449,9 @@ impl KafkaSource {
                 });
                 if let Some(command) = command {
                     match command {
-                        KafkaReaderDrainCommand::Begin(request) => {
+                        KafkaReaderDrainCommand::Begin { request, deadline } => {
                             if let Some(current) = active_drain.as_ref() {
-                                if current.request.round != request.round {
+                                if current.request != request {
                                     warn!(
                                         current = ?current.request.round,
                                         requested = ?request.round,
@@ -1389,12 +1465,20 @@ impl KafkaSource {
                                     return;
                                 }
                             } else {
-                                let Some((registry, _)) = vnode_reassign.as_ref() else {
-                                    warn!("Kafka reader received drain control without vnode ownership");
+                                if tokio::time::Instant::now() >= deadline {
                                     publish_reader_fault(
                                         &reader_fault,
                                         &data_ready,
-                                        "drain control has no vnode ownership",
+                                        "Kafka source drain began after its engine deadline",
+                                    );
+                                    return;
+                                }
+                                let Some((registry, _)) = vnode_reassign.as_ref() else {
+                                    warn!("Kafka reader received drain control without cluster ownership");
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "drain control has no cluster ownership",
                                     );
                                     return;
                                 };
@@ -1413,30 +1497,50 @@ impl KafkaSource {
                                     );
                                     return;
                                 }
-                                let revoked = match kafka_drain_partitions(
-                                    &request,
-                                    source_name.as_ref(),
-                                    registry.vnode_count(),
-                                    &vnode_topic_meta,
-                                ) {
-                                    Ok(revoked) => revoked,
+                                if last_assignment_version != request.round.predecessor_version {
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "Kafka drain predecessor is not reconciled",
+                                    );
+                                    return;
+                                }
+                                let assignment = match consumer.assignment() {
+                                    Ok(assignment) => assignment,
+                                    Err(error) => {
+                                        publish_reader_fault(
+                                            &reader_fault,
+                                            &data_ready,
+                                            format!(
+                                                "Kafka drain could not inspect its assignment: {error}"
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                };
+                                let inputs = match kafka_drain_partitions(&assignment) {
+                                    Ok(inputs) => inputs,
                                     Err(error) => {
                                         warn!(
                                             source = source_name.as_ref(),
                                             %error,
-                                            "Kafka reader rejected a non-canonical drain route"
+                                            "Kafka reader rejected its drain assignment"
                                         );
                                         publish_reader_fault(
                                             &reader_fault,
                                             &data_ready,
-                                            format!("non-canonical drain route: {error}"),
+                                            format!("invalid Kafka drain assignment: {error}"),
                                         );
                                         return;
                                     }
                                 };
                                 active_drain = Some(KafkaReaderDrain {
                                     request,
-                                    revoked,
+                                    prepare_deadline: deadline,
+                                    held_inputs: Arc::clone(&inputs),
+                                    inputs,
+                                    held_assignment_version: Some(last_assignment_version),
+                                    hold_complete: false,
                                     boundary_queued: false,
                                 });
                             }
@@ -1444,106 +1548,183 @@ impl KafkaSource {
                         KafkaReaderDrainCommand::Resolve {
                             resolution,
                             cut,
+                            deadline,
+                            execution,
                             reply,
                         } => {
-                            let result = if let Some(active) = active_drain.as_ref() {
-                                resolve_kafka_reader_drain(
+                            if active_drain.is_none() {
+                                let _ = reply.send(Err(
+                                    "Kafka reader has no active drain to resolve".into(),
+                                ));
+                                continue;
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                let _ = reply.send(Err(
+                                    "Kafka drain deadline expired before target reconciliation"
+                                        .into(),
+                                ));
+                                continue;
+                            }
+                            let Some((registry, _)) = vnode_reassign.as_ref() else {
+                                let _ = reply.send(Err(
+                                    "Kafka drain resolution has no cluster assignment".into(),
+                                ));
+                                continue;
+                            };
+                            let target_ready = match kafka_drain_target_ready(
+                                resolution.round.target_version,
+                                registry.assignment_version(),
+                                last_assignment_version,
+                            ) {
+                                Ok(ready) => ready,
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    continue;
+                                }
+                            };
+                            let target_paused = target_ready
+                                && active_drain.as_ref().is_some_and(|active| {
+                                    active.held_assignment_version
+                                        == Some(resolution.round.target_version)
+                                        && active.hold_complete
+                                });
+                            if !target_ready || !target_paused {
+                                deferred_drain_command = Some(KafkaReaderDrainCommand::Resolve {
+                                    resolution,
+                                    cut,
+                                    deadline,
+                                    execution,
+                                    reply,
+                                });
+                            } else {
+                                let result = resolve_kafka_reader_drain(
                                     &consumer,
                                     vnode_reassign.as_ref(),
-                                    active,
+                                    active_drain.as_ref().expect("validated above"),
                                     resolution,
                                     &cut,
                                     is_paused,
+                                    deadline,
+                                    &execution,
                                 )
-                                .await
-                            } else {
-                                Err("Kafka reader has no active drain to resolve".into())
-                            };
-                            if result.is_ok() {
-                                if let Some(active) = active_drain.take() {
-                                    let revoked: std::collections::HashSet<(Arc<str>, i32)> =
-                                        active
-                                            .revoked
-                                            .iter()
-                                            .map(|input| {
-                                                (Arc::clone(&input.topic), input.partition)
-                                            })
-                                            .collect();
-                                    drain_paused.retain(|input| !revoked.contains(input));
+                                .await;
+                                if result.is_ok() {
+                                    active_drain = None;
+                                    drain_paused.clear();
                                 }
-                            }
-                            let _ = reply.send(result);
-                            continue;
-                        }
-                    }
-                }
-
-                // A boundary is queued only after every concrete input reports a successful
-                // pause. Per-partition errors are authoritative even when the aggregate call
-                // succeeds. The reader is the FIFO's sole producer, so all prior payloads are
-                // necessarily ahead of this marker.
-                if let Some(active) = active_drain.as_mut().filter(|drain| !drain.boundary_queued) {
-                    let remaining: Vec<(Arc<str>, i32)> = active
-                        .revoked
-                        .iter()
-                        .filter(|input| {
-                            !drain_paused.contains(&(Arc::clone(&input.topic), input.partition))
-                        })
-                        .map(|input| (Arc::clone(&input.topic), input.partition))
-                        .collect();
-                    let to_pause = tpl_of(remaining.iter());
-                    if to_pause.count() > 0 {
-                        match consumer.pause(&to_pause) {
-                            Ok(()) => {
-                                for element in to_pause.elements() {
-                                    if element.error().is_ok() {
-                                        drain_paused.insert((
-                                            Arc::from(element.topic()),
-                                            element.partition(),
-                                        ));
-                                    }
-                                }
-                                if let Err(error) =
-                                    validate_kafka_partition_results("drain pause", &to_pause)
-                                {
-                                    warn!(%error, "Kafka drain pause incomplete; will retry");
-                                    continue;
-                                }
-                            }
-                            Err(error) => {
-                                warn!(%error, "Kafka drain pause failed; will retry");
+                                let _ = reply.send(result);
                                 continue;
                             }
                         }
                     }
-                    let all_paused = active.revoked.iter().all(|input| {
-                        drain_paused.contains(&(Arc::clone(&input.topic), input.partition))
-                    });
-                    if all_paused {
-                        let boundary = KafkaDrainBoundary {
-                            round: active.request.round,
-                            revoked_input_digest: kafka_drain_input_digest(&active.revoked),
-                            revoked_inputs: Arc::clone(&active.revoked),
+                }
+
+                // Hold the complete live Kafka assignment for the full source cut. Assignment
+                // reconciliation can replace inputs while the cut is held, so new inputs are
+                // paused before the reader is allowed to receive from them.
+                if let Some(active) = active_drain.as_mut() {
+                    if active.held_assignment_version != Some(last_assignment_version) {
+                        let assignment = match consumer.assignment() {
+                            Ok(assignment) => assignment,
+                            Err(error) => {
+                                warn!(%error, "Kafka drain could not inspect the live assignment");
+                                continue;
+                            }
                         };
-                        channel_len.fetch_add(1, Ordering::Relaxed);
-                        let sent = tokio::select! {
-                            biased;
-                            _ = reader_shutdown.changed() => false,
-                            result = msg_tx.send(KafkaReaderItem::DrainBoundary(boundary)) => result.is_ok(),
-                        };
-                        if !sent {
-                            channel_len.fetch_sub(1, Ordering::Relaxed);
-                            if !*reader_shutdown.borrow() {
+                        active.held_inputs = match kafka_drain_partitions(&assignment) {
+                            Ok(inputs) => inputs,
+                            Err(error) => {
                                 publish_reader_fault(
                                     &reader_fault,
                                     &data_ready,
-                                    "reader drain-boundary channel closed unexpectedly",
+                                    format!("invalid Kafka assignment while draining: {error}"),
                                 );
+                                return;
                             }
-                            break;
+                        };
+                        let current_set: std::collections::HashSet<(Arc<str>, i32)> = active
+                            .held_inputs
+                            .iter()
+                            .map(|input| (Arc::clone(&input.topic), input.partition))
+                            .collect();
+                        drain_paused.retain(|input| current_set.contains(input));
+                        active.held_assignment_version = Some(last_assignment_version);
+                        active.hold_complete = false;
+                    }
+                    if !active.hold_complete {
+                        let remaining: Vec<(Arc<str>, i32)> = active
+                            .held_inputs
+                            .iter()
+                            .filter(|input| {
+                                !drain_paused.contains(&(Arc::clone(&input.topic), input.partition))
+                            })
+                            .map(|input| (Arc::clone(&input.topic), input.partition))
+                            .collect();
+                        let to_pause = tpl_of(remaining.iter());
+                        if to_pause.count() > 0 {
+                            match consumer.pause(&to_pause) {
+                                Ok(()) => {
+                                    for element in to_pause.elements() {
+                                        if element.error().is_ok() {
+                                            drain_paused.insert((
+                                                Arc::from(element.topic()),
+                                                element.partition(),
+                                            ));
+                                        }
+                                    }
+                                    if let Err(error) =
+                                        validate_kafka_partition_results("drain pause", &to_pause)
+                                    {
+                                        warn!(%error, "Kafka drain pause incomplete; will retry");
+                                        continue;
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(%error, "Kafka drain pause failed; will retry");
+                                    continue;
+                                }
+                            }
                         }
-                        active.boundary_queued = true;
-                        data_ready.notify_one();
+                        active.hold_complete = active.held_inputs.iter().all(|input| {
+                            drain_paused.contains(&(Arc::clone(&input.topic), input.partition))
+                        });
+                    }
+                    if !active.boundary_queued {
+                        let cut_is_paused = active.inputs.iter().all(|input| {
+                            drain_paused.contains(&(Arc::clone(&input.topic), input.partition))
+                        });
+                        if cut_is_paused {
+                            let boundary = KafkaDrainBoundary {
+                                round: active.request.round,
+                                inputs: Arc::clone(&active.inputs),
+                            };
+                            channel_len.fetch_add(1, Ordering::Relaxed);
+                            let sent = tokio::select! {
+                                biased;
+                                _ = reader_shutdown.changed() => false,
+                                () = tokio::time::sleep_until(active.prepare_deadline) => false,
+                                result = msg_tx.send(KafkaReaderItem::DrainBoundary(boundary)) => result.is_ok(),
+                            };
+                            if !sent {
+                                channel_len.fetch_sub(1, Ordering::Relaxed);
+                                if tokio::time::Instant::now() >= active.prepare_deadline {
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "Kafka drain boundary delivery exceeded its engine deadline",
+                                    );
+                                } else if !*reader_shutdown.borrow() {
+                                    publish_reader_fault(
+                                        &reader_fault,
+                                        &data_ready,
+                                        "reader drain-boundary channel closed unexpectedly",
+                                    );
+                                }
+                                break;
+                            }
+                            active.boundary_queued = true;
+                            data_ready.notify_one();
+                        }
                     }
                 }
 
@@ -1639,10 +1820,10 @@ impl KafkaSource {
                         }
                     };
                     if seek_ok {
-                        // Positioned — undo the callback's pause unless backpressure
-                        // is currently holding partitions.
+                        // Positioned — undo the callback's pause only when neither
+                        // backpressure nor a global source cut is holding intake.
                         let mut resumed_ok = true;
-                        if !is_paused {
+                        if !is_paused && active_drain.is_none() {
                             if let Ok(assignment) = consumer.assignment() {
                                 if let Err(e) = consumer.resume(&assignment) {
                                     warn!(error = %e, "post-seek resume failed; will retry");
@@ -1653,32 +1834,9 @@ impl KafkaSource {
                                 ) {
                                     warn!(%error, "post-seek resume incomplete; will retry");
                                     resumed_ok = false;
-                                } else if !drain_paused.is_empty() {
-                                    // Keep rotation-drained partitions paused. A failed re-pause
-                                    // cannot fall through to recv: that could cross the cut.
-                                    let drained = tpl_of(drain_paused.iter());
-                                    if let Err(error) = consumer
-                                        .pause(&drained)
-                                        .map_err(|error| {
-                                            format!(
-                                                "Kafka post-seek drain re-pause failed: {error}"
-                                            )
-                                        })
-                                        .and_then(|()| {
-                                            validate_kafka_partition_results(
-                                                "post-seek drain re-pause",
-                                                &drained,
-                                            )
-                                        })
-                                    {
-                                        warn!(%error, "post-seek drain re-pause incomplete; will retry");
-                                        resumed_ok = false;
-                                    }
                                 }
                             }
                         }
-                        // Advance only when resumed, else the partitions stay paused
-                        // and never fetch.
                         if resumed_ok {
                             last_assign_gen = cur_assign_gen;
                         } else {
@@ -1694,7 +1852,7 @@ impl KafkaSource {
                 } else {
                     0.0
                 };
-                if fill >= pause_threshold && !is_paused {
+                if active_drain.is_none() && fill >= pause_threshold && !is_paused {
                     if let Ok(assignment) = consumer.assignment() {
                         match consumer.pause(&assignment) {
                             Ok(()) => match validate_kafka_partition_results(
@@ -1714,7 +1872,7 @@ impl KafkaSource {
                             }
                         }
                     }
-                } else if fill <= resume_threshold && is_paused {
+                } else if active_drain.is_none() && fill <= resume_threshold && is_paused {
                     if let Ok(assignment) = consumer.assignment() {
                         let resumed = consumer
                             .resume(&assignment)
@@ -1725,26 +1883,6 @@ impl KafkaSource {
                         if let Err(error) = resumed {
                             warn!(%error, "reader backpressure resume incomplete");
                             continue;
-                        }
-                        // Keep rotation-drained partitions paused. Do not receive if this fails:
-                        // resume may already have made a revoked partition fetchable.
-                        if !drain_paused.is_empty() {
-                            let drained = tpl_of(drain_paused.iter());
-                            let re_paused = consumer
-                                .pause(&drained)
-                                .map_err(|error| {
-                                    format!("Kafka backpressure drain re-pause failed: {error}")
-                                })
-                                .and_then(|()| {
-                                    validate_kafka_partition_results(
-                                        "backpressure drain re-pause",
-                                        &drained,
-                                    )
-                                });
-                            if let Err(error) = re_paused {
-                                warn!(%error, "reader drain re-pause incomplete");
-                                continue;
-                            }
                         }
                         is_paused = false;
                         debug!("reader: resumed Kafka partitions (fill={fill:.2})");
@@ -1760,22 +1898,44 @@ impl KafkaSource {
                 } else {
                     std::time::Duration::from_millis(200)
                 };
+                let drain_held = active_drain
+                    .as_ref()
+                    .is_some_and(|drain| drain.boundary_queued);
+                let prepare_deadline = active_drain
+                    .as_ref()
+                    .filter(|drain| !drain.boundary_queued)
+                    .map(|drain| drain.prepare_deadline);
+                let resolution_deferred = deferred_drain_command.is_some();
                 let msg_result = tokio::select! {
                     biased;
                     _ = reader_shutdown.changed() => break,
+                    () = async {
+                        match prepare_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        publish_reader_fault(
+                            &reader_fault,
+                            &data_ready,
+                            "Kafka source drain preparation exceeded its engine deadline",
+                        );
+                        return;
+                    },
                     command = async {
                         match reader_drain_rx.as_mut() {
                             Some(receiver) => receiver.recv().await,
                             None => std::future::pending().await,
                         }
-                    } => {
+                    }, if !resolution_deferred => {
                         deferred_drain_command = command;
                         if deferred_drain_command.is_none() {
                             reader_drain_rx = None;
                         }
                         continue;
                     },
-                    msg = tokio::time::timeout(recv_timeout, consumer.recv()) => match msg {
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)), if drain_held => continue,
+                    msg = tokio::time::timeout(recv_timeout, consumer.recv()), if !drain_held => match msg {
                         Ok(result) => result,
                         Err(_timeout) => continue,
                     },
@@ -1784,30 +1944,6 @@ impl KafkaSource {
                     Ok(msg) => {
                         if let Some(payload) = msg.payload() {
                             let topic = msg.topic();
-                            if active_drain.as_ref().is_some_and(|drain| {
-                                drain.boundary_queued
-                                    && drain
-                                        .revoked
-                                        .binary_search_by(|input| {
-                                            input
-                                                .topic
-                                                .as_ref()
-                                                .cmp(topic)
-                                                .then(input.partition.cmp(&msg.partition()))
-                                        })
-                                        .is_ok()
-                            }) {
-                                // librdkafka may return records prefetched before pause. They are
-                                // deliberately outside Laminar's cut: do not enqueue them or
-                                // advance the engine cursor. Abort seeks back to the receipt cut.
-                                debug!(
-                                    topic,
-                                    partition = msg.partition(),
-                                    offset = msg.offset(),
-                                    "filtered prefetched Kafka record after drain boundary"
-                                );
-                                continue;
-                            }
                             if &*cached_topic != topic {
                                 if vnode_reassign.is_some() {
                                     let Some((canonical_topic, routes)) =
@@ -2045,9 +2181,6 @@ impl KafkaSource {
         let Some((registry, _)) = &self.vnode_assignment else {
             return Ok(Some(self.capture_non_vnode_checkpoint()));
         };
-        if self.vnode_topic_meta.is_empty() {
-            return Ok(Some(self.capture_non_vnode_checkpoint()));
-        }
         // Cursor serialization runs outside the registry and publication locks. A final fence
         // check discards the candidate if ownership rotates while offsets are being encoded.
         try_capture_at_assignment_fence(
@@ -2719,11 +2852,28 @@ impl SourceConnector for KafkaSource {
     fn begin_drain(
         &mut self,
         request: &SourceDrainRequest,
-    ) -> Result<SourceDrainStart, ConnectorError> {
-        self.check_reader_health("starting a vnode drain")?;
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.check_reader_health("starting a global source drain")?;
+        if let Some(active) = self.source_drain.as_ref() {
+            if active.request != *request {
+                return Err(ConnectorError::InvalidState {
+                    expected: format!("active Kafka drain {:?}", active.request.round),
+                    actual: format!("conflicting Kafka drain {:?}", request.round),
+                });
+            }
+            // Retain the first preparation deadline. A caller retry carries a wait budget,
+            // not authority to extend or shorten work already in progress.
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ConnectorError::Internal(
+                "Kafka source drain began after its engine deadline".into(),
+            ));
+        }
         let Some((registry, _)) = self.vnode_assignment.as_ref() else {
             return Err(ConnectorError::InvalidState {
-                expected: "Kafka vnode assignment installed before source drain".into(),
+                expected: "Kafka cluster assignment installed before source drain".into(),
                 actual: "embedded/single Kafka source".into(),
             });
         };
@@ -2736,44 +2886,41 @@ impl SourceConnector for KafkaSource {
                 actual: registry.assignment_version().to_string(),
             });
         }
-        if let Some(&vnode) = request.revoking_vnodes.last() {
-            if vnode >= registry.vnode_count() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "Kafka drain vnode {vnode} is outside the configured 0..{} range",
-                    registry.vnode_count()
-                )));
-            }
-        }
-        if let Some(active) = self.source_drain.as_ref() {
-            if active.request.round != request.round || active.request != *request {
-                return Err(ConnectorError::InvalidState {
-                    expected: format!("active Kafka drain {:?}", active.request.round),
-                    actual: format!("conflicting Kafka drain {:?}", request.round),
-                });
-            }
-            return Ok(SourceDrainStart::Pending);
+        let reconciled = self.reconciled_assignment_version.load(Ordering::Acquire);
+        if reconciled != request.round.predecessor_version {
+            return Err(ConnectorError::InvalidState {
+                expected: format!(
+                    "reconciled Kafka predecessor assignment {}",
+                    request.round.predecessor_version
+                ),
+                actual: reconciled.to_string(),
+            });
         }
         self.ensure_reader_started();
         let tx = self.reader_drain_tx.as_ref().ok_or_else(|| {
-            ConnectorError::Internal("Kafka vnode reader has no drain control channel".into())
+            ConnectorError::Internal("Kafka cluster reader has no drain control channel".into())
         })?;
-        tx.send(KafkaReaderDrainCommand::Begin(request.clone()))
-            .map_err(|_| ConnectorError::Internal("Kafka reader drain channel closed".into()))?;
+        tx.send(KafkaReaderDrainCommand::Begin {
+            request: request.clone(),
+            deadline,
+        })
+        .map_err(|_| ConnectorError::Internal("Kafka reader drain channel closed".into()))?;
         self.source_drain = Some(KafkaSourceDrain {
             request: request.clone(),
+            prepare_deadline: deadline,
             boundary: None,
             cut: None,
-            cut_taken: false,
+            pending_resolution: None,
         });
         self.data_ready.notify_one();
-        Ok(SourceDrainStart::Pending)
+        Ok(())
     }
 
-    fn take_drain_cut(
+    fn poll_drain_ready(
         &mut self,
         round: laminar_core::checkpoint::AssignmentDrainId,
-    ) -> Result<Option<ConnectorDrainCut>, ConnectorError> {
-        self.check_reader_health("capturing a vnode drain cut")?;
+    ) -> Result<bool, ConnectorError> {
+        self.check_reader_health("capturing a global source drain cut")?;
         let Some(active) = self.source_drain.as_ref() else {
             return Err(ConnectorError::InvalidState {
                 expected: format!("active Kafka drain {round:?}"),
@@ -2786,36 +2933,29 @@ impl SourceConnector for KafkaSource {
                 actual: format!("cut requested for {round:?}"),
             });
         }
-        if active.cut_taken {
-            return Ok(None);
+        if active.cut.is_some() {
+            return Ok(true);
         }
-        let Some(boundary) = active.boundary.clone() else {
-            return Ok(None);
-        };
-        if kafka_drain_input_digest(&boundary.revoked_inputs) != boundary.revoked_input_digest {
+        if tokio::time::Instant::now() >= active.prepare_deadline {
             return Err(ConnectorError::Internal(
-                "Kafka drain boundary input digest mismatch".into(),
+                "Kafka drain deadline expired before cursor capture".into(),
             ));
         }
-        let cut = self.capture_drain_positions(&boundary.revoked_inputs)?;
-        let connector_cut = ConnectorDrainCut {
-            revoked_input_count: u32::try_from(boundary.revoked_inputs.len()).map_err(|_| {
-                ConnectorError::Internal("Kafka drain input count exceeds u32::MAX".into())
-            })?,
-            revoked_input_digest: boundary.revoked_input_digest,
-            cut_cursor_digest: kafka_drain_cursor_digest(&cut),
+        let Some(boundary) = active.boundary.clone() else {
+            return Ok(false);
         };
+        let cut = self.capture_drain_positions(&boundary.inputs, Some(active.prepare_deadline))?;
         let active = self.source_drain.as_mut().expect("checked above");
         active.cut = Some(cut);
-        active.cut_taken = true;
-        Ok(Some(connector_cut))
+        Ok(true)
     }
 
     async fn finish_drain(
         &mut self,
         resolution: SourceDrainResolution,
+        deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
-        self.check_reader_health("resolving a vnode drain")?;
+        self.check_reader_health("resolving a global source drain")?;
         let active = self
             .source_drain
             .as_ref()
@@ -2838,22 +2978,102 @@ impl SourceConnector for KafkaSource {
                     expected: "Kafka FIFO drain cut before resolution".into(),
                     actual: "drain boundary not consumed".into(),
                 })?;
-        let tx = self.reader_drain_tx.as_ref().ok_or_else(|| {
-            ConnectorError::Internal("Kafka reader drain channel is absent".into())
-        })?;
-        let (reply, result) = tokio::sync::oneshot::channel();
-        tx.send(KafkaReaderDrainCommand::Resolve {
-            resolution,
-            cut,
-            reply,
-        })
-        .map_err(|_| ConnectorError::Internal("Kafka reader drain channel closed".into()))?;
-        result
-            .await
-            .map_err(|_| ConnectorError::Internal("Kafka reader dropped drain resolution".into()))?
-            .map_err(ConnectorError::Internal)?;
-        self.source_drain = None;
-        Ok(())
+        if let Some(pending) = active.pending_resolution.as_ref() {
+            if pending.resolution != resolution {
+                return Err(ConnectorError::InvalidState {
+                    expected: format!("pending Kafka resolution {:?}", pending.resolution),
+                    actual: format!("conflicting Kafka resolution {resolution:?}"),
+                });
+            }
+            // The first terminal command owns the resolution deadline. A retry waits on that
+            // same command and cannot extend or shorten its provider execution window.
+            if let Some(error) = pending.terminal_error.as_ref() {
+                return Err(ConnectorError::Internal(error.to_string()));
+            }
+            if pending.execution.load(Ordering::Acquire) == KAFKA_DRAIN_EXECUTION_CANCELLED {
+                return Err(ConnectorError::Internal(
+                    "Kafka drain resolution was cancelled before execution".into(),
+                ));
+            }
+        } else {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ConnectorError::Internal(
+                    "Kafka drain engine deadline expired before resolution".into(),
+                ));
+            }
+            let tx = self.reader_drain_tx.as_ref().ok_or_else(|| {
+                ConnectorError::Internal("Kafka reader drain channel is absent".into())
+            })?;
+            let execution = Arc::new(AtomicU8::new(KAFKA_DRAIN_EXECUTION_PENDING));
+            let (reply, result) = tokio::sync::oneshot::channel();
+            tx.send(KafkaReaderDrainCommand::Resolve {
+                resolution,
+                cut,
+                deadline,
+                execution: Arc::clone(&execution),
+                reply,
+            })
+            .map_err(|_| ConnectorError::Internal("Kafka reader drain channel closed".into()))?;
+            self.source_drain
+                .as_mut()
+                .expect("active drain was validated above")
+                .pending_resolution = Some(KafkaPendingDrainResolution {
+                resolution,
+                deadline,
+                execution,
+                reply: result,
+                terminal_error: None,
+            });
+            self.data_ready.notify_one();
+        }
+        let pending = self
+            .source_drain
+            .as_mut()
+            .and_then(|active| active.pending_resolution.as_mut())
+            .expect("pending Kafka resolution was installed above");
+        let execution = Arc::clone(&pending.execution);
+        let mut wait_guard = KafkaDrainWaitGuard::new(Arc::clone(&execution));
+        let reply = match tokio::time::timeout_at(pending.deadline, &mut pending.reply).await {
+            Ok(reply) => reply,
+            Err(_) => match execution.compare_exchange(
+                KAFKA_DRAIN_EXECUTION_PENDING,
+                KAFKA_DRAIN_EXECUTION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(KAFKA_DRAIN_EXECUTION_CANCELLED) => {
+                    let error: Arc<str> = Arc::from(
+                        "Kafka drain engine deadline expired before resolution completed",
+                    );
+                    pending.terminal_error = Some(Arc::clone(&error));
+                    wait_guard.disarm();
+                    return Err(ConnectorError::Internal(error.to_string()));
+                }
+                Err(KAFKA_DRAIN_EXECUTION_STARTED) => (&mut pending.reply).await,
+                Err(state) => {
+                    wait_guard.disarm();
+                    return Err(ConnectorError::Internal(format!(
+                        "Kafka drain resolution has invalid execution state {state}"
+                    )));
+                }
+            },
+        };
+        wait_guard.disarm();
+        match reply {
+            Ok(Ok(())) => {
+                self.source_drain = None;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                pending.terminal_error = Some(Arc::from(error.as_str()));
+                Err(ConnectorError::Internal(error))
+            }
+            Err(_) => {
+                let error: Arc<str> = Arc::from("Kafka reader dropped drain resolution");
+                pending.terminal_error = Some(Arc::clone(&error));
+                Err(ConnectorError::Internal(error.to_string()))
+            }
+        }
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -3091,7 +3311,6 @@ impl SourceConnector for KafkaSource {
         //
         // Reset stale metadata so a re-`start()` that falls back to subscribe
         // doesn't leave `checkpoint()` filtering by a prior run's vnode ownership.
-        self.vnode_topic_meta.clear();
         self.vnode_partition_routes.clear();
         let vnode = self
             .vnode_assignment
@@ -3203,7 +3422,6 @@ impl SourceConnector for KafkaSource {
                     kafka_partition_set(&active).map_err(ConnectorError::ConnectionFailed)?;
                 validate_kafka_assignment(&owned_partitions, &active)
                     .map_err(ConnectorError::ConnectionFailed)?;
-                self.vnode_topic_meta = topic_meta;
                 self.vnode_partition_routes = partition_routes;
                 *lock_or_recover(&self.assignment_publication) =
                     Arc::new(KafkaAssignmentPublication::new(
@@ -3650,7 +3868,7 @@ impl SourceConnector for KafkaSource {
 
         // Pin one ownership publication only while draining the non-awaiting
         // payload queue. An assignment writer waits for this short read-side
-        // critical section, so one drain cannot mix vnode owners from two versions.
+        // critical section, so one cut cannot mix ownership publications.
         let (drained_assignment_version, retires_rotation_baseline) = {
             let vnode_registry = self
                 .vnode_assignment
@@ -4332,15 +4550,12 @@ mod tests {
         CommittedSourceHandoff::try_from(&capsule)
     }
 
-    fn drain_request(vnodes: &[u32]) -> SourceDrainRequest {
-        SourceDrainRequest::new(
-            laminar_core::checkpoint::AssignmentDrainId {
-                predecessor_version: 7,
-                target_version: 8,
-                digest: [9; 32],
-            },
-            Arc::from(vnodes.to_vec()),
-        )
+    fn drain_request() -> SourceDrainRequest {
+        SourceDrainRequest::new(laminar_core::checkpoint::AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [9; 32],
+        })
         .unwrap()
     }
 
@@ -4357,35 +4572,138 @@ mod tests {
     }
 
     #[test]
-    fn drain_partition_set_is_canonical_and_vnode_scoped() {
-        let inputs = kafka_drain_partitions(
-            &drain_request(&[1, 3]),
-            "orders_source",
-            4,
-            &[(Arc::from("events"), 8)],
-        )
-        .unwrap();
-        let expected: Vec<i32> = (0..8)
-            .filter(|partition| {
-                [1, 3].contains(
-                    &crate::kafka::partition_assignment::partition_vnode(
-                        "orders_source",
-                        "events",
-                        *partition,
-                        4,
-                    )
-                    .unwrap(),
-                )
-            })
-            .collect();
+    fn drain_partition_set_covers_the_complete_live_assignment() {
+        let mut assignment = TopicPartitionList::new();
+        assignment.add_partition("events", 7);
+        assignment.add_partition("audit", 2);
+        assignment.add_partition("events", 1);
+        let inputs = kafka_drain_partitions(&assignment).unwrap();
         assert_eq!(
             inputs
                 .iter()
-                .map(|input| input.partition)
+                .map(|input| (input.topic.as_ref(), input.partition))
                 .collect::<Vec<_>>(),
-            expected
+            [("audit", 2), ("events", 1), ("events", 7)]
         );
-        assert_ne!(kafka_drain_input_digest(&inputs), [0; 32]);
+    }
+
+    #[test]
+    fn drain_partition_set_rejects_empty_and_duplicate_inputs() {
+        let mut empty_topic = TopicPartitionList::new();
+        empty_topic.add_partition("", 1);
+        assert!(matches!(
+            kafka_drain_partitions(&empty_topic),
+            Err(ConnectorError::ConfigurationError(message))
+                if message.contains("empty topic")
+        ));
+
+        let mut duplicate = TopicPartitionList::new();
+        duplicate.add_partition("events", 1);
+        duplicate.add_partition("events", 1);
+        assert!(matches!(
+            kafka_drain_partitions(&duplicate),
+            Err(ConnectorError::ConfigurationError(message))
+                if message.contains("duplicate input 'events-1'")
+        ));
+    }
+
+    #[test]
+    fn drain_resolution_waits_for_the_exact_reconciled_target() {
+        assert_eq!(kafka_drain_target_ready(8, 7, 7), Ok(false));
+        assert_eq!(kafka_drain_target_ready(8, 8, 7), Ok(false));
+        assert_eq!(kafka_drain_target_ready(8, 8, 8), Ok(true));
+        assert!(kafka_drain_target_ready(8, 9, 9).is_err());
+    }
+
+    #[test]
+    fn cancelled_drain_resolution_cannot_later_claim_provider_execution() {
+        let execution = AtomicU8::new(KAFKA_DRAIN_EXECUTION_PENDING);
+        execution
+            .compare_exchange(
+                KAFKA_DRAIN_EXECUTION_PENDING,
+                KAFKA_DRAIN_EXECUTION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .unwrap();
+
+        let error = claim_kafka_drain_execution(
+            &execution,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect_err("cancelled resolution must not seek or resume");
+        assert!(error.contains("cancelled before execution"));
+        assert_eq!(
+            execution.load(Ordering::Acquire),
+            KAFKA_DRAIN_EXECUTION_CANCELLED
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_cut_outlives_prepare_deadline_and_uses_resolution_deadline() {
+        let request = drain_request();
+        let prepare_deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let inputs: Arc<[KafkaDrainPartition]> = Arc::from([KafkaDrainPartition {
+            topic: Arc::from("events"),
+            partition: 0,
+        }]);
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.source_drain = Some(KafkaSourceDrain {
+            request: request.clone(),
+            prepare_deadline,
+            boundary: Some(KafkaDrainBoundary {
+                round: request.round,
+                inputs,
+            }),
+            cut: Some(Arc::from([KafkaDrainPosition {
+                topic: Arc::from("events"),
+                partition: 0,
+                next_offset: 42,
+            }])),
+            pending_resolution: None,
+        });
+
+        // A retry's fresh wait budget cannot replace the already-completed prepare phase.
+        source
+            .begin_drain(
+                &request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(
+            source.source_drain.as_ref().unwrap().prepare_deadline,
+            prepare_deadline
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        source.reader_drain_tx = Some(tx);
+        let resolution = SourceDrainResolution {
+            round: request.round,
+            outcome: SourceDrainOutcome::Commit,
+        };
+        let resolution_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let finish = source.finish_drain(resolution, resolution_deadline);
+        let respond = async {
+            let KafkaReaderDrainCommand::Resolve {
+                resolution: actual,
+                deadline,
+                execution,
+                reply,
+                ..
+            } = rx.recv().await.unwrap()
+            else {
+                panic!("expected Kafka drain resolution");
+            };
+            assert_eq!(actual, resolution);
+            assert_eq!(deadline, resolution_deadline);
+            claim_kafka_drain_execution(&execution, deadline).unwrap();
+            reply.send(Ok(())).unwrap();
+        };
+        let (result, ()) = tokio::join!(finish, respond);
+        result.unwrap();
+        assert!(source.source_drain.is_none());
     }
 
     #[tokio::test]
@@ -4399,9 +4717,8 @@ mod tests {
             partition: 1,
         }]);
         let boundary = KafkaDrainBoundary {
-            round: drain_request(&[1]).round,
-            revoked_input_digest: kafka_drain_input_digest(&inputs),
-            revoked_inputs: inputs,
+            round: drain_request().round,
+            inputs,
         };
         let marker =
             tokio::spawn(async move { tx.send(KafkaReaderItem::DrainBoundary(boundary)).await });
@@ -4431,23 +4748,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("events-3"));
-    }
-
-    #[test]
-    fn drain_cursor_digest_binds_next_offsets() {
-        let first = [KafkaDrainPosition {
-            topic: Arc::from("events"),
-            partition: 1,
-            next_offset: 42,
-        }];
-        let second = [KafkaDrainPosition {
-            next_offset: 43,
-            ..first[0].clone()
-        }];
-        assert_ne!(
-            kafka_drain_cursor_digest(&first),
-            kafka_drain_cursor_digest(&second)
-        );
     }
 
     #[test]
@@ -4726,6 +5026,7 @@ mod tests {
             "injected terminal reader fault",
         );
         wake.await;
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
 
         for error in [
             source
@@ -4739,16 +5040,19 @@ mod tests {
                 .try_checkpoint()
                 .expect_err("checkpoint capture must fail closed"),
             source
-                .begin_drain(&drain_request(&[0]))
+                .begin_drain(&drain_request(), drain_deadline)
                 .expect_err("drain start must fail closed"),
             source
-                .take_drain_cut(drain_request(&[0]).round)
+                .poll_drain_ready(drain_request().round)
                 .expect_err("drain cut must fail closed"),
             source
-                .finish_drain(SourceDrainResolution {
-                    round: drain_request(&[0]).round,
-                    outcome: SourceDrainOutcome::Abort,
-                })
+                .finish_drain(
+                    SourceDrainResolution {
+                        round: drain_request().round,
+                        outcome: SourceDrainOutcome::Abort,
+                    },
+                    drain_deadline,
+                )
                 .await
                 .expect_err("drain resolution must fail closed"),
         ] {
@@ -4760,29 +5064,29 @@ mod tests {
     }
 
     #[test]
-    fn drain_rejects_out_of_range_vnodes_before_starting_the_reader() {
+    fn drain_rejects_an_unreconciled_predecessor_before_starting_the_reader() {
         let node = laminar_core::state::NodeId(1);
         let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(4, node));
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.source_name = Arc::from("events_source");
         source.vnode_assignment = Some((Arc::clone(&registry), node));
-        let request = SourceDrainRequest::new(
-            laminar_core::checkpoint::AssignmentDrainId {
-                predecessor_version: registry.assignment_version(),
-                target_version: registry.assignment_version() + 1,
-                digest: [9; 32],
-            },
-            Arc::from([registry.vnode_count()]),
-        )
+        let request = SourceDrainRequest::new(laminar_core::checkpoint::AssignmentDrainId {
+            predecessor_version: registry.assignment_version(),
+            target_version: registry.assignment_version() + 1,
+            digest: [9; 32],
+        })
         .unwrap();
 
         let error = source
-            .begin_drain(&request)
-            .expect_err("out-of-range drain ownership must fail closed");
+            .begin_drain(
+                &request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect_err("unreconciled predecessor must fail closed");
         assert!(matches!(
             error,
-            ConnectorError::ConfigurationError(message)
-                if message.contains("outside the configured")
+            ConnectorError::InvalidState { expected, actual }
+                if expected.contains("reconciled Kafka predecessor") && actual == "0"
         ));
         assert!(source.reader_handle.is_none());
         assert!(source.reader_drain_tx.is_none());
@@ -5393,7 +5697,6 @@ mod tests {
 
         source.source_name = Arc::from("events_source");
         source.vnode_assignment = Some((Arc::clone(&registry), node1));
-        source.vnode_topic_meta = vec![(Arc::from("events"), 4)];
         source.manual_partition_baselines = KafkaPartitionBaselines::from([
             (("events".to_string(), 0), 10),
             (("events".to_string(), 1), 20),
@@ -5458,7 +5761,6 @@ mod tests {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.source_name = Arc::from("events_source");
         source.vnode_assignment = Some((Arc::clone(&registry), node1));
-        source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
         source.offsets.update_force("events", 0, 250); // stale prior stint
         source.manual_partition_baselines =
             KafkaPartitionBaselines::from([(("events".to_string(), 0), 5)]);
@@ -5522,7 +5824,6 @@ mod tests {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.source_name = Arc::from("events-source");
         source.vnode_assignment = Some((Arc::clone(&registry), node1));
-        source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
         source.offsets.update("events", 0, 100);
         source
             .reconciled_assignment_version
@@ -5582,7 +5883,6 @@ mod tests {
         let registry = Arc::new(laminar_core::state::VnodeRegistry::new_unassigned(1));
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.vnode_assignment = Some((registry, laminar_core::state::NodeId(1)));
-        source.vnode_topic_meta = vec![(Arc::from("events"), 1)];
 
         assert!(!source.checkpoint_ready().unwrap());
         assert!(source.try_checkpoint().unwrap().is_none());

@@ -240,58 +240,6 @@ pub(crate) fn logical_aggregate_stage_count(plan: &datafusion_expr::LogicalPlan)
             .sum::<usize>()
 }
 
-pub(crate) fn physical_aggregate_stage_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    use datafusion::physical_plan::aggregates::AggregateExec;
-
-    usize::from(plan.as_any().is::<AggregateExec>())
-        + plan
-            .children()
-            .into_iter()
-            .map(physical_aggregate_stage_count)
-            .sum::<usize>()
-}
-
-fn unsupported_cluster_aggregate(
-    plan: &Arc<dyn ExecutionPlan>,
-    reads_changelog: bool,
-) -> Option<String> {
-    use datafusion::physical_plan::aggregates::AggregateExec;
-
-    if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
-        if !aggregate.group_expr().expr().is_empty() {
-            return Some(
-                "keyed aggregates retain operator-owned map state without a live-state byte budget"
-                    .into(),
-            );
-        }
-        for expression in aggregate.aggr_expr() {
-            let name = expression.fun().name().to_ascii_lowercase();
-            if expression.is_distinct() {
-                return Some(format!(
-                    "DISTINCT aggregate '{name}' has unbounded per-key state and no spillable vnode lifecycle"
-                ));
-            }
-            let extrema = matches!(name.as_str(), "min" | "max");
-            if reads_changelog && extrema {
-                return Some(format!(
-                    "aggregate '{name}' over a changelog uses an unbounded counted multiset and has no spillable vnode lifecycle"
-                ));
-            }
-            // These are the only aggregate state formats exercised by the vnode checkpoint and
-            // rebalance path. Expand this list only with recovery and resource-bound tests.
-            let bounded = matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max");
-            if !bounded {
-                return Some(format!(
-                    "aggregate '{name}' has unbounded or unclassified per-key state and no spillable vnode lifecycle"
-                ));
-            }
-        }
-    }
-    plan.children()
-        .into_iter()
-        .find_map(|child| unsupported_cluster_aggregate(child, reads_changelog))
-}
-
 fn distinct_streaming_aggregate(sql: &str) -> Option<String> {
     let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
     let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.first()? else {
@@ -2293,11 +2241,11 @@ impl LaminarDB {
         name: &str,
         query_sql: &str,
         plan: &PlannedStreamingQuery,
-    ) -> Result<(), DbError> {
+    ) -> Result<bool, DbError> {
         use laminar_sql::translator::{JoinOperatorConfig, OrderOperatorConfig};
 
         if !self.is_cluster_runtime() {
-            return Ok(());
+            return Ok(false);
         }
         self.validate_cluster_query_shape_before_plan(
             object_kind,
@@ -2377,23 +2325,15 @@ impl LaminarDB {
                 "a built-in DataFusion join has no distributed shuffle and vnode state lifecycle",
             );
         }
-        let physical_aggregate_stages = physical_aggregate_stage_count(&physical);
-        let has_aggregate = match (logical_aggregate_stages, physical_aggregate_stages) {
-            (0, 0) => false,
-            (1, 1) => true,
-            (logical, physical) => {
+        let has_aggregate = match logical_aggregate_stages {
+            0 => false,
+            1 => true,
+            logical => {
                 return reject(&format!(
-                    "aggregate plan has {logical} logical and {physical} physical aggregate stages; cluster admission requires exactly one of each until aggregate distribution stages are planner-certified"
+                    "aggregate plan has {logical} logical aggregate stages; cluster admission requires at most one until multi-stage distribution is planner-certified"
                 ));
             }
         };
-        let incremental_mvs = self.incremental_mv_names();
-        let reads_changelog = crate::sql_analysis::extract_table_references(query_sql)
-            .iter()
-            .any(|table| incremental_mvs.contains(table));
-        if let Some(reason) = unsupported_cluster_aggregate(&physical, reads_changelog) {
-            return reject(&reason);
-        }
         if has_aggregate {
             #[cfg(feature = "cluster")]
             if self.shuffle_sender.lock().is_none()
@@ -2408,14 +2348,14 @@ impl LaminarDB {
                 .emit_clause
                 .as_ref()
                 .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
-            match crate::aggregate_state::IncrementalAggState::try_from_sql(
+            let aggregate = match crate::aggregate_state::IncrementalAggState::try_from_sql(
                 &self.ctx,
                 query_sql,
                 emit_changelog,
             )
             .await
             {
-                Ok(Some(_)) => {}
+                Ok(Some(aggregate)) => aggregate,
                 Ok(None) => {
                     return reject(
                         "aggregate cannot be constructed on the exact incremental execution path; node-local DataFusion fallback would produce partial cluster results",
@@ -2426,9 +2366,16 @@ impl LaminarDB {
                         "aggregate incremental execution path could not be constructed: {error}"
                     ));
                 }
+            };
+            let incremental_mvs = self.incremental_mv_names();
+            let reads_changelog = crate::sql_analysis::extract_table_references(query_sql)
+                .iter()
+                .any(|table| incremental_mvs.contains(table));
+            if let Some(reason) = aggregate.cluster_state_rejection(reads_changelog) {
+                return reject(&reason);
             }
         }
-        Ok(())
+        Ok(has_aggregate)
     }
 
     /// Register a materialized view and wire it into the running pipeline.

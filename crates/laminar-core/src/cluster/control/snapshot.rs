@@ -7,13 +7,14 @@
 //! append-only winner works on every backend, including `LocalFileSystem`, without relying on
 //! conditional overwrite support.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 
 use crate::checkpoint::{
@@ -24,9 +25,18 @@ use crate::cluster::discovery::NodeId;
 use crate::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 
 const SNAPSHOT_PREFIX: &str = "control/assignment-snapshots/";
+const RECOVERY_PROPOSAL_PREFIX: &str = "control/assignment-recovery-proposals/v1/";
+const RECOVERY_MATERIALIZATION_RELATIVE_PREFIX: &str = "recovery-materializations/v1/";
+const RECOVERY_MATERIALIZATION_PREFIX: &str =
+    "control/assignment-snapshots/recovery-materializations/v1/";
 const DRAIN_FINALIZATION_PREFIX: &str = "control/assignment-drain-finalizations/";
 const SNAPSHOT_VERSION_WIDTH: usize = 20;
 const DRAIN_FINALIZATION_VERSION: u16 = 1;
+const RECOVERY_MATERIALIZATION_VERSION: u16 = 1;
+const MAX_RECOVERY_PROPOSAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECOVERY_MATERIALIZATION_BYTES: u64 = 8 * 1024 * 1024 + 1024;
+const RECOVERY_PROPOSAL_GC_BATCH: usize = 64;
+const RECOVERY_PROPOSAL_GC_MAX_BATCHES: usize = 4;
 
 fn snapshot_path(version: u64) -> OsPath {
     // Fixed-width so lexicographic list order matches numeric order.
@@ -43,11 +53,59 @@ fn drain_finalization_path(version: u64) -> OsPath {
     ))
 }
 
+fn recovery_proposal_path(reference: &AssignmentSnapshotRef) -> OsPath {
+    OsPath::from(format!(
+        "{RECOVERY_PROPOSAL_PREFIX}v{:0width$}/sha256={}.json",
+        reference.version,
+        reference.sha256,
+        width = SNAPSHOT_VERSION_WIDTH
+    ))
+}
+
+fn recovery_proposal_version_prefix(version: u64) -> OsPath {
+    OsPath::from(format!(
+        "{RECOVERY_PROPOSAL_PREFIX}v{version:0width$}/",
+        width = SNAPSHOT_VERSION_WIDTH
+    ))
+}
+
+fn recovery_materialization_path(version: u64) -> OsPath {
+    OsPath::from(format!(
+        "{RECOVERY_MATERIALIZATION_PREFIX}v{version:0width$}.json",
+        width = SNAPSHOT_VERSION_WIDTH
+    ))
+}
+
 fn current_time_millis() -> i64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+fn version_from_file(name: &str, kind: &str, minimum: u64) -> Result<u64, SnapshotError> {
+    let Some(number) = name
+        .strip_prefix('v')
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return Err(SnapshotError::Invalid(format!(
+            "non-canonical {kind} filename {name}"
+        )));
+    };
+    if number.len() != SNAPSHOT_VERSION_WIDTH || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SnapshotError::Invalid(format!(
+            "non-canonical {kind} filename {name}"
+        )));
+    }
+    let version = number.parse::<u64>().map_err(|error| {
+        SnapshotError::Invalid(format!("invalid {kind} filename {name}: {error}"))
+    })?;
+    if version < minimum {
+        return Err(SnapshotError::Invalid(format!(
+            "{kind} version must be at least {minimum}"
+        )));
+    }
+    Ok(version)
 }
 
 /// Durable vnode-to-instance assignment snapshot.
@@ -77,6 +135,98 @@ pub struct AssignmentSnapshot {
     /// Present if and only if `draining` is true.
     #[serde(default)]
     pub drain_transition: Option<AssignmentDrainTransition>,
+}
+
+/// Exact immutable reference to a staged failure-recovery successor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSnapshotRef {
+    /// Assignment generation carried by the referenced snapshot.
+    pub version: u64,
+    /// Lowercase hexadecimal SHA-256 of its canonical JSON body.
+    pub sha256: String,
+    /// Exact canonical body length.
+    pub encoded_len: u64,
+}
+
+/// Create-only logical assignment head for an authority-selected recovery proposal.
+///
+/// Recovery uses a separate namespace from graceful-drain intents. A delayed drain writer may
+/// still win the raw snapshot key after losing leadership, but it cannot replace this immutable
+/// materialization winner for the same assignment version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryMaterialization {
+    protocol_version: u16,
+    proposal: AssignmentSnapshotRef,
+    snapshot: AssignmentSnapshot,
+}
+
+impl RecoveryMaterialization {
+    fn new(
+        proposal: AssignmentSnapshotRef,
+        snapshot: AssignmentSnapshot,
+    ) -> Result<Self, SnapshotError> {
+        let materialization = Self {
+            protocol_version: RECOVERY_MATERIALIZATION_VERSION,
+            proposal,
+            snapshot,
+        };
+        materialization.validate()?;
+        Ok(materialization)
+    }
+
+    fn validate(&self) -> Result<(), SnapshotError> {
+        self.proposal.validate()?;
+        if self.protocol_version != RECOVERY_MATERIALIZATION_VERSION {
+            return Err(SnapshotError::Invalid(format!(
+                "unsupported recovery materialization version {}",
+                self.protocol_version
+            )));
+        }
+        let (_, actual_reference) = self.snapshot.encode_recovery_proposal()?;
+        if actual_reference != self.proposal {
+            return Err(SnapshotError::Invalid(
+                "recovery materialization body does not match its proposal reference".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AssignmentSnapshotRef {
+    /// Validate the reference independently of the staged object.
+    ///
+    /// # Errors
+    /// Rejects a non-successor version, malformed digest, or unsafe encoded length.
+    pub fn validate(&self) -> Result<(), SnapshotError> {
+        if self.version < 2 {
+            return Err(SnapshotError::Invalid(
+                "recovery proposal must be a successor generation".into(),
+            ));
+        }
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SnapshotError::Invalid(
+                "recovery proposal SHA-256 must be 64 lowercase hexadecimal characters".into(),
+            ));
+        }
+        if self.encoded_len == 0
+            || self.encoded_len
+                > u64::try_from(MAX_RECOVERY_PROPOSAL_BYTES)
+                    .expect("recovery proposal byte limit fits u64")
+        {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery proposal encoded length {} is outside 1..={MAX_RECOVERY_PROPOSAL_BYTES}",
+                self.encoded_len
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Immutable winner that settles one draining snapshot without changing its certified target
@@ -222,11 +372,14 @@ impl AssignmentSnapshot {
             && self.participants.iter().all(|participant| {
                 participant.node_id != 0 && !participant.boot_incarnation.is_nil()
             })
-            && self.vnodes.values().all(|owner| {
-                self.participants
-                    .binary_search_by_key(&owner.0, |participant| participant.node_id)
-                    .is_ok()
-            });
+            && {
+                let owners: BTreeSet<u64> = self.vnodes.values().map(|owner| owner.0).collect();
+                owners.len() == self.participants.len()
+                    && self
+                        .participants
+                        .iter()
+                        .all(|participant| owners.contains(&participant.node_id))
+            };
         if self.version == 0 || !dense || !canonical_participants {
             return Err(SnapshotError::Invalid(
                 "assignment snapshot is not canonical".into(),
@@ -253,6 +406,31 @@ impl AssignmentSnapshot {
                 "assignment drain flag and transition disagree".into(),
             )),
         }
+    }
+
+    fn encode_recovery_proposal(&self) -> Result<(Vec<u8>, AssignmentSnapshotRef), SnapshotError> {
+        self.validate()?;
+        if self.draining || self.drain_transition.is_some() || self.version < 2 {
+            return Err(SnapshotError::Invalid(
+                "recovery proposal must be a committed successor generation".into(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > MAX_RECOVERY_PROPOSAL_BYTES {
+            return Err(SnapshotError::Invalid(format!(
+                "encoded recovery proposal is {} bytes; maximum is {MAX_RECOVERY_PROPOSAL_BYTES}",
+                encoded.len()
+            )));
+        }
+        let reference = AssignmentSnapshotRef {
+            version: self.version,
+            sha256: format!("{:x}", Sha256::digest(&encoded)),
+            encoded_len: u64::try_from(encoded.len()).map_err(|_| {
+                SnapshotError::Invalid("recovery proposal encoded length overflow".into())
+            })?,
+        };
+        reference.validate()?;
+        Ok((encoded, reference))
     }
 
     fn assignment_fence_unchecked(&self) -> Result<CheckpointAssignmentFence, SnapshotError> {
@@ -381,6 +559,21 @@ impl AssignmentSnapshot {
 /// I/O wrapper for [`AssignmentSnapshot`] on an object store.
 pub struct AssignmentSnapshotStore {
     store: Arc<dyn ObjectStore>,
+    /// Exact kind returned by the last successful head inventory/load. Snapshot watchers audit
+    /// that same version immediately, so they can reuse this immutable provenance instead of
+    /// issuing a speculative overlay GET. Unknown versions still take the verified fallback.
+    last_loaded_head: parking_lot::Mutex<Option<(u64, SnapshotHeadKind)>>,
+}
+
+struct AssignmentVersionInventory {
+    versions: Vec<u64>,
+    recovery_materializations: BTreeSet<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotHeadKind {
+    Raw,
+    Recovery,
 }
 
 impl std::fmt::Debug for AssignmentSnapshotStore {
@@ -408,16 +601,212 @@ impl AssignmentSnapshotStore {
     /// Wrap a pre-constructed object store.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            last_loaded_head: parking_lot::Mutex::new(None),
+        }
     }
 
-    /// Scan the snapshot prefix and return every stored version in
-    /// ascending order. Cheap on small clusters (rotations are rare);
-    /// the list operation is one round trip on every backend.
-    async fn list_versions(&self) -> Result<Vec<u64>, SnapshotError> {
+    /// Stage one committed successor under its canonical content address.
+    ///
+    /// Identical retries converge on the same immutable object. This does not change the durable
+    /// assignment head; callers publish the returned reference through their fencing authority
+    /// before materialization.
+    ///
+    /// # Errors
+    /// Rejects an invalid/non-committed successor or a write that cannot be reconciled exactly.
+    pub async fn stage_recovery_proposal(
+        &self,
+        proposal: &AssignmentSnapshot,
+    ) -> Result<AssignmentSnapshotRef, SnapshotError> {
+        let (encoded, reference) = proposal.encode_recovery_proposal()?;
+        let path = recovery_proposal_path(&reference);
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let put_error = self
+            .store
+            .put_opts(
+                &path,
+                PutPayload::from(Bytes::copy_from_slice(&encoded)),
+                options,
+            )
+            .await
+            .err();
+
+        match self.load_recovery_proposal(&reference).await {
+            Ok(stored) if stored == *proposal => Ok(reference),
+            Ok(_) => Err(SnapshotError::Invalid(format!(
+                "recovery proposal '{}' differs from the proposed snapshot",
+                reference.sha256
+            ))),
+            Err(reconcile_error) => {
+                if let Some(put_error) = put_error {
+                    Err(SnapshotError::Io(format!(
+                        "recovery proposal write failed ({put_error}); reconciliation failed ({reconcile_error})"
+                    )))
+                } else {
+                    Err(reconcile_error)
+                }
+            }
+        }
+    }
+
+    /// Load and verify one exact immutable recovery proposal.
+    ///
+    /// # Errors
+    /// Rejects a missing, malformed, non-canonical, or reference-mismatched object.
+    pub async fn load_recovery_proposal(
+        &self,
+        reference: &AssignmentSnapshotRef,
+    ) -> Result<AssignmentSnapshot, SnapshotError> {
+        reference.validate()?;
+        let result = match self.store.get(&recovery_proposal_path(reference)).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(SnapshotError::Invalid(format!(
+                    "recovery proposal '{}' is missing",
+                    reference.sha256
+                )));
+            }
+            Err(error) => return Err(SnapshotError::Io(error.to_string())),
+        };
+        if result.meta.size != reference.encoded_len {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery proposal '{}' is {} bytes, expected {}",
+                reference.sha256, result.meta.size, reference.encoded_len
+            )));
+        }
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| SnapshotError::Io(error.to_string()))?;
+        if u64::try_from(bytes.len()).ok() != Some(reference.encoded_len) {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery proposal '{}' payload length changed while reading",
+                reference.sha256
+            )));
+        }
+        let proposal: AssignmentSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+            SnapshotError::Invalid(format!("recovery proposal '{}': {error}", reference.sha256))
+        })?;
+        let (canonical, actual_reference) = proposal.encode_recovery_proposal()?;
+        if actual_reference != *reference || canonical.as_slice() != bytes.as_ref() {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery proposal '{}' does not match its content-addressed reference",
+                reference.sha256
+            )));
+        }
+        Ok(proposal)
+    }
+
+    async fn load_recovery_materialization(
+        &self,
+        version: u64,
+    ) -> Result<Option<RecoveryMaterialization>, SnapshotError> {
+        let result = match self
+            .store
+            .get(&recovery_materialization_path(version))
+            .await
+        {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(SnapshotError::Io(error.to_string())),
+        };
+        if result.meta.size == 0 || result.meta.size > MAX_RECOVERY_MATERIALIZATION_BYTES {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery materialization is {} bytes; expected 1..={MAX_RECOVERY_MATERIALIZATION_BYTES}",
+                result.meta.size
+            )));
+        }
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| SnapshotError::Io(error.to_string()))?;
+        let materialization: RecoveryMaterialization = serde_json::from_slice(&bytes)?;
+        materialization.validate()?;
+        if materialization.proposal.version != version {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery materialization path version {version} references proposal version {}",
+                materialization.proposal.version
+            )));
+        }
+        let canonical = serde_json::to_vec(&materialization)?;
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery materialization {version} does not use its canonical body"
+            )));
+        }
+        Ok(Some(materialization))
+    }
+
+    /// Verify and publish a staged successor as the monotonic durable assignment head.
+    ///
+    /// The create-only materialization is the version reservation. It lives outside the raw
+    /// graceful-drain snapshot namespace, so a drain write already in flight under a superseded
+    /// leader cannot occupy or replace the recovery winner. Readers always prefer this record for
+    /// its exact version.
+    ///
+    /// # Errors
+    /// Rejects an invalid proposal reference or a durable head other than its predecessor.
+    pub(super) async fn materialize_recovery(
+        &self,
+        reference: &AssignmentSnapshotRef,
+    ) -> Result<RotateOutcome, SnapshotError> {
+        let proposal = self.load_recovery_proposal(reference).await?;
+        let predecessor_version = reference.version.checked_sub(1).ok_or_else(|| {
+            SnapshotError::Invalid("recovery proposal has no predecessor generation".into())
+        })?;
+        let head = self.list_versions().await?.last().copied();
+        if head != Some(predecessor_version) && head != Some(reference.version) {
+            return Err(SnapshotError::Invalid(format!(
+                "recovery materialization requires durable head {predecessor_version} or {}, observed {head:?}",
+                reference.version
+            )));
+        }
+
+        let materialization = RecoveryMaterialization::new(reference.clone(), proposal.clone())?;
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let result = self
+            .store
+            .put_opts(
+                &recovery_materialization_path(reference.version),
+                PutPayload::from(Bytes::from(serde_json::to_vec(&materialization)?)),
+                options,
+            )
+            .await;
+        let winner = self
+            .load_recovery_materialization(reference.version)
+            .await?
+            .ok_or_else(|| {
+                SnapshotError::Io(format!(
+                    "recovery materialization {} was not durably visible",
+                    reference.version
+                ))
+            })?;
+        let winner_snapshot = winner.snapshot.clone();
+        if result.is_ok() {
+            if winner != materialization || winner_snapshot != proposal {
+                return Err(SnapshotError::Invalid(format!(
+                    "recovery materialization {} changed after its create succeeded",
+                    reference.version
+                )));
+            }
+            return Ok(RotateOutcome::Rotated);
+        }
+        Ok(RotateOutcome::Conflict(winner_snapshot))
+    }
+
+    /// Enumerate raw snapshots and recovery materializations with one object-store LIST.
+    async fn list_version_inventory(&self) -> Result<AssignmentVersionInventory, SnapshotError> {
         let prefix = OsPath::from(SNAPSHOT_PREFIX);
         let mut entries = self.store.list(Some(&prefix));
-        let mut versions: Vec<u64> = Vec::new();
+        let mut versions = Vec::new();
+        let mut recovery_materializations = BTreeSet::new();
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| SnapshotError::Io(e.to_string()))?;
             let loc = entry.location.as_ref();
@@ -426,26 +815,19 @@ impl AssignmentSnapshotStore {
             let Some(rest) = loc.strip_prefix(SNAPSHOT_PREFIX) else {
                 continue;
             };
-            let Some(num) = rest.strip_prefix('v').and_then(|s| s.strip_suffix(".json")) else {
+            if let Some(name) = rest.strip_prefix(RECOVERY_MATERIALIZATION_RELATIVE_PREFIX) {
+                let version = version_from_file(name, "recovery materialization", 2)?;
+                versions.push(version);
+                recovery_materializations.insert(version);
                 continue;
-            };
-            if num.len() != SNAPSHOT_VERSION_WIDTH || !num.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(SnapshotError::Invalid(format!(
-                    "non-canonical assignment snapshot filename {rest}"
-                )));
             }
-            let v = num.parse::<u64>().map_err(|error| {
-                SnapshotError::Invalid(format!("invalid snapshot filename {rest}: {error}"))
-            })?;
-            if v == 0 {
-                return Err(SnapshotError::Invalid(
-                    "assignment snapshot version zero is not durable".into(),
-                ));
+            if !rest.starts_with('v') {
+                continue;
             }
-            versions.push(v);
+            versions.push(version_from_file(rest, "assignment snapshot", 1)?);
         }
         versions.sort_unstable();
+        versions.dedup();
         if versions.windows(2).any(|pair| {
             pair[0]
                 .checked_add(1)
@@ -455,7 +837,15 @@ impl AssignmentSnapshotStore {
                 "assignment snapshot versions are not contiguous".into(),
             ));
         }
-        Ok(versions)
+        Ok(AssignmentVersionInventory {
+            versions,
+            recovery_materializations,
+        })
+    }
+
+    /// Scan the shared history prefix and return every logical version in ascending order.
+    async fn list_versions(&self) -> Result<Vec<u64>, SnapshotError> {
+        Ok(self.list_version_inventory().await?.versions)
     }
 
     async fn list_drain_finalization_versions(&self) -> Result<Vec<u64>, SnapshotError> {
@@ -506,11 +896,32 @@ impl AssignmentSnapshotStore {
     /// # Errors
     /// Object-store I/O or JSON decode failure.
     pub async fn load(&self) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
-        let versions = self.list_versions().await?;
-        let Some(&latest) = versions.last() else {
+        let inventory = self.list_version_inventory().await?;
+        let Some(&latest) = inventory.versions.last() else {
             return Ok(None);
         };
-        self.load_version(latest).await
+        if inventory.recovery_materializations.contains(&latest) {
+            let materialization = self
+                .load_recovery_materialization(latest)
+                .await?
+                .ok_or_else(|| {
+                    SnapshotError::Io(format!(
+                        "listed recovery materialization {latest} disappeared before load"
+                    ))
+                })?;
+            self.last_loaded_head
+                .lock()
+                .replace((latest, SnapshotHeadKind::Recovery));
+            return Ok(Some(materialization.snapshot));
+        }
+        let loaded = self.load_base_version(latest).await?;
+        if loaded.is_some() {
+            let mut last_loaded_head = self.last_loaded_head.lock();
+            if *last_loaded_head != Some((latest, SnapshotHeadKind::Recovery)) {
+                last_loaded_head.replace((latest, SnapshotHeadKind::Raw));
+            }
+        }
+        Ok(loaded)
     }
 
     /// Load a specific version's snapshot. `Ok(None)` if that version
@@ -519,6 +930,16 @@ impl AssignmentSnapshotStore {
     /// # Errors
     /// Object-store I/O or JSON decode failure.
     pub async fn load_version(
+        &self,
+        version: u64,
+    ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
+        if let Some(materialization) = self.load_recovery_materialization(version).await? {
+            return Ok(Some(materialization.snapshot));
+        }
+        self.load_base_version(version).await
+    }
+
+    async fn load_base_version(
         &self,
         version: u64,
     ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
@@ -549,6 +970,20 @@ impl AssignmentSnapshotStore {
         &self,
         version: u64,
     ) -> Result<Option<AssignmentDrainTransition>, SnapshotError> {
+        let last_loaded_head = *self.last_loaded_head.lock();
+        match last_loaded_head {
+            Some((loaded, SnapshotHeadKind::Recovery)) if loaded == version => return Ok(None),
+            Some((loaded, SnapshotHeadKind::Raw)) if loaded == version => {
+                return Ok(self
+                    .load_snapshot_object(version)
+                    .await?
+                    .and_then(|snapshot| snapshot.drain_transition));
+            }
+            _ => {}
+        }
+        if self.load_recovery_materialization(version).await?.is_some() {
+            return Ok(None);
+        }
         Ok(self
             .load_snapshot_object(version)
             .await?
@@ -625,6 +1060,50 @@ impl AssignmentSnapshotStore {
             Ok(_) => Ok(Some(snapshot.clone())),
             Err(object_store::Error::AlreadyExists { .. }) => Ok(None),
             Err(e) => Err(SnapshotError::Io(e.to_string())),
+        }
+    }
+
+    async fn prune_recovery_proposals_for_version(
+        &self,
+        version: u64,
+    ) -> Result<(), SnapshotError> {
+        let prefix = recovery_proposal_version_prefix(version);
+        for _ in 0..RECOVERY_PROPOSAL_GC_MAX_BATCHES {
+            let mut entries = self.store.list(Some(&prefix));
+            let mut candidates = Vec::with_capacity(RECOVERY_PROPOSAL_GC_BATCH);
+            while candidates.len() < RECOVERY_PROPOSAL_GC_BATCH {
+                let Some(entry) = entries.next().await else {
+                    break;
+                };
+                candidates.push(
+                    entry
+                        .map_err(|error| SnapshotError::Io(error.to_string()))?
+                        .location,
+                );
+            }
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            let deletions =
+                futures::stream::iter(candidates.into_iter().map(Ok::<_, object_store::Error>));
+            let mut results = self.store.delete_stream(Box::pin(deletions));
+            while let Some(result) = results.next().await {
+                if let Err(error) = result {
+                    if !matches!(error, object_store::Error::NotFound { .. }) {
+                        return Err(SnapshotError::Io(error.to_string()));
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let mut remaining = self.store.list(Some(&prefix));
+        match remaining.next().await {
+            None => Ok(()),
+            Some(Ok(_)) => Err(SnapshotError::Io(format!(
+                "recovery proposal garbage for assignment {version} exceeds the bounded cleanup budget"
+            ))),
+            Some(Err(error)) => Err(SnapshotError::Io(error.to_string())),
         }
     }
 
@@ -768,15 +1247,28 @@ impl AssignmentSnapshotStore {
         if before == 0 {
             return Ok(());
         }
-        let versions = self.list_versions().await?;
-        for v in versions {
-            if v >= before {
+        let inventory = self.list_version_inventory().await?;
+        for version in inventory.versions {
+            if version >= before {
                 break;
             }
-            let path = snapshot_path(v);
-            match self.store.delete(&path).await {
+            // Remove every winning and losing staged body while the version marker still exists.
+            // A crash leaves that marker discoverable, so the next retention pass resumes GC
+            // instead of leaking an orphaned body of up to 8 MiB.
+            self.prune_recovery_proposals_for_version(version).await?;
+            match self.store.delete(&snapshot_path(version)).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(SnapshotError::Io(e.to_string())),
+            }
+            if inventory.recovery_materializations.contains(&version) {
+                match self
+                    .store
+                    .delete(&recovery_materialization_path(version))
+                    .await
+                {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => return Err(SnapshotError::Io(error.to_string())),
+                }
             }
         }
         // Finalization records are in a separate append-only namespace. Scan it independently so
@@ -832,14 +1324,29 @@ mod tests {
         }
     }
 
-    fn snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
-        let participants = [1, 2, 3, 10, 20, 99]
+    fn participants_for(vnodes: &BTreeMap<u32, NodeId>) -> Vec<CheckpointParticipant> {
+        vnodes
+            .values()
+            .map(|owner| owner.0)
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .map(|node| participant(node, u128::from(node)))
-            .collect();
+            .collect()
+    }
+
+    fn snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
+        let participants = participants_for(&vnodes);
         AssignmentSnapshot::empty()
             .next_for_participants(vnodes, participants)
             .unwrap()
+    }
+
+    fn next_snapshot(
+        current: &AssignmentSnapshot,
+        vnodes: BTreeMap<u32, NodeId>,
+    ) -> AssignmentSnapshot {
+        let participants = participants_for(&vnodes);
+        current.next_for_participants(vnodes, participants).unwrap()
     }
 
     fn store_in(dir: &std::path::Path) -> AssignmentSnapshotStore {
@@ -878,6 +1385,18 @@ mod tests {
         assert_eq!(restarted.vnodes, first.vnodes);
         assert_ne!(restarted.participants, first.participants);
         assert!(restarted.has_canonical_participants());
+    }
+
+    #[test]
+    fn assignment_generation_rejects_zero_vnode_participants() {
+        let error = AssignmentSnapshot::empty()
+            .next_for_participants(
+                BTreeMap::from([(0, NodeId(1))]),
+                vec![participant(1, 11), participant(2, 22)],
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SnapshotError::Invalid(message) if message.contains("canonical")));
     }
 
     #[test]
@@ -1105,7 +1624,7 @@ mod tests {
 
         let mut v2_map = BTreeMap::new();
         v2_map.insert(0, NodeId(2));
-        let v2 = v1.next(v2_map).unwrap();
+        let v2 = next_snapshot(&v1, v2_map);
         // Rotate via save_if_version — the canonical post-boot path.
         assert!(matches!(
             s.save_if_version(&v2, v1.version).await.unwrap(),
@@ -1161,10 +1680,10 @@ mod tests {
         // durable storage.
         let mut m2 = BTreeMap::new();
         m2.insert(0, NodeId(2));
-        let v2 = v1.next(m2).unwrap();
+        let v2 = next_snapshot(&v1, m2);
         let mut m3 = BTreeMap::new();
         m3.insert(0, NodeId(3));
-        let v3 = v2.next(m3).unwrap();
+        let v3 = next_snapshot(&v2, m3);
         let err = s.save_if_version(&v3, 1).await.unwrap_err();
         assert!(
             matches!(err, SnapshotError::Invalid(msg) if msg.contains("monotonic")),
@@ -1206,7 +1725,7 @@ mod tests {
 
         let mut v2_map = BTreeMap::new();
         v2_map.insert(0, NodeId(2));
-        let second = first.next(v2_map).unwrap();
+        let second = next_snapshot(&first, v2_map);
         let outcome = s.save_if_version(&second, first.version).await.unwrap();
         assert!(matches!(outcome, RotateOutcome::Rotated));
 
@@ -1229,7 +1748,7 @@ mod tests {
 
         let mut winner_map = BTreeMap::new();
         winner_map.insert(0, NodeId(10));
-        let winner = v1.next(winner_map).unwrap();
+        let winner = next_snapshot(&v1, winner_map);
         assert!(matches!(
             s.save_if_version(&winner, v1.version).await.unwrap(),
             RotateOutcome::Rotated,
@@ -1237,7 +1756,7 @@ mod tests {
 
         let mut loser_map = BTreeMap::new();
         loser_map.insert(0, NodeId(20));
-        let loser = v1.next(loser_map).unwrap();
+        let loser = next_snapshot(&v1, loser_map);
         match s.save_if_version(&loser, v1.version).await.unwrap() {
             RotateOutcome::Conflict(current) => {
                 assert_eq!(
@@ -1341,6 +1860,134 @@ mod tests {
                 Err(SnapshotError::Invalid(message)) if message.contains("vnode cardinality")
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_proposal_stage_and_materialization_are_idempotent() {
+        let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = AssignmentSnapshotStore::new(backing);
+        let predecessor = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&predecessor).await.unwrap();
+        let proposal = next_snapshot(&predecessor, BTreeMap::from([(0, NodeId(2))]));
+
+        let first_reference = store.stage_recovery_proposal(&proposal).await.unwrap();
+        let retry_reference = store.stage_recovery_proposal(&proposal).await.unwrap();
+        assert_eq!(retry_reference, first_reference);
+        assert_eq!(
+            store
+                .load_recovery_proposal(&first_reference)
+                .await
+                .unwrap(),
+            proposal
+        );
+        assert!(matches!(
+            store.materialize_recovery(&first_reference).await.unwrap(),
+            RotateOutcome::Rotated
+        ));
+        assert!(matches!(
+            store.materialize_recovery(&first_reference).await.unwrap(),
+            RotateOutcome::Conflict(existing) if existing == proposal
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_materialization_surfaces_a_different_same_version_winner() {
+        let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = AssignmentSnapshotStore::new(backing);
+        let predecessor = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&predecessor).await.unwrap();
+        let winner = next_snapshot(&predecessor, BTreeMap::from([(0, NodeId(2))]));
+        let loser = next_snapshot(&predecessor, BTreeMap::from([(0, NodeId(3))]));
+        let winner_reference = store.stage_recovery_proposal(&winner).await.unwrap();
+        let loser_reference = store.stage_recovery_proposal(&loser).await.unwrap();
+
+        assert!(matches!(
+            store.materialize_recovery(&winner_reference).await.unwrap(),
+            RotateOutcome::Rotated
+        ));
+        assert!(matches!(
+            store.materialize_recovery(&loser_reference).await.unwrap(),
+            RotateOutcome::Conflict(existing) if existing == winner
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_retention_removes_winning_and_losing_staged_bodies() {
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let store = AssignmentSnapshotStore::new(backing.clone());
+        let predecessor = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&predecessor).await.unwrap();
+        let winner = next_snapshot(&predecessor, BTreeMap::from([(0, NodeId(2))]));
+        let loser = next_snapshot(&predecessor, BTreeMap::from([(0, NodeId(3))]));
+        let winner_reference = store.stage_recovery_proposal(&winner).await.unwrap();
+        let loser_reference = store.stage_recovery_proposal(&loser).await.unwrap();
+        assert!(matches!(
+            store.materialize_recovery(&winner_reference).await.unwrap(),
+            RotateOutcome::Rotated
+        ));
+        let successor = next_snapshot(&winner, winner.vnodes.clone());
+        assert!(matches!(
+            store
+                .save_if_version(&successor, winner.version)
+                .await
+                .unwrap(),
+            RotateOutcome::Rotated
+        ));
+
+        store.prune_before(successor.version).await.unwrap();
+
+        for reference in [&winner_reference, &loser_reference] {
+            assert!(matches!(
+                backing.get(&recovery_proposal_path(reference)).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            backing
+                .get(&recovery_materialization_path(winner.version))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(store.load_version(winner.version).await.unwrap().is_none());
+        assert_eq!(store.load().await.unwrap(), Some(successor));
+    }
+
+    #[tokio::test]
+    async fn recovery_materialization_rejects_a_tampered_staged_body() {
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let store = AssignmentSnapshotStore::new(backing.clone());
+        let predecessor = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        store.save_if_absent(&predecessor).await.unwrap();
+        let proposal = next_snapshot(&predecessor, BTreeMap::from([(0, NodeId(2))]));
+        let reference = store.stage_recovery_proposal(&proposal).await.unwrap();
+        let (mut tampered, encoded_reference) = proposal.encode_recovery_proposal().unwrap();
+        assert_eq!(encoded_reference, reference);
+        let marker = b"\"updated_at_ms\":";
+        let value_start = tampered
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap()
+            + marker.len();
+        let digit = tampered[value_start..]
+            .iter()
+            .position(u8::is_ascii_digit)
+            .map(|offset| value_start + offset)
+            .unwrap();
+        tampered[digit] = if tampered[digit] == b'9' { b'8' } else { b'9' };
+        backing
+            .put(
+                &recovery_proposal_path(&reference),
+                PutPayload::from(Bytes::from(tampered)),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.load_recovery_proposal(&reference).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("content-addressed reference")
+        ));
+        assert!(store.materialize_recovery(&reference).await.is_err());
+        assert_eq!(store.load().await.unwrap(), Some(predecessor));
     }
 
     #[test]

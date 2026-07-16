@@ -113,6 +113,13 @@ jobs:
             minio/mc:RELEASE.2024-10-08T09-37-26Z -c \
             'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
 
+      - name: Verify Kafka global source handoff
+        if: matrix.discovery == 'static'
+        run: cargo test --profile soak -p laminar-connectors --no-default-features --features kafka --test kafka_global_drain -- --nocapture
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_KAFKA_BROKERS: 127.0.0.1:19092
+
       - name: Kill leader and followers during in-flight checkpoints
         run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka" --test cluster_soak three_node_kill9_soak -- --ignored --nocapture
         env:

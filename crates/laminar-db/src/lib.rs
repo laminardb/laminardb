@@ -137,7 +137,7 @@ pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, Vn
 
 /// Rebalance-driven state-rehydration types (cluster mode).
 #[cfg(feature = "cluster")]
-pub use db::{RehydratedVnode, SnapshotAdoption};
+pub use db::{ClusterStartupDisposition, RehydratedVnode, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

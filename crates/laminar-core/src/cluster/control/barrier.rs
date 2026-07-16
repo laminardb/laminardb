@@ -552,10 +552,15 @@ struct GrpcState {
 type ActiveLeaderState = Option<(NodeId, watch::Receiver<Vec<NodeInfo>>, Arc<AtomicBool>)>;
 
 #[cfg(feature = "cluster")]
+pub(crate) type LocalLeaderProofProvider =
+    Arc<dyn Fn() -> Option<super::LeaderProof> + Send + Sync>;
+
+#[cfg(feature = "cluster")]
 struct GrpcBarrierServer {
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     prepare_acks: Arc<parking_lot::Mutex<PrepareAckState>>,
     leader_lease_store: Arc<parking_lot::Mutex<Option<Arc<super::LeaderLeaseStore>>>>,
+    local_leader_proof: Arc<parking_lot::Mutex<Option<LocalLeaderProofProvider>>>,
 }
 
 #[cfg(feature = "cluster")]
@@ -782,6 +787,40 @@ impl GrpcBarrierServer {
 #[cfg(feature = "cluster")]
 #[tonic::async_trait]
 impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
+    async fn capture_leader_proof(
+        &self,
+        request: tonic::Request<barrier_v1::LeaderProofRequest>,
+    ) -> Result<tonic::Response<barrier_v1::LeaderProofResponse>, tonic::Status> {
+        let requested = request.into_inner();
+        let boot = uuid::Uuid::from_slice(&requested.boot_id).map_err(|_| {
+            tonic::Status::invalid_argument(
+                "Leader proof request boot identity must contain exactly 16 bytes",
+            )
+        })?;
+        if requested.node_id == 0 || boot.is_nil() || requested.process_term == 0 {
+            return Err(tonic::Status::invalid_argument(
+                "Leader proof request identity and process term must be nonzero",
+            ));
+        }
+        let provider = self.local_leader_proof.lock().clone().ok_or_else(|| {
+            tonic::Status::failed_precondition("Local leader proof provider is not installed")
+        })?;
+        let proof = provider().ok_or_else(|| {
+            tonic::Status::failed_precondition("No process-local leader grant is live")
+        })?;
+        if proof.owner.node_id != requested.node_id
+            || proof.owner.boot_id != boot
+            || proof.owner.process_term != requested.process_term
+        {
+            return Err(tonic::Status::failed_precondition(
+                "Live leader grant does not match the requested process term",
+            ));
+        }
+        Ok(tonic::Response::new(barrier_v1::LeaderProofResponse {
+            proof: leader_proof_to_wire(Some(&proof)),
+        }))
+    }
+
     async fn prepare(
         &self,
         request: tonic::Request<barrier_v1::PrepareRequest>,
@@ -1143,6 +1182,8 @@ pub struct BarrierCoordinator {
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
     #[cfg(feature = "cluster")]
     leader_lease_store: Arc<parking_lot::Mutex<Option<Arc<super::LeaderLeaseStore>>>>,
+    #[cfg(feature = "cluster")]
+    local_leader_proof: Arc<parking_lot::Mutex<Option<LocalLeaderProofProvider>>>,
 }
 
 impl std::fmt::Debug for BarrierCoordinator {
@@ -1182,7 +1223,14 @@ impl BarrierCoordinator {
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
             leader_lease_store: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_local_leader_proof_provider(&self, provider: LocalLeaderProofProvider) {
+        *self.local_leader_proof.lock() = Some(provider);
     }
 
     /// Install the durable authority used to validate clustered reversible barrier phases.
@@ -1305,6 +1353,7 @@ impl BarrierCoordinator {
             incoming_tx: incoming_tx.clone(),
             prepare_acks: Arc::clone(&prepare_acks),
             leader_lease_store: Arc::clone(&self.leader_lease_store),
+            local_leader_proof: Arc::clone(&self.local_leader_proof),
         };
 
         // The pull-path query service shares this control-plane port; peers
@@ -1387,6 +1436,76 @@ impl BarrierCoordinator {
         self.kv.write(BARRIER_ADDR_KEY, advertise_addr).await;
 
         Ok(local_addr)
+    }
+
+    /// Ask one exact remote process to capture its live process-local leader grant.
+    #[cfg(feature = "cluster")]
+    pub async fn capture_remote_leader_proof(
+        &self,
+        participant: super::CheckpointParticipant,
+        process_term: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<super::LeaderProof>, String> {
+        let peer = NodeId(participant.node_id);
+        if peer.is_unassigned() || participant.boot_incarnation.is_nil() || process_term == 0 {
+            return Err("remote leader proof request is not canonical".into());
+        }
+        let state = self
+            .grpc
+            .lock()
+            .clone()
+            .ok_or_else(|| "cluster control RPC server is not started".to_string())?;
+        let clients = Arc::clone(&state.clients);
+        let request_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let result = tokio::time::timeout_at(deadline, async {
+            let mut client = get_barrier_client(peer, &clients, &self.kv)
+                .await
+                .ok_or_else(|| {
+                    format!("cluster control address for peer {} is unavailable", peer.0)
+                })?;
+            let mut request = tonic::Request::new(barrier_v1::LeaderProofRequest {
+                node_id: participant.node_id,
+                boot_id: participant.boot_incarnation.as_bytes().to_vec(),
+                process_term,
+            });
+            request.set_timeout(request_timeout);
+            match client.capture_leader_proof(request).await {
+                Ok(response) => leader_proof_from_wire(response.into_inner().proof)
+                    .map_err(|error| error.to_string()),
+                Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                    // The stable node id may now advertise a replacement process. Do not pin
+                    // subsequent proof attempts to a still-responsive channel for the old boot.
+                    clients.lock().remove(&peer);
+                    Ok(None)
+                }
+                Err(status) => Err(status.to_string()),
+            }
+        })
+        .await;
+        let proof = match result {
+            Ok(Ok(proof)) => proof,
+            Ok(Err(error)) => {
+                clients.lock().remove(&peer);
+                return Err(error);
+            }
+            Err(_) => {
+                clients.lock().remove(&peer);
+                return Err(format!(
+                    "remote leader proof request for peer {} timed out",
+                    peer.0
+                ));
+            }
+        };
+        if proof.as_ref().is_some_and(|proof| {
+            proof.owner.node_id != participant.node_id
+                || proof.owner.boot_id != participant.boot_incarnation
+                || proof.owner.process_term != process_term
+        }) {
+            return Err(
+                "remote leader proof response does not match the requested process term".into(),
+            );
+        }
+        Ok(proof)
     }
 
     /// Leader-side announce.
@@ -1992,6 +2111,7 @@ mod tests {
             incoming_tx,
             prepare_acks: Arc::new(parking_lot::Mutex::new(PrepareAckState::default())),
             leader_lease_store: Arc::new(parking_lot::Mutex::new(Some(Arc::clone(&store)))),
+            local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
         };
         assert!(server
             .require_latest_proof(&replacement_lease.proof())

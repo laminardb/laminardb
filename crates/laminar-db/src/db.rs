@@ -256,8 +256,6 @@ pub struct LaminarDB {
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) catalog_seal_gate:
         parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
-    /// Set at pipeline start when a sink is exactly-once; gates the rotation drain.
-    pub(crate) rotation_drain_required: Arc<std::sync::atomic::AtomicBool>,
     /// Kept inside an async mutex while joined. A cancelled stop future drops only the guard,
     /// never the sole watcher handle, so a retry cannot publish a false terminal state.
     pub(crate) runtime_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -818,6 +816,18 @@ pub struct SnapshotAdoption {
     pub rehydration_epoch: Option<u64>,
 }
 
+/// Result of certifying a clustered process at startup.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterStartupDisposition {
+    /// This process owns vnodes and may serve its certified assignment.
+    Serving,
+    /// This process owns no vnodes and remains data-plane fenced while watching assignments.
+    Idle,
+    /// A coordinated recovery must release this process before it may serve data.
+    RecoveryFenced,
+}
+
 /// Result of publishing one locally serialized assignment-authority certificate.
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -993,7 +1003,6 @@ impl LaminarDB {
             stop_after_claim_gate: parking_lot::Mutex::new(None),
             #[cfg(all(test, feature = "cluster"))]
             catalog_seal_gate: parking_lot::Mutex::new(None),
-            rotation_drain_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: tokio::sync::Mutex::new(None),
             committer_handle: tokio::sync::Mutex::new(None),
             exact_deployment_lock: parking_lot::Mutex::new(None),
@@ -1272,10 +1281,67 @@ impl LaminarDB {
             });
         }
 
+        // Installing a certificate briefly serializes source and shuffle authority. During a
+        // drain, preserve an already-open predecessor execution scope: its source tasks are held
+        // by the drain protocol, while its coordinator must still consume the FIFO boundary and
+        // checkpoint barrier. Fresh and target-only processes enter with this gate closed and
+        // remain closed until the terminal assignment is adopted.
+        let intake_was_closed = self.cluster_intake_fenced();
         self.set_source_gate(true);
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("assignment activation has no cluster controller".into())
         })?;
+        let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("assignment activation has no vnode registry".into())
+        })?;
+        let assignment = registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        let local_id = controller.instance_id().0;
+        let local_incarnation = fence.participant_incarnation(local_id);
+        if !fence.is_canonical()
+            || fence.assignment_version != assignment.version()
+            || fence.vnode_count != registry.vnode_count()
+            || !fence.matches_owner_map(&owners)
+            || local_incarnation
+                .is_some_and(|incarnation| incarnation != controller.recovery_incarnation())
+            || (local_incarnation.is_none() && owners.contains(&local_id))
+        {
+            return Err(DbError::Checkpoint(format!(
+                "assignment certificate does not match local assignment {} and process {}",
+                assignment.version(),
+                local_id
+            )));
+        }
+
+        // A live process outside the owner roster is control-plane ready, but has no source,
+        // compute, shuffle, checkpoint, or recovery authority. Retain the audited certificate so
+        // its watcher can observe a later assignment that grants ownership.
+        if local_incarnation.is_none() {
+            let shuffle_active = self
+                .shuffle_receiver
+                .lock()
+                .as_ref()
+                .is_some_and(|receiver| receiver.assignment_version() != 0)
+                || self
+                    .shuffle_sender
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|sender| sender.assignment_version() != 0);
+            let revision = if shuffle_active {
+                self.invalidate_shuffle_assignment_fence();
+                self.assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+            } else {
+                expected_revision
+            };
+            controller.publish_checkpoint_drain_transition(drain_transition);
+            controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+            return Ok(AssignmentAuthorityActivation {
+                installed: true,
+                intake_open: false,
+                revision,
+            });
+        }
         if let Err(error) = self.install_shuffle_assignment_fence(fence) {
             controller.publish_checkpoint_drain_transition(None);
             controller.publish_checkpoint_assignment_fence(None);
@@ -1298,6 +1364,7 @@ impl LaminarDB {
             });
         }
 
+        let source_drain_active = drain_transition.is_some();
         controller.publish_checkpoint_drain_transition(drain_transition);
         controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
         if self
@@ -1318,7 +1385,36 @@ impl LaminarDB {
         }
 
         let mut intake_open = false;
-        if !controller.is_recovering() {
+        let preserve_predecessor_execution = source_drain_active && !intake_was_closed;
+        if !controller.is_recovering() && (!source_drain_active || preserve_predecessor_execution) {
+            // This read is inside the serialized assignment/execution boundary. A startup or
+            // topology watcher that derived authority before a durable fault appeared must not
+            // open intake over that fault while waiting for the recovery monitor's next poll.
+            let fault_reports =
+                match tokio::time::timeout_at(deadline, controller.read_fault_reports()).await {
+                    Ok(Ok(reports)) => reports,
+                    Ok(Err(error)) => {
+                        controller.set_recovering(true);
+                        return Err(DbError::Checkpoint(format!(
+                        "could not audit recovery faults before opening assignment intake: {error}"
+                    )));
+                    }
+                    Err(_) => {
+                        controller.set_recovering(true);
+                        return Err(DbError::Checkpoint(
+                            "recovery fault audit timed out before opening assignment intake"
+                                .into(),
+                        ));
+                    }
+                };
+            if fault_reports.iter().any(|(_, sequence)| *sequence != 0) {
+                controller.set_recovering(true);
+                return Ok(AssignmentAuthorityActivation {
+                    installed: true,
+                    intake_open: false,
+                    revision: expected_revision,
+                });
+            }
             self.set_source_gate(false);
             let unchanged = self
                 .assignment_authority_revision
@@ -2079,7 +2175,6 @@ impl LaminarDB {
                 snapshot.version,
             );
         }
-        registry.clear_draining();
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
         }
@@ -2105,20 +2200,18 @@ impl LaminarDB {
         Ok(adoption)
     }
 
-    /// Wait for every local vnode-partitioned source to publish an exact FIFO drain receipt.
+    /// Wait for every local source to publish an exact FIFO drain receipt.
     #[cfg(feature = "cluster")]
     pub(crate) async fn prepare_local_source_drain(
         &self,
         transition: &laminar_core::checkpoint::AssignmentDrainTransition,
         participant: laminar_core::checkpoint::CheckpointParticipant,
-        revoking_vnodes: &[u32],
         deadline: tokio::time::Instant,
-    ) -> Result<laminar_core::checkpoint::NodeDrainReceiptAggregate, DbError> {
+    ) -> Result<(), DbError> {
         crate::pipeline::streaming_coordinator::prepare_owned_source_drain(
             &self.owned_source_tasks,
             transition,
             participant,
-            Arc::from(revoking_vnodes.to_vec()),
             deadline,
         )
         .await
@@ -2142,15 +2235,13 @@ impl LaminarDB {
         .map_err(|error| DbError::Checkpoint(format!("source drain resolution failed: {error}")))
     }
 
-    /// Mark the vnodes this node is about to lose as draining (source pauses their
-    /// partitions for a clean checkpoint cut); does NOT change ownership. Returns
-    /// them so the leader can wait on the drain. The committed snapshot rotates
-    /// ownership later via [`adopt_assignment_snapshot`](Self::adopt_assignment_snapshot).
+    /// Validate a draining generation without changing local ownership. Source intake is held by
+    /// the source-task drain protocol until the durable outcome is resolved.
     #[cfg(feature = "cluster")]
-    pub(crate) fn adopt_draining_snapshot(
+    pub(crate) fn validate_source_drain_snapshot(
         &self,
         snapshot: &laminar_core::cluster::control::AssignmentSnapshot,
-    ) -> Result<Vec<u32>, DbError> {
+    ) -> Result<(), DbError> {
         if !snapshot.draining {
             return Err(DbError::Checkpoint(format!(
                 "assignment {} is not a draining generation",
@@ -2163,9 +2254,12 @@ impl LaminarDB {
                 snapshot.version
             )));
         }
-        let Some(registry) = self.vnode_registry.lock().clone() else {
-            return Ok(Vec::new());
-        };
+        let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "draining assignment {} cannot be validated without a vnode registry",
+                snapshot.version
+            ))
+        })?;
         let expected_version = registry
             .assignment_version()
             .checked_add(1)
@@ -2177,46 +2271,14 @@ impl LaminarDB {
                 registry.assignment_version()
             )));
         }
-        let vnode_count = registry.vnode_count();
-        let self_id = self
-            .cluster_controller
-            .lock()
-            .as_ref()
-            .map_or(laminar_core::state::NodeId(0), |c| {
-                laminar_core::state::NodeId(c.instance_id().0)
-            });
-        let next = snapshot
-            .to_vnode_vec(vnode_count)
+        snapshot
+            .to_vnode_vec(registry.vnode_count())
             .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        let current = registry.snapshot();
-        let revoking: Vec<u32> = (0..vnode_count)
-            .filter(|&v| {
-                current.get(v as usize).copied() == Some(self_id)
-                    && next.get(v as usize).copied() != Some(self_id)
-            })
-            .collect();
-        // Reset first so only this snapshot's revoking set stays marked (a newer
-        // draining snapshot may skip the committed snapshot that would have cleared
-        // the previous marks).
-        registry.clear_draining();
-        if !revoking.is_empty() {
-            tracing::info!(
-                count = revoking.len(),
-                version = snapshot.version,
-                "pre-rotation drain: pausing source for revoking vnodes"
-            );
-            registry.mark_draining(&revoking);
-        }
-        Ok(revoking)
-    }
-
-    /// Whether vnode rotations run the pre-rotation source drain — true when a sink
-    /// is exactly-once, so the old owner stops at the checkpoint cut rather than
-    /// emitting past the sealed offset. At-least-once pipelines skip it.
-    #[must_use]
-    pub fn requires_rotation_drain(&self) -> bool {
-        self.rotation_drain_required
-            .load(std::sync::atomic::Ordering::Acquire)
+        tracing::info!(
+            version = snapshot.version,
+            "validated global source-drain generation"
+        );
+        Ok(())
     }
 
     /// Staged vnode state from the most recent rebalance adoptions, keyed by vnode.

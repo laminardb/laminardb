@@ -234,19 +234,19 @@ jobs:
         run: |
           # Core features
           cargo check -p laminar-core --no-default-features
-          cargo check -p laminar-core --features cluster
+          cargo check -p laminar-core --no-default-features --features cluster
 
           # DB features
-          cargo check -p laminar-db --features cluster
+          cargo check -p laminar-db --no-default-features --features cluster
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features
-          cargo check -p laminar-connectors --features kafka
-          cargo check -p laminar-connectors --features postgres-cdc
-          cargo check -p laminar-connectors --features postgres-sink
-          cargo check -p laminar-connectors --features mongodb-cdc
-          cargo check -p laminar-connectors --features files
-          cargo check -p laminar-connectors --features parquet-lookup
+          cargo check -p laminar-connectors --no-default-features --features kafka
+          cargo check -p laminar-connectors --no-default-features --features postgres-cdc
+          cargo check -p laminar-connectors --no-default-features --features postgres-sink
+          cargo check -p laminar-connectors --no-default-features --features mongodb-cdc
+          cargo check -p laminar-connectors --no-default-features --features files
+          cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
   # ============================================
   # MSRV Check

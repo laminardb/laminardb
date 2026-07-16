@@ -15,7 +15,7 @@ use laminar_core::checkpoint::{
 use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
 use uuid::Uuid;
 
-const ASSIGNMENT_OWNERS: [u64; 8] = [2; 8];
+const ASSIGNMENT_OWNERS: [u64; 8] = [1, 2, 2, 2, 2, 2, 2, 2];
 
 fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()

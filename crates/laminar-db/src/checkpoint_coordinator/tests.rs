@@ -303,12 +303,10 @@ fn test_assignment_fence(
                 .unwrap(),
         })
         .collect::<Vec<_>>();
-    let owners = vec![
-        participants
-            .first()
-            .expect("test assignment has a participant")
-            .node_id,
-    ];
+    let owners = participants
+        .iter()
+        .map(|participant| participant.node_id)
+        .collect::<Vec<_>>();
     CheckpointAssignmentFence::from_owner_map(assignment_version, &owners, participants).unwrap()
 }
 
@@ -333,9 +331,14 @@ fn publish_test_assignment_fence_with_owners(
 ) {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
 
+    let owner_ids = owners
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let participants = controller
         .checkpoint_instances()
         .into_iter()
+        .filter(|node| owner_ids.contains(&node.0))
         .map(|node| CheckpointParticipant {
             node_id: node.0,
             boot_incarnation: if node == controller.instance_id() {
@@ -3611,146 +3614,17 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn seal_requires_readiness_from_zero_vnode_participants() {
-    use bytes::Bytes;
-    use laminar_core::state::{InProcessBackend, StateBackend};
-
-    let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
-    let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(backend.clone()).unwrap();
-    coord.set_assignment_version(9);
-    coord.set_vnode_set(vec![0]);
-    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[2]).await;
-    let leader_proof = coord
-        .cluster_controller
-        .as_ref()
-        .unwrap()
-        .capture_leader_proof()
-        .unwrap();
-    let attempt = CheckpointAttempt::new(5, 7);
-    let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
-    manifest.participant_id = 1;
-    manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
-    manifest.pipeline_identity = coord.expected_pipeline_identity();
-    manifest
-        .source_offsets
-        .insert("kafka".into(), ConnectorCheckpoint::new());
-    coord
-        .persist_participant_ready_until(
-            attempt,
-            &manifest,
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            false,
-        )
-        .await
-        .unwrap();
-    backend
-        .write_certified_partial(
-            attempt,
-            0,
-            coord.active_assignment_fence.as_ref().unwrap(),
-            1,
-            Bytes::from_static(b"state"),
-        )
-        .await
-        .unwrap();
-
-    let required = [participant_ready_key(1), participant_ready_key(2)];
-    assert!(
-        !backend
-            .seal_checkpoint(
-                attempt,
-                coord.active_assignment_fence.as_ref(),
-                &[0],
-                &required,
-            )
-            .await
-            .unwrap(),
-        "a zero-vnode participant still owes a final prepare attestation"
-    );
-
-    let (manifest_sha256, portable_state_sha256) = manifest_digests(&manifest).unwrap();
-    let peer_ready = ParticipantReady {
-        version: PARTICIPANT_READY_VERSION,
-        attempt,
-        participant_id: 2,
-        assignment_fence: coord.active_assignment_fence.clone().unwrap(),
-        deployment_id: manifest.deployment_id.clone(),
-        pipeline_identity: manifest.pipeline_identity.clone(),
-        owned_vnodes: Vec::new(),
-        source_offsets: std::collections::BTreeMap::new(),
-        source_metadata: std::collections::BTreeMap::new(),
-        source_assignment_versions: std::collections::BTreeMap::new(),
-        source_watermarks: std::collections::BTreeMap::new(),
-        local_watermark: CheckpointWatermark::Uninitialized,
-        manifest_sha256,
-        portable_state_sha256,
-    };
-    backend
-        .write_certified_commit_descriptor(
-            attempt,
-            &participant_ready_key(2),
-            coord.active_assignment_fence.as_ref().unwrap(),
-            2,
-            &leader_proof,
-            Bytes::from(serde_json::to_vec(&peer_ready).unwrap()),
-        )
-        .await
-        .unwrap();
-    assert!(backend
-        .seal_checkpoint(
-            attempt,
-            coord.active_assignment_fence.as_ref(),
-            &[0],
-            &required,
-        )
-        .await
-        .unwrap());
-    let inventory = backend
-        .checkpoint_seal_inventory(attempt)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut readiness = Vec::new();
-    for key in &required {
-        let bytes = backend
-            .read_commit_descriptor(attempt, key)
-            .await
-            .unwrap()
-            .unwrap();
-        readiness.push((
-            key.clone(),
-            serde_json::from_slice::<ParticipantReady>(&bytes).unwrap(),
-        ));
-    }
-    let capsule = crate::cluster_recovery_capsule::assemble_capsule(
-        &inventory,
-        readiness,
-        coord.expected_deployment_id().unwrap(),
-        &coord.expected_pipeline_identity(),
-        CheckpointWatermark::Uninitialized,
-        None,
-    )
-    .unwrap();
-    assert!(capsule
-        .source_offsets
-        .get("kafka")
-        .is_some_and(std::collections::BTreeMap::is_empty));
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
 async fn readiness_rejects_overlapping_vnode_ownership() {
     use bytes::Bytes;
     use laminar_core::state::{InProcessBackend, StateBackend};
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
-    let backend = Arc::new(InProcessBackend::new(1));
+    let mut coord = make_cluster_coordinator(dir.path(), 2).await;
+    let backend = Arc::new(InProcessBackend::new(2));
     coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(9);
     coord.set_vnode_set(vec![0]);
+    coord.set_gate_vnode_set(vec![0, 1]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[2]).await;
     let leader_proof = coord
         .cluster_controller
@@ -3865,7 +3739,7 @@ async fn readiness_encoding_is_canonical_for_idempotent_reconstruction() {
         assignment_fence: assignment_fence.clone(),
         deployment_id: "deployment".into(),
         pipeline_identity: PipelineIdentity::empty(),
-        owned_vnodes: Vec::new(),
+        owned_vnodes: vec![0],
         source_offsets: std::collections::BTreeMap::from([(
             "kafka".into(),
             offsets

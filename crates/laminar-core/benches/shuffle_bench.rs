@@ -52,7 +52,7 @@ async fn harness() -> Harness {
     let sender = ShuffleSender::new(1, uuid::Uuid::from_u128(1));
     let fence = CheckpointAssignmentFence::from_owner_map(
         1,
-        &[2],
+        &[1, 2],
         vec![
             CheckpointParticipant {
                 node_id: 1,
@@ -65,8 +65,8 @@ async fn harness() -> Harness {
         ],
     )
     .unwrap();
-    recv.install_assignment_fence(&fence, &[2]).unwrap();
-    sender.install_assignment_fence(&fence, &[2]).unwrap();
+    recv.install_assignment_fence(&fence, &[1, 2]).unwrap();
+    sender.install_assignment_fence(&fence, &[1, 2]).unwrap();
     sender.register_peer(2, recv.local_addr()).await;
     let received = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&received);

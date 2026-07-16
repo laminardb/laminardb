@@ -31,6 +31,19 @@ impl LeaseDeadline {
         self.valid_until_ns.store(until, Ordering::Release);
     }
 
+    pub(crate) fn extend_until(&self, valid_until: Instant) {
+        let Some(remaining_from_origin) = valid_until.checked_duration_since(self.origin) else {
+            self.fence();
+            return;
+        };
+        if remaining_from_origin.is_zero() {
+            self.fence();
+            return;
+        }
+        let until = u64::try_from(remaining_from_origin.as_nanos()).unwrap_or(u64::MAX);
+        self.valid_until_ns.store(until, Ordering::Release);
+    }
+
     pub(crate) fn fence(&self) {
         self.valid_until_ns.store(0, Ordering::Release);
     }
@@ -49,5 +62,24 @@ impl std::fmt::Debug for LeaseDeadline {
             .debug_struct("LeaseDeadline")
             .field("live", &self.is_live())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_extension_preserves_the_original_deadline() {
+        let deadline = LeaseDeadline::fenced();
+        let valid_for = Duration::from_millis(37);
+        let valid_until = deadline.origin.checked_add(valid_for).unwrap();
+
+        deadline.extend_until(valid_until);
+
+        assert_eq!(
+            deadline.valid_until_ns.load(Ordering::Acquire),
+            u64::try_from(valid_for.as_nanos()).unwrap()
+        );
     }
 }

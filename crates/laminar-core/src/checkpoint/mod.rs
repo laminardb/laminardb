@@ -25,10 +25,8 @@ pub mod object_store_builder;
 pub mod recovery_capsule;
 
 pub use assignment::{
-    source_drain_plan_digest, source_drain_source_id, source_drain_vnode_digest, AssignmentDrainId,
-    AssignmentDrainTransition, CheckpointAssignmentAdoption, CheckpointAssignmentFence,
-    CheckpointParticipant, NodeDrainReceiptAggregate, SourceDrainReceipt,
-    MAX_CHECKPOINT_PARTICIPANTS, SOURCE_DRAIN_RECEIPT_VERSION,
+    AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentAdoption,
+    CheckpointAssignmentFence, CheckpointParticipant, MAX_CHECKPOINT_PARTICIPANTS,
 };
 pub use authority::{LeaderProof, LeaderProofOwner};
 pub use barrier::{

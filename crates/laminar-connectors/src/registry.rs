@@ -3,11 +3,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use ::serde::Serialize;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use sha2::{Digest, Sha256};
 
 use crate::config::{ConnectorConfig, ConnectorInfo};
 use crate::connector::{SinkConnector, SourceConnector};
@@ -52,19 +50,13 @@ pub type TableSourceFactory = Arc<
 >;
 
 /// Factory for constructing a lookup source (async, for on-demand mode).
-///
-/// Previously this was a hand-rolled `Arc<dyn Fn(...) -> Pin<Box<Future>>>`
-/// type alias that nobody could read. A trait with an `async` method
-/// says the same thing without forcing the caller to spell out the
-/// `Pin<Box<...>>`.
 #[async_trait]
 pub trait LookupSourceFactory: Send + Sync {
     /// Build a lookup source instance from the given config.
     ///
-    /// `declared_schema` is the table's declared Arrow schema (from the
-    /// `CREATE LOOKUP TABLE` columns), when known. Schema-bearing sources
-    /// (Delta/Iceberg/Postgres) derive their own and ignore it; schemaless
-    /// sources (`MongoDB`) need it to project documents into typed columns.
+    /// `declared_schema` is the table's declared Arrow schema, when known.
+    /// Schema-bearing sources may derive their own; schemaless sources use it
+    /// to project records into typed columns.
     async fn build(
         &self,
         config: ConnectorConfig,
@@ -73,45 +65,6 @@ pub trait LookupSourceFactory: Send + Sync {
 }
 
 type LookupSourceRegistration = (ConnectorInfo, Arc<dyn LookupSourceFactory>);
-
-/// Stable connector-configuration field included in a frozen registry descriptor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ConnectorConfigKeyDescriptor {
-    /// Property name.
-    pub key: String,
-    /// Whether construction requires the property when no default is present.
-    pub required: bool,
-    /// Declared default value.
-    pub default: Option<String>,
-}
-
-/// Stable description of one registered connector factory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ConnectorFactoryDescriptor {
-    /// Registry category.
-    pub kind: &'static str,
-    /// Name used for runtime lookup.
-    pub registered_name: String,
-    /// Connector implementation name declared by its metadata.
-    pub implementation_name: String,
-    /// Connector implementation version declared by its metadata.
-    pub implementation_version: String,
-    /// Whether the implementation declares source capability.
-    pub is_source: bool,
-    /// Whether the implementation declares sink capability.
-    pub is_sink: bool,
-    /// Accepted configuration schema, sorted by property name.
-    pub config_keys: Vec<ConnectorConfigKeyDescriptor>,
-}
-
-/// Canonical, factory-pointer-free description of a frozen connector registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FrozenConnectorRegistryDescriptor {
-    /// Descriptor wire/schema version.
-    pub version: u32,
-    /// Registered factories sorted by category and lookup name.
-    pub factories: Vec<ConnectorFactoryDescriptor>,
-}
 
 /// Registry of available connector implementations. Connectors register
 /// a factory per type string; the runtime looks up by the `connector`
@@ -152,74 +105,6 @@ impl ConnectorRegistry {
     #[must_use]
     pub fn is_frozen(&self) -> bool {
         *self.frozen.read()
-    }
-
-    /// Returns a deterministic description of this registry after it has been frozen.
-    ///
-    /// Factory pointers and display text are intentionally excluded. The descriptor captures
-    /// only lookup/category identity and construction-relevant connector metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConnectorError::InvalidState`] while registration is still open.
-    pub fn frozen_descriptor(&self) -> Result<FrozenConnectorRegistryDescriptor, ConnectorError> {
-        let frozen = self.frozen.read();
-        if !*frozen {
-            return Err(ConnectorError::InvalidState {
-                expected: "frozen connector registry".into(),
-                actual: "registration open".into(),
-            });
-        }
-
-        let mut factories = Vec::new();
-        factories.extend(
-            self.sources
-                .read()
-                .iter()
-                .map(|(name, (info, _))| connector_descriptor("source", name, info)),
-        );
-        factories.extend(
-            self.sinks
-                .read()
-                .iter()
-                .map(|(name, (info, _))| connector_descriptor("sink", name, info)),
-        );
-        factories.extend(
-            self.table_sources
-                .read()
-                .iter()
-                .map(|(name, (info, _))| connector_descriptor("table source", name, info)),
-        );
-        factories.extend(
-            self.lookup_sources
-                .read()
-                .iter()
-                .map(|(name, (info, _))| connector_descriptor("lookup source", name, info)),
-        );
-        factories.sort_unstable_by(|left, right| {
-            (left.kind, left.registered_name.as_str())
-                .cmp(&(right.kind, right.registered_name.as_str()))
-        });
-        drop(frozen);
-        Ok(FrozenConnectorRegistryDescriptor {
-            version: 1,
-            factories,
-        })
-    }
-
-    /// Returns the lowercase SHA-256 digest of the canonical frozen descriptor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the registry is not frozen or descriptor serialization fails.
-    pub fn frozen_fingerprint(&self) -> Result<String, ConnectorError> {
-        let descriptor = self.frozen_descriptor()?;
-        let bytes = serde_json::to_vec(&descriptor).map_err(|error| {
-            ConnectorError::Internal(format!(
-                "failed to serialize frozen connector registry descriptor: {error}"
-            ))
-        })?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
     /// Registers a source connector factory.
@@ -282,8 +167,7 @@ impl ConnectorRegistry {
     ///
     /// Three outcomes:
     /// - `Ok(Some(schema))` — discovery succeeded and produced fields.
-    /// - `Ok(None)` — connector type is unknown OR the connector chose
-    ///   not to discover (e.g. non-Avro Kafka format, missing SR url).
+    /// - `Ok(None)` — connector type is unknown or does not support discovery.
     /// - `Err(_)` — discovery was attempted and failed with a specific
     ///   cause; callers should surface the message verbatim.
     ///
@@ -1043,121 +927,5 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn frozen_fingerprint_is_independent_of_registration_and_config_key_order() {
-        use crate::config::ConfigKeySpec;
-
-        fn info(keys: Vec<ConfigKeySpec>) -> ConnectorInfo {
-            ConnectorInfo {
-                name: "implementation".into(),
-                display_name: "display text is not deployment identity".into(),
-                version: "7.2.1".into(),
-                is_source: true,
-                is_sink: false,
-                config_keys: keys,
-            }
-        }
-        let keys = || {
-            vec![
-                ConfigKeySpec::optional("z", "z field", "default"),
-                ConfigKeySpec::required("a", "a field"),
-            ]
-        };
-        let source = || {
-            Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
-                Ok(Box::new(MockSourceConnector::new()) as Box<dyn SourceConnector>)
-            }) as SourceFactory
-        };
-
-        let first = ConnectorRegistry::new();
-        first.register_source("b", info(keys()), source()).unwrap();
-        first
-            .register_source("a", info(keys().into_iter().rev().collect()), source())
-            .unwrap();
-        assert!(first.frozen_descriptor().is_err());
-        first.freeze();
-
-        let second = ConnectorRegistry::new();
-        second.register_source("a", info(keys()), source()).unwrap();
-        second
-            .register_source("b", info(keys().into_iter().rev().collect()), source())
-            .unwrap();
-        second.freeze();
-
-        assert_eq!(
-            first.frozen_descriptor().unwrap(),
-            second.frozen_descriptor().unwrap()
-        );
-        assert_eq!(
-            first.frozen_fingerprint().unwrap(),
-            second.frozen_fingerprint().unwrap()
-        );
-    }
-
-    #[test]
-    fn frozen_descriptor_redacts_secret_defaults_without_losing_endpoint_identity() {
-        use crate::config::ConfigKeySpec;
-
-        let registry = ConnectorRegistry::new();
-        let mut info = mock_info("secure", true, false);
-        info.config_keys = vec![
-            ConfigKeySpec::optional("password", "credential", "literal-password"),
-            ConfigKeySpec::optional(
-                "endpoint",
-                "service URI",
-                "https://user:pass@api.example/v1?region=eu&sig=signed-secret",
-            ),
-            ConfigKeySpec::optional("batch.size", "batch size", "128"),
-        ];
-        registry
-            .register_source(
-                "secure",
-                info,
-                Arc::new(|_: Option<&Arc<prometheus::Registry>>| {
-                    Ok(Box::new(MockSourceConnector::new()))
-                }),
-            )
-            .unwrap();
-        registry.freeze();
-
-        let encoded = serde_json::to_string(&registry.frozen_descriptor().unwrap()).unwrap();
-        assert!(!encoded.contains("literal-password"));
-        assert!(!encoded.contains("signed-secret"));
-        assert!(!encoded.contains("user:pass"));
-        assert!(encoded.contains("api.example"));
-        assert!(encoded.contains("region=eu"));
-        assert!(encoded.contains("128"));
-        assert!(encoded.contains("<redacted>"));
-    }
-}
-
-fn connector_descriptor(
-    kind: &'static str,
-    registered_name: &str,
-    info: &ConnectorInfo,
-) -> ConnectorFactoryDescriptor {
-    let mut config_keys = info
-        .config_keys
-        .iter()
-        .map(|spec| ConnectorConfigKeyDescriptor {
-            key: spec.key.clone(),
-            required: spec.required,
-            default: spec
-                .default
-                .as_deref()
-                .map(|value| crate::security::sanitize_identity_value(&spec.key, value)),
-        })
-        .collect::<Vec<_>>();
-    config_keys.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-    ConnectorFactoryDescriptor {
-        kind,
-        registered_name: registered_name.to_owned(),
-        implementation_name: info.name.clone(),
-        implementation_version: info.version.clone(),
-        is_source: info.is_source,
-        is_sink: info.is_sink,
-        config_keys,
     }
 }
