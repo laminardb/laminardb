@@ -2475,16 +2475,23 @@ mod tests {
         let addr = spawn_test_server(Arc::clone(&state)).await;
 
         let (attached_tx, attached_rx) = tokio::sync::oneshot::channel();
+        let (data_tx, data_rx) = tokio::sync::oneshot::channel();
         let reader = tokio::task::spawn_blocking(move || {
             let (mut socket, _) =
                 tungstenite::connect(format!("ws://{addr}/ws/visible")).expect("WS connect");
             let _ = attached_tx.send(());
+            let mut data_tx = Some(data_tx);
             let mut frames = Vec::new();
             loop {
                 match socket.read().expect("WS frame") {
                     tungstenite::Message::Text(text) => {
                         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
                         frames.push(json.clone());
+                        if json["type"] == "data" {
+                            if let Some(data_tx) = data_tx.take() {
+                                let _ = data_tx.send(());
+                            }
+                        }
                         if json["type"] == "progress" {
                             return frames;
                         }
@@ -2508,6 +2515,10 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), data_rx)
+            .await
+            .expect("the input must reach the WebSocket before checkpointing")
+            .expect("WebSocket reader must remain attached");
         let committed = state.db.checkpoint().await.expect("checkpoint");
         assert!(committed.success);
         let frames = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
