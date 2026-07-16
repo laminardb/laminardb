@@ -19,16 +19,26 @@ use crate::checkpoint::{
 /// Durable checkpoint metadata store.
 pub struct CheckpointDecisionStore {
     store: Arc<dyn ObjectStore>,
+    update_mode: DecisionStoreUpdateMode,
     /// Serializes candidates from this instance so its durable creates cannot reorder.
     reservation_lock: tokio::sync::Mutex<()>,
+    /// Serializes the fallback for a certified single-writer local namespace.
+    outcome_floor_update_lock: tokio::sync::Mutex<()>,
     /// Highest reservation observed or attempted by this store instance.
     reservation_hint: AtomicU64,
     deployment_id: tokio::sync::OnceCell<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionStoreUpdateMode {
+    NativeCas,
+    LocalSingleWriter,
+}
+
 impl std::fmt::Debug for CheckpointDecisionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckpointDecisionStore")
+            .field("update_mode", &self.update_mode)
             .finish_non_exhaustive()
     }
 }
@@ -359,12 +369,27 @@ pub struct RecoveryCapsuleGcStep {
 }
 
 impl CheckpointDecisionStore {
-    /// Wrap an existing object store.
+    /// Wrap shared storage that must provide native conditional updates.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self::with_update_mode(store, DecisionStoreUpdateMode::NativeCas)
+    }
+
+    /// Wrap node-local storage whose namespace has exactly one process writer.
+    ///
+    /// Stores without conditional-update support use a serialized atomic overwrite for mutable
+    /// retention metadata. Do not use this constructor for storage shared by cluster nodes.
+    #[must_use]
+    pub fn local_single_writer(store: Arc<dyn ObjectStore>) -> Self {
+        Self::with_update_mode(store, DecisionStoreUpdateMode::LocalSingleWriter)
+    }
+
+    fn with_update_mode(store: Arc<dyn ObjectStore>, update_mode: DecisionStoreUpdateMode) -> Self {
         Self {
             store,
+            update_mode,
             reservation_lock: tokio::sync::Mutex::new(()),
+            outcome_floor_update_lock: tokio::sync::Mutex::new(()),
             reservation_hint: AtomicU64::new(0),
             deployment_id: tokio::sync::OnceCell::new(),
         }
@@ -1109,12 +1134,12 @@ impl CheckpointDecisionStore {
             .map(Bytes::from)
             .map_err(|error| DecisionError::Conflict(error.to_string()))?;
         let options = PutOptions {
-            mode: expected.map_or(PutMode::Create, PutMode::Update),
+            mode: expected.clone().map_or(PutMode::Create, PutMode::Update),
             ..PutOptions::default()
         };
         let result = self
             .store
-            .put_opts(&path, PutPayload::from(payload), options)
+            .put_opts(&path, PutPayload::from(payload.clone()), options)
             .await;
         match result {
             Ok(_) => Ok(true),
@@ -1123,6 +1148,42 @@ impl CheckpointDecisionStore {
                 | object_store::Error::AlreadyExists { .. }
                 | object_store::Error::NotFound { .. },
             ) => Ok(false),
+            Err(object_store::Error::NotImplemented { .. })
+                if expected.is_some()
+                    && self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter =>
+            {
+                // LocalFileSystem atomically replaces a file but cannot condition that replace on
+                // an ETag. The runtime topology guarantees one process writer for this namespace;
+                // serialize its read/compare/replace so concurrent maintenance tasks cannot
+                // regress the floor. Shared stores never enter this path.
+                let _guard = self.outcome_floor_update_lock.lock().await;
+                let Some(current) = self.read_outcome_gc_floor(&floor.deployment_id).await? else {
+                    return Ok(false);
+                };
+                if current.floor.before_epoch >= floor.before_epoch {
+                    return Ok(true);
+                }
+                if Some(&current.update_version) != expected.as_ref() {
+                    return Ok(false);
+                }
+                let overwrite = PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..PutOptions::default()
+                };
+                match self
+                    .store
+                    .put_opts(&path, PutPayload::from(payload), overwrite)
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) => match self.read_outcome_gc_floor(&floor.deployment_id).await? {
+                        Some(current) if current.floor.before_epoch >= floor.before_epoch => {
+                            Ok(true)
+                        }
+                        _ => Err(DecisionError::Io(error.to_string())),
+                    },
+                }
+            }
             Err(error) => match self.read_outcome_gc_floor(&floor.deployment_id).await? {
                 Some(current) if current.floor.before_epoch >= floor.before_epoch => Ok(true),
                 _ => Err(DecisionError::Io(error.to_string())),
@@ -1749,7 +1810,24 @@ mod tests {
 
     fn store_in(dir: &std::path::Path) -> CheckpointDecisionStore {
         let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
-        CheckpointDecisionStore::new(fs)
+        CheckpointDecisionStore::local_single_writer(fs)
+    }
+
+    async fn record_local_commits(store: &CheckpointDecisionStore, last_epoch: u64) {
+        for epoch in 1..=last_epoch {
+            store
+                .record_outcome(
+                    epoch,
+                    epoch * 10,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Commit,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
     }
 
     struct DeferredPutStore {
@@ -2673,6 +2751,121 @@ mod tests {
                 .map(|outcome| outcome.epoch)
                 .collect::<Vec<_>>(),
             vec![LAST_EPOCH]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_filesystem_outcome_floor_advances_repeatedly_and_survives_restart() {
+        const LAST_EPOCH: u64 = 24;
+
+        let dir = tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let store = CheckpointDecisionStore::local_single_writer(Arc::clone(&object_store));
+        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
+        record_local_commits(&store, LAST_EPOCH).await;
+
+        for before in 2..=LAST_EPOCH {
+            assert_eq!(store.prune_outcomes_before(before).await.unwrap(), before);
+        }
+        assert_eq!(store.outcome_gc_floor_horizon().await.unwrap(), LAST_EPOCH);
+        assert_eq!(
+            store
+                .outcomes()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|outcome| outcome.epoch)
+                .collect::<Vec<_>>(),
+            vec![LAST_EPOCH]
+        );
+
+        let mut floors = object_store.list(Some(&OsPath::from("checkpoint-outcome-gc/")));
+        let mut floor_paths = Vec::new();
+        while let Some(entry) = floors.next().await {
+            floor_paths.push(entry.unwrap().location);
+        }
+        assert_eq!(
+            floor_paths,
+            vec![CheckpointDecisionStore::outcome_gc_floor_path(
+                &deployment_id
+            )]
+        );
+
+        drop(store);
+        let restarted = CheckpointDecisionStore::local_single_writer(object_store);
+        assert_eq!(
+            restarted.outcome_gc_floor_horizon().await.unwrap(),
+            LAST_EPOCH
+        );
+        assert_eq!(
+            restarted
+                .highest_committed_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            LAST_EPOCH
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_filesystem_concurrent_floor_advancement_is_monotonic() {
+        const LAST_EPOCH: u64 = 16;
+
+        let dir = tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let store = Arc::new(CheckpointDecisionStore::local_single_writer(object_store));
+        record_local_commits(store.as_ref(), LAST_EPOCH).await;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for before in 2..=LAST_EPOCH {
+            let store = Arc::clone(&store);
+            tasks.spawn(async move { (before, store.prune_outcomes_before(before).await) });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (requested, horizon) = result.unwrap();
+            assert!(
+                horizon.unwrap() >= requested,
+                "a serialized local winner may supersede but never regress a request"
+            );
+        }
+        assert_eq!(store.outcome_gc_floor_horizon().await.unwrap(), LAST_EPOCH);
+        assert_eq!(
+            store
+                .outcomes()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|outcome| outcome.epoch)
+                .collect::<Vec<_>>(),
+            vec![LAST_EPOCH]
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_local_filesystem_requires_native_conditional_floor_updates() {
+        let dir = tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let store = CheckpointDecisionStore::new(object_store);
+        record_local_commits(&store, 4).await;
+
+        assert_eq!(store.prune_outcomes_before(2).await.unwrap(), 2);
+        let error = store.prune_outcomes_before(3).await.unwrap_err();
+        assert!(error.to_string().contains("PutMode::Update"), "{error}");
+        assert_eq!(store.outcome_gc_floor_horizon().await.unwrap(), 2);
+        assert_eq!(
+            store
+                .outcomes()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|outcome| outcome.epoch)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4],
+            "a failed shared update must not delete outcomes beyond the durable floor"
         );
     }
 

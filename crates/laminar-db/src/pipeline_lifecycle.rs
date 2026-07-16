@@ -1959,17 +1959,21 @@ impl LaminarDB {
                 #[cfg(feature = "cluster")]
                 {
                     self.decision_store.lock().clone().unwrap_or_else(|| {
-                        Arc::new(
+                        Arc::new(if startup_runtime == RuntimeMode::Local {
+                            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_single_writer(
+                                Arc::clone(&decision_backing),
+                            )
+                        } else {
                             laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
                                 Arc::clone(&decision_backing),
-                            ),
-                        )
+                            )
+                        })
                     })
                 }
                 #[cfg(not(feature = "cluster"))]
                 {
                     Arc::new(
-                        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+                        laminar_core::checkpoint_decision::CheckpointDecisionStore::local_single_writer(
                             Arc::clone(&decision_backing),
                         ),
                     )
