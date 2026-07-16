@@ -25,7 +25,7 @@ default = [
 ]
 api = []  # FFI-friendly API module for language bindings
 ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen headers, Arrow C Data Interface)
-kafka = ["laminar-connectors/kafka"]
+kafka = ["laminar-connectors/kafka", "dep:rdkafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 delta-lake = ["laminar-connectors/delta-lake"]
@@ -52,7 +52,7 @@ local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.28.0" }
 laminar-sql = { path = "../laminar-sql", version = "0.28.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.28.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.28.0", default-features = false }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 quick_cache = { workspace = true }
@@ -132,6 +132,13 @@ uuid = { workspace = true, optional = true }
 # uses `LocalFileSystem`; cluster reuses the configured remote store).
 object_store = { workspace = true }
 
+# Kafka producer/admin client used by `kafka_docker_scenarios.rs`.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
@@ -140,7 +147,7 @@ tempfile = { workspace = true }
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
 laminar-derive = { path = "../laminar-derive", version = "0.28.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.28.0", features = ["testing"] }
+laminar-connectors = { path = "../laminar-connectors", version = "0.28.0", default-features = false, features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -149,18 +156,6 @@ proptest = { workspace = true }
 # websocket-gated test; no TLS so non-websocket dev builds stay openssl-free).
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3" }
-# Kafka producer/admin client used by `kafka_docker_scenarios.rs` integration tests.
-# Tests skip gracefully when the Redpanda broker started by
-# `tests/docker/compose.yml` is not reachable on `localhost:19092`.
-# On Windows the build picks up OpenSSL via `OPENSSL_DIR`
-# (`C:\Program Files\OpenSSL-Win64` by default).
-
-[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl"] }
-
-[target.'cfg(target_os = "windows")'.dev-dependencies]
-rdkafka = { version = "0.39", features = ["cmake-build"] }
-
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # S3-compatible object store client used by the MinIO-backed integration
 # test. Workspace feature set + aws for the AmazonS3 builder.
@@ -177,3 +172,8 @@ harness = false
 [[bench]]
 name = "hot_path_micro"
 harness = false
+
+[[test]]
+name = "kafka_docker_scenarios"
+path = "tests/kafka_docker_scenarios.rs"
+required-features = ["kafka"]

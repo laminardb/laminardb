@@ -1420,7 +1420,7 @@ impl StreamingCoordinator {
         control_rx: ControlMsgRx,
         source_gate: Arc<std::sync::atomic::AtomicBool>,
         owned_source_tasks: OwnedSourceTasks,
-        cluster_source_drain: bool,
+        _cluster_source_drain: bool,
     ) -> Result<Self, DbError> {
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
@@ -1593,7 +1593,7 @@ impl StreamingCoordinator {
             let mut connector = src.connector;
 
             #[cfg(feature = "cluster")]
-            let drain_control = cluster_source_drain.then(|| {
+            let drain_control = _cluster_source_drain.then(|| {
                 let (command_tx, _) =
                     tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
                 let (status_tx, _) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);

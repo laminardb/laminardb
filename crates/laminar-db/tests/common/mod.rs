@@ -6,17 +6,24 @@
 
 use std::net::TcpStream;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
-use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::Message;
+#[cfg(feature = "kafka")]
+use std::time::Instant;
+
+#[cfg(feature = "kafka")]
+use rdkafka::{
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    client::DefaultClientContext,
+    config::ClientConfig,
+    consumer::{Consumer, StreamConsumer},
+    producer::{FutureProducer, FutureRecord},
+    Message,
+};
 
 /// Address of the Kafka broker started by `tests/docker/compose.yml`.
 /// Kept in sync with the `19092:19092` port mapping in that file.
+#[cfg(feature = "kafka")]
 pub const KAFKA_BROKERS: &str = "127.0.0.1:19092";
 
 /// Returns `Some(KAFKA_BROKERS)` when a TCP connection to the broker
@@ -29,6 +36,7 @@ pub const KAFKA_BROKERS: &str = "127.0.0.1:19092";
 ///     return;
 /// };
 /// ```
+#[cfg(feature = "kafka")]
 pub fn kafka_brokers() -> Option<&'static str> {
     let addr: std::net::SocketAddr = KAFKA_BROKERS.parse().ok()?;
     TcpStream::connect_timeout(&addr, Duration::from_millis(500))
@@ -38,6 +46,7 @@ pub fn kafka_brokers() -> Option<&'static str> {
 
 /// Create a Kafka topic (no-op if it already exists). Used by each test
 /// to isolate its data under unique topic names.
+#[cfg(feature = "kafka")]
 pub async fn create_topic(brokers: &str, topic: &str, partitions: i32) {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -51,6 +60,7 @@ pub async fn create_topic(brokers: &str, topic: &str, partitions: i32) {
 }
 
 /// Delete a topic. Used during test teardown to keep the broker clean.
+#[cfg(feature = "kafka")]
 pub async fn delete_topic(brokers: &str, topic: &str) {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -60,6 +70,7 @@ pub async fn delete_topic(brokers: &str, topic: &str) {
 }
 
 /// Produce `count` JSON records shaped `{"id": i, "value": i * 10}`.
+#[cfg(feature = "kafka")]
 pub async fn produce_json_seq(brokers: &str, topic: &str, count: usize) {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -82,6 +93,7 @@ pub async fn produce_json_seq(brokers: &str, topic: &str, count: usize) {
 /// Consume up to `expected` records from `topic`, failing the test if
 /// fewer arrive within `deadline`. Returns the payloads as UTF-8
 /// strings (one per record).
+#[cfg(feature = "kafka")]
 pub async fn consume_json(
     brokers: &str,
     topic: &str,
@@ -117,6 +129,7 @@ pub async fn consume_json(
 /// Consume up to `expected` messages (including tombstones) from `topic`, returning `(key, value)`
 /// per message where `value` is `None` for a null-payload tombstone. Used to verify upsert-envelope
 /// output where a removed group is a keyed tombstone.
+#[cfg(feature = "kafka")]
 pub async fn consume_keyed(
     brokers: &str,
     topic: &str,
@@ -152,6 +165,7 @@ pub async fn consume_keyed(
 }
 
 /// Integer field from a JSON payload (panics if absent/non-integer) — for exact-value oracles.
+#[cfg(feature = "kafka")]
 pub fn json_i64(payload: &str, field: &str) -> i64 {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
@@ -162,6 +176,7 @@ pub fn json_i64(payload: &str, field: &str) -> i64 {
 /// Run `docker compose -f tests/docker/compose.yml <args>` and ignore
 /// non-zero exit codes (useful for kill/restart that may race with the
 /// health-checker).
+#[cfg(feature = "kafka")]
 pub fn compose(args: &[&str]) {
     let cwd = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     // Tests run from `crates/laminar-db/`; compose file is two levels up.
@@ -186,6 +201,7 @@ pub fn compose(args: &[&str]) {
 /// Wait until the Kafka broker is reachable (or the deadline expires).
 /// Useful after `compose(&["start", "redpanda"])` to block until the
 /// broker is serving again.
+#[cfg(feature = "kafka")]
 pub async fn wait_for_broker(deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
@@ -207,7 +223,7 @@ pub const MINIO_ACCESS_KEY: &str = "laminar";
 pub const MINIO_SECRET_KEY: &str = "laminar-test-secret";
 
 /// Returns `Some(MINIO_ENDPOINT)` when MinIO is reachable, `None`
-/// otherwise. Same skip semantics as [`kafka_brokers`].
+/// otherwise.
 pub fn minio_endpoint() -> Option<&'static str> {
     let addr: std::net::SocketAddr = "127.0.0.1:19000".parse().ok()?;
     TcpStream::connect_timeout(&addr, Duration::from_millis(500))

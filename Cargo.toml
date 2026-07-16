@@ -8,7 +8,6 @@ members = [
     "crates/laminar-db",
 ]
 exclude = [
-    "examples/*",
     "tools/*",
     "vendor/pgwire",
     "vendor/pgwire-replication",

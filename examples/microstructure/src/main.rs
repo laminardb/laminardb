@@ -1,7 +1,6 @@
 #![allow(clippy::disallowed_types)]
 
 mod history;
-mod latency;
 mod tui;
 mod types;
 

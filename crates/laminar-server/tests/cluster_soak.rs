@@ -39,21 +39,28 @@ use std::io::{Read, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(feature = "kafka")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "kafka")]
 use std::sync::Arc;
+#[cfg(feature = "kafka")]
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const NODES: usize = 3;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
 const BASE_PORT: u16 = 19310;
+#[cfg(feature = "kafka")]
 const DEFAULT_CLUSTER_KEY_GROUPS: u32 = 64;
+#[cfg(feature = "kafka")]
 const DEFAULT_KAFKA_PARTITIONS: u64 = 96;
+#[cfg(feature = "kafka")]
 const OUTPUT_TOPIC_PARTITIONS: i32 = 1;
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
 const HARD_KILL_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "kafka")]
 const OUTPUT_BOUNDARY_STABILITY: Duration = Duration::from_secs(3);
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -68,6 +75,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
     }
 }
 
+#[cfg(feature = "kafka")]
 fn cluster_key_group_count() -> u32 {
     let key_groups = env_u64(
         "LAMINAR_SOAK_KEY_GROUPS",
@@ -81,6 +89,7 @@ fn cluster_key_group_count() -> u32 {
     key_groups
 }
 
+#[cfg(feature = "kafka")]
 fn cluster_kafka_partition_count() -> i32 {
     let partitions = env_u64("LAMINAR_SOAK_KAFKA_PARTITIONS", DEFAULT_KAFKA_PARTITIONS);
     let partitions = i32::try_from(partitions)
@@ -365,6 +374,7 @@ impl Node {
         found.then_some(sum)
     }
 
+    #[cfg(feature = "kafka")]
     fn is_leader(&self) -> Option<bool> {
         let body = self.http_get("/api/v1/cluster/leader")?;
         serde_json::from_str::<serde_json::Value>(&body)
@@ -373,6 +383,7 @@ impl Node {
             .as_bool()
     }
 
+    #[cfg(feature = "kafka")]
     fn peer_names(&self) -> Option<Vec<String>> {
         serde_json::from_str::<Vec<serde_json::Value>>(&self.http_get("/api/v1/cluster/nodes")?)
             .ok()?
@@ -386,6 +397,7 @@ impl Node {
             .collect()
     }
 
+    #[cfg(feature = "kafka")]
     fn trigger_fault(&self, role: &str) {
         let path = self
             .fault_trigger_path
@@ -499,17 +511,20 @@ impl Drop for Node {
     }
 }
 
+#[cfg(feature = "kafka")]
 struct ProducerGuard {
     stop: Arc<AtomicBool>,
     produced: Arc<AtomicU64>,
     handle: Option<JoinHandle<Vec<i64>>>,
 }
 
+#[cfg(feature = "kafka")]
 struct ProducedPrefix {
     count: u64,
     end_offsets: Vec<i64>,
 }
 
+#[cfg(feature = "kafka")]
 impl ProducerGuard {
     fn spawn(brokers: String, topic: String, partitions: i32, rps: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -563,6 +578,7 @@ impl ProducerGuard {
     }
 }
 
+#[cfg(feature = "kafka")]
 impl Drop for ProducerGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -572,12 +588,14 @@ impl Drop for ProducerGuard {
     }
 }
 
+#[cfg(feature = "kafka")]
 struct KafkaCommitOracle {
     consumer: rdkafka::consumer::BaseConsumer,
     topic: String,
     partitions: i32,
 }
 
+#[cfg(feature = "kafka")]
 impl KafkaCommitOracle {
     fn new(brokers: &str, group: &str, topic: &str, partitions: i32) -> Self {
         use rdkafka::consumer::Consumer;
@@ -656,6 +674,7 @@ impl KafkaCommitOracle {
     }
 }
 
+#[cfg(feature = "kafka")]
 fn kafka_high_watermarks(
     consumer: &rdkafka::consumer::BaseConsumer,
     topic: &str,
@@ -673,6 +692,7 @@ fn kafka_high_watermarks(
         .collect()
 }
 
+#[cfg(feature = "kafka")]
 fn record_consumed_offset(consumed: &mut [i64], partition: i32, offset: i64) {
     let partition = usize::try_from(partition).expect("Kafka returned a negative partition");
     let next = offset.saturating_add(1);
@@ -682,6 +702,7 @@ fn record_consumed_offset(consumed: &mut [i64], partition: i32, offset: i64) {
     *consumed = (*consumed).max(next);
 }
 
+#[cfg(feature = "kafka")]
 struct KafkaOutputOracle {
     consumer: rdkafka::consumer::BaseConsumer,
     topic: String,
@@ -691,6 +712,7 @@ struct KafkaOutputOracle {
     duplicates: u64,
 }
 
+#[cfg(feature = "kafka")]
 impl KafkaOutputOracle {
     fn new(brokers: &str, topic: &str, partitions: i32) -> Self {
         use rdkafka::consumer::Consumer;
@@ -801,6 +823,7 @@ impl KafkaOutputOracle {
     }
 }
 
+#[cfg(feature = "kafka")]
 fn assert_final_outputs(
     nodes: &mut [Node],
     output: &mut KafkaOutputOracle,
@@ -909,6 +932,7 @@ fn aggregate_high_seq(key: u64, count: u64, groups: u64, span: u64) -> u64 {
         .expect("aggregate sequence overflow")
 }
 
+#[cfg(feature = "kafka")]
 fn write_config(
     dir: &Path,
     id: usize,
@@ -1223,6 +1247,7 @@ fn local_checkpoint_epoch(nodes: &[Node]) -> u64 {
     epochs[0]
 }
 
+#[cfg(feature = "kafka")]
 fn converged_durable_checkpoint(nodes: &[Node]) -> Option<DurableCheckpointStatus> {
     let mut statuses = nodes
         .iter()
@@ -1234,6 +1259,7 @@ fn converged_durable_checkpoint(nodes: &[Node]) -> Option<DurableCheckpointStatu
         .then_some(first)
 }
 
+#[cfg(feature = "kafka")]
 fn wait_for_converged_durable_checkpoint(
     nodes: &mut [Node],
     deadline: Instant,
@@ -1290,6 +1316,7 @@ fn assert_running_nodes(nodes: &mut [Node]) {
     assert!(live > 0, "soak has no expected-live node processes");
 }
 
+#[cfg(feature = "kafka")]
 fn assert_every_node_ingests(nodes: &mut [Node], producer: &mut ProducerGuard, window: Duration) {
     assert_running_nodes(nodes);
     producer.assert_running();
@@ -1310,6 +1337,7 @@ fn assert_every_node_ingests(nodes: &mut [Node], producer: &mut ProducerGuard, w
     });
 }
 
+#[cfg(feature = "kafka")]
 fn observed_leader(nodes: &[Node]) -> Option<usize> {
     let roles: Option<Vec<bool>> = nodes.iter().map(Node::is_leader).collect();
     let leaders: Vec<usize> = roles?
@@ -1320,6 +1348,7 @@ fn observed_leader(nodes: &[Node]) -> Option<usize> {
     (leaders.len() == 1).then_some(leaders[0])
 }
 
+#[cfg(feature = "kafka")]
 fn has_full_membership(nodes: &[Node]) -> bool {
     nodes.iter().all(|node| {
         let Some(peers) = node.peer_names() else {
@@ -1337,6 +1366,7 @@ fn has_full_membership(nodes: &[Node]) -> bool {
     })
 }
 
+#[cfg(feature = "kafka")]
 fn wait_for_stable_leader(nodes: &mut [Node], producer: &mut ProducerGuard) -> usize {
     let mut candidate = None;
     let mut stable_samples = 0u8;
@@ -1390,6 +1420,7 @@ fn assert_checkpoint_progress(
 
 /// Assert two committed checkpoints over advancing source data. With Kafka, also require a new
 /// broker offset commit so an empty-checkpoint loop cannot satisfy the soak.
+#[cfg(feature = "kafka")]
 fn assert_progress(
     nodes: &mut [Node],
     mut producer: Option<&mut ProducerGuard>,
@@ -1481,6 +1512,7 @@ fn assert_progress(
     wait_for_converged_durable_checkpoint(nodes, deadline, label, previous_checkpoint)
 }
 
+#[cfg(feature = "kafka")]
 fn assert_final_input_cut(
     nodes: &mut [Node],
     commit_oracle: &KafkaCommitOracle,
@@ -1753,6 +1785,7 @@ fn local_exact_source_state_kill9_soak() {
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
+#[cfg(feature = "kafka")]
 fn three_node_kill9_soak() {
     let soak_secs = env_u64("LAMINAR_SOAK_SECONDS", 90);
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
@@ -2196,6 +2229,7 @@ fn three_node_kill9_soak() {
 }
 
 /// Create `topic` with `partitions` partitions (blocking; the admin API is async).
+#[cfg(feature = "kafka")]
 fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
     use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
     use rdkafka::client::DefaultClientContext;
@@ -2225,6 +2259,7 @@ fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
 /// Every delivery is awaited so broker-side rejection or timeout fails the soak.
 /// Explicit round-robin assignment guarantees that every source partition and vnode receives
 /// records; Kafka keys remain unique diagnostics and do not determine placement.
+#[cfg(feature = "kafka")]
 fn produce_seq(
     brokers: &str,
     topic: &str,
